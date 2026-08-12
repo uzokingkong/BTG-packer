@@ -221,6 +221,19 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
                     ip = (ip as i64 + rel) as usize;
                 }
             }
+            OP_SETCC => {
+                // v50: setcc writes ONLY the low byte of the destination vreg and
+                // preserves the status flags. (x86 setcc is a partial-register
+                // write: the upper bits of the destination are untouched and the
+                // flags are not modified.)
+                let dst = code[ip] as usize;
+                let cond = code[ip + 1];
+                ip += 2;
+                let cur = *vreg64(state, dst)?;
+                let taken = flags::cond_taken(cond, flags_of(state));
+                let newv = (cur & !0xFFu64) | if taken { 1u64 } else { 0 };
+                *vreg64(state, dst)? = newv;
+            }
             OP_HALT => return Ok(()),
             // ── M2 (v22) opcodes ─────────────────────────────────────────────
             OP_MOV_R_R64 => {
@@ -370,16 +383,14 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
                 ip += 1;
                 let sp = sp_of(state).wrapping_sub(8);
                 set_sp(state, sp);
-                let base = ptr_slot(state, MEM_STACK as usize)?;
-                let addr = base.checked_add(sp as usize).ok_or(VmError::OobMem)?;
+                let addr = sp as usize;
                 mem_put(mem, addr, &vreg64(state, r)?.to_le_bytes())?;
             }
             OP_POP_R => {
                 let r = code[ip] as usize;
                 ip += 1;
                 let sp = sp_of(state);
-                let base = ptr_slot(state, MEM_STACK as usize)?;
-                let addr = base.checked_add(sp as usize).ok_or(VmError::OobMem)?;
+                let addr = sp as usize;
                 let val = u64::from_le_bytes(mem_get(mem, addr, 8).ok_or(VmError::OobMem)?.try_into().unwrap());
                 *vreg64(state, r)? = val;
                 set_sp(state, sp.wrapping_add(8));
@@ -389,15 +400,13 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
                 ip += 1;
                 let sp = sp_of(state).wrapping_sub(8);
                 set_sp(state, sp);
-                let base = ptr_slot(state, MEM_STACK as usize)?;
-                let addr = base.checked_add(sp as usize).ok_or(VmError::OobMem)?;
+                let addr = sp as usize;
                 mem_put(mem, addr, &(ip as u64).to_le_bytes())?;
                 ip = (ip as i64 + rel) as usize;
             }
             OP_RET => {
                 let sp = sp_of(state);
-                let base = ptr_slot(state, MEM_STACK as usize)?;
-                let addr = base.checked_add(sp as usize).ok_or(VmError::OobMem)?;
+                let addr = sp as usize;
                 let val = u64::from_le_bytes(mem_get(mem, addr, 8).ok_or(VmError::OobMem)?.try_into().unwrap());
                 set_sp(state, sp.wrapping_add(8));
                 ip = val as usize;
@@ -406,8 +415,7 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
                 let imm = u16::from_le_bytes(code[ip..ip + 2].try_into().unwrap());
                 ip += 2;
                 let sp = sp_of(state);
-                let base = ptr_slot(state, MEM_STACK as usize)?;
-                let addr = base.checked_add(sp as usize).ok_or(VmError::OobMem)?;
+                let addr = sp as usize;
                 let val = u64::from_le_bytes(mem_get(mem, addr, 8).ok_or(VmError::OobMem)?.try_into().unwrap());
                 set_sp(state, sp.wrapping_add(8 + imm as u64));
                 ip = val as usize;
@@ -469,8 +477,7 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
                 ip += 4;
                 let sp = sp_of(state).wrapping_sub(8);
                 set_sp(state, sp);
-                let base = ptr_slot(state, MEM_STACK as usize)?;
-                let addr = base.checked_add(sp as usize).ok_or(VmError::OobMem)?;
+                let addr = sp as usize;
                 mem_put(mem, addr, &(ip as u64).to_le_bytes())?;
                 ip = (ip as i64 + rel as i64) as usize;
             }
@@ -583,7 +590,10 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
                         _ => sv.to_le_bytes().to_vec(),
                     };
                     mem_put(mem, addr, &bytes)?;
-                    set_flags(state, F_ZF);
+                    // native handler captures ONLY ZF and preserves the other
+                    // (undefined-on-x86) flags; the interpreter must mirror that
+                    // so interp == native. Preserve all bits except ZF, set ZF.
+                    set_flags(state, (flags_of(state) & !F_ZF) | F_ZF);
                 } else {
                     // On failure RAX's operand-width bytes become [addr]. x86 writes
                     // only AL/AX for 8/16 (upper RAX untouched); EAX zero-extends for
@@ -594,7 +604,8 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
                         _ => cur,
                     };
                     *vreg64(state, 0)? = new_v0;
-                    set_flags(state, 0);
+                    // ZF cleared, all other flags preserved (mirror native handler).
+                    set_flags(state, flags_of(state) & !F_ZF);
                 }
             }
             OP_XCHG_MEM8_A | OP_XCHG_MEM16_A | OP_XCHG_MEM32_A | OP_XCHG_MEM64_A => {
@@ -648,14 +659,16 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
                         let b = sv as u8;
                         mem_put(mem, addr, &a.wrapping_add(b).to_le_bytes())?;
                         *vreg64(state, src)? = (sv & !0xFF) | (a as u64);
-                        set_flags(state, flags::add_flags(a as u32, b as u32));
+                        // width-correct 8-bit ADD flags (matches native `lock xadd [addr], al`)
+                        set_flags(state, flags::add_flags_width(a as u64, b as u64, 8));
                     }
                     2 => {
                         let a = u16::from_le_bytes([g[0], g[1]]);
                         let b = sv as u16;
                         mem_put(mem, addr, &a.wrapping_add(b).to_le_bytes())?;
                         *vreg64(state, src)? = (sv & !0xFFFF) | (a as u64);
-                        set_flags(state, flags::add_flags(a as u32, b as u32));
+                        // width-correct 16-bit ADD flags (matches native `lock xadd [addr], ax`)
+                        set_flags(state, flags::add_flags_width(a as u64, b as u64, 16));
                     }
                     4 => {
                         let a = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
@@ -1187,16 +1200,18 @@ fn ptr_slot(state: &[u8], slot: usize) -> Result<usize, VmError> {
     Ok(u64::from_le_bytes(state[off..off + 8].try_into().unwrap()) as usize)
 }
 
-/// Read the VM stack pointer (offset from the stack base).
+/// Read the VM stack pointer (vreg[4] = the real RSP). Single-stack model:
+/// call/ret/push/pop and `[rsp+disp]` addressing all share this one pointer,
+/// matching real x86. See the fix note in handlers.rs (vreg4-as-single-stack).
 #[inline]
 fn sp_of(state: &[u8]) -> u64 {
-    u64::from_le_bytes(state[STATE_SP..STATE_SP + 8].try_into().unwrap())
+    u64::from_le_bytes(state[STATE_VREGS + 4 * 8..STATE_VREGS + 4 * 8 + 8].try_into().unwrap())
 }
 
-/// Write the VM stack pointer.
+/// Write the VM stack pointer (vreg[4]).
 #[inline]
 fn set_sp(state: &mut [u8], sp: u64) {
-    state[STATE_SP..STATE_SP + 8].copy_from_slice(&sp.to_le_bytes());
+    state[STATE_VREGS + 4 * 8..STATE_VREGS + 4 * 8 + 8].copy_from_slice(&sp.to_le_bytes());
 }
 
 /// Read `n` bytes from the arena at `addr` (n = 1..=8).

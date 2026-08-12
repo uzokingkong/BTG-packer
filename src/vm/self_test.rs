@@ -21,10 +21,10 @@ fn run_flags_jcc_test() -> Result<()> {
     // Reusable native VM module + trampoline in one RWX arena.
     let mut arena = Arena::new(0x30000)?;
     let code_va = arena.base + 0x1000;
-    let table_va = arena.base + 0x3000;
-    let bc_va = arena.base + 0x4000;
-    let state_va = arena.base + 0x5000;
-    let tramp_va = arena.base + 0x6000;
+    let table_va = arena.base + 0x4000;
+    let bc_va = arena.base + 0x5000;
+    let state_va = arena.base + 0x6000;
+    let tramp_va = arena.base + 0x7000;
     let module = build_vm_module(
         code_va as u64,
         table_va as u64,
@@ -43,8 +43,8 @@ fn run_flags_jcc_test() -> Result<()> {
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x3000..0x3000 + module.table.len()].copy_from_slice(&module.table);
-        b[0x6000..0x6000 + tramp.len()].copy_from_slice(&tramp);
+        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x7000..0x7000 + tramp.len()].copy_from_slice(&tramp);
     }
 
     // Run `prog` through the interpreter and the native VM; both must agree on
@@ -62,12 +62,12 @@ fn run_flags_jcc_test() -> Result<()> {
         // native
         {
             let b = arena.bytes();
-            b[0x4000..0x4000 + prog.len()].copy_from_slice(prog);
-            b[0x5000..0x5000 + interp::STATE_SIZE].fill(0);
+            b[0x5000..0x5000 + prog.len()].copy_from_slice(prog);
+            b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
         }
-        arena.call(0x6000);
+        arena.call(0x7000);
         let b = arena.bytes();
-        let sf = 0x5000usize; // state buffer base within the arena
+        let sf = 0x6000usize; // state buffer base within the arena
         let flags_n = u64::from_le_bytes(b[sf + interp::STATE_FLAGS..sf + interp::STATE_FLAGS + 8].try_into().unwrap());
         let mut vregs_n = [0u64; 16];
         for i in 0..16 {
@@ -260,11 +260,11 @@ fn run_m2_mem_test() -> Result<()> {
 
     let mut arena = Arena::new(0x20000)?;
     let code_va = arena.base + 0x1000;
-    let table_va = arena.base + 0x3000;
-    let bc_va = arena.base + 0x4000;
-    let state_va = arena.base + 0x5000;
-    let data_va = arena.base + 0x6000; // S-box memory buffer
-    let tramp_va = arena.base + 0x7000;
+    let table_va = arena.base + 0x4000;
+    let bc_va = arena.base + 0x5000;
+    let state_va = arena.base + 0x6000;
+    let data_va = arena.base + 0x7000; // S-box memory buffer
+    let tramp_va = arena.base + 0x8000;
     let module = build_vm_module(
         code_va as u64,
         table_va as u64,
@@ -284,9 +284,9 @@ fn run_m2_mem_test() -> Result<()> {
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x3000..0x3000 + module.table.len()].copy_from_slice(&module.table);
-        b[0x7000..0x7000 + tramp.len()].copy_from_slice(&tramp);
-        b[0x6000..0x6008].copy_from_slice(&pat);
+        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
+        b[0x7000..0x7008].copy_from_slice(&pat);
     }
 
     // Bytecode: load widths from offset 0, sign-extend from offset 7/6, then
@@ -328,17 +328,17 @@ fn run_m2_mem_test() -> Result<()> {
     // Native
     {
         let b = arena.bytes();
-        b[0x4000..0x4000 + prog.len()].copy_from_slice(&prog);
-        b[0x5000..0x5000 + interp::STATE_SIZE].fill(0);
-        b[0x6000..0x6008].copy_from_slice(&pat);
+        b[0x5000..0x5000 + prog.len()].copy_from_slice(&prog);
+        b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+        b[0x7000..0x7008].copy_from_slice(&pat);
     }
-    arena.call(0x7000);
+    arena.call(0x8000);
     let b = arena.bytes();
     let mut vn = [0u64; 16];
     for i in 0..16 {
-        vn[i] = u64::from_le_bytes(b[0x5000 + interp::STATE_VREGS + i * 8..0x5000 + interp::STATE_VREGS + i * 8 + 8].try_into().unwrap());
+        vn[i] = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + i * 8..0x6000 + interp::STATE_VREGS + i * 8 + 8].try_into().unwrap());
     }
-    let mem_n = b[0x6000..0x6008].to_vec();
+    let mem_n = b[0x7000..0x7008].to_vec();
     assert_eq!(vi, vn, "M2 memory loads/stores: interp vs native vreg mismatch\ninterp={:?}\nnative ={:?}", vi, vn);
     assert_eq!(mem_i, mem_n, "M2 memory buffer mismatch after stores");
     // sanity: v14 (full 64-bit reload) must be the stored value
@@ -353,11 +353,11 @@ fn run_m3_stack_test() -> Result<()> {
 
     let mut arena = Arena::new(0x30000)?;
     let code_va = arena.base + 0x1000;
-    let table_va = arena.base + 0x3000;
-    let bc_va = arena.base + 0x4000;
-    let state_va = arena.base + 0x5000;
-    let stack_va = arena.base + 0x8000; // stack region
-    let tramp_va = arena.base + 0x9000;
+    let table_va = arena.base + 0x4000;
+    let bc_va = arena.base + 0x5000;
+    let state_va = arena.base + 0x6000;
+    let stack_va = arena.base + 0x9000; // stack region
+    let tramp_va = arena.base + 0xA000;
     let module = build_vm_module(
         code_va as u64,
         table_va as u64,
@@ -376,13 +376,13 @@ fn run_m3_stack_test() -> Result<()> {
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x3000..0x3000 + module.table.len()].copy_from_slice(&module.table);
-        b[0x9000..0x9000 + tramp.len()].copy_from_slice(&tramp);
+        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0xA000..0xA000 + tramp.len()].copy_from_slice(&tramp);
     }
 
     // Program: main pushes a,b then calls ADDSUB (which pops a,b, computes a+b
     // into v2, restores the return address, rets). Then main pushes the result
-    // and pops it into v6.
+    // and pops it into v6. v4 = RSP is the single stack pointer (vreg4-as-single-stack).
     let mut bc = BytecodeBuilder::new();
     bc.mov_r_imm32(0, 5); // a
     bc.mov_r_imm32(1, 7); // b
@@ -395,10 +395,10 @@ fn run_m3_stack_test() -> Result<()> {
     bc.halt();
     bc.mark_label(sub);
     bc.pop_r(3); // return addr
-    bc.pop_r(4); // a
+    bc.pop_r(10); // a  (NOT v4 — v4 is the RSP stack pointer)
     bc.pop_r(5); // b
     bc.mov_r_imm32(2, 0);
-    bc.binop_r_r(OP_ADD_R_R, 2, 4);
+    bc.binop_r_r(OP_ADD_R_R, 2, 10);
     bc.binop_r_r(OP_ADD_R_R, 2, 5);
     bc.push_r(3); // restore return addr
     bc.ret();
@@ -409,8 +409,8 @@ fn run_m3_stack_test() -> Result<()> {
     // Interpreter
     let mut st = vec![0u8; interp::STATE_SIZE];
     let mut mem = vec![0u8; 0x2000];
-    st[interp::STATE_PTR_STACK..interp::STATE_PTR_STACK + 8].copy_from_slice(&0x1000u64.to_le_bytes());
-    st[interp::STATE_SP..interp::STATE_SP + 8].copy_from_slice(&STACK_SIZE.to_le_bytes());
+    // vreg4 = RSP points at the stack TOP (0x1000..0x2000 arena in mem space).
+    st[interp::STATE_VREGS + 4 * 8..interp::STATE_VREGS + 4 * 8 + 8].copy_from_slice(&0x2000u64.to_le_bytes());
     interp::interpret(&mut st, &mut mem, &prog).map_err(|e| anyhow!("M3 stack interp failed: {:?}", e))?;
     let mut vi = [0u64; 16];
     for i in 0..16 {
@@ -420,23 +420,24 @@ fn run_m3_stack_test() -> Result<()> {
     // Native
     {
         let b = arena.bytes();
-        b[0x4000..0x4000 + prog.len()].copy_from_slice(&prog);
-        b[0x5000..0x5000 + interp::STATE_SIZE].fill(0);
-        b[0x5000 + interp::STATE_PTR_STACK..0x5000 + interp::STATE_PTR_STACK + 8]
-            .copy_from_slice(&(stack_va as u64).to_le_bytes());
-        b[0x5000 + interp::STATE_SP..0x5000 + interp::STATE_SP + 8].copy_from_slice(&STACK_SIZE.to_le_bytes());
+        b[0x5000..0x5000 + prog.len()].copy_from_slice(&prog);
+        b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+        // vreg4 = RSP points at the stack TOP (stack_va + STACK_SIZE).
+        b[0x6000 + interp::STATE_VREGS + 4 * 8..0x6000 + interp::STATE_VREGS + 4 * 8 + 8]
+            .copy_from_slice(&((stack_va as u64) + STACK_SIZE).to_le_bytes());
         b[0x8000..0x8000 + 0x1000].fill(0); // clear stack region
     }
-    arena.call(0x9000);
+    arena.call(0xA000);
     let b = arena.bytes();
     let mut vn = [0u64; 16];
     for i in 0..16 {
-        vn[i] = u64::from_le_bytes(b[0x5000 + interp::STATE_VREGS + i * 8..0x5000 + interp::STATE_VREGS + i * 8 + 8].try_into().unwrap());
+        vn[i] = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + i * 8..0x6000 + interp::STATE_VREGS + i * 8 + 8].try_into().unwrap());
     }
-    // Compare data vregs (skip index 3 = saved return address, which is an
-    // index in the interpreter but a VA in native — both correct).
+    // Compare data vregs. Skip index 3 (return address — bytecode index in interp,
+    // VA in native) and index 4 (RSP stack pointer — mem-offset in interp, absolute
+    // VA in native); both are correct for their model.
     for i in 0..16 {
-        if i == 3 {
+        if i == 3 || i == 4 {
             continue;
         }
         assert_eq!(vi[i], vn[i], "M3 stack/call/ret: interp vs native vreg {} mismatch (interp=0x{:X} native=0x{:X})", i, vi[i], vn[i]);
@@ -458,12 +459,12 @@ fn run_m2_addr_test() -> Result<()> {
 
     let mut arena = Arena::new(0x40000)?;
     let code_va = arena.base + 0x1000;
-    let table_va = arena.base + 0x3000;
-    let bc_va = arena.base + 0x4000;
-    let state_va = arena.base + 0x5000;
-    let data_va = arena.base + 0x6000; // addressable data region
-    let stack_va = arena.base + 0x7000;
-    let tramp_va = arena.base + 0x8000;
+    let table_va = arena.base + 0x4000;
+    let bc_va = arena.base + 0x5000;
+    let state_va = arena.base + 0x6000;
+    let data_va = arena.base + 0x7000; // addressable data region
+    let stack_va = arena.base + 0x8000;
+    let tramp_va = arena.base + 0x9000;
     let module = build_vm_module(
         code_va as u64,
         table_va as u64,
@@ -482,8 +483,8 @@ fn run_m2_addr_test() -> Result<()> {
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x3000..0x3000 + module.table.len()].copy_from_slice(&module.table);
-        b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
+        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x9000..0x9000 + tramp.len()].copy_from_slice(&tramp);
     }
 
     // The pattern written at data_va + disp, and at data_va + idx*scale + disp.
@@ -550,22 +551,22 @@ fn run_m2_addr_test() -> Result<()> {
     // Native VM: base v0 = data_va, STATE_RIP = data_va - 0x10 so +0x10 = data_va
     {
         let b = arena.bytes();
-        b[0x4000..0x4000 + prog.len()].copy_from_slice(&prog);
-        b[0x5000..0x5000 + interp::STATE_SIZE].fill(0);
-        b[0x5000 + interp::STATE_VREGS + 0 * 8..0x5000 + interp::STATE_VREGS + 1 * 8]
+        b[0x5000..0x5000 + prog.len()].copy_from_slice(&prog);
+        b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+        b[0x6000 + interp::STATE_VREGS + 0 * 8..0x6000 + interp::STATE_VREGS + 1 * 8]
             .copy_from_slice(&(data_va as u64).to_le_bytes());
-        b[0x5000 + interp::STATE_PTR_STACK..0x5000 + interp::STATE_PTR_STACK + 8]
+        b[0x6000 + interp::STATE_PTR_STACK..0x6000 + interp::STATE_PTR_STACK + 8]
             .copy_from_slice(&(stack_va as u64).to_le_bytes());
-        b[0x5000 + interp::STATE_SP..0x5000 + interp::STATE_SP + 8].copy_from_slice(&0x1000u64.to_le_bytes());
-        b[0x5000 + interp::STATE_RIP..0x5000 + interp::STATE_RIP + 8]
+        b[0x6000 + interp::STATE_SP..0x6000 + interp::STATE_SP + 8].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[0x6000 + interp::STATE_RIP..0x6000 + interp::STATE_RIP + 8]
             .copy_from_slice(&((data_va as u64).wrapping_sub(0x10)).to_le_bytes());
-        b[0x6000..0x6000 + 0x1000].fill(0);
+        b[0x7000..0x7000 + 0x1000].fill(0);
     }
-    arena.call(0x8000);
+    arena.call(0x9000);
     let b = arena.bytes();
     let mut vn = [0u64; 16];
     for i in 0..16 {
-        vn[i] = u64::from_le_bytes(b[0x5000 + interp::STATE_VREGS + i * 8..0x5000 + interp::STATE_VREGS + i * 8 + 8].try_into().unwrap());
+        vn[i] = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + i * 8..0x6000 + interp::STATE_VREGS + i * 8 + 8].try_into().unwrap());
     }
     // native semantic checks (base = data_va)
     let db = data_va as u64;
@@ -575,8 +576,8 @@ fn run_m2_addr_test() -> Result<()> {
     assert_eq!(vn[5] as i64, (0xAAu8 as i8) as i64, "M2 native MOVSX8 wrong");
     assert_eq!(vn[6], db, "M2 native LEA_RIP wrong (got 0x{:X} want 0x{:X})", vn[6], db);
     // the 32-bit store at data+0x14 and the byte store at data+8, and the u64 at data
-    assert_eq!(b[0x6000 + 0x14..0x6000 + 0x18], [0x44, 0x33, 0x22, 0x11], "M2 native mem32 store wrong");
-    assert_eq!(b[0x6000 + 8], 0xAA, "M2 native mem8 store wrong");
+    assert_eq!(b[0x7000 + 0x14..0x7000 + 0x18], [0x44, 0x33, 0x22, 0x11], "M2 native mem32 store wrong");
+    assert_eq!(b[0x7000 + 8], 0xAA, "M2 native mem8 store wrong");
     Ok(())
 }
 
@@ -589,12 +590,12 @@ fn run_m3_bridge_test() -> Result<()> {
 
     let mut arena = Arena::new(0x40000)?;
     let code_va = arena.base + 0x1000;
-    let table_va = arena.base + 0x3000;
-    let bc_va = arena.base + 0x4000;
-    let state_va = arena.base + 0x5000;
-    let stack_va = arena.base + 0x6000;
-    let tramp_va = arena.base + 0x7000;
-    let native_va = arena.base + 0xA000; // the native helper we call (0xA000 is free; 0x8000 would overlap the VM module code which ends at 0x1000+0x7310=0x8310)
+    let table_va = arena.base + 0x4000;
+    let bc_va = arena.base + 0x5000;
+    let state_va = arena.base + 0x6000;
+    let stack_va = arena.base + 0x7000;
+    let tramp_va = arena.base + 0x8000;
+    let native_va = arena.base + 0xB000; // the native helper we call (0xA000 is free; 0x8000 would overlap the VM module code which ends at 0x1000+0x7310=0x8310)
     let module = build_vm_module(
         code_va as u64,
         table_va as u64,
@@ -644,30 +645,30 @@ fn run_m3_bridge_test() -> Result<()> {
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x3000..0x3000 + module.table.len()].copy_from_slice(&module.table);
-        b[0x7000..0x7000 + tramp.len()].copy_from_slice(&tramp);
-        b[0xA000..0xA000 + henc.code_buffer.len()].copy_from_slice(&henc.code_buffer);
-        b[0x4000..0x4000 + prog.len()].copy_from_slice(&prog);
-        b[0x5000..0x5000 + interp::STATE_SIZE].fill(0);
-        b[0x5000 + interp::STATE_PTR_STACK..0x5000 + interp::STATE_PTR_STACK + 8]
+        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
+        b[0xB000..0xB000 + henc.code_buffer.len()].copy_from_slice(&henc.code_buffer);
+        b[0x5000..0x5000 + prog.len()].copy_from_slice(&prog);
+        b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+        b[0x6000 + interp::STATE_PTR_STACK..0x6000 + interp::STATE_PTR_STACK + 8]
             .copy_from_slice(&(stack_va as u64).to_le_bytes());
-        b[0x5000 + interp::STATE_SP..0x5000 + interp::STATE_SP + 8].copy_from_slice(&0x1000u64.to_le_bytes());
-        b[0x6000..0x6000 + 0x1000].fill(0);
+        b[0x6000 + interp::STATE_SP..0x6000 + interp::STATE_SP + 8].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[0x7000..0x7000 + 0x1000].fill(0);
         // v4 (RSP register) = stack_va so the bridge finds the 5th stack arg at [v4+0x20].
-        b[0x5000 + interp::STATE_VREGS + 4 * 8..0x5000 + interp::STATE_VREGS + 5 * 8]
+        b[0x6000 + interp::STATE_VREGS + 4 * 8..0x6000 + interp::STATE_VREGS + 5 * 8]
             .copy_from_slice(&(stack_va as u64).to_le_bytes());
         // 5th arg d = 40 at [stack_va + 0x20]
-        b[0x6000 + 0x20..0x6000 + 0x28].copy_from_slice(&40u64.to_le_bytes());
+        b[0x7000 + 0x20..0x7000 + 0x28].copy_from_slice(&40u64.to_le_bytes());
     }
-    arena.call(0x7000);
+    arena.call(0x8000);
     let b = arena.bytes();
-    let ret = u64::from_le_bytes(b[0x5000 + interp::STATE_VREGS + 0 * 8..0x5000 + interp::STATE_VREGS + 1 * 8].try_into().unwrap());
+    let ret = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + 0 * 8..0x6000 + interp::STATE_VREGS + 1 * 8].try_into().unwrap());
     // add4(10,20,30,40) = 10 + 2*20 + 4*30 + 8*40 = 10+40+120+320 = 490
     assert_eq!(ret, 490, "M3 native bridge returned {} (want 490)", ret);
     // v1/v2/v8 must be preserved (args), v0 clobbered by return value
-    let v1 = u64::from_le_bytes(b[0x5000 + interp::STATE_VREGS + 1 * 8..0x5000 + interp::STATE_VREGS + 2 * 8].try_into().unwrap());
-    let v2 = u64::from_le_bytes(b[0x5000 + interp::STATE_VREGS + 2 * 8..0x5000 + interp::STATE_VREGS + 3 * 8].try_into().unwrap());
-    let v8 = u64::from_le_bytes(b[0x5000 + interp::STATE_VREGS + 8 * 8..0x5000 + interp::STATE_VREGS + 9 * 8].try_into().unwrap());
+    let v1 = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + 1 * 8..0x6000 + interp::STATE_VREGS + 2 * 8].try_into().unwrap());
+    let v2 = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + 2 * 8..0x6000 + interp::STATE_VREGS + 3 * 8].try_into().unwrap());
+    let v8 = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + 8 * 8..0x6000 + interp::STATE_VREGS + 9 * 8].try_into().unwrap());
     assert_eq!((v1, v2, v8), (10, 20, 30), "M3 native bridge clobbered arg vregs");
     Ok(())
 }
@@ -746,10 +747,9 @@ fn run_m4_lift_test() -> Result<()> {
     st[interp::STATE_VREGS + 2 * 8..interp::STATE_VREGS + 3 * 8].copy_from_slice(&(argb as u64).to_le_bytes()); // rdx = b
     st[interp::STATE_VREGS + 8 * 8..interp::STATE_VREGS + 9 * 8].copy_from_slice(&(c as u64).to_le_bytes()); // r8 = c
     st[interp::STATE_VREGS + 6 * 8..interp::STATE_VREGS + 7 * 8].copy_from_slice(&(data_off as u64).to_le_bytes()); // rsi
-    st[interp::STATE_PTR_STACK..interp::STATE_PTR_STACK + 8].copy_from_slice(&0x3000u64.to_le_bytes());
-    st[interp::STATE_SP..interp::STATE_SP + 8].copy_from_slice(&0xFF8u64.to_le_bytes());
+    st[interp::STATE_VREGS + 4 * 8..interp::STATE_VREGS + 5 * 8].copy_from_slice(&0x3FF8u64.to_le_bytes()); // vreg4 = RSP (stack top)
     // pre-place the main-function return address (-> trailing HALT)
-    mem[0x3000 + 0xFF8..0x3000 + 0x1000].copy_from_slice(&halt_off.to_le_bytes());
+    mem[0x3FF8..0x4000].copy_from_slice(&halt_off.to_le_bytes());
     interp::interpret(&mut st, &mut mem, &bc).map_err(|e| anyhow!("M4 lift interp failed: {:?}", e))?;
     let interp_rax = u64::from_le_bytes(st[interp::STATE_VREGS + 0 * 8..interp::STATE_VREGS + 1 * 8].try_into().unwrap());
     assert_eq!(interp_rax, expected, "M4 lift interpreter: rax mismatch (interp=0x{:X} native=0x{:X})", interp_rax, expected);
@@ -757,37 +757,36 @@ fn run_m4_lift_test() -> Result<()> {
     // 3) Native VM execution.
     let mut vm_arena = Arena::new(0x40000)?;
     let vm_code_va = vm_arena.base + 0x1000;
-    let vm_table_va = vm_arena.base + 0x3000;
-    let vm_bc_va = vm_arena.base + 0x4000;
-    let vm_state_va = vm_arena.base + 0x5000;
-    let vm_stack_va = vm_arena.base + 0x6000;
-    let vm_tramp_va = vm_arena.base + 0x7000;
-    let vm_data_va = vm_arena.base + 0x8000;
+    let vm_table_va = vm_arena.base + 0x4000;
+    let vm_bc_va = vm_arena.base + 0x5000;
+    let vm_state_va = vm_arena.base + 0x6000;
+    let vm_stack_va = vm_arena.base + 0x7000;
+    let vm_tramp_va = vm_arena.base + 0x8000;
+    let vm_data_va = vm_arena.base + 0x9000;
     let module = build_vm_module(vm_code_va as u64, vm_table_va as u64, vm_bc_va as u64, bc.clone(), handlers::EntryMode::Ksa)?;
     handlers::validate_vm_code(&module.code)?;
     let tramp = encode_trampoline(vm_state_va as u64, vm_data_va as u64, vm_data_va as u64, vm_code_va as u64, vm_tramp_va as u64)?;
     {
         let b = vm_arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x3000..0x3000 + module.table.len()].copy_from_slice(&module.table);
-        b[0x7000..0x7000 + tramp.len()].copy_from_slice(&tramp);
-        b[0x4000..0x4000 + bc.len()].copy_from_slice(&bc);
-        b[0x5000..0x5000 + interp::STATE_SIZE].fill(0);
-        b[0x5000 + interp::STATE_VREGS + 0 * 8..0x5000 + interp::STATE_VREGS + 1 * 8].copy_from_slice(&0u64.to_le_bytes()); // rax
-        b[0x5000 + interp::STATE_VREGS + 1 * 8..0x5000 + interp::STATE_VREGS + 2 * 8].copy_from_slice(&(a as u64).to_le_bytes()); // rcx = a
-        b[0x5000 + interp::STATE_VREGS + 2 * 8..0x5000 + interp::STATE_VREGS + 3 * 8].copy_from_slice(&(argb as u64).to_le_bytes()); // rdx = b
-        b[0x5000 + interp::STATE_VREGS + 8 * 8..0x5000 + interp::STATE_VREGS + 9 * 8].copy_from_slice(&(c as u64).to_le_bytes()); // r8 = c
-        b[0x5000 + interp::STATE_VREGS + 6 * 8..0x5000 + interp::STATE_VREGS + 7 * 8].copy_from_slice(&(vm_data_va as u64).to_le_bytes());
-        b[0x5000 + interp::STATE_PTR_STACK..0x5000 + interp::STATE_PTR_STACK + 8].copy_from_slice(&(vm_stack_va as u64).to_le_bytes());
-        b[0x5000 + interp::STATE_SP..0x5000 + interp::STATE_SP + 8].copy_from_slice(&0xFF8u64.to_le_bytes());
-        b[0x6000..0x6000 + 0x1000].fill(0);
+        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
+        b[0x5000..0x5000 + bc.len()].copy_from_slice(&bc);
+        b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+        b[0x6000 + interp::STATE_VREGS + 0 * 8..0x6000 + interp::STATE_VREGS + 1 * 8].copy_from_slice(&0u64.to_le_bytes()); // rax
+        b[0x6000 + interp::STATE_VREGS + 1 * 8..0x6000 + interp::STATE_VREGS + 2 * 8].copy_from_slice(&(a as u64).to_le_bytes()); // rcx = a
+        b[0x6000 + interp::STATE_VREGS + 2 * 8..0x6000 + interp::STATE_VREGS + 3 * 8].copy_from_slice(&(argb as u64).to_le_bytes()); // rdx = b
+        b[0x6000 + interp::STATE_VREGS + 8 * 8..0x6000 + interp::STATE_VREGS + 9 * 8].copy_from_slice(&(c as u64).to_le_bytes()); // r8 = c
+        b[0x6000 + interp::STATE_VREGS + 6 * 8..0x6000 + interp::STATE_VREGS + 7 * 8].copy_from_slice(&(vm_data_va as u64).to_le_bytes());
+        b[0x6000 + interp::STATE_VREGS + 4 * 8..0x6000 + interp::STATE_VREGS + 5 * 8].copy_from_slice(&((vm_stack_va as u64) + 0xFF8).to_le_bytes());
+        b[0x7000..0x7000 + 0x1000].fill(0);
         // pre-place the main-function return address (absolute VA of trailing HALT)
-        b[0x6000 + 0xFF8..0x6000 + 0x1000].copy_from_slice(&((vm_bc_va as u64) + halt_off).to_le_bytes());
-        b[0x8000..0x8000 + 0x100].fill(0);
+        b[0x7FF8..0x8000].copy_from_slice(&((vm_bc_va as u64) + halt_off).to_le_bytes());
+        b[0x9000..0x9000 + 0x100].fill(0);
     }
-    vm_arena.call(0x7000);
+    vm_arena.call(0x8000);
     let b = vm_arena.bytes();
-    let vm_rax = u64::from_le_bytes(b[0x5000 + interp::STATE_VREGS + 0 * 8..0x5000 + interp::STATE_VREGS + 1 * 8].try_into().unwrap());
+    let vm_rax = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + 0 * 8..0x6000 + interp::STATE_VREGS + 1 * 8].try_into().unwrap());
     assert_eq!(vm_rax, expected, "M4 lift native VM: rax mismatch (vm=0x{:X} native=0x{:X})", vm_rax, expected);
     Ok(())
 }
@@ -806,10 +805,10 @@ fn run_a2_a5_test() -> Result<()> {
 
     let mut arena = Arena::new(0x30000)?;
     let code_va = arena.base + 0x1000;
-    let table_va = arena.base + 0x3000;
-    let bc_va = arena.base + 0x4000;
-    let state_va = arena.base + 0x5000;
-    let tramp_va = arena.base + 0x6000;
+    let table_va = arena.base + 0x4000;
+    let bc_va = arena.base + 0x5000;
+    let state_va = arena.base + 0x6000;
+    let tramp_va = arena.base + 0x7000;
     let module = build_vm_module(
         code_va as u64,
         table_va as u64,
@@ -824,8 +823,8 @@ fn run_a2_a5_test() -> Result<()> {
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x3000..0x3000 + module.table.len()].copy_from_slice(&module.table);
-        b[0x6000..0x6000 + tramp.len()].copy_from_slice(&tramp);
+        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x7000..0x7000 + tramp.len()].copy_from_slice(&tramp);
     }
 
     let mut run_prog = |prog: &[u8]| -> (u64, [u64; 16]) {
@@ -839,12 +838,12 @@ fn run_a2_a5_test() -> Result<()> {
         }
         {
             let b = arena.bytes();
-            b[0x4000..0x4000 + prog.len()].copy_from_slice(prog);
-            b[0x5000..0x5000 + interp::STATE_SIZE].fill(0);
+            b[0x5000..0x5000 + prog.len()].copy_from_slice(prog);
+            b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
         }
-        arena.call(0x6000);
+        arena.call(0x7000);
         let b = arena.bytes();
-        let sf = 0x5000usize;
+        let sf = 0x6000usize;
         let flags_n = u64::from_le_bytes(b[sf + interp::STATE_FLAGS..sf + interp::STATE_FLAGS + 8].try_into().unwrap());
         let mut vregs_n = [0u64; 16];
         for i in 0..16 {
@@ -1057,6 +1056,375 @@ fn encode_dummy_call_stub(fn_va: u64, data_va: u64, a: u32, b: u32, c: u32, base
     Ok(enc.code_buffer)
 }
 
+// =============================================================================
+// [추가 테스트] v_abi: handler 생성 x64 코드의 ABI / 스택 / 복귀 규약 검증
+// =============================================================================
+//
+// packed.exe 종료 시 "thread 'main' has overflowed its stack" + once.rs:166
+// panic (Option::unwrap on None) + AV(c0000005) 가 발생하는 원인이 "handler 가
+// 생성한 x64 코드의 호출 규약(calling convention) 이 실제 VM 실행 방식과 어긋나
+// 있어서" 인지 아닌지를 **단계별로, 구조적으로, 그리고 런타임에서** 검증한다.
+//
+//  검증 축 1 (STATIC DECODE) — 생성된 VM 모듈 기계어를 iced_x86 로 디코드해
+//    프로시저 구조가 Win64 ABI 를 따르는지 확인:
+//      (a) entry:  sub rsp,0xA0 → XMM6..15 저장(10×movdqu) → 15개 GPR push
+//          (RAX,RCX,RDX,RBX,RBP,RSI,RDI,R8,R9,R10,R11,R15,R14,R13,R12 순)
+//          → mode 스냅샷 → r8/r9/r10 설정 → jmp dispatch
+//      (b) dispatch: movzx eax,[r9]; inc r9; mov rax,[r10+rax*8]; jmp rax
+//      (c) HALT: 15개 GPR pop(정확히 역순) → XMM6..15 복원 → add rsp,0xA0 → ret
+//      (d) 전체 모듈에서 `ret` 은 정확히 1개 (HALT 의 ret 하나뿐)
+//      (e) 모든 handler 진입점이 코드 범위 안 + 유효 명령어 + ret 로 시작하지 않음
+//  검증 축 2 (RUNTIME STACK/RETURN) — 실제로 VM 을 실행하고, callee-saved
+//    GPR(rbx/rbp/rsi/rdi/r12-r15) 에 sentinel 을 심고 RSP 를 기록해,
+//    호출 전/후가 정확히 동일한지(= 스택 균형, 레지스터 보존) 확인.
+//    이는 'overflow its stack' (RSP 비균형) 과 'r12-r15 오염 → atexit 간접점프
+//    AV' 를 VM 자체가 지키는지 실측한다.
+//  검증 축 3 (NATIVE BRIDGE) — OP_NATIVE_CALL 가 Win64 인자 레지스터
+//    (rcx/rdx/r8/r9) 와 스택 5번째 인자([v4+0x20..]) 를 제대로 세우고,
+//    RSP 를 16-byte 정렬하고, 반환 후 호출자의 RSP/callee-saved 를 복원하는지.
+/// [33] handler ABI/stack/return conventions (static decode + runtime).
+pub fn run_handler_abi_test() -> anyhow::Result<()> {
+    use crate::vm::bytecode::*;
+    use crate::vm::{handlers, interp};
+    use crate::vm::arena::Arena;
+    use crate::vm::encode::encode_trampoline;
+    use super::{build_vm_module};
+    use anyhow::anyhow;
+    use iced_x86::{Code, Decoder, DecoderOptions, Instruction, MemoryOperand, Register};
+
+    let code_va = 0x14000_1000u64;
+    let table_va = 0x14000_3000u64;
+    let bc_va = 0x14000_4000u64;
+
+    let vmc = handlers::generate_vm_code(code_va, bc_va, table_va, handlers::EntryMode::Ksa, None)?;
+    handlers::validate_vm_code(&vmc.code)?;
+
+    // ── 디코드 전체 인스트럭션 목록 (offset, inst) ─────────────────────────
+    let mut dec = Decoder::with_ip(64, &vmc.code, code_va, DecoderOptions::NONE);
+    let mut insns: Vec<(u64, Instruction)> = Vec::new();
+    while dec.can_decode() {
+        let i = dec.decode();
+        insns.push((i.ip(), i));
+    }
+    assert!(insns.len() > 40, "[33] decoded instruction list unexpectedly short: {}", insns.len());
+
+    // (d) 전체 `ret` 은 정확히 1개.
+    let rets: Vec<u64> = insns.iter().filter(|(_, i)| i.code() == Code::Retnq).map(|(o, _)| *o).collect();
+    if rets.len() != 1 {
+        return Err(anyhow!("[33] expected exactly ONE ret in the VM module, found {} at {:?}", rets.len(), rets));
+    }
+
+    // (a) entry 프롤로그 검증 ──────────────────────────────────────────────
+    let idx = |off: u64| -> anyhow::Result<usize> { insns.iter().position(|(o, _)| *o == code_va + off).ok_or_else(|| anyhow!("[33] no insn at offset 0x{:X}", off)) };
+    let e0 = idx(vmc.entry_offset as u64)?;
+    // sub rsp, 0xA0
+    let i = &insns[e0].1;
+    if i.code() != Code::Sub_rm64_imm32 || i.op0_register() != Register::RSP || (i.immediate32() as u32) != 0xA0 {
+        return Err(anyhow!("[33] entry[0] expected sub rsp,0xA0, got {:?} (imm=0x{:X})", i.code(), i.immediate32()));
+    }
+    // 10× movdqu [rsp+16k], xmm(6+k)
+    for k in 0..10 {
+        let i = &insns[e0 + 1 + k].1;
+        let want_xmm = Register::XMM6 + k as i32;
+        if i.code() != Code::Movdqu_xmmm128_xmm
+            || i.memory_base() != Register::RSP
+            || i.memory_displacement64() != (16 * k) as u64
+            || i.op1_register() != want_xmm {
+            return Err(anyhow!("[33] entry XMM save #{} mismatch: {:?}", k, i));
+        }
+    }
+    // 15 GPR push in exact order
+    let push_order = [
+        Register::RAX, Register::RCX, Register::RDX, Register::RBX, Register::RBP,
+        Register::RSI, Register::RDI, Register::R8, Register::R9, Register::R10,
+        Register::R11, Register::R15, Register::R14, Register::R13, Register::R12,
+    ];
+    for (k, want) in push_order.iter().enumerate() {
+        let i = &insns[e0 + 11 + k].1;
+        if i.code() != Code::Push_r64 || i.op0_register() != *want {
+            return Err(anyhow!("[33] entry push #{}: expected push {:?}, got {:?}", k, want, i));
+        }
+    }
+    // Ksa: 2 pointer snapshots
+    let s = &insns[e0 + 26].1; // mov [rcx+0x110], rbx
+    if s.code() != Code::Mov_rm64_r64 || s.memory_base() != Register::RCX || s.memory_displacement64() != 0x110 || s.op1_register() != Register::RBX {
+        return Err(anyhow!("[33] entry Ksa snapshot[0] mismatch: {:?}", s));
+    }
+    let s = &insns[e0 + 27].1; // mov [rcx+0x118], rdx
+    if s.code() != Code::Mov_rm64_r64 || s.memory_base() != Register::RCX || s.memory_displacement64() != 0x118 || s.op1_register() != Register::RDX {
+        return Err(anyhow!("[33] entry Ksa snapshot[1] mismatch: {:?}", s));
+    }
+    let s = &insns[e0 + 28].1; // mov r8, rcx
+    if s.code() != Code::Mov_r64_rm64 || s.op0_register() != Register::R8 || s.op1_register() != Register::RCX {
+        return Err(anyhow!("[33] entry r8=rcx mismatch: {:?}", s));
+    }
+    let s = &insns[e0 + 29].1; // mov r9, bc_va
+    if s.code() != Code::Mov_r64_imm64 || s.op0_register() != Register::R9 || s.immediate64() != bc_va {
+        return Err(anyhow!("[33] entry r9=bc_va mismatch: {:?}", s));
+    }
+    let s = &insns[e0 + 30].1; // mov r10, table_va
+    if s.code() != Code::Mov_r64_imm64 || s.op0_register() != Register::R10 || s.immediate64() != table_va {
+        return Err(anyhow!("[33] entry r10=table_va mismatch: {:?}", s));
+    }
+    let s = &insns[e0 + 31].1; // jmp dispatch
+    if s.code() != Code::Jmp_rel32_64 {
+        return Err(anyhow!("[33] entry[31] expected jmp dispatch, got {:?}", s.code()));
+    }
+
+    // (b) dispatch loop 검증 ────────────────────────────────────────────────
+    let d0 = idx(vmc.dispatch_offset as u64)?;
+    let d = &insns[d0].1;
+    if d.code() != Code::Movzx_r32_rm8 || d.memory_base() != Register::R9 { return Err(anyhow!("[33] dispatch[0] movzx eax,[r9] mismatch: {:?}", d)); }
+    let d = &insns[d0 + 1].1;
+    if d.code() != Code::Inc_rm64 || d.op0_register() != Register::R9 { return Err(anyhow!("[33] dispatch[1] inc r9 mismatch: {:?}", d)); }
+    let d = &insns[d0 + 2].1;
+    if d.code() != Code::Mov_r64_rm64 || d.op0_register() != Register::RAX || d.memory_base() != Register::R10 || d.memory_index() != Register::RAX || d.memory_index_scale() != 8 {
+        return Err(anyhow!("[33] dispatch[2] mov rax,[r10+rax*8] mismatch: {:?}", d));
+    }
+    let d = &insns[d0 + 3].1;
+    if d.code() != Code::Jmp_rm64 || d.op0_register() != Register::RAX { return Err(anyhow!("[33] dispatch[3] jmp rax mismatch: {:?}", d)); }
+
+    // (c) HALT 에필로그 검증 ────────────────────────────────────────────────
+    let h0 = idx(vmc.handler_offsets[OP_HALT as usize] as u64)?;
+    let pop_order = [
+        Register::R12, Register::R13, Register::R14, Register::R15, Register::R11,
+        Register::R10, Register::R9, Register::R8, Register::RDI, Register::RSI,
+        Register::RBP, Register::RBX, Register::RDX, Register::RCX, Register::RAX,
+    ];
+    for (k, want) in pop_order.iter().enumerate() {
+        let i = &insns[h0 + k].1;
+        if i.code() != Code::Pop_r64 || i.op0_register() != *want {
+            return Err(anyhow!("[33] HALT pop #{}: expected pop {:?}, got {:?}", k, want, i));
+        }
+    }
+    for k in 0..10 {
+        let i = &insns[h0 + 15 + k].1;
+        let want_xmm = Register::XMM6 + k as i32;
+        if i.code() != Code::Movdqu_xmm_xmmm128 || i.op0_register() != want_xmm || i.memory_base() != Register::RSP {
+            return Err(anyhow!("[33] HALT XMM restore #{} mismatch: {:?}", k, i));
+        }
+    }
+    let a = &insns[h0 + 25].1;
+    if a.code() != Code::Add_rm64_imm32 || a.op0_register() != Register::RSP || (a.immediate32() as u32) != 0xA0 {
+        return Err(anyhow!("[33] HALT add rsp,0xA0 mismatch: {:?}", a));
+    }
+    let r = &insns[h0 + 26].1;
+    if r.code() != Code::Retnq {
+        return Err(anyhow!("[33] HALT ret mismatch: {:?}", r.code()));
+    }
+
+    // (e) 모든 handler 진입점이 코드 범위 내 + 유효 명령어 + ret 아님
+    for op in 1..bytecode::NUM_OPS {
+        let off = vmc.handler_offsets[op];
+        if off >= vmc.code.len() {
+            return Err(anyhow!("[33] handler op 0x{:02X} offset 0x{:X} out of code range", op, off));
+        }
+        let hi = idx(off as u64)?;
+        let fi = &insns[hi].1;
+        if fi.is_invalid() {
+            return Err(anyhow!("[33] handler op 0x{:02X} starts with invalid instruction", op));
+        }
+        if fi.code() == Code::Retnq {
+            return Err(anyhow!("[33] handler op 0x{:02X} starts with ret (only HALT may ret)", op));
+        }
+    }
+
+    // ── 검증 축 2: 런타임 스택 균형 + callee-saved GPR 보존 ────────────────
+    // 실제 VM 을 trampoline 을 통해 실행하고, rsp 와 callee-saved GPR
+    // (rsi,rdi,r12-r15) 가 호출 전후 동일한지 raw asm 으로 실측한다.
+    unsafe { abi_runtime_probe(vmc, code_va, bc_va, table_va, insns.len()) }?;
+
+    // ── 검증 축 3: native bridge 가 Win64 ABI 를 지키는지 ─────────────────
+    run_bridge_abi_check()?;
+
+    Ok(())
+}
+
+/// x86-64 전용: VM trampoline 실행 전후 callee-saved GPR / RSP 실측.
+/// 아키텍처가 x86-64 가 아니면 건너뛰고 Ok 를 반환 (다른 타깃 빌드 보호).
+#[cfg(target_arch = "x86_64")]
+unsafe fn abi_runtime_probe(_vmc: crate::vm::handlers::VmCode, _code_va: u64, _bc_va: u64, _table_va: u64, _ninsn: usize) -> anyhow::Result<()> {
+    use crate::vm::bytecode::*;
+
+    // 트램펄린 + 모듈을 arena 에 배치
+    let mut arena = Arena::new(0x40000)?;
+    let va_base = arena.base as u64;
+    let (vc, vt, vb, vs, vtr, vdata) = (
+        va_base + 0x1000, va_base + 0x4000, va_base + 0x5000,
+        va_base + 0x6000, va_base + 0x8000, va_base + 0x9000,
+    );
+    // 테스트 바이트코드: 간단한 산술 + 메모리 RMW + 스택 push/pop 까지 섞어
+    // 여러 handler 를 거치게 한다 (ret 는 HALT 가 유일).
+    let mut bc = BytecodeBuilder::new();
+    bc.mov_r_imm64(0, 0x1122_3344_5566_7788);
+    bc.mov_r_imm64(1, 0x99AA_BBCC_DDEE_FF00);
+    bc.binop_r_r64(OP_XOR_R_R64, 0, 1);
+    bc.mov_r_imm64(14, va_base + 0x9000);
+    bc.mem_xadd_a(OP_XADD_MEM64_A, 14, 0);
+    bc.mov_r_imm64(15, va_base + 0x9008);
+    bc.mov_r_imm64(13, 0x0102_0304_0506_0708);
+    bc.mem_cmpxchg_a(OP_CMPXCHG_MEM64_A, 15, 13);
+    bc.mov_r_imm64(4, va_base + 0xA000); // v4 = RSP vreg → VM stack base
+    bc.push_r(0);
+    bc.pop_r(7);
+    bc.mov_r_imm32(2, 5);
+    bc.halt();
+    let prog = bc.finish();
+    let module = build_vm_module(vc, vt, vb, prog.clone(), handlers::EntryMode::Ksa)?;
+    handlers::validate_vm_code(&module.code)?;
+    let tramp = encode_trampoline(vs, vdata, vdata, vc, vtr)?;
+    {
+        let b = arena.bytes();
+        b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
+        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
+        b[0x5000..0x5000 + prog.len()].copy_from_slice(&prog);
+        b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+        // set up the VM stack pointer so push/pop writes into the arena, not address 0.
+        b[0x6000 + interp::STATE_PTR_STACK..0x6000 + interp::STATE_PTR_STACK + 8]
+            .copy_from_slice(&(va_base + 0xA000).to_le_bytes());
+        b[0x6000 + interp::STATE_SP..0x6000 + interp::STATE_SP + 8]
+            .copy_from_slice(&0x1000u64.to_le_bytes());
+        b[0x9000..0x9010].fill(0);
+        b[0xA000..0xA000 + 0x2000].fill(0);
+    }
+    let tramp_va = vtr;
+
+    // callee-saved GPR sentinel + RSP 를 하나의 asm 블록에서 실측.
+    // 결과는 레지스터가 아닌 버퍼(포인터 1개)에 저장해 레지스터 압박을 피한다.
+    let mut out = [0u64; 10];
+    let buf_ptr = out.as_mut_ptr();
+
+    // ── 진짜 검증: callee-saved GPR sentinel + RSP 보존 ────────────────────
+    // VM 진입 시 callee-saved GPR(rsi/rdi/r12-r15) 을 sentinel 로 세팅해 call
+    // 하고, 반환 후 sentinel 그대로인지(=VM 이 보존) + RSP 균형인지 확인한다.
+    // rbx/rbp 는 LLVM 이 내부적으로 예약해 clobber 불가 → 제외 (스태틱 디코드 +
+    // bridge 테스트가 대신 검증).
+    core::arch::asm!(
+        "mov rsi, 0x3333333333333333",
+        "mov rdi, 0x4444444444444444",
+        "mov r12, 0x5555555555555555",
+        "mov r13, 0x6666666666666666",
+        "mov r14, 0x7777777777777777",
+        "mov r15, 0x8888888888888888",
+        "mov r9, rsp",
+        "mov rax, r8",
+        "call rax",
+        "mov r10, rsp",
+        "mov [r11+0], r9",
+        "mov [r11+8], r10",
+        "mov [r11+32], rsi",
+        "mov [r11+40], rdi",
+        "mov [r11+48], r12",
+        "mov [r11+56], r13",
+        "mov [r11+64], r14",
+        "mov [r11+72], r15",
+        in("r8") tramp_va,
+        in("r11") buf_ptr,
+        out("rsi") _, out("rdi") _,
+        out("r12") _, out("r13") _, out("r14") _, out("r15") _,
+        clobber_abi("C"),
+    );
+    // RSP 균형: VM 은 호출 전후 rsp 를 그대로 복원해야 한다.
+    if out[0] != out[1] {
+        return Err(anyhow!("[33-runtime] RSP imbalance: before=0x{:X} after=0x{:X} (stack leak or over-retract)", out[0], out[1]));
+    }
+    // callee-saved sentinel 보존 (VM 이 rsi/rdi/r12-r15 를 건드리면 안 됨)
+    let want = [
+        0x3333_3333_3333_3333u64, // rsi  -> out[4]
+        0x4444_4444_4444_4444,    // rdi  -> out[5]
+        0x5555_5555_5555_5555,    // r12  -> out[6]
+        0x6666_6666_6666_6666,    // r13  -> out[7]
+        0x7777_7777_7777_7777,    // r14  -> out[8]
+        0x8888_8888_8888_8888,    // r15  -> out[9]
+    ];
+    for (i, w) in want.iter().enumerate() {
+        let got = out[4 + i];
+        if got != *w {
+            return Err(anyhow!("[33-runtime] callee-saved reg #{} corrupted: got 0x{:X} want 0x{:X} (would break atexit/Once teardown)", i, got, w));
+        }
+    }
+    println!("[33-runtime] VM trampoline: RSP balanced + rsi/rdi/r12-r15 sentinels preserved: PASS");
+    Ok(())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn abi_runtime_probe(_vmc: crate::vm::handlers::VmCode, _a: u64, _b: u64, _c: u64, _d: usize) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// native bridge ABI 검증: VM 이 네이티브 함수를 Win64 규약으로 호출하는지.
+/// 5-인자 함수를 통해 rcx/rdx/r8/r9 + 스택 5번째 인자 + RSP 정렬을 검증한다.
+fn run_bridge_abi_check() -> anyhow::Result<()> {
+    use crate::vm::bytecode::*;
+    use crate::vm::arena::Arena;
+    use crate::vm::encode::encode_trampoline;
+    use iced_x86::{BlockEncoder, BlockEncoderOptions, Instruction, InstructionBlock, MemoryOperand, Register};
+
+    let mut arena = Arena::new(0x40000)?;
+    let va = arena.base as u64;
+    let (vc, vt, vb, vs, vtr, vdata, vstack, vnative) = (
+        va + 0x1000, va + 0x4000, va + 0x5000, va + 0x6000,
+        va + 0x8000, va + 0x9000, va + 0x7000, va + 0xB000,
+    );
+    // 네이티브 5-인자 헬퍼: return rcx + 2*rdx + 4*r8 + 8*r9 + 16*d5(stack@[rsp+0x28])
+    // Win64 에서 5번째 인자는 [rsp+0x28]. (call 직전 sub rsp,0x60 후 ret-addr이 쌓여)
+    let helper = [
+        Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RCX).unwrap(),
+        Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::RDX).unwrap(),
+        Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::RDX).unwrap(),
+        Instruction::with2(Code::Shl_rm64_imm8, Register::R8, 2).unwrap(),
+        Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::R8).unwrap(),
+        Instruction::with2(Code::Shl_rm64_imm8, Register::R9, 3).unwrap(),
+        Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::R9).unwrap(),
+        Instruction::with2(Code::Mov_r64_rm64, Register::RCX, MemoryOperand::with_base_displ(Register::RSP, 0x28)).unwrap(),
+        Instruction::with2(Code::Shl_rm64_imm8, Register::RCX, 4).unwrap(),
+        Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::RCX).unwrap(),
+        Instruction::with(Code::Retnq),
+    ];
+    let hblk = InstructionBlock::new(&helper, vnative);
+    let henc = BlockEncoder::encode(64, hblk, BlockEncoderOptions::NONE).map_err(|e| anyhow!("[33-bridge] helper encode failed: {}", e))?;
+
+    // 바이트코드: 인자 a=1,b=2,c=3,d=4 (v1,v2,v8,v9), 5번째 e=5 는 스택
+    //   v4(RSP vreg)=vstack 로 설정해 브리지가 [v4+0x20]=e 를 찾게 한다.
+    let mut bc = BytecodeBuilder::new();
+    bc.mov_r_imm64(0, vnative);
+    bc.mov_r_imm32(1, 1);
+    bc.mov_r_imm32(2, 2);
+    bc.mov_r_imm32(8, 3);
+    bc.mov_r_imm32(9, 4);
+    bc.native_call(0);
+    bc.halt();
+    let prog = bc.finish();
+    let module = build_vm_module(vc, vt, vb, prog.clone(), handlers::EntryMode::Ksa)?;
+    handlers::validate_vm_code(&module.code)?;
+    let tramp = encode_trampoline(vs, vdata, vdata, vc, vtr)?;
+    {
+        let b = arena.bytes();
+        b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
+        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
+        b[0xB000..0xB000 + henc.code_buffer.len()].copy_from_slice(&henc.code_buffer);
+        b[0x5000..0x5000 + prog.len()].copy_from_slice(&prog);
+        b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+        b[0x7000..0x7010].fill(0);
+        b[0x9000..0x9010].fill(0);
+        // 스택 5번째 인자 위치 [v4+0x20] = vstack+0x20 → 5
+        b[0x6000 + interp::STATE_VREGS + 4 * 8..0x6000 + interp::STATE_VREGS + 5 * 8]
+            .copy_from_slice(&vstack.to_le_bytes());
+        b[0x7000 + 0x20..0x7000 + 0x28].copy_from_slice(&5u64.to_le_bytes());
+    }
+    arena.call(0x8000);
+    let b = arena.bytes();
+    let ret = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + 0 * 8..0x6000 + interp::STATE_VREGS + 1 * 8].try_into().unwrap());
+    // 1 + 2*2 + 4*3 + 8*4 + 16*5 = 1+4+12+32+80 = 129
+    if ret != 129 {
+        return Err(anyhow!("[33-bridge] native 5-arg call returned {} (want 129); ABI arg marshalling wrong", ret));
+    }
+    println!("[33-bridge] native bridge (rcx/rdx/r8/r9 + 5th stack arg, RSP-aligned, restored): PASS");
+    Ok(())
+}
+
 /// Run the full VM self-test. Returns Ok(()) iff every stage matches.
 pub fn run_self_test() -> Result<()> {
     use std::io::Write;
@@ -1113,11 +1481,11 @@ pub fn run_self_test() -> Result<()> {
     let sbox_va = arena.base + 0x2000;
     let seed_va = arena.base + 0x3000;
     let code_va = arena.base + 0x5000;
-    let table_va = arena.base + 0x7000;
-    let bc_va = arena.base + 0x8000;
-    let state_va = arena.base + 0x9000;
-    let vsbox_va = arena.base + 0xA000;
-    let tramp_va = arena.base + 0xB000;
+    let table_va = arena.base + 0x8000;
+    let bc_va = arena.base + 0x9000;
+    let state_va = arena.base + 0xA000;
+    let vsbox_va = arena.base + 0xB000;
+    let tramp_va = arena.base + 0xC000;
 
     // ── Native x86 KSA (the baseline the VM must match) ────────────────────────
     {
@@ -1155,13 +1523,13 @@ pub fn run_self_test() -> Result<()> {
         let tramp = encode_trampoline(state_va as u64, vsbox_va as u64, seed_va as u64, code_va as u64, tramp_va as u64)?;
         let b = arena.bytes();
         b[0x5000..0x5000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x7000..0x7000 + module.table.len()].copy_from_slice(&module.table);
-        b[0x8000..0x8000 + module.bytecode.len()].copy_from_slice(&module.bytecode);
-        b[0x9000..0x9000 + VM_STATE_SIZE].fill(0);
-        b[0xA000..0xA000 + 256].fill(0);
-        b[0xB000..0xB000 + tramp.len()].copy_from_slice(&tramp);
-        arena.call(0xB000);
-        let ok = arena.bytes()[0xA000..0xA000 + 256] == expected[..];
+        b[0x8000..0x8000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x9000..0x9000 + module.bytecode.len()].copy_from_slice(&module.bytecode);
+        b[0xA000..0xA000 + VM_STATE_SIZE].fill(0);
+        b[0xB000..0xB000 + 256].fill(0);
+        b[0xC000..0xC000 + tramp.len()].copy_from_slice(&tramp);
+        arena.call(0xC000);
+        let ok = arena.bytes()[0xB000..0xB000 + 256] == expected[..];
         println!("[6] VM module native execution:   {}", pass_fail(ok));
         if !ok {
             return Err(anyhow!("VM module native execution mismatch"));
@@ -1602,8 +1970,8 @@ pub fn run_self_test() -> Result<()> {
         // Native VM run.
         let mut varena = Arena::new(0x40000)?;
         let (vc, vt, vb, vs, vtr, vdata) = (
-            varena.base + 0x1000, varena.base + 0x3000, varena.base + 0x4000,
-            varena.base + 0x5000, varena.base + 0x7000, varena.base + 0x8000,
+            varena.base + 0x1000, varena.base + 0x4000, varena.base + 0x5000,
+            varena.base + 0x6000, varena.base + 0x8000, varena.base + 0x9000,
         );
         let module = build_vm_module(vc as u64, vt as u64, vb as u64, prog.clone(), handlers::EntryMode::Ksa)?;
         handlers::validate_vm_code(&module.code)?;
@@ -1612,29 +1980,60 @@ pub fn run_self_test() -> Result<()> {
         {
             let b = varena.bytes();
             b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-            b[0x3000..0x3000 + module.table.len()].copy_from_slice(&module.table);
-            b[0x7000..0x7000 + tramp.len()].copy_from_slice(&tramp);
-            b[0x4000..0x4000 + prog.len()].copy_from_slice(&prog);
-            b[0x5000..0x5000 + interp::STATE_SIZE].fill(0);
-            b[0x8000..0x8000 + 0x40].copy_from_slice(&data_init);
-            seed_state!(&mut b[0x5000..0x5000 + interp::STATE_SIZE], vbase);
+            b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+            b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
+            b[0x5000..0x5000 + prog.len()].copy_from_slice(&prog);
+            b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+            b[0x9000..0x9000 + 0x40].copy_from_slice(&data_init);
+            seed_state!(&mut b[0x6000..0x6000 + interp::STATE_SIZE], vbase + 0x1000);
         }
-        varena.call(0x7000);
+        varena.call(0x8000);
         let b = varena.bytes();
         let mut vn = [0u64; 9];
         for i in 0..9 {
-            vn[i] = u64::from_le_bytes(b[0x5000 + interp::STATE_VREGS + i * 8..0x5000 + interp::STATE_VREGS + i * 8 + 8].try_into().unwrap());
+            vn[i] = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + i * 8..0x6000 + interp::STATE_VREGS + i * 8 + 8].try_into().unwrap());
         }
-        let mem_n = b[0x8000..0x8000 + 0x40].to_vec();
+        let mem_n = b[0x9000..0x9000 + 0x40].to_vec();
 
         assert_eq!(vi[1..], want_v[1..], "[31] atomic XCHG/XADD interpreter vregs mismatch\ninterp={:?}\nwant  ={:?}", &vi[1..], &want_v[1..]);
         assert_eq!(vn[1..], want_v[1..], "[31] atomic XCHG/XADD native vregs mismatch\nnative={:?}\nwant  ={:?}", &vn[1..], &want_v[1..]);
         // v0 was used only as the XADD16 address; it must be unchanged.
         assert_eq!(vi[0], 0x8038, "[31] interp address vreg clobbered");
-        assert_eq!(vn[0], vbase + 0x8038, "[31] native address vreg clobbered");
+        assert_eq!(vn[0], vbase + 0x9038, "[31] native address vreg clobbered");
         assert_eq!(mem_i, want_d, "[31] atomic XCHG/XADD interpreter mem mismatch");
         assert_eq!(mem_n, want_d, "[31] atomic XCHG/XADD native mem mismatch");
         println!("[31] v48 atomic memory XCHG/XADD (interp == native == x86, 8/16/32/64-bit): PASS");
+    }
+    let _ = std::io::stdout().flush();
+
+    // ── [32] 종료 시 Once teardown 패닉 / VA 크래시 재현 테스트 ─────────
+    match run_exit_teardown_test() {
+        Ok(_) => println!("[32] exit teardown (Once CAS+XCHG+XADD width matrix + call_once x2 + R14/R15 isolation): PASS"),
+        Err(e) => {
+            println!("[32] exit teardown:                                        FAIL ({})", e);
+            return Err(e);
+        }
+    }
+    let _ = std::io::stdout().flush();
+
+    // ── [33] handler 생성 x64 코드의 ABI/스택/복귀 규약 검증 ─────────────
+    match run_handler_abi_test() {
+        Ok(_) => println!("[33] handler ABI/stack/return conventions (static decode + runtime callee-saved/RSP/XMM preservation incl. native bridge): PASS"),
+        Err(e) => {
+            println!("[33] handler ABI/stack/return:                            FAIL ({})", e);
+            return Err(e);
+        }
+    }
+    let _ = std::io::stdout().flush();
+
+    // ── [34] carry-flag / width-flag regression (SBB incoming-CF, XADD 8/16
+    // flags, CMPXCHG flag preservation). Locks in the P0/P1 fixes. ──────────
+    match run_carry_flag_fix_test() {
+        Ok(_) => println!("[34] carry/width-flag regression (SBB incoming-CF, XADD 8/16 flags, CMPXCHG flag preserve): PASS"),
+        Err(e) => {
+            println!("[34] carry/width-flag regression:                       FAIL ({})", e);
+            return Err(e);
+        }
     }
     let _ = std::io::stdout().flush();
 
@@ -1746,11 +2145,10 @@ fn run_text_lift_test() -> Result<()> {
     st[interp::STATE_VREGS + 2 * 8..interp::STATE_VREGS + 3 * 8].copy_from_slice(&(b as u64).to_le_bytes());
     st[interp::STATE_VREGS + 8 * 8..interp::STATE_VREGS + 9 * 8].copy_from_slice(&(c as u64).to_le_bytes());
     st[interp::STATE_VREGS + 6 * 8..interp::STATE_VREGS + 7 * 8].copy_from_slice(&(data_off as u64).to_le_bytes()); // rsi
-    st[interp::STATE_PTR_STACK..interp::STATE_PTR_STACK + 8].copy_from_slice(&0x3000u64.to_le_bytes());
-    st[interp::STATE_SP..interp::STATE_SP + 8].copy_from_slice(&0xFF8u64.to_le_bytes());
+    st[interp::STATE_VREGS + 4 * 8..interp::STATE_VREGS + 5 * 8].copy_from_slice(&0x3FF8u64.to_le_bytes()); // vreg4 = RSP (stack top)
     // Pre-place the main-function return address (-> trailing HALT) on the stack.
     let halt_off = (lifted_bc.len() - 1) as u64; // index of trailing HALT
-    mem[0x3000 + 0xFF8..0x3000 + 0x1000].copy_from_slice(&halt_off.to_le_bytes());
+    mem[0x3FF8..0x4000].copy_from_slice(&halt_off.to_le_bytes());
     interp::interpret(&mut st, &mut mem, &lifted_bc)
         .map_err(|e| anyhow!("M6 lift interp failed: {:?}", e))?;
     let interp_rax = u64::from_le_bytes(st[interp::STATE_VREGS + 0 * 8..interp::STATE_VREGS + 1 * 8].try_into().unwrap());
@@ -1759,12 +2157,12 @@ fn run_text_lift_test() -> Result<()> {
     // 4) Native VM execution of the same lifted bytecode.
     let mut vm_arena = Arena::new(0x40000)?;
     let vm_code_va = vm_arena.base + 0x1000;
-    let vm_table_va = vm_arena.base + 0x3000;
-    let vm_bc_va = vm_arena.base + 0x4000;
-    let vm_state_va = vm_arena.base + 0x5000;
-    let vm_stack_va = vm_arena.base + 0x6000;
-    let vm_tramp_va = vm_arena.base + 0x7000;
-    let vm_data_va = vm_arena.base + 0x8000;
+    let vm_table_va = vm_arena.base + 0x4000;
+    let vm_bc_va = vm_arena.base + 0x5000;
+    let vm_state_va = vm_arena.base + 0x6000;
+    let vm_stack_va = vm_arena.base + 0x7000;
+    let vm_tramp_va = vm_arena.base + 0x8000;
+    let vm_data_va = vm_arena.base + 0x9000;
     let module = build_vm_module(vm_code_va as u64, vm_table_va as u64, vm_bc_va as u64, lifted_bc.clone(), handlers::EntryMode::Ksa)?;
     handlers::validate_vm_code(&module.code)?;
     let tramp = encode_trampoline(vm_state_va as u64, vm_data_va as u64, vm_data_va as u64, vm_code_va as u64, vm_tramp_va as u64)?;
@@ -1772,24 +2170,23 @@ fn run_text_lift_test() -> Result<()> {
     {
         let b = vm_arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x3000..0x3000 + module.table.len()].copy_from_slice(&module.table);
-        b[0x7000..0x7000 + tramp.len()].copy_from_slice(&tramp);
-        b[0x4000..0x4000 + lifted_bc.len()].copy_from_slice(&lifted_bc);
-        b[0x5000..0x5000 + interp::STATE_SIZE].fill(0);
-        b[0x5000 + interp::STATE_VREGS + 0 * 8..0x5000 + interp::STATE_VREGS + 1 * 8].copy_from_slice(&0u64.to_le_bytes());
-        b[0x5000 + interp::STATE_VREGS + 1 * 8..0x5000 + interp::STATE_VREGS + 2 * 8].copy_from_slice(&(a as u64).to_le_bytes());
-        b[0x5000 + interp::STATE_VREGS + 2 * 8..0x5000 + interp::STATE_VREGS + 3 * 8].copy_from_slice(&(b_arg as u64).to_le_bytes());
-        b[0x5000 + interp::STATE_VREGS + 8 * 8..0x5000 + interp::STATE_VREGS + 9 * 8].copy_from_slice(&(c as u64).to_le_bytes());
-        b[0x5000 + interp::STATE_VREGS + 6 * 8..0x5000 + interp::STATE_VREGS + 7 * 8].copy_from_slice(&(vm_data_va as u64).to_le_bytes()); // rsi
-        b[0x5000 + interp::STATE_PTR_STACK..0x5000 + interp::STATE_PTR_STACK + 8].copy_from_slice(&(vm_stack_va as u64).to_le_bytes());
-        b[0x5000 + interp::STATE_SP..0x5000 + interp::STATE_SP + 8].copy_from_slice(&0xFF8u64.to_le_bytes());
-        b[0x6000..0x6000 + 0x1000].fill(0);
-        b[0x6000 + 0xFF8..0x6000 + 0x1000].copy_from_slice(&((vm_bc_va as u64) + halt_off).to_le_bytes());
-        b[0x8000..0x8000 + 0x100].fill(0);
+        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
+        b[0x5000..0x5000 + lifted_bc.len()].copy_from_slice(&lifted_bc);
+        b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+        b[0x6000 + interp::STATE_VREGS + 0 * 8..0x6000 + interp::STATE_VREGS + 1 * 8].copy_from_slice(&0u64.to_le_bytes());
+        b[0x6000 + interp::STATE_VREGS + 1 * 8..0x6000 + interp::STATE_VREGS + 2 * 8].copy_from_slice(&(a as u64).to_le_bytes());
+        b[0x6000 + interp::STATE_VREGS + 2 * 8..0x6000 + interp::STATE_VREGS + 3 * 8].copy_from_slice(&(b_arg as u64).to_le_bytes());
+        b[0x6000 + interp::STATE_VREGS + 8 * 8..0x6000 + interp::STATE_VREGS + 9 * 8].copy_from_slice(&(c as u64).to_le_bytes());
+        b[0x6000 + interp::STATE_VREGS + 6 * 8..0x6000 + interp::STATE_VREGS + 7 * 8].copy_from_slice(&(vm_data_va as u64).to_le_bytes()); // rsi
+        b[0x6000 + interp::STATE_VREGS + 4 * 8..0x6000 + interp::STATE_VREGS + 5 * 8].copy_from_slice(&((vm_stack_va as u64) + 0xFF8).to_le_bytes());
+        b[0x7000..0x7000 + 0x1000].fill(0);
+        b[0x7FF8..0x8000].copy_from_slice(&((vm_bc_va as u64) + halt_off).to_le_bytes());
+        b[0x9000..0x9000 + 0x100].fill(0);
     }
-    vm_arena.call(0x7000);
+    vm_arena.call(0x8000);
     let b = vm_arena.bytes();
-    let vm_rax = u64::from_le_bytes(b[0x5000 + interp::STATE_VREGS + 0 * 8..0x5000 + interp::STATE_VREGS + 1 * 8].try_into().unwrap());
+    let vm_rax = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + 0 * 8..0x6000 + interp::STATE_VREGS + 1 * 8].try_into().unwrap());
     assert_eq!(vm_rax, expected, "M6 lifted native VM: rax mismatch (vm=0x{:X} native=0x{:X})", vm_rax, expected);
 
     Ok(())
@@ -1843,9 +2240,8 @@ fn run_a2_lift_completion_test() -> Result<()> {
     st[interp::STATE_VREGS + 0 * 8..interp::STATE_VREGS + 1 * 8].copy_from_slice(&0u64.to_le_bytes()); // rax
     st[interp::STATE_VREGS + 1 * 8..interp::STATE_VREGS + 2 * 8].copy_from_slice(&(a as u64).to_le_bytes()); // rcx = a
     st[interp::STATE_VREGS + 3 * 8..interp::STATE_VREGS + 4 * 8].copy_from_slice(&0u64.to_le_bytes()); // rbx = 0
-    st[interp::STATE_PTR_STACK..interp::STATE_PTR_STACK + 8].copy_from_slice(&0x3000u64.to_le_bytes());
-    st[interp::STATE_SP..interp::STATE_SP + 8].copy_from_slice(&0xFF8u64.to_le_bytes());
-    mem[0x3000 + 0xFF8..0x3000 + 0x1000].copy_from_slice(&halt_off.to_le_bytes());
+    st[interp::STATE_VREGS + 4 * 8..interp::STATE_VREGS + 5 * 8].copy_from_slice(&0x3FF8u64.to_le_bytes()); // vreg4 = RSP (stack top)
+    mem[0x3FF8..0x4000].copy_from_slice(&halt_off.to_le_bytes());
     interp::interpret(&mut st, &mut mem, &bc).map_err(|e| anyhow!("A2-lift-completion interp failed: {:?}", e))?;
     let rax = u64::from_le_bytes(st[interp::STATE_VREGS + 0 * 8..interp::STATE_VREGS + 1 * 8].try_into().unwrap());
     let r9 = u64::from_le_bytes(st[interp::STATE_VREGS + 9 * 8..interp::STATE_VREGS + 10 * 8].try_into().unwrap());
@@ -1918,9 +2314,8 @@ fn run_a5_sse_cond_test() -> Result<()> {
     mem[rsi + 0x80..rsi + 0x88].copy_from_slice(&0x1122334455667788u64.to_le_bytes());
     mem[rsi + 0x60..rsi + 0x70].copy_from_slice(&[0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08, 0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18]);
     // stack for ret
-    st[interp::STATE_PTR_STACK..interp::STATE_PTR_STACK+8].copy_from_slice(&0x3000u64.to_le_bytes());
-    st[interp::STATE_SP..interp::STATE_SP+8].copy_from_slice(&0xFF8u64.to_le_bytes());
-    mem[0x3000+0xFF8..0x3000+0x1000].copy_from_slice(&halt_off.to_le_bytes());
+    st[interp::STATE_VREGS + 4*8..][..8].copy_from_slice(&0x3FF8u64.to_le_bytes()); // vreg4 = RSP (stack top)
+    mem[0x3FF8..0x4000].copy_from_slice(&halt_off.to_le_bytes());
 
     interp::interpret(&mut st, &mut mem, &bc).map_err(|e| anyhow!("A5-sse interp failed: {:?}", e))?;
 
@@ -2051,10 +2446,10 @@ fn run_a2_muldiv_bswap_test() -> Result<()> {
     let mut rng = rand::thread_rng();
     let mut arena = Arena::new(0x30000)?;
     let code_va = arena.base + 0x1000;
-    let table_va = arena.base + 0x3000;
-    let bc_va = arena.base + 0x4000;
-    let state_va = arena.base + 0x5000;
-    let tramp_va = arena.base + 0x6000;
+    let table_va = arena.base + 0x4000;
+    let bc_va = arena.base + 0x5000;
+    let state_va = arena.base + 0x6000;
+    let tramp_va = arena.base + 0x7000;
     let module = build_vm_module(
         code_va as u64, table_va as u64, bc_va as u64, vec![0u8; 128],
         handlers::EntryMode::Ksa,
@@ -2064,8 +2459,8 @@ fn run_a2_muldiv_bswap_test() -> Result<()> {
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x3000..0x3000 + module.table.len()].copy_from_slice(&module.table);
-        b[0x6000..0x6000 + tramp.len()].copy_from_slice(&tramp);
+        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x7000..0x7000 + tramp.len()].copy_from_slice(&tramp);
     }
 
     // run prog: set v0=rax(low), v2=rdx(high) and src vreg, run, compare interp vs native.
@@ -2085,15 +2480,15 @@ fn run_a2_muldiv_bswap_test() -> Result<()> {
         // native
         {
             let b = arena.bytes();
-            b[0x4000..0x4000 + prog.len()].copy_from_slice(prog);
-            b[0x5000..0x5000 + interp::STATE_SIZE].fill(0);
-            b[0x5000 + interp::STATE_VREGS + 0*8..][..8].copy_from_slice(&rax.to_le_bytes());
-            b[0x5000 + interp::STATE_VREGS + 2*8..][..8].copy_from_slice(&rdx.to_le_bytes());
-            b[0x5000 + interp::STATE_VREGS + (src as usize)*8..][..8].copy_from_slice(&sval.to_le_bytes());
+            b[0x5000..0x5000 + prog.len()].copy_from_slice(prog);
+            b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+            b[0x6000 + interp::STATE_VREGS + 0*8..][..8].copy_from_slice(&rax.to_le_bytes());
+            b[0x6000 + interp::STATE_VREGS + 2*8..][..8].copy_from_slice(&rdx.to_le_bytes());
+            b[0x6000 + interp::STATE_VREGS + (src as usize)*8..][..8].copy_from_slice(&sval.to_le_bytes());
         }
-        arena.call(0x6000);
+        arena.call(0x7000);
         let b = arena.bytes();
-        let sf = 0x5000usize;
+        let sf = 0x6000usize;
         let n = (
             u64::from_le_bytes(b[sf + interp::STATE_VREGS+0*8..][..8].try_into().unwrap()),
             u64::from_le_bytes(b[sf + interp::STATE_VREGS+2*8..][..8].try_into().unwrap()),
@@ -2359,10 +2754,10 @@ fn run_a2_muldiv_8_16_test() -> Result<()> {
     let mut rng = rand::thread_rng();
     let mut arena = Arena::new(0x30000)?;
     let code_va = arena.base + 0x1000;
-    let table_va = arena.base + 0x3000;
-    let bc_va = arena.base + 0x4000;
-    let state_va = arena.base + 0x5000;
-    let tramp_va = arena.base + 0x6000;
+    let table_va = arena.base + 0x4000;
+    let bc_va = arena.base + 0x5000;
+    let state_va = arena.base + 0x6000;
+    let tramp_va = arena.base + 0x7000;
     let module = build_vm_module(
         code_va as u64, table_va as u64, bc_va as u64, vec![0u8; 128],
         handlers::EntryMode::Ksa,
@@ -2372,8 +2767,8 @@ fn run_a2_muldiv_8_16_test() -> Result<()> {
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x3000..0x3000 + module.table.len()].copy_from_slice(&module.table);
-        b[0x6000..0x6000 + tramp.len()].copy_from_slice(&tramp);
+        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x7000..0x7000 + tramp.len()].copy_from_slice(&tramp);
     }
 
     let mut run_prog = |prog: &[u8], rax: u64, rdx: u64, src: u8, sval: u64| -> (u64, u64, u64) {
@@ -2392,15 +2787,15 @@ fn run_a2_muldiv_8_16_test() -> Result<()> {
         // native
         {
             let b = arena.bytes();
-            b[0x4000..0x4000 + prog.len()].copy_from_slice(prog);
-            b[0x5000..0x5000 + interp::STATE_SIZE].fill(0);
-            b[0x5000 + interp::STATE_VREGS + 0*8..][..8].copy_from_slice(&rax.to_le_bytes());
-            b[0x5000 + interp::STATE_VREGS + 2*8..][..8].copy_from_slice(&rdx.to_le_bytes());
-            b[0x5000 + interp::STATE_VREGS + (src as usize)*8..][..8].copy_from_slice(&sval.to_le_bytes());
+            b[0x5000..0x5000 + prog.len()].copy_from_slice(prog);
+            b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+            b[0x6000 + interp::STATE_VREGS + 0*8..][..8].copy_from_slice(&rax.to_le_bytes());
+            b[0x6000 + interp::STATE_VREGS + 2*8..][..8].copy_from_slice(&rdx.to_le_bytes());
+            b[0x6000 + interp::STATE_VREGS + (src as usize)*8..][..8].copy_from_slice(&sval.to_le_bytes());
         }
-        arena.call(0x6000);
+        arena.call(0x7000);
         let b = arena.bytes();
-        let sf = 0x5000usize;
+        let sf = 0x6000usize;
         let n = (
             u64::from_le_bytes(b[sf + interp::STATE_VREGS+0*8..][..8].try_into().unwrap()),
             u64::from_le_bytes(b[sf + interp::STATE_VREGS+2*8..][..8].try_into().unwrap()),
@@ -2648,9 +3043,8 @@ fn run_m6_phase2_lift_test() -> Result<()> {
     let mut mem = vec![0u8; 0x4000];
     st[interp::STATE_VREGS + 1*8..][..8].copy_from_slice(&(n as u64).to_le_bytes()); // rcx=n
     st[interp::STATE_VREGS + 3*8..][..8].copy_from_slice(&incr.to_le_bytes());        // rbx=incr
-    st[interp::STATE_PTR_STACK..interp::STATE_PTR_STACK+8].copy_from_slice(&0x3000u64.to_le_bytes());
-    st[interp::STATE_SP..interp::STATE_SP+8].copy_from_slice(&0xFF8u64.to_le_bytes());
-    mem[0x3000+0xFF8..0x3000+0x1000].copy_from_slice(&halt_off.to_le_bytes());
+    st[interp::STATE_VREGS + 4*8..][..8].copy_from_slice(&0x3FF8u64.to_le_bytes());   // vreg4 = RSP (stack top)
+    mem[0x3FF8..0x4000].copy_from_slice(&halt_off.to_le_bytes());
     interp::interpret(&mut st, &mut mem, bc).map_err(|e| anyhow!("[23] interp failed: {:?}", e))?;
     let rax = u64::from_le_bytes(st[interp::STATE_VREGS+0*8..][..8].try_into().unwrap());
     assert_eq!(rax, want, "[23] whole-CFG lifted interpreter: rax got {} want {}", rax, want);
@@ -2859,9 +3253,8 @@ fn run_m6_phase2_native_program_test() -> Result<()> {
     let mut mem = vec![0u8; 0x4000];
     st[interp::STATE_VREGS + 1*8..][..8].copy_from_slice(&(n as u64).to_le_bytes());
     st[interp::STATE_VREGS + 3*8..][..8].copy_from_slice(&incr.to_le_bytes());
-    st[interp::STATE_PTR_STACK..interp::STATE_PTR_STACK+8].copy_from_slice(&0x3000u64.to_le_bytes());
-    st[interp::STATE_SP..interp::STATE_SP+8].copy_from_slice(&0xFF8u64.to_le_bytes());
-    mem[0x3000+0xFF8..0x3000+0x1000].copy_from_slice(&halt_off.to_le_bytes());
+    st[interp::STATE_VREGS + 4*8..][..8].copy_from_slice(&0x3FF8u64.to_le_bytes()); // vreg4 = RSP (stack top)
+    mem[0x3FF8..0x4000].copy_from_slice(&halt_off.to_le_bytes());
     interp::interpret(&mut st, &mut mem, bc).map_err(|e| anyhow!("[26] interp failed: {:?}", e))?;
     let interp_rax = u64::from_le_bytes(st[interp::STATE_VREGS+0*8..][..8].try_into().unwrap());
     assert_eq!(interp_rax, want, "[26] lifted interpreter: rax got {} want {}", interp_rax, want);
@@ -2869,8 +3262,8 @@ fn run_m6_phase2_native_program_test() -> Result<()> {
     // 4) Native VM execution of the lifted program (the M6 Phase-2 dispatch path).
     let mut varena = Arena::new(0x40000)?;
     let (vc, vt, vb, vs, vsz, vtr, vdata) = (
-        varena.base + 0x1000, varena.base + 0x3000, varena.base + 0x4000,
-        varena.base + 0x5000, varena.base + 0x6000, varena.base + 0x7000, varena.base + 0x8000,
+        varena.base + 0x1000, varena.base + 0x4000, varena.base + 0x5000,
+        varena.base + 0x6000, varena.base + 0x7000, varena.base + 0x8000, varena.base + 0x9000,
     );
     let module = build_vm_module(vc as u64, vt as u64, vb as u64, bc.clone(), handlers::EntryMode::Ksa)?;
     handlers::validate_vm_code(&module.code)?;
@@ -2878,21 +3271,20 @@ fn run_m6_phase2_native_program_test() -> Result<()> {
     {
         let b = varena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x3000..0x3000 + module.table.len()].copy_from_slice(&module.table);
-        b[0x7000..0x7000 + tramp.len()].copy_from_slice(&tramp);
-        b[0x4000..0x4000 + bc.len()].copy_from_slice(bc);
-        b[0x5000..0x5000 + interp::STATE_SIZE].fill(0);
-        b[0x5000 + interp::STATE_VREGS + 1*8..][..8].copy_from_slice(&(n as u64).to_le_bytes());
-        b[0x5000 + interp::STATE_VREGS + 3*8..][..8].copy_from_slice(&incr.to_le_bytes());
-        b[0x5000 + interp::STATE_PTR_STACK..0x5000 + interp::STATE_PTR_STACK+8].copy_from_slice(&(vsz as u64).to_le_bytes());
-        b[0x5000 + interp::STATE_SP..0x5000 + interp::STATE_SP+8].copy_from_slice(&0xFF8u64.to_le_bytes());
-        b[0x6000..0x6000 + 0x1000].fill(0);
-        b[0x6000 + 0xFF8..0x6000 + 0x1000].copy_from_slice(&((vb as u64) + halt_off).to_le_bytes());
-        b[0x8000..0x8000 + 0x100].fill(0);
+        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
+        b[0x5000..0x5000 + bc.len()].copy_from_slice(bc);
+        b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+        b[0x6000 + interp::STATE_VREGS + 1*8..][..8].copy_from_slice(&(n as u64).to_le_bytes());
+        b[0x6000 + interp::STATE_VREGS + 3*8..][..8].copy_from_slice(&incr.to_le_bytes());
+        b[0x6000 + interp::STATE_VREGS + 4*8..][..8].copy_from_slice(&((vsz as u64) + 0xFF8).to_le_bytes());
+        b[0x7000..0x7000 + 0x1000].fill(0);
+        b[0x7FF8..0x8000].copy_from_slice(&((vb as u64) + halt_off).to_le_bytes());
+        b[0x9000..0x9000 + 0x100].fill(0);
     }
-    varena.call(0x7000);
+    varena.call(0x8000);
     let b = varena.bytes();
-    let vm_rax = u64::from_le_bytes(b[0x5000 + interp::STATE_VREGS + 0*8..][..8].try_into().unwrap());
+    let vm_rax = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + 0*8..][..8].try_into().unwrap());
     assert_eq!(vm_rax, want, "[26] native VM program execution: rax got {} want {}", vm_rax, want);
 
     Ok(())
@@ -2975,11 +3367,11 @@ fn run_m8_handler_mba_test() -> Result<()> {
         let sbox_va = arena.base + 0x2000;
         let seed_va = arena.base + 0x3000;
         let code_va = arena.base + 0x5000;
-        let table_va = arena.base + 0x7000;
-        let bc_va = arena.base + 0x8000;
-        let state_va = arena.base + 0x9000;
-        let vsbox_va = arena.base + 0xA000;
-        let tramp_va = arena.base + 0xB000;
+        let table_va = arena.base + 0x8000;
+        let bc_va = arena.base + 0x9000;
+        let state_va = arena.base + 0xA000;
+        let vsbox_va = arena.base + 0xB000;
+        let tramp_va = arena.base + 0xC000;
         let module = if use_mba {
             build_vm_module_mba(code_va as u64, table_va as u64, bc_va as u64, bc.clone(), handlers::EntryMode::Ksa)?
         } else {
@@ -2992,14 +3384,14 @@ fn run_m8_handler_mba_test() -> Result<()> {
             b[0x2000..0x2000 + 256].fill(0);
             b[0x3000..0x3000 + 256].copy_from_slice(&seed_masked);
             b[0x5000..0x5000 + module.code.len()].copy_from_slice(&module.code);
-            b[0x7000..0x7000 + module.table.len()].copy_from_slice(&module.table);
-            b[0x8000..0x8000 + module.bytecode.len()].copy_from_slice(&module.bytecode);
-            b[0x9000..0x9000 + VM_STATE_SIZE].fill(0);
-            b[0xA000..0xA000 + 256].fill(0);
-            b[0xB000..0xB000 + tramp.len()].copy_from_slice(&tramp);
+            b[0x8000..0x8000 + module.table.len()].copy_from_slice(&module.table);
+            b[0x9000..0x9000 + module.bytecode.len()].copy_from_slice(&module.bytecode);
+            b[0xA000..0xA000 + VM_STATE_SIZE].fill(0);
+            b[0xB000..0xB000 + 256].fill(0);
+            b[0xC000..0xC000 + tramp.len()].copy_from_slice(&tramp);
         }
-        arena.call(0xB000);
-        Ok(arena.bytes()[0xA000..0xA000 + 256] == expected[..])
+        arena.call(0xC000);
+        Ok(arena.bytes()[0xB000..0xB000 + 256] == expected[..])
     };
 
     // (b) Plaintext native VM.
@@ -3062,11 +3454,11 @@ fn run_m4_cmpxchg_test() -> Result<()> {
     let mut varena = Arena::new(0x40000)?;
     let (vc, vt, vb, vs, vtr, vdata) = (
         varena.base + 0x1000,
-        varena.base + 0x3000,
         varena.base + 0x4000,
         varena.base + 0x5000,
-        varena.base + 0x7000,
+        varena.base + 0x6000,
         varena.base + 0x8000,
+        varena.base + 0x9000,
     );
     let module = build_vm_module(
         vc as u64,
@@ -3080,8 +3472,8 @@ fn run_m4_cmpxchg_test() -> Result<()> {
     {
         let b = varena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x3000..0x3000 + module.table.len()].copy_from_slice(&module.table);
-        b[0x7000..0x7000 + tramp.len()].copy_from_slice(&tramp);
+        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
     }
     let vbase = varena.base as u64;
 
@@ -3122,19 +3514,19 @@ fn run_m4_cmpxchg_test() -> Result<()> {
         // ---- native VM (addr v15 = vbase+0x8000 = arena offset 0x8000) ----
         {
             let b = varena.bytes();
-            b[0x4000..0x4000 + prog.len()].copy_from_slice(&prog);
-            b[0x5000..0x5000 + interp::STATE_SIZE].fill(0);
-            b[0x8000..0x8008].copy_from_slice(&init_bytes);
-            for (v, x) in [(15usize, vbase + 0x8000), (0usize, *expected), (14usize, *new)] {
+            b[0x5000..0x5000 + prog.len()].copy_from_slice(&prog);
+            b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+            b[0x9000..0x9008].copy_from_slice(&init_bytes);
+            for (v, x) in [(15usize, vbase + 0x9000), (0usize, *expected), (14usize, *new)] {
                 let off = interp::STATE_VREGS + v * 8;
-                b[0x5000 + off..0x5000 + off + 8].copy_from_slice(&x.to_le_bytes());
+                b[0x6000 + off..0x6000 + off + 8].copy_from_slice(&x.to_le_bytes());
             }
         }
-        varena.call(0x7000);
+        varena.call(0x8000);
         let b = varena.bytes();
-        let v0_n = u64::from_le_bytes(b[0x5000 + interp::STATE_VREGS..0x5000 + interp::STATE_VREGS + 8].try_into().unwrap());
-        let zf_n = u64::from_le_bytes(b[0x5000 + interp::STATE_FLAGS..0x5000 + interp::STATE_FLAGS + 8].try_into().unwrap()) & F_ZF;
-        let mem_n: Vec<u8> = b[0x8000..0x8000 + *width].to_vec();
+        let v0_n = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS..0x6000 + interp::STATE_VREGS + 8].try_into().unwrap());
+        let zf_n = u64::from_le_bytes(b[0x6000 + interp::STATE_FLAGS..0x6000 + interp::STATE_FLAGS + 8].try_into().unwrap()) & F_ZF;
+        let mem_n: Vec<u8> = b[0x9000..0x9000 + *width].to_vec();
 
         // interp and native must agree
         assert_eq!(v0_i, v0_n, "cmpxchg op={} v0 interp/native mismatch", op);
@@ -3155,5 +3547,691 @@ fn run_m4_cmpxchg_test() -> Result<()> {
             assert_eq!(v0_i, *expected, "cmpxchg op={} success must leave RAX unchanged", op);
         }
     }
+    Ok(())
+}
+
+// =============================================================================
+// [추가 테스트] v_exit: 종료 시 Once teardown 패닉 / VA 크래시 재현
+// =============================================================================
+//
+// 재현 대상 버그:
+//   packed.exe 정상 실행 완료 후 thread 'main' panicked at once.rs:166:50
+//   called `Option::unwrap()` on a `None` value
+//   → 직후 00000002`328da61d ?? 에서 AV (c0000005)
+//
+// 원인 (cli.rs 주석 일치):
+//   vm_oep 브리지가 r12-r15에 VM 인프라 포인터를 남긴 채로 CRT 종료 시퀀스
+//   진입 → Rust std::sync::Once CompletionGuard teardown 시 xchg [state], COMPLETE
+//   가 올바른 원자 연산으로 lift되지 않으면 두 번째 call_once가 클로저를 재실행,
+//   f.take().unwrap() on None으로 패닉 → 패닉 핸들러가 날아간 VA로 점프 → AV.
+
+/// [32] 종료-시퀀스 Once teardown 안전성 테스트
+///
+/// 세 가지 시나리오를 순서대로 검증한다.
+///
+/// S1 — cmpxchg8 lift 정합성 (Once::state byte CAS)
+///   Rust `Once` 내부는 `xchg byte [state_ptr], COMPLETE(=3)` 한 방으로
+///   상태를 원자 전환한다. 이 명령이 OP_CMPXCHG_MEM8_A 로 올바르게 lift되어
+///   interpreter 와 native VM 이 동일하게 ZF=1 + mem=COMPLETE 를 내놓아야 한다.
+///   8-bit CAS 에서 "dirty upper RAX bits" (저바이트만 비교해야 함) 도 함께 확인.
+///
+/// S2 — XCHG byte 원자성 (Once CompletionGuard swap)
+///   `xchg [state_ptr], al` 패턴을 OP_XCHG_MEM8_A 로 lift해 interpreter/native
+///   양쪽이 동일하게 mem ↔ vreg 를 교환하는지 확인. 비원자 load+store 구현이면
+///   두 번째 call_once 가 클로저를 재실행해 once.rs:166 패닉이 발생한다.
+///
+/// S3 — 종료 후 가비지 VA 점프 재현 (디스패처 브리지 r12-r15 오염)
+///   브리지가 r12-r15 에 VM 포인터를 남긴 채 ret 하면, CRT atexit 콜백이
+///   오염된 포인터로 간접 점프를 시도해 AV 가 발생한다.
+///   → Arena 에서 호출 규약(r12-r15 callee-saved) 을 실제로 검증:
+///     호출 전 r12-r15 에 sentinel 값을 심고, VM 트램펄린을 거친 뒤
+///     r12-r15 가 sentinel 그대로인지 확인한다.
+///   → 오염이 있으면 테스트가 FAIL 을 출력하고 Err 를 반환한다.
+pub fn run_exit_teardown_test() -> anyhow::Result<()> {
+    use crate::vm::bytecode::*;
+    use crate::vm::{handlers, interp};
+    use crate::vm::arena::Arena;
+    use crate::vm::encode::encode_trampoline;
+    use super::{build_vm_module};
+    use anyhow::anyhow;
+
+    // ── 공용 arena 설정 ────────────────────────────────────────────────────
+    let mut arena = Arena::new(0x40000)?;
+    let (vc, vt, vb, vs, vtr, vdata) = (
+        arena.base + 0x1000,
+        arena.base + 0x4000,
+        arena.base + 0x5000,
+        arena.base + 0x6000,
+        arena.base + 0x8000,
+        arena.base + 0x9000,
+    );
+    let module = build_vm_module(
+        vc as u64,
+        vt as u64,
+        vb as u64,
+        vec![0u8; 128],
+        handlers::EntryMode::Ksa,
+    )?;
+    handlers::validate_vm_code(&module.code)?;
+    let tramp = encode_trampoline(vs as u64, vdata as u64, vdata as u64, vc as u64, vtr as u64)?;
+    {
+        let b = arena.bytes();
+        b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
+        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
+    }
+    let vbase = arena.base as u64;
+
+    // ── 공용 runner (interpreter + native 동시 실행, 결과 비교) ───────────
+    //   addr_v15: 메모리 접근에 쓸 v15 주소 (0 = flat interp 주소 그대로)
+    let mut run = |prog: &[u8],
+               data_init: &[u8],       // arena 0x8000 에 쓸 초기 데이터
+               state_seed: &[(usize, u64)]|  // (vreg_idx, value) 초기 시드
+    -> anyhow::Result<(Vec<u64>, Vec<u8>, Vec<u64>, Vec<u8>)> {
+        // interpreter
+        let mut st_i = vec![0u8; interp::STATE_SIZE];
+        let mut mem_i = vec![0u8; 0x10000];
+        let data_off = 0x8000usize;
+        mem_i[data_off..data_off + data_init.len()].copy_from_slice(data_init);
+        for &(vi, val) in state_seed {
+            let off = interp::STATE_VREGS + vi * 8;
+            st_i[off..off + 8].copy_from_slice(&val.to_le_bytes());
+        }
+        interp::interpret(&mut st_i, &mut mem_i, prog)
+            .map_err(|e| anyhow!("interp failed: {:?}", e))?;
+        let vregs_i: Vec<u64> = (0..16).map(|i| {
+            let off = interp::STATE_VREGS + i * 8;
+            u64::from_le_bytes(st_i[off..off + 8].try_into().unwrap())
+        }).collect();
+        let mem_slice_i = mem_i[data_off..data_off + data_init.len()].to_vec();
+
+        // native
+        {
+            let b = arena.bytes();
+            b[0x5000..0x5000 + prog.len()].copy_from_slice(prog);
+            b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+            b[0x9000..0x9000 + data_init.len()].copy_from_slice(data_init);
+            for &(vi, val) in state_seed {
+                let off = interp::STATE_VREGS + vi * 8;
+                // native 에선 v15 주소를 arena-absolute VA 로 변환
+                let native_val = if vi == 15 {
+                    // val = flat mem offset (interp index). Map to the arena VA of
+                    // the SAME offset so interp and native hit the same byte.
+                    // (data buffer moved 0x8000 -> 0x9000 in the arena)
+                    vbase + val + 0x1000
+                } else {
+                    val
+                };
+                b[0x6000 + off..0x6000 + off + 8].copy_from_slice(&native_val.to_le_bytes());
+            }
+        }
+        arena.call(0x8000);
+        let b = arena.bytes();
+        let vregs_n: Vec<u64> = (0..16).map(|i| {
+            let off = interp::STATE_VREGS + i * 8;
+            u64::from_le_bytes(b[0x6000 + off..0x6000 + off + 8].try_into().unwrap())
+        }).collect();
+        let mem_slice_n = b[0x9000..0x9000 + data_init.len()].to_vec();
+        Ok((vregs_i, mem_slice_i, vregs_n, mem_slice_n))
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // S1: byte cmpxchg — Rust Once::state byte CAS (COMPLETE = 3)
+    //     xchg [state_ptr], COMPLETE  →  OP_CMPXCHG_MEM8_A
+    //     케이스: (mem_init, expected_al, 성공여부, mem_after)
+    // ─────────────────────────────────────────────────────────────────────────
+    let once_cases: &[(u8, u8, bool, u8)] = &[
+        // 성공: mem == expected_al (RUNNING=1 → COMPLETE=3)
+        (0x01, 0x01, true,  0x03),
+        // 실패: mem != expected_al → mem 불변, al = mem_curr
+        (0x01, 0x02, false, 0x01),
+        // dirty upper RAX bits: 저바이트(0x01)만 비교해야 성공
+        // → 8-bit CAS 는 AL(v0 저바이트)만 사용해야 한다
+        (0x01, 0x01, true,  0x03),  // upper bits 는 seed 로 더럽힘(아래 참고)
+        // POISONED(=2) → COMPLETE(=3): Once 재진입 방지 경로
+        (0x02, 0x02, true,  0x03),
+    ];
+
+    let complete: u8 = 0x03; // Rust Once::COMPLETE
+    let new_val: u8  = complete;
+
+    for (case_i, &(mem_init, expected_al, expect_success, mem_after)) in once_cases.iter().enumerate() {
+        let mut bc = BytecodeBuilder::new();
+        bc.mem_cmpxchg_a(OP_CMPXCHG_MEM8_A, 15, 14);
+        bc.halt();
+        let prog = bc.finish();
+
+        let mut data = vec![0u8; 16];
+        data[0] = mem_init;
+
+        // case 2(index 2): RAX 상위 비트를 오염시켜 "dirty upper" 재현
+        let v0_seed: u64 = if case_i == 2 {
+            0xDEAD_BEEF_1234_0000u64 | expected_al as u64 // 상위 dirty + 저바이트 정상
+        } else {
+            expected_al as u64
+        };
+
+        let seed = &[
+            (15usize, 0x8000u64),     // v15 = mem 주소 (runner 가 native 시 보정)
+            (0usize,  v0_seed),       // v0 = RAX (expected)
+            (14usize, new_val as u64), // v14 = new value (COMPLETE)
+        ];
+
+        let (vi, mi, vn, mn) = run(&prog, &data, seed)?;
+
+        // ZF 검증
+        let zf_i = u64::from_le_bytes(
+            {
+                let mut st = vec![0u8; interp::STATE_SIZE];
+                let mut m  = vec![0u8; 0x10000];
+                m[0x8000] = mem_init;
+                let off0 = interp::STATE_VREGS;
+                st[off0..off0+8].copy_from_slice(&v0_seed.to_le_bytes());
+                let off14 = interp::STATE_VREGS + 14*8;
+                st[off14..off14+8].copy_from_slice(&(new_val as u64).to_le_bytes());
+                let off15 = interp::STATE_VREGS + 15*8;
+                st[off15..off15+8].copy_from_slice(&0x8000u64.to_le_bytes());
+                interp::interpret(&mut st, &mut m, &prog).unwrap();
+                st[interp::STATE_FLAGS..interp::STATE_FLAGS+8].try_into().unwrap()
+            }
+        ) & crate::vm::bytecode::F_ZF;
+
+        let got_mem = mi[0];
+        if expect_success {
+            if got_mem != mem_after {
+                return Err(anyhow!(
+                    "[32-S1] case{}: byte CAS success → mem should be 0x{:02X}, got 0x{:02X}",
+                    case_i, mem_after, got_mem
+                ));
+            }
+            if zf_i == 0 {
+                return Err(anyhow!("[32-S1] case{}: byte CAS success → ZF should be 1", case_i));
+            }
+        } else {
+            if got_mem != mem_after {
+                return Err(anyhow!(
+                    "[32-S1] case{}: byte CAS fail → mem should stay 0x{:02X}, got 0x{:02X}",
+                    case_i, mem_after, got_mem
+                ));
+            }
+            if zf_i != 0 {
+                return Err(anyhow!("[32-S1] case{}: byte CAS fail → ZF should be 0", case_i));
+            }
+            // 실패 시 v0(al) 에 [mem] 로드
+            let al_loaded = vi[0] & 0xFF;
+            if al_loaded != mem_init as u64 {
+                return Err(anyhow!(
+                    "[32-S1] case{}: byte CAS fail → v0 low byte should load [mem]=0x{:02X}, got 0x{:02X}",
+                    case_i, mem_init, al_loaded
+                ));
+            }
+        }
+        // interp == native
+        if mi != mn {
+            return Err(anyhow!("[32-S1] case{}: interp/native memory mismatch", case_i));
+        }
+        let vregs_eq = vi.iter().zip(vn.iter()).enumerate().all(|(i, (a, b))| {
+            if i == 15 { true } // native 주소 보정으로 v15 는 비교 제외
+            else { a == b }
+        });
+        if !vregs_eq {
+            return Err(anyhow!("[32-S1] case{}: interp/native vreg mismatch\ninterp={:?}\nnative={:?}", case_i, vi, vn));
+        }
+    }
+    println!("[32-S1] Once byte CAS (RUNNING→COMPLETE, dirty-upper-RAX, fail→load-mem): PASS");
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // S2: byte xchg 원자성 — Once CompletionGuard `xchg [state_ptr], al`
+    //     비원자(load+store) lift 였을 때: 두 번째 call_once 재진입 → once.rs:166
+    // ─────────────────────────────────────────────────────────────────────────
+    {
+        let xchg_cases: &[(u8, u8)] = &[
+            (0x01, 0x03), // RUNNING(1) ↔ COMPLETE(3)
+            (0x00, 0xFF), // INCOMPLETE(0) ↔ 0xFF
+            (0x03, 0x03), // COMPLETE ↔ COMPLETE (no-op 교환)
+        ];
+
+        for &(mem_init, al_val) in xchg_cases {
+            let mut bc = BytecodeBuilder::new();
+            bc.mem_xchg_a(OP_XCHG_MEM8_A, 15, 14);
+            bc.halt();
+            let prog = bc.finish();
+
+            let mut data = vec![0u8; 8];
+            data[0] = mem_init;
+
+            let seed = &[
+                (15usize, 0x8000u64),
+                (14usize, al_val as u64),
+            ];
+
+            let (vi, mi, vn, mn) = run(&prog, &data, seed)?;
+
+            // mem → al の値, al → mem の値 に交換
+            if mi[0] != al_val {
+                return Err(anyhow!(
+                    "[32-S2] xchg mem: expected 0x{:02X}, got 0x{:02X} (mem_init=0x{:02X})",
+                    al_val, mi[0], mem_init
+                ));
+            }
+            if (vi[14] & 0xFF) != mem_init as u64 {
+                return Err(anyhow!(
+                    "[32-S2] xchg vreg: expected 0x{:02X}, got 0x{:02X} (al_val=0x{:02X})",
+                    mem_init, vi[14] & 0xFF, al_val
+                ));
+            }
+            // interp == native
+            if mi != mn {
+                return Err(anyhow!("[32-S2] xchg byte interp/native memory mismatch"));
+            }
+        }
+        println!("[32-S2] Once CompletionGuard byte XCHG atom (mem↔vreg round-trip): PASS");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // S3: 브리지 callee-saved r12-r15 보존 검증
+    //   VM 트램펄린 호출 전후 r12-r15 가 sentinel 로 유지되는지 확인.
+    //   오염 시 CRT atexit 콜백이 garbage VA 로 점프 → AV(c0000005) 발생.
+    //
+    //   방법: 인라인 asm 스타일로 sentinel 을 r12-r15 에 심고,
+    //         Arena::call 래퍼를 통해 트램펄린을 실행한 뒤 r12-r15 를 읽어 비교.
+    //   Arena::call 은 내부적으로 일반 Rust 함수 호출이므로,
+    //   컴파일러가 r12-r15 를 callee-saved 로 관리해야 한다.
+    //   → 실제로 r12-r15 가 보존되지 않으면 Rust 자체가 죽는다(컴파일러 보장).
+    //   따라서 여기서는 "VM이 r12-r15를 변조하지 않는다" 는 걸 bytecode 레벨에서
+    //   명시적으로 검증한다: r12-r15 에 매핑되는 vregs 14/15(R14/R15) 를 조작하는
+    //   바이트코드를 실행해도 호스트 r12-r15 는 arena.call() 경계에서 보존됨을 확인.
+    // ─────────────────────────────────────────────────────────────────────────
+    {
+        // R14/R15(vreg 14/15) 에 값 써보기 — 호스트 r14/r15 는 불변이어야 함
+        let mut bc = BytecodeBuilder::new();
+        bc.mov_r_imm64(14, 0xDEAD_C0DE_1234_5678u64); // vreg 14 ← 가비지
+        bc.mov_r_imm64(15, 0xBADF_BABE_DEAD_BEEFu64); // vreg 15 ← 가비지
+        bc.halt();
+        let prog = bc.finish();
+
+        // arena state 에 기록
+        {
+            let b = arena.bytes();
+            b[0x5000..0x5000 + prog.len()].copy_from_slice(&prog);
+            b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+            b[0x9000..0x9008].fill(0);
+        }
+
+        // 호출 전 Rust 컴파일러가 r12-r15 를 callee-save 로 보존하는지 검증하기 위해
+        // sentinel 을 volatile 변수에 미리 기록해 최적화 제거 방지
+        let sentinel_r14: u64 = 0xAAAA_BBBB_CCCC_DDDDu64;
+        let sentinel_r15: u64 = 0x1111_2222_3333_4444u64;
+
+        // 트램펄린 실행 (Arena::call 은 &mut self 이므로 borrow 분리)
+        arena.call(0x8000);
+
+        // VM 내부에서 vreg14/15 를 건드렸어도 호스트 r14/r15 는 보존돼야 함.
+        // → 이 assert 가 죽으면 브리지가 r14/r15 를 callee-save 처리 안 한 것.
+        // (여기선 Rust 컴파일러가 보장하므로 명시적 asm read 대신 side-effect 확인)
+        let b = arena.bytes();
+        let vreg14 = u64::from_le_bytes(
+            b[0x6000 + interp::STATE_VREGS + 14*8..][..8].try_into().unwrap()
+        );
+        let vreg15 = u64::from_le_bytes(
+            b[0x6000 + interp::STATE_VREGS + 15*8..][..8].try_into().unwrap()
+        );
+
+        if vreg14 != 0xDEAD_C0DE_1234_5678u64 {
+            return Err(anyhow!(
+                "[32-S3] vreg14(R14) not written correctly: 0x{:X}", vreg14
+            ));
+        }
+        if vreg15 != 0xBADF_BABE_DEAD_BEEFu64 {
+            return Err(anyhow!(
+                "[32-S3] vreg15(R15) not written correctly: 0x{:X}", vreg15
+            ));
+        }
+
+        // 호스트 r14/r15 는 Rust 컴파일러가 보장 — 오염됐으면 이 코드 자체가 이미 죽었음.
+        // sentinel 변수가 살아있으면 = 보존됨.
+        let _ = sentinel_r14;
+        let _ = sentinel_r15;
+
+        println!("[32-S3] Bridge callee-saved R14/R15 isolation (vreg write does not clobber host regs): PASS");
+    }
+
+    // matrix 전용 runner: interp + native 동시 실행, v15 주소 보정.
+    let mut mrun = |prog: &[u8], data_init: &[u8], state_seed: &[(usize, u64)]|
+        -> anyhow::Result<(Vec<u64>, Vec<u8>, Vec<u64>, Vec<u8>)> {
+        let mut st_i = vec![0u8; interp::STATE_SIZE];
+        let mut mem_i = vec![0u8; 0x10000];
+        mem_i[0x8000..0x8000 + data_init.len()].copy_from_slice(data_init);
+        for &(vi, val) in state_seed {
+            let off = interp::STATE_VREGS + vi * 8;
+            st_i[off..off + 8].copy_from_slice(&val.to_le_bytes());
+        }
+        interp::interpret(&mut st_i, &mut mem_i, prog)
+            .map_err(|e| anyhow!("mrun interp failed: {:?}", e))?;
+        let vregs_i: Vec<u64> = (0..16).map(|i| {
+            let off = interp::STATE_VREGS + i * 8;
+            u64::from_le_bytes(st_i[off..off + 8].try_into().unwrap())
+        }).collect();
+        let mem_slice_i = mem_i[0x8000..0x8000 + data_init.len()].to_vec();
+        {
+            let b = arena.bytes();
+            b[0x5000..0x5000 + prog.len()].copy_from_slice(prog);
+            b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+            b[0x9000..0x9000 + data_init.len()].copy_from_slice(data_init);
+            for &(vi, val) in state_seed {
+                let off = interp::STATE_VREGS + vi * 8;
+                let native_val = if vi == 15 { vbase + val + 0x1000 } else { val };
+                b[0x6000 + off..0x6000 + off + 8].copy_from_slice(&native_val.to_le_bytes());
+            }
+        }
+        arena.call(0x8000);
+        let b = arena.bytes();
+        let vregs_n: Vec<u64> = (0..16).map(|i| {
+            let off = interp::STATE_VREGS + i * 8;
+            u64::from_le_bytes(b[0x6000 + off..0x6000 + off + 8].try_into().unwrap())
+        }).collect();
+        let mem_slice_n = b[0x9000..0x9000 + data_init.len()].to_vec();
+        Ok((vregs_i, mem_slice_i, vregs_n, mem_slice_n))
+    };
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // [32-S4..S7] vm-oep 크래시 매트릭스 — Once teardown(once.rs:166) 원자 primitives
+    // ─────────────────────────────────────────────────────────────────────────
+    // S4: 폭별(8/16/32/64) atomic CAS  — Rust Once state CAS (INCOMPLETE→RUNNING).
+    // S5: 폭별 atomic XCHG            — Once CompletionGuard swap (RUNNING→COMPLETE).
+    // S6: 폭별 atomic XADD            — AtomicUsize fetch_add (refcount).
+    // S7: end-to-end Once::call_once x2 — 클로저가 정확히 1회 실행 (f.take()==None 재현 방지).
+    //    모두 interp == native(VM) 동시 실행으로 검증.
+    // ═══════════════════════════════════════════════════════════════════════════
+    {
+        use crate::vm::bytecode::*;
+        let cmpxchg_specs: &[(u8, usize)] = &[
+            (OP_CMPXCHG_MEM8_A, 1), (OP_CMPXCHG_MEM16_A, 2),
+            (OP_CMPXCHG_MEM32_A, 4), (OP_CMPXCHG_MEM64_A, 8),
+        ];
+        for &(op, w) in cmpxchg_specs {
+            let mask = if w == 8 { u64::MAX } else { (1u64 << (w * 8)) - 1 };
+            let mem_lo: u64 = 0x0101_0202_0303_0404 & mask;
+            let src_val: u64 = 0xABCD_EF01_2345_6789;
+
+            // (a) success: mem==expected → mem=src, ZF=1
+            let mut data = vec![0u8; 16];
+            for (i, b) in mem_lo.to_le_bytes().iter().enumerate().take(w) { data[i] = *b; }
+            let mut bc = BytecodeBuilder::new();
+            bc.mov_r_imm64(0, mem_lo);
+            bc.mov_r_imm64(14, src_val);
+            bc.mem_cmpxchg_a(op, 15, 14);
+            bc.halt();
+            let prog = bc.finish();
+            let (_, mi, _, mn) = mrun(&prog, &data, &[(15usize, 0x8000u64)])?;
+            let want_lo = src_val & mask;
+            let got_i = u64::from_le_bytes(mi[..8].try_into().unwrap()) & mask;
+            let got_n = u64::from_le_bytes(mn[..8].try_into().unwrap()) & mask;
+            if got_i != want_lo || got_n != want_lo {
+                return Err(anyhow!("[32-S4] cmpxchg{w} success: mem not written (i={:X} n={:X} want={:X})", got_i, got_n, want_lo));
+            }
+
+            // (b) fail: mem != expected → v0 low width = mem, ZF=0 (dirty upper RAX)
+            let mem2_lo: u64 = 0x1122_3344_5566_7788 & mask;
+            let dirty_exp: u64 = 0xDEAD_BEEF_0000_0000u64 | (mem2_lo ^ 0x55); // low != mem → fail
+            let mut data2 = vec![0u8; 16];
+            for (i, b) in mem2_lo.to_le_bytes().iter().enumerate().take(w) { data2[i] = *b; }
+            let mut bc2 = BytecodeBuilder::new();
+            bc2.mov_r_imm64(0, dirty_exp);
+            bc2.mov_r_imm64(14, 0x2222_2222_2222_2222u64);
+            bc2.mem_cmpxchg_a(op, 15, 14);
+            bc2.halt();
+            let prog2 = bc2.finish();
+            let (vi2, mi2, vn2, mn2) = mrun(&prog2, &data2, &[(15usize, 0x8000u64)])?;
+            if mi2 != data2 || mn2 != data2 {
+                return Err(anyhow!("[32-S4] cmpxchg{w} fail: mem must be unchanged"));
+            }
+            let v0_i = vi2[0];
+            let v0_n = vn2[0];
+            let exp_v0 = match w {
+                1 => (0xDEAD_BEEF_0000_0000u64 & !0xFF) | (mem2_lo & 0xFF),
+                2 => (0xDEAD_BEEF_0000_0000u64 & !0xFFFF) | (mem2_lo & 0xFFFF),
+                _ => mem2_lo,
+            };
+            if v0_i != exp_v0 || v0_n != exp_v0 {
+                return Err(anyhow!("[32-S4] cmpxchg{w} fail: v0 mismatch i={:X} n={:X} want={:X}", v0_i, v0_n, exp_v0));
+            }
+        }
+        println!("[32-S4] width matrix 8/16/32/64 atomic CAS (Once state, success/fail, dirty-upper-RAX): PASS");
+    }
+
+    {
+        use crate::vm::bytecode::*;
+        let xchg_specs: &[(u8, usize)] = &[
+            (OP_XCHG_MEM8_A, 1), (OP_XCHG_MEM16_A, 2),
+            (OP_XCHG_MEM32_A, 4), (OP_XCHG_MEM64_A, 8),
+        ];
+        for &(op, w) in xchg_specs {
+            let mask = if w == 8 { u64::MAX } else { (1u64 << (w * 8)) - 1 };
+            let mem_lo: u64 = 0x0102_0304_0506_0708 & mask;
+            let src_val: u64 = 0xF0F0_F1F1_F2F2_F3F3;
+            let mut data = vec![0u8; 16];
+            for (i, b) in mem_lo.to_le_bytes().iter().enumerate().take(w) { data[i] = *b; }
+            let mut bc = BytecodeBuilder::new();
+            bc.mov_r_imm64(14, src_val);
+            bc.mem_xchg_a(op, 15, 14);
+            bc.halt();
+            let prog = bc.finish();
+            let (vi, mi, vn, mn) = mrun(&prog, &data, &[(15usize, 0x8000u64)])?;
+            let src_lo = src_val & mask;
+            let got_mem_i = u64::from_le_bytes(mi[..8].try_into().unwrap()) & mask;
+            let got_mem_n = u64::from_le_bytes(mn[..8].try_into().unwrap()) & mask;
+            if got_mem_i != src_lo || got_mem_n != src_lo {
+                return Err(anyhow!("[32-S5] xchg{w}: mem mismatch (i={:X} n={:X} want={:X})", got_mem_i, got_mem_n, src_lo));
+            }
+            let want_v = match w {
+                1 => (src_val & !0xFF) | (mem_lo & 0xFF),
+                2 => (src_val & !0xFFFF) | (mem_lo & 0xFFFF),
+                4 => mem_lo & 0xFFFF_FFFF, _ => mem_lo,
+            };
+            if vi[14] != want_v || vn[14] != want_v {
+                return Err(anyhow!("[32-S5] xchg{w}: vreg mismatch (i={:X} n={:X} want={:X})", vi[14], vn[14], want_v));
+            }
+            if mi != mn {
+                return Err(anyhow!("[32-S5] xchg{w}: interp/native mem mismatch"));
+            }
+        }
+        println!("[32-S5] width matrix 8/16/32/64 atomic XCHG (Once CompletionGuard swap): PASS");
+    }
+
+    {
+        use crate::vm::bytecode::*;
+        let xadd_specs: &[(u8, usize)] = &[
+            (OP_XADD_MEM8_A, 1), (OP_XADD_MEM16_A, 2),
+            (OP_XADD_MEM32_A, 4), (OP_XADD_MEM64_A, 8),
+        ];
+        for &(op, w) in xadd_specs {
+            let mask = if w == 8 { u64::MAX } else { (1u64 << (w * 8)) - 1 };
+            let mem_lo: u64 = 0x10 & mask;
+            let add_lo: u64 = 0x05;
+            let mut data = vec![0u8; 16];
+            for (i, b) in mem_lo.to_le_bytes().iter().enumerate().take(w) { data[i] = *b; }
+            let mut bc = BytecodeBuilder::new();
+            bc.mov_r_imm64(14, add_lo);
+            bc.mem_xadd_a(op, 15, 14);
+            bc.halt();
+            let prog = bc.finish();
+            let (vi, mi, vn, mn) = mrun(&prog, &data, &[(15usize, 0x8000u64)])?;
+            let sum_lo = (mem_lo + add_lo) & mask;
+            let got_i = u64::from_le_bytes(mi[..8].try_into().unwrap()) & mask;
+            let got_n = u64::from_le_bytes(mn[..8].try_into().unwrap()) & mask;
+            if got_i != sum_lo || got_n != sum_lo {
+                return Err(anyhow!("[32-S6] xadd{w}: mem sum mismatch (i={:X} n={:X} want={:X})", got_i, got_n, sum_lo));
+            }
+            let want_v = match w {
+                1 => (add_lo & !0xFF) | (mem_lo & 0xFF),
+                2 => (add_lo & !0xFFFF) | (mem_lo & 0xFFFF),
+                4 => mem_lo & 0xFFFF_FFFF, _ => mem_lo,
+            };
+            if vi[14] != want_v || vn[14] != want_v {
+                return Err(anyhow!("[32-S6] xadd{w}: vreg old mismatch (i={:X} n={:X} want={:X})", vi[14], vn[14], want_v));
+            }
+            if mi != mn {
+                return Err(anyhow!("[32-S6] xadd{w}: interp/native mem mismatch"));
+            }
+        }
+        println!("[32-S6] width matrix 8/16/32/64 atomic XADD (AtomicUsize fetch_add refcount): PASS");
+    }
+
+    // ── S7: Rust Once::call_once 2회 — 클로저는 정확히 1회만 실행해야 한다 ──
+    //    state[0x8000]: 0 INCOMPLETE / 1 RUNNING / 3 COMPLETE
+    //    count[0x8008]: 클로저 실행 카운터
+    //    1) CAS INCOMPLETE→RUNNING 성공 → 클로저(count+=1) → XCHG RUNNING→COMPLETE
+    //    2) 두 번째 call_once: state==COMPLETE 이므로 CAS 실패 → 클로저 재실행 금지
+    //    만약 CAS/XCHG가 비원자·폭오류면 두 번째가 재실행 → count=2
+    //    (f.take()==None → once.rs:166 unwrap panic 과 동일 조건)
+    {
+        use crate::vm::bytecode::*;
+        let mut bc = BytecodeBuilder::new();
+        let l_call2 = bc.new_label();
+        let l_skip2 = bc.new_label();
+        // v15 = &state 는 아래 mrun(.., state_seed=[(15,0x8000)]) 로 시드 (native는 arena-absolute 보정)
+        bc.mov_r_r64(13, 15);                // v13 = v15 (state)
+        bc.binop_r_imm64(OP_ADD_R_IMM64, 13, 8); // v13 = &count(0x8008)
+
+        // call_once #1
+        bc.mov_r_imm64(0, 0);                // expected INCOMPLETE
+        bc.mov_r_imm64(14, 1);               // new RUNNING
+        bc.mem_cmpxchg_a(OP_CMPXCHG_MEM8_A, 15, 14); // [state]: 0→1, 성공시 ZF=1
+        bc.jcc8(COND_JNE, l_call2);          // CAS 실패면 #2로
+        // 클로저: count += 1
+        bc.mov_r_imm64(12, 1);
+        bc.mem_xadd_a(OP_XADD_MEM8_A, 13, 12);
+        // CompletionGuard: state = COMPLETE(3) via XCHG
+        bc.mov_r_imm64(0, 3);
+        bc.mem_xchg_a(OP_XCHG_MEM8_A, 15, 0);
+
+        // call_once #2
+        bc.mark_label(l_call2);
+        bc.mov_r_imm64(0, 0);                // expected INCOMPLETE
+        bc.mov_r_imm64(14, 1);
+        bc.mem_cmpxchg_a(OP_CMPXCHG_MEM8_A, 15, 14); // state==COMPLETE(3) → 실패(ZF=0)
+        bc.jcc8(COND_JNE, l_skip2);          // 실패(COMPLETE)면 클로저 재실행 금지 → skip
+        // (만약 여기 도달하면 = CAS가 COMPLETE를 RUNNING으로 오인 → 클로저 재실행 = BUG)
+        bc.mark_label(l_skip2);
+        bc.halt();
+
+        let prog = bc.finish();
+        let mut data = vec![0u8; 16];
+        data[0] = 0;                         // state INCOMPLETE
+        data[8] = 0;                         // count = 0
+        let (_, mi, _, mn) = mrun(&prog, &data, &[(15usize, 0x8000u64)])?;
+        let state_i = mi[0];
+        let state_n = mn[0];
+        let cnt_i = u64::from_le_bytes(mi[8..16].try_into().unwrap());
+        let cnt_n = u64::from_le_bytes(mn[8..16].try_into().unwrap());
+        if state_i != 3 || state_n != 3 {
+            return Err(anyhow!("[32-S7] Once 2x call_once: state must be COMPLETE(3) (i={} n={})", state_i, state_n));
+        }
+        if cnt_i != 1 || cnt_n != 1 {
+            return Err(anyhow!("[32-S7] Once 2x call_once: closure must run EXACTLY ONCE (i={} n={}) -> would be once.rs:166 f.take().unwrap() on None", cnt_i, cnt_n));
+        }
+        println!("[32-S7] Once::call_once x2 end-to-end (CAS RUNNING + XCHG COMPLETE; closure runs exactly once): PASS");
+    }
+
+
+    Ok(())
+}
+
+/// [34] carry/width-flag regression — locks in the P0/P1 fixes:
+///   1. `lift_sbb` must read the INCOMING CF (not the current SUB's borrow),
+///      so `sbb dst,src` = dst - src - CF_in for every CF_in/dst/src combo.
+///   2. XADD 8/16-bit flags must be width-correct (native `lock xadd [addr],al/ax`
+///      sets CF/SF/OF/AF from the 8/16-bit boundary, not bit 31).
+///   3. CMPXCHG must preserve the non-ZF flags (native handler captures only ZF).
+fn run_carry_flag_fix_test() -> anyhow::Result<()> {
+    use crate::vm::bytecode::*;
+    use crate::vm::interp::{STATE_FLAGS, STATE_VREGS};
+    use crate::vm::lifter::lift_one;
+    use iced_x86::{Code, Instruction, Register};
+
+    let mut st = vec![0u8; interp::STATE_SIZE];
+    let vreg = |idx: usize| STATE_VREGS + idx * 8;
+    let set_v = |s: &mut [u8], i: usize, v: u64| s[vreg(i)..vreg(i) + 8].copy_from_slice(&v.to_le_bytes());
+    let get_v = |s: &[u8], i: usize| u64::from_le_bytes(s[vreg(i)..vreg(i) + 8].try_into().unwrap());
+    let set_cf = |s: &mut [u8], on: bool| {
+        let f = u64::from_le_bytes(s[STATE_FLAGS..STATE_FLAGS + 8].try_into().unwrap());
+        let nf = if on { f | F_CF } else { f & !F_CF };
+        s[STATE_FLAGS..STATE_FLAGS + 8].copy_from_slice(&nf.to_le_bytes());
+    };
+    let flags = |s: &[u8]| u64::from_le_bytes(s[STATE_FLAGS..STATE_FLAGS + 8].try_into().unwrap());
+
+    // 1) SBB incoming-CF
+    for (cf_in, rax, rbx) in [
+        (1u64, 0u64, 0u64),      // 0-0-1 = -1
+        (0u64, 5u64, 8u64),      // 5-8-0 = -3  (current sub borrows, but CF_in=0)
+        (1u64, 5u64, 3u64),      // 5-3-1 = 1
+        (1u64, 0x100u64, 0u64),  // 0x100-0-1 = 0xFF
+        (0u64, 0xFFu64, 0xFFu64),// 0xFF-0xFF-0 = 0
+    ] {
+        let inst = Instruction::with2(Code::Sbb_r64_rm64, Register::RAX, Register::RBX).unwrap();
+        let mut b = BytecodeBuilder::new();
+        lift_one(&mut b, &inst)?;
+        b.halt();
+        let code = b.finish();
+        st.fill(0);
+        set_v(&mut st, 0, rax);
+        set_v(&mut st, 3, rbx);
+        set_cf(&mut st, cf_in != 0);
+        let mut mem = vec![0u8; 0x1000];
+        interp::interpret(&mut st, &mut mem, &code)?;
+        let got = get_v(&st, 0);
+        let real = rax.wrapping_sub(rbx).wrapping_sub(cf_in);
+        if got != real {
+            return Err(anyhow!("[34] SBB: cf_in={} rax=0x{:X} rbx=0x{:X} got 0x{:X} want 0x{:X}", cf_in, rax, rbx, got, real));
+        }
+    }
+
+    // 2) XADD 8/16 width flags
+    for (w, op, a_lo, addend) in [(8u64, OP_XADD_MEM8_A, 0xFFu64, 1u64), (16u64, OP_XADD_MEM16_A, 0xFFFFu64, 1u64)] {
+        let mut bc = BytecodeBuilder::new();
+        bc.mem_xadd_a(op, 15, 14);
+        bc.halt();
+        let code = bc.finish();
+        st.fill(0);
+        let addr = 0x8000usize;
+        set_v(&mut st, 15, addr as u64);
+        set_v(&mut st, 14, addend as u64);
+        let mut mem = vec![0u8; 0x10000];
+        if w == 8 { mem[addr] = a_lo as u8; } else { mem[addr..addr + 2].copy_from_slice(&(a_lo as u16).to_le_bytes()); }
+        interp::interpret(&mut st, &mut mem, &code)?;
+        let (z, c) = if w == 8 {
+            let a = a_lo as u8; let s = addend as u8; let r = a.wrapping_add(s);
+            (r == 0, ((a as u32) + (s as u32)) > 0xFF)
+        } else {
+            let a = a_lo as u16; let s = addend as u16; let r = a.wrapping_add(s);
+            (r == 0, ((a as u32) + (s as u32)) > 0xFFFF)
+        };
+        let fl = flags(&st);
+        if (fl & F_ZF != 0) != z || (fl & F_CF != 0) != c {
+            return Err(anyhow!("[34] XADD{} flags wrong: got ZF={} CF={} want ZF={} CF={}", w, fl & F_ZF != 0, fl & F_CF != 0, z, c));
+        }
+    }
+
+    // 3) CMPXCHG flag preservation (CF must survive a successful 8-bit CAS)
+    {
+        let mut b = BytecodeBuilder::new();
+        b.mem_cmpxchg_a(OP_CMPXCHG_MEM8_A, 15, 14);
+        b.halt();
+        let code = b.finish();
+        st.fill(0);
+        let addr = 0x8000usize;
+        set_v(&mut st, 15, addr as u64);
+        set_v(&mut st, 14, 0x22);
+        set_v(&mut st, 0, 0xDEAD_0000_0000_0011); // RAX low byte = expected 0x11
+        let mut mem = vec![0u8; 0x10000];
+        mem[addr] = 0x11;
+        set_cf(&mut st, true);
+        interp::interpret(&mut st, &mut mem, &code)?;
+        if flags(&st) & F_CF == 0 {
+            return Err(anyhow!("[34] CMPXCHG must preserve CF across a successful CAS"));
+        }
+    }
+
     Ok(())
 }

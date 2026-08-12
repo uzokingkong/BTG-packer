@@ -549,7 +549,9 @@ fn build_rc4_block(stub: &BootStubCtx) -> Vec<u8> {
         seq.push((Instruction::with2(Code::Mov_rm64_r64, M::with_base_displ(Register::RAX, (crate::vm::interp::STATE_VREGS as i64) + 1*8), Register::RCX).unwrap(), None));
         seq.push((Instruction::with2(Code::Mov_rm64_r64, M::with_base_displ(Register::RAX, (crate::vm::interp::STATE_VREGS as i64) + 8*8), Register::R8).unwrap(), None));
         seq.push((Instruction::with2(Code::Mov_rm64_r64, M::with_base_displ(Register::RAX, (crate::vm::interp::STATE_VREGS as i64) + 9*8), Register::R9).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_rm64_imm32, M::with_base_displ(Register::RAX, crate::vm::interp::STATE_SP as i64), 0).unwrap(), None));
+        // NOTE: the program VM's stack pointer is vreg[4] (RSP), captured from the
+        // real RSP in the dispatcher entry below (not STATE_SP). STATE_SP/PTR_STACK
+        // are NOT used by the call/ret/push/pop handlers anymore (single-stack fix).
         // v43: GS base(=TEB) 캡처 — gs:[0x30]은 NT_TIB.Self(=TEB base)를 가리키므로,
         // STATE_SEG_GS(0x240)에 저장해 PEB/TEB 접근(gs:[...])이 VM에서 동작하게 한다.
         seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RDX,
@@ -1038,7 +1040,9 @@ fn build_rc4_block(stub: &BootStubCtx) -> Vec<u8> {
         use iced_x86::MemoryOperand as M;
         seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.vm_prog_state_va).unwrap(), None));
         seq.push((Instruction::with2(Code::Mov_rm64_r64, M::with_base_displ(Register::RAX, (crate::vm::interp::STATE_VREGS as i64) + 4*8), Register::RSP).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_rm64_r64, M::with_base_displ(Register::RAX, crate::vm::interp::STATE_PTR_STACK as i64), Register::RSP).unwrap(), None));
+        // vreg[4] = RSP is the single VM stack pointer (single-stack fix); the
+        // call/ret/push/pop handlers read/write it directly, so STATE_SP/PTR_STACK
+        // are intentionally left unused.
 
         if stub.vm_oep_native_entry {
             // ── clean native OEP entry (once.rs:166 crash fix) ─────────────────
@@ -1724,6 +1728,20 @@ pub fn run(
             if vm_oep_native_entry { "NOT " } else { "" },
             vm_prog_bytecode.len()
         );
+        // ── [VM-OEP-DIAG] 실제 타깃의 진단 (once.rs:166 원인 판별) ────────────
+        //   entry_native=true  : OEP(mainCRTStartup)가 VM화 제외 → clean native OEP
+        //                        점프. Program VM은 OEP를 실행하지 않는다.
+        //   entry_native=false : OEP가 VM화됨 → Program VM이 OEP를 실행 → native_call
+        //                        bridge가 CRT entry를 호출 → once.rs:166 크래시 가능.
+        //   → 이 값이 곧 1순위 가설(entry_native)의 정답이다.
+        println!("[VM-OEP-DIAG] EP             = 0x{:X}", oep_va);
+        println!("[VM-OEP-DIAG] entry_native   = {}", vm_oep_native_entry);
+        println!("[VM-OEP-DIAG] bytecode       = {} bytes (blocks={})", vm_prog_bytecode.len(), if vm_oep_native_entry { "n/a (OEP native)" } else { "n/a" });
+        println!("[VM-OEP-DIAG] route          = {}", if vm_oep_native_entry { "boot → native OEP → CRT → Once (Program VM 실행 안 함)" } else { "boot → Program VM → native_call → CRT → Once" });
+        // STATE_SP 진단 (single-stack fix): boot stub는 vreg[4]=RSP를 스택 포인터로
+        // 쓴다. 이제 CALL32/RET/PUSH/POP가 vreg[4]로 실제 스택을 공유하므로, 과거
+        // STATE_SP=0 + STATE_PTR_STACK=RSP가 별도 오프셋 스택을 만들어 OEP 프레임과
+        // 겹치던 (스택 오염) 문제가 제거되었다. [VM-OEP-DIAG] STATE_SP/PTR_STACK 미사용 (vreg[4]=RSP).
     }
 
     let stub = BootStubCtx {
@@ -1991,7 +2009,9 @@ pub fn run(
     ];
     let mut native_guards_patched = 0usize;
     if btg.bytes.len() >= 12 {
-        for i in 0..btg.bytes.len() - 12 {
+        let sweep_end = max_phys_end.min(btg.bytes.len().saturating_sub(12));
+        let sweep_start = first_block_offset.min(sweep_end);
+        for i in sweep_start..sweep_end {
             if btg.bytes[i..i + 12] == pat_target {
                 btg.bytes[i..i + 12].copy_from_slice(&pat_repl);
                 native_guards_patched += 1;
@@ -2007,7 +2027,9 @@ pub fn run(
     let ff_repl: [u8; 7]   = [0x31, 0xc9, 0xc3, 0x90, 0x90, 0x90, 0x90];
     let mut textb_ff_count = 0usize;
     if btg.bytes.len() >= 7 {
-        for i in 0..btg.bytes.len() - 7 {
+        let sweep_end = max_phys_end.min(btg.bytes.len().saturating_sub(7));
+        let sweep_start = first_block_offset.min(sweep_end);
+        for i in sweep_start..sweep_end {
             if btg.bytes[i..i + 7] == ff_target {
                 btg.bytes[i..i + 7].copy_from_slice(&ff_repl);
                 textb_ff_count += 1;
@@ -2018,20 +2040,23 @@ pub fn run(
         println!("[+] FastFail Safety Patch: Neutralized {} native mov ecx,7; int 29h stub(s) in .textb.", textb_ff_count);
     }
 
-    // ── Neutralize all ud2 (0x0F 0x0B -> nop nop) instructions in .textb ──────────
-    let mut all_ud2_count = 0usize;
-    if btg.bytes.len() >= 2 {
-        for i in 0..btg.bytes.len() - 1 {
-            if btg.bytes[i] == 0x0f && btg.bytes[i + 1] == 0x0b {
-                btg.bytes[i] = 0x90;     // nop
-                btg.bytes[i + 1] = 0x90; // nop
-                all_ud2_count += 1;
-            }
-        }
-    }
-    if all_ud2_count > 0 {
-        println!("[+] UD2 Safety Patch: Neutralized {} ud2 instruction(s) in .textb.", all_ud2_count);
-    }
+    // ── ud2 (0x0F 0x0B) 은 절대 NOP으로 바꾸지 않는다 ────────────────────────────
+    // (v13.4c: removed the previous whole-section .textb ud2 -> nop nop sweep.)
+    //
+    // WHY: `ud2` is a *guaranteed* hard trap — the CPU never falls through past it.
+    // Converting it to `nop nop` (0x90 0x90) silently *enables* fall-through. In a
+    // block-shuffled .textb the bytes after any given ud2 belong to a completely
+    // unrelated block, so `call ...; ud2; <next function>` becomes
+    // `call ...; nop; nop; <next function>` — control now falls straight into the
+    // next (shuffled) function, executing garbage instead of trapping. That wrong
+    // instruction path is what then triggers a panic, a bogus OS unwind, a wrong
+    // RSP and finally 0xC0000005.
+    //
+    // Leaving ud2 as-is keeps the "no fall-through" contract: if it is ever reached
+    // (only on a genuine unreachable-path bug), the process faults *cleanly* at that
+    // exact instruction instead of silently corrupting control flow. Any reachable
+    // ud2 is a separate bug to fix at its source, not by erasing the trap.
+    // (The per-block ud2 neutralization in pass4_section.rs is removed likewise.)
 
     // ── v4: .vdata 페이로드 섹션 VA (빌더와 동일한 정렬 규칙 — 잘린 .textb 직후) ──
     let payload_va: u64 = if payload_relocate && code_len > 0 {

@@ -1574,6 +1574,17 @@ fn lift_ret_imm16(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
 fn lift_incdec(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     use iced_x86::Code::*;
     let is_inc = matches!(inst.code(), Inc_rm32 | Inc_rm64 | Inc_rm8 | Inc_rm16);
+    // A `lock`-prefixed memory INC/DEC is an atomic read-modify-write (used by Rust
+    // runtime refcounts / Once teardown). Lowering it to load->modify->store below
+    // corrupts that state (once.rs:166). It must never be lifted; it is kept native
+    // by block_has_lock_memory_rmw in --vm-oep. Surface it loudly if it ever reaches
+    // here so the exclusion gap is caught instead of silently mis-compiling.
+    if inst.has_lock_prefix() && inst.op0_kind() == OpKind::Memory {
+        return Err(anyhow::anyhow!(
+            "lift_incdec: LOCK-prefixed memory {} must remain native (atomic RMW)",
+            inst
+        ));
+    }
     if inst.op0_kind() == OpKind::Register {
         let r = vreg(inst.op0_register())?;
         if is_inc { b.inc_r(r); } else { b.dec_r(r); }
@@ -1746,23 +1757,23 @@ fn map_cond(cc: iced_x86::ConditionCode) -> (u8, u8) {
 /// If the condition is taken we set 1, so we branch over the "set 1" only
 /// when the *negated* condition is true.
 fn lift_setcc(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
-    let (_, neg) = map_cond(inst.condition_code());
-    let skip = b.new_label();
+    let (cond, _neg) = map_cond(inst.condition_code());
     if inst.op0_kind() == OpKind::Memory {
-        // setcc byte ptr [mem]: compute 0/1 into SCRATCH, then store a byte.
+        // setcc byte ptr [mem]: compute 0/1 into SCRATCH low byte, then store a byte.
         let addr = mem_emit(b, inst, 0)?;
-        b.mov_r_imm32(SCRATCH2, 0);
-        b.jcc8(neg, skip);
-        b.mov_r_imm32(SCRATCH2, 1);
-        b.mark_label(skip);
+        b.setcc(SCRATCH2, cond);
         b.mem_store_a(OP_MOV_MEM8_A, addr, SCRATCH2);
         Ok(())
     } else {
+        // 진짜 `setcc r/m8` 시맨틱: 하위 8비트(예: AL)만 쓰고 나머지 상위 비트와
+        // 모든 상태 플래그를 보존한다. x86 에서 setcc 는 32/64비트 zero-extend 규칙이
+        // 적용되지 않는 예외 명령이고, 플래그도 수정하지 않는다.
+        //  * `mov_r_imm32`(전체 zero-extend) 로 lift 하면 cmpxchg 직후 RAX 에 남은
+        //    "actual" 값이 0/1 로 날아가 Once 상태머신이 꼬인다.
+        //  * AND/OR 로 lift 하면 STATE_FLAGS 가 깨져 직후 cmovcc/sbb 가 잘못 분기한다.
+        //  → 전용 OP_SETCC: 하위 바이트만 0/1, 나머지 비트 + 플래그 보존.
         let dst = vreg(inst.op0_register())?;
-        b.mov_r_imm32(dst, 0);
-        b.jcc8(neg, skip); // if !cond, skip the "set 1"
-        b.mov_r_imm32(dst, 1);
-        b.mark_label(skip);
+        b.setcc(dst, cond);
         Ok(())
     }
 }
@@ -1789,10 +1800,21 @@ fn lift_cmovcc(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
 }
 
 /// SBB: dst = dst - src - CF. For the common `sbb reg,reg` idiom this is
-/// dst = dst - src - (CF?1:0). We compute with a scratch subtract then, if CF
-/// was set, subtract 1 more.
+/// dst = dst - src - (CF?1:0).
+///
+/// FIX(P0): real x86 `sbb dst,src` subtracts the carry flag that existed BEFORE
+/// the instruction (`DST = DST - SRC - CF_in`). The previous implementation did
+/// `sub dst,src` FIRST and then branched on that sub's OWN borrow, so it read
+/// the wrong CF — a result one too small whenever borrow(dst-src) != CF_in,
+/// e.g. `sbb rax,0` after a carry, or `sbb reg,reg` borrow propagation. Read the
+/// INCOMING CF via a jcc BEFORE any subtract (same pattern as `lift_adc`), then
+/// conditionally subtract the borrow.
 fn lift_sbb(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
-    let (_, neg) = map_cond(iced_x86::ConditionCode::b); // neg of CF-set = JAE
+    // Memory destination is not correctly handled by vreg(op0) (it would read the
+    // base register). Surface it loudly rather than silently corrupting state.
+    if inst.op0_kind() == iced_x86::OpKind::Memory {
+        return Err(anyhow!("lift_sbb: memory destination unsupported ({}), keep native", inst));
+    }
     let dst = vreg(inst.op0_register())?;
     let is64 = reg_bits(inst.op0_register()) == 64;
     let src_vreg: u8 = if inst.op1_kind() == OpKind::Register {
@@ -1804,17 +1826,19 @@ fn lift_sbb(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
         if is64 { b.mov_r_imm64(SCRATCH2, imm); } else { b.mov_r_imm32(SCRATCH2, imm as u32); }
         SCRATCH2
     };
-    // SCRATCH = dst; subtract src (sets CF); then if CF, dst -= 1.
-    if is64 {
-        b.mov_r_r64(SCRATCH, dst);
-        b.binop_r_r64(OP_SUB_R_R64, SCRATCH, src_vreg);
-    } else {
-        b.mov_r_r(SCRATCH, dst);
-        b.binop_r_r(OP_SUB_R_R, SCRATCH, src_vreg);
-    }
-    // borrow path: if CF==0 skip the -1
+    // SCRATCH = dst; branch on the INCOMING CF (state flags untouched so far).
+    if is64 { b.mov_r_r64(SCRATCH, dst); } else { b.mov_r_r(SCRATCH, dst); }
+    let has_carry = b.new_label();
     let done = b.new_label();
-    b.jcc8(neg, done); // JAE: CF==0 -> done
+    b.jcc8(COND_JB, has_carry); // incoming CF set?
+    // CF_in == 0: result = dst - src  (final flags = borrow of this sub, correct)
+    if is64 { b.binop_r_r64(OP_SUB_R_R64, SCRATCH, src_vreg); }
+    else { b.binop_r_r(OP_SUB_R_R, SCRATCH, src_vreg); }
+    b.jmp8(done);
+    b.mark_label(has_carry);
+    // CF_in == 1: result = dst - src - 1
+    if is64 { b.binop_r_r64(OP_SUB_R_R64, SCRATCH, src_vreg); }
+    else { b.binop_r_r(OP_SUB_R_R, SCRATCH, src_vreg); }
     if is64 { b.binop_r_imm64(OP_ADD_R_IMM64, SCRATCH, 0xFFFF_FFFF); }
     else { b.binop_r_imm32(OP_ADD_R_IMM32, SCRATCH, 0xFFFF_FFFF); } // += -1 => subtract 1
     b.mark_label(done);

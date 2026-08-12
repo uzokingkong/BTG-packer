@@ -260,6 +260,18 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         )?;
 
         block.instructions = wb.instructions;
+        // ── ud2 (0x0F 0x0B) 은 그대로 둔다 — NOP 변환 금지 (v13.4c) ─────────────
+        // (removed the earlier v13.5 ud2->nop nop neutralization that lived here.)
+        //
+        // `ud2`는 "절대 fall-through 하지 않는다"는 하드 트랩이다. 여기서 nop nop 로
+        // 바꾸면 블록 shuffle 레이아웃에서 그 다음 블록으로 제어가 흘러 들어가(엉뚱한
+        // 함수 진입) panic → 잘못된 OS unwind → 잘못된 RSP → 0xC0000005 로 이어진다.
+        //
+        // pass3/pass4/crypto 의 어느 단계에서도 ud2를 NOP으로 바꾸지 않는다. Pass 4 가
+        // `block.instructions` 를 .textb 에 그대로 복사하므로, 여기서 ud2를 보존하면
+        // Phase 0.3 검증이 쓰는 `block.instructions` 와 디스크에 쓰인 바이트가 항상
+        // 일치한다 (불일치로 인한 "plaintext/roundtrip mismatch" 는 ud2를 보존한
+        // 양쪽에서 재발하지 않는다).
         layout.table_offsets[logical_id] = real_off;
         layout.encrypted_table_entries[logical_id] = real_off ^ key;
     }

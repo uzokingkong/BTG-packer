@@ -469,6 +469,8 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
             }
             let len_enc = u32::from_le_bytes(out[entry_off..entry_off + 4].try_into().unwrap());
             let decoded_len = len_enc ^ key;
+            if decoded_len != (if is_call_target {0} else {len as u32}) {
+            }
             if is_call_target {
                 if decoded_len != 0 {
                     bail!(

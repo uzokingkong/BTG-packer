@@ -57,6 +57,10 @@ enum Cl {
     JccNotTaken,
     JccBlk(u8),
     JccDispatch,
+    // v50: SETcc condition-evaluation labels (mirror JCC but produce a 0/1 byte)
+    SetccDispatch,
+    SetccBlk(u8),
+    SetccMerge,
     // v24: addressing-mode branch continuations
     LeaNoIndex,
     LeaDone,
@@ -570,11 +574,10 @@ pub fn generate_vm_code(
                 Some(Cl::Handler(OP_CALL32)),
             ));
             seq.push((Instruction::with2(Code::Lea_r64_m, Register::RDX, MemoryOperand::with_base_displ(Register::R9, 4)).unwrap(), None));
-            seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, STATE_SP as i32)).unwrap(), None));
+            seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, 0x20)).unwrap(), None));
             seq.push((Instruction::with2(Code::Sub_rm64_imm32, Register::R11, 8).unwrap(), None));
-            seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, STATE_SP as i32), Register::R11).unwrap(), None));
-            seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(Register::R8, STATE_PTR_STACK as i32)).unwrap(), None));
-            seq.push((Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_index_scale(Register::RCX, Register::R11, 1), Register::RDX).unwrap(), None));
+            seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, 0x20), Register::R11).unwrap(), None));
+            seq.push((Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base(Register::R11), Register::RDX).unwrap(), None));
             seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R9, 4).unwrap(), None));
             seq.push((Instruction::with2(Code::Add_rm64_r64, Register::R9, Register::RAX).unwrap(), None));
             seq.push((jmp_disp(), Some(Cl::Dispatch)));
@@ -668,10 +671,111 @@ pub fn generate_vm_code(
         seq.push((jmp_disp(), Some(Cl::Dispatch)));
     }
 
+    // ── v50: 0x89 SETCC (dst_vreg, cond) — writes ONLY the low byte, preserves
+    // STATE_FLAGS (x86 setcc is a partial-register write that does not modify
+    // flags). Evaluates cond against STATE_FLAGS, producing a 0/1, then merges
+    // it into the low byte of the destination vreg. Never writes STATE_FLAGS,
+    // so a following cmovcc/sbb reads the flags the setcc's source cmp set.
+    {
+        // entry: edi = dst vreg (preserved across cond blocks), edx = cond; r9 += 2
+        seq.push((Instruction::with2(Code::Movzx_r32_rm8, Register::EDI, MemoryOperand::with_base(Register::R9)).unwrap(), Some(Cl::Handler(OP_SETCC))));
+        seq.push((Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(), None));
+        seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap(), None));
+
+        // cond dispatch chain: cmp edx,cond ; je SetccBlk(cond)
+        let simple: [(u8, Code, u64, bool); 10] = [
+            (COND_JE, Code::Setne_rm8, F_ZF, true),
+            (COND_JNE, Code::Sete_rm8, F_ZF, false),
+            (COND_JB, Code::Setne_rm8, F_CF, true),
+            (COND_JAE, Code::Sete_rm8, F_CF, false),
+            (COND_JS, Code::Setne_rm8, F_SF, true),
+            (COND_JNS, Code::Sete_rm8, F_SF, false),
+            (COND_JO, Code::Setne_rm8, F_OF, true),
+            (COND_JNO, Code::Sete_rm8, F_OF, false),
+            (COND_JP, Code::Setne_rm8, F_PF, true),
+            (COND_JNP, Code::Sete_rm8, F_PF, false),
+        ];
+        let signed: [(u8, bool, bool); 4] = [
+            (COND_JG, true, true),   // test (ZF||delta), taken when ==0
+            (COND_JGE, false, true), // test delta,        taken when ==0
+            (COND_JL, false, false), // test delta,        taken when !=0
+            (COND_JLE, true, false), // test (ZF||delta),  taken when !=0
+        ];
+        let unsigned: [(u8, Code); 2] = [
+            (COND_JA, Code::Sete_rm8),   // taken when (CF|ZF)==0
+            (COND_JBE, Code::Setne_rm8), // taken when (CF|ZF)!=0
+        ];
+        let dispatch_conds: Vec<u8> = simple.iter().map(|(c, ..)| *c)
+            .chain(signed.iter().map(|(c, ..)| *c))
+            .chain(unsigned.iter().map(|(c, ..)| *c))
+            .collect();
+        for (i, c) in dispatch_conds.iter().enumerate() {
+            let lbl = if i == 0 { Some(Cl::SetccDispatch) } else { None };
+            seq.push((Instruction::with2(Code::Cmp_rm32_imm32, Register::EDX, *c as i32).unwrap(), lbl));
+            seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Cl::SetccBlk(*c))));
+        }
+        // unknown cond -> treat as set to 0, merge
+        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RAX).unwrap(), Some(Cl::SetccBlk(0xFF))));
+        seq.push((jmp_disp(), Some(Cl::SetccMerge)));
+
+        // simple single-bit blocks: load flags, test bit, set AL via setcc
+        for (cond, cc, bit, _set) in &simple {
+            seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, state_flags_mem()).unwrap(), Some(Cl::SetccBlk(*cond))));
+            seq.push((Instruction::with2(Code::Test_rm64_imm32, Register::R11, *bit as i32).unwrap(), None));
+            seq.push((Instruction::with1(*cc, Register::AL).unwrap(), None));
+            seq.push((jmp_disp(), Some(Cl::SetccMerge)));
+        }
+
+        // signed blocks: delta = SF^OF ; optionally OR ZF ; test -> set AL
+        for (cond, test_zf_or_delta, taken_when_zero) in &signed {
+            seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, state_flags_mem()).unwrap(), Some(Cl::SetccBlk(*cond))));
+            seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R11).unwrap(), None));
+            seq.push((Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 7).unwrap(), None));
+            seq.push((Instruction::with2(Code::Shr_rm64_CL, Register::RAX, Register::CL).unwrap(), None));
+            seq.push((Instruction::with2(Code::And_rm64_imm32, Register::RAX, 1).unwrap(), None));
+            seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RSI, Register::R11).unwrap(), None));
+            seq.push((Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 11).unwrap(), None));
+            seq.push((Instruction::with2(Code::Shr_rm64_CL, Register::RSI, Register::CL).unwrap(), None));
+            seq.push((Instruction::with2(Code::And_rm64_imm32, Register::RSI, 1).unwrap(), None));
+            seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RSI).unwrap(), None)); // rax = delta
+            if *test_zf_or_delta {
+                seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RSI, Register::R11).unwrap(), None));
+                seq.push((Instruction::with2(Code::And_rm64_imm32, Register::RSI, F_ZF as i32).unwrap(), None));
+                seq.push((Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RSI).unwrap(), None));
+            }
+            let cc = if *taken_when_zero { Code::Sete_rm8 } else { Code::Setne_rm8 };
+            seq.push((Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(), None));
+            seq.push((Instruction::with1(cc, Register::AL).unwrap(), None));
+            seq.push((jmp_disp(), Some(Cl::SetccMerge)));
+        }
+
+        // unsigned combined: rax = CF|ZF (0/1), then set AL per JA/JBE
+        for (cond, cc) in &unsigned {
+            seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, state_flags_mem()).unwrap(), Some(Cl::SetccBlk(*cond))));
+            seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R11).unwrap(), None));
+            seq.push((Instruction::with2(Code::And_rm64_imm32, Register::RAX, F_CF as i32).unwrap(), None));
+            seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RSI, Register::R11).unwrap(), None));
+            seq.push((Instruction::with2(Code::And_rm64_imm32, Register::RSI, F_ZF as i32).unwrap(), None));
+            seq.push((Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RSI).unwrap(), None));
+            seq.push((Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(), None));
+            seq.push((Instruction::with1(*cc, Register::AL).unwrap(), None));
+            seq.push((jmp_disp(), Some(Cl::SetccMerge)));
+        }
+
+        // merge: dst = (dst & ~0xFF) | (AL & 1). STATE_FLAGS untouched (setcc must
+        // not modify flags). rdi (value) still holds the dst vreg index.
+        seq.push((Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::AL).unwrap(), Some(Cl::SetccMerge)));
+        // [r8 + rdi*8] = dst vreg (rdi holds the *vreg index value*, not the reg)
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, MemoryOperand::with_base_index_scale(Register::R8, Register::RDI, 8)).unwrap(), None));
+        seq.push((Instruction::with2(Code::And_rm64_imm32, Register::R11, !0xFFu32 as i32).unwrap(), None)); // clear low byte
+        seq.push((Instruction::with2(Code::Or_rm64_r64, Register::R11, Register::RAX).unwrap(), None));       // OR in boolean
+        seq.push((Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_index_scale(Register::R8, Register::RDI, 8), Register::R11).unwrap(), None));
+        seq.push((jmp_disp(), Some(Cl::Dispatch)));
+    }
+
     // ── M2 (v22) opcodes ─────────────────────────────────────────────────────
     // 0x17 MOV_R_R64 (dst, src) — full 64-bit copy
-    hdr(
-        &mut seq,
+    hdr(        &mut seq,
         OP_MOV_R_R64,
         vec![
             Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
@@ -844,12 +948,11 @@ pub fn generate_vm_code(
         OP_PUSH_R,
         vec![
             Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
-            Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, STATE_SP as i32)).unwrap(),
+            Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, 0x20)).unwrap(),
             Instruction::with2(Code::Sub_rm64_imm32, Register::R11, 8).unwrap(),
-            Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, STATE_SP as i32), Register::R11).unwrap(),
-            Instruction::with2(Code::Mov_r64_rm64, Register::RDX, m(Register::R8, STATE_PTR_STACK as i32)).unwrap(),
+            Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, 0x20), Register::R11).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RCX)).unwrap(),
-            Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_index_scale(Register::RDX, Register::R11, 1), Register::RAX).unwrap(),
+            Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base(Register::R11), Register::RAX).unwrap(),
             Instruction::with2(Code::Add_rm64_imm32, Register::R9, 1).unwrap(),
         ],
     );
@@ -859,12 +962,11 @@ pub fn generate_vm_code(
         OP_POP_R,
         vec![
             Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
-            Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, STATE_SP as i32)).unwrap(),
-            Instruction::with2(Code::Mov_r64_rm64, Register::RDX, m(Register::R8, STATE_PTR_STACK as i32)).unwrap(),
-            Instruction::with2(Code::Mov_r64_rm64, Register::RAX, MemoryOperand::with_base_index_scale(Register::RDX, Register::R11, 1)).unwrap(),
+            Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, 0x20)).unwrap(),
+            Instruction::with2(Code::Mov_r64_rm64, Register::RAX, MemoryOperand::with_base(Register::R11)).unwrap(),
             Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(),
             Instruction::with2(Code::Add_rm64_imm32, Register::R11, 8).unwrap(),
-            Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, STATE_SP as i32), Register::R11).unwrap(),
+            Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, 0x20), Register::R11).unwrap(),
             Instruction::with2(Code::Add_rm64_imm32, Register::R9, 1).unwrap(),
         ],
     );
@@ -875,11 +977,10 @@ pub fn generate_vm_code(
             Some(Cl::Handler(OP_CALL8)),
         ));
         seq.push((Instruction::with2(Code::Lea_r64_m, Register::RDX, MemoryOperand::with_base_displ(Register::R9, 1)).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, STATE_SP as i32)).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, 0x20)).unwrap(), None));
         seq.push((Instruction::with2(Code::Sub_rm64_imm32, Register::R11, 8).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, STATE_SP as i32), Register::R11).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(Register::R8, STATE_PTR_STACK as i32)).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_index_scale(Register::RCX, Register::R11, 1), Register::RDX).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, 0x20), Register::R11).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base(Register::R11), Register::RDX).unwrap(), None));
         seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R9, 1).unwrap(), None));
         seq.push((Instruction::with2(Code::Add_rm64_r64, Register::R9, Register::RAX).unwrap(), None));
         seq.push((jmp_disp(), Some(Cl::Dispatch)));
@@ -887,13 +988,12 @@ pub fn generate_vm_code(
     // 0x33 RET: r9 = pop
     {
         seq.push((
-            Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, STATE_SP as i32)).unwrap(),
+            Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, 0x20)).unwrap(),
             Some(Cl::Handler(OP_RET)),
         ));
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(Register::R8, STATE_PTR_STACK as i32)).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, MemoryOperand::with_base_index_scale(Register::RCX, Register::R11, 1)).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, MemoryOperand::with_base(Register::R11)).unwrap(), None));
         seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R11, 8).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, STATE_SP as i32), Register::R11).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, 0x20), Register::R11).unwrap(), None));
         seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::RAX).unwrap(), None));
         seq.push((jmp_disp(), Some(Cl::Dispatch)));
     }
@@ -1823,19 +1923,14 @@ pub fn generate_vm_code(
     // 0x7C ret imm16 (2 operands: imm16): pop return ip into r9, then sp += imm16.
     {
         seq.push((
-            Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, STATE_SP as i32)).unwrap(),
-            Some(Cl::Handler(OP_RET_IMM16)),
-        ));
-        seq.push((
-            Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, STATE_SP as i32)).unwrap(),
+            Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, 0x20)).unwrap(),
             Some(Cl::Handler(OP_RET_IMM16)),
         ));
         seq.push((Instruction::with2(Code::Movzx_r32_rm16, Register::EDI, MemoryOperand::with_base(Register::R9)).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(Register::R8, STATE_PTR_STACK as i32)).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, MemoryOperand::with_base_index_scale(Register::RCX, Register::R11, 1)).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, MemoryOperand::with_base(Register::R11)).unwrap(), None));
         seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R11, 8).unwrap(), None));
         seq.push((Instruction::with2(Code::Add_rm64_r64, Register::R11, Register::RDI).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, STATE_SP as i32), Register::R11).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, 0x20), Register::R11).unwrap(), None));
         seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::RAX).unwrap(), None));
         seq.push((jmp_disp(), Some(Cl::Dispatch)));
     }

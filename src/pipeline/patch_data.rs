@@ -54,33 +54,22 @@ pub fn run(ctx: &mut PipelineContext, mut relayed_sections: Vec<SectionData>) ->
         }
     }
 
-    // ── 2. .pdata RuntimeFunction 재배치 ─────────────────────────────────────────
+    // ── 2. .pdata RuntimeFunction 재배치 제거 (v13.4c) ──────────────────────────
+    // 원래 여기서 각 .pdata 엔트리의 Begin/End RVA 를 `resolve_va_to_real_va`로
+    // 각각 독립 remap 했는데, 전역 블록 shuffle 후에는 원본 함수의 Begin 과 End 가
+    // 물리적으로 분리·재배치되어 [new_begin, new_end) 범위 안에 그 함수가 아닌 수많은
+    // 다른 블록이 섞인다. 그런 잘못된 RUNTIME_FUNCTION 범위를 OS 언와인더가 읽으면
+    // 잘못된 UNWIND_INFO → 잘못된 RSP → 0xC0000005 가 된다.
+    //
+    // 블록 shuffle된 함수는 단일 연속 RUNTIME_FUNCTION 으로 표현할 수 없으므로
+    // 여기서 재배치하지 않고, build.rs(update_pdata_seh)에서 .text(shuffle 대상)를
+    // 가리키는 원본 엔트리를 제거하고 디스패처 부트 영역만 타이트하게 커버한다.
+    // (.pdata 섹션은 원본 그대로 둔다.)
     let mut patched_ptrs_count = 0usize;
 
     for sec in &mut relayed_sections {
         if sec.name == ".pdata" {
-            let mut patched_pdata = 0;
-            for off in (0..sec.bytes.len().saturating_sub(11)).step_by(12) {
-                let begin_rva = u32::from_le_bytes(sec.bytes[off..off + 4].try_into().unwrap_or([0; 4]));
-                let end_rva = u32::from_le_bytes(sec.bytes[off + 4..off + 8].try_into().unwrap_or([0; 4]));
-                let orig_begin_va = image_base + begin_rva as u64;
-                let orig_end_va = image_base + end_rva as u64;
-
-                if let Some(real_begin_va) = resolve_va_to_real_va(
-                    orig_begin_va, text_start_va, text_end_va, va_to_trigger_id, table_offsets, dispatcher_va
-                ) {
-                    let real_begin_rva = (real_begin_va - image_base) as u32;
-                    sec.bytes[off..off + 4].copy_from_slice(&real_begin_rva.to_le_bytes());
-                    patched_pdata += 1;
-                }
-                if let Some(real_end_va) = resolve_va_to_real_va(
-                    orig_end_va, text_start_va, text_end_va, va_to_trigger_id, table_offsets, dispatcher_va
-                ) {
-                    let real_end_rva = (real_end_va - image_base) as u32;
-                    sec.bytes[off + 4..off + 8].copy_from_slice(&real_end_rva.to_le_bytes());
-                }
-            }
-            println!("[+] Relocated {} .pdata exception table entries.", patched_pdata);
+            println!("[+] .pdata: skipped Begin/End relocation (block-shuffled functions are non-contiguous; handled in build.rs).");
             continue;
         }
 

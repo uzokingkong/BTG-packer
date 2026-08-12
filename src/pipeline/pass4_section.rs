@@ -271,56 +271,20 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, needs_boot_stub: bool, t
         }
 
         btg_bytes[phys_offset..phys_offset + block_len].copy_from_slice(&block.instructions);
-
-        // ── ud2 (0x0F 0x0B) → nop nop (0x90 0x90) per-block Safety Patch ─────────
-        // Rust/LLVM emits `ud2` as an unreachable-code sentinel in the original .text.
-        // These bytes land verbatim in the shuffled .textb code-block area and can be
-        // reached at runtime (e.g. via a mis-predicted indirect jump or VM dispatch
-        // error), causing STATUS_ILLEGAL_INSTRUCTION (0xC000001D).
-        // We neutralise them here — inside the precise byte range of each block —
-        // rather than in a later whole-section sweep, so we never accidentally clobber
-        // the VM invalid-opcode handler (Code::Ud2) that sits in the boot-area tail.
-        {
-            let block_slice = &mut btg_bytes[phys_offset..phys_offset + block_len];
-            let mut ud2_in_block = 0usize;
-            let n = block_slice.len();
-            let mut j = 0usize;
-            while j + 1 < n {
-                if block_slice[j] == 0x0f && block_slice[j + 1] == 0x0b {
-                    block_slice[j]     = 0x90; // nop
-                    block_slice[j + 1] = 0x90; // nop
-                    ud2_in_block += 1;
-                    j += 2; // skip both bytes so we don't re-examine the second nop
-                } else {
-                    j += 1;
-                }
-            }
-            if ud2_in_block > 0 {
-                // tally for aggregate report printed after the loop
-                let _ = ud2_in_block; // suppressed per-block; aggregate below
-            }
-        }
+        // ── ud2 (0x0F 0x0B) 은 그대로 둔다 — NOP 변환 금지 (v13.4c) ─────────────
+        // `ud2`는 "절대 fall-through 하지 않는다"는 하드 트랩 계약이다. 이를 nop nop
+        // (0x90 0x90)로 바꾸면 블록 shuffle 레이아웃에서 그 다음 블록으로 제어가
+        // 흘러 들어가(엉뚱한 함수 진입) panic → 잘못된 OS unwind → 잘못된 RSP →
+        // 0xC0000005 로 이어진다. ud2가 유효 경로로 도달하는 상황 자체가 별개 버그이지
+        // 트랩을 지워서 고칠 일이 아니다. 도달 시 해당 명령에서 깨끗하게 fault 하도록
+        // 원본 0x0F 0x0B 를 보존한다. (crypto.rs 의 전섹션 ud2 sweep 도 동일하게 제거)
     }
 
-    // ── Aggregate ud2 count report ────────────────────────────────────────────────
+    // ── ud2 보존 확인 (v13.4c) ───────────────────────────────────────────────────
+    // ud2는 더 이상 NOP으로 변환하지 않는다(위 주석 참조). 블록 shuffle로 인해
+    // 블록 내 ud2는 해당 블록의 종단 트랩으로 그대로 유지된다. 여기서는 단순히
+    // 블록 코드에 원본 ud2가 그대로 보존되었음을 집계해 로그로 남긴다 (변환 안 함).
     {
-        let mut total_ud2 = 0usize;
-        for block in &layout.shuffled_blocks {
-            let logical_id = block.id as usize;
-            let phys_offset = layout.table_offsets[logical_id] as usize;
-            let block_len = block.instructions.len();
-            if phys_offset + block_len <= btg_bytes.len() {
-                let slice = &btg_bytes[phys_offset..phys_offset + block_len];
-                let mut j = 0usize;
-                while j + 1 < slice.len() {
-                    // After patching above, ud2 pairs should be gone; count remaining 0x0f 0x0b
-                    // (should be 0, but report if somehow missed)
-                    if slice[j] == 0x0f && slice[j + 1] == 0x0b { total_ud2 += 1; }
-                    j += 1;
-                }
-            }
-        }
-        // Count ud2 that were in original instructions (before patch) for logging
         let mut original_ud2 = 0usize;
         for block in &layout.shuffled_blocks {
             let n = block.instructions.len();
@@ -335,8 +299,8 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, needs_boot_stub: bool, t
             }
         }
         if original_ud2 > 0 {
-            println!("[+] Pass4 UD2 Safety Patch: Neutralized {} ud2 instruction(s) across {} code blocks in .textb (remaining: {}).",
-                original_ud2, layout.shuffled_blocks.len(), total_ud2);
+            println!("[+] Pass4: Preserved {} ud2 trap(s) verbatim across {} code blocks in .textb (no NOP conversion — fall-through safety).",
+                original_ud2, layout.shuffled_blocks.len());
         }
     }
 

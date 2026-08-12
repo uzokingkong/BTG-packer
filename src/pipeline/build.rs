@@ -13,7 +13,7 @@ use std::path::Path;
 ///
 /// 처리 순서:
 /// 1. DataDirectory 정리 (Debug, Security, Relocations 제거)
-/// 2. `.pdata` SEH 테이블 갱신 (.btg 섹션 커버리지 추가)
+/// 2. `.pdata` SEH 테이블 갱신 (.btg 커버리지는 디스패처 부트 영역만 타이트하게)
 /// 3. `PeMultiSectionBuilder::build()` 호출
 /// 4. 파일 기록
 ///
@@ -27,8 +27,17 @@ pub fn run(ctx: &PipelineContext, output_path: &Path) -> Result<Vec<u8>> {
         .ok_or_else(|| anyhow::anyhow!("btg_section_data not set — run Pass 4 first"))?;
 
     let dispatcher_rva = ctx.dispatcher_rva;
-    let total_section_size = btg_section.bytes.len() as u32;
     let unwind_info_rva = dispatcher_rva + 0x18;
+    // 디스패처/부트 스텁 영역 길이: [dispatcher .. dispatcher+first_block_offset)
+    // 까지만이 실제 연속적인 "부트 함수"(고유 prologue + UNWIND_INFO). 그 뒤의
+    // shuffled 블록 영역은 각기 다른 stack frame 의 무수한 블록이므로 단일
+    // RUNTIME_FUNCTION 으로 커버하면 안 된다 (잘못된 unwind → 잘못된 RSP →
+    // 0xC0000005).
+    let boot_area_len = ctx.first_block_offset as u32;
+    let (text_start_rva, text_end_rva) = {
+        let (s_va, e_va) = ctx.text_va_range();
+        ((s_va - ctx.target_info.image_base) as u32, (e_va - ctx.target_info.image_base) as u32)
+    };
 
     // ── DataDirectory 정리 ────────────────────────────────────────────────────────
     let mut clean_data_dirs = ctx.target_info.data_directories.clone();
@@ -56,15 +65,17 @@ pub fn run(ctx: &PipelineContext, output_path: &Path) -> Result<Vec<u8>> {
     // ── DLL Characteristics: DYNAMIC_BASE(0x0040), HIGH_ENTROPY_VA(0x0020), GUARD_CF(0x4000) 제거 ──
     let clean_dll_characteristics = ctx.target_info.dll_characteristics & !(0x0020 | 0x0040 | 0x4000);
 
-    // ── 패치된 섹션에서 .pdata SEH 테이블 갱신 ───────────────────────────────────
+    // ── 패치된 섹션에서 .pdata SEH 테이블 재구성 ────────────────────────────────
     let mut relayed_sections = ctx.patched_sections.clone();
     update_pdata_seh(
         &mut relayed_sections,
         &mut clean_data_dirs,
         &ctx.target_info.original_pdata_entries,
         dispatcher_rva,
-        total_section_size,
+        boot_area_len,
         unwind_info_rva,
+        text_start_rva,
+        text_end_rva,
     );
 
     // ── PE 빌드 ───────────────────────────────────────────────────────────────────
@@ -153,27 +164,52 @@ fn neutralize_tls_callbacks(ctx: &PipelineContext, out: &mut [u8]) {
     }
 }
 
-/// `.pdata` 섹션에 `.btg` 섹션 전체를 커버하는 RUNTIME_FUNCTION 항목을 추가하고
-/// DataDirectory[3]을 갱신한다.
+/// `.pdata` SEH 테이블을 재구성한다 (v13.4c).
+///
+/// 블록 shuffle된 `.text` 함수는 물리적으로 분리·비연속이므로 단일 RUNTIME_FUNCTION
+/// 으로 표현할 수 없다. 따라서:
+///   1. 원본 `.text`(shuffle 대상) 범위를 가리키는 엔트리는 **제거**한다 — 이를
+///      Begin/End 로 remap 하면 [new_begin, new_end) 가 엉뚱한 블록들을 포함해
+///      OS 언와인더가 잘못된 UNWIND_INFO 를 읽고 잘못된 RSP 로 0xC0000005 를 낸다.
+///   2. `.text` 밖의 원본 엔트리(변하지 않는 함수)는 그대로 보존한다.
+///   3. 디스패처/부트 스텁 영역만 타이트하게 커버하는 RUNTIME_FUNCTION 하나를 추가
+///      한다 ([dispatcher .. dispatcher+boot_area_len), 자신의 UNWIND_INFO 사용).
+///      예전처럼 `.btg` 전체를 하나의 RUNTIME_FUNCTION 로 등록하면 서로 다른 stack
+///      frame 을 가진 수천 블록을 하나의 UNWIND_INFO 로 처리하려다 잘못된 unwind 가
+///      된다.
 fn update_pdata_seh(
     relayed_sections: &mut Vec<SectionData>,
     clean_data_dirs: &mut Vec<DataDirectory>,
     original_pdata_entries: &[RuntimeFunction],
     dispatcher_rva: u32,
-    total_section_size: u32,
+    boot_area_len: u32,
     unwind_info_rva: u32,
+    text_start_rva: u32,
+    text_end_rva: u32,
 ) {
     if let Some(pdata_sec) = relayed_sections.iter_mut().find(|s| s.name == ".pdata") {
-        let mut rf_list: Vec<RuntimeFunction> = original_pdata_entries.to_vec();
+        // 원본 엔트리 중 .text(shuffle 대상) 를 가리키지 않는 것만 보존.
+        // .text 범위 밖의 함수는 재배치되지 않아 원본 RUNTIME_FUNCTION 이 그대로 유효하다.
+        let mut rf_list: Vec<RuntimeFunction> = original_pdata_entries
+            .iter()
+            .filter(|rf| {
+                rf.begin_address > 0
+                    && rf.end_address > rf.begin_address
+                    && !(rf.begin_address >= text_start_rva && rf.begin_address < text_end_rva)
+            })
+            .copied()
+            .collect();
 
-        // .btg 섹션 전체 커버하는 leaf UNWIND_INFO 항목 추가
-        rf_list.push(RuntimeFunction {
-            begin_address: dispatcher_rva,
-            end_address: dispatcher_rva + total_section_size,
-            unwind_info_address: unwind_info_rva,
-        });
+        // 디스패처 부트 영역만 커버하는 타이트 leaf 추가 (.btg 전체가 아님).
+        // 기존 엔트리와 Begin 이 충돌하지 않을 때만.
+        if !rf_list.iter().any(|rf| rf.begin_address == dispatcher_rva) {
+            rf_list.push(RuntimeFunction {
+                begin_address: dispatcher_rva,
+                end_address: dispatcher_rva + boot_area_len,
+                unwind_info_address: unwind_info_rva,
+            });
+        }
 
-        // 정렬 & 중복 제거 (x64 SEH 스펙 요구)
         rf_list.sort_by_key(|rf| rf.begin_address);
         rf_list.dedup_by_key(|rf| rf.begin_address);
 
@@ -193,8 +229,9 @@ fn update_pdata_seh(
                 size: rf_bytes.len() as u32,
             };
             println!(
-                "[+] Synthesized Tight SEH Table (.pdata): RVA 0x{:X}, {} entries (Size 0x{:X})",
-                pdata_sec.virtual_address, rf_list.len(), rf_bytes.len()
+                "[+] Rebuilt SEH Table (.pdata): RVA 0x{:X}, {} entries (Size 0x{:X}) [text-shuffled entries dropped; dispatcher boot leaf {}..0x{:X} only]",
+                pdata_sec.virtual_address, rf_list.len(), rf_bytes.len(),
+                dispatcher_rva, dispatcher_rva + boot_area_len
             );
         }
     }

@@ -283,17 +283,36 @@ pub fn lift_program_cfg(
     // them NATIVE instead of virtualizing them. Their SEH/unwind metadata must
     // match the real native frame layout; block-shuffling them into the VM is
     // what corrupts the unwind chain on panic (the once.rs:166 teardown crash).
-    let excluded_ranges = detect_panic_unwind_ranges(
+    let excl = detect_panic_unwind_ranges(
         text_bytes, base_va, image_base, relayed_sections,
     );
+    let runtime_globals: std::collections::HashSet<u64> =
+        excl.runtime_globals.iter().copied().collect();
+    // Shared-state (Once state word / panic-hook / stdio / rt-cleanup) global
+    // ranges, for the lock-atomic net below (data/.rdata/.bss only).
+    let state_ranges: Vec<(u64, u64)> = relayed_sections
+        .iter()
+        .filter(|s| {
+            s.name.starts_with(".data") || s.name.starts_with(".rdata") || s.name.starts_with(".bss")
+        })
+        .map(|s| {
+            let start = image_base + s.virtual_address as u64;
+            let len = (s.virtual_size.max(s.bytes.len() as u32)) as u64;
+            (start, start + len)
+        })
+        .collect();
     let excluded_blocks: std::collections::HashSet<u64> = blocks
         .iter()
-        .filter(|bb| excluded_ranges.iter().any(|(s, e)| *s <= bb.start_va && bb.start_va < *e))
+        .filter(|bb| {
+            excl.func_ranges.iter().any(|(s, e)| *s <= bb.start_va && bb.start_va < *e)
+                || block_refs_runtime_global(bb, &runtime_globals)
+                || block_has_lock_atomic_on_global(bb, &state_ranges)
+        })
         .map(|bb| bb.start_va)
         .collect();
     if !excluded_blocks.is_empty() {
         println!(
-            "[+] --vm-oep: excluding {} Rust panic/unwind runtime block(s) from VMization (native SEH preserved)",
+            "[+] --vm-oep: excluding {} Rust panic/unwind/Once runtime block(s) from VMization (native SEH preserved)",
             excluded_blocks.len()
         );
     }
@@ -568,14 +587,101 @@ fn find_subslice(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     (from..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
 }
 
-/// Detect the VA ranges (image-base absolute) of the Rust panic/unwind runtime
-/// functions in `.text`, so `lift_program_cfg` can keep them native.
+/// Result of the panic/unwind/Once runtime scan.
+///
+/// - `func_ranges`: whole `.pdata` functions to keep native.
+/// - `runtime_globals`: the shared-state slots (Once state word, panic-hook
+///   state, stdio state, rt::cleanup state, …) referenced by those functions.
+///
+/// `lift_program_cfg` keeps native every block inside a `func_range` **and**
+/// every block that references one of the `runtime_globals` — the second half
+/// is what catches inlined `Once::call_once`/`Once::call`/`is_completed` copies
+/// and the Once completion path that lives just past the function's `.pdata`
+/// end. Both cases are exactly the once.rs:166 `f.take().unwrap()` teardown
+/// crash's root cause: the VM re-executing Once's atomic/closure logic.
+#[derive(Debug, Clone, Default)]
+pub struct PanicUnwindExclusion {
+    pub func_ranges: Vec<(u64, u64)>,
+    pub runtime_globals: Vec<u64>,
+}
+
+/// Does `inst` reference (via a RIP-relative or absolute memory operand) an
+/// address in `globals`? The Once/panic runtime reaches its shared state through
+/// both `lea reg,[state]` and atomic `lock cmpxchg [state],reg` forms.
+fn instr_refs_global(inst: &iced_x86::Instruction, globals: &std::collections::HashSet<u64>) -> bool {
+    use iced_x86::{OpKind, Register};
+    for oi in 0..inst.op_count() {
+        if inst.op_kind(oi) != OpKind::Memory {
+            continue;
+        }
+        let addr = if inst.is_ip_rel_memory_operand() {
+            inst.memory_displacement64()
+        } else if inst.memory_base() == Register::None && inst.memory_index() == Register::None {
+            inst.memory_displacement64()
+        } else {
+            continue;
+        };
+        if globals.contains(&addr) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Does this basic block reference any runtime (Once/panic) shared-state global?
+/// Used to keep blocks that contain INLINED Once logic (or a Once completion
+/// path outside any `.pdata` boundary) native even though no whole function
+/// range covers them.
+fn block_refs_runtime_global(
+    bb: &crate::graph::BasicBlock,
+    globals: &std::collections::HashSet<u64>,
+) -> bool {
+    bb.instructions.iter().any(|i| instr_refs_global(i, globals))
+}
+
+/// Does this basic block contain a `lock`-prefixed atomic instruction whose
+/// memory operand lands on a data/.rdata/.bss global? `Once` state is a
+/// `lock cmpxchg` on such a global; lifting that into the VM is what corrupts
+/// the state/closure (once.rs:166). This is a belt-and-suspenders net on top of
+/// `block_refs_runtime_global` in case a state slot isn't reached by an already
+/// excluded function and so isn't in `runtime_globals`.
+fn block_has_lock_atomic_on_global(
+    bb: &crate::graph::BasicBlock,
+    state_ranges: &[(u64, u64)],
+) -> bool {
+    use iced_x86::{OpKind, Register};
+    bb.instructions.iter().any(|inst| {
+        if !inst.has_lock_prefix() {
+            return false;
+        }
+        for oi in 0..inst.op_count() {
+            if inst.op_kind(oi) != OpKind::Memory {
+                continue;
+            }
+            let addr = if inst.is_ip_rel_memory_operand() {
+                inst.memory_displacement64()
+            } else if inst.memory_base() == Register::None && inst.memory_index() == Register::None {
+                inst.memory_displacement64()
+            } else {
+                continue;
+            };
+            if state_ranges.iter().any(|&(gs, ge)| gs <= addr && addr < ge) {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Detect the Rust panic/unwind/Once runtime functions in `.text`, so
+/// `lift_program_cfg` can keep them native (and keep native every block that
+/// touches their shared-state globals — see `PanicUnwindExclusion`).
 pub fn detect_panic_unwind_ranges(
     text_bytes: &[u8],
     base_va: u64,
     image_base: u64,
     relayed_sections: &[crate::pe::builder::SectionData],
-) -> Vec<(u64, u64)> {
+) -> PanicUnwindExclusion {
     use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, OpKind, Register};
 
     // Rust panic message signatures that only appear in the panic/unwind runtime.
@@ -850,11 +956,25 @@ pub fn detect_panic_unwind_ranges(
         }
     }
 
-    // convert excluded function-start VAs back to ranges
-    excluded
+    // convert excluded function-start VAs back to ranges, and collect the
+    // shared-state globals every excluded function references.
+    let mut runtime_globals: std::collections::BTreeSet<u64> = Default::default();
+    for &s in excluded.iter() {
+        if let Some(&(_, e)) = funcs.iter().find(|&&(ss, _)| ss == s) {
+            for g in fn_globals(s, e) {
+                runtime_globals.insert(g);
+            }
+        }
+    }
+    let func_ranges: Vec<(u64, u64)> = excluded
         .iter()
         .filter_map(|&s| funcs.iter().copied().find(|&(ss, _)| ss == s))
-        .collect()
+        .collect();
+
+    PanicUnwindExclusion {
+        func_ranges,
+        runtime_globals: runtime_globals.into_iter().collect(),
+    }
 }
 
 

@@ -40,8 +40,8 @@ macro_rules! opcodes {
             pub const $name: u8 = $val;
         )*
 
-        /// Handler-table slot count (opcodes 0x00..=0x88). 0x00 = invalid-opcode handler.
-        pub const NUM_OPS: usize = 0x89;
+        /// Handler-table slot count (opcodes 0x00..=0x89). 0x00 = invalid-opcode handler.
+        pub const NUM_OPS: usize = 0x8A;
 
         /// Opcode -> (mnemonic, operand byte length after the opcode byte).
         pub const OPCODE_INFO: &[(u8, &'static str, usize)] = &[
@@ -219,6 +219,15 @@ opcodes! {
     // encoding as the 32/64-bit variants; hardware compares only AL/AX.
     OP_CMPXCHG_MEM8_A  = 0x87 : "cmpxchg8" , 2 ;
     OP_CMPXCHG_MEM16_A = 0x88 : "cmpxchg16" , 2 ;
+    // v50: SETcc — writes ONLY the low byte of the destination vreg (AL/CL/…)
+    // and preserves all status flags (x86 setcc is a *partial-register* write
+    // that does NOT zero the rest of the register and does NOT modify flags).
+    // Rust `compare_exchange` -> `lock cmpxchg` -> `sete al` pattern relies on
+    // this: RAX keeps the cmpxchg "actual" value in its upper bits while AL holds
+    // the success boolean. Lifting it as a full-register mov (zero-extend) wiped
+    // the actual value and broke the Once teardown; lifting it as AND/OR clobbers
+    // the flags that a following cmovcc/sbb reads. Encoding: [op, dst_vreg, cond].
+    OP_SETCC = 0x89 : "setcc" , 2 ;
 }
 
 /// Index-slot sentinel for LEA: no index term (see opcodes! / OP_LEA).
@@ -631,6 +640,12 @@ impl BytecodeBuilder {
     /// into STATE_FLAGS. Used for Rust atomic refcounts / fetch_add.
     pub fn mem_xadd_a(&mut self, op: u8, addr: u8, src: u8) {
         self.bytes.extend_from_slice(&[op, addr, src]);
+    }
+
+    /// SETcc (v50): vreg[dst] low byte = (cond ? 1 : 0); upper bits and flags
+    /// preserved. `cond` is a COND_* constant.
+    pub fn setcc(&mut self, dst: u8, cond: u8) {
+        self.bytes.extend_from_slice(&[OP_SETCC, dst, cond]);
     }
 
     // ── M3 follow-up: native API bridge builder (v24) ────────────────────────
