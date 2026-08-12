@@ -21,7 +21,7 @@
 
 
 use crate::vm::bytecode::*;
-use crate::vm::interp::{STATE_FLAGS, STATE_PTR_STACK, STATE_RIP, STATE_SEG_GS, STATE_SP, STATE_XMM};
+use crate::vm::interp::{STATE_CALL_SP, STATE_FLAGS, STATE_PTR_CALL_STACK, STATE_PTR_STACK, STATE_RIP, STATE_SEG_GS, STATE_SP, STATE_XMM};
 
 use anyhow::{Result, anyhow};
 use iced_x86::{
@@ -64,8 +64,6 @@ enum Cl {
     // v24: addressing-mode branch continuations
     LeaNoIndex,
     LeaDone,
-    LoadSentinel,
-    LoadDone,
     HaltSearchLoop,
     HaltSearchFound,
     // v24: native API bridge
@@ -567,17 +565,20 @@ pub fn generate_vm_code(
                 Instruction::with2(Code::Add_rm64_r64, Register::R9, Register::RAX).unwrap(),
             ],
         );
-        // CALL32 rel32: push r9+4 (return ip); r9 += 4 + rel
+        // CALL32 rel32: push r9+4 (bytecode return IP) onto the VM return-IP stack
+        // (STATE_CALL_SP); r9 += 4 + rel. (Two-stack model — see CALL8.)
         {
             seq.push((
                 Instruction::with2(Code::Movsxd_r64_rm32, Register::RAX, MemoryOperand::with_base(Register::R9)).unwrap(),
                 Some(Cl::Handler(OP_CALL32)),
             ));
             seq.push((Instruction::with2(Code::Lea_r64_m, Register::RDX, MemoryOperand::with_base_displ(Register::R9, 4)).unwrap(), None));
-            seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, 0x20)).unwrap(), None));
+            seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, STATE_CALL_SP as i32)).unwrap(), None));
             seq.push((Instruction::with2(Code::Sub_rm64_imm32, Register::R11, 8).unwrap(), None));
-            seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, 0x20), Register::R11).unwrap(), None));
-            seq.push((Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base(Register::R11), Register::RDX).unwrap(), None));
+            seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, STATE_CALL_SP as i32), Register::R11).unwrap(), None));
+            seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(Register::R8, STATE_PTR_CALL_STACK as i32)).unwrap(), None));
+            seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RCX, Register::R11).unwrap(), None));
+            seq.push((Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base(Register::RCX), Register::RDX).unwrap(), None));
             seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R9, 4).unwrap(), None));
             seq.push((Instruction::with2(Code::Add_rm64_r64, Register::R9, Register::RAX).unwrap(), None));
             seq.push((jmp_disp(), Some(Cl::Dispatch)));
@@ -970,31 +971,42 @@ pub fn generate_vm_code(
             Instruction::with2(Code::Add_rm64_imm32, Register::R9, 1).unwrap(),
         ],
     );
-    // 0x32 CALL8 (rel8): push r9+1 (return ip); r9 += 1 + rel
+    // 0x32 CALL8 (rel8): push r9+1 (bytecode return IP) onto the VM return-IP
+    // stack (STATE_CALL_SP); r9 += 1 + rel. The program's observed return VA is
+    // pushed to [v4] separately by the lifter before the call (two-stack model).
     {
         seq.push((
             Instruction::with2(Code::Movsx_r64_rm8, Register::RAX, MemoryOperand::with_base(Register::R9)).unwrap(),
             Some(Cl::Handler(OP_CALL8)),
         ));
         seq.push((Instruction::with2(Code::Lea_r64_m, Register::RDX, MemoryOperand::with_base_displ(Register::R9, 1)).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, 0x20)).unwrap(), None));
+        // VM return-IP stack: csp -= 8; addr = base + csp; [addr] = bytecode return ip
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, STATE_CALL_SP as i32)).unwrap(), None));
         seq.push((Instruction::with2(Code::Sub_rm64_imm32, Register::R11, 8).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, 0x20), Register::R11).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base(Register::R11), Register::RDX).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, STATE_CALL_SP as i32), Register::R11).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(Register::R8, STATE_PTR_CALL_STACK as i32)).unwrap(), None));
+        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RCX, Register::R11).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base(Register::RCX), Register::RDX).unwrap(), None));
         seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R9, 1).unwrap(), None));
         seq.push((Instruction::with2(Code::Add_rm64_r64, Register::R9, Register::RAX).unwrap(), None));
         seq.push((jmp_disp(), Some(Cl::Dispatch)));
     }
-    // 0x33 RET: r9 = pop
+    // 0x33 RET: pop bytecode return IP from the VM return-IP stack (STATE_CALL_SP)
+    // into r9; advance the architectural RSP (v4) past the caller's return VA.
     {
         seq.push((
-            Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, 0x20)).unwrap(),
+            Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, STATE_CALL_SP as i32)).unwrap(),
             Some(Cl::Handler(OP_RET)),
         ));
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, MemoryOperand::with_base(Register::R11)).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::R8, STATE_PTR_CALL_STACK as i32)).unwrap(), None));
+        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::R11).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R9, MemoryOperand::with_base(Register::RAX)).unwrap(), None));
+        seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R11, 8).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, STATE_CALL_SP as i32), Register::R11).unwrap(), None));
+        // architectural RSP (v4) += 8
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, 0x20)).unwrap(), None));
         seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R11, 8).unwrap(), None));
         seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, 0x20), Register::R11).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::RAX).unwrap(), None));
         seq.push((jmp_disp(), Some(Cl::Dispatch)));
     }
 
@@ -1062,13 +1074,8 @@ pub fn generate_vm_code(
         seq.push((Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(), Some(Cl::Handler(op))));
         seq.push((Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(), None));
         seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RDX)).unwrap(), None));
-        // v43/fix: check if R11 == -2 (uninitialized sentinel). If so, zero RAX to prevent AV 0xC0000005.
-        seq.push((Instruction::with2(Code::Cmp_rm64_imm8, Register::R11, -2i8 as i32).unwrap(), None));
-        seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Cl::LoadSentinel)));
         seq.push((Instruction::with2(code, dst_reg, MemoryOperand::with_base(Register::R11)).unwrap(), None));
-        seq.push((Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap(), Some(Cl::LoadDone)));
-        seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::EAX, Register::EAX).unwrap(), Some(Cl::LoadSentinel)));
-        seq.push((Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(), Some(Cl::LoadDone)));
+        seq.push((Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(), None));
         seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap(), None));
         seq.push((jmp_disp(), Some(Cl::Dispatch)));
     }
@@ -1580,6 +1587,42 @@ pub fn generate_vm_code(
             Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap(),
         ],
     );
+    // 0x8A unpcklps xmm[dst], xmm[src] -> { src.d1, dst.d1, src.d0, dst.d0 }.
+    // SSE single-precision unpack: interleave the low 2 dwords of dst with the
+    // low 2 dwords of src. All four dwords are read BEFORE any write so the
+    // dst==src case is correct. Scratch: rax/rcx/rdx/rsi/rbx/r10/r11 (rsi/rbx
+    // hold the src/dst slot base pointers; reloaded each dispatch like pshufd).
+    {
+        hdr(
+            &mut seq,
+            OP_UNPCKLPS_XMM,
+            vec![
+                Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+                Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
+                Instruction::with2(Code::Shl_rm64_imm8, Register::RCX, 4).unwrap(),
+                Instruction::with2(Code::Shl_rm64_imm8, Register::RDX, 4).unwrap(),
+                // src slot base in RSI = r8 + src*16 + STATE_XMM
+                Instruction::with2(Code::Mov_r64_rm64, Register::RSI, Register::R8).unwrap(),
+                Instruction::with2(Code::Add_rm64_r64, Register::RSI, Register::RDX).unwrap(),
+                Instruction::with2(Code::Add_rm64_imm32, Register::RSI, STATE_XMM as i32).unwrap(),
+                // dst slot base in RBX = r8 + dst*16 + STATE_XMM
+                Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::R8).unwrap(),
+                Instruction::with2(Code::Add_rm64_r64, Register::RBX, Register::RCX).unwrap(),
+                Instruction::with2(Code::Add_rm64_imm32, Register::RBX, STATE_XMM as i32).unwrap(),
+                // read all four dwords before writing
+                Instruction::with2(Code::Mov_r32_rm32, Register::EAX, MemoryOperand::with_base(Register::RSI)).unwrap(),
+                Instruction::with2(Code::Mov_r32_rm32, Register::R10D, MemoryOperand::with_base_displ(Register::RSI, 4)).unwrap(),
+                Instruction::with2(Code::Mov_r32_rm32, Register::EDX, MemoryOperand::with_base(Register::RBX)).unwrap(),
+                Instruction::with2(Code::Mov_r32_rm32, Register::R11D, MemoryOperand::with_base_displ(Register::RBX, 4)).unwrap(),
+                // write { src.d1, dst.d1, src.d0, dst.d0 } to dst slot
+                Instruction::with2(Code::Mov_rm32_r32, MemoryOperand::with_base(Register::RBX), Register::EDX).unwrap(),
+                Instruction::with2(Code::Mov_rm32_r32, MemoryOperand::with_base_displ(Register::RBX, 4), Register::EAX).unwrap(),
+                Instruction::with2(Code::Mov_rm32_r32, MemoryOperand::with_base_displ(Register::RBX, 8), Register::R11D).unwrap(),
+                Instruction::with2(Code::Mov_rm32_r32, MemoryOperand::with_base_displ(Register::RBX, 12), Register::R10D).unwrap(),
+                Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap(),
+            ],
+        );
+    }
     // 0x6C xorps xmm[dst] ^= xmm[src] (128-bit bitwise XOR). Uses r11/rax scratch
     // (preserves r10 = handler-table base). Mirrors the movsd/unpcklpd slot addressing.
     hdr(
@@ -1920,18 +1963,25 @@ pub fn generate_vm_code(
             Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap(),
         ],
     );
-    // 0x7C ret imm16 (2 operands: imm16): pop return ip into r9, then sp += imm16.
+    // 0x7C ret imm16 (operands: imm16): pop bytecode return IP from the VM
+    // return-IP stack into r9, then v4(RSP) += 8 + imm16 (cdecl arg cleanup).
     {
         seq.push((
-            Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, 0x20)).unwrap(),
+            Instruction::with2(Code::Movzx_r32_rm16, Register::EDI, MemoryOperand::with_base(Register::R9)).unwrap(),
             Some(Cl::Handler(OP_RET_IMM16)),
         ));
-        seq.push((Instruction::with2(Code::Movzx_r32_rm16, Register::EDI, MemoryOperand::with_base(Register::R9)).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, MemoryOperand::with_base(Register::R11)).unwrap(), None));
+        // bytecode return IP = [base + csp]; csp += 8
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, STATE_CALL_SP as i32)).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::R8, STATE_PTR_CALL_STACK as i32)).unwrap(), None));
+        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::R11).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R9, MemoryOperand::with_base(Register::RAX)).unwrap(), None));
+        seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R11, 8).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, STATE_CALL_SP as i32), Register::R11).unwrap(), None));
+        // architectural RSP (v4) += 8 + imm16
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, 0x20)).unwrap(), None));
         seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R11, 8).unwrap(), None));
         seq.push((Instruction::with2(Code::Add_rm64_r64, Register::R11, Register::RDI).unwrap(), None));
         seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, 0x20), Register::R11).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::RAX).unwrap(), None));
         seq.push((jmp_disp(), Some(Cl::Dispatch)));
     }
     // ── v31: 1-op multiply/divide + BSWAP ─────────────────────────────────────

@@ -43,7 +43,23 @@ pub const STATE_PTR_STACK: usize = 0x130; // M3: stack base pointer
 pub const STATE_RIP: usize = 0x138;       // v24: base VA of current lifted instruction (RIP-rel)
 pub const STATE_XMM: usize = 0x140;       // v29: XMM register file (16 regs x 16 bytes = 0x100)
 pub const STATE_SEG_GS: usize = 0x240;    // v43: GS segment base (= TEB). M6 Phase-2 PEB/TEB 접근.
-pub const STATE_SIZE: usize = 0x248;
+// ── Two-stack model (v13.4e): the VM keeps the *architectural* program stack on
+//    vreg[4] (RSP) and a SEPARATE VM bytecode return-IP stack here. CALL/RET no
+//    longer conflate the bytecode IP with the program's observed return address:
+//    CALL stores the program's original return VA on [v4] (RSP) and the bytecode
+//    return IP on this dedicated stack; RET pops the bytecode IP for control flow
+//    and advances v4 past the return VA. STATE_SP/STATE_PTR_STACK (0x108/0x130)
+//    are legacy M3 slots no longer used by call/ret/push/pop.
+pub const STATE_CALL_SP: usize = 0x248;          // VM bytecode return-IP stack offset (from base)
+pub const STATE_PTR_CALL_STACK: usize = 0x250;   // VM bytecode return-IP stack base
+// Dedicated bytecode return-IP stack buffer lives OUTSIDE the state buffer (the
+// boot stub reserves CALL_STACK_SIZE right after it and points STATE_PTR_CALL_STACK
+// at STATE_CALL_STACK_BUF). Kept out of STATE_SIZE so the small KSA/PRGA VMs (which
+// never call) don't balloon their state buffer.
+pub const CALL_STACK_SIZE: usize = 0x2000;       // 8 KiB = 1024 nested calls
+pub const STATE_SIZE: usize = 0x258;
+/// Offset from the VM state base where the dedicated return-IP stack buffer begins.
+pub const STATE_CALL_STACK_BUF: usize = STATE_SIZE;
 
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmError {
@@ -398,26 +414,34 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
             OP_CALL8 => {
                 let rel = code[ip] as i8 as i64;
                 ip += 1;
-                let sp = sp_of(state).wrapping_sub(8);
-                set_sp(state, sp);
-                let addr = sp as usize;
-                mem_put(mem, addr, &(ip as u64).to_le_bytes())?;
+                // Two-stack model: the bytecode return IP goes on the VM return-IP
+                // stack (STATE_CALL_SP), NOT on the architectural stack [v4]. The
+                // program's observed return address (original x86 return VA) is
+                // pushed to [v4] separately by the lifter before the call.
+                let ret_ip = ip as u64;
+                let csp = call_sp_of(state).wrapping_sub(8);
+                set_call_sp(state, csp);
+                let caddr = call_stack_addr(state, csp);
+                mem_put(mem, caddr, &ret_ip.to_le_bytes())?;
                 ip = (ip as i64 + rel) as usize;
             }
             OP_RET => {
-                let sp = sp_of(state);
-                let addr = sp as usize;
-                let val = u64::from_le_bytes(mem_get(mem, addr, 8).ok_or(VmError::OobMem)?.try_into().unwrap());
-                set_sp(state, sp.wrapping_add(8));
+                // Pop the bytecode return IP from the VM return-IP stack (control
+                // flow); advance the architectural RSP (v4) past the caller's
+                // pushed return VA.
+                let csp = call_sp_of(state);
+                let val = u64::from_le_bytes(mem_get(mem, call_stack_addr(state, csp), 8).ok_or(VmError::OobMem)?.try_into().unwrap());
+                set_call_sp(state, csp.wrapping_add(8));
+                set_sp(state, sp_of(state).wrapping_add(8));
                 ip = val as usize;
             }
             OP_RET_IMM16 => {
                 let imm = u16::from_le_bytes(code[ip..ip + 2].try_into().unwrap());
                 ip += 2;
-                let sp = sp_of(state);
-                let addr = sp as usize;
-                let val = u64::from_le_bytes(mem_get(mem, addr, 8).ok_or(VmError::OobMem)?.try_into().unwrap());
-                set_sp(state, sp.wrapping_add(8 + imm as u64));
+                let csp = call_sp_of(state);
+                let val = u64::from_le_bytes(mem_get(mem, call_stack_addr(state, csp), 8).ok_or(VmError::OobMem)?.try_into().unwrap());
+                set_call_sp(state, csp.wrapping_add(8));
+                set_sp(state, sp_of(state).wrapping_add(8 + imm as u64));
                 ip = val as usize;
             }
             OP_PINSRW_XMM => {
@@ -475,10 +499,11 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
             OP_CALL32 => {
                 let rel = i32::from_le_bytes(code[ip..ip + 4].try_into().unwrap());
                 ip += 4;
-                let sp = sp_of(state).wrapping_sub(8);
-                set_sp(state, sp);
-                let addr = sp as usize;
-                mem_put(mem, addr, &(ip as u64).to_le_bytes())?;
+                let ret_ip = ip as u64;
+                let csp = call_sp_of(state).wrapping_sub(8);
+                set_call_sp(state, csp);
+                let caddr = call_stack_addr(state, csp);
+                mem_put(mem, caddr, &ret_ip.to_le_bytes())?;
                 ip = (ip as i64 + rel as i64) as usize;
             }
             // ── M2 follow-up (v24): addressing modes ────────────────────────
@@ -859,6 +884,23 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
                 state[dbase..dbase + 8].copy_from_slice(&dlo);
                 state[dbase + 8..dbase + 16].copy_from_slice(&slo);
             }
+            OP_UNPCKLPS_XMM => {
+                let dst = code[ip] as usize;
+                let src = code[ip + 1] as usize;
+                ip += 2;
+                let dbase = STATE_XMM + dst * 16;
+                let sbase = STATE_XMM + src * 16;
+                // Read all four dwords BEFORE writing (dst == src must be safe):
+                // result = { src.d1, dst.d1, src.d0, dst.d0 }.
+                let d0 = state[dbase..dbase + 4].to_vec();
+                let d1 = state[dbase + 4..dbase + 8].to_vec();
+                let s0 = state[sbase..sbase + 4].to_vec();
+                let s1 = state[sbase + 4..sbase + 8].to_vec();
+                state[dbase..dbase + 4].copy_from_slice(&d0);
+                state[dbase + 4..dbase + 8].copy_from_slice(&s0);
+                state[dbase + 8..dbase + 12].copy_from_slice(&d1);
+                state[dbase + 12..dbase + 16].copy_from_slice(&s1);
+            }
             OP_XORPS_XMM => {
                 let dst = code[ip] as usize;
                 let src = code[ip + 1] as usize;
@@ -1212,6 +1254,28 @@ fn sp_of(state: &[u8]) -> u64 {
 #[inline]
 fn set_sp(state: &mut [u8], sp: u64) {
     state[STATE_VREGS + 4 * 8..STATE_VREGS + 4 * 8 + 8].copy_from_slice(&sp.to_le_bytes());
+}
+
+/// Read the VM bytecode return-IP stack offset (STATE_CALL_SP). This is an offset
+/// from STATE_PTR_CALL_STACK base (a mem-offset in the interpreter, an absolute VA
+/// in the native handlers), growing downward as the return-IP stack fills.
+#[inline]
+fn call_sp_of(state: &[u8]) -> u64 {
+    u64::from_le_bytes(state[STATE_CALL_SP..STATE_CALL_SP + 8].try_into().unwrap())
+}
+
+/// Write the VM bytecode return-IP stack offset.
+#[inline]
+fn set_call_sp(state: &mut [u8], csp: u64) {
+    state[STATE_CALL_SP..STATE_CALL_SP + 8].copy_from_slice(&csp.to_le_bytes());
+}
+
+/// Absolute (mem-space) address of the VM bytecode return-IP stack slot at the
+/// given offset: STATE_PTR_CALL_STACK (base) + csp.
+#[inline]
+fn call_stack_addr(state: &[u8], csp: u64) -> usize {
+    let base = u64::from_le_bytes(state[STATE_PTR_CALL_STACK..STATE_PTR_CALL_STACK + 8].try_into().unwrap());
+    base.wrapping_add(csp) as usize
 }
 
 /// Read `n` bytes from the arena at `addr` (n = 1..=8).

@@ -9,6 +9,16 @@ use iced_x86::{
 
 pub mod antidebug;
 
+// ── v13.4d diag: dispatcher ring-buffer 상수 ───────────────────────────────────
+/// 기록할 마지막 logical block id 개수 (종료/패닉 직전 어느 블록들로 디스패치됐는지).
+pub const RING_ENTRIES: usize = 32;
+/// .btg 섹션에서 ring 영역을 위해 테이블 앞에 예약하는 바이트 수 (entries + index).
+pub const RING_REGION: usize = 0x100;
+/// ring 영역 내 next-index u32의 오프셋 (entries 뒤).
+pub const RING_INDEX_OFF: usize = RING_ENTRIES * 4;
+/// 예약 영역 내에서 ring 메타(index) 시작 위치를 보고할 때 사용하는 상수.
+pub const RING_META_OFF: usize = 0x80;
+
 /// dispatcher_va 및 table_offset 기반으로 PIC 디스패처 셸코드를 동적으로 생성한다.
 ///
 /// # 스택 레이아웃 (디스패처 진입 직전)
@@ -49,6 +59,8 @@ pub fn build_dispatcher(
     num_blocks: usize,
     anti_debug_trace: bool,
     mba_constant: u32,
+    block_ring: bool,
+    ring_va: u64,
 ) -> Vec<u8> {
     // 디스패처 셸코드는 .btg 섹션 오프셋 0x20에 위치
     let disp_base_va = dispatcher_va + 0x20;
@@ -101,6 +113,45 @@ pub fn build_dispatcher(
     }
     if let Ok(inst) = Instruction::with2(Code::Cmovae_r64_rm64, Register::R10, Register::RCX) {
         instructions.push(inst);
+    }
+
+    // ── v13.4d diag: dispatcher ring-buffer (마지막 RING_ENTRIES 개 dispatched
+    //    logical block id 기록). 종료 시점 once.rs:166 패닉이 .pdata/exit-unwind
+    //    경로의 어느 블록으로 dispatcher가 되돌아가는지 좁히는 데 쓴다.
+    //    영역: .btg 섹션 내 [table_offset - RING_REGION .. table_offset) (패딩).
+    //    레이아웃: [0..RING_ENTRIES*4)=u32 entries, [RING_ENTRIES*4..+4)=next index.
+    //    스크래치: r11(이후 step7이 seed로 덮음) + eax(이후 step10이 id로 덮음) — 안전.
+    if block_ring {
+        if let Ok(inst) = Instruction::with2(Code::Mov_r64_imm64, Register::R11, ring_va as i64) {
+            instructions.push(inst); // r11 = ring base
+        }
+        if let Ok(inst) = Instruction::with2(
+            Code::Mov_r32_rm32,
+            Register::EAX,
+            MemoryOperand::with_base_displ(Register::R11, RING_ENTRIES as i64 * 4),
+        ) {
+            instructions.push(inst); // eax = next index
+        }
+        if let Ok(inst) = Instruction::with2(
+            Code::Mov_rm32_r32,
+            MemoryOperand::with_base_index_scale(Register::R11, Register::RAX, 4),
+            Register::R10D,
+        ) {
+            instructions.push(inst); // ring[index] = target block id
+        }
+        if let Ok(inst) = Instruction::with2(Code::Add_rm32_imm32, Register::EAX, 1) {
+            instructions.push(inst);
+        }
+        if let Ok(inst) = Instruction::with2(Code::And_rm32_imm32, Register::EAX, (RING_ENTRIES - 1) as i32) {
+            instructions.push(inst); // wrap
+        }
+        if let Ok(inst) = Instruction::with2(
+            Code::Mov_rm32_r32,
+            MemoryOperand::with_base_displ(Register::R11, RING_ENTRIES as i64 * 4),
+            Register::EAX,
+        ) {
+            instructions.push(inst); // store next index
+        }
     }
 
     // 7. mov r11, [rsp+0x28]  (seed — v6)
@@ -1059,7 +1110,7 @@ mod tests {
         // 일반 디스패처는 2-푸시 규약 [seed][target]에 맞춰 정확히 2슬롯만
         // 소비해야 한다. (v8~v9에는 블록 스텁이 3푸시를 했지만 디스패처가
         // 2슬롯만 소비해 디스패치마다 8바이트가 남았음)
-        let code = build_dispatcher(0x140001000, 0x80, 16, false, 0xCAFEBABE);
+        let code = build_dispatcher(0x140001000, 0x80, 16, false, 0xCAFEBABE, false, 0);
         let consumed = net_stack_slots_consumed(&code, 0x140001020);
         assert_eq!(
             consumed, 2,
@@ -1067,8 +1118,65 @@ mod tests {
             consumed
         );
         // trace 모드(INT3 1B)도 같은 균형
-        let code_t = build_dispatcher(0x140001000, 0x80, 16, true, 0xCAFEBABE);
+        let code_t = build_dispatcher(0x140001000, 0x80, 16, true, 0xCAFEBABE, false, 0);
         assert_eq!(net_stack_slots_consumed(&code_t, 0x140001020), 2);
+    }
+
+    #[test]
+    fn test_dispatcher_ring_buffer_injects_and_validates() {
+        // v13.4d diag: block_ring=true 일 때 ring write 시퀀스가 들어가고
+        // 디스패처는 여전히 validate/stack-balance 를 만족해야 한다.
+        let va: u64 = 0x140001000;
+        let to: usize = 0x600;
+        // ring 영역 VA = dispatcher_va + table_offset - RING_REGION
+        let ring_va = va + to as u64 - RING_REGION as u64;
+        let code = build_dispatcher(va, to, 16, false, 0xCAFEBABE, true, ring_va);
+        assert!(!code.is_empty());
+        assert!(validate_dispatcher(&code).is_ok());
+        // 디스패처가 ring 영역을 침범하면 안 됨 (disp_base + len <= ring_va)
+        assert!(
+            (va + 0x20) + code.len() as u64 <= ring_va,
+            "dispatcher {} bytes overflows into ring region @0x{:X}",
+            code.len(), ring_va
+        );
+        // disasm 후, ring base(r11 절대주소) 를 계산하는 mov r64,imm64 이 존재해야 한다.
+        let mut dec = Decoder::with_ip(64, &code, va + 0x20, DecoderOptions::NONE);
+        let mut found_base = false;
+        let mut found_store = false;
+        for _ in 0..512 {
+            if !dec.can_decode() { break; }
+            let inst = dec.decode();
+            if inst.code() == Code::Mov_r64_imm64
+                && inst.op0_register() == Register::R11
+                && inst.immediate64() as u64 == ring_va
+            {
+                found_base = true;
+            }
+            // [r11 + rax*4] 인덱스 스토어 (ring[index] = block_id)
+            if inst.code() == Code::Mov_rm32_r32
+                && inst.memory_base() == Register::R11
+                && inst.memory_index() == Register::RAX
+            {
+                found_store = true;
+            }
+        }
+        assert!(found_base, "ring base (mov r11, imm64=ring_va) not found");
+        assert!(found_store, "ring indexed store not found");
+        // ring off 일 때는 base store 가 없어야 한다.
+        let code_off = build_dispatcher(va, to, 16, false, 0xCAFEBABE, false, 0);
+        let mut dec2 = Decoder::with_ip(64, &code_off, va + 0x20, DecoderOptions::NONE);
+        let mut base_off = false;
+        for _ in 0..512 {
+            if !dec2.can_decode() { break; }
+            let inst = dec2.decode();
+            if inst.code() == Code::Mov_r64_imm64
+                && inst.op0_register() == Register::R11
+                && inst.immediate64() as u64 == ring_va
+            {
+                base_off = true;
+            }
+        }
+        assert!(!base_off, "ring must be absent when block_ring=false");
     }
 
     #[test]

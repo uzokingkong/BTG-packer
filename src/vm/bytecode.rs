@@ -41,7 +41,7 @@ macro_rules! opcodes {
         )*
 
         /// Handler-table slot count (opcodes 0x00..=0x89). 0x00 = invalid-opcode handler.
-        pub const NUM_OPS: usize = 0x8A;
+        pub const NUM_OPS: usize = 0x8B;
 
         /// Opcode -> (mnemonic, operand byte length after the opcode byte).
         pub const OPCODE_INFO: &[(u8, &'static str, usize)] = &[
@@ -228,6 +228,10 @@ opcodes! {
     // the actual value and broke the Once teardown; lifting it as AND/OR clobbers
     // the flags that a following cmovcc/sbb reads. Encoding: [op, dst_vreg, cond].
     OP_SETCC = 0x89 : "setcc" , 2 ;
+    // v14 --vm-oep + --full: UNPCKLPS xmm, xmm/m128 (SSE single-precision unpack).
+    // Interleaves the low 2 dwords of dst with the low 2 dwords of src:
+    //   result = { src.d1, dst.d1, src.d0, dst.d0 }.
+    OP_UNPCKLPS_XMM = 0x8A : "unpcklps", 2 ;
 }
 
 /// Index-slot sentinel for LEA: no index term (see opcodes! / OP_LEA).
@@ -705,6 +709,12 @@ impl BytecodeBuilder {
     pub fn unpcklpd_xmm(&mut self, dst: u8, src: u8) {
         self.bytes.extend_from_slice(&[OP_UNPCKLPD_XMM, dst, src]);
     }
+
+    /// unpcklps xmm[dst], xmm[src]: interleave the low 2 dwords (d0,d1) of dst
+    /// with (d0,d1) of src -> result = { src.d1, dst.d1, src.d0, dst.d0 }.
+    pub fn unpcklps_xmm(&mut self, dst: u8, src: u8) {
+        self.bytes.extend_from_slice(&[OP_UNPCKLPS_XMM, dst, src]);
+    }
     /// xorps xmm[dst] ^= xmm[src] (128-bit bitwise XOR).
     pub fn xorps_xmm(&mut self, dst: u8, src: u8) {
         self.bytes.extend_from_slice(&[OP_XORPS_XMM, dst, src]);
@@ -1087,6 +1097,7 @@ pub fn disassemble(code: &[u8]) -> String {
             OP_MOVUPS_XMM_MEM => { line += &format!("movups xmm{}, [v{}]", code[ip], code[ip+1]); ip += 2; }
             OP_MOVUPS_MEM_XMM => { line += &format!("movups [v{}], xmm{}", code[ip], code[ip+1]); ip += 2; }
             OP_UNPCKLPD_XMM => { line += &format!("unpcklpd xmm{}, xmm{}", code[ip], code[ip+1]); ip += 2; }
+            OP_UNPCKLPS_XMM => { line += &format!("unpcklps xmm{}, xmm{}", code[ip], code[ip+1]); ip += 2; }
             OP_XORPS_XMM => { line += &format!("xorps xmm{}, xmm{}", code[ip], code[ip+1]); ip += 2; }
             OP_PSHUFLW_XMM => { line += &format!("pshuflw xmm{}, xmm{}, 0x{:02X}", code[ip], code[ip+1], code[ip+2]); ip += 3; }
             OP_PSHUFHW_XMM => { line += &format!("pshufhw xmm{}, xmm{}, 0x{:02X}", code[ip], code[ip+1], code[ip+2]); ip += 3; }

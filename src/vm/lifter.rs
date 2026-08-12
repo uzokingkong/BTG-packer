@@ -554,6 +554,7 @@ pub fn lift_one(
         Movq_xmm_rm64 | Movq_rm64_xmm => lift_movq(b, inst)?,
 
         Unpcklpd_xmm_xmmm128 => lift_sse(b, inst, 2)?,
+        Unpcklps_xmm_xmmm128 => lift_unpcklps(b, inst)?,
         Ud2 => b.halt(),
         Bt_rm32_r32 | Bt_rm64_r64 | Bt_rm16_r16 | Bt_rm32_imm8 | Bt_rm64_imm8 | Bt_rm16_imm8 => lift_bt(b, inst)?,
         Bts_rm64_r64 | Bts_rm32_r32 | Bts_rm16_r16 | Bts_rm64_imm8 | Bts_rm32_imm8 | Bts_rm16_imm8
@@ -696,7 +697,13 @@ pub fn lift_block(seq: &[LiftedInstr], seq_base_va: u64) -> Result<Vec<u8>> {
                     }
                     b.jcc8(jcc_cond(c), id);
                 }
-                Code::Call_rel32_64 => b.call8(id),
+                Code::Call_rel32_64 => {
+                    // Two-stack model: push the original x86 return VA to [v4]
+                    // before the internal call (bytecode IP goes on the VM stack).
+                    b.mov_r_imm64(SCRATCH, va.wrapping_add(inst.len() as u64));
+                    b.push_r(SCRATCH);
+                    b.call8(id);
+                }
                 _ => return Err(anyhow!("lifter: unsupported branch {:?}", code)),
             }
             // branch source instruction: its VA does not matter for RIP-rel
@@ -711,6 +718,10 @@ pub fn lift_block(seq: &[LiftedInstr], seq_base_va: u64) -> Result<Vec<u8>> {
                 Some(t) => *labels.entry(t).or_insert_with(|| b.new_label()),
                 None => return Err(anyhow!("lifter: CALL requires a target label")),
             };
+            // Two-stack model: push the original x86 return VA to [v4] first;
+            // the bytecode return IP is handled on the VM return-IP stack by call.
+            b.mov_r_imm64(SCRATCH, va.wrapping_add(inst.len() as u64));
+            b.push_r(SCRATCH);
             b.call8(id);
             va = va.wrapping_add(inst.len() as u64);
             continue;
@@ -951,6 +962,9 @@ pub fn lift_cfg_switch(
                     FlowControl::Call => {
                         let t = inst.near_branch_target();
                         if let Some(&lbl) = block_label.get(&t) {
+                            // Two-stack model: push the original x86 return VA.
+                            b.mov_r_imm64(SCRATCH, va.wrapping_add(len as u64));
+                            b.push_r(SCRATCH);
                             b.call32(lbl);
                         } else {
                             b.mov_r_imm64(SCRATCH, t);
@@ -1481,6 +1495,27 @@ fn lift_sse(b: &mut BytecodeBuilder, inst: &Instruction, kind: u8) -> Result<()>
             let src = xmm_idx(inst.op1_register());
             b.unpcklpd_xmm(dst, src);
         }
+    }
+    Ok(())
+}
+
+/// UNPCKLPS xmm, xmm/m128 (v14 --vm-oep + --full): interleave the low 2 dwords
+/// of dst with the low 2 dwords of src -> result = { src.d1, dst.d1, src.d0,
+/// dst.d0 }. Register source emits OP_UNPCKLPS_XMM; a memory source is first
+/// loaded into the scratch XMM slot (xmm15) and then unpacked reg-reg.
+fn lift_unpcklps(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
+    use iced_x86::OpKind;
+    let xmm = inst.op0_register();
+    let dst = if xmm == iced_x86::Register::None { 0 } else { xmm.number() as u8 };
+    if inst.op1_kind() == OpKind::Register {
+        let src = inst.op1_register();
+        let src_i = if src == iced_x86::Register::None { 0 } else { src.number() as u8 };
+        b.unpcklps_xmm(dst, src_i);
+    } else {
+        // memory source: load [mem] into scratch XMM slot (xmm15), then unpack.
+        let addr = mem_emit(b, inst, 1)?;
+        b.movups_xmm_mem(15, addr);
+        b.unpcklps_xmm(dst, 15);
     }
     Ok(())
 }

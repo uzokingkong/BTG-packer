@@ -62,9 +62,9 @@ pub fn run(ctx: &mut PipelineContext, mut relayed_sections: Vec<SectionData>) ->
     // 잘못된 UNWIND_INFO → 잘못된 RSP → 0xC0000005 가 된다.
     //
     // 블록 shuffle된 함수는 단일 연속 RUNTIME_FUNCTION 으로 표현할 수 없으므로
-    // 여기서 재배치하지 않고, build.rs(update_pdata_seh)에서 .text(shuffle 대상)를
-    // 가리키는 원본 엔트리를 제거하고 디스패처 부트 영역만 타이트하게 커버한다.
-    // (.pdata 섹션은 원본 그대로 둔다.)
+    // 여기서 재배치하지 않는다. 원본 `.text`는 TLS/CRT/native bridge에서 계속
+    // 실행되므로 build.rs(update_pdata_seh)는 원본 엔트리를 모두 보존하고
+    // 디스패처 부트 영역의 leaf만 추가한다. (.pdata 입력은 여기서 수정하지 않는다.)
     let mut patched_ptrs_count = 0usize;
 
     for sec in &mut relayed_sections {
@@ -312,49 +312,10 @@ pub fn run(ctx: &mut PipelineContext, mut relayed_sections: Vec<SectionData>) ->
         }
     }
 
-    // ── 6. Rust Thread Guard Sentinel (-2) Native Safety Patch ─────────────────────
-    // 원본 18B 패턴: mov rax, [rcx]; movzx ecx, [rax]; mov [rax], 0; cmp cl, 1; jne +0x19c
-    // 치환 18B 패턴: mov rax, [rcx]; test rax, rax; js +0x19a; movzx ecx, [rax]; mov [rax], 0
-    // rax가 음수 센티널(-2)일 때 native execution에서 0xC0000005 AV 크래시가 일어나는 것을 방지한다.
-    let target_pat: [u8; 18] = [
-        0x48, 0x8b, 0x01, 0x0f, 0xb6, 0x08, 0xc6, 0x00, 0x00, 0x80, 0xf9, 0x01, 0x0f, 0x85, 0x9c, 0x01, 0x00, 0x00,
-    ];
-    let repl_pat: [u8; 18] = [
-        0x48, 0x8b, 0x01, 0x48, 0x85, 0xc0, 0x0f, 0x88, 0x9a, 0x01, 0x00, 0x00, 0x0f, 0xb6, 0x08, 0xc6, 0x00, 0x00,
-    ];
-
-    let mut guard_patched = 0usize;
-    for sec in &mut relayed_sections {
-        if sec.bytes.len() >= 18 {
-            for i in 0..sec.bytes.len() - 18 {
-                if sec.bytes[i..i + 18] == target_pat {
-                    sec.bytes[i..i + 18].copy_from_slice(&repl_pat);
-                    guard_patched += 1;
-                }
-            }
-        }
-    }
-    if guard_patched > 0 {
-        println!("[+] Native Thread Guard Sentinel Safety Patch: Patched {} sentinel guard site(s).", guard_patched);
-    }
-
-    // ── 7. Native FastFail (mov ecx, 7; int 29h -> ret; nop) Neutralization ────────
-    let ff_target: [u8; 7] = [0xb9, 0x07, 0x00, 0x00, 0x00, 0xcd, 0x29];
-    let ff_repl: [u8; 7]   = [0x31, 0xc9, 0xc3, 0x90, 0x90, 0x90, 0x90];
-    let mut ff_count = 0usize;
-    for sec in &mut relayed_sections {
-        if sec.bytes.len() >= 7 {
-            for i in 0..sec.bytes.len() - 7 {
-                if sec.bytes[i..i + 7] == ff_target {
-                    sec.bytes[i..i + 7].copy_from_slice(&ff_repl);
-                    ff_count += 1;
-                }
-            }
-        }
-    }
-    if ff_count > 0 {
-        println!("[+] FastFail Safety Patch: Neutralized {} native mov ecx,7; int 29h stub(s) in unencrypted sections.", ff_count);
-    }
+    // 원본 런타임 코드는 바이트 패턴으로 수정하지 않는다. Rust thread-guard의
+    // 상태 분기나 `int 29h` fast-fail을 바꾸면 정상 teardown 상태 머신이 깨지고,
+    // noreturn 경로에서 `ret`하여 손상된 스택으로 실행을 계속하게 된다. -2 주소나
+    // fast-fail이 관찰되면 그 앞의 변환 버그를 고쳐야 하며 트랩을 지워서는 안 된다.
 
     ctx.patched_sections = relayed_sections;
     Ok(())

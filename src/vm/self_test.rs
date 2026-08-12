@@ -389,6 +389,11 @@ fn run_m3_stack_test() -> Result<()> {
     bc.push_r(1); // push b
     bc.push_r(0); // push a
     let sub = bc.new_label();
+    // Two-stack model: push the program-visible return VA to [v4] before the
+    // internal call (the bytecode return IP is handled on the VM return-IP stack
+    // by call8, NOT written to the architectural stack).
+    bc.mov_r_imm64(crate::vm::lifter::SCRATCH, 0x1234_5678_0000_0000);
+    bc.push_r(crate::vm::lifter::SCRATCH);
     bc.call8(sub);
     bc.push_r(2); // push result
     bc.pop_r(6); // v6 = result
@@ -405,12 +410,16 @@ fn run_m3_stack_test() -> Result<()> {
     let prog = bc.finish();
 
     const STACK_SIZE: u64 = 0x1000;
+    let call_stack_va = arena.base + 0xB000; // dedicated VM bytecode return-IP stack (two-stack)
 
     // Interpreter
     let mut st = vec![0u8; interp::STATE_SIZE];
-    let mut mem = vec![0u8; 0x2000];
-    // vreg4 = RSP points at the stack TOP (0x1000..0x2000 arena in mem space).
-    st[interp::STATE_VREGS + 4 * 8..interp::STATE_VREGS + 4 * 8 + 8].copy_from_slice(&0x2000u64.to_le_bytes());
+    let mut mem = vec![0u8; 0x8000];
+    // vreg4 = RSP points at the architectural stack TOP in mem space.
+    st[interp::STATE_VREGS + 4 * 8..interp::STATE_VREGS + 4 * 8 + 8].copy_from_slice(&0x4000u64.to_le_bytes());
+    // Two-stack model: init the dedicated VM bytecode return-IP stack.
+    st[interp::STATE_PTR_CALL_STACK..interp::STATE_PTR_CALL_STACK + 8].copy_from_slice(&0x1000u64.to_le_bytes());
+    st[interp::STATE_CALL_SP..interp::STATE_CALL_SP + 8].copy_from_slice(&(interp::CALL_STACK_SIZE as u64).to_le_bytes());
     interp::interpret(&mut st, &mut mem, &prog).map_err(|e| anyhow!("M3 stack interp failed: {:?}", e))?;
     let mut vi = [0u64; 16];
     for i in 0..16 {
@@ -425,6 +434,12 @@ fn run_m3_stack_test() -> Result<()> {
         // vreg4 = RSP points at the stack TOP (stack_va + STACK_SIZE).
         b[0x6000 + interp::STATE_VREGS + 4 * 8..0x6000 + interp::STATE_VREGS + 4 * 8 + 8]
             .copy_from_slice(&((stack_va as u64) + STACK_SIZE).to_le_bytes());
+        // Two-stack model: init the dedicated VM bytecode return-IP stack (base at
+        // a free arena region, empty offset = CALL_STACK_SIZE).
+        b[0x6000 + interp::STATE_PTR_CALL_STACK..0x6000 + interp::STATE_PTR_CALL_STACK + 8]
+            .copy_from_slice(&(call_stack_va as u64).to_le_bytes());
+        b[0x6000 + interp::STATE_CALL_SP..0x6000 + interp::STATE_CALL_SP + 8]
+            .copy_from_slice(&(interp::CALL_STACK_SIZE as u64).to_le_bytes());
         b[0x8000..0x8000 + 0x1000].fill(0); // clear stack region
     }
     arena.call(0xA000);
@@ -748,8 +763,12 @@ fn run_m4_lift_test() -> Result<()> {
     st[interp::STATE_VREGS + 8 * 8..interp::STATE_VREGS + 9 * 8].copy_from_slice(&(c as u64).to_le_bytes()); // r8 = c
     st[interp::STATE_VREGS + 6 * 8..interp::STATE_VREGS + 7 * 8].copy_from_slice(&(data_off as u64).to_le_bytes()); // rsi
     st[interp::STATE_VREGS + 4 * 8..interp::STATE_VREGS + 5 * 8].copy_from_slice(&0x3FF8u64.to_le_bytes()); // vreg4 = RSP (stack top)
-    // pre-place the main-function return address (-> trailing HALT)
-    mem[0x3FF8..0x4000].copy_from_slice(&halt_off.to_le_bytes());
+    // Two-stack model: init the dedicated VM return-IP stack and pre-place the
+    // outermost function's return ip (-> trailing HALT) on it, since `ret` pops
+    // the bytecode IP from this stack (not from [v4]).
+    st[interp::STATE_PTR_CALL_STACK..interp::STATE_PTR_CALL_STACK + 8].copy_from_slice(&0u64.to_le_bytes());
+    st[interp::STATE_CALL_SP..interp::STATE_CALL_SP + 8].copy_from_slice(&((interp::CALL_STACK_SIZE - 8) as u64).to_le_bytes());
+    mem[(interp::CALL_STACK_SIZE - 8) as usize..interp::CALL_STACK_SIZE].copy_from_slice(&halt_off.to_le_bytes());
     interp::interpret(&mut st, &mut mem, &bc).map_err(|e| anyhow!("M4 lift interp failed: {:?}", e))?;
     let interp_rax = u64::from_le_bytes(st[interp::STATE_VREGS + 0 * 8..interp::STATE_VREGS + 1 * 8].try_into().unwrap());
     assert_eq!(interp_rax, expected, "M4 lift interpreter: rax mismatch (interp=0x{:X} native=0x{:X})", interp_rax, expected);
@@ -766,6 +785,7 @@ fn run_m4_lift_test() -> Result<()> {
     let module = build_vm_module(vm_code_va as u64, vm_table_va as u64, vm_bc_va as u64, bc.clone(), handlers::EntryMode::Ksa)?;
     handlers::validate_vm_code(&module.code)?;
     let tramp = encode_trampoline(vm_state_va as u64, vm_data_va as u64, vm_data_va as u64, vm_code_va as u64, vm_tramp_va as u64)?;
+    let call_stack_va = vm_arena.base + 0xA000; // dedicated VM bytecode return-IP stack (two-stack)
     {
         let b = vm_arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
@@ -780,8 +800,14 @@ fn run_m4_lift_test() -> Result<()> {
         b[0x6000 + interp::STATE_VREGS + 6 * 8..0x6000 + interp::STATE_VREGS + 7 * 8].copy_from_slice(&(vm_data_va as u64).to_le_bytes());
         b[0x6000 + interp::STATE_VREGS + 4 * 8..0x6000 + interp::STATE_VREGS + 5 * 8].copy_from_slice(&((vm_stack_va as u64) + 0xFF8).to_le_bytes());
         b[0x7000..0x7000 + 0x1000].fill(0);
-        // pre-place the main-function return address (absolute VA of trailing HALT)
-        b[0x7FF8..0x8000].copy_from_slice(&((vm_bc_va as u64) + halt_off).to_le_bytes());
+        // Two-stack model: init the dedicated VM return-IP stack and pre-place the
+        // outermost return ip (absolute VA of trailing HALT) on it.
+        b[0x6000 + interp::STATE_PTR_CALL_STACK..0x6000 + interp::STATE_PTR_CALL_STACK + 8]
+            .copy_from_slice(&(call_stack_va as u64).to_le_bytes());
+        b[0x6000 + interp::STATE_CALL_SP..0x6000 + interp::STATE_CALL_SP + 8]
+            .copy_from_slice(&((interp::CALL_STACK_SIZE - 8) as u64).to_le_bytes());
+        b[(0xA000 + (interp::CALL_STACK_SIZE - 8)) as usize..0xA000 + interp::CALL_STACK_SIZE]
+            .copy_from_slice(&((vm_bc_va as u64) + halt_off).to_le_bytes());
         b[0x9000..0x9000 + 0x100].fill(0);
     }
     vm_arena.call(0x8000);
@@ -2146,9 +2172,12 @@ fn run_text_lift_test() -> Result<()> {
     st[interp::STATE_VREGS + 8 * 8..interp::STATE_VREGS + 9 * 8].copy_from_slice(&(c as u64).to_le_bytes());
     st[interp::STATE_VREGS + 6 * 8..interp::STATE_VREGS + 7 * 8].copy_from_slice(&(data_off as u64).to_le_bytes()); // rsi
     st[interp::STATE_VREGS + 4 * 8..interp::STATE_VREGS + 5 * 8].copy_from_slice(&0x3FF8u64.to_le_bytes()); // vreg4 = RSP (stack top)
-    // Pre-place the main-function return address (-> trailing HALT) on the stack.
+    // Two-stack model: init the dedicated VM return-IP stack and pre-place the
+    // outermost return ip (-> trailing HALT) on it (ret pops this stack, not [v4]).
     let halt_off = (lifted_bc.len() - 1) as u64; // index of trailing HALT
-    mem[0x3FF8..0x4000].copy_from_slice(&halt_off.to_le_bytes());
+    st[interp::STATE_PTR_CALL_STACK..interp::STATE_PTR_CALL_STACK + 8].copy_from_slice(&0u64.to_le_bytes());
+    st[interp::STATE_CALL_SP..interp::STATE_CALL_SP + 8].copy_from_slice(&((interp::CALL_STACK_SIZE - 8) as u64).to_le_bytes());
+    mem[(interp::CALL_STACK_SIZE - 8) as usize..interp::CALL_STACK_SIZE].copy_from_slice(&halt_off.to_le_bytes());
     interp::interpret(&mut st, &mut mem, &lifted_bc)
         .map_err(|e| anyhow!("M6 lift interp failed: {:?}", e))?;
     let interp_rax = u64::from_le_bytes(st[interp::STATE_VREGS + 0 * 8..interp::STATE_VREGS + 1 * 8].try_into().unwrap());
@@ -2167,6 +2196,7 @@ fn run_text_lift_test() -> Result<()> {
     handlers::validate_vm_code(&module.code)?;
     let tramp = encode_trampoline(vm_state_va as u64, vm_data_va as u64, vm_data_va as u64, vm_code_va as u64, vm_tramp_va as u64)?;
     let b_arg = b; // keep the b argument across the arena-shadowing block below
+    let call_stack_va = vm_arena.base + 0xA000; // dedicated VM bytecode return-IP stack (two-stack)
     {
         let b = vm_arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
@@ -2181,7 +2211,14 @@ fn run_text_lift_test() -> Result<()> {
         b[0x6000 + interp::STATE_VREGS + 6 * 8..0x6000 + interp::STATE_VREGS + 7 * 8].copy_from_slice(&(vm_data_va as u64).to_le_bytes()); // rsi
         b[0x6000 + interp::STATE_VREGS + 4 * 8..0x6000 + interp::STATE_VREGS + 5 * 8].copy_from_slice(&((vm_stack_va as u64) + 0xFF8).to_le_bytes());
         b[0x7000..0x7000 + 0x1000].fill(0);
-        b[0x7FF8..0x8000].copy_from_slice(&((vm_bc_va as u64) + halt_off).to_le_bytes());
+        // Two-stack model: init the dedicated VM return-IP stack and pre-place the
+        // outermost return ip (absolute VA of trailing HALT) on it.
+        b[0x6000 + interp::STATE_PTR_CALL_STACK..0x6000 + interp::STATE_PTR_CALL_STACK + 8]
+            .copy_from_slice(&(call_stack_va as u64).to_le_bytes());
+        b[0x6000 + interp::STATE_CALL_SP..0x6000 + interp::STATE_CALL_SP + 8]
+            .copy_from_slice(&((interp::CALL_STACK_SIZE - 8) as u64).to_le_bytes());
+        b[(0xA000 + (interp::CALL_STACK_SIZE - 8)) as usize..0xA000 + interp::CALL_STACK_SIZE]
+            .copy_from_slice(&((vm_bc_va as u64) + halt_off).to_le_bytes());
         b[0x9000..0x9000 + 0x100].fill(0);
     }
     vm_arena.call(0x8000);
@@ -2241,7 +2278,11 @@ fn run_a2_lift_completion_test() -> Result<()> {
     st[interp::STATE_VREGS + 1 * 8..interp::STATE_VREGS + 2 * 8].copy_from_slice(&(a as u64).to_le_bytes()); // rcx = a
     st[interp::STATE_VREGS + 3 * 8..interp::STATE_VREGS + 4 * 8].copy_from_slice(&0u64.to_le_bytes()); // rbx = 0
     st[interp::STATE_VREGS + 4 * 8..interp::STATE_VREGS + 5 * 8].copy_from_slice(&0x3FF8u64.to_le_bytes()); // vreg4 = RSP (stack top)
-    mem[0x3FF8..0x4000].copy_from_slice(&halt_off.to_le_bytes());
+    // Two-stack model: init the dedicated VM return-IP stack and pre-place the
+    // outermost return ip (-> trailing HALT) on it.
+    st[interp::STATE_PTR_CALL_STACK..interp::STATE_PTR_CALL_STACK + 8].copy_from_slice(&0u64.to_le_bytes());
+    st[interp::STATE_CALL_SP..interp::STATE_CALL_SP + 8].copy_from_slice(&((interp::CALL_STACK_SIZE - 8) as u64).to_le_bytes());
+    mem[(interp::CALL_STACK_SIZE - 8) as usize..interp::CALL_STACK_SIZE].copy_from_slice(&halt_off.to_le_bytes());
     interp::interpret(&mut st, &mut mem, &bc).map_err(|e| anyhow!("A2-lift-completion interp failed: {:?}", e))?;
     let rax = u64::from_le_bytes(st[interp::STATE_VREGS + 0 * 8..interp::STATE_VREGS + 1 * 8].try_into().unwrap());
     let r9 = u64::from_le_bytes(st[interp::STATE_VREGS + 9 * 8..interp::STATE_VREGS + 10 * 8].try_into().unwrap());
@@ -2313,9 +2354,12 @@ fn run_a5_sse_cond_test() -> Result<()> {
     // memory: [rsi+0x80] = 8-byte double value ; [rsi+0x60] = 16-byte
     mem[rsi + 0x80..rsi + 0x88].copy_from_slice(&0x1122334455667788u64.to_le_bytes());
     mem[rsi + 0x60..rsi + 0x70].copy_from_slice(&[0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08, 0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18]);
-    // stack for ret
+    // Two-stack model: init the dedicated VM return-IP stack and pre-place the
+    // outermost return ip (-> trailing HALT) on it.
     st[interp::STATE_VREGS + 4*8..][..8].copy_from_slice(&0x3FF8u64.to_le_bytes()); // vreg4 = RSP (stack top)
-    mem[0x3FF8..0x4000].copy_from_slice(&halt_off.to_le_bytes());
+    st[interp::STATE_PTR_CALL_STACK..interp::STATE_PTR_CALL_STACK + 8].copy_from_slice(&0u64.to_le_bytes());
+    st[interp::STATE_CALL_SP..interp::STATE_CALL_SP + 8].copy_from_slice(&((interp::CALL_STACK_SIZE - 8) as u64).to_le_bytes());
+    mem[(interp::CALL_STACK_SIZE - 8) as usize..interp::CALL_STACK_SIZE].copy_from_slice(&halt_off.to_le_bytes());
 
     interp::interpret(&mut st, &mut mem, &bc).map_err(|e| anyhow!("A5-sse interp failed: {:?}", e))?;
 
@@ -2426,9 +2470,12 @@ fn run_m5_multiblock_test() -> Result<()> {
     st[interp::STATE_VREGS + 1*8..][..8].copy_from_slice(&(n as u64).to_le_bytes());
     st[interp::STATE_VREGS + 2*8..][..8].copy_from_slice(&0u64.to_le_bytes());
     st[interp::STATE_VREGS + 3*8..][..8].copy_from_slice(&incr.to_le_bytes());
-    st[interp::STATE_PTR_STACK..interp::STATE_PTR_STACK+8].copy_from_slice(&0x3000u64.to_le_bytes());
-    st[interp::STATE_SP..interp::STATE_SP+8].copy_from_slice(&0xFF8u64.to_le_bytes());
-    mem[0x3000+0xFF8..0x3000+0x1000].copy_from_slice(&halt_off.to_le_bytes());
+    st[interp::STATE_VREGS + 4*8..][..8].copy_from_slice(&0x3FF8u64.to_le_bytes()); // v4 = RSP (arch stack top)
+    // Two-stack model: init the dedicated VM return-IP stack and pre-place the
+    // outermost return ip (-> trailing HALT) on it.
+    st[interp::STATE_PTR_CALL_STACK..interp::STATE_PTR_CALL_STACK + 8].copy_from_slice(&0u64.to_le_bytes());
+    st[interp::STATE_CALL_SP..interp::STATE_CALL_SP + 8].copy_from_slice(&((interp::CALL_STACK_SIZE - 8) as u64).to_le_bytes());
+    mem[(interp::CALL_STACK_SIZE - 8) as usize..interp::CALL_STACK_SIZE].copy_from_slice(&halt_off.to_le_bytes());
     interp::interpret(&mut st, &mut mem, &bc).map_err(|e| anyhow!("M5 interp failed: {:?}", e))?;
     let rax = u64::from_le_bytes(st[interp::STATE_VREGS + 0*8..][..8].try_into().unwrap());
     assert_eq!(rax, want, "M5 lifted interpreter: rax got {} want {}", rax, want);
@@ -2663,10 +2710,13 @@ fn run_a2a5_lift_residual_test() -> Result<()> {
     let bc = lift_block(&seq, 0)?;
     let mut st = vec![0u8; interp::STATE_SIZE];
     let mut mem = vec![0u8; 0x4000];
-    st[interp::STATE_PTR_STACK..interp::STATE_PTR_STACK + 8].copy_from_slice(&0x3000u64.to_le_bytes());
-    st[interp::STATE_SP..interp::STATE_SP + 8].copy_from_slice(&0xFF8u64.to_le_bytes());
+    st[interp::STATE_VREGS + 4*8..][..8].copy_from_slice(&0x3FF8u64.to_le_bytes()); // v4 = RSP (arch stack top)
+    // Two-stack model: init the dedicated VM return-IP stack and pre-place the
+    // outermost return ip (-> trailing HALT) on it.
     let halt_off = (bc.len() - 1) as u64;
-    mem[0x3000 + 0xFF8..0x3000 + 0x1000].copy_from_slice(&halt_off.to_le_bytes());
+    st[interp::STATE_PTR_CALL_STACK..interp::STATE_PTR_CALL_STACK + 8].copy_from_slice(&0u64.to_le_bytes());
+    st[interp::STATE_CALL_SP..interp::STATE_CALL_SP + 8].copy_from_slice(&((interp::CALL_STACK_SIZE - 8) as u64).to_le_bytes());
+    mem[(interp::CALL_STACK_SIZE - 8) as usize..interp::CALL_STACK_SIZE].copy_from_slice(&halt_off.to_le_bytes());
     interp::interpret(&mut st, &mut mem, &bc).map_err(|e| anyhow!("[21] interp failed: {:?}", e))?;
     let rax = u64::from_le_bytes(st[interp::STATE_VREGS + 0 * 8..][..8].try_into().unwrap());
     let rcx = u64::from_le_bytes(st[interp::STATE_VREGS + 1 * 8..][..8].try_into().unwrap());
@@ -3043,8 +3093,12 @@ fn run_m6_phase2_lift_test() -> Result<()> {
     let mut mem = vec![0u8; 0x4000];
     st[interp::STATE_VREGS + 1*8..][..8].copy_from_slice(&(n as u64).to_le_bytes()); // rcx=n
     st[interp::STATE_VREGS + 3*8..][..8].copy_from_slice(&incr.to_le_bytes());        // rbx=incr
-    st[interp::STATE_VREGS + 4*8..][..8].copy_from_slice(&0x3FF8u64.to_le_bytes());   // vreg4 = RSP (stack top)
-    mem[0x3FF8..0x4000].copy_from_slice(&halt_off.to_le_bytes());
+    st[interp::STATE_VREGS + 4*8..][..8].copy_from_slice(&0x3FF8u64.to_le_bytes());   // v4 = RSP (arch stack top)
+    // Two-stack model: init the dedicated VM return-IP stack and pre-place the
+    // outermost return ip (-> trailing HALT) on it.
+    st[interp::STATE_PTR_CALL_STACK..interp::STATE_PTR_CALL_STACK + 8].copy_from_slice(&0u64.to_le_bytes());
+    st[interp::STATE_CALL_SP..interp::STATE_CALL_SP + 8].copy_from_slice(&((interp::CALL_STACK_SIZE - 8) as u64).to_le_bytes());
+    mem[(interp::CALL_STACK_SIZE - 8) as usize..interp::CALL_STACK_SIZE].copy_from_slice(&halt_off.to_le_bytes());
     interp::interpret(&mut st, &mut mem, bc).map_err(|e| anyhow!("[23] interp failed: {:?}", e))?;
     let rax = u64::from_le_bytes(st[interp::STATE_VREGS+0*8..][..8].try_into().unwrap());
     assert_eq!(rax, want, "[23] whole-CFG lifted interpreter: rax got {} want {}", rax, want);
@@ -3129,9 +3183,12 @@ use crate::vm::lifter::LiftedInstr;
         let mut st = vec![0u8; interp::STATE_SIZE];
         let mut mem = vec![0u8; 0x4000];
         st[interp::STATE_VREGS + 7*8..][..8].copy_from_slice(&(idx as u64).to_le_bytes()); // edi=index
-        st[interp::STATE_PTR_STACK..interp::STATE_PTR_STACK+8].copy_from_slice(&0x3000u64.to_le_bytes());
-        st[interp::STATE_SP..interp::STATE_SP+8].copy_from_slice(&0xFF8u64.to_le_bytes());
-        mem[0x3000+0xFF8..0x3000+0x1000].copy_from_slice(&halt_off.to_le_bytes());
+        // Two-stack model: init the dedicated VM return-IP stack and pre-place the
+        // outermost return ip (-> trailing HALT) on it.
+        st[interp::STATE_VREGS + 4*8..][..8].copy_from_slice(&0x3FF8u64.to_le_bytes()); // v4 = RSP (arch stack top)
+        st[interp::STATE_PTR_CALL_STACK..interp::STATE_PTR_CALL_STACK+8].copy_from_slice(&0u64.to_le_bytes());
+        st[interp::STATE_CALL_SP..interp::STATE_CALL_SP+8].copy_from_slice(&((interp::CALL_STACK_SIZE - 8) as u64).to_le_bytes());
+        mem[(interp::CALL_STACK_SIZE - 8) as usize..interp::CALL_STACK_SIZE].copy_from_slice(&halt_off.to_le_bytes());
         interp::interpret(&mut st, &mut mem, &bc).map_err(|e| anyhow!("[24] interp idx={} failed: {:?}", idx, e))?;
         let rax = u64::from_le_bytes(st[interp::STATE_VREGS+0*8..][..8].try_into().unwrap());
         assert_eq!(rax, *want, "[24] switch dispatch idx={}: rax got 0x{:X} want 0x{:X}", idx, rax, want);
@@ -3253,8 +3310,12 @@ fn run_m6_phase2_native_program_test() -> Result<()> {
     let mut mem = vec![0u8; 0x4000];
     st[interp::STATE_VREGS + 1*8..][..8].copy_from_slice(&(n as u64).to_le_bytes());
     st[interp::STATE_VREGS + 3*8..][..8].copy_from_slice(&incr.to_le_bytes());
-    st[interp::STATE_VREGS + 4*8..][..8].copy_from_slice(&0x3FF8u64.to_le_bytes()); // vreg4 = RSP (stack top)
-    mem[0x3FF8..0x4000].copy_from_slice(&halt_off.to_le_bytes());
+    st[interp::STATE_VREGS + 4*8..][..8].copy_from_slice(&0x3FF8u64.to_le_bytes()); // v4 = RSP (arch stack top)
+    // Two-stack model: init the dedicated VM return-IP stack and pre-place the
+    // outermost return ip (-> trailing HALT) on it.
+    st[interp::STATE_PTR_CALL_STACK..interp::STATE_PTR_CALL_STACK + 8].copy_from_slice(&0u64.to_le_bytes());
+    st[interp::STATE_CALL_SP..interp::STATE_CALL_SP + 8].copy_from_slice(&((interp::CALL_STACK_SIZE - 8) as u64).to_le_bytes());
+    mem[(interp::CALL_STACK_SIZE - 8) as usize..interp::CALL_STACK_SIZE].copy_from_slice(&halt_off.to_le_bytes());
     interp::interpret(&mut st, &mut mem, bc).map_err(|e| anyhow!("[26] interp failed: {:?}", e))?;
     let interp_rax = u64::from_le_bytes(st[interp::STATE_VREGS+0*8..][..8].try_into().unwrap());
     assert_eq!(interp_rax, want, "[26] lifted interpreter: rax got {} want {}", interp_rax, want);
@@ -3268,6 +3329,7 @@ fn run_m6_phase2_native_program_test() -> Result<()> {
     let module = build_vm_module(vc as u64, vt as u64, vb as u64, bc.clone(), handlers::EntryMode::Ksa)?;
     handlers::validate_vm_code(&module.code)?;
     let tramp = encode_trampoline(vs as u64, vdata as u64, vdata as u64, vc as u64, vtr as u64)?;
+    let call_stack_va = varena.base + 0xA000; // dedicated VM bytecode return-IP stack (two-stack)
     {
         let b = varena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
@@ -3279,7 +3341,14 @@ fn run_m6_phase2_native_program_test() -> Result<()> {
         b[0x6000 + interp::STATE_VREGS + 3*8..][..8].copy_from_slice(&incr.to_le_bytes());
         b[0x6000 + interp::STATE_VREGS + 4*8..][..8].copy_from_slice(&((vsz as u64) + 0xFF8).to_le_bytes());
         b[0x7000..0x7000 + 0x1000].fill(0);
-        b[0x7FF8..0x8000].copy_from_slice(&((vb as u64) + halt_off).to_le_bytes());
+        // Two-stack model: init the dedicated VM return-IP stack and pre-place the
+        // outermost return ip (absolute VA of trailing HALT) on it.
+        b[0x6000 + interp::STATE_PTR_CALL_STACK..0x6000 + interp::STATE_PTR_CALL_STACK + 8]
+            .copy_from_slice(&(call_stack_va as u64).to_le_bytes());
+        b[0x6000 + interp::STATE_CALL_SP..0x6000 + interp::STATE_CALL_SP + 8]
+            .copy_from_slice(&((interp::CALL_STACK_SIZE - 8) as u64).to_le_bytes());
+        b[(0xA000 + (interp::CALL_STACK_SIZE - 8)) as usize..0xA000 + interp::CALL_STACK_SIZE]
+            .copy_from_slice(&((vb as u64) + halt_off).to_le_bytes());
         b[0x9000..0x9000 + 0x100].fill(0);
     }
     varena.call(0x8000);

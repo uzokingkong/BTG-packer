@@ -38,6 +38,11 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
     // 실제 디스패처가 더 길어지는 일이 없도록 보수적으로 잡는다.
     let dispatcher_size = if ctx.reencrypt {
         crate::dispatcher::build_dispatcher_reencrypt(0, 0, num_blocks, ctx.mba_constant, true).len()
+    } else if ctx.block_ring {
+        // v13.4d diag: --block-ring 은 표준 디스패처에 ring-write ~24B 를 더한다.
+        // 실제 셸코드가 0x80을 넘지 않도록 여유(+0x40)를 둔다. (테이블 앞 공간만 더
+        // 예약하며, ring 저장소 자체는 pass4에서 섹션 tail에 별도로 잡는다.)
+        DISPATCHER_MAX_SIZE + 0x40
     } else {
         DISPATCHER_MAX_SIZE
     };

@@ -1,0 +1,34 @@
+# Build artifacts
+/target
+**/target
+
+# Packer runtime outputs (debug / packed binaries)
+packed*.exe
+packed*.btg_layout.log
+pack_*.log
+*.btg_layout.log
+native_ksa.bin
+bt_cdb.txt
+_*.txt
+_*.ps1
+_*.log
+
+# Archives / scratch
+*.zip
+*.rar
+*.7z
+temp_iced_src/
+src/vm/count.ps1
+pack_log.txt
+pack_keep_log.txt
+pack_novm_log.txt
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Local test scratch dir
+/test/target

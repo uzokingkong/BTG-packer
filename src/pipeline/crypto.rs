@@ -35,8 +35,8 @@ use rand::RngCore;
 /// 문자열 런 최대 개수 / 총 바이트 상한 (성능 보호)
 const MAX_STRING_RUNS: usize = 512;
 
-/// 부트 스텁의 안티디버그 블록 길이 (고정 69바이트)
-const ANTI_DEBUG_BLOCK_LEN: usize = 69;
+/// 부트 스텁의 안티디버그 블록 길이 (고정 73바이트)
+const ANTI_DEBUG_BLOCK_LEN: usize = 73;
 const MAX_STRING_TOTAL: usize = 1 << 20;
 
 /// ── 패커 측 RC4 (부트 스텁과 정확히 동일한 알고리즘) ────────────────────────────
@@ -159,10 +159,8 @@ struct BootStubCtx {
     /// 프로그램 VM 상태 버퍼 VA (부트 스텁이 초기화 후 디스패치)
     vm_prog_state_va: u64,
     /// true = 원본 프로그램 entry 블록이 제외(네이티브 유지)되어, 부트 스텁이
-    /// 프로그램 VM 디스패처(브리지) 대신 네이티브 OEP로 깨끗하게 진입한다.
-    /// (브리지는 VM infra를 r12-r15에 남기고, CRT entry는 ExitProcess로 복귀하지
-    /// 않아 그 포인터가 프로세스 내내 유지돼 Rust Once teardown이 once.rs:166
-    /// `f.take().unwrap()` on None으로 패닉한다 — clean native entry로 회피.)
+    /// 프로그램 VM 디스패처 대신 로더가 준 레지스터/RFLAGS/RSP를 정확히 복원한 뒤
+    /// 네이티브 OEP로 tail-jump한다.
     vm_oep_native_entry: bool,
     /// clean native entry가 사용할 원본 OEP VA (entry_point_rva + image_base).
     vm_oep_native_va: u64,
@@ -208,7 +206,7 @@ struct BootStubCtx {
     /// 보호할 .textb 영역 (페이지 정렬 base / 페이지 라운드업 크기)
     mem_code_base: u64,
     mem_code_size: u64,
-    /// 스택 프레임 크기 — 외부 API 호출 시 16B 정렬 보장(0x138), 아니면 0x110
+    /// 스택 프레임 크기 — 외부 API 호출 시 16B 정렬 보장(0x138), 아니면 0x118
     stack_frame: u32,
     // ── v14: import 이름 per-entry MBA 키 (다층 2단계) ─────────────────────
     /// 리졸브 테이블 이름 XOR 키 유도용 마스터 상수 (ctx.mba_constant)
@@ -220,57 +218,45 @@ struct BootStubCtx {
 /// import 이름 XOR용 MBA 상수 (패커/부트 스텁 공유 — mba_xor와 동일)
 const IMPORT_MBA_C: u32 = 0x9E37_79B9;
 
-/// 올바른 PEB 기반 안티디버그 블록 (71바이트, 정상 경로는 RC4 코드로 fall-through)
-///
-/// 레이아웃:
-///   0x00 mov rax, gs:[0x60]        ; PEB
-///   0x09 movzx eax, byte [rax+2]   ; BeingDebugged
-///   0x0D test eax, eax
-///   0x0F jnz +0x34 -> 0x45 (ud2)
-///   0x11 mov rax, gs:[0x60]
-///   0x1A mov eax, [rax+0xBC]       ; NtGlobalFlag
-///   0x20 and eax, 0x70
-///   0x25 jnz +0x1E -> 0x45 (ud2)
-///   0x27 mov rax, gs:[0x60]
-///   0x30 mov rax, [rax+0x30]       ; ProcessHeap
-///   0x36 mov eax, [rax+0x70]       ; Heap.Flags
-///   0x3C and eax, 0x70
-///   0x41 jnz +0x02 -> 0x45 (ud2)
-///   0x43 jmp +0x02 -> 0x47 (rc4_start, skip ud2)
-///   0x45 ud2
-///   0x47 rc4_start
+/// 올바른 PEB 기반 안티디버그 블록.
+/// RAX/RFLAGS를 저장한 뒤 세 가지 PEB 검사를 수행한다. 정상 경로는 둘을 원상
+/// 복원하고 RC4 블록으로 이어지며, 탐지 경로는 `ud2`에서 종료한다.
 fn build_anti_debug_raw_block() -> Vec<u8> {
     vec![
-        // 0x00 mov rax, gs:[0x60] (PEB)
+        0x9C, // pushfq
+        0x50, // push rax
+        // mov rax, gs:[0x60] (PEB)
         0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00,
-        // 0x09 movzx eax, byte [rax+2] (BeingDebugged)
+        // movzx eax, byte [rax+2] (BeingDebugged)
         0x0F, 0xB6, 0x40, 0x02,
-        // 0x0D test eax, eax
+        // test eax, eax
         0x85, 0xC0,
-        // 0x0F jnz +0x32 → ud2 @0x43
+        // jnz +0x32 → ud2
         0x75, 0x32,
-        // 0x11 mov rax, gs:[0x60]
+        // mov rax, gs:[0x60]
         0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00,
-        // 0x1A mov eax, [rax+0xBC] (NtGlobalFlag)
+        // mov eax, [rax+0xBC] (NtGlobalFlag)
         0x8B, 0x80, 0xBC, 0x00, 0x00, 0x00,
-        // 0x20 and eax, 0x70
+        // and eax, 0x70
         0x25, 0x70, 0x00, 0x00, 0x00,
-        // 0x25 jnz +0x1C → ud2
+        // jnz +0x1C → ud2
         0x75, 0x1C,
-        // 0x27 mov rax, gs:[0x60]
+        // mov rax, gs:[0x60]
         0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00,
-        // 0x30 mov rax, [rax+0x30] (ProcessHeap)
+        // mov rax, [rax+0x30] (ProcessHeap)
         0x48, 0x8B, 0x40, 0x30,
-        // 0x36 mov eax, [rax+0x70] (Heap.Flags)
+        // mov eax, [rax+0x70] (Heap.Flags)
         0x8B, 0x80, 0x70, 0x00, 0x00, 0x00,
-        // 0x3C and eax, 0x70
+        // and eax, 0x70
         0x25, 0x70, 0x00, 0x00, 0x00,
-        // 0x41 jnz +0x02 → ud2
+        // jnz +0x02 → ud2
         0x75, 0x02,
-        // 0x43 jmp +0x02 → rc4_start (skip ud2)
+        // jmp +0x02 → restore
         0xEB, 0x02,
-        // 0x45 ud2
+        // ud2
         0x0F, 0x0B,
+        0x58, // pop rax
+        0x9D, // popfq
     ]
 }
 
@@ -505,6 +491,32 @@ fn build_rc4_block(stub: &BootStubCtx) -> Vec<u8> {
     // (inst, Option<분기 레이블>)
     let mut seq: Vec<(Instruction, Option<Label>)> = Vec::new();
 
+    // Native OEP는 새 함수 호출이 아니라 로더가 제공한 entry context의 연속이다.
+    // 부트 스텁이 사용하기 전에 모든 GPR/RFLAGS를 저장하고 tail-jump 직전에 정확히
+    // 복원한다. 이로써 원본 RSP도 바이트 단위로 동일하게 유지된다.
+    if stub.vm_oep_native_entry {
+        seq.push((Instruction::with(Code::Pushfq), None));
+        for r in [
+            Register::RAX,
+            Register::RCX,
+            Register::RDX,
+            Register::RBX,
+            Register::RBP,
+            Register::RSI,
+            Register::RDI,
+            Register::R8,
+            Register::R9,
+            Register::R10,
+            Register::R11,
+            Register::R12,
+            Register::R13,
+            Register::R14,
+            Register::R15,
+        ] {
+            seq.push((Instruction::with1(Code::Push_r64, r).unwrap(), None));
+        }
+    }
+
     // ── M6 Phase-2 (--vm-oep): 원본 프로그램의 실제 entry 레지스터를 프로그램 VM
     // 상태 버퍼에 캡처한다. 프로그램 VM은 빈 상태로 시작하면 원본 entry 블록이
     // vreg(=0)로 절대주소 접근해 [0] 크래시 → 여기서 로더가 부여한 entry 컨텍스트
@@ -544,6 +556,12 @@ fn build_rc4_block(stub: &BootStubCtx) -> Vec<u8> {
         // BUF/RUNS → seed_va 근처 여유 (부트 영역이 매핑된 RW 영역이므로 안전).
         seq.push((Instruction::with2(Code::Mov_rm64_r64, M::with_base_displ(Register::RAX, crate::vm::interp::STATE_PTR_BUF as i64), Register::R11).unwrap(), None));
         seq.push((Instruction::with2(Code::Mov_rm64_r64, M::with_base_displ(Register::RAX, crate::vm::interp::STATE_PTR_RUNS as i64), Register::R11).unwrap(), None));
+        // (state 버퍼 끝 직후, STATE_CALL_STACK_BUF(=STATE_SIZE) 이후
+        // CALL_STACK_SIZE 바이트를 별도 예약해 두stack 모델 VM return-IP 스택으로 쓴다).
+        seq.push((Instruction::with2(Code::Lea_r64_m, Register::R11, M::with_base_displ(Register::RAX, crate::vm::interp::STATE_CALL_STACK_BUF as i64)).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_rm64_r64, M::with_base_displ(Register::RAX, crate::vm::interp::STATE_PTR_CALL_STACK as i64), Register::R11).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R11, crate::vm::interp::CALL_STACK_SIZE as u64).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_rm64_r64, M::with_base_displ(Register::RAX, crate::vm::interp::STATE_CALL_SP as i64), Register::R11).unwrap(), None));
 
         // vregs: v1=RCX(PEB), v8=R8, v9=R9 (v4=RSP captured right before VM entry below)
         seq.push((Instruction::with2(Code::Mov_rm64_r64, M::with_base_displ(Register::RAX, (crate::vm::interp::STATE_VREGS as i64) + 1*8), Register::RCX).unwrap(), None));
@@ -1045,28 +1063,30 @@ fn build_rc4_block(stub: &BootStubCtx) -> Vec<u8> {
         // are intentionally left unused.
 
         if stub.vm_oep_native_entry {
-            // ── clean native OEP entry (once.rs:166 crash fix) ─────────────────
-            // 원본 entry 블록(mainCRTStartup)이 제외되어 네이티브로 남은 경우, 프로그램
-            // VM 디스패처로 들어가면 첫 동작이 OP_NATIVE_CALL 브리지가 된다. 브리지는
-            // VM infra(state/ip/table)를 callee-saved 레지스터 r12/r13/r14에, saved-RSP를
-            // r15에 스태시한 뒤 네이티브 entry를 호출하는데, CRT entry(mainCRTStartup)는
-            // ExitProcess로 프로세스를 끝내며 브리지로 복귀하지 않는다. 그 결과 VM 포인터가
-            // 프로세스 수명 동안 r12-r15에 남아 Rust 런타임을 오염시켜 종료 시점 Once
-            // teardown이 재진입하고 `f.take().unwrap()`(None) → once.rs:166 패닉.
-            // 따라서 여기서는 정상 OS-entry 레지스터 상태로 네이티브 OEP에 점프한다:
-            // rsp는 위 `add rsp,stack_frame`로 원본 entry RSP가 복원됐고, 원본 PEB는
-            // state vreg[1]에 저장돼 있으니 그것을 rcx로 다시 적재하고 나머지를 0으로 만든다.
-            // mainCRTStartup은 복귀하지 않으므로 스택/레지스터 복원은 불필요하다(안전).
-            seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RCX,
-                M::with_base_displ(Register::RAX, (crate::vm::interp::STATE_VREGS as i64) + 8)).unwrap(), None));
+            // 로더가 제공한 entry context를 정확히 복원한다. 임의로 레지스터를 0으로
+            // 만드는 것은 Windows entry 계약이 아니며 CRT/TLS 초기 상태를 바꿀 수 있다.
             for r in [
-                Register::RDX, Register::RBX, Register::RBP, Register::RSI, Register::RDI,
-                Register::R8, Register::R9, Register::R12, Register::R13, Register::R14, Register::R15,
+                Register::R15,
+                Register::R14,
+                Register::R13,
+                Register::R12,
+                Register::R11,
+                Register::R10,
+                Register::R9,
+                Register::R8,
+                Register::RDI,
+                Register::RSI,
+                Register::RBP,
+                Register::RBX,
+                Register::RDX,
+                Register::RCX,
+                Register::RAX,
             ] {
-                seq.push((Instruction::with2(Code::Xor_rm64_r64, r, r).unwrap(), None));
+                seq.push((Instruction::with1(Code::Pop_r64, r).unwrap(), None));
             }
-            seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.vm_oep_native_va).unwrap(), None));
-            seq.push((Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap(), None));
+            seq.push((Instruction::with(Code::Popfq), None));
+            // 상대 tail-jump를 사용해야 복원한 RAX를 포함한 모든 GPR이 그대로 유지된다.
+            seq.push((Instruction::with_branch(Code::Jmp_rel32_64, stub.vm_oep_native_va).unwrap(), None));
         } else {
             // 프로그램 VM: state 포인터를 RCX로 전달하고 프로그램 VM 엔트리로 점프.
             seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.vm_prog_state_va).unwrap(), None));
@@ -1241,7 +1261,7 @@ fn is_branch_code(code: iced_x86::Code) -> bool {
     let enc_opts = BlockEncoderOptions::DONT_FIX_BRANCHES;
 
     // ── 2. IP 배치 (각 명령을 개별 인코딩해 정확한 길이 측정) ──────────────────
-    // anti-debug 블록은 고정 69바이트 (ud2 @0x43). rc4 코드는 그 뒤에서 시작.
+    // anti-debug 블록은 고정 길이이며 rc4 코드는 그 뒤에서 시작한다.
     let rc4_start_va = stub.boot_va + if stub.anti_debug { ANTI_DEBUG_BLOCK_LEN as u64 } else { 0 };
     let mut ip = rc4_start_va;
     let mut label_ips: std::collections::HashMap<Label, u64> = std::collections::HashMap::new();
@@ -1791,7 +1811,9 @@ pub fn run(
         mem_ntprot_name_va: 0,
         mem_code_base: 0,
         mem_code_size: 0,
-        stack_frame: if ctx.iat_hide || ctx.mem_harden { 0x138 } else { 0x110 },
+        // Win64 entry에서 RSP는 16-byte 경계보다 8만큼 어긋나 있다. 8 mod 16인
+        // 프레임을 빼야 VM/native helper CALL 직전 RSP가 16-byte 정렬된다.
+        stack_frame: if ctx.iat_hide || ctx.mem_harden { 0x138 } else { 0x118 },
     };
 
     // 1st pass: stub 길이 측정 (runs_va/seed_va/vm_* = 0)
@@ -1872,7 +1894,9 @@ pub fn run(
     } else {
         (0, 0, 0)
     };
-    cursor += vm_prog_total;
+    // reserve the dedicated bytecode return-IP stack (CALL_STACK_SIZE) for the program VM
+    cursor += vm_prog_total
+        + if vm_prog_mod.is_some() { crate::vm::interp::CALL_STACK_SIZE } else { 0 };
     cursor = (cursor + 7) & !7; // align 8
     // v16: 패킹당 레이아웃 난독화 — 부트 스텁/시드/문자열/리졸브 테이블의 절대
     // VMA를 빌드마다 랜덤 이동시켜, 정적 분석 스크립트가 하드코딩한 오프셋을
@@ -1997,48 +2021,8 @@ pub fn run(
         old_section_len.saturating_sub(new_section_len)
     );
 
-    // ── Native Rust Thread Guard Sentinel (-2) Safety Patch (.textb) ─────────────
-    // 원본 12B 패턴: mov rax, [rcx] (48 8b 01); movzx ecx, [rax] (0f b6 08); mov [rax], 0 (c6 00 00); cmp cl, 1 (80 f9 01)
-    // 치환 12B 패턴: mov rax, [rcx] (48 8b 01); test rax, rax (48 85 c0); js +4 (78 04); movzx ecx, [rax] (0f b6 08); nop (90)
-    // rax가 음수 센티널(-2)일 때 native execution에서 0xC0000005 AV 크래시가 발생하는 것을 완전 차단한다.
-    let pat_target: [u8; 12] = [
-        0x48, 0x8b, 0x01, 0x0f, 0xb6, 0x08, 0xc6, 0x00, 0x00, 0x80, 0xf9, 0x01,
-    ];
-    let pat_repl: [u8; 12] = [
-        0x48, 0x8b, 0x01, 0x48, 0x85, 0xc0, 0x78, 0x04, 0x0f, 0xb6, 0x08, 0x90,
-    ];
-    let mut native_guards_patched = 0usize;
-    if btg.bytes.len() >= 12 {
-        let sweep_end = max_phys_end.min(btg.bytes.len().saturating_sub(12));
-        let sweep_start = first_block_offset.min(sweep_end);
-        for i in sweep_start..sweep_end {
-            if btg.bytes[i..i + 12] == pat_target {
-                btg.bytes[i..i + 12].copy_from_slice(&pat_repl);
-                native_guards_patched += 1;
-            }
-        }
-    }
-    if native_guards_patched > 0 {
-        println!("[+] Native Thread Guard Sentinel Safety Patch: Patched {} sentinel guard site(s) in .textb.", native_guards_patched);
-    }
-
-    // ── Neutralize FastFail stubs (b9 07 00 00 00 cd 29 -> ret nop) in .textb ─────
-    let ff_target: [u8; 7] = [0xb9, 0x07, 0x00, 0x00, 0x00, 0xcd, 0x29];
-    let ff_repl: [u8; 7]   = [0x31, 0xc9, 0xc3, 0x90, 0x90, 0x90, 0x90];
-    let mut textb_ff_count = 0usize;
-    if btg.bytes.len() >= 7 {
-        let sweep_end = max_phys_end.min(btg.bytes.len().saturating_sub(7));
-        let sweep_start = first_block_offset.min(sweep_end);
-        for i in sweep_start..sweep_end {
-            if btg.bytes[i..i + 7] == ff_target {
-                btg.bytes[i..i + 7].copy_from_slice(&ff_repl);
-                textb_ff_count += 1;
-            }
-        }
-    }
-    if textb_ff_count > 0 {
-        println!("[+] FastFail Safety Patch: Neutralized {} native mov ecx,7; int 29h stub(s) in .textb.", textb_ff_count);
-    }
+    // `.textb`의 Rust TLS guard와 fast-fail 바이트도 그대로 둔다. 조건 분기를
+    // 삭제하거나 noreturn fast-fail을 `ret`으로 바꾸면 종료 상태가 손상된다.
 
     // ── ud2 (0x0F 0x0B) 은 절대 NOP으로 바꾸지 않는다 ────────────────────────────
     // (v13.4c: removed the previous whole-section .textb ud2 -> nop nop sweep.)
@@ -2485,7 +2469,8 @@ mod tests {
     fn test_anti_debug_block_length() {
         let b = build_anti_debug_raw_block();
         assert_eq!(b.len(), ANTI_DEBUG_BLOCK_LEN);
-        assert_eq!(&b[b.len()-2..], &[0x0F, 0x0B]); // ud2
+        assert_eq!(&b[b.len()-4..b.len()-2], &[0x0F, 0x0B]); // ud2
+        assert_eq!(&b[b.len()-2..], &[0x58, 0x9D]); // pop rax; popfq
     }
 
     #[test]
@@ -2534,7 +2519,7 @@ mod tests {
             mem_ntprot_name_va: 0,
             mem_code_base: 0,
             mem_code_size: 0,
-            stack_frame: 0x110,
+            stack_frame: 0x118,
         };
         let ad = build_anti_debug_raw_block();
         assert_eq!(ad.len(), ANTI_DEBUG_BLOCK_LEN);
@@ -2645,7 +2630,7 @@ mod tests {
             mem_ntprot_name_va: 0,
             mem_code_base: 0,
             mem_code_size: 0,
-            stack_frame: 0x110,
+            stack_frame: 0x118,
         };
         let code = build_rc4_block(&stub);
         assert!(!code.is_empty());

@@ -166,4 +166,18 @@ pub struct CliArgs {
     /// 원본 블록/함수/명령으로 가역적으로 역추적하는 데 쓴다. (`--map`도 함께 켠다)
     #[arg(long, default_value_t = false)]
     pub sym_map: bool,
+
+    /// 원본 `.pdata` SEH 테이블을 바이트 단위로 그대로 둔다. 기본값은 원본
+    /// RUNTIME_FUNCTION 항목을 모두 보존하면서 새 디스패처 부트 leaf를 추가한다.
+    /// 이 플래그는 해당 leaf 추가도 건너뛰는 진단/호환 모드다.
+    #[arg(long, default_value_t = false)]
+    pub keep_pdata: bool,
+
+    /// v13.4d diag: 디스패처에 "마지막 32개 dispatched logical block id" ring-buffer 를
+    /// 주입한다 (표준 디스패처 경로에서만; 재암호화 디스패처는 미지원 — 경고 후 무시).
+    /// 실행 중 매 디스패치마다 target block id 를 .btg 섹션 테이블 앞 예약 영역에
+    /// 기록한다. 종료 시점 once.rs:166 패닉 직전에 dispatcher 가 어느 블록들로
+    /// 되돌아갔는지 덤프(cdb/winDbg)에서 읽어 좁히는 데 쓴다.
+    #[arg(long, default_value_t = false)]
+    pub block_ring: bool,
 }

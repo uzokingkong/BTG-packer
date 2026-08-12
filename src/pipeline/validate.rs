@@ -338,8 +338,9 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
     );
 
     // 2b. v5 (안정성): crypto 활성 시 EP가 실제 부트 스텁 프롤로그를 가리키는지 확인.
-    //     anti_debug → `mov rax, gs:[0x60]` (65 48 8B 04 25 60 00 00 00),
-    //     --vm-oep → `mov rax, imm64` (48 B8 ?? ?? ?? ?? ?? ?? ??) [OEP 레지스터 캡처],
+    //     anti_debug → `pushfq; push rax; mov rax, gs:[0x60]` (9C 50 65 ...),
+    //     --vm-oep native → `pushfq; push rax; push rcx` (9C 50 51 ...),
+    //     --vm-oep VM → `mov rax, imm64` (48 B8 ...),
     //     그 외 → `sub rsp, imm32` (48 81 EC ?? ?? ?? ??).
     if ctx.crypto_enabled {
         let ep_local = (entry_rva - ep_sec.rva) as usize;
@@ -348,10 +349,12 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
         if file_off + 12 <= out.len() && file_off + 12 <= raw_avail {
             let b = &out[file_off..];
             let prologue_ok = if ctx.anti_debug {
-                b.len() >= 9 && b[0..9] == [0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]
+                b.len() >= 5 && b[0..5] == [0x9C, 0x50, 0x65, 0x48, 0x8B]
             } else if ctx.vm_oep {
-                // --vm-oep: 부트 스텁 첫 명령이 OEP 캡처 `mov rax, imm64` (48 B8 ..).
-                b.len() >= 3 && b[0] == 0x48 && b[1] == 0xB8
+                // Native fallback saves the exact loader context; a fully lifted
+                // entry starts by loading the VM state address into RAX.
+                (b.len() >= 3 && b[0..3] == [0x9C, 0x50, 0x51])
+                    || (b.len() >= 2 && b[0..2] == [0x48, 0xB8])
             } else {
                 b.len() >= 3 && b[0] == 0x48 && b[1] == 0x81 && b[2] == 0xEC
             };

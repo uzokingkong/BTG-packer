@@ -110,6 +110,12 @@ pub struct PipelineContext {
     /// mem-harden 문자열 VA
     pub mem_ntdll_name_va: u64,
     pub mem_ntprot_name_va: u64,
+    /// --keep-pdata — 원본 .pdata를 바이트 단위로 유지한다. 기본 모드도 모든 원본
+    /// 항목을 보존하지만 디스패처 부트 leaf를 하나 추가한다.
+    pub keep_pdata: bool,
+    /// v13.4d diag: --block-ring — 표준 디스패처에 마지막 32개 logical block id
+    /// ring-buffer 를 주입한다 (재암호화 디스패처는 미지원).
+    pub block_ring: bool,
 }
 
 impl PipelineContext {
@@ -159,6 +165,8 @@ impl PipelineContext {
             iat_table_len: 0,
             mem_ntdll_name_va: 0,
             mem_ntprot_name_va: 0,
+            keep_pdata: false,
+            block_ring: false,
         }
     }
 

@@ -301,7 +301,7 @@ pub fn lift_program_cfg(
             (start, start + len)
         })
         .collect();
-    let excluded_blocks: std::collections::HashSet<u64> = blocks
+    let mut excluded_blocks: std::collections::HashSet<u64> = blocks
         .iter()
         .filter(|bb| {
             excl.func_ranges.iter().any(|(s, e)| *s <= bb.start_va && bb.start_va < *e)
@@ -311,6 +311,41 @@ pub fn lift_program_cfg(
         })
         .map(|bb| bb.start_va)
         .collect();
+
+    // FIX(v14 redesign -- whole-program VM must actually execute): the OEP was
+    // landing in the panic/unwind/Once/lock exclusion net, which forced
+    // entry_native=true and made the boot stub jump straight to the native OEP
+    // (the Program VM was built but never dispatched). Force the OEP into the
+    // VM so the boot stub enters the Program VM, which runs the lifted OEP and
+    // enters every excluded runtime callee through the native-call bridge.
+    // Only do this if the entry block itself lifts cleanly (no unsupported
+    // instructions); otherwise fall back to the native-OEP route.
+    if entry_point_va != 0 {
+        let entry_liftable = blocks
+            .iter()
+            .find(|bb| bb.start_va == entry_point_va)
+            .map(|bb| {
+                let real: Vec<iced_x86::Instruction> = bb
+                    .instructions
+                    .iter()
+                    .copied()
+                    .filter(|i| !is_zero_padding(i))
+                    .collect();
+                let seq: Vec<LiftedInstr> = real.iter().map(|i| LiftedInstr::plain(*i)).collect();
+                diagnose_unsupported(&seq).is_empty()
+            })
+            .unwrap_or(false);
+        if entry_liftable {
+            excluded_blocks.remove(&entry_point_va);
+            println!(
+                "[+] --vm-oep: OEP virtualized (entry_native=false) -- Program VM now dispatches the program; excluded runtime callees run via the native-call bridge"
+            );
+        } else {
+            println!(
+                "[!] --vm-oep: OEP not liftable -- keeping entry_native=true (fall back to native OEP)"
+            );
+        }
+    }
     if !excluded_blocks.is_empty() {
         println!(
             "[+] --vm-oep: excluding {} Rust panic/unwind/Once runtime block(s) from VMization (native SEH preserved)",

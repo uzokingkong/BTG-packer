@@ -46,45 +46,12 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, needs_boot_stub: bool, t
     let dispatcher_va = ctx.dispatcher_va;
     let dispatcher_rva = ctx.dispatcher_rva;
     let num_blocks = layout.shuffled_blocks.len();
-
-    // ── 디스패처 셸코드 생성 ─────────────────────────────────────────────────────
-    // v8(Phase 0.3): 재암호화 디스패처는 블록별 RC4 KSA/PRGA 서브루틴을 내장한다.
-    let dispatcher_bytes = if ctx.reencrypt {
-        dispatcher::build_dispatcher_reencrypt(
-            dispatcher_va,
-            table_offset,
-            num_blocks,
-            ctx.mba_constant,
-            trace_blocks,
-        )
-    } else {
-        dispatcher::build_dispatcher(
-            dispatcher_va,
-            table_offset,
-            num_blocks,
-            trace_blocks,
-            ctx.mba_constant,
-        )
-    };
-    dispatcher::validate_dispatcher(&dispatcher_bytes)?;
-
-    println!(
-        "[+] Dispatcher: table_offset=0x{:X}, shellcode_len={} bytes, available={} bytes, anti_debug={}",
-        table_offset,
-        dispatcher_bytes.len(),
-        table_offset.saturating_sub(0x20),
-        anti_debug
-    );
-
-    let disp_end = 0x20 + dispatcher_bytes.len();
-    if disp_end > table_offset {
-        return Err(anyhow::anyhow!(
-            "Dispatcher shellcode ({} bytes) overflows into jump table at offset 0x{:X}! (max {} bytes)",
-            dispatcher_bytes.len(), table_offset, table_offset - 0x20
-        ).into());
-    }
+    let block_ring = ctx.block_ring;
 
     // ── 섹션 버퍼 크기 계산 (FIX: 올바른 블록별 offset + 길이 사용) ──────────────
+    // v13.4d: --block-ring 이면 섹션 tail(부트 스텁 앞/혹은 끝)에 RING_REGION 을 예약.
+    // 디스패처가 그 VA 를 알아야 하므로, total_section_size 를 먼저 확정한 뒤
+    // 디스패처를 생성한다 (기존엔 디스패처를 먼저 만들었음).
     let mut max_phys_offset = first_block_offset;
     for block in &layout.shuffled_blocks {
         let logical_id = block.id as usize;
@@ -106,8 +73,80 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, needs_boot_stub: bool, t
     if needs_boot_stub {
         total_section_size += BOOT_AREA_RESERVE;
         ctx.crypto_enabled = true;
-        // 부트 스텁 오프셋 (섹션 tail 시작 = 예약 영역 시작)
         ctx.boot_entry_offset = (total_section_size - BOOT_AREA_RESERVE) as u32;
+    }
+
+    // ── v13.4d diag: ring-buffer tail 예약 ───────────────────────────────────────
+    // 부트 스텁이 있으면 그 직전, 없으면 섹션 끝에 RING_REGION 을 잡는다.
+    let ring_va: u64 = if block_ring {
+        let ring_off = if needs_boot_stub {
+            total_section_size - BOOT_AREA_RESERVE - dispatcher::RING_REGION
+        } else {
+            total_section_size
+        };
+        total_section_size += dispatcher::RING_REGION;
+        if needs_boot_stub {
+            // 부트 스텁이 ring 뒤로 밀린다 — OEP 진입 오프셋 재계산
+            ctx.boot_entry_offset = (total_section_size - BOOT_AREA_RESERVE) as u32;
+        }
+        dispatcher_va + ring_off as u64
+    } else {
+        0
+    };
+
+    // ── 디스패처 셸코드 생성 ─────────────────────────────────────────────────────
+    // v8(Phase 0.3): 재암호화 디스패처는 블록별 RC4 KSA/PRGA 서브루틴을 내장한다.
+    // v13.4d diag: ring-buffer 는 표준 디스패처(build_dispatcher)에서만 지원한다.
+    // 재암호화 디스패처는 핸들러가 빡빡해 안정성 리스크 — 경고 후 무시.
+    let dispatcher_bytes = if ctx.reencrypt {
+        if block_ring {
+            println!("[!] --block-ring: reencrypt dispatcher is not instrumented (standard-dispatcher only); ignored for this build.");
+        }
+        dispatcher::build_dispatcher_reencrypt(
+            dispatcher_va,
+            table_offset,
+            num_blocks,
+            ctx.mba_constant,
+            trace_blocks,
+        )
+    } else {
+        dispatcher::build_dispatcher(
+            dispatcher_va,
+            table_offset,
+            num_blocks,
+            trace_blocks,
+            ctx.mba_constant,
+            block_ring,
+            ring_va,
+        )
+    };
+    dispatcher::validate_dispatcher(&dispatcher_bytes)?;
+
+    println!(
+        "[+] Dispatcher: table_offset=0x{:X}, shellcode_len={} bytes, available={} bytes, anti_debug={}, block_ring={}",
+        table_offset,
+        dispatcher_bytes.len(),
+        table_offset.saturating_sub(0x20),
+        anti_debug,
+        block_ring
+    );
+
+    let disp_end = 0x20 + dispatcher_bytes.len();
+    if disp_end > table_offset {
+        return Err(anyhow::anyhow!(
+            "Dispatcher shellcode ({} bytes) overflows into jump table at offset 0x{:X}! (max {} bytes)",
+            dispatcher_bytes.len(), table_offset, table_offset - 0x20
+        ).into());
+    }
+    if block_ring {
+        println!(
+            "[+] Diag ring-buffer: {} entries x4B @VA 0x{:X} (next-index u32 @0x{:X}), region [0x{:X}..0x{:X})",
+            dispatcher::RING_ENTRIES,
+            ring_va,
+            ring_va + dispatcher::RING_ENTRIES as u64 * 4,
+            ring_va,
+            ring_va + dispatcher::RING_REGION as u64
+        );
     }
 
     // ── 안티 디버깅 셸코드 생성 (옵션) ───────────────────────────────────────────
@@ -116,13 +155,20 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, needs_boot_stub: bool, t
     //           절대 VA(ad_va/dispatcher_va)를 넣어 정상 경로가 디스패처로
     //           점프하도록 생성한다. (이전: tail에 배치만 하고 실행 경로가 없었음)
     let (anti_debug_bytes, ad_offset) = if anti_debug && !needs_boot_stub {
-        let off = total_section_size.saturating_sub(dispatcher::antidebug::ANTI_DEBUG_SIZE + 16);
-        let ad = dispatcher::antidebug::build_anti_debug_shellcode(
-            dispatcher_va + off as u64,
-            dispatcher_va + 0x20,
-        );
-        println!("[+] Anti-Debug: Generated {} bytes of anti-debugging shellcode.", ad.len());
-        (ad, off)
+        // v13.4d: --block-ring 을 켠 진단 빌드는 부트 스텁이 필요(needs_boot_stub)하므로
+        // 이 분기에 오지 않는다. 혹시 오더라도 ring 영역과 겹치지 않게 막아둔다.
+        if block_ring {
+            println!("[!] Anti-Debug shellcode skipped: overlaps --block-ring ring region without a boot stub (use a boot-stub config).");
+            (Vec::new(), 0)
+        } else {
+            let off = total_section_size.saturating_sub(dispatcher::antidebug::ANTI_DEBUG_SIZE + 16);
+            let ad = dispatcher::antidebug::build_anti_debug_shellcode(
+                dispatcher_va + off as u64,
+                dispatcher_va + 0x20,
+            );
+            println!("[+] Anti-Debug: Generated {} bytes of anti-debugging shellcode.", ad.len());
+            (ad, off)
+        }
     } else {
         (Vec::new(), 0)
     };

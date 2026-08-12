@@ -33,20 +33,41 @@ fn main() -> error::Result<()> {
     // 개별 플래그가 함께 주어지면 그 플래그가 우선(OR), --full은 부족한 나머지를
     // 채운다. 상충 조합은 기존 규칙(재암호화 우선, chained/vm 무효화)으로 해소.
     let full = args.full;
+    // FIX(v14 --vm-oep + --full): --vm-oep(전체 프로그램 VM 가상화)와 --full이
+    // 함의하는 --dispatcher-reencrypt(블록 단위 네이티브 디스패치 재암호화)는 서로
+    // 배타적인 디스패치 모델이다. vm-oep는 부트 스텁 bulk-복호화 경로를 써서 원본
+    // 프로그램을 프로그램 VM으로 lift하므로, 둘을 함께 주면(--full --vm-oep) vm-oep가
+    // 우선해서 reencrypt는 끈다. 이로써 두 플래그가 동시에 동작한다.
+    let vm_oep_requested = args.vm_oep;
     let anti_debug = args.anti_debug || full;
-    let dispatcher_reencrypt = args.dispatcher_reencrypt || full;
+    let dispatcher_reencrypt = (args.dispatcher_reencrypt || full) && !vm_oep_requested;
+    if (args.dispatcher_reencrypt || full) && vm_oep_requested {
+        eprintln!("[!] --vm-oep takes precedence over --dispatcher-reencrypt (implied by --full): per-block re-encryption skipped so the whole program can be virtualized into the program VM");
+    }
     let integrity = args.integrity || full;
     let payload_relocate = args.payload_relocate || full;
     let rsrc_register = args.rsrc_register || full;
-    let iat_hide = args.iat_hide || full;
+    // FIX(v14 --vm-oep + --full): --iat-hide(--full이 켬)는 네이티브 디스패치용 IAT
+    // 은닉/재구성이므로, 원본 프로그램 전체를 VM으로 lift해 데이터·import 포인터를
+    // 평문으로 직접 읽는 --vm-oep와 양립하지 않는다. 게다가 TLS callback이 있는 PE
+    // (Rust/CRT 대상)에선 iat-hide가 하드-에러로 실패한다. --vm-oep가 우선한다.
+    let iat_hide = (args.iat_hide || full) && !vm_oep_requested;
+    if (args.iat_hide || full) && vm_oep_requested {
+        eprintln!("[!] --vm-oep takes precedence over --iat-hide (implied by --full): IAT hiding skipped (incompatible with full-program VM virtualization / TLS-callback targets)");
+    }
     // FIX(v12.2): --dispatcher-reencrypt(런타임 블록 단위 복호화)는 .textb 블록
     // 영역에 대한 쓰기 권한이 계속 필요하다. --mem-harden(RX 전환)과 동시 적용하면
     // 디스패처의 첫 in-place 복호화가 RX 페이지에 쓰다 0xC0000005 크래시
     // (fault @ dispatcher block_crypt PRGA `xor [rcx],al`). 재암호화가 우선이며
     // mem-harden의 RX 전환은 생략한다.
-    let mem_harden = (args.mem_harden || full) && !dispatcher_reencrypt;
+    // FIX(v14 --vm-oep + --full): --mem-harden(.textb → RX 전환)은 프로그램 VM
+    // 런타임과도 양립하지 않는다 (lift된 프로그램 실행 중 .textb 쓰기 → 0xC0000005).
+    // --vm-oep가 우선해 mem-harden도 끈다.
+    let mem_harden = (args.mem_harden || full) && !dispatcher_reencrypt && !vm_oep_requested;
     if (args.mem_harden || full) && dispatcher_reencrypt {
         eprintln!("[!] --dispatcher-reencrypt takes precedence over --mem-harden: runtime per-block decryption needs writable .textb (RX transition skipped)");
+    } else if (args.mem_harden || full) && vm_oep_requested {
+        eprintln!("[!] --vm-oep takes precedence over --mem-harden (implied by --full): .textb RX switch skipped (incompatible with the program VM's runtime)");
     }
     let obf_level = if full { 3u32 } else { args.obf_level };
 
@@ -322,6 +343,10 @@ fn main() -> error::Result<()> {
     // (crypto off여도 부트 스텁이 필요할 수 있으므로 pass4보다 먼저 알아야 한다)
     ctx.iat_hide = iat_hide;
     ctx.mem_harden = mem_harden;
+    // v13.4d experiment (A/B): 원본 .pdata 유지 여부 — build.rs의 .pdata 재구성 gate
+    ctx.keep_pdata = args.keep_pdata;
+    // v13.4d diag: 디스패처 ring-buffer (마지막 32개 block id) 주입 여부
+    ctx.block_ring = args.block_ring;
 
     // ── Pass 1: CFG 추출 + MicroSlicer ────────────────────────────────────────────
     pipeline::pass1_slice::run(&mut ctx)?;
