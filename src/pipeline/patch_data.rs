@@ -457,6 +457,29 @@ pub(crate) fn collect_protected_rva_ranges(
                 if tls_rva >= s.virtual_address && tls_rva + 0x28 <= s.virtual_address + s.virtual_size {
                     let off = (tls_rva - s.virtual_address) as usize;
                     if off + 0x20 <= s.bytes.len() {
+                        // v58 (Phase 2.5-fix): protect the TLS RAW DATA TEMPLATE
+                        // [StartAddressOfRawData .. EndAddressOfRawData). The loader
+                        // copies this template into every thread's TLS slots at
+                        // process start (BEFORE the boot stub runs), so
+                        // `#[thread_local]` statics — including std's TLS-destructor
+                        // list `DTORS` (a RefCell<Vec>, borrow counter at offset 8) —
+                        // are initialized from it. Encrypting the template leaves the
+                        // DTORS borrow field as garbage, so the first
+                        // `thread_local!`-with-destructor registration at runtime
+                        // (e.g. mpsc/thread::spawn in test [9]) hits a corrupted
+                        // borrow state and aborts with "the System allocator may not
+                        // use TLS with destructors". Keep the template plaintext.
+                        let start_va = u64::from_le_bytes(
+                            s.bytes[off..off + 8].try_into().unwrap_or([0; 8]),
+                        );
+                        let end_va = u64::from_le_bytes(
+                            s.bytes[off + 8..off + 16].try_into().unwrap_or([0; 8]),
+                        );
+                        if start_va > ctx.target_info.image_base && end_va > start_va {
+                            let ts = (start_va - ctx.target_info.image_base) as u32;
+                            let te = (end_va - ctx.target_info.image_base) as u32;
+                            raw_ranges.push((ts, te));
+                        }
                         let callbacks_va = u64::from_le_bytes(
                             s.bytes[off + 0x18..off + 0x20].try_into().unwrap_or([0; 8]),
                         );
