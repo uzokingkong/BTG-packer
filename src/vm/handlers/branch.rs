@@ -32,14 +32,14 @@ pub(super) fn emit_jb8(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     seq.push((Instruction::with2(Code::Test_rm8_imm8, Register::AL, 1).unwrap(), None));
     seq.push((Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(), Some(Cl::JbTaken)));
     seq.push((Instruction::with1(Code::Inc_rm64, Register::R9).unwrap(), None));
-    seq.push((jmp_disp(), Some(Cl::Dispatch)));
+    emit_dispatch(seq, None);
     seq.push((
         Instruction::with2(Code::Movsx_r64_rm8, Register::RAX, MemoryOperand::with_base(Register::R9)).unwrap(),
         Some(Cl::JbTaken),
     ));
     seq.push((Instruction::with1(Code::Inc_rm64, Register::R9).unwrap(), None));
     seq.push((Instruction::with2(Code::Add_rm64_r64, Register::R9, Register::RAX).unwrap(), None));
-    seq.push((jmp_disp(), Some(Cl::Dispatch)));
+    emit_dispatch(seq, None);
 }
 
 // ── 0x16 JCC8 cond, rel8 (M1: full x86 conditional-branch model) ──────────
@@ -109,7 +109,7 @@ pub(super) fn emit_jcc(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq.push((Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base(Register::RCX), Register::RDX).unwrap(), None));
         seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R9, 4).unwrap(), None));
         seq.push((Instruction::with2(Code::Add_rm64_r64, Register::R9, Register::RAX).unwrap(), None));
-        seq.push((jmp_disp(), Some(Cl::Dispatch)));
+        emit_dispatch(seq, None);
     }
 
     // Handler entry: r9 -> (cond, rel)
@@ -194,10 +194,10 @@ pub(super) fn emit_jcc(seq: &mut Vec<(Instruction, Option<Cl>)>) {
 
     // taken epilogue: r9 = taken ip (rdx holds it)
     seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::RDX).unwrap(), Some(Cl::JccTaken)));
-    seq.push((jmp_disp(), Some(Cl::Dispatch)));
+    emit_dispatch(seq, None);
     // not-taken epilogue: r9 already = fallthrough (label on a non-branch)
     seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::R11, Register::R11).unwrap(), Some(Cl::JccNotTaken)));
-    seq.push((jmp_disp(), Some(Cl::Dispatch)));
+    emit_dispatch(seq, None);
 }
 
 // ── v50: 0x89 SETCC (dst_vreg, cond) — writes ONLY the low byte, preserves
@@ -299,7 +299,7 @@ pub(super) fn emit_setcc(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     seq.push((Instruction::with2(Code::And_rm64_imm32, Register::R11, !0xFFu32 as i32).unwrap(), None)); // clear low byte
     seq.push((Instruction::with2(Code::Or_rm64_r64, Register::R11, Register::RAX).unwrap(), None));       // OR in boolean
     seq.push((Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_index_scale(Register::R8, Register::RDI, 8), Register::R11).unwrap(), None));
-    seq.push((jmp_disp(), Some(Cl::Dispatch)));
+    emit_dispatch(seq, None);
 }
 
 // ── 0x13 HALT: restore + ret ───────────────────────────────────────────────

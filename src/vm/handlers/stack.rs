@@ -62,7 +62,7 @@ pub(super) fn emit_call8(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     seq.push((Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base(Register::RCX), Register::RDX).unwrap(), None));
     seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R9, 1).unwrap(), None));
     seq.push((Instruction::with2(Code::Add_rm64_r64, Register::R9, Register::RAX).unwrap(), None));
-    seq.push((jmp_disp(), Some(Cl::Dispatch)));
+    emit_dispatch(seq, None);
 }
 
 // 0x33 RET: pop bytecode return IP from the VM return-IP stack (STATE_CALL_SP)
@@ -81,7 +81,7 @@ pub(super) fn emit_ret(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(Register::R8, 0x20)).unwrap(), None));
     seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R11, 8).unwrap(), None));
     seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, 0x20), Register::R11).unwrap(), None));
-    seq.push((jmp_disp(), Some(Cl::Dispatch)));
+    emit_dispatch(seq, None);
 }
 
 // ── M3 follow-up (v24): native API bridge ─────────────────────────────────
@@ -207,7 +207,7 @@ pub(super) fn emit_native_call(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     seq.push((Instruction::with1(Code::Pop_r64, Register::R14).unwrap(), None));
     seq.push((Instruction::with1(Code::Pop_r64, Register::R13).unwrap(), None));
     seq.push((Instruction::with1(Code::Pop_r64, Register::R12).unwrap(), None));
-    seq.push((jmp_disp(), Some(Cl::Dispatch)));
+    emit_dispatch(seq, None);
 }
 
 // 0x7C ret imm16 (operands: imm16): pop bytecode return IP from the VM
@@ -229,5 +229,5 @@ pub(super) fn emit_ret_imm16(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R11, 8).unwrap(), None));
     seq.push((Instruction::with2(Code::Add_rm64_r64, Register::R11, Register::RDI).unwrap(), None));
     seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, 0x20), Register::R11).unwrap(), None));
-    seq.push((jmp_disp(), Some(Cl::Dispatch)));
+    emit_dispatch(seq, None);
 }

@@ -64,7 +64,7 @@ pub(super) fn emit_lea(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     seq.push((Instruction::with2(Code::Add_rm64_r64, Register::R11, Register::RAX).unwrap(), None));
     seq.push((Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RSI), Register::R11).unwrap(), None));
     seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R9, 8).unwrap(), None));
-    seq.push((jmp_disp(), Some(Cl::Dispatch)));
+    emit_dispatch(seq, None);
 }
 
 // ── M2 follow-up (v24) 0x35 OP_SET_RIP (imm64) — STATE_RIP = imm64 ──────────
@@ -72,7 +72,7 @@ pub(super) fn emit_set_rip(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, MemoryOperand::with_base(Register::R9)).unwrap(), Some(Cl::Handler(OP_SET_RIP))));
     seq.push((Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, STATE_RIP as i32), Register::RAX).unwrap(), None));
     seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R9, 8).unwrap(), None));
-    seq.push((jmp_disp(), Some(Cl::Dispatch)));
+    emit_dispatch(seq, None);
 }
 
 // ── M2 follow-up (v24) 0x36 OP_LEA_RIP (dst, rel32) — vreg[dst] = STATE_RIP + sext(rel32) ──
@@ -83,7 +83,7 @@ pub(super) fn emit_lea_rip(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::R11).unwrap(), None));
     seq.push((Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(), None));
     seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R9, 5).unwrap(), None));
-    seq.push((jmp_disp(), Some(Cl::Dispatch)));
+    emit_dispatch(seq, None);
 }
 
 // ── 0x6B OP_LEA_GS (dst, disp32) — vreg[dst] = STATE_SEG_GS + sext(disp32) ──
@@ -98,7 +98,7 @@ pub(super) fn emit_lea_gs(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::R11).unwrap(), None));
     seq.push((Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(), None));
     seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R9, 5).unwrap(), None));
-    seq.push((jmp_disp(), Some(Cl::Dispatch)));
+    emit_dispatch(seq, None);
 }
 
 // ── M2 follow-up (v24) 0x37-0x3C absolute-address memory loads (dst, addr) ──
@@ -118,7 +118,7 @@ pub(super) fn emit_mem_loads_abs(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq.push((Instruction::with2(code, dst_reg, MemoryOperand::with_base(Register::R11)).unwrap(), None));
         seq.push((Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(), None));
         seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap(), None));
-        seq.push((jmp_disp(), Some(Cl::Dispatch)));
+        emit_dispatch(seq, None);
     }
 }
 

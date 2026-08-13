@@ -12,6 +12,7 @@
 //
 // Register contract inside the VM:
 //   r8  = state buffer base      r9  = bytecode ip      r10 = handler table base
+//   r15 = MBA handler-table key K (derived once at entry; 0 on the plain path)
 //   rax/rcx/rdx/r11 = scratch (clobbered freely)
 //
 // The generated code is position-independent except for two absolute imm64s in
@@ -132,14 +133,50 @@ fn jmp_disp() -> Instruction {
     Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap()
 }
 
-/// Append a handler: first instruction gets the Handler(op) label.
+/// Threaded-dispatch epilogue / central dispatch block (Phase 2.5, v58):
+/// fetch the opcode byte at r9, advance r9, load the handler address from the
+/// table, XOR-decrypt it with r15 (the MBA key K derived once at VM entry, or
+/// 0 for the plain path), and jump.
+///
+/// The sequence is inlined at the end of every handler (threaded dispatch —
+/// no round-trip through a shared `jmp Dispatch`), so each VM instruction pays
+/// a single indirect jump instead of two, and the CPU's indirect-branch
+/// predictor sees one stable thread of `jmp [r10+rax*8]` targets. `emit_dispatch`
+/// is also used once as the shared block that the entry stub jumps into.
+///
+/// `lbl` marks the first instruction (used only for the entry dispatch block;
+/// threaded epilogues pass `None`).
+fn emit_dispatch(seq: &mut Vec<(Instruction, Option<Cl>)>, lbl: Option<Cl>) {
+    seq.push((
+        Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        lbl,
+    ));
+    seq.push((Instruction::with1(Code::Inc_rm64, Register::R9).unwrap(), None));
+    seq.push((
+        Instruction::with2(
+            Code::Mov_r64_rm64,
+            Register::RAX,
+            MemoryOperand::with_base_index_scale(Register::R10, Register::RAX, 8),
+        )
+        .unwrap(),
+        None,
+    ));
+    // r15 holds K (MBA) or 0 (plain); XOR decrypts the table entry. Also clears
+    // ZF etc. — RFLAGS are never read at a handler entry (handlers capture the
+    // modelled flags into STATE_FLAGS via cap_flags), so this is safe.
+    seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R15).unwrap(), None));
+    seq.push((Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap(), None));
+}
+
+/// Append a handler: first instruction gets the Handler(op) label, then the
+/// body, then a threaded-dispatch epilogue (no `jmp Dispatch` round-trip).
 fn hdr(seq: &mut Vec<(Instruction, Option<Cl>)>, op: u8, body: Vec<Instruction>) {
     let mut it = body.into_iter();
     seq.push((it.next().unwrap(), Some(Cl::Handler(op))));
     for i in it {
         seq.push((i, None));
     }
-    seq.push((jmp_disp(), Some(Cl::Dispatch)));
+    emit_dispatch(seq, None);
 }
 
 /// The VM STATE_FLAGS slot as a memory operand `[r8 + STATE_FLAGS]`, with the
@@ -205,12 +242,13 @@ fn cap_flags_shift() -> Vec<Instruction> {
 /// M8: MBA-obfuscated VM handler table.
 ///
 /// When `mba_key` is `Some((a, b))`, the handler table stores each handler's
-/// absolute address XOR-encrypted with `K = a + b (mod 2^64)`. The dispatch loop
-/// derives `K` at runtime from the two embedded immediates via the MBA identity
-/// `a + b == (a ^ b) + 2 * (a & b)`, then XORs the loaded entry before `jmp` — so
-/// `K` never appears as a single plaintext constant, and the handler addresses in
-/// the dumped table are not directly readable. `None` keeps the original (plain)
-/// dispatch, byte-identical to pre-M8 output.
+/// absolute address XOR-encrypted with `K = a + b (mod 2^64)`. The entry stub
+/// derives `K` once at runtime from the two embedded immediates via the MBA
+/// identity `a + b == (a ^ b) + 2 * (a & b)`, keeps it in r15 for the whole VM
+/// invocation, and every dispatch XORs the loaded table entry with r15 before
+/// `jmp` — so `K` never appears as a single plaintext constant and the handler
+/// addresses in a dumped table are not directly readable. `None` keeps the
+/// original (plain) dispatch semantics (with r15 zeroed; identical behaviour).
 pub fn generate_vm_code(
     code_va: u64,
     bytecode_va: u64,
@@ -295,47 +333,32 @@ pub fn generate_vm_code(
     seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R8, Register::RCX).unwrap(), None));
     seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R9, bytecode_va).unwrap(), None));
     seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R10, table_va).unwrap(), None));
+    // v58 (Phase 2.5): the MBA table key K = a + b is derived ONCE at entry into
+    // r15 (a callee-saved register the VM owns for the whole execution — the
+    // NATIVE_CALL bridge pushes/pops it around the call, and HALT restores the
+    // caller's r15), and every dispatch XORs the loaded table entry with r15.
+    // This removes the previous 13-instruction per-dispatch K derivation
+    // (2 imm64 loads + the MBA identity + 2 push/pop) while keeping the same
+    // guarantees: `a`/`b` never appear as a single plaintext K constant, and the
+    // handler table stays XOR-masked in the file and at rest in memory. K is
+    // materialized transiently in a register only.
+    if let Some((a, b)) = mba_key {
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R15, a).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX, b).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::R15).unwrap(), None));
+        seq.push((Instruction::with2(Code::And_rm64_r64, Register::RCX, Register::RDX).unwrap(), None));
+        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RCX, Register::RCX).unwrap(), None));
+        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::R15, Register::RDX).unwrap(), None));
+        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::R15, Register::RCX).unwrap(), None));
+    } else {
+        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::R15, Register::R15).unwrap(), None));
+    }
     seq.push((Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap(), Some(Cl::Dispatch)));
 
     // ── Dispatch loop ───────────────────────────────────────────────────────────
-    seq.push((
-        Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, MemoryOperand::with_base(Register::R9)).unwrap(),
-        Some(Cl::Dispatch),
-    ));
-    seq.push((Instruction::with1(Code::Inc_rm64, Register::R9).unwrap(), None));
-    seq.push((
-        Instruction::with2(
-            Code::Mov_r64_rm64,
-            Register::RAX,
-            MemoryOperand::with_base_index_scale(Register::R10, Register::RAX, 8),
-        )
-        .unwrap(),
-        None,
-    ));
-    // M8: MBA handler-table decryption. K = a + b (mod 2^64); derive via the MBA
-    // identity  a + b == (a ^ b) + 2 * (a & b)  so K is not a plaintext constant.
-    // Preserve RCX and RDX across MBA computation to avoid clobbering caller/VM registers.
-    if let Some((a, b)) = mba_key {
-        seq.push((Instruction::with1(Code::Push_r64, Register::RCX).unwrap(), None));
-        seq.push((Instruction::with1(Code::Push_r64, Register::RDX).unwrap(), None));
-        // r11 = a (scratch); rcx = b
-        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R11, a).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RCX, b).unwrap(), None));
-        // rdx = a & b
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::R11).unwrap(), None));
-        seq.push((Instruction::with2(Code::And_rm64_r64, Register::RDX, Register::RCX).unwrap(), None));
-        // rdx = 2 * (a & b)
-        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RDX, Register::RDX).unwrap(), None));
-        // r11 = a ^ b
-        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::R11, Register::RCX).unwrap(), None));
-        // r11 = (a ^ b) + 2*(a & b) == a + b == K
-        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::R11, Register::RDX).unwrap(), None));
-        // rax ^= K  (decrypt handler entry)
-        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R11).unwrap(), None));
-        seq.push((Instruction::with1(Code::Pop_r64, Register::RDX).unwrap(), None));
-        seq.push((Instruction::with1(Code::Pop_r64, Register::RCX).unwrap(), None));
-    }
-    seq.push((Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap(), None));
+    // Shared block reached only from the entry stub (threaded dispatch inlines
+    // the same sequence at the end of every handler).
+    emit_dispatch(&mut seq, Some(Cl::Dispatch));
 
     // ── Invalid opcode handler (table[0]) ───────────────────────────────────────
     seq.push((Instruction::with(Code::Ud2), Some(Cl::Invalid)));
