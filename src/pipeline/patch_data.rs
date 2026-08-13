@@ -164,6 +164,19 @@ pub fn run(ctx: &mut PipelineContext, mut relayed_sections: Vec<SectionData>) ->
             continue;
         }
 
+        // v59 (--vm-oep): 프로그램은 Program VM + 원본 .text 네이티브 브리지로
+        // 실행된다. 여기서 .rdata/.data 함수 포인터를 셔플 블록(.textb) 주소로
+        // 재배치하면, 네이티브 CRT(_initterm 등)가 **프롤로그 없이 mid-function
+        // 블록**을 실행해 RSP 정렬이 붕괴되고 GetModuleHandleA 내부 movaps
+        // 미정렬 AV로 크래시한다 (problem.txt 진단). vm_oep 모드에서는 포인터를
+        // **원본 .text 주소 그대로 유지**한다 — 원본 .text는 평문 안전 복사본으로
+        // 보존·실행 가능하고, VM 브리지도 같은 주소로 네이티브 함수를 호출하므로
+        // 실행 모델이 일관된다. (비-oep 모드는 전체가 블록 디스패치로 실행되어
+        // 이 재배치가 일관되게 동작하므로 유지.)
+        if ctx.vm_oep {
+            continue;
+        }
+
         let text_rva_start = ctx.target_info.text_rva;
         let text_rva_end = ctx.target_info.text_rva + ctx.target_info.text_vsize as u32;
 

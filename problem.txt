@@ -158,4 +158,37 @@ entry_native 제거)과 독립적으로 추적할 것.
   과대 확장과 달리 최소 집합만 네이티브로 남김.)
   참고: --full은 이 타깃(TLS callback)에 대해 기존의 --iat-hide 제한으로 계속
   실패 — 이번 변경과 무관 (main.rs v14 코멘트 참조).
+
+  [진단 갱신 2026-08-14] --vm-oep 부트 크래시 cdb 재진단. 확인된 사실:
+   1) 부트 스텁은 Program VM 진입(0x14008B560, VM state 초기화 코드)을 먼저
+      히트 — VM 진입 자체는 정상.
+   2) 그러나 크래시 지점(GetModuleHandleA 내부 movaps 미정렬 AV)의 호출자가
+      **셔플 블록(.textb) 주소**이고, 해당 블록은 `[rsp]=가비지` 상태로
+      디스패처(0x44020) 경유 진입 → Program VM과 **블록 디스패치 실행이 공존**.
+   3) 크래시 블록에서 `call [IAT→GetModuleHandleA]` 시 RSP%16==8 (정렬 위반) →
+      ntdll!RtlDosApplyFileIsolationRedirection의 movaps [rsp+220h]가 미정렬 저장
+      → 0xC0000005.
+   4) 리프트된 바이트코드에는 .textb 주소 상수가 전혀 없음(VM native_call은 원본
+      .text VA 사용). 원본 .text 섹션은 패킹 exe에서 byte-identical(패치 없음).
+   5) **.rdata/.data의 정렬 함수 포인터 132개가 .textb(0x14004xxxx+) 셔플 주소로
+      재배치**되어 있음 (patch_data.rs §4). 원본 .text 포인터는 19개만 유지.
+   → 종합: vm_oep 모드는 "Program VM + 원본 .text 네이티브 브리지" 실행 모델인데,
+     .rdata/.data 함수 포인터 재배치가 셔플 블록(.textb, block-dispatch 전용)을
+     가리켜, CRT _initterm 등이 VM 밖에서 셔플 블록을 프롤로그 없이 실행 → RSP
+     정렬/프레임 붕괴. (비-oep 모드는 전체가 블록 디스패치로 실행되므로 동일
+     재배치가 일관되어 동작.)
+   [해결 2026-08-14] 두 가지 수정으로 --vm-oep 부트 크래시 해소 → **--vm --vm-oep
+   패킹 exe [1..16] 전체 통과, FINAL CHECKSUM = baseline 동일**:
+   1) patch_data.rs §4: vm_oep 모드에서 .rdata/.data 함수 포인터 재배치를 생략하고
+      **원본 .text 주소를 유지** (ctx.vm_oep는 pass1 이전으로 설정 이동). 네이티브
+      CRT(_initterm 등)가 셔플 블록 대신 원본 함수 전체(프롤로그 포함)를 호출.
+   2) vm/lifter/cfg.rs `lift_cfg_switch`: excluded 블록으로의 native-call 브리지
+      타깃을 **포함 .pdata 함수 진입점**(func_entry_for)으로 매핑 — mid-function
+      블록 시작을 호출해 프롤로그를 건너뛰는 문제 제거 (크래시 체인 0x2c00f가
+      `call 0x113f0; mov ebx,eax` 사이 mid-function 주소였음을 cdb로 확인).
+      call/jmp/jcc의 non-lifted 타깃도 동일 매핑. (global-ref 단일 블록은
+      func_range 밖이므로 기존처럼 블록 시작 유지.)
+   전제: .text는 패킹 후 byte-identical(안전 복사본) 보존, 리프트 바이트코드는
+   .textb 주소 상수 없음(원본 VA만)을 확인. 이 두 수정은 vm_oep 모드에만 적용되고
+   비-oep 모드(--vm/--chained/--reencrypt/plain)는 기존과 동일하게 동작.
 ==============================================================================

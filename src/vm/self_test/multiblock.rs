@@ -163,7 +163,7 @@ pub(crate) fn run_switch_lift_test() -> Result<()> {
         (2i64, case_vas[2]),
         (3i64, case_vas[3]), // default case block
     ])];
-    let bc = lift_cfg_switch(&blocks, &switch_cases, &std::collections::HashMap::new(), None, &Default::default())?;
+    let bc = lift_cfg_switch(&blocks, &switch_cases, &std::collections::HashMap::new(), None, &Default::default(), &[])?;
     let bad = crate::vm::lifter::diagnose_unsupported(&{
         use crate::vm::{bytecode, handlers, import_key, interp, ksa, lifter, prga};
 use crate::vm::lifter::LiftedInstr;

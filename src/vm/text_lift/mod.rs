@@ -358,8 +358,15 @@ pub fn lift_program_cfg(
             excluded_blocks.len()
         );
     }
-    let bytecode = lift_cfg_switch(&blocks, &sc, &sc_idx, Some(entry_point_va), &excluded_blocks)
-        .map_err(|e| anyhow!("lift_program_cfg: lift_cfg failed: {}", e))?;
+    let bytecode = lift_cfg_switch(
+        &blocks,
+        &sc,
+        &sc_idx,
+        Some(entry_point_va),
+        &excluded_blocks,
+        &excl.func_ranges,
+    )
+    .map_err(|e| anyhow!("lift_program_cfg: lift_cfg failed: {}", e))?;
 
     // lift 불가 명령 진단 (실패 지점 노출 — 전체 프로그램 lift의 정확도).
     let mut unsupported = Vec::new();

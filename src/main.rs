@@ -347,6 +347,11 @@ fn main() -> error::Result<()> {
     ctx.keep_pdata = args.keep_pdata;
     // v13.4d diag: 디스패처 ring-buffer (마지막 32개 block id) 주입 여부
     ctx.block_ring = args.block_ring;
+    // M6 Phase-2: OEP→VM entry 전환 — 부트 스텁이 원본 .text를 평문 복호화하지
+    // 않고 lift된 프로그램 VM 모듈로 디스패치. (--vm 필요)
+    // v59: patch_data가 .rdata/.data 포인터 재배치를 vm_oep 모드에서 원본 .text
+    // 유지로 바꾸므로 **pass1 이전에** 설정해야 한다. (기존엔 crypto 직전 설정)
+    ctx.vm_oep = args.vm_oep && vm_enabled;
 
     // ── Pass 1: CFG 추출 + MicroSlicer ────────────────────────────────────────────
     pipeline::pass1_slice::run(&mut ctx)?;
@@ -376,7 +381,7 @@ fn main() -> error::Result<()> {
 
     // ── M6 Phase-2: OEP→VM entry 전환 — 부트 스텁이 원본 .text를 평문 복호화하지
     // 않고 lift된 프로그램 VM 모듈로 디스패치. (--vm 필요, 기본 false → 기존 경로 유지)
-    ctx.vm_oep = args.vm_oep && vm_enabled;
+    // (v59: vm_oep는 pass1 이전에 이미 설정됨 — 위의 초기화 참조)
 
     // ── M7: on-demand 재암호화(anti-dump) — 원본 .text/.data/.rdata 런을 파일에는
     // 암호문으로 저장하고 실행 중 on-demand 복호화→사용→재암호화. (--vm 필요)

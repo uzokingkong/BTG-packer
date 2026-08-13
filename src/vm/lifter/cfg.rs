@@ -136,16 +136,25 @@ pub fn lift_block(seq: &[LiftedInstr], seq_base_va: u64) -> Result<Vec<u8>> {
 
 /// M5 (v30) — multi-block control-flow lift driver.
 pub fn lift_cfg(blocks: &[crate::graph::BasicBlock]) -> Result<Vec<u8>> {
-    lift_cfg_switch(blocks, &[], &std::collections::HashMap::new(), None, &Default::default())
+    lift_cfg_switch(blocks, &[], &std::collections::HashMap::new(), None, &Default::default(), &[])
 }
 
 /// Lift a whole CFG to a single VM program.
+///
+/// `excluded` = block start VAs kept native (bridged via native_call).
+/// `excluded_func_ranges` = the whole `.pdata` function ranges those blocks
+/// belong to. When bridging to an excluded block, we must jump to the
+/// **function entry** (its prologue), NOT the mid-function block start:
+/// calling a mid-function block skips the prologue, so the callee's RSP/frame
+/// is wrong and any internal `call` is 8-byte misaligned → 0xC0000005 inside
+/// e.g. GetModuleHandleA (--vm-oep boot crash, problem.txt).
 pub fn lift_cfg_switch(
     blocks: &[crate::graph::BasicBlock],
     switch_cases: &[(u64, Vec<(i64, u64)>)],
     switch_idx: &std::collections::HashMap<u64, u8>,
     entry_va: Option<u64>,
     excluded: &std::collections::HashSet<u64>,
+    excluded_func_ranges: &[(u64, u64)],
 ) -> Result<Vec<u8>> {
     use iced_x86::FlowControl;
     let mut b = BytecodeBuilder::new();
@@ -182,13 +191,14 @@ pub fn lift_cfg_switch(
             sym_blocks.push((b.bytes.len(), bb.start_va, excluded.contains(&bb.start_va), src_len));
         }
         if excluded.contains(&bb.start_va) {
-            b.mov_r_imm64(SCRATCH, bb.start_va);
+            // v59: bridge to the enclosing FUNCTION entry so the prologue runs.
+            let target = func_entry_for(bb.start_va, excluded_func_ranges);
+            b.mov_r_imm64(SCRATCH, target);
             b.native_call(SCRATCH);
             b.ret();
             continue;
         }
-        let n = bb.instructions.len();
-        let mut va = bb.start_va;
+        let n = bb.instructions.len();        let mut va = bb.start_va;
         for (i, inst) in bb.instructions.iter().enumerate() {
             let is_last = i + 1 == n;
             let inst_va = va;
@@ -256,7 +266,7 @@ pub fn lift_cfg_switch(
                         if let Some(&lbl) = block_label.get(&t) {
                             b.jmp32(lbl);
                         } else {
-                            b.mov_r_imm64(SCRATCH, t);
+                            b.mov_r_imm64(SCRATCH, func_entry_for(t, excluded_func_ranges));
                             b.native_call(SCRATCH);
                             b.halt();
                         }
@@ -275,7 +285,7 @@ pub fn lift_cfg_switch(
                             if let Some(&lbl) = block_label.get(&t) {
                                 b.jcc32(COND_JE, lbl);
                             } else {
-                                b.mov_r_imm64(SCRATCH, t);
+                                b.mov_r_imm64(SCRATCH, func_entry_for(t, excluded_func_ranges));
                                 b.native_call(SCRATCH);
                                 b.halt();
                             }
@@ -284,7 +294,7 @@ pub fn lift_cfg_switch(
                             if let Some(&lbl) = block_label.get(&t) {
                                 b.jcc32(jcc_cond(code), lbl);
                             } else {
-                                b.mov_r_imm64(SCRATCH, t);
+                                b.mov_r_imm64(SCRATCH, func_entry_for(t, excluded_func_ranges));
                                 b.native_call(SCRATCH);
                                 b.halt();
                             }
@@ -299,7 +309,7 @@ pub fn lift_cfg_switch(
                             b.push_r(SCRATCH);
                             b.call32(lbl);
                         } else {
-                            b.mov_r_imm64(SCRATCH, t);
+                            b.mov_r_imm64(SCRATCH, func_entry_for(t, excluded_func_ranges));
                             b.native_call(SCRATCH);
                             b.halt();
                         }
@@ -336,4 +346,15 @@ pub fn lift_cfg_switch(
         let (bytes, branches, labels) = b.into_parts();
         super::ir::run_ir_pipeline(&bytes, &branches, &labels)
     }
+}
+
+/// v59: if `va` lies inside one of the excluded `.pdata` function ranges,
+/// return that function's ENTRY address so a native bridge runs the full
+/// function (prologue included). Otherwise return `va` unchanged.
+fn func_entry_for(va: u64, excluded_func_ranges: &[(u64, u64)]) -> u64 {
+    excluded_func_ranges
+        .iter()
+        .find(|&&(s, e)| s <= va && va < e)
+        .map(|&(s, _)| s)
+        .unwrap_or(va)
 }

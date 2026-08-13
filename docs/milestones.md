@@ -122,7 +122,22 @@
   모두 **[1..16] 전체 통과, FINAL CHECKSUM = 베이스라인과 동일**. 보호 커버리지
   회귀는 이 타깃에서 .text ~28%(175 함수, 0x127B0)가 네이티브 유지되는 정도로
   제한됨 (VM 경로의 11,016 블록 과대 확장과 대조).
-- ⚠️ `--vm-oep` 부트 크래시(GetModuleHandleA) — 기존 유보 (`problem.txt`).
+- [x] `--vm-oep` 부트 크래시(GetModuleHandleA) 해소 (2026-08-14). 원인/수정 2건:
+  (1) vm_oep 모드에서 `.rdata/.data` 함수 포인터가 `.textb` 셔플 주소로 재배치되어
+  네이티브 CRT가 프롤로그 없는 mid-function 블록을 실행 → patch_data §4를
+  vm_oep에서 원본 .text 유지로 전환; (2) VM native-call이 excluded 블록을
+  **함수 진입점**이 아닌 블록 시작(mid-function)으로 호출해 프롤로그를 건너뜀 →
+  `lift_cfg_switch`에 `func_entry_for`(포함 .pdata 함수 시작으로 매핑) 추가.
+  결과: **--vm --vm-oep 패킹 exe [1..16] 전체 통과, FINAL CHECKSUM = baseline
+  동일** (`problem.txt` 참조).
+- [x] **Crypto 추상화 (plan.txt 1~3단계)**: `crypto/provider.rs` — `CryptoProvider`
+  트레이트(derive_block_key/from_key/apply/encrypt_block/decrypt_block) +
+  `BlockCryptoMeta`(block_id/offset/length/nonce/epoch). RC4를 `impl CryptoProvider`
+  로 감싸 pipeline(코드 영역·런·reencrypt 블록)이 트레이트 API만 사용하도록
+  재배선. `chained_encrypt`는 `crypto::chain_encrypt`로 이동. 동작 동치 유지
+  (부트 스텁/디스패처/VM KSA·PRGA는 RC4 그대로) → --vm/--chained/--reencrypt
+  패킹 [1..16] 통과, FINAL CHECKSUM 동일. 79개 단위 테스트 통과.
+  (plan.txt 4~6단계 custom 512-bit cipher 교체는 이 경계 뒤에서 진행 예정.)
 
 ## Phase 3 — 문서 & 마무리
 - [x] `docs/vm-compiler-architecture.md` — 모듈 지도 + 절단 지점.
