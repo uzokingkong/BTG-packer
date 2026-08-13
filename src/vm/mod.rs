@@ -6,8 +6,9 @@
 //   bytecode.rs   - VM bytecode format + emitter + disassembler
 //   ksa.rs        - virtualization target: the boot stub's RC4 KSA routine
 //   lifter.rs     - x86-64 -> bytecode lifter (MVP subset)
-//   interp.rs     - reference interpreter (self-test)
-//   handlers.rs   - native x86-64 handler / dispatch / entry codegen
+//   interp/       - reference interpreter (self-test): mod(dispatch) + per-group
+//                   opcode handlers + state helpers (directory module)
+//   handlers/     - native x86-64 handler / dispatch / entry codegen (directory module)
 //
 // `build_vm_module` produces a complete, linkable VM module (machine code +
 // absolute handler table + bytecode) for a caller-supplied placement. The
