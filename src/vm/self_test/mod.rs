@@ -28,6 +28,8 @@ mod multiblock;
 mod muldiv;
 mod sse;
 mod exit;
+mod cmov;
+mod util;
 
 // ── test functions the orchestrator dispatches (from submodules) ──
 use self::a2_a5::run_a2_a5_test;
@@ -38,6 +40,7 @@ use self::a2_a5::run_a2a5_lift_residual_test;
 use self::sse::run_a5_sse_cond_test;
 use self::flags::run_carry_flag_fix_test;
 use self::exit::run_exit_teardown_test;
+use self::cmov::run_cmovcc_test;
 use self::flags::run_flags_jcc_test;
 use self::abi::run_handler_abi_test;
 use self::addr::run_m2_addr_test;
@@ -664,6 +667,15 @@ pub fn run_self_test() -> Result<()> {
         Ok(_) => println!("[34] carry/width-flag regression (SBB incoming-CF, XADD 8/16 flags, CMPXCHG flag preserve): PASS"),
         Err(e) => {
             println!("[34] carry/width-flag regression:                       FAIL ({})", e);
+            return Err(e);
+        }
+    }
+    let _ = std::io::stdout().flush();
+
+    match run_cmovcc_test() {
+        Ok(_) => println!("[35] D-1 CMOVcc (all cond families; lift==interp==native): PASS"),
+        Err(e) => {
+            println!("[35] D-1 CMOVcc:                                                FAIL ({})", e);
             return Err(e);
         }
     }
