@@ -66,12 +66,31 @@ pub struct BtgCipher {
 impl BtgCipher {
     pub fn new(key: &[u8], nonce: u32) -> Self {
         let mut key32 = [0u8; 32];
-        let n = key.len().min(32);
-        key32[..n].copy_from_slice(&key[..n]);
-        if key.len() > 32 {
-            // 32바이트를 넘는 키는 다시 섞어 32바이트로 압축 (도메인별).
-            for (i, &b) in key[32..].iter().enumerate() {
-                key32[(i + 1) % 32] = key32[(i + 1) % 32].wrapping_add(b ^ (i as u8));
+        if key.len() <= 32 {
+            key32[..key.len()].copy_from_slice(key);
+        } else {
+            // 32바이트를 초과하는 키는 256-bit 상태(8×u32)에 전체 키 바이트를 흡수 및
+            // 비선형 라운드 압축하여 모든 바이트의 엔트로피를 보존한다.
+            let mut h = [
+                0x6A09_E667u32, 0xBB67_AE85, 0x3C6E_F372, 0xA54F_F53A,
+                0x510E_527F, 0x9B05_688C, 0x1F83_D9AB, 0x5BE0_CD19,
+            ];
+            for (chunk_idx, chunk) in key.chunks(32).enumerate() {
+                for (i, &b) in chunk.iter().enumerate() {
+                    let w_idx = i / 4;
+                    let shift = (i % 4) * 8;
+                    h[w_idx] ^= (b as u32) << shift;
+                }
+                for i in 0..8 {
+                    let mut z = h[i].wrapping_add(0x9E37_79B9).wrapping_add(chunk_idx as u32);
+                    z = (z ^ (z >> 16)).wrapping_mul(0x85EB_CA6B);
+                    z = (z ^ (z >> 13)).wrapping_mul(0xC2B2_AE35);
+                    z ^= z >> 16;
+                    h[i] = z ^ h[(i + 1) % 8].rotate_left(7);
+                }
+            }
+            for (i, w) in h.iter().enumerate() {
+                key32[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
             }
         }
         BtgCipher {

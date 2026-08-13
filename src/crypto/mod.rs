@@ -22,7 +22,7 @@ pub mod permutation;
 pub mod round;
 pub mod state;
 
-pub use provider::{chain_encrypt, BlockCryptoMeta, CryptoError, CryptoProvider};
+pub use provider::{chain_encrypt, chain_encrypt_with, BlockCryptoMeta, CryptoError, CryptoProvider};
 pub use state::{BtgCipher, BtgState};
 
 #[cfg(test)]

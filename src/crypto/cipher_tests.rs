@@ -87,8 +87,8 @@ fn keystream_differs_by_counter() {
 
 #[test]
 fn avalanche_diffusion() {
-    // two states differing in one bit; after rounds the output bit-diff ratio
-    // must be high (diffusion). ~50% is ideal; require > 25%.
+    // 1-bit difference in input word; after rounds the output bit-diff ratio
+    // must reach cryptographic avalanche standard (~50%). Require >= 45%.
     let mut a = [0u32; STATE_WORDS];
     let mut b = [0u32; STATE_WORDS];
     a[5] = 0x12345678;
@@ -103,8 +103,52 @@ fn avalanche_diffusion() {
     }
     let ratio = diff_bits as f64 / (STATE_WORDS as f64 * 32.0);
     assert!(
-        ratio > 0.25,
-        "avalanche ratio too low: {:.2}% (diffusion too weak)",
+        ratio >= 0.45 && ratio <= 0.55,
+        "avalanche ratio out of bounds: {:.2}% (expected 45%..55%)",
+        ratio * 100.0
+    );
+}
+
+#[test]
+fn counter_avalanche_diffusion() {
+    // 0 -> 1 counter change (1-bit diff) must achieve >= 45% bit diffusion in the 512-bit output block
+    let key = [0x42u8; 32];
+    let st0 = super::state::BtgState::absorb(&key, 0, 0x1234).to_keystream_bytes();
+    let st1 = super::state::BtgState::absorb(&key, 1, 0x1234).to_keystream_bytes();
+    let mut diff_bits = 0u32;
+    for i in 0..64 {
+        diff_bits += (st0[i] ^ st1[i]).count_ones();
+    }
+    let ratio = diff_bits as f64 / 512.0;
+    assert!(
+        ratio >= 0.45 && ratio <= 0.55,
+        "counter avalanche ratio out of bounds: {:.2}% (expected 45%..55%)",
+        ratio * 100.0
+    );
+}
+
+#[test]
+fn long_key_entropy_diffusion() {
+    // Keys > 32 bytes: changing 1 bit in key bytes beyond 32 must diffuse across >= 45% bits
+    let mut key1 = vec![0x33u8; 64];
+    let mut key2 = vec![0x33u8; 64];
+    key2[45] ^= 0x01; // 1-bit change in extended key area
+
+    let mut c1 = BtgCipher::new(&key1, 0x99);
+    let mut c2 = BtgCipher::new(&key2, 0x99);
+    let mut buf1 = [0u8; 64];
+    let mut buf2 = [0u8; 64];
+    c1.crypt(&mut buf1);
+    c2.crypt(&mut buf2);
+
+    let mut diff_bits = 0u32;
+    for i in 0..64 {
+        diff_bits += (buf1[i] ^ buf2[i]).count_ones();
+    }
+    let ratio = diff_bits as f64 / 512.0;
+    assert!(
+        ratio >= 0.45 && ratio <= 0.55,
+        "long key avalanche ratio out of bounds: {:.2}% (expected 45%..55%)",
         ratio * 100.0
     );
 }

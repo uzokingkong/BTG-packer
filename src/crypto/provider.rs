@@ -20,6 +20,7 @@
 // 이루어진다 (plan.txt 4~6단계).
 // ==============================================================================
 
+use crate::crypto::state::BtgCipher;
 use crate::pipeline::crypto::cipher::Rc4;
 use std::fmt;
 
@@ -135,20 +136,37 @@ impl CryptoProvider for Rc4 {
     }
 }
 
-/// v7 청크 체이닝 (chain mode 전용): 256B 청크마다 이전 청크 평문으로 재키잉.
-/// `Key_i = 이전 청크 평문`, chunk0 = `anchor`. 마지막 256B 윈도우를 반환해
-/// 문자열/리졸브 테이블 런의 키로 사용한다.
-///
-/// 이 함수는 `chained_encrypt`(cipher.rs)의 로직을 이 계층으로 옮긴 것이다.
-/// 부트 스텁의 체인 복호화 셸코드와 정확히 동일해야 하므로 동작은 그대로 유지.
-pub fn chain_encrypt(buf: &mut [u8], anchor: &[u8; 256]) -> [u8; 256] {
+impl CryptoProvider for BtgCipher {
+    fn derive_block_key(master_key: &[u8], meta: &BlockCryptoMeta) -> Vec<u8> {
+        let mut key = [0u8; 32];
+        let n = master_key.len().min(32);
+        key[..n].copy_from_slice(&master_key[..n]);
+        let meta_bytes = meta.to_bytes();
+        for (i, &b) in meta_bytes.iter().enumerate() {
+            key[i % 32] ^= b.wrapping_add((i as u8).wrapping_mul(0x5A));
+        }
+        key.to_vec()
+    }
+
+    fn from_key(key: &[u8]) -> Self {
+        BtgCipher::new(key, 0)
+    }
+
+    fn apply(&mut self, buf: &mut [u8]) {
+        self.crypt(buf);
+    }
+}
+
+/// 제네릭 청크 체이닝: 임의의 `CryptoProvider`를 사용하여 256B 청크마다
+/// 이전 청크 평문으로 재키잉 암호화한다.
+pub fn chain_encrypt_with<P: CryptoProvider>(buf: &mut [u8], anchor: &[u8; 256]) -> [u8; 256] {
     let plain = buf.to_vec();
     let mut prev: [u8; 256] = *anchor;
     let mut off = 0usize;
     while off < buf.len() {
         let n = (buf.len() - off).min(256);
-        let mut rc4 = Rc4::new(&prev);
-        rc4.crypt(&mut buf[off..off + n]);
+        let mut cipher = P::from_key(&prev);
+        cipher.apply(&mut buf[off..off + n]);
         if off + n >= 256 {
             prev.copy_from_slice(&plain[off + n - 256..off + n]);
         } else {
@@ -158,6 +176,12 @@ pub fn chain_encrypt(buf: &mut [u8], anchor: &[u8; 256]) -> [u8; 256] {
         off += n;
     }
     prev
+}
+
+/// v7 청크 체이닝 (기본 Rc4 provider 호환):
+/// 부트 스텁의 체인 복호화 셸코드와 정확히 동일한 동작을 유지한다.
+pub fn chain_encrypt(buf: &mut [u8], anchor: &[u8; 256]) -> [u8; 256] {
+    chain_encrypt_with::<Rc4>(buf, anchor)
 }
 
 #[cfg(test)]
@@ -234,6 +258,51 @@ mod tests {
             off += n;
         }
         assert_eq!(data, orig, "chain decrypt must restore plaintext");
+        assert_eq!(last_key, prev);
+    }
+
+    #[test]
+    fn btg_cipher_provider_roundtrip() {
+        let key = b"btg-cipher-provider-key-01234567";
+        let meta = BlockCryptoMeta::new(42, 0x1000, 512);
+        let block_key = <BtgCipher as CryptoProvider>::derive_block_key(key, &meta);
+        let mut data = vec![0xAAu8; 512];
+        let orig = data.clone();
+        let mut enc = <BtgCipher as CryptoProvider>::from_key(&block_key);
+        let mut dec = <BtgCipher as CryptoProvider>::from_key(&block_key);
+        enc.encrypt_block(&meta, &mut data).unwrap();
+        assert_ne!(data, orig);
+        dec.decrypt_block(&meta, &mut data).unwrap();
+        assert_eq!(data, orig);
+    }
+
+    #[test]
+    fn btg_cipher_chain_encrypt_roundtrip() {
+        let anchor = [0x7Eu8; 256];
+        let mut data = vec![0u8; 600];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i * 37 + 13) as u8;
+        }
+        let orig = data.clone();
+        let last_key = chain_encrypt_with::<BtgCipher>(&mut data, &anchor);
+        assert_ne!(data, orig);
+
+        // 체인 복호화
+        let mut prev = anchor;
+        let mut off = 0usize;
+        while off < orig.len() {
+            let n = (orig.len() - off).min(256);
+            let mut cipher = <BtgCipher as CryptoProvider>::from_key(&prev);
+            cipher.apply(&mut data[off..off + n]);
+            if off + n >= 256 {
+                prev.copy_from_slice(&orig[off + n - 256..off + n]);
+            } else {
+                prev = [0u8; 256];
+                prev[..off + n].copy_from_slice(&orig[..off + n]);
+            }
+            off += n;
+        }
+        assert_eq!(data, orig, "BtgCipher chain decrypt must restore plaintext");
         assert_eq!(last_key, prev);
     }
 }

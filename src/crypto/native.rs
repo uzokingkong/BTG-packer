@@ -183,26 +183,58 @@ pub fn emit_btg_crypt_blob(state_va: u64, sbox_va: u64) -> Vec<u8> {
 }
 
 fn emit_absorb(s: &mut Seq) {
-    push(s, Instruction::with2(Code::Mov_rm32_imm32, w(0), C0).unwrap());
-    push(s, Instruction::with2(Code::Mov_rm32_imm32, w(4), C1).unwrap());
-    push(s, Instruction::with2(Code::Mov_rm32_imm32, w(8), C2).unwrap());
-    push(s, Instruction::with2(Code::Mov_rm32_imm32, w(12), C3).unwrap());
-    for i in 0..8 {
-        push(s, Instruction::with2(Code::Mov_r32_rm32, Register::EAX, MemoryOperand::with_base_displ(Register::R14, (i * 4) as i64)).unwrap());
-        push(s, Instruction::with2(Code::Mov_rm32_r32, w(4 * 4 + (i as i32) * 4), Register::EAX).unwrap());
-    }
-    // ctr_lo/hi
+    // ctr (64-bit) -> RAX (ctr_lo), RDX (ctr_hi)
     push(s, Instruction::with2(Code::Mov_r64_rm64, Register::RAX, MemoryOperand::with_base_displ(Register::R14, 0x20)).unwrap());
+    push(s, Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap());
+    push(s, Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 32).unwrap());
+    // nonce -> R8D
+    push(s, Instruction::with2(Code::Mov_r32_rm32, Register::R8D, MemoryOperand::with_base_displ(Register::R14, 0x28)).unwrap());
+
+    // st[0] = C0 ^ rol(ctr_lo, 7)
+    push(s, Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EAX).unwrap());
+    push(s, Instruction::with2(Code::Rol_rm32_imm8, Register::ECX, 7).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::ECX, C0).unwrap());
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(0), Register::ECX).unwrap());
+
+    // st[1] = C1 ^ rol(ctr_hi, 19)
+    push(s, Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EDX).unwrap());
+    push(s, Instruction::with2(Code::Rol_rm32_imm8, Register::ECX, 19).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::ECX, C1).unwrap());
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(4), Register::ECX).unwrap());
+
+    // st[2] = C2 ^ (rol(ctr_lo + 0x9E3779B9, 13) ^ ctr_hi)
+    push(s, Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EAX).unwrap());
+    push(s, Instruction::with2(Code::Add_rm32_imm32, Register::ECX, 0x9E37_79B9u32 as i32).unwrap());
+    push(s, Instruction::with2(Code::Rol_rm32_imm8, Register::ECX, 13).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_r32, Register::ECX, Register::EDX).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::ECX, C2).unwrap());
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(8), Register::ECX).unwrap());
+
+    // st[3] = C3 ^ rol(nonce, 11)
+    push(s, Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R8D).unwrap());
+    push(s, Instruction::with2(Code::Rol_rm32_imm8, Register::ECX, 11).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::ECX, C3).unwrap());
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(12), Register::ECX).unwrap());
+
+    // key 8 words (st[4..12])
+    for i in 0..8 {
+        push(s, Instruction::with2(Code::Mov_r32_rm32, Register::ECX, MemoryOperand::with_base_displ(Register::R14, (i * 4) as i64)).unwrap());
+        push(s, Instruction::with2(Code::Mov_rm32_r32, w(4 * 4 + (i as i32) * 4), Register::ECX).unwrap());
+    }
+
+    // st[12] = ctr_lo
     push(s, Instruction::with2(Code::Mov_rm32_r32, w(12 * 4), Register::EAX).unwrap());
-    push(s, Instruction::with2(Code::Shr_rm64_imm8, Register::RAX, 32).unwrap());
-    push(s, Instruction::with2(Code::Mov_rm32_r32, w(13 * 4), Register::EAX).unwrap());
-    // nonce
-    push(s, Instruction::with2(Code::Mov_r32_rm32, Register::EAX, MemoryOperand::with_base_displ(Register::R14, 0x28)).unwrap());
-    push(s, Instruction::with2(Code::Mov_rm32_r32, w(14 * 4), Register::EAX).unwrap());
-    // domain
-    push(s, Instruction::with2(Code::Mov_r32_rm32, Register::EAX, w(12 * 4)).unwrap());
-    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::EAX, u32::from_le_bytes(*b"BTGC")).unwrap());
-    push(s, Instruction::with2(Code::Mov_rm32_r32, w(15 * 4), Register::EAX).unwrap());
+    // st[13] = ctr_hi
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(13 * 4), Register::EDX).unwrap());
+    // st[14] = nonce
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(14 * 4), Register::R8D).unwrap());
+
+    // st[15] = "BTGC" ^ ctr_lo ^ rol(ctr_hi, 13)
+    push(s, Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EDX).unwrap());
+    push(s, Instruction::with2(Code::Rol_rm32_imm8, Register::ECX, 13).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_r32, Register::ECX, Register::EAX).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::ECX, u32::from_le_bytes(*b"BTGC")).unwrap());
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(15 * 4), Register::ECX).unwrap());
 }
 
 fn emit_round(s: &mut Seq) {
@@ -311,22 +343,58 @@ pub fn emit_keystream_block() -> Vec<u8> {
 }
 
 fn emit_absorb_reg(s: &mut Seq) {
-    push(s, Instruction::with2(Code::Mov_rm32_imm32, w(0), C0).unwrap());
-    push(s, Instruction::with2(Code::Mov_rm32_imm32, w(4), C1).unwrap());
-    push(s, Instruction::with2(Code::Mov_rm32_imm32, w(8), C2).unwrap());
-    push(s, Instruction::with2(Code::Mov_rm32_imm32, w(12), C3).unwrap());
+    // R11 has ctr (64-bit). Copy to RAX (ctr_lo) & RDX (ctr_hi)
+    push(s, Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R11).unwrap());
+    push(s, Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::R11).unwrap());
+    push(s, Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 32).unwrap());
+    // Load nonce from w(0xC0) into R8D
+    push(s, Instruction::with2(Code::Mov_r32_rm32, Register::R8D, w(0xC0)).unwrap());
+
+    // st[0] = C0 ^ rol(ctr_lo, 7)
+    push(s, Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EAX).unwrap());
+    push(s, Instruction::with2(Code::Rol_rm32_imm8, Register::ECX, 7).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::ECX, C0).unwrap());
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(0), Register::ECX).unwrap());
+
+    // st[1] = C1 ^ rol(ctr_hi, 19)
+    push(s, Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EDX).unwrap());
+    push(s, Instruction::with2(Code::Rol_rm32_imm8, Register::ECX, 19).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::ECX, C1).unwrap());
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(4), Register::ECX).unwrap());
+
+    // st[2] = C2 ^ (rol(ctr_lo + 0x9E3779B9, 13) ^ ctr_hi)
+    push(s, Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EAX).unwrap());
+    push(s, Instruction::with2(Code::Add_rm32_imm32, Register::ECX, 0x9E37_79B9u32 as i32).unwrap());
+    push(s, Instruction::with2(Code::Rol_rm32_imm8, Register::ECX, 13).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_r32, Register::ECX, Register::EDX).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::ECX, C2).unwrap());
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(8), Register::ECX).unwrap());
+
+    // st[3] = C3 ^ rol(nonce, 11)
+    push(s, Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R8D).unwrap());
+    push(s, Instruction::with2(Code::Rol_rm32_imm8, Register::ECX, 11).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::ECX, C3).unwrap());
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(12), Register::ECX).unwrap());
+
+    // key 8 words (st[4..12])
     for i in 0..8 {
-        push(s, Instruction::with2(Code::Mov_r32_rm32, Register::EAX, MemoryOperand::with_base_displ(Register::RSI, (i * 4) as i64)).unwrap());
-        push(s, Instruction::with2(Code::Mov_rm32_r32, w(4 * 4 + (i as i32) * 4), Register::EAX).unwrap());
+        push(s, Instruction::with2(Code::Mov_r32_rm32, Register::ECX, MemoryOperand::with_base_displ(Register::RSI, (i * 4) as i64)).unwrap());
+        push(s, Instruction::with2(Code::Mov_rm32_r32, w(4 * 4 + (i as i32) * 4), Register::ECX).unwrap());
     }
-    push(s, Instruction::with2(Code::Mov_rm32_r32, w(12 * 4), Register::R11D).unwrap());
-    push(s, Instruction::with2(Code::Shr_rm64_imm8, Register::R11, 32).unwrap());
-    push(s, Instruction::with2(Code::Mov_rm32_r32, w(13 * 4), Register::R11D).unwrap());
-    push(s, Instruction::with2(Code::Mov_r32_rm32, Register::EAX, w(0xC0)).unwrap());
-    push(s, Instruction::with2(Code::Mov_rm32_r32, w(14 * 4), Register::EAX).unwrap());
-    push(s, Instruction::with2(Code::Mov_r32_rm32, Register::EAX, w(12 * 4)).unwrap());
-    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::EAX, u32::from_le_bytes(*b"BTGC")).unwrap());
-    push(s, Instruction::with2(Code::Mov_rm32_r32, w(15 * 4), Register::EAX).unwrap());
+
+    // st[12] = ctr_lo
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(12 * 4), Register::EAX).unwrap());
+    // st[13] = ctr_hi
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(13 * 4), Register::EDX).unwrap());
+    // st[14] = nonce
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(14 * 4), Register::R8D).unwrap());
+
+    // st[15] = "BTGC" ^ ctr_lo ^ rol(ctr_hi, 13)
+    push(s, Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EDX).unwrap());
+    push(s, Instruction::with2(Code::Rol_rm32_imm8, Register::ECX, 13).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_r32, Register::ECX, Register::EAX).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::ECX, u32::from_le_bytes(*b"BTGC")).unwrap());
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(15 * 4), Register::ECX).unwrap());
 }
 
 fn emit_round_reg(s: &mut Seq) {
