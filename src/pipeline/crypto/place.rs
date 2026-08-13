@@ -564,11 +564,6 @@ pub(crate) fn place_boot_stub(
             vm_prog_entry_va,
             vm_prog_state_va
         );
-        // DEBUG(P2-4): dump handler offsets of the Program VM for parity forensics
-        {
-            let t = u64::from_le_bytes(prmod.table[0x41 * 8..0x41 * 8 + 8].try_into().unwrap());
-            eprintln!("[DBG] prog VM code VA=0x{:X} native_call handler VA=0x{:X}", prva, t);
-        }
     }
 
     // 런 테이블 헤더 + 엔트리 (절대 VA) — 문자열 런 + v6 리졸브 테이블 run

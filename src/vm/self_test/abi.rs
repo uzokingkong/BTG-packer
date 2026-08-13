@@ -328,7 +328,7 @@ pub(crate) fn run_bridge_abi_check() -> anyhow::Result<()> {
     let mut arena = Arena::new(0x40000)?;
     let va = arena.base as u64;
     let (vc, vt, vb, vs, vtr, vdata, vstack, vnative) = (
-        va + 0x1000, va + 0x4000, va + 0x5000, va + 0x6000,
+        va + 0x1000, va + 0x4800, va + 0x5000, va + 0x6000,
         va + 0x8000, va + 0x9000, va + 0x7000, va + 0xB000,
     );
     // 네이티브 5-인자 헬퍼: return rcx + 2*rdx + 4*r8 + 8*r9 + 16*d5(stack@[rsp+0x28])

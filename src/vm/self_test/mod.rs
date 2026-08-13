@@ -166,22 +166,6 @@ pub fn run_self_test() -> Result<()> {
             VM_STATE_SIZE
         );
         let tramp = encode_trampoline(state_va as u64, vsbox_va as u64, seed_va as u64, code_va as u64, tramp_va as u64)?;
-        // TEMP DEBUG(P2-5): dump handler offsets + disassemble halt region
-        {
-            let d = module.code.clone();
-            let mut dec = iced_x86::Decoder::with_ip(64, &d, 0, iced_x86::DecoderOptions::NONE);
-            let mut last = 0u64;
-            while dec.can_decode() {
-                let i = dec.decode();
-                if i.is_invalid() { break; }
-                let end = i.ip() + i.len() as u64;
-                if end > 0x32C0 {
-                    eprintln!("[DBG] 0x{:04X}: {}", i.ip(), i);
-                }
-                last = end;
-            }
-            eprintln!("[DBG] code len=0x{:X} last_end=0x{:X} halt_off=0x{:X}", module.code.len(), last, crate::vm::handlers::generate_vm_code(0, 0, 0, handlers::EntryMode::Ksa, None).map(|v| v.handler_offsets[0x13]).unwrap_or(0));
-        }
         let b = arena.bytes();
         b[0x5000..0x5000 + module.code.len()].copy_from_slice(&module.code);
         b[0x8800..0x8800 + module.table.len()].copy_from_slice(&module.table);
