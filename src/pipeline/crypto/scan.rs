@@ -151,21 +151,17 @@ pub(crate) fn gather_runs(
     };
 
     if !no_crypto && !vm_oep_effective {
-        if let Some(ti) = ctx.patched_sections.iter().position(|s| s.name == ".text") {
-            let tsec = &ctx.patched_sections[ti];
-            if !tsec.bytes.is_empty() {
-                runs.push(StringRun {
-                    sec_idx: ti,
-                    offset: 0,
-                    len: tsec.bytes.len(),
-                    va: image_base + tsec.virtual_address as u64,
-                });
-                println!(
-                    "[+] v14: original .text {} bytes registered as boot-decrypt run (plaintext hidden at rest)",
-                    tsec.bytes.len()
-                );
-            }
-        }
+        // v58 (Phase 2.5-fix): the original `.text` is deliberately NOT registered
+        // as a boot-decrypt run. The loader runs the PE's TLS callbacks BEFORE the
+        // entry point (boot stub), and those callbacks execute the ORIGINAL .text
+        // code (plus whatever it direct-calls). If the whole section were encrypted
+        // here ("hide .text at rest", v14), the TLS callback would execute
+        // ciphertext and the process dies instantly with 0xC0000005 before the
+        // boot stub ever decrypts. The design's "safe copy" intent (patch_data.rs /
+        // build.rs: keep the original .text as an executable plaintext copy for
+        // TLS/CRT/native-bridge paths) is restored: the real executing code lives
+        // in the encrypted .textb blocks, so hiding the dead .text copy buys no
+        // protection while breaking every TLS-callback target.
 
         // ── v14: 원본 데이터(.rdata/.data/.rodata)도 런타임 복호화로 은닉 ────────
         // 공격자가 flag 비교용 target_table 같은 원본 프로그램 데이터를 .rdata에서
