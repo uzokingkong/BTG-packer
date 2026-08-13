@@ -1,8 +1,9 @@
 use super::bootstub::{build_anti_debug_raw_block, build_rc4_block, BootStubCtx};
-use super::cipher::{chained_encrypt, Rc4};
+use super::cipher::Rc4;
 use super::integrity::crc32;
 use super::scan::scan_string_runs;
 use super::{run, ANTI_DEBUG_BLOCK_LEN, IMPORT_MBA_C};
+use crate::crypto::chain_encrypt;
 use crate::pe::builder::SectionData;
 use crate::pipeline::PipelineContext;
 
@@ -35,7 +36,7 @@ use crate::pipeline::PipelineContext;
         let anchor = [0xA7u8; 256];
         let mut data: Vec<u8> = (0..5000u32).map(|i| (i.wrapping_mul(31) + 7) as u8).collect();
         let orig = data.clone();
-        let last_key = chained_encrypt(&mut data, &anchor);
+        let last_key = chain_encrypt(&mut data, &anchor);
 
         let mut prev = anchor;
         let mut off = 0usize;

@@ -12,6 +12,7 @@ pub mod assembler;
 pub mod btg;
 pub mod cli;
 pub mod core;
+pub mod crypto;
 pub mod debug;
 pub mod dispatcher;
 pub mod error;

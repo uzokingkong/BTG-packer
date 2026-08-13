@@ -46,31 +46,9 @@ impl Rc4 {
     }
 }
 
-/// v7: 청크 체이닝 암호화 — 256B 청크마다 RC4를 재키잉한다.
-/// `Key_i = 이전 청크의 평문` (chunk 0 = `anchor`). 마지막 256B 윈도우를
-/// 반환해 문자열/리졸브 테이블 런의 키로 사용한다.
-
-pub(crate) fn chained_encrypt(buf: &mut [u8], anchor: &[u8; 256]) -> [u8; 256] {
-    // 평문 사본을 먼저 확보: 다음 청크의 키는 "이전 청크의 평문"이어야 한다.
-    // (부트 스텁은 복호화 후 평문 상태에서 prev 윈도우를 갱신하므로, 패커도
-    //  암호화 전 평문에서 갱신해야 스텁과 정확히 일치한다.)
-    let plain = buf.to_vec();
-    let mut prev: [u8; 256] = *anchor;
-    let mut off = 0usize;
-    while off < buf.len() {
-        let n = (buf.len() - off).min(256);
-        let mut rc4 = Rc4::new(&prev);
-        rc4.crypt(&mut buf[off..off + n]);
-        if off + n >= 256 {
-            prev.copy_from_slice(&plain[off + n - 256..off + n]);
-        } else {
-            prev = [0u8; 256];
-            prev[..off + n].copy_from_slice(&plain[..off + n]);
-        }
-        off += n;
-    }
-    prev
-}
+/// v7: 청크 체이닝 암호화는 `crate::crypto::provider::chain_encrypt`로 이동
+/// (plan.txt 1~3단계 — CryptoProvider 추상화 계층). 부트 스텁 셸코드와 동일
+/// 알고리즘을 유지하므로 동작은 그대로다.
 
 
 /// v19: 시드 생성 + RC4 키 파생 (base-bound). 패커 키 == 부트 스텁/VM 경로와 동일.

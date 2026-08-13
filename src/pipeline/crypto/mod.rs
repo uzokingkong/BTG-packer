@@ -23,14 +23,14 @@
 //   → 정적 파일에서 단순 추출 불가, 실행 시점에만 복원됨
 // ==============================================================================
 
+use crate::crypto::{chain_encrypt, BlockCryptoMeta, CryptoProvider};
 use crate::pipeline::pass4_section::BOOT_AREA_RESERVE;
 use crate::pipeline::PipelineContext;
 use anyhow::Result;
-use cipher::chained_encrypt;
 use rand::RngCore;
 
 mod bootstub;
-mod cipher;
+pub(crate) mod cipher;
 mod encode;
 mod iat;
 mod integrity;
@@ -194,9 +194,13 @@ pub fn run(
         // 개별 RC4 암호화한다. 디스패처가 매 디스패치마다 해당 블록만 복호화하고
         // 직전 블록을 재암호화한다. 문자열 런은 아래에서 영역 없이 시작하는
         // fresh RC4 스트림으로 암호화한다 (부트 스텁도 영역 복호화를 생략).
-        for (off, len, key) in &block_keys {
-            let mut rc4b = Rc4::new(&key.to_le_bytes());
-            rc4b.crypt(&mut btg.bytes[*off..*off + *len]);
+        // plan.txt 3단계: 블록 메타데이터(offset/length/block_id)로 키를 유도.
+        for (off, len, key_u32) in &block_keys {
+            let meta = BlockCryptoMeta::new(*off as u32, *off as u64, *len as u32);
+            let mut rc4b = <Rc4 as CryptoProvider>::from_key(&key_u32.to_le_bytes());
+            rc4b
+                .encrypt_block(&meta, &mut btg.bytes[*off..*off + *len])
+                .map_err(|e| anyhow::anyhow!("reencrypt block {}: {}", meta.block_id, e))?;
         }
         if integrity_effective {
             crc_source = Some(btg.bytes[code_start..code_end].to_vec());
@@ -209,9 +213,10 @@ pub fn run(
     } else if chained_effective {
         // v7: 청크 체이닝 암호화 — Key_i = 이전 청크 평문(256B), chunk0 = seed anchor.
         // 반환된 마지막 256B 윈도우가 문자열/리졸브 테이블 런의 키가 된다.
+        // (crypto 계층 chain_encrypt — boot 스텁 셸코드와 동일 알고리즘 유지)
         let mut anchor = [0u8; 256];
         anchor.copy_from_slice(&seed_masked);
-        let chain_key = chained_encrypt(&mut btg.bytes[code_start..code_end], &anchor);
+        let chain_key = chain_encrypt(&mut btg.bytes[code_start..code_end], &anchor);
         rc4 = Rc4::new(&chain_key);
         println!(
             "[+] v7 Chained-Crypto: {} bytes code region chained in 256B chunks (skip-ahead blocked)",
@@ -238,10 +243,10 @@ pub fn run(
         );
     }
 
-    // 5b. 문자열 런 (부트 스텁 런 테이블과 같은 순서)
+    // 5b. 문자열 런 (부트 스텁 런 테이블과 같은 순서) — CryptoProvider.apply
     for run in &runs {
         let sec = &mut ctx.patched_sections[run.sec_idx];
-        rc4.crypt(&mut sec.bytes[run.offset..run.offset + run.len]);
+        rc4.apply(&mut sec.bytes[run.offset..run.offset + run.len]);
     }
 
     place::place_boot_stub(
