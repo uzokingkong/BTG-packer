@@ -1,0 +1,209 @@
+// ==============================================================================
+// BTG v24 - x86-64 → VM Bytecode Lifter: shift / rotate / INC-DEC / NOT-NEG
+// ==============================================================================
+// SHL/SHR/SAR/ROL/ROR (all widths, 1/imm8/CL forms), INC/DEC and NOT/NEG on
+// register or memory destinations (load-modify-store via the scratch vregs).
+// Shared infra (`vreg`, `reg_bits`, `SCRATCH`, `SCRATCH2`, `mem_emit`) lives in
+// `super`.
+// ==============================================================================
+
+use super::mem::mem_emit;
+use super::{vreg, SCRATCH2};
+use crate::vm::bytecode::*;
+use anyhow::{Result, anyhow};
+use iced_x86::{Instruction, OpKind};
+
+/// Unified lifter for SHL, SHR, SAR, ROL, ROR (8/16/32/64-bit, reg/mem, _1/_imm8/_CL).
+pub(super) fn lift_shift_rotate(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
+    use iced_x86::Code::*;
+    use iced_x86::OpKind;
+    let code = inst.code();
+
+    let name = format!("{:?}", code);
+    let is_shl = name.starts_with("Shl_");
+    let is_shr = name.starts_with("Shr_");
+    let is_sar = name.starts_with("Sar_");
+    let is_rol = name.starts_with("Rol_");
+
+    let is8 = name.contains("_rm8_");
+    let is16 = name.contains("_rm16_");
+    let is64 = name.contains("_rm64_");
+
+    let mem_target = inst.op0_kind() == OpKind::Memory;
+    let (dst_reg, mem_addr) = if mem_target {
+        let addr = mem_emit(b, inst, 0)?;
+        let load_op = if is8 {
+            OP_MOVZX_R_MEM8_A
+        } else if is16 {
+            OP_MOVZX_R_MEM16_A
+        } else if is64 {
+            OP_MOV_R_MEM64_A
+        } else {
+            OP_MOVZX_R_MEM32_A
+        };
+        b.mem_load_a(load_op, SCRATCH2, addr);
+        (SCRATCH2, Some(addr))
+    } else {
+        (vreg(inst.op0_register())?, None)
+    };
+
+    let is_cl = name.ends_with("_CL");
+    let is_one = name.ends_with("_1");
+
+    if is_rol || name.starts_with("Ror_") {
+        let cnt = if is_one {
+            1
+        } else if is_cl {
+            if vreg(inst.op1_register())? != 1 {
+                return Err(anyhow!("lifter: CL shift source must be RCX"));
+            }
+            1
+        } else {
+            inst.immediate8() as u8
+        };
+
+        if is_rol {
+            b.rol_r_imm8(dst_reg, cnt);
+        } else {
+            b.ror_r_imm8(dst_reg, cnt);
+        }
+    } else if is_cl {
+        if vreg(inst.op1_register())? != 1 {
+            return Err(anyhow!("lifter: CL shift source must be RCX"));
+        }
+        let op = if is64 {
+            if is_shl {
+                OP_SHL64_R_CL
+            } else if is_shr {
+                OP_SHR64_R_CL
+            } else {
+                OP_SAR64_R_CL
+            }
+        } else {
+            if is_shl {
+                OP_SHL_R_CL
+            } else if is_shr {
+                OP_SHR_R_CL
+            } else {
+                OP_SAR_R_CL
+            }
+        };
+        b.shift_r_cl(op, dst_reg);
+    } else {
+        let cnt = if is_one { 1 } else { inst.immediate8() as u8 };
+        if is64 {
+            let op = if is_shl {
+                OP_SHL64_R_IMM8
+            } else if is_shr {
+                OP_SHR64_R_IMM8
+            } else {
+                OP_SAR64_R_IMM8
+            };
+            b.shift64_r_imm8(op, dst_reg, cnt);
+        } else {
+            let op = if is_shl {
+                OP_SHL_R_IMM8
+            } else if is_shr {
+                OP_SHR_R_IMM8
+            } else {
+                OP_SAR_R_IMM8
+            };
+            b.shift_r_imm8(op, dst_reg, cnt);
+        }
+    }
+
+    if is8 {
+        b.binop_r_imm32(OP_AND_R_IMM32, dst_reg, 0xFF);
+    } else if is16 {
+        b.binop_r_imm32(OP_AND_R_IMM32, dst_reg, 0xFFFF);
+    }
+
+    if let Some(addr) = mem_addr {
+        let store_op = if is8 {
+            OP_MOV_MEM8_A
+        } else if is16 {
+            OP_MOV_MEM16_A
+        } else if is64 {
+            OP_MOV_MEM64_A
+        } else {
+            OP_MOV_MEM32_A
+        };
+        b.mem_store_a(store_op, addr, dst_reg);
+    }
+
+    Ok(())
+}
+
+/// INC/DEC on a register or a memory destination (load-modify-store).
+pub(super) fn lift_incdec(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
+    use iced_x86::Code::*;
+    let is_inc = matches!(inst.code(), Inc_rm32 | Inc_rm64 | Inc_rm8 | Inc_rm16);
+    if inst.has_lock_prefix() && inst.op0_kind() == OpKind::Memory {
+        return Err(anyhow::anyhow!(
+            "lift_incdec: LOCK-prefixed memory {} must remain native (atomic RMW)",
+            inst
+        ));
+    }
+    if inst.op0_kind() == OpKind::Register {
+        let r = vreg(inst.op0_register())?;
+        if is_inc { b.inc_r(r); } else { b.dec_r(r); }
+        return Ok(());
+    }
+    let addr = mem_emit(b, inst, 0)?;
+    let sz = match inst.code() {
+        Inc_rm8 | Dec_rm8 => 8,
+        Inc_rm16 | Dec_rm16 => 16,
+        Inc_rm32 | Dec_rm32 => 32,
+        _ => 64,
+    };
+    let load = match sz { 8 => OP_MOVZX_R_MEM8_A, 16 => OP_MOVZX_R_MEM16_A, 32 => OP_MOVZX_R_MEM32_A, _ => OP_MOV_R_MEM64_A };
+    let store = match sz { 8 => OP_MOV_MEM8_A, 16 => OP_MOV_MEM16_A, 32 => OP_MOV_MEM32_A, _ => OP_MOV_MEM64_A };
+    b.mem_load_a(load, SCRATCH2, addr);
+    if is_inc { b.inc_r(SCRATCH2); } else { b.dec_r(SCRATCH2); }
+    b.mem_store_a(store, addr, SCRATCH2);
+    Ok(())
+}
+
+/// NOT / NEG — unary ops on register or memory operand.
+pub(super) fn lift_not_neg(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
+    use iced_x86::Code::*;
+    let code = inst.code();
+    let name = format!("{:?}", code);
+    let is_not = name.starts_with("Not_");
+    let is8  = name.contains("_rm8");
+    let is16 = name.contains("_rm16");
+    let is64 = name.contains("_rm64");
+
+    if inst.op0_kind() == OpKind::Register {
+        let r = vreg(inst.op0_register())?;
+        if is_not {
+            if is64 { b.not_r64(r); } else { b.not_r(r); }
+        } else {
+            if is64 { b.neg_r64(r); } else { b.neg_r(r); }
+        }
+        if is8  { b.binop_r_imm32(OP_AND_R_IMM32, r, 0xFF); }
+        if is16 { b.binop_r_imm32(OP_AND_R_IMM32, r, 0xFFFF); }
+        return Ok(());
+    }
+
+    let addr = mem_emit(b, inst, 0)?;
+    let (load, store) = if is8 {
+        (OP_MOVZX_R_MEM8_A,  OP_MOV_MEM8_A)
+    } else if is16 {
+        (OP_MOVZX_R_MEM16_A, OP_MOV_MEM16_A)
+    } else if is64 {
+        (OP_MOV_R_MEM64_A,   OP_MOV_MEM64_A)
+    } else {
+        (OP_MOVZX_R_MEM32_A, OP_MOV_MEM32_A)
+    };
+    b.mem_load_a(load, SCRATCH2, addr);
+    if is_not {
+        if is64 { b.not_r64(SCRATCH2); } else { b.not_r(SCRATCH2); }
+    } else {
+        if is64 { b.neg_r64(SCRATCH2); } else { b.neg_r(SCRATCH2); }
+    }
+    if is8  { b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH2, 0xFF); }
+    if is16 { b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH2, 0xFFFF); }
+    b.mem_store_a(store, addr, SCRATCH2);
+    Ok(())
+}
