@@ -120,4 +120,18 @@ entry_native 제거)과 독립적으로 추적할 것.
   frame까지 도달하지 못한다. → 빌드 블록용 .pdata/UNWIND_INFO 생성 필요
   (블록별 stack frame 상이 → 단일 RUNTIME_FUNCTION 불가). plan.txt P0 10단계
   (VM-OEP/native ABI/SEH 안정화)의 핵심 항목.
+
+  [심층 분석 2026-08-13] SEH 수정 시도 결과:
+  1) per-block .pdata(virtual-Begin, 원본 UNWIND_INFO 재사용) — **로더 거부**
+     (Begin = textb - 함수오프셋이 이미지 밖으로 나가 STATUS_INVALID_IMAGE_FORMAT).
+  2) 함수 연속 레이아웃(각 함수 블록을 .textb에서 주소순 연속 배치) + per-function
+     .pdata(원본 UNWIND_INFO 재사용, 이미지 내 범위) — **부분 진전**: 예외가
+     "처리"되어 0xE06D7363 미처리 → 0xC000001D(명령 중간 점프)로 변화.
+     하지만 catch 복귀 주소가 여전히 어긋나 크래시.
+  → 남은 블로커: 컴파일러가 생성한 SEH 메타데이터(**FuncInfo/catch table**)
+    이 원본 함수 주소/오프셋을 참조하는데 블록 셔플이 코드를 이동시켜
+    catch-unwind 복귀 타깃이 깨진다. 완전 수정 = 셔플 코드용 SEH 메타데이터
+    재작성(또는 SEH 함수 비셔플). 이는 plan.txt P0 "SEH 안정화"의 큰 작업.
+    (함수 연속 레이아웃은 셔플 세분도를 낮춰 보안 회귀이므로 원복함 —
+     현재 트리는 --vm 패킹 [1..9] 통과 상태 유지.)
 ==============================================================================
