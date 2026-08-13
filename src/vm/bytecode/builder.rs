@@ -485,6 +485,31 @@ impl BytecodeBuilder {
     pub fn tzcnt_r(&mut self, op: u8, dst: u8, src: u8) {
         self.bytes.extend_from_slice(&[op, dst, src]);
     }
+    // ---- v52: BMI1/2 (Group B) builder helpers -------------------------------
+    /// lzcnt: vreg[dst] = count leading zeros of vreg[src]. op = OP_LZCNT_R32/_R64.
+    pub fn lzcnt_r(&mut self, op: u8, dst: u8, src: u8) {
+        self.bytes.extend_from_slice(&[op, dst, src]);
+    }
+    /// popcnt: vreg[dst] = popcount of vreg[src]. op = OP_POPCNT_R32/_R64.
+    pub fn popcnt_r(&mut self, op: u8, dst: u8, src: u8) {
+        self.bytes.extend_from_slice(&[op, dst, src]);
+    }
+    /// blsr: vreg[dst] = vreg[src] & (vreg[src] - 1). op = OP_BLSR_R32/_R64.
+    pub fn blsr_r(&mut self, op: u8, dst: u8, src: u8) {
+        self.bytes.extend_from_slice(&[op, dst, src]);
+    }
+    /// blsmsk: vreg[dst] = vreg[src] ^ (vreg[src] - 1). op = OP_BLSMSK_R32/_R64.
+    pub fn blsmsk_r(&mut self, op: u8, dst: u8, src: u8) {
+        self.bytes.extend_from_slice(&[op, dst, src]);
+    }
+    /// blsi: vreg[dst] = vreg[src] & -vreg[src]. op = OP_BLSI_R32/_R64.
+    pub fn blsi_r(&mut self, op: u8, dst: u8, src: u8) {
+        self.bytes.extend_from_slice(&[op, dst, src]);
+    }
+    /// andn: vreg[dst] = ~vreg[src1] & vreg[src2]. op = OP_ANDN_R_R32/_R64.
+    pub fn andn_r(&mut self, op: u8, dst: u8, src1: u8, src2: u8) {
+        self.bytes.extend_from_slice(&[op, dst, src1, src2]);
+    }
     /// ret imm16: pop return ip and add imm16 to SP (cdecl cleanup).
     pub fn ret_imm16(&mut self, imm: u16) {
         self.bytes.extend_from_slice(&[OP_RET_IMM16]);

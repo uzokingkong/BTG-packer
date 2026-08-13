@@ -549,6 +549,14 @@ pub fn lift_one(
         Int_imm8 => b.halt(),
         Loopne_rel8_64_RCX => return Err(anyhow!("lifter: LOOPNE handled by block driver")),
 
+        // ---- v52: BMI1/2 (Group B) register-register forms -------------------
+        Lzcnt_r32_rm32 | Lzcnt_r64_rm64
+        | Popcnt_r32_rm32 | Popcnt_r64_rm64
+        | VEX_Andn_r32_r32_rm32 | VEX_Andn_r64_r64_rm64
+        | VEX_Blsr_r32_rm32 | VEX_Blsr_r64_rm64
+        | VEX_Blsmsk_r32_rm32 | VEX_Blsmsk_r64_rm64
+        | VEX_Blsi_r32_rm32 | VEX_Blsi_r64_rm64 => lift_bmi(b, inst)?,
+
         other => {
             return Err(crate::error::VmCompilerError::UnsupportedInstruction {
                 instruction: inst.to_string(),
@@ -639,4 +647,45 @@ mod tests {
         let bc = b.finish();
         assert!(!bc.is_empty());
     }
+}
+
+/// Lift a BMI1/2 register-register op (Group B). The bytecode uses the generic
+/// [op, dst_vreg, src_vreg] encoding (ANDN uses [op, dst, src1, src2]).
+pub(super) fn lift_bmi(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
+    use iced_x86::Code::*;
+    let d = vreg(inst.op0_register())?;
+    let code = inst.code();
+    if inst.op1_kind() == OpKind::Register {
+        let s1 = vreg(inst.op1_register())?;
+        match code {
+            Lzcnt_r32_rm32 => b.lzcnt_r(OP_LZCNT_R32, d, s1),
+            Lzcnt_r64_rm64 => b.lzcnt_r(OP_LZCNT_R64, d, s1),
+            Popcnt_r32_rm32 => b.popcnt_r(OP_POPCNT_R32, d, s1),
+            Popcnt_r64_rm64 => b.popcnt_r(OP_POPCNT_R64, d, s1),
+            VEX_Blsr_r32_rm32 => b.blsr_r(OP_BLSR_R32, d, s1),
+            VEX_Blsr_r64_rm64 => b.blsr_r(OP_BLSR_R64, d, s1),
+            VEX_Blsmsk_r32_rm32 => b.blsmsk_r(OP_BLSMSK_R32, d, s1),
+            VEX_Blsmsk_r64_rm64 => b.blsmsk_r(OP_BLSMSK_R64, d, s1),
+            VEX_Blsi_r32_rm32 => b.blsi_r(OP_BLSI_R32, d, s1),
+            VEX_Blsi_r64_rm64 => b.blsi_r(OP_BLSI_R64, d, s1),
+            VEX_Andn_r32_r32_rm32 => {
+                if inst.op2_kind() != OpKind::Register {
+                    return Err(anyhow!("lifter: andn requires register operands, got {}", inst));
+                }
+                b.andn_r(OP_ANDN_R_R32, d, s1, vreg(inst.op2_register())?);
+            }
+            VEX_Andn_r64_r64_rm64 => {
+                if inst.op2_kind() != OpKind::Register {
+                    return Err(anyhow!("lifter: andn requires register operands, got {}", inst));
+                }
+                b.andn_r(OP_ANDN_R_R64, d, s1, vreg(inst.op2_register())?);
+            }
+            _ => {
+                return Err(anyhow!("lifter: unsupported BMI op {:?}", code));
+            }
+        }
+    } else {
+        return Err(anyhow!("lifter: BMI memory-source form not yet supported: {}", inst));
+    }
+    Ok(())
 }

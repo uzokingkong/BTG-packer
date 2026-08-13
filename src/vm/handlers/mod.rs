@@ -406,6 +406,12 @@ pub fn generate_vm_code(
     alu::emit_cpuid(&mut seq);
     alu::emit_xgetbv(&mut seq);
     alu::emit_tzcnt(&mut seq);
+    alu::emit_lzcnt(&mut seq);
+    alu::emit_popcnt(&mut seq);
+    alu::emit_blsr(&mut seq);
+    alu::emit_blsmsk(&mut seq);
+    alu::emit_blsi(&mut seq);
+    alu::emit_andn(&mut seq);
     stack::emit_ret_imm16(&mut seq);
     muldiv::emit_mul_rr64(&mut seq);
     muldiv::emit_mul_rr32(&mut seq);

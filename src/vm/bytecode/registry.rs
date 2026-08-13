@@ -41,7 +41,7 @@ macro_rules! opcodes {
         )*
 
         /// Handler-table slot count (opcodes 0x00..=0x89). 0x00 = invalid-opcode handler.
-        pub const NUM_OPS: usize = 0x8B;
+        pub const NUM_OPS: usize = 0x97;
 
         /// Opcode -> (mnemonic, operand byte length after the opcode byte).
         pub const OPCODE_INFO: &[(u8, &'static str, usize)] = &[
@@ -232,6 +232,22 @@ opcodes! {
     // Interleaves the low 2 dwords of dst with the low 2 dwords of src:
     //   result = { src.d1, dst.d1, src.d0, dst.d0 }.
     OP_UNPCKLPS_XMM = 0x8A : "unpcklps", 2 ;
+    // ── v52: BMI1/2 (Group B, Phase 2.1) ─────────────────────────────────────
+    // Register-register bit-manipulation. LZCNT/POPCNT mirror TZCNT's portable
+    // (no-CPU-dep) emulation; BLSR/BLSMSK/BLSI/ANDN are plain bit arithmetic.
+    // Encoding [op, dst_vreg, src_vreg]; ANDN is [op, dst, src1, src2].
+    OP_LZCNT_R32   = 0x8B : "lzcnt32", 2 ;
+    OP_LZCNT_R64   = 0x8C : "lzcnt64", 2 ;
+    OP_POPCNT_R32  = 0x8D : "popcnt32", 2 ;
+    OP_POPCNT_R64  = 0x8E : "popcnt64", 2 ;
+    OP_BLSR_R32    = 0x8F : "blsr32", 2 ;
+    OP_BLSR_R64    = 0x90 : "blsr64", 2 ;
+    OP_BLSMSK_R32  = 0x91 : "blsmsk32", 2 ;
+    OP_BLSMSK_R64  = 0x92 : "blsmsk64", 2 ;
+    OP_BLSI_R32    = 0x93 : "blsi32", 2 ;
+    OP_BLSI_R64    = 0x94 : "blsi64", 2 ;
+    OP_ANDN_R_R32  = 0x95 : "andn32", 3 ;
+    OP_ANDN_R_R64  = 0x96 : "andn64", 3 ;
 }
 
 /// Index-slot sentinel for LEA: no index term (see opcodes! / OP_LEA).

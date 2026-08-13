@@ -345,6 +345,68 @@ pub(crate) fn exec(
             }
             Ok(ip)
         }
+        OP_LZCNT_R32 | OP_LZCNT_R64 => {
+            let d = code[ip] as usize;
+            let sr = code[ip + 1] as usize;
+            let ip = ip + 2;
+            let is64 = op == OP_LZCNT_R64;
+            let v = if is64 { *vreg64(state, sr)? } else { vreg32(state, sr)? as u64 };
+            let lz = if is64 { v.leading_zeros() as u64 } else { (v as u32).leading_zeros() as u64 };
+            *vreg64(state, d)? = lz;
+            if v == 0 { set_flags(state, F_CF | F_ZF); } else if lz == 0 { set_flags(state, F_ZF); } else { set_flags(state, 0); }
+            Ok(ip)
+        }
+        OP_POPCNT_R32 | OP_POPCNT_R64 => {
+            let d = code[ip] as usize;
+            let sr = code[ip + 1] as usize;
+            let ip = ip + 2;
+            let is64 = op == OP_POPCNT_R64;
+            let v = if is64 { *vreg64(state, sr)? } else { vreg32(state, sr)? as u64 };
+            let pc = if is64 { v.count_ones() as u64 } else { (v as u32).count_ones() as u64 };
+            *vreg64(state, d)? = pc;
+            if pc == 0 { set_flags(state, F_ZF); } else { set_flags(state, 0); }
+            Ok(ip)
+        }
+        OP_BLSR_R32 | OP_BLSR_R64 | OP_BLSMSK_R32 | OP_BLSMSK_R64 | OP_BLSI_R32 | OP_BLSI_R64 => {
+            let d = code[ip] as usize;
+            let sr = code[ip + 1] as usize;
+            let ip = ip + 2;
+            let is64 = matches!(op, OP_BLSR_R64 | OP_BLSMSK_R64 | OP_BLSI_R64);
+            if is64 {
+                let v = *vreg64(state, sr)?;
+                let r = match op {
+                    OP_BLSR_R64 => v & v.wrapping_sub(1),
+                    OP_BLSMSK_R64 => v ^ v.wrapping_sub(1),
+                    _ => v & v.wrapping_neg(),
+                };
+                *vreg64(state, d)? = r;
+            } else {
+                let v = vreg32(state, sr)?;
+                let r = match op {
+                    OP_BLSR_R32 => v & v.wrapping_sub(1),
+                    OP_BLSMSK_R32 => v ^ v.wrapping_sub(1),
+                    _ => v & v.wrapping_neg(),
+                };
+                *vreg64(state, d)? = r as u64;
+            }
+            Ok(ip)
+        }
+        OP_ANDN_R_R32 | OP_ANDN_R_R64 => {
+            let d = code[ip] as usize;
+            let s1 = code[ip + 1] as usize;
+            let s2 = code[ip + 2] as usize;
+            let ip = ip + 3;
+            if op == OP_ANDN_R_R64 {
+                let a = *vreg64(state, s1)?;
+                let b = *vreg64(state, s2)?;
+                *vreg64(state, d)? = !a & b;
+            } else {
+                let a = vreg32(state, s1)?;
+                let b = vreg32(state, s2)?;
+                *vreg64(state, d)? = (!a & b) as u64;
+            }
+            Ok(ip)
+        }
         OP_TZCNT_R32 => {
             let d = code[ip] as usize;
             let s = code[ip + 1] as usize;
