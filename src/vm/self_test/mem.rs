@@ -23,7 +23,7 @@ pub(crate) fn run_m2_mem_test() -> Result<()> {
 
     let mut arena = Arena::new(0x20000)?;
     let code_va = arena.base + 0x1000;
-    let table_va = arena.base + 0x4000;
+    let table_va = arena.base + 0x4800;
     let bc_va = arena.base + 0x5000;
     let state_va = arena.base + 0x6000;
     let data_va = arena.base + 0x7000; // S-box memory buffer
@@ -47,7 +47,7 @@ pub(crate) fn run_m2_mem_test() -> Result<()> {
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
         b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
         b[0x7000..0x7008].copy_from_slice(&pat);
     }
@@ -215,7 +215,7 @@ pub(crate) fn run_m4_cmpxchg_test() -> Result<()> {
     let mut varena = Arena::new(0x40000)?;
     let (vc, vt, vb, vs, vtr, vdata) = (
         varena.base + 0x1000,
-        varena.base + 0x4000,
+        varena.base + 0x4800,
         varena.base + 0x5000,
         varena.base + 0x6000,
         varena.base + 0x8000,
@@ -233,7 +233,7 @@ pub(crate) fn run_m4_cmpxchg_test() -> Result<()> {
     {
         let b = varena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
         b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
     }
     let vbase = varena.base as u64;

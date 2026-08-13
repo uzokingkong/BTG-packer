@@ -28,7 +28,7 @@ pub fn run_native(
     let mut arena = Arena::new(0x40000)?;
     let (vc, vt, vb, vs, vtr, vdata) = (
         arena.base + 0x1000,
-        arena.base + 0x4000,
+        arena.base + 0x4800,
         arena.base + 0x5000,
         arena.base + 0x6000,
         arena.base + 0x8000,
@@ -41,7 +41,7 @@ pub fn run_native(
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
         b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
         b[0x5000..0x5000 + prog.len()].copy_from_slice(prog);
         b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
@@ -67,7 +67,7 @@ pub fn run_native_with_data(
     let mut arena = Arena::new(0x40000)?;
     let (vc, vt, vb, vs, vtr, vdata) = (
         arena.base + 0x1000,
-        arena.base + 0x4000,
+        arena.base + 0x4800,
         arena.base + 0x5000,
         arena.base + 0x6000,
         arena.base + 0x8000,
@@ -80,7 +80,7 @@ pub fn run_native_with_data(
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
         b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
         b[0x5000..0x5000 + prog.len()].copy_from_slice(prog);
         b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);

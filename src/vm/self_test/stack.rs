@@ -20,7 +20,7 @@ pub(crate) fn run_m3_stack_test() -> Result<()> {
 
     let mut arena = Arena::new(0x30000)?;
     let code_va = arena.base + 0x1000;
-    let table_va = arena.base + 0x4000;
+    let table_va = arena.base + 0x4800;
     let bc_va = arena.base + 0x5000;
     let state_va = arena.base + 0x6000;
     let stack_va = arena.base + 0x9000; // stack region
@@ -43,7 +43,7 @@ pub(crate) fn run_m3_stack_test() -> Result<()> {
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
         b[0xA000..0xA000 + tramp.len()].copy_from_slice(&tramp);
     }
 

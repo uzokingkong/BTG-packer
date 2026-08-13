@@ -103,7 +103,7 @@ pub(crate) fn run_m4_lift_test() -> Result<()> {
     // 3) Native VM execution.
     let mut vm_arena = Arena::new(0x40000)?;
     let vm_code_va = vm_arena.base + 0x1000;
-    let vm_table_va = vm_arena.base + 0x4000;
+    let vm_table_va = vm_arena.base + 0x4800;
     let vm_bc_va = vm_arena.base + 0x5000;
     let vm_state_va = vm_arena.base + 0x6000;
     let vm_stack_va = vm_arena.base + 0x7000;
@@ -116,7 +116,7 @@ pub(crate) fn run_m4_lift_test() -> Result<()> {
     {
         let b = vm_arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
         b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
         b[0x5000..0x5000 + bc.len()].copy_from_slice(&bc);
         b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);

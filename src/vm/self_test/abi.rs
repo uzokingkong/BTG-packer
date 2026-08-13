@@ -125,9 +125,9 @@ pub fn run_handler_abi_test() -> anyhow::Result<()> {
     if s.code() != Code::Mov_r64_imm64 || s.op0_register() != Register::R10 || s.immediate64() != table_va {
         return Err(anyhow!("[33] entry r10=table_va mismatch: {:?}", s));
     }
-    let s = &insns[e0 + 31].1; // jmp dispatch
+    let s = &insns[e0 + 32].1; // jmp dispatch (r15 MBA-key zeroing inserted at [31])
     if s.code() != Code::Jmp_rel32_64 {
-        return Err(anyhow!("[33] entry[31] expected jmp dispatch, got {:?}", s.code()));
+        return Err(anyhow!("[33] entry[32] expected jmp dispatch, got {:?}", s.code()));
     }
 
     // (b) dispatch loop 검증 ────────────────────────────────────────────────
@@ -141,7 +141,9 @@ pub fn run_handler_abi_test() -> anyhow::Result<()> {
         return Err(anyhow!("[33] dispatch[2] mov rax,[r10+rax*8] mismatch: {:?}", d));
     }
     let d = &insns[d0 + 3].1;
-    if d.code() != Code::Jmp_rm64 || d.op0_register() != Register::RAX { return Err(anyhow!("[33] dispatch[3] jmp rax mismatch: {:?}", d)); }
+    if d.code() != Code::Xor_rm64_r64 || d.op0_register() != Register::RAX || d.op1_register() != Register::R15 { return Err(anyhow!("[33] dispatch[3] xor rax,r15 (MBA key) mismatch: {:?}", d)); }
+    let d = &insns[d0 + 4].1;
+    if d.code() != Code::Jmp_rm64 || d.op0_register() != Register::RAX { return Err(anyhow!("[33] dispatch[4] jmp rax mismatch: {:?}", d)); }
 
     // (c) HALT 에필로그 검증 ────────────────────────────────────────────────
     let h0 = idx(vmc.handler_offsets[OP_HALT as usize] as u64)?;
@@ -210,7 +212,7 @@ pub(crate) unsafe fn abi_runtime_probe(_vmc: crate::vm::handlers::VmCode, _code_
     let mut arena = Arena::new(0x40000)?;
     let va_base = arena.base as u64;
     let (vc, vt, vb, vs, vtr, vdata) = (
-        va_base + 0x1000, va_base + 0x4000, va_base + 0x5000,
+        va_base + 0x1000, va_base + 0x4800, va_base + 0x5000,
         va_base + 0x6000, va_base + 0x8000, va_base + 0x9000,
     );
     // 테스트 바이트코드: 간단한 산술 + 메모리 RMW + 스택 push/pop 까지 섞어
@@ -236,7 +238,7 @@ pub(crate) unsafe fn abi_runtime_probe(_vmc: crate::vm::handlers::VmCode, _code_
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
         b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
         b[0x5000..0x5000 + prog.len()].copy_from_slice(&prog);
         b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
@@ -364,7 +366,7 @@ pub(crate) fn run_bridge_abi_check() -> anyhow::Result<()> {
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x4000..0x4000 + module.table.len()].copy_from_slice(&module.table);
+        b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
         b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
         b[0xB000..0xB000 + henc.code_buffer.len()].copy_from_slice(&henc.code_buffer);
         b[0x5000..0x5000 + prog.len()].copy_from_slice(&prog);
@@ -433,7 +435,7 @@ pub(crate) fn run_m8_handler_mba_test() -> Result<()> {
         let sbox_va = arena.base + 0x2000;
         let seed_va = arena.base + 0x3000;
         let code_va = arena.base + 0x5000;
-        let table_va = arena.base + 0x8000;
+        let table_va = arena.base + 0x8800;
         let bc_va = arena.base + 0x9000;
         let state_va = arena.base + 0xA000;
         let vsbox_va = arena.base + 0xB000;
@@ -450,7 +452,7 @@ pub(crate) fn run_m8_handler_mba_test() -> Result<()> {
             b[0x2000..0x2000 + 256].fill(0);
             b[0x3000..0x3000 + 256].copy_from_slice(&seed_masked);
             b[0x5000..0x5000 + module.code.len()].copy_from_slice(&module.code);
-            b[0x8000..0x8000 + module.table.len()].copy_from_slice(&module.table);
+            b[0x8800..0x8800 + module.table.len()].copy_from_slice(&module.table);
             b[0x9000..0x9000 + module.bytecode.len()].copy_from_slice(&module.bytecode);
             b[0xA000..0xA000 + VM_STATE_SIZE].fill(0);
             b[0xB000..0xB000 + 256].fill(0);
