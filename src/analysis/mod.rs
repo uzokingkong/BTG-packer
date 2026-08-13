@@ -1,3 +1,4 @@
+pub mod entropy;
 pub mod metrics;
 
 #[allow(unused_imports)]
