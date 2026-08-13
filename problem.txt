@@ -100,12 +100,24 @@ entry_native 제거)과 독립적으로 추적할 것.
   암호화**했는데, PE 로더는 **TLS callback을 엔트리(부트 스텁)보다 먼저 실행**
   하므로 콜백이 암호문을 실행해 0xC0000005. 수정: .text run 제거 → .text를
   설계 의도대로 평문 "안전 복사본"으로 유지 (TLS/CRT/native-bridge 경로).
-  그 결과 --vm 패킹 exe가 테스트 [1..8]까지 정상 실행됨.
 
-  [잔여 2026-08-13] 부트는 성공하지만 **test [9] multithreading에서 Rust
-  런타임 abort**: "the System allocator may not use TLS with destructors"
-  (EXIT 0xC0000409). --chained-crypto(다른 크립토 경로)도 동일 → 패킹 일반
-  TLS/스레드 통합 이슈(부트 스텁이 CRT TLS/할당자 상태에 미치는 영향).
-  --vm --no-crypto는 [9] 통과 → 부트 스텁 존재가 트리거일 가능성.
-  test [10] SEH unwinding에서 C++ 예외(0xE06D7363) 크래시도 잔여.
+  [수정 완료 2026-08-13] test [9] "System allocator may not use TLS with
+  destructors" abort (0xC0000409) 근본 원인: **TLS raw-data 템플릿
+  [StartAddressOfRawData..EndAddressOfRawData)이 protected에 없어 v14 부트-
+  복호화 런이 암호화**했다. 로더는 프로세스 시작 시(부트 스텁 전) 이 템플릿을
+  모든 스레드의 TLS 슬롯에 복사하므로, std의 #[thread_local] 정적(DTORS
+  RefCell<Vec> — borrow 카운터가 slot+8)이 암호문으로 초기화되었다. [9]의 첫
+  thread_local!-with-dtor 등록(mpsc/thread::spawn)에서 가비지 borrow 카운터를
+  읽어 try_borrow_mut() Err → std::rt abort. 수정: patch_data.rs
+  collect_protected_rva_ranges에 TLS 템플릿 범위 추가 → --vm/--chained-crypto
+  패킹 exe가 [1..9] 통과.
+
+  [잔여 2026-08-13] test [10] SEH unwinding & catch_unwind: 0xE06D7363(C++
+  예외) unhandled 크래시. 근본 원인: catch_unwind가 설치한 SEH 핸들러가
+  stage_exceptions의 프레임에 등록되는데, 그 프레임은 셔플 블록(.textb,
+  RVA 0x44000+)이라 .pdata RUNTIME_FUNCTION 커버리지 밖이다. 원본 .text의
+  .pdata 항목은 보존되지만 실행 코드는 .textb에 있으므로 OS unwind가 catch
+  frame까지 도달하지 못한다. → 빌드 블록용 .pdata/UNWIND_INFO 생성 필요
+  (블록별 stack frame 상이 → 단일 RUNTIME_FUNCTION 불가). plan.txt P0 10단계
+  (VM-OEP/native ABI/SEH 안정화)의 핵심 항목.
 ==============================================================================

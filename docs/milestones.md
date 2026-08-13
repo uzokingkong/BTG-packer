@@ -101,8 +101,11 @@
       읽던 크래시(0xC0000005) 해소 → **--vm-test [1..40] ALL CHECKS PASSED**
       복구 (`494af70`).
 - [ ] 핸들러 퓨전 (슈퍼인스트럭션: movzx+alu 등) — 2x 목표 도달용.
-- ⚠️ `--vm`(non-OEP) 패킹 산출물 실행 크래시(ntdll!_chkstk)는 main에서도
-      재현되는 기존 부트/VM 통합 결함 계열 — `problem.txt`에 기록.
+- ⚠️ 패킹 산출물 부트/실행 진전 (2026-08-13): .text boot-decrypt run 제거로
+  **TLS 콜백 부트 크래시 해소** (`31522f0`), TLS raw-data 템플릿 보호로
+  **test [9] System-allocator TLS abort 해소** (`4a97696`) — --vm/--chained
+  패킹 exe가 테스트 [1..9] 통과. 잔여: test [10] SEH catch_unwind
+  (0xE06D7363, 셔플 블록 .pdata 커버리지 문제 — plan.txt P0) + --vm-oep 부트.
 
 ## Phase 3 — 문서 & 마무리
 - [x] `docs/vm-compiler-architecture.md` — 모듈 지도 + 절단 지점.
