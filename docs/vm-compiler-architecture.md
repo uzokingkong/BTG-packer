@@ -103,12 +103,17 @@ BTG 패커는 실제 실행 코드를 `.textb` 블록(셔플+RC4)으로 옮기�
   RefCell 포함)을 암호문으로 초기화 → 첫 `thread_local!`-with-dtor 등록에서
   `DTORS.try_borrow_mut()` 실패 → `std::rt` abort. 수정: `collect_protected_rva_ranges`
   에 TLS 템플릿 범위 추가 → --vm/--chained [1..9] 통과.
-- **test [10] SEH catch_unwind (잔여, P0)**: 셔플 블록이 `.pdata` 커버리지 밖이라
-  OS unwind가 catch frame에 도달 못함. .pdata 수정 2회 시도:
-  (a) per-block virtual-Begin — 로더가 이미지 밖 범위로 거부;
-  (b) 함수 연속 레이아웃 + per-function .pdata — 예외는 "처리"되나(0xE06D7363
-  미처리 → 0xC000001D) catch 복귀 주소가 깨짐. 남은 블로커 = 컴파일러 SEH
-  메타데이터(FuncInfo/catch table)의 원본 주소 참조. 완전 수정은 SEH 메타데이터
-  재작성 또는 SEH 함수 비셔플 (plan.txt P0 "SEH 안정화").
+- **test [10] SEH catch_unwind (해소, SEH 함수 비셔플)**: 셔플 블록이 `.pdata`
+  커버리지 밖이라 OS unwind가 catch frame에 도달 못했음. .pdata 수정 2회 시도
+  (per-block virtual-Begin → 로더 거부, 함수 연속 레이아웃 + per-function .pdata
+  + FuncInfo/CHAININFO 재작성 → panic 경로 회귀)는 모두 원복. **해결책**:
+  `pass1_slice`가 panic/catch unwind 경로 함수를 셔플에서 제외해 원본 `.text`
+  (평문 안전 복사본)에 유지 — `.pdata`/UNWIND_INFO/FuncInfo가 원본 주소 그대로
+  유효하므로 OS unwind가 온전. 선택 규칙(`exclusions.rs::detect_seh_native_functions`):
+  panic 문자열 참조 함수 ∪ EHANDLER/UHANDLER 함수 ∪ (direct call로 panic 함수에
+  도달 가능 + EHANDLER 함수에 도달 불가 = raise~catch 사이 프레임) − entry 함수.
+  셔플 블록 → 네이티브 분기는 pass3 `resolve_va_to_real_va`가 원본 주소를 유지하고,
+  `slicer.rs`의 jcc는 네이티브 타깃에 원본 분기를 유지한다. 이 타깃에서 .text의
+  ~28%(175 함수)가 네이티브 유지되며 --vm/--chained/plain 패킹 [1..16] 전체 통과.
 
 세부 우선순위/검증 기준은 `milestones.md` 참조.

@@ -62,6 +62,9 @@
 - 잔여 제외 = SEH 구조적 제외(panic/unwind 런타임 함수 + shared-state
   global 참조 블록) — SEH 메타데이터 정합 때문에 설계상 네이티브 유지
   (휴리스틱이 아닌 정확성 요건; `exclusions.rs` 주석 참조).
+  블록 셔플 파이프라인(비-VM)은 별도의 최소 SEH 제외
+  (`exclusions.rs::detect_seh_native_functions`)를 써서 panic/catch 경로
+  함수만 원본 .text에 유지 — test [10] catch_unwind 해소 (2026-08-14).
 - ⚠️ 기존 결함(베이스라인 0cb48c6에서도 재현): `--full --vm --vm-oep`
   packed rust_packer_test.exe가 즉시 0xC0000005 크래시(출력 없음).
   Phase 2.4(부트 정합)/Phase 3(샘플 실행 회귀)에서 추적 예정.
@@ -105,15 +108,20 @@
   **TLS 콜백 부트 크래시 해소** (`31522f0`), TLS raw-data 템플릿 보호로
   **test [9] System-allocator TLS abort 해소** (`4a97696`) — --vm/--chained
   패킹 exe가 테스트 [1..9] 통과.
-- ⚠️ test [10] SEH catch_unwind 잔여 (0xE06D7363). 심층 분석 (`d71f790`):
-  (1) per-block .pdata(virtual-Begin)는 **로더가 이미지 밖 범위로 거부**;
-  (2) 함수 연속 레이아웃 + per-function .pdata는 **부분 진전** — 예외가
-  "처리"되어 미처리 0xE06D7363 → 0xC000001D(명령 중간 점프)로 변화했으나
-  catch 복귀 주소가 여전히 깨짐. 블로커 = 컴파일러 SEH 메타데이터(FuncInfo/
-  catch table)가 원본 주소를 참조 → 블록 셔플로 복귀 타깃 손상. 완전 수정은
-  셔플 코드용 SEH 메타데이터 재작성(또는 SEH 함수 비셔플) — plan.txt P0
-  "SEH 안정화". (함수 연속 레이아웃은 셔플 세분도 회귀라 원복 — 현재 트리는
-  --vm [1..9] 통과 상태.)
+- [x] test [10] SEH catch_unwind 해소 (0xE06D7363 → 정상 catch). 이전 시도들
+  (`d71f790`): (1) per-block .pdata(virtual-Begin)는 로더가 이미지 밖 범위로
+  거부; (2) 함수 연속 레이아웃 + per-function .pdata + FuncInfo/CHAININFO 재작성은
+  panic 경로 회귀로 원복. **최종 수정 (SEH 함수 비셔플)**: `pass1_slice`에서
+  panic/catch unwind 경로에 속하는 함수를 셔플에서 제외해 원본 `.text`(평문
+  안전 복사본)에 그대로 두고, 컴파일러 .pdata/UNWIND_INFO/FuncInfo가 그대로
+  유효하도록 함. 선택 규칙 = panic 문자열 참조 함수 ∪ EHANDLER/UHANDLER
+  (UNWIND_INFO byte0&0x18) 함수 ∪ (직접 call 엣지로 panic 함수에 도달 가능하면서
+  EHANDLER 함수에 도달하지 못하는 함수 — raise와 catch 사이 프레임) − entry 함수.
+  entry는 항상 셔플 유지(디스패처 진입). 부수: `slicer.rs` jcc 타깃이 제외(네이티브)
+  함수를 가리킬 때 원본 분기 유지. 결과: --vm / --chained-crypto / plain 패킹 exe
+  모두 **[1..16] 전체 통과, FINAL CHECKSUM = 베이스라인과 동일**. 보호 커버리지
+  회귀는 이 타깃에서 .text ~28%(175 함수, 0x127B0)가 네이티브 유지되는 정도로
+  제한됨 (VM 경로의 11,016 블록 과대 확장과 대조).
 - ⚠️ `--vm-oep` 부트 크래시(GetModuleHandleA) — 기존 유보 (`problem.txt`).
 
 ## Phase 3 — 문서 & 마무리

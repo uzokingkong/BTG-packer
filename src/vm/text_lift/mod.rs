@@ -28,7 +28,7 @@ pub mod switch;
 #[cfg(test)]
 mod tests;
 
-pub use exclusions::detect_panic_unwind_ranges;
+pub use exclusions::{detect_panic_unwind_ranges, detect_seh_native_functions};
 use exclusions::block_refs_runtime_global;
 pub use switch::resolve_switch_cases;
 

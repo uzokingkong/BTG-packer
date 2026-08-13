@@ -209,51 +209,71 @@ impl MicroSlicer {
                 let taken_target_va = current_inst.near_branch_target();
                 let fallthrough_va = current_inst.ip() + current_inst.len() as u64;
 
-                let target_taken_id = Self::resolve_target_id(&va_to_trigger_id, taken_target_va, block_id, text_start_va, text_end_va).unwrap_or(block_id);
-                let target_fallthrough_id = Self::resolve_target_id(&va_to_trigger_id, fallthrough_va, block_id, text_start_va, text_end_va).unwrap_or(block_id);
+                let taken_id = Self::resolve_target_id(&va_to_trigger_id, taken_target_va, block_id, text_start_va, text_end_va);
+                let fall_id = Self::resolve_target_id(&va_to_trigger_id, fallthrough_va, block_id, text_start_va, text_end_va);
+                let taken_is_trigger = taken_id.is_some();
+                let fall_is_trigger = fall_id.is_some();
 
-                // v6: 디스패처가 런타임에 MBA 항등식으로 키를 재도출한다 — 스텁은 시드를 push.
-                let seed_taken = MbaGenerator::seed_for(self.mba_constant, target_taken_id);
-                let key_taken =
-                    MbaGenerator::compute_key(seed_taken, target_taken_id, self.mba_constant, 2);
-                let seed_fallthrough = MbaGenerator::seed_for(self.mba_constant, target_fallthrough_id);
-                let key_fallthrough =
-                    MbaGenerator::compute_key(seed_fallthrough, target_fallthrough_id, self.mba_constant, 2);
+                // Dispatcher stub: push [current_id?][target_id][seed] + jmp dispatcher.
+                // v8(Phase 0.3): 재암호화 디스패처 3-푸시 규약 — [seed][target_id][current_id].
+                // current_id(자기 자신)는 디스패처가 '직전 블록'을 재암호화하는 데 쓰인다.
+                // v10 FIX: 일반 디스패처는 2-푸시 규약이므로 current_id push를 생략한다
+                // (남으면 디스패치마다 8B 스택 누수 → RSP 8바이트 어긋남).
+                let push_dispatch_stub = |chunk: &mut Vec<Instruction>, target: u32| -> anyhow::Result<usize> {
+                    let stub_idx = chunk.len();
+                    if self.reencrypt {
+                        chunk.push(Instruction::with1(Code::Pushq_imm32, block_id as i32)?);
+                    }
+                    chunk.push(Instruction::with1(Code::Pushq_imm32, target as i32)?);
+                    let seed = MbaGenerator::seed_for(self.mba_constant, target);
+                    chunk.push(Instruction::with1(Code::Pushq_imm32, seed as i32)?);
+                    chunk.push(Instruction::with_branch(Code::Jmp_rel32_64, dispatcher_va)?);
+                    Ok(stub_idx)
+                };
 
                 let jcc_inst_idx = chunk.len();
                 // as_near_branch() mutates in-place (&mut self -> ()) in iced-x86 v1.21.
                 // Clone current_inst, then mutate the clone to near-branch form.
                 let mut jcc_inst = current_inst;
                 jcc_inst.as_near_branch();
-                // v8(Phase 0.3): 재암호화 디스패처 3-푸시 규약 — [seed][target_id][current_id].
-                // current_id(자기 자신)는 디스패처가 '직전 블록'을 재암호화하는 데 쓰인다.
-                // v10 FIX: 일반 디스패처는 2-푸시 규약이므로 current_id push를 생략한다
-                // (남으면 디스패치마다 8B 스택 누수 → RSP 8바이트 어긋남).
                 // Placeholder target for size measurement in prep-loop:
                 // Jcc near (rel32) = 6 bytes
                 // Fallthrough stub = 2~3×push(10~15) + jmp(5) = 15~20 bytes
                 // (rel32 jcc는 타깃과 무관하게 항상 6바이트 — pass3가 실제 IP로 재설정)
-                jcc_inst.set_near_branch64(current_inst.ip() + 26);
-                chunk.push(jcc_inst);
-
-                // Fallthrough path stub
-                if self.reencrypt {
-                    chunk.push(Instruction::with1(Code::Pushq_imm32, block_id as i32)?);
+                if taken_is_trigger && fall_is_trigger {
+                    // Both targets dispatch (original behavior).
+                    let target_taken_id = taken_id.unwrap();
+                    let target_fallthrough_id = fall_id.unwrap();
+                    jcc_inst.set_near_branch64(current_inst.ip() + 26);
+                    chunk.push(jcc_inst);
+                    push_dispatch_stub(&mut chunk, target_fallthrough_id)?;
+                    let taken_stub_idx = push_dispatch_stub(&mut chunk, target_taken_id)?;
+                    tb.jcc_info = Some((jcc_inst_idx, taken_stub_idx));
+                } else if taken_is_trigger {
+                    // Fall target is NATIVE (SEH-excluded function): jcc taken →
+                    // dispatcher stub; not-taken falls to the original .text address.
+                    let target_taken_id = taken_id.unwrap();
+                    jcc_inst.set_near_branch64(current_inst.ip() + 26);
+                    chunk.push(jcc_inst);
+                    chunk.push(Instruction::with_branch(Code::Jmp_rel32_64, fallthrough_va)?);
+                    let taken_stub_idx = push_dispatch_stub(&mut chunk, target_taken_id)?;
+                    tb.jcc_info = Some((jcc_inst_idx, taken_stub_idx));
+                } else if fall_is_trigger {
+                    // Taken target is NATIVE: jcc keeps its original taken target
+                    // (pass3 resolves it to .text); not-taken dispatches to fall.
+                    let target_fallthrough_id = fall_id.unwrap();
+                    jcc_inst.set_near_branch64(taken_target_va);
+                    chunk.push(jcc_inst);
+                    push_dispatch_stub(&mut chunk, target_fallthrough_id)?;
+                    tb.jcc_info = None;
+                } else {
+                    // Both targets NATIVE: keep the original jcc + jmp (pass3
+                    // resolves both displacements to original .text addresses).
+                    jcc_inst.set_near_branch64(taken_target_va);
+                    chunk.push(jcc_inst);
+                    chunk.push(Instruction::with_branch(Code::Jmp_rel32_64, fallthrough_va)?);
+                    tb.jcc_info = None;
                 }
-                chunk.push(Instruction::with1(Code::Pushq_imm32, target_fallthrough_id as i32)?);
-                chunk.push(Instruction::with1(Code::Pushq_imm32, seed_fallthrough as i32)?);
-                chunk.push(Instruction::with_branch(Code::Jmp_rel32_64, dispatcher_va)?);
-
-                // Taken path stub
-                let taken_stub_idx = chunk.len();
-                if self.reencrypt {
-                    chunk.push(Instruction::with1(Code::Pushq_imm32, block_id as i32)?);
-                }
-                chunk.push(Instruction::with1(Code::Pushq_imm32, target_taken_id as i32)?);
-                chunk.push(Instruction::with1(Code::Pushq_imm32, seed_taken as i32)?);
-                chunk.push(Instruction::with_branch(Code::Jmp_rel32_64, dispatcher_va)?);
-
-                tb.jcc_info = Some((jcc_inst_idx, taken_stub_idx));
             } else if !is_terminal {
                 let is_uncond_jmp = is_last_inst && matches!(flow, FlowControl::UnconditionalBranch);
                 let target_block_id_opt = if is_last_inst {

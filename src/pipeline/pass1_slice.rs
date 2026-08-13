@@ -33,6 +33,41 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
 
     println!("[+] Bidirectional Graph Validation Passed.");
 
+    // ── SEH 함수 비셔플 (plan.txt P0 "SEH 안정화", option A) ──────────────────
+    // x64 SEH unwind (panic → catch_unwind)는 raise 지점부터 catch 프레임까지
+    // 모든 프레임의 .pdata/UNWIND_INFO가 실제 네이티브 프레임과 일치해야 한다.
+    // 블록 셔플된 코드(.textb)는 .pdata 커버리지가 없으므로 test [10]
+    // catch_unwind가 0xE06D7363 미처리로 죽는다. 여기서 panic/catch 경로에
+    // 속하는 함수(panic 문자열 참조 + EHANDLER/UHANDLER 함수 + raise~catch
+    // 사이 프레임)를 원본 .text에 남기고 셔플에서 제외한다. 원본 .text는
+    // plaintext로 보존되므로 이 함수들은 원래 주소·원래 .pdata로 실행되어
+    // OS unwind가 온전하다. entry 함수는 항상 셔플 유지(디스패처 진입 보존).
+    let seh_native = crate::vm::text_lift::detect_seh_native_functions(
+        &ctx.target_info.text_bytes,
+        target_base_va,
+        ctx.target_info.image_base,
+        &ctx.target_info.relayed_sections,
+        target_ep_va,
+    );
+    let total_before = basic_blocks.len();
+    let basic_blocks: Vec<_> = basic_blocks
+        .into_iter()
+        .filter(|bb| {
+            !seh_native
+                .func_ranges
+                .iter()
+                .any(|&(s, e)| s <= bb.start_va && bb.start_va < e)
+        })
+        .collect();
+    if basic_blocks.len() != total_before {
+        println!(
+            "[+] Pass 1: {} of {} basic blocks kept native (SEH), {} blocks sliced/shuffled.",
+            total_before - basic_blocks.len(),
+            total_before,
+            basic_blocks.len()
+        );
+    }
+
     // MicroSlicer: max_chunk_size = usize::MAX → 원자 기본 블록 경계 유지.
     // 블록 내부에서 자르면 SSE(movaps) 등에서 요구하는 16-byte RSP 정렬이 깨질 수 있음.
     // v10: 디스패처 스택 규약 선택을 전달 (2-푸시 일반 / 3-푸시 재암호화).

@@ -402,3 +402,271 @@ pub fn detect_panic_unwind_ranges(
         runtime_globals: runtime_globals.into_iter().collect(),
     }
 }
+
+// ==============================================================================
+// SEH-functions stay native (plan.txt P0 "SEH 안정화" / "SEH 함수 비셔플")
+//
+// x64 SEH unwind (Rust panic → 0xE06D7363 → catch_unwind) requires EVERY frame
+// between the raise site and the catch frame to have a `.pdata` RUNTIME_FUNCTION
+// whose UNWIND_INFO matches the real native frame layout, and the catch frame's
+// compiler-generated FuncInfo/catch table to reference the executing addresses.
+// Block-shuffled code lives in `.textb` (no .pdata, stale FuncInfo RVAs), so any
+// such frame breaks the unwind with an unhandled 0xE06D7363.
+//
+// The fix (option A, SEH 함수 비셔플) keeps exactly those functions at their
+// original `.text` addresses, where the compiler's .pdata/UNWIND_INFO/FuncInfo
+// remain valid. The native set is deliberately the *minimal* one that the OS
+// unwinder walks from a raise up to its catch:
+//
+//   - panic-string-referencing functions (the raise path, e.g. core::panicking),
+//   - functions whose UNWIND_INFO has an EHANDLER/UHANDLER flag (can host catch
+//     frames or cleanup frames — e.g. the monomorphized __rust_try),
+//   - functions that can transitively reach a panic-string function WITHOUT
+//     passing through a handler function — these are the frames strictly below a
+//     catch (the unwinder must walk them, but their caller-ancestors above the
+//     catch do not need .pdata),
+//   - minus the entry function, which must stay shuffled so the packed binary
+//     still enters through the dispatcher (a native entry would silently run the
+//     whole program as the un-protected original .text copy).
+//
+// Unlike `detect_panic_unwind_ranges` (the VM path, which keeps the whole
+// bidirectional call+global closure native — 11,016 blocks in this target),
+// this uses only *downward* reachability so the entry chain and the rest of the
+// program stay shuffled (protection is preserved; only the unwind-relevant
+// frames go native).
+// ==============================================================================
+
+/// Result of the SEH native-preservation scan (block-shuffle pipeline).
+#[derive(Debug, Clone, Default)]
+pub struct SehNativeExclusion {
+    /// Whole functions (absolute begin..end VA) to keep un-shuffled.
+    pub func_ranges: Vec<(u64, u64)>,
+}
+
+/// Parse `.pdata` RUNTIME_FUNCTION entries into absolute function ranges plus
+/// each entry's UNWIND_INFO RVA.
+fn parse_pdata_functions(
+    relayed_sections: &[crate::pe::builder::SectionData],
+    image_base: u64,
+) -> Vec<(u64, u64, u32)> {
+    let mut funcs: Vec<(u64, u64, u32)> = Vec::new();
+    if let Some(pd) = relayed_sections.iter().find(|s| s.name == ".pdata") {
+        for chunk in pd.bytes.chunks_exact(12) {
+            if chunk.len() < 12 {
+                break;
+            }
+            let s0 = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+            let e0 = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+            let u0 = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+            if s0 > 0 && e0 > s0 {
+                funcs.push((image_base + s0 as u64, image_base + e0 as u64, u0));
+            }
+        }
+    }
+    funcs.sort_by_key(|f| f.0);
+    funcs
+}
+
+/// Resolve a UNWIND_INFO RVA to its header byte (version|flags), following
+/// CHAININFO links. Returns `None` if it cannot be located.
+///
+/// x64 UNWIND_INFO header byte 0: [version(3) | flags(5)]. Within the flags
+/// field, UNW_FLAG_EHANDLER = 0x01 and UNW_FLAG_UHANDLER = 0x02, i.e. the
+/// handler bits are byte0 & 0x18. UNW_FLAG_CHAININFO = 0x04 (byte0 & 0x20)
+/// chains to another UNWIND_INFO whose RVA sits at header offset 4.
+fn unwind_info_flags(
+    unwind_rva: u32,
+    relayed_sections: &[crate::pe::builder::SectionData],
+) -> Option<u8> {
+    let locate = |rva: u32| -> Option<(&[u8], usize)> {
+        for sec in relayed_sections {
+            let sva = sec.virtual_address as u64;
+            let svs = sec.virtual_size.max(sec.bytes.len() as u32) as u64;
+            let r = rva as u64;
+            if r >= sva && r < sva + svs {
+                let off = (r - sva) as usize;
+                if off + 4 <= sec.bytes.len() {
+                    return Some((&sec.bytes, off));
+                }
+                return None;
+            }
+        }
+        None
+    };
+    let mut rva = unwind_rva;
+    for _ in 0..8 {
+        let (bytes, off) = locate(rva)?;
+        let byte0 = bytes[off];
+        let flags_field = byte0 >> 3;
+        if flags_field & (0x01 | 0x02) != 0 {
+            return Some(byte0); // EHANDLER or UHANDLER present
+        }
+        if flags_field & 0x04 != 0 && off + 8 <= bytes.len() {
+            // CHAININFO: the next UNWIND_INFO RVA is at header offset 4.
+            rva = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+            continue;
+        }
+        return Some(byte0);
+    }
+    None
+}
+
+/// Detect the functions that must stay NATIVE in the block-shuffle pipeline so
+/// the OS exception unwinder can walk from a panic raise up to its catch frame.
+/// See the module comment above for the exact selection rule.
+pub fn detect_seh_native_functions(
+    text_bytes: &[u8],
+    base_va: u64,
+    image_base: u64,
+    relayed_sections: &[crate::pe::builder::SectionData],
+    entry_point_va: u64,
+) -> SehNativeExclusion {
+    use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    const SIGS: &[&[u8]] = &[
+        b"panicked at ",
+        b"called `Option::unwrap()`",
+        b"called `Result::unwrap()`",
+        b"fatal runtime error",
+        b"Rust panics must be rethrown",
+        b"failed to initiate panic",
+        b"Once instance has previously been poisoned",
+        b"thread panicked while processing panic",
+        b"drop of the panic payload panicked",
+        b"attempt to divide by zero",
+        b"index out of bounds",
+        b"Rust cannot catch foreign exceptions",
+    ];
+
+    // 1) panic-message string VAs in .rdata
+    let mut panic_string_vas: Vec<u64> = Vec::new();
+    for sec in relayed_sections {
+        if sec.name != ".rdata" {
+            continue;
+        }
+        let sec_va = image_base + sec.virtual_address as u64;
+        for sig in SIGS {
+            let mut pos = 0usize;
+            while let Some(i) = find_subslice(&sec.bytes, sig, pos) {
+                panic_string_vas.push(sec_va + i as u64);
+                pos = i + sig.len();
+            }
+        }
+    }
+
+    // 2) .pdata function ranges (+ unwind-info RVAs)
+    let funcs = parse_pdata_functions(relayed_sections, image_base);
+    let func_of = |va: u64| -> Option<(u64, u64)> {
+        funcs
+            .iter()
+            .copied()
+            .find(|&(s, e, _)| s <= va && va < e)
+            .map(|(s, e, _)| (s, e))
+    };
+
+    // 3) decode .text: panic-string reference sites + direct call/jmp edges
+    let mut refs: Vec<u64> = Vec::new();
+    let mut call_edges: Vec<(u64, u64)> = Vec::new(); // (caller, direct callee VA)
+    let mut dec = Decoder::with_ip(64, text_bytes, base_va, DecoderOptions::NONE);
+    while dec.can_decode() {
+        let inst = dec.decode();
+        if inst.is_invalid() {
+            continue;
+        }
+        let va = inst.ip();
+        match inst.flow_control() {
+            FlowControl::Call | FlowControl::UnconditionalBranch => {
+                let near = inst.near_branch_target();
+                if near >= base_va && near < base_va + text_bytes.len() as u64 {
+                    call_edges.push((va, near));
+                }
+            }
+            _ => {}
+        }
+        for oi in 0..inst.op_count() {
+            if inst.op_kind(oi) == OpKind::Memory && inst.is_ip_rel_memory_operand() {
+                let tgt = inst.memory_displacement64();
+                if panic_string_vas.contains(&tgt) {
+                    refs.push(va);
+                }
+            }
+        }
+    }
+
+    // 4) seeds
+    let mut panic_seed_starts: HashSet<u64> = HashSet::new();
+    for &r in &refs {
+        if let Some((s, _)) = func_of(r) {
+            panic_seed_starts.insert(s);
+        }
+    }
+    let mut ehandler_starts: HashSet<u64> = HashSet::new();
+    for &(s, _, u) in &funcs {
+        if let Some(byte0) = unwind_info_flags(u, relayed_sections) {
+            if byte0 & 0x18 != 0 {
+                ehandler_starts.insert(s);
+            }
+        }
+    }
+
+    // 5) reverse reachability over direct call edges (caller graph)
+    let mut callers: HashMap<u64, Vec<u64>> = HashMap::new(); // callee -> callers
+    for &(caller, callee) in &call_edges {
+        if let (Some((cs, _)), Some((ks, _))) = (func_of(caller), func_of(callee)) {
+            callers.entry(ks).or_default().push(cs);
+        }
+    }
+    let reverse_reach = |seeds: &HashSet<u64>| -> HashSet<u64> {
+        let mut out: HashSet<u64> = seeds.clone();
+        let mut queue: VecDeque<u64> = seeds.iter().copied().collect();
+        while let Some(f) = queue.pop_front() {
+            if let Some(cs) = callers.get(&f) {
+                for &c in cs {
+                    if out.insert(c) {
+                        queue.push_back(c);
+                    }
+                }
+            }
+        }
+        out
+    };
+    let can_reach_panic = reverse_reach(&panic_seed_starts);
+    let can_reach_ehandler = reverse_reach(&ehandler_starts);
+
+    // 6) native set = seeds ∪ {can reach panic but NOT can reach a handler}
+    let mut native: HashSet<u64> = HashSet::new();
+    native.extend(panic_seed_starts.iter().copied());
+    native.extend(ehandler_starts.iter().copied());
+    for &s in &can_reach_panic {
+        if !can_reach_ehandler.contains(&s) {
+            native.insert(s);
+        }
+    }
+    // The entry function must stay shuffled: the boot stub dispatches into it,
+    // and a native entry would make the whole program run as the original
+    // (un-protected) .text copy.
+    if let Some((es, _)) = func_of(entry_point_va) {
+        native.remove(&es);
+    }
+
+    let mut func_ranges: Vec<(u64, u64)> = native
+        .iter()
+        .filter_map(|&s| funcs.iter().copied().find(|&(ss, _, _)| ss == s).map(|(ss, ee, _)| (ss, ee)))
+        .collect();
+    func_ranges.sort_by_key(|r| r.0);
+
+    if !func_ranges.is_empty() {
+        println!(
+            "[+] SEH native-preservation: keeping {} function(s) un-shuffled (panic/catch unwind path)",
+            func_ranges.len()
+        );
+        let bytes: u64 = func_ranges.iter().map(|(s, e)| e - s).sum();
+        println!(
+            "[+]   total native bytes = 0x{:X} (entry function excluded, dispatcher entry preserved)",
+            bytes
+        );
+    }
+
+    SehNativeExclusion { func_ranges }
+}

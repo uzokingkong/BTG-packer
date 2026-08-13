@@ -139,4 +139,23 @@ entry_native 제거)과 독립적으로 추적할 것.
     RSP 복원, catch 복귀 주소 체인이 셔플과 양립하려면 SEH 메타데이터 재작성 +
     리턴 주소 체인 유지가 필요. plan.txt P0 "SEH 안정화"의 전용 작업으로 추적.
     현재 트리는 --vm 패킹 [1..9] 통과 (안정 상태 유지).
+
+  [해결 2026-08-14] SEH 함수 비셔플 (option A) 구현 → test [10] 통과.
+  pass1_slice가 panic/catch unwind 경로 함수를 셔플에서 제외해 원본 .text에 유지
+  (원본 .pdata/UNWIND_INFO/FuncInfo 그대로 유효). 선택 규칙
+  (exclusions.rs::detect_seh_native_functions):
+    - panic 문자열 참조 함수 (raise 경로),
+    - UNWIND_INFO byte0&0x18 (EHANDLER/UHANDLER) 함수 (catch/cleanup 프레임),
+    - direct call 엣지로 panic 함수에 도달 가능하면서 EHANDLER 함수에 도달하지
+      못하는 함수 (= raise~catch 사이 프레임 — unwinder가 실제로 걷는 프레임),
+    - minus entry 함수 (디스패처 진입 보존 — 네이티브 entry면 전체 프로그램이
+      원본 .text로 실행되어 보호가 사라짐).
+  부수: slicer.rs jcc 타깃이 제외 함수를 가리킬 때 원본 분기 유지 (타깃이 트리거
+  블록이 아닌 경우 dispathcher 스텁 대신 원본 VA로).
+  검증: --vm / --chained-crypto / plain 패킹 exe 모두 **[1..16] 전체 통과**,
+  FINAL CHECKSUM = baseline 동일 (0x2cdc0e4511d84a64). 보호 커버리지 손실은 이
+  타깃에서 .text ~28%(175 함수, 0x127B0) 네이티브 유지. (VM 경로의 11,016 블록
+  과대 확장과 달리 최소 집합만 네이티브로 남김.)
+  참고: --full은 이 타깃(TLS callback)에 대해 기존의 --iat-hide 제한으로 계속
+  실패 — 이번 변경과 무관 (main.rs v14 코멘트 참조).
 ==============================================================================
