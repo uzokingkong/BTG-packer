@@ -54,7 +54,7 @@ use self::sse::{
     lift_movq, lift_pinsrw, lift_sse, lift_sseshift_imm8, lift_sseshuffle, lift_tzcnt,
     lift_unpcklps,
 };
-use self::string::{lift_rep_cmps, lift_rep_movs, lift_rep_stosq};
+use self::string::{lift_cmps, lift_lods, lift_movs, lift_scas, lift_stos};
 
 mod arith;
 mod cfg;
@@ -254,8 +254,8 @@ pub fn lift_one(
             lift_narrow_arith(b, inst)?
         }
         // ── A-5 잔여: rep movs / rep cmps (string ops) ─────────────────────
-        Movsb_m8_m8 | Movsw_m16_m16 | Movsd_m32_m32 | Movsq_m64_m64 => lift_rep_movs(b, inst)?,
-        Cmpsb_m8_m8 | Cmpsw_m16_m16 | Cmpsd_m32_m32 | Cmpsq_m64_m64 => lift_rep_cmps(b, inst)?,
+        Movsb_m8_m8 | Movsw_m16_m16 | Movsd_m32_m32 | Movsq_m64_m64 => lift_movs(b, inst)?,
+        Cmpsb_m8_m8 | Cmpsw_m16_m16 | Cmpsd_m32_m32 | Cmpsq_m64_m64 => lift_cmps(b, inst)?,
 
         // ── register / immediate moves ─────────────────────────────────────
         Mov_r64_imm64 => { let r = vreg(inst.op0_register())?; b.mov_r_imm64(r, inst.immediate64()); }
@@ -494,7 +494,9 @@ pub fn lift_one(
         | Adc_rm64_r64 | Adc_r64_rm64 | Adc_rm64_imm8 | Adc_rm64_imm32 | Adc_RAX_imm32
         | Adc_rm8_r8 | Adc_r8_rm8 | Adc_rm16_r16 | Adc_r16_rm16
         | Adc_rm8_imm8 | Adc_rm16_imm8 | Adc_rm16_imm16 | Adc_AL_imm8 | Adc_AX_imm16 => lift_adc(b, inst)?,
-        Stosq_m64_RAX => lift_rep_stosq(b)?,
+        Stosb_m8_AL | Stosw_m16_AX | Stosd_m32_EAX | Stosq_m64_RAX => lift_stos(b, inst)?,
+        Lodsb_AL_m8 | Lodsw_AX_m16 | Lodsd_EAX_m32 | Lodsq_RAX_m64 => lift_lods(b, inst)?,
+        Scasb_AL_m8 | Scasw_AX_m16 | Scasd_EAX_m32 | Scasq_RAX_m64 => lift_scas(b, inst)?,
         Cmpxchg_rm8_r8 | Cmpxchg_rm16_r16 | Cmpxchg_rm32_r32 | Cmpxchg_rm64_r64 => lift_cmpxchg(b, inst)?,
         Xadd_rm8_r8 | Xadd_rm16_r16 | Xadd_rm32_r32 | Xadd_rm64_r64 => lift_xadd(b, inst)?,
         Movsd_xmm_xmmm64 | Movss_xmm_xmmm32 | Movq_xmm_xmmm64 | Movd_xmm_rm32

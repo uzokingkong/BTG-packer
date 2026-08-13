@@ -30,6 +30,7 @@ mod sse;
 mod exit;
 mod cmov;
 mod util;
+mod string_ops;
 
 // ── test functions the orchestrator dispatches (from submodules) ──
 use self::a2_a5::run_a2_a5_test;
@@ -41,6 +42,7 @@ use self::sse::run_a5_sse_cond_test;
 use self::flags::run_carry_flag_fix_test;
 use self::exit::run_exit_teardown_test;
 use self::cmov::run_cmovcc_test;
+use self::string_ops::run_string_ops_test;
 use self::flags::run_flags_jcc_test;
 use self::abi::run_handler_abi_test;
 use self::addr::run_m2_addr_test;
@@ -676,6 +678,15 @@ pub fn run_self_test() -> Result<()> {
         Ok(_) => println!("[35] D-1 CMOVcc (all cond families; lift==interp==native): PASS"),
         Err(e) => {
             println!("[35] D-1 CMOVcc:                                                FAIL ({})", e);
+            return Err(e);
+        }
+    }
+    let _ = std::io::stdout().flush();
+
+    match run_string_ops_test() {
+        Ok(_) => println!("[36] C-1 string ops (rep stos/movs/lods/scas/cmps + non-REP; interp==native): PASS"),
+        Err(e) => {
+            println!("[36] C-1 string ops:                                                                   FAIL ({})", e);
             return Err(e);
         }
     }

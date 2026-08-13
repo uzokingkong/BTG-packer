@@ -17,13 +17,14 @@ use crate::vm::{build_vm_module, handlers, interp};
 /// vdata = arena.base + 0x9000); pass empty `data` for programs that need none.
 /// `seed` mutates the native state buffer; it receives the buffer and the arena
 /// base so it can embed absolute addresses into address vregs / pointer slots.
-/// Returns the final state buffer (for reading vregs / flags / XMM file).
+/// Returns the final state buffer and the arena base (so callers can turn
+/// absolute vregs back into base-relative offsets).
 pub fn run_native(
     prog: &[u8],
     data: &[u8],
     data_off: usize,
     seed: impl Fn(&mut [u8], u64),
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, u64)> {
     let mut arena = Arena::new(0x40000)?;
     let (vc, vt, vb, vs, vtr, vdata) = (
         arena.base + 0x1000,
@@ -51,7 +52,7 @@ pub fn run_native(
     }
     arena.call(0x8000);
     let b = arena.bytes();
-    Ok(b[0x6000..0x6000 + interp::STATE_SIZE].to_vec())
+    Ok((b[0x6000..0x6000 + interp::STATE_SIZE].to_vec(), vbase))
 }
 
 /// Read a 64-bit vreg from an interpreter/native state buffer.
@@ -99,7 +100,7 @@ mod tests {
         b.mov_r_imm64(3, 0x1122_3344_5566_7788u64);
         b.halt();
         let prog = b.finish();
-        let st = run_native(&prog, &[], 0, |s, _| {}).unwrap();
+        let (st, _base) = run_native(&prog, &[], 0, |_s, _| {}).unwrap();
         assert_eq!(vreg(&st, 3), 0x1122_3344_5566_7788u64);
     }
 }

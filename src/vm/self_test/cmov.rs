@@ -61,7 +61,7 @@ pub(crate) fn run_cmovcc_test() -> Result<()> {
     let st_i = st.clone();
 
     // ── native VM ──────────────────────────────────────────────────────────
-    let st_n = run_native(&bc, &[], 0, |s, _base| seed_state(s))?;
+    let (st_n, _nb) = run_native(&bc, &[], 0, |s, _base| seed_state(s))?;
 
     for (dst, code) in cmovs {
         let taken = cmov_taken(*code);
