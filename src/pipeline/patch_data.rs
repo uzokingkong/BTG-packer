@@ -519,6 +519,19 @@ pub(crate) fn collect_protected_rva_ranges(
         raw_ranges.push((cookie_rva, cookie_rva.saturating_add(32)));
     }
 
+    // v58 (Phase 2.5 SEH): 원본 .pdata의 UNWIND_INFO 주소를 보호한다. 로더가
+    // 예외 디스패치(panic/catch_unwind) 시 런타임에 .pdata → UNWIND_INFO → EHANDLER
+    // 를 읽는다. UNWIND_INFO가 v14 .rdata run에 포함돼 부트-복호화가 부분적으로
+    // 어긋나면(keystream 정렬) UI 바이트가 손상되어 EHANDLER를 인식하지 못하고
+    // catch_unwind가 panic을 못 잡는다. 메타데이터이므로 평문 유지가 안전하다.
+    for rf in &ctx.target_info.original_pdata_entries {
+        let ui = rf.unwind_info_address;
+        if ui > 0 {
+            // 각 UNWIND_INFO 블록을 보호 (평균 ~16-32B; 여유 0x40)
+            raw_ranges.push((ui, ui.saturating_add(0x40)));
+        }
+    }
+
     // Sort & Merge
     raw_ranges.retain(|&(s, e)| s < e);
     raw_ranges.sort_by_key(|&(s, _)| s);
