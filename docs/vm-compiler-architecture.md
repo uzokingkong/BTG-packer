@@ -76,6 +76,11 @@
 3. **제외 블록 제거**: lock-atomic RMW / panic-unwind 블록을 VM opcode로.
 4. **전체 .text 가상화 + 부트 정합**: `entry_native` 브랜치 제거,
    OEP→VM 진입 고정, `once.rs:166` 종료 패닉 해소.
-5. **핸들러 성능**: threaded-dispatch/핸들러 퓨전, `--vm-bench` 2x.
+5. **핸들러 성능**: threaded-dispatch(`emit_dispatch`를 각 핸들러 epilogue에
+   인라인 → `jmp Dispatch` 왕복 제거) + MBA 테이블 키를 VM 엔트리에서 r15에
+   1회 유도(`xor rax,r15`로 디스패치당 13→1 명령) 완료 (v58, 2026-08-13).
+   `--vm-bench` ~1.5x (23.4→14-17µs). 2x 목표는 핸들러 퓨전으로 잔여.
+   레지스터 계약: r8=state, r9=bytecode ip, r10=table, **r15=MBA 키 K(또는 0)**,
+   rax/rcx/rdx/r11=scratch.
 
 세부 우선순위/검증 기준은 `milestones.md` 참조.

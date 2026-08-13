@@ -82,4 +82,16 @@ entry_native 제거)과 독립적으로 추적할 것.
 관련 코드: src/vm/text_lift/{mod,exclusions}.rs,
            src/pipeline/crypto/{place,bootstub,vm_embed}.rs,
            src/vm/handlers/stack.rs (OP_NATIVE_CALL 브리지)
+
+------------------------------------------------------------------------------
+추가 관찰 (2026-08-13, Phase 2.5 진행 중)
+------------------------------------------------------------------------------
+  `--vm`(non-OEP, KSA/PRGA VM만) 경로의 패킹 산출물도 실행 즉시
+  0xC0000005로 크래시한다 (출력 없음). cdb 관찰: ntdll!_chkstk → 예외 디스패치
+  (RtlDispatchException/KiUserExceptionDispatch) 중 크래시 — --vm-oep의
+  GetModuleHandleA 부트 크래시와는 다른 양상(스택 프로브/예외 전달 경로 손상).
+  **main 기준선에서도 동일 재현** → threaded-dispatch(2.5) 회귀가 아니라
+  기존 부트/VM 통합 결함 계열. 샘플 타깃 실행 검증(Phase 3)은 이 계열
+  해소 후 진행 가능. (2.5의 --vm-bench 속도 개선은 --vm-test/native VM
+  경로로만 검증됨 — 패킹 산출물 실행은 유보.)
 ==============================================================================

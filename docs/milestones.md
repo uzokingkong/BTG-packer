@@ -87,8 +87,22 @@
 - [ ] `entry_native` 브랜치 제거, 부트스텁이 항상 프로그램 VM으로 진입.
 - [ ] 종료 teardown 패닉(`once.rs:166`) 해결.
 
-### 2.5 핸들러 성능 ⬜
-- [ ] threaded-dispatch / 핸들러 퓨전, `--vm-bench` 2x 목표.
+### 2.5 핸들러 성능 🔶 (2026-08-13, threaded-dispatch 완료 / 퓨전 잔여)
+- [x] **threaded-dispatch**(v58): 핸들러마다 `jmp Dispatch` 왕복 제거 —
+      `emit_dispatch`(movzx/inc/table-load/xor/jmp)를 각 핸들러 epilogue에
+      인라인. VM 명령당 간접 점프 1회로 감소.
+- [x] **MBA 키 1회 유도**: 디스패치마다 13개 명령으로 K=a+b를 재유도하던 것을
+      VM 엔트리에서 r15에 1회 유도 + 매 디스패치 `xor rax,r15`. 동일 보안 속성
+      (a/b 평문 비노출, 테이블 XOR-mask 유지). plain 경로는 r15=0.
+- [x] `--vm-bench` 측정: main ~23.4µs/iter → crypto-refactor ~14-17µs/iter
+      (**~1.5x**, 교차 실행 기준). 2x 목표는 **핸들러 퓨전으로 잔여**.
+- [x] 부수 픽스: f0f56eb가 아레나 테이블 복사를 0x4800으로 옮기면서
+      `run_bridge_abi_check`의 `vt`(0x4000)를 안 바꿔 디스패치가 가비지를
+      읽던 크래시(0xC0000005) 해소 → **--vm-test [1..40] ALL CHECKS PASSED**
+      복구 (`494af70`).
+- [ ] 핸들러 퓨전 (슈퍼인스트럭션: movzx+alu 등) — 2x 목표 도달용.
+- ⚠️ `--vm`(non-OEP) 패킹 산출물 실행 크래시(ntdll!_chkstk)는 main에서도
+      재현되는 기존 부트/VM 통합 결함 계열 — `problem.txt`에 기록.
 
 ## Phase 3 — 문서 & 마무리
 - [x] `docs/vm-compiler-architecture.md` — 모듈 지도 + 절단 지점.
