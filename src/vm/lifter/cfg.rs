@@ -122,7 +122,16 @@ pub fn lift_block(seq: &[LiftedInstr], seq_base_va: u64) -> Result<Vec<u8>> {
     }
 
     b.halt();
-    Ok(b.finish())
+    // Phase 2.3 (v56): run the assembled stream through the IR pipeline
+    // (VInstr + const copy-prop / dead-mov elim / peephole, then re-encode).
+    // --map/--sym-map diagnostics (mapper active) keep the legacy byte-exact
+    // path so recorded offsets stay valid.
+    if crate::vm::mapper::active() {
+        Ok(b.finish())
+    } else {
+        let (bytes, branches, labels) = b.into_parts();
+        super::ir::run_ir_pipeline(&bytes, &branches, &labels)
+    }
 }
 
 /// M5 (v30) — multi-block control-flow lift driver.
@@ -319,5 +328,12 @@ pub fn lift_cfg_switch(
             crate::vm::mapper::end_block(bc_end, src_va + src_len);
         }
     }
-    Ok(b.finish())
+    // Phase 2.3 (v56): IR pipeline (see lift_block); --map/--sym-map keeps the
+    // legacy byte-exact path for offset validity.
+    if crate::vm::mapper::active() {
+        Ok(b.finish())
+    } else {
+        let (bytes, branches, labels) = b.into_parts();
+        super::ir::run_ir_pipeline(&bytes, &branches, &labels)
+    }
 }

@@ -60,6 +60,7 @@ use self::string::{lift_cmps, lift_lods, lift_movs, lift_scas, lift_stos};
 mod arith;
 mod cfg;
 mod control;
+pub(crate) mod ir;
 mod mem;
 mod muldiv;
 mod shift;

@@ -68,10 +68,19 @@
   `--full --vm`(no --vm-oep)은 이 타깃에서 --iat-hide+TLS callback 충돌로
   패킹 자체 불가 (의도된 거부).
 
-### 2.3 IR 프론트엔드 ⬜
-- [ ] `lift_one` 1:1 매칭을 경량 IR(`VInstr`)로 승격.
-- [ ] 레지스터 맵핑(16 vreg) + 상수 폴딩 + 죽은 코드 제거 + peephole.
-- [ ] M4 검증(dummy_fn 동치) 유지.
+### 2.3 IR 프론트엔드 ✅ (2026-08-13, v56)
+- [x] `lift_one` 1:1 매칭을 경량 IR(`VInstr`)로 승격: `lifter/ir.rs` —
+      assemble된 바이트스트림을 parse→(op+label+분기 메타 보존)→passes→
+      emit(분기 재해결, rel8→rel32 확장 포함)하는 파이프라인.
+      `lift_block`/`lift_cfg_switch`는 IR 경유(--map/--sym-map 진단 모드는
+      오프셋 보존을 위해 레거시 경로 유지).
+- [x] 레지스터 맵핑(vreg 0..19 = 16 프로그램 GPR + lifter scratch) + 상수
+      폴딩(mov-family 상수 전파) + 죽은 코드 제거(dead-mov elim) + peephole
+      (self-mov64 제거). 플래그/메모리/라벨/분기를 span 경계로 한 보수적
+      mov-only 패스 → 정확성 보장(self-test [40]).
+- [x] M4 검증(dummy_fn 동치) 유지 — [14] PASS, 전체 --vm-test ALL PASS.
+      (부수 수정: 레거시 `BytecodeBuilder::widen_branch`가 JCC8 확장 시 cond
+      바이트를 opcode로 오독하던 잠복 버그 수정 — [A2] 테스트가 발동.)
 
 ### 2.4 전체 프로그램 가상화 + 부트 정합 ⬜
 - [ ] `lift_program_cfg`를 전체 .text로 확장.

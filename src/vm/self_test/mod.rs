@@ -34,6 +34,7 @@ mod string_ops;
 mod bmi;
 mod sse_fpu;
 mod lock_incdec;
+mod ir;
 
 // ── test functions the orchestrator dispatches (from submodules) ──
 use self::a2_a5::run_a2_a5_test;
@@ -49,6 +50,7 @@ use self::string_ops::run_string_ops_test;
 use self::bmi::run_bmi_test;
 use self::sse_fpu::run_sse_fpu_test;
 use self::lock_incdec::run_lock_incdec_test;
+use self::ir::run_ir_test;
 use self::flags::run_flags_jcc_test;
 use self::abi::run_handler_abi_test;
 use self::addr::run_m2_addr_test;
@@ -720,6 +722,15 @@ pub fn run_self_test() -> Result<()> {
         Ok(_) => println!("[39] v55 LOCK atomic inc/dec (8/16/32/64 + CF-preserve + lift; interp==native==x86): PASS"),
         Err(e) => {
             println!("[39] v55 LOCK atomic inc/dec:                                                    FAIL ({})", e);
+            return Err(e);
+        }
+    }
+    let _ = std::io::stdout().flush();
+
+    match run_ir_test() {
+        Ok(_) => println!("[40] P2-3 IR frontend (VInstr round-trip == legacy; const-prop/DCE/peephole + rel8 widen): PASS"),
+        Err(e) => {
+            println!("[40] P2-3 IR frontend:                                                           FAIL ({})", e);
             return Err(e);
         }
     }

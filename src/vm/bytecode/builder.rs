@@ -86,7 +86,16 @@ impl BytecodeBuilder {
     fn widen_branch(&mut self, idx: usize) -> usize {
         let (rel_off, label, width) = self.branches[idx];
         debug_assert_eq!(width, 1);
-        let op = self.bytes[rel_off - 1];
+        // OP_JCC8's rel field sits one byte past its cond byte ([op, cond, rel]),
+        // so `bytes[rel_off - 1]` is the COND value (0..=15), not the opcode —
+        // detecting OP_JCC8 at rel_off-2 fixes a long-latent panic when a JCC8
+        // branch falls out of rel8 range (no test had widened a JCC8 before).
+        let (op_pos, op) = if rel_off >= 2 && self.bytes[rel_off - 2] == OP_JCC8 {
+            (rel_off - 2, OP_JCC8)
+        } else {
+            (rel_off - 1, self.bytes[rel_off - 1])
+        };
+        let _ = op_pos;
         // (splice_at, splice_len, op_pos, new_op, new_rel_off, cond_byte)
         let (splice_at, splice_len, op_pos, new_op, new_rel_off, cond) = match op {
             OP_JMP8 => (rel_off, 3, rel_off - 1, OP_JMP32, rel_off, None),
@@ -593,5 +602,16 @@ impl BytecodeBuilder {
             self.bytes.push(OP_HALT);
         }
         self.bytes
+    }
+
+    /// Phase 2.3 (v56): decompose the builder into its pre-fixup parts for the
+    /// IR pipeline (`lifter::ir`): raw bytes (branch rel fields are still 0),
+    /// the `(rel_off, label, width)` branch-fixup list, and label->offset map.
+    /// Appends the self-terminating HALT first (same rule as `finish`).
+    pub fn into_parts(mut self) -> (Vec<u8>, Vec<(usize, u32, u8)>, std::collections::HashMap<u32, usize>) {
+        if self.bytes.last().copied() != Some(OP_HALT) {
+            self.bytes.push(OP_HALT);
+        }
+        (self.bytes, self.branches, self.labels)
     }
 }
