@@ -329,6 +329,14 @@ pub fn disassemble(code: &[u8]) -> String {
             }
             OP_PEXTRD_XMM => { line += &format!("pextrd v{}, xmm{}, 0x{:02X}", code[ip], code[ip+1], code[ip+2]); ip += 3; }
             OP_PINSRD_XMM => { line += &format!("pinsrd xmm{}, v{}, 0x{:02X}", code[ip], code[ip+1], code[ip+2]); ip += 3; }
+            OP_LOCK_INC_MEM8_A | OP_LOCK_INC_MEM16_A | OP_LOCK_INC_MEM32_A | OP_LOCK_INC_MEM64_A => {
+                let w = match op { OP_LOCK_INC_MEM8_A => 8, OP_LOCK_INC_MEM16_A => 16, OP_LOCK_INC_MEM32_A => 32, _ => 64 };
+                line += &format!("lock inc{} [v{}]", w, code[ip]); ip += 1;
+            }
+            OP_LOCK_DEC_MEM8_A | OP_LOCK_DEC_MEM16_A | OP_LOCK_DEC_MEM32_A | OP_LOCK_DEC_MEM64_A => {
+                let w = match op { OP_LOCK_DEC_MEM8_A => 8, OP_LOCK_DEC_MEM16_A => 16, OP_LOCK_DEC_MEM32_A => 32, _ => 64 };
+                line += &format!("lock dec{} [v{}]", w, code[ip]); ip += 1;
+            }
             // ── v31: multiply/divide + BSWAP ──────────────────────────────
             OP_MUL_R_R32 | OP_MUL_R_R64 => {
                 let w = if op == OP_MUL_R_R32 { "mul32" } else { "mul64" };

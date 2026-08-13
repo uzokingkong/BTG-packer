@@ -33,8 +33,8 @@
 - **CMOVcc (v49)**: 16개 조건 패밀리, JCC+MOV lowering — self-test [35].
 - **스택/호출**: PUSH/POP, CALL8/32, RET/RET_IMM16(두-스택 모델), JMP/Jcc(rel8/32).
 - **어드레싱**: LEA(disp/idx/scale), LEA_RIP, LEA_GS(PEB/TEB), 절대주소 mem.
-- **원자적**: CMPXCHG(8/16/32/64), XCHG(8/16/32/64), XADD(8/16/32/64) —
-  Rust `Once`/refcount/teardown용.
+- **원자적**: CMPXCHG(8/16/32/64), XCHG(8/16/32/64), XADD(8/16/32/64),
+  LOCK INC/DEC(8/16/32/64, v55) — Rust `Once`/refcount/teardown용.
 - **SSE 이동/shuffle**: MOVSD/MOVUPS/XORPS(=PXOR)/UNPCKLPD/UNPCKLPS/
   PSHUFLW/HW/D/PSRLQ/PSLLQ/PINSRW.
 - **SSE/FPU 산술·변환 (v54)**: ADDSS/ADDSD/SUBSS/SUBSD/MULSS/MULSD/
@@ -43,15 +43,34 @@
   self-test [38].
 - **기타**: CPUID, XGETBV, NOP, native_call 브리지, HALT.
 
-## 3. 알려진 미지원 / 제외
+## 3. 실측 고정 (2026-08-13, v55)
 
-> 정확한 목록은 타깃에서 `--text-vm`을 돌려 `coverage.md`에 고정한다.
-> 아래는 구조적으로 예상되는 그룹.
+`--text-vm --input test/target/debug/rust_packer_test.exe`:
+- 기본 블록 6,738 / 총 명령 26,956 / **lift 가능 26,956 (100.00%) / lift 불가 0**.
+- lift 바이트코드 45,109 bytes.
 
+이전 잔여 15개(전부 해소됨):
+- `lock dec rm64 ×12`, `lock inc rm32 ×2`, `lock inc rm64 ×1`
+  → OP_LOCK_INC/DEC_MEM8/16/32/64_A (v55, self-test [39]).
+- `xor rax, imm32` (`Xor_RAX_imm32 ×1`)
+  → `lift_arith_imm` 라우팅 누락분 보완 (`Add/Or/And/Xor/Sub_RAX_imm32`).
+
+### 알려진 미지원 잔여 (구조적)
 - **SSE/FPU 잔여**: SQRT, MIN/MAX, CMPSS/COMISS, PMIN/PMAX/PMULLW 등
-  lift 표만 있는 패킹드 연산 다수, x87 FPU 스택 명령.
-- **시스템/특권**: syscall/sysenter, 특권 명령 — 명시적 제외로 문서화(가상화 불가).
-- **기타 iced Code** 중 레지스트리 외 나머지.
+  lift 표만 있는 패킹드 연산 다수 — 실측 타깃에서는 미출현.
+- **x87 FPU 스택 명령** (FLD/FSTP/FADD/…/FNSTSW) — VM은 x87 스택 미모델
+  (SSE 스칼라 경로만 커버; 실측 타깃 미출현).
+
+### 명시적 제외 — 시스템/특권 명령 (가상화 불가, 설계상 제외)
+- **특권/시스템 콜**: `SYSCALL`/`SYSENTER`/`SYSRET`, `SYSRET`, `IRET*`,
+  `HLT`, `STI`/`CLI`, `LGDT`/`LIDT`/`LLDT`/`LTR`, `MOV CRn/DRn`,
+  `INVD`/`WBINVD`/`INVLPG`, `RDMSR`/`WRMSR`, `RDTSC`/`RDPMC`, `XSETBV`,
+  `IN`/`OUT` — 사용자 모드 앱의 .text에는 출현하지 않으며, 출현 시
+  `diagnose_unsupported`가 명시적으로 보고한다.
+- **`INT n` / `INT3`**: 부트·외부 호출 경계로 `HALT` 취급 (특권 제외와 무관).
+- **DF=1(하향) 문자열 연산**: DF 클리어(순방향) 가정 — `STD` 출현 코드는
+  미지원(문서화된 한계).
+- 참고: `CPUID`/`XGETBV`는 VM opcode로 **지원**(0x79/0x7A).
 
 ### 네이티브 제외 (프로그램 VM에서 평문으로 남는 블록 — Phase 2.2 대상)
 - Rust panic/unwind/Once 런타임 함수 (`detect_panic_unwind_ranges`).

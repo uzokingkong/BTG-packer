@@ -105,20 +105,21 @@ pub(super) fn lift_arith_imm(b: &mut BytecodeBuilder, inst: &Instruction) -> Res
     let is8 = is_imm8_op(code);
     let mut imm = inst_imm(inst, is8);
     let is_sub = matches!(code,
-        Sub_RAX_imm32 | Sub_rm32_imm8 | Sub_rm32_imm32 | Sub_rm64_imm8 | Sub_rm64_imm32);
+        Sub_EAX_imm32 | Sub_RAX_imm32
+        | Sub_rm32_imm8 | Sub_rm32_imm32 | Sub_rm64_imm8 | Sub_rm64_imm32);
     if is_sub { imm = -imm; }
 
     let (op32, op64) = if matches!(code,
-        Add_EAX_imm32 | Add_rm32_imm8 | Add_rm32_imm32 | Add_rm64_imm8 | Add_rm64_imm32
-        | Sub_RAX_imm32 | Sub_rm32_imm8 | Sub_rm32_imm32 | Sub_rm64_imm8 | Sub_rm64_imm32)
+        Add_EAX_imm32 | Add_RAX_imm32 | Add_rm32_imm8 | Add_rm32_imm32 | Add_rm64_imm8 | Add_rm64_imm32
+        | Sub_EAX_imm32 | Sub_RAX_imm32 | Sub_rm32_imm8 | Sub_rm32_imm32 | Sub_rm64_imm8 | Sub_rm64_imm32)
     {
         (OP_ADD_R_IMM32, OP_ADD_R_IMM64)
     } else if matches!(code,
-        And_EAX_imm32 | And_rm32_imm8 | And_rm32_imm32 | And_rm64_imm8 | And_rm64_imm32)
+        And_EAX_imm32 | And_RAX_imm32 | And_rm32_imm8 | And_rm32_imm32 | And_rm64_imm8 | And_rm64_imm32)
     {
         (OP_AND_R_IMM32, OP_AND_R_IMM64)
     } else if matches!(code,
-        Or_EAX_imm32 | Or_rm32_imm8 | Or_rm32_imm32 | Or_rm64_imm8 | Or_rm64_imm32)
+        Or_EAX_imm32 | Or_RAX_imm32 | Or_rm32_imm8 | Or_rm32_imm32 | Or_rm64_imm8 | Or_rm64_imm32)
     {
         (OP_OR_R_IMM32, OP_OR_R_IMM64)
     } else {

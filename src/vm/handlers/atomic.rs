@@ -102,6 +102,35 @@ pub(super) fn emit_xchg(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     }
 }
 
+// ── v55: LOCK-prefixed atomic INC/DEC (Rust refcount bump/drop) ─────────────
+// OP_LOCK_INC_MEM*_A / OP_LOCK_DEC_MEM*_A: [addr_vreg] (1 operand).
+//   Real `lock inc [addr]` / `lock dec [addr]` at the absolute address. INC/DEC
+//   flags are captured with cap_flags_incdec (CF preserved — x86 INC/DEC do not
+//   modify CF), matching the interpreter's flags::incdec_flags_width paths.
+pub(super) fn emit_lock_incdec(seq: &mut Vec<(Instruction, Option<Cl>)>) {
+    for (op, code) in [
+        (OP_LOCK_INC_MEM8_A, Code::Inc_rm8),
+        (OP_LOCK_INC_MEM16_A, Code::Inc_rm16),
+        (OP_LOCK_INC_MEM32_A, Code::Inc_rm32),
+        (OP_LOCK_INC_MEM64_A, Code::Inc_rm64),
+        (OP_LOCK_DEC_MEM8_A, Code::Dec_rm8),
+        (OP_LOCK_DEC_MEM16_A, Code::Dec_rm16),
+        (OP_LOCK_DEC_MEM32_A, Code::Dec_rm32),
+        (OP_LOCK_DEC_MEM64_A, Code::Dec_rm64),
+    ] {
+        let mut body = vec![
+            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
+        ];
+        let mut ci = Instruction::with1(code, MemoryOperand::with_base(Register::R11)).unwrap();
+        ci.set_has_lock_prefix(true);
+        body.push(ci);
+        body.extend(cap_flags_incdec());
+        body.push(Instruction::with2(Code::Add_rm64_imm32, Register::R9, 1).unwrap());
+        hdr(seq, op, body);
+    }
+}
+
 pub(super) fn emit_xadd(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     for (op, xadd_code, xreg) in [
         (OP_XADD_MEM8_A, Code::Xadd_rm8_r8, Register::AL),

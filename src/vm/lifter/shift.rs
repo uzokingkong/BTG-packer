@@ -138,11 +138,24 @@ pub(super) fn lift_shift_rotate(b: &mut BytecodeBuilder, inst: &Instruction) -> 
 pub(super) fn lift_incdec(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     use iced_x86::Code::*;
     let is_inc = matches!(inst.code(), Inc_rm32 | Inc_rm64 | Inc_rm8 | Inc_rm16);
+    // LOCK-prefixed memory INC/DEC — atomic RMW (Rust refcount bump/drop).
+    // Lifted to the dedicated LOCK_INC/DEC_MEM*_A opcodes (real `lock inc/dec`
+    // in the native handler), NOT decomposed into a non-atomic load/mod/store
+    // (a racing thread must observe the atomic update).
     if inst.has_lock_prefix() && inst.op0_kind() == OpKind::Memory {
-        return Err(anyhow::anyhow!(
-            "lift_incdec: LOCK-prefixed memory {} must remain native (atomic RMW)",
-            inst
-        ));
+        let addr = mem_emit(b, inst, 0)?;
+        let op = match inst.code() {
+            Inc_rm8 => OP_LOCK_INC_MEM8_A,
+            Inc_rm16 => OP_LOCK_INC_MEM16_A,
+            Inc_rm32 => OP_LOCK_INC_MEM32_A,
+            Inc_rm64 => OP_LOCK_INC_MEM64_A,
+            Dec_rm8 => OP_LOCK_DEC_MEM8_A,
+            Dec_rm16 => OP_LOCK_DEC_MEM16_A,
+            Dec_rm32 => OP_LOCK_DEC_MEM32_A,
+            _ => OP_LOCK_DEC_MEM64_A,
+        };
+        if is_inc { b.lock_inc_a(op, addr); } else { b.lock_dec_a(op, addr); }
+        return Ok(());
     }
     if inst.op0_kind() == OpKind::Register {
         let r = vreg(inst.op0_register())?;

@@ -380,6 +380,7 @@ pub fn generate_vm_code(
     atomic::emit_cmpxchg(&mut seq);
     atomic::emit_xchg(&mut seq);
     atomic::emit_xadd(&mut seq);
+    atomic::emit_lock_incdec(&mut seq);
     stack::emit_native_call(&mut seq);
     alu::emit_or_rr(&mut seq);
     alu::emit_or_imm(&mut seq);
@@ -497,7 +498,9 @@ pub fn generate_vm_code(
                 if op == 0 {
                     offsets[&Cl::Invalid]
                 } else {
-                    offsets[&Cl::Handler(op as u8)]
+                    *offsets
+                        .get(&Cl::Handler(op as u8))
+                        .unwrap_or_else(|| panic!("generate_vm_code: no handler emitted for opcode 0x{op:02X}"))
                 }
             })
             .collect(),

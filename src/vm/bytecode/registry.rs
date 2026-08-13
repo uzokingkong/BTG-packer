@@ -40,8 +40,8 @@ macro_rules! opcodes {
             pub const $name: u8 = $val;
         )*
 
-        /// Handler-table slot count (opcodes 0x00..=0xAB). 0x00 = invalid-opcode handler.
-        pub const NUM_OPS: usize = 0xAC;
+        /// Handler-table slot count (opcodes 0x00..=0xB3). 0x00 = invalid-opcode handler.
+        pub const NUM_OPS: usize = 0xB4;
 
         /// Opcode -> (mnemonic, operand byte length after the opcode byte).
         pub const OPCODE_INFO: &[(u8, &'static str, usize)] = &[
@@ -286,6 +286,18 @@ opcodes! {
     //   PINSRD: xmm[dst].dword[lane] = vreg[src_gpr].low32 (others preserved)
     OP_PEXTRD_XMM  = 0xAA : "pextrd", 3 ;
     OP_PINSRD_XMM  = 0xAB : "pinsrd", 3 ;
+    // v55: LOCK-prefixed atomic INC/DEC ( refcount inc/dec — `lock inc/dec [mem]`).
+    // Encoding [addr_vreg] (1 operand). Real `lock inc`/`lock dec` at the absolute
+    // address; flags are INC/DEC semantics (CF preserved — captured via the same
+    // cap_flags_incdec path as the register INC/DEC handlers).
+    OP_LOCK_INC_MEM8_A  = 0xAC : "lock_inc8", 1 ;
+    OP_LOCK_INC_MEM16_A = 0xAD : "lock_inc16", 1 ;
+    OP_LOCK_INC_MEM32_A = 0xAE : "lock_inc32", 1 ;
+    OP_LOCK_INC_MEM64_A = 0xAF : "lock_inc64", 1 ;
+    OP_LOCK_DEC_MEM8_A  = 0xB0 : "lock_dec8", 1 ;
+    OP_LOCK_DEC_MEM16_A = 0xB1 : "lock_dec16", 1 ;
+    OP_LOCK_DEC_MEM32_A = 0xB2 : "lock_dec32", 1 ;
+    OP_LOCK_DEC_MEM64_A = 0xB3 : "lock_dec64", 1 ;
 }
 
 /// Index-slot sentinel for LEA: no index term (see opcodes! / OP_LEA).

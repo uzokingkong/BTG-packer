@@ -402,11 +402,11 @@ pub fn lift_one(
             b.bswap_r(op, r);
         }
         Bsr_r32_rm32 | Bsr_r64_rm64 | Bsf_r32_rm32 | Bsf_r64_rm64 => lift_bs(b, inst)?,
-        Add_EAX_imm32 | Add_rm32_imm8 | Add_rm32_imm32 | Add_rm64_imm8 | Add_rm64_imm32
-        | Sub_RAX_imm32 | Sub_rm32_imm8 | Sub_rm32_imm32 | Sub_rm64_imm8 | Sub_rm64_imm32
-        | And_EAX_imm32 | And_rm32_imm8 | And_rm32_imm32 | And_rm64_imm8 | And_rm64_imm32
-        | Or_EAX_imm32 | Or_rm32_imm8 | Or_rm32_imm32 | Or_rm64_imm8 | Or_rm64_imm32
-        | Xor_EAX_imm32 | Xor_rm32_imm8 | Xor_rm32_imm32 | Xor_rm64_imm8 | Xor_rm64_imm32 => {
+        Add_EAX_imm32 | Add_RAX_imm32 | Add_rm32_imm8 | Add_rm32_imm32 | Add_rm64_imm8 | Add_rm64_imm32
+        | Sub_EAX_imm32 | Sub_RAX_imm32 | Sub_rm32_imm8 | Sub_rm32_imm32 | Sub_rm64_imm8 | Sub_rm64_imm32
+        | And_EAX_imm32 | And_RAX_imm32 | And_rm32_imm8 | And_rm32_imm32 | And_rm64_imm8 | And_rm64_imm32
+        | Or_EAX_imm32 | Or_RAX_imm32 | Or_rm32_imm8 | Or_rm32_imm32 | Or_rm64_imm8 | Or_rm64_imm32
+        | Xor_EAX_imm32 | Xor_RAX_imm32 | Xor_rm32_imm8 | Xor_rm32_imm32 | Xor_rm64_imm8 | Xor_rm64_imm32 => {
             lift_arith_imm(b, inst)?;
         }
         // ── shift / rotate (all widths, forms, 1/imm8/CL) ────────────────

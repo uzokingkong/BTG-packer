@@ -545,6 +545,16 @@ impl BytecodeBuilder {
     pub fn pinsrd_xmm(&mut self, dst_xmm: u8, src_gpr: u8, imm: u8) {
         self.bytes.extend_from_slice(&[OP_PINSRD_XMM, dst_xmm, src_gpr, imm]);
     }
+
+    // ── v55: LOCK-prefixed atomic INC/DEC (refcounts) ─────────────────────────
+    /// `lock inc [vreg[addr]]` (width by op). Flags: INC semantics (CF kept).
+    pub fn lock_inc_a(&mut self, op: u8, addr: u8) {
+        self.bytes.extend_from_slice(&[op, addr]);
+    }
+    /// `lock dec [vreg[addr]]` (width by op). Flags: DEC semantics (CF kept).
+    pub fn lock_dec_a(&mut self, op: u8, addr: u8) {
+        self.bytes.extend_from_slice(&[op, addr]);
+    }
     /// ret imm16: pop return ip and add imm16 to SP (cdecl cleanup).
     pub fn ret_imm16(&mut self, imm: u16) {
         self.bytes.extend_from_slice(&[OP_RET_IMM16]);

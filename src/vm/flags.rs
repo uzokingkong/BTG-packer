@@ -98,6 +98,60 @@ pub fn add_flags_width(a: u64, b: u64, width: u32) -> u64 {
 }
 
 
+/// Flags for SUB / CMP at 8/16/32-bit width (like add_flags_width: the
+/// carry/sign/overflow boundaries are bit 7 / bit 15 / bit 31, not bit 31).
+/// `width` is the operand width in bits (8 or 16); 32 is equivalent to
+/// `sub_flags`. Only the low `width` bits of `a`/`b` are considered.
+pub fn sub_flags_width(a: u64, b: u64, width: u32) -> u64 {
+    let mask: u64 = match width {
+        8 => 0xFF,
+        16 => 0xFFFF,
+        _ => 0xFFFF_FFFF,
+    };
+    let a2 = a & mask;
+    let b2 = b & mask;
+    let r = a2.wrapping_sub(b2) & mask;
+    let msb: u64 = match width {
+        8 => 0x80,
+        16 => 0x8000,
+        _ => 0x8000_0000,
+    };
+    let mut f = 0u64;
+    if a2 < b2 {
+        f |= F_CF;
+    }
+    if r == 0 {
+        f |= F_ZF;
+    }
+    if r & msb != 0 {
+        f |= F_SF;
+    }
+    if (a2 ^ b2) & (a2 ^ r) & msb != 0 {
+        f |= F_OF;
+    }
+    if (a2 ^ b2 ^ r) & 0x10 != 0 {
+        f |= F_AF;
+    }
+    if parity8(r as u32) {
+        f |= F_PF;
+    }
+    f
+}
+
+/// Width-generic INC/DEC flags (8/16-bit): ADD/SUB-with-1 flags but CF is
+/// *preserved* (the LOCK-prefixed atomic INC/DEC paths; matches the native
+/// `lock inc/dec [mem]` handlers, which capture with cap_flags_incdec).
+pub fn incdec_flags_width(a: u64, width: u32, is_inc: bool, prev_flags: u64) -> u64 {
+    let mut f = if is_inc {
+        add_flags_width(a, 1, width)
+    } else {
+        sub_flags_width(a, 1, width)
+    };
+    f &= !F_CF;
+    f |= prev_flags & F_CF;
+    f
+}
+
 /// Flags for SUB / CMP (r = a - b, 32-bit).
 pub fn sub_flags(a: u32, b: u32) -> u64 {
     let r = a.wrapping_sub(b);
