@@ -29,9 +29,7 @@ pub mod switch;
 mod tests;
 
 pub use exclusions::detect_panic_unwind_ranges;
-use exclusions::{
-    block_has_lock_atomic_on_global, block_has_lock_memory_rmw, block_refs_runtime_global,
-};
+use exclusions::block_refs_runtime_global;
 pub use switch::resolve_switch_cases;
 
 
@@ -296,31 +294,26 @@ pub fn lift_program_cfg(
     // them NATIVE instead of virtualizing them. Their SEH/unwind metadata must
     // match the real native frame layout; block-shuffling them into the VM is
     // what corrupts the unwind chain on panic (the once.rs:166 teardown crash).
+    //
+    // v56 (Phase 2.2): the two purely-atomicity-driven lock nets
+    // (`block_has_lock_atomic_on_global` / `block_has_lock_memory_rmw` and the
+    // LOCK-RMW function quarantine inside `detect_panic_unwind_ranges`) were
+    // REMOVED: every lock-prefixed memory RMW that occurs is now a real
+    // `lock`-prefixed VM opcode (CMPXCHG/XCHG/XADD v46-v49, LOCK INC/DEC v55),
+    // so virtualizing those blocks no longer lowers an atomic update to a
+    // non-atomic load->modify->store. What remains excluded is the structural
+    // SEH set only: the panic/unwind runtime functions and every block touching
+    // their shared-state globals.
     let excl = detect_panic_unwind_ranges(
         text_bytes, base_va, image_base, relayed_sections,
     );
     let runtime_globals: std::collections::HashSet<u64> =
         excl.runtime_globals.iter().copied().collect();
-    // Shared-state (Once state word / panic-hook / stdio / rt-cleanup) global
-    // ranges, for the lock-atomic net below (data/.rdata/.bss only).
-    let state_ranges: Vec<(u64, u64)> = relayed_sections
-        .iter()
-        .filter(|s| {
-            s.name.starts_with(".data") || s.name.starts_with(".rdata") || s.name.starts_with(".bss")
-        })
-        .map(|s| {
-            let start = image_base + s.virtual_address as u64;
-            let len = (s.virtual_size.max(s.bytes.len() as u32)) as u64;
-            (start, start + len)
-        })
-        .collect();
     let mut excluded_blocks: std::collections::HashSet<u64> = blocks
         .iter()
         .filter(|bb| {
             excl.func_ranges.iter().any(|(s, e)| *s <= bb.start_va && bb.start_va < *e)
                 || block_refs_runtime_global(bb, &runtime_globals)
-                || block_has_lock_atomic_on_global(bb, &state_ranges)
-                || block_has_lock_memory_rmw(bb)
         })
         .map(|bb| bb.start_va)
         .collect();

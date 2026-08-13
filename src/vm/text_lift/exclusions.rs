@@ -86,63 +86,15 @@ pub(crate) fn block_refs_runtime_global(
     bb.instructions.iter().any(|i| instr_refs_global(i, globals))
 }
 
-/// Does this basic block contain a `lock`-prefixed atomic instruction whose
-/// memory operand lands on a data/.rdata/.bss global? `Once` state is a
-/// `lock cmpxchg` on such a global; lifting that into the VM is what corrupts
-/// the state/closure (once.rs:166). This is a belt-and-suspenders net on top of
-/// `block_refs_runtime_global` in case a state slot isn't reached by an already
-/// excluded function and so isn't in `runtime_globals`.
-pub(crate) fn block_has_lock_atomic_on_global(
-    bb: &crate::graph::BasicBlock,
-    state_ranges: &[(u64, u64)],
-) -> bool {
-    use iced_x86::{OpKind, Register};
-    bb.instructions.iter().any(|inst| {
-        if !inst.has_lock_prefix() {
-            return false;
-        }
-        for oi in 0..inst.op_count() {
-            if inst.op_kind(oi) != OpKind::Memory {
-                continue;
-            }
-            let addr = if inst.is_ip_rel_memory_operand() {
-                inst.memory_displacement64()
-            } else if inst.memory_base() == Register::None && inst.memory_index() == Register::None {
-                inst.memory_displacement64()
-            } else {
-                continue;
-            };
-            if state_ranges.iter().any(|&(gs, ge)| gs <= addr && addr < ge) {
-                return true;
-            }
-        }
-        false
-    })
-}
-
-/// Does this basic block contain a `lock`-prefixed memory read-modify-write
-/// (INC/DEC/ADD/SUB/XADD/AND/OR/XOR/NEG/NOT on a memory operand) regardless of
-/// addressing mode? x86 `lock` on a memory RMW is an atomic read-modify-write.
-/// `lift_incdec`/the generic memory path lowers a memory INC/DEC to a
-/// non-atomic load->modify->store, which corrupts Rust runtime refcounts and
-/// shared state (e.g. the exit-time Once teardown -> once.rs:166). Keep any
-/// block that performs one native. Unlike `block_has_lock_atomic_on_global`
-/// (which only recognizes RIP-relative / absolute operands), this catches the
-/// register-base form `lock dec [rax]` that evades that check.
-pub(crate) fn block_has_lock_memory_rmw(bb: &crate::graph::BasicBlock) -> bool {
-    use iced_x86::OpKind;
-    bb.instructions.iter().any(|inst| {
-        if !inst.has_lock_prefix() {
-            return false;
-        }
-        for oi in 0..inst.op_count() {
-            if inst.op_kind(oi) == OpKind::Memory {
-                return true;
-            }
-        }
-        false
-    })
-}
+// ── v56 (Phase 2.2): the lock-atomicity exclusion nets were REMOVED ────────
+// `block_has_lock_atomic_on_global` / `block_has_lock_memory_rmw` (block
+// level) and the LOCK-RMW function quarantine (function level) used to keep
+// any block with a `lock`-prefixed memory RMW native, because lowering one to
+// a non-atomic load->modify->store corrupted Rust runtime refcounts and the
+// Once state (once.rs:166). Every occurring lock memory RMW is now a real
+// `lock`-prefixed VM opcode (CMPXCHG v46/v49, XCHG v48, XADD v48, LOCK
+// INC/DEC v55), so the atomicity-driven nets are gone; only the structural
+// SEH-driven panic/unwind exclusion below remains.
 
 /// Detect the Rust panic/unwind/Once runtime functions in `.text`, so
 /// `lift_program_cfg` can keep them native (and keep native every block that
@@ -153,7 +105,7 @@ pub fn detect_panic_unwind_ranges(
     image_base: u64,
     relayed_sections: &[crate::pe::builder::SectionData],
 ) -> PanicUnwindExclusion {
-    use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, OpKind, Register};
+    use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind, Register};
 
     // Rust panic message signatures that only appear in the panic/unwind runtime.
     const SIGS: &[&[u8]] = &[
@@ -427,52 +379,8 @@ pub fn detect_panic_unwind_ranges(
         }
     }
 
-    // ── LOCK memory-RMW function quarantine (once.rs:166) ────────────────────
-    // A `lock`-prefixed memory INC/DEC/ADD/SUB/... is an atomic RMW. `lift_incdec`
-    // lowers a memory INC/DEC to a non-atomic load->modify->store, which corrupts
-    // Rust runtime refcount/shared state on the exit teardown path. Besides the
-    // block-level net in lift_program_cfg, keep the WHOLE .pdata function native so
-    // a refcount/teardown function is not split native<->VM (register-base operands
-    // like `lock dec [rax]` evade block_has_lock_atomic_on_global, so catch any lock
-    // memory RMW here and quarantine the entire function).
-    for &(fs, fe) in &funcs {
-        if excluded.contains(&fs) {
-            continue;
-        }
-        let off = fs.saturating_sub(base_va) as usize;
-        if off >= text_bytes.len() {
-            continue;
-        }
-        let mut d = Decoder::with_ip(64, &text_bytes[off..], fs, DecoderOptions::NONE);
-        let mut has_lock_rmw = false;
-        let mut guard = 0usize;
-        for inst in d {
-            if guard > 1_000_000 {
-                break;
-            }
-            guard += 1;
-            if inst.ip() >= fe {
-                break;
-            }
-            if inst.is_invalid() {
-                continue;
-            }
-            if inst.has_lock_prefix() {
-                for oi in 0..inst.op_count() {
-                    if inst.op_kind(oi) == OpKind::Memory {
-                        has_lock_rmw = true;
-                        break;
-                    }
-                }
-            }
-            if has_lock_rmw {
-                break;
-            }
-        }
-        if has_lock_rmw {
-            excluded.insert(fs);
-        }
-    }
+    // (v56: the LOCK memory-RMW function quarantine that used to live here was
+    // removed — those RMWs are VM opcodes now; see the note at the top.)
 
     // convert excluded function-start VAs back to ranges, and collect the
     // shared-state globals every excluded function references.

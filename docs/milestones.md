@@ -54,9 +54,19 @@
       [39] LOCK inc/dec — 2026-08-13).
 - [x] 시스템/특권 명령은 명시적 제외로 문서화 (`coverage.md` §3).
 
-### 2.2 제외 블록 제거 ⬜
-- [ ] lock-atomic RMW / panic-unwind 블록을 네이티브로 남기는 휴리스틱을
-      VM opcode로 대체 → 프로그램 본문 100% VM.
+### 2.2 제외 블록 제거 ✅
+- [x] lock-atomic RMW 휴리스틱(`block_has_lock_atomic_on_global`,
+      `block_has_lock_memory_rmw`, LOCK-RMW 함수 격리)을 VM opcode로 대체
+      (CMPXCHG/XCHG/XADD v46-v49 + LOCK INC/DEC v55) → lock 블록은 이제
+      정확한 원자 VM opcode로 가상화. 제외 필터에서 두 넷 제거 (2026-08-13).
+- 잔여 제외 = SEH 구조적 제외(panic/unwind 런타임 함수 + shared-state
+  global 참조 블록) — SEH 메타데이터 정합 때문에 설계상 네이티브 유지
+  (휴리스틱이 아닌 정확성 요건; `exclusions.rs` 주석 참조).
+- ⚠️ 기존 결함(베이스라인 0cb48c6에서도 재현): `--full --vm --vm-oep`
+  packed rust_packer_test.exe가 즉시 0xC0000005 크래시(출력 없음).
+  Phase 2.4(부트 정합)/Phase 3(샘플 실행 회귀)에서 추적 예정.
+  `--full --vm`(no --vm-oep)은 이 타깃에서 --iat-hide+TLS callback 충돌로
+  패킹 자체 불가 (의도된 거부).
 
 ### 2.3 IR 프론트엔드 ⬜
 - [ ] `lift_one` 1:1 매칭을 경량 IR(`VInstr`)로 승격.
