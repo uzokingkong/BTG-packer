@@ -17,8 +17,8 @@ const C3: u32 = 0x27D4_EB2F ^ 0xE654_6B64;
 ///   [12]     counter_lo
 ///   [13]     counter_hi
 ///   [14]     nonce
-///   [15]     domain = "BTGC" 블록 구분자 XOR block_index
-pub fn initial_state(key: &[u8; 32], counter: u64, nonce: u32, block_index: u32) -> [u32; STATE_WORDS] {
+///   [15]     domain = "BTGC" XOR counter_lo (블록 구분)
+pub fn initial_state(key: &[u8; 32], counter: u64, nonce: u32) -> [u32; STATE_WORDS] {
     let mut st = [0u32; STATE_WORDS];
     st[0] = C0;
     st[1] = C1;
@@ -30,6 +30,6 @@ pub fn initial_state(key: &[u8; 32], counter: u64, nonce: u32, block_index: u32)
     st[12] = counter as u32;
     st[13] = (counter >> 32) as u32;
     st[14] = nonce;
-    st[15] = u32::from_le_bytes(*b"BTGC") ^ block_index;
+    st[15] = u32::from_le_bytes(*b"BTGC") ^ (counter as u32);
     st
 }

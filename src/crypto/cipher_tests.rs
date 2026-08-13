@@ -108,3 +108,51 @@ fn avalanche_diffusion() {
         ratio * 100.0
     );
 }
+
+#[test]
+fn native_keystream_matches_reference() {
+    // plan.txt 6단계: native(셸코드) == reference 정본 동치.
+    use super::native;
+    use super::state::BtgState;
+    use crate::vm::arena::Arena;
+
+    let code = native::emit_keystream_block();
+    let sbox = super::nonlinear::sbox();
+    let key = [0x13u8, 0x57, 0x9A, 0xE4, 0x28, 0x6B, 0xD3, 0x0F, 0x91, 0x4C, 0xE7, 0x52, 0xBA, 0x39, 0x86, 0xD1, 0x05, 0xEF, 0x77, 0x20, 0xCB, 0x58, 0x43, 0xF6, 0x2E, 0xAD, 0x64, 0x91, 0x3C, 0xF5, 0x08, 0x1B];
+    // code / sbox / key / out must not overlap (fully-unrolled 16-round code is ~30KB).
+    let code_off = 0x0000;
+    let sbox_off = 0x9000;
+    let key_off = 0x9100;
+    let out_off = 0x9200;
+    assert!(code.len() <= sbox_off, "native code ({}B) overlaps sbox", code.len());
+
+    let mut arena = Arena::new(0x40000).unwrap();
+    {
+        let b = arena.bytes();
+        b[code_off..code_off + code.len()].copy_from_slice(&code);
+        b[sbox_off..sbox_off + 0x100].copy_from_slice(&sbox);
+        b[key_off..key_off + 0x20].copy_from_slice(&key);
+    }
+
+    for ctr in [0u64, 1, 7, 42] {
+        let nonce = 0xA5B6_C7D8u32;
+        arena.call5(
+            code_off,
+            arena.base + key_off,
+            ctr,
+            nonce,
+            arena.base + sbox_off,
+            arena.base + out_off,
+        );
+        let mut native_out = [0u8; 64];
+        native_out.copy_from_slice(&arena.bytes()[out_off..out_off + 64]);
+        let ref_out = BtgState::absorb(&key, ctr, nonce).to_keystream_bytes();
+        assert_eq!(
+            native_out,
+            ref_out,
+            "native keystream block must match reference (ctr={})",
+            ctr
+        );
+    }
+}
+

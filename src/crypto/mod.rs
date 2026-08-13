@@ -16,6 +16,7 @@ pub mod provider;
 
 // BTG-C1 커스텀 사이퍼 reference 모듈 (plan.txt 5단계).
 pub mod key_schedule;
+pub mod native;
 pub mod nonlinear;
 pub mod permutation;
 pub mod round;

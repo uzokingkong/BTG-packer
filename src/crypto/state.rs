@@ -30,16 +30,13 @@ pub const ROUNDS: usize = 16;
 pub struct BtgState(pub [u32; STATE_WORDS]);
 
 impl BtgState {
-    /// (key, counter, nonce, block_index) → 초기 상태 흡수.
-    /// `block_index`는 각 키스트림 블록(64B)의 구분자 — 같은 (key, ctr, nonce)로
-    /// 연속 블록을 만들 때 block_index가 늘어난다.
-    pub fn absorb(key: &[u8; 32], counter: u64, nonce: u32, block_index: u32) -> Self {
-        let mut st = key_schedule::initial_state(key, counter, nonce, block_index);
+    /// (key, counter, nonce) → 초기 상태 흡수 후 라운드+피드포워드.
+    /// counter는 64B 키스트림 블록 카운터 (0,1,2,…) — native/VM과 정본 동일.
+    pub fn absorb(key: &[u8; 32], counter: u64, nonce: u32) -> Self {
+        let init = key_schedule::initial_state(key, counter, nonce);
+        let mut st = init;
         round::apply_rounds(&mut st, ROUNDS);
-        // feed-forward: 최종 상태를 초기 상태에 더해 덧셈 비가역성을 강화한다
-        // (counter 모드 키스트림의 표준 기법과 동일한 아이디어지만 초기 상태를
-        // 다시 더하는 대신 결과 상태를 초기 상태와 XOR해 독립성을 유지한다).
-        let init = key_schedule::initial_state(key, counter, nonce, block_index);
+        // feed-forward: 최종 상태 = 라운드 결과 + 초기 상태 (wrapping_add)
         for i in 0..STATE_WORDS {
             st[i] = st[i].wrapping_add(init[i]);
         }
@@ -87,8 +84,7 @@ impl BtgCipher {
     }
 
     fn refill(&mut self) {
-        let block_index = (self.ctr / 8) as u32; // ctr 하위 8블록 인덱스는 도메인 워드로
-        let st = BtgState::absorb(&self.key, self.ctr, self.nonce, block_index);
+        let st = BtgState::absorb(&self.key, self.ctr, self.nonce);
         self.ks = st.to_keystream_bytes();
         self.ks_off = 0;
         self.ctr = self.ctr.wrapping_add(1);

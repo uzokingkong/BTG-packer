@@ -52,6 +52,22 @@ impl Arena {
         let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(self.base + off) };
         f()
     }
+
+    /// Execute machine code with 5 Win64 args (BTG-C1 native equivalence tests).
+    pub(crate) fn call5(
+        &self,
+        off: usize,
+        a1: usize,
+        a2: u64,
+        a3: u32,
+        a4: usize,
+        a5: usize,
+    ) {
+        // SAFETY: generated code with the exact (ptr, u64, u32, ptr, ptr) ABI.
+        let f: extern "C" fn(usize, u64, u32, usize, usize) =
+            unsafe { std::mem::transmute(self.base + off) };
+        f(a1, a2, a3, a4, a5);
+    }
 }
 
 #[cfg(unix)]
@@ -122,6 +138,22 @@ mod arena_win {
             // SAFETY: transmuted to a return-value signature; arena is RWX.
             let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(self.base + off) };
             f()
+        }
+
+        /// Execute machine code with 5 Win64 args (BTG-C1 native equivalence tests).
+        pub fn call5(
+            &self,
+            off: usize,
+            a1: usize,
+            a2: u64,
+            a3: u32,
+            a4: usize,
+            a5: usize,
+        ) {
+            // SAFETY: generated code with the exact (ptr, u64, u32, ptr, ptr) ABI.
+            let f: extern "C" fn(usize, u64, u32, usize, usize) =
+                unsafe { std::mem::transmute(self.base + off) };
+            f(a1, a2, a3, a4, a5);
         }
     }
 

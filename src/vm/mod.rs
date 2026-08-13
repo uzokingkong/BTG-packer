@@ -147,7 +147,7 @@ pub fn build_program_vm(
 //   self_test/   - --vm-test cross-validation suite (directory module)
 //   bench.rs    - --vm-bench interpreter vs native throughput
 // ═══════════════════════════════════════════════════════════════════════
-mod arena;
+pub(crate) mod arena;
 mod encode;
 mod self_test;
 mod bench;
