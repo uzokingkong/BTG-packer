@@ -213,8 +213,10 @@ pub(crate) fn run_a2_a5_test() -> Result<()> {
         let bc = lift_block(&seq, 0)?;
         assert!(!bc.is_empty(), "A5 lift produced empty bytecode");
 
+        // ADDSS became supported in v54 (Group A), so the negative-diagnostic
+        // probe uses SQRTSS — an SSE FP op still outside the lift table.
         let mut bad_seq: Vec<LiftedInstr> = Vec::new();
-        bad_seq.push(LiftedInstr::plain(Instruction::with2(Code::Addss_xmm_xmmm32, Register::XMM0, Register::XMM1).unwrap()));
+        bad_seq.push(LiftedInstr::plain(Instruction::with2(Code::Sqrtss_xmm_xmmm32, Register::XMM0, Register::XMM1).unwrap()));
         let bad2 = diagnose_unsupported(&bad_seq);
         assert!(!bad2.is_empty(), "A5 diagnose should flag FP op");
         let lift_err = lift_block(&bad_seq, 0);
@@ -345,10 +347,11 @@ pub(crate) fn run_a2a5_lift_residual_test() -> Result<()> {
 
     // ── Part B: rep movsd (mem copy) ───────────────────────────────────────
     // iced-x86 does not support Instruction::with() for MOVS/CMPS (implicit [rdi]/[rsi]
-    // operands). Decode from the raw opcode byte instead.
+    // operands). Decode from the raw opcode bytes instead (F3 = REP prefix;
+    // a bare MOVSD without REP copies a single dword).
     let mseq = {
         use iced_x86::{Decoder, DecoderOptions};
-        let raw = [0xA5u8]; // MOVSD m32, m32 (64-bit mode)
+        let raw = [0xF3u8, 0xA5]; // REP MOVSD m32, m32 (64-bit mode)
         let mut dec = Decoder::with_ip(64, &raw, 0, DecoderOptions::NONE);
         [LiftedInstr::plain(dec.decode())]
     };
@@ -377,7 +380,7 @@ pub(crate) fn run_a2a5_lift_residual_test() -> Result<()> {
     // ── Part C: rep cmpsd (matching → rcx=0; mismatch → stops early) ───────
     let cseq = {
         use iced_x86::{Decoder, DecoderOptions};
-        let raw = [0xA7u8]; // CMPSD m32, m32 (64-bit mode)
+        let raw = [0xF3u8, 0xA7]; // REPE CMPSD m32, m32 (64-bit mode)
         let mut dec = Decoder::with_ip(64, &raw, 0, DecoderOptions::NONE);
         [LiftedInstr::plain(dec.decode())]
     };

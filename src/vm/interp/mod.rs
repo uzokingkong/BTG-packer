@@ -108,7 +108,14 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
             | OP_MOVSD_MEM_XMM | OP_MOVUPS_XMM_MEM | OP_MOVUPS_MEM_XMM
             | OP_UNPCKLPD_XMM | OP_UNPCKLPS_XMM | OP_XORPS_XMM
             | OP_PSRLQ_XMM_IMM8 | OP_PSLLQ_XMM_IMM8
-            | OP_PSHUFLW_XMM | OP_PSHUFHW_XMM | OP_PSHUFD_XMM => {
+            | OP_PSHUFLW_XMM | OP_PSHUFHW_XMM | OP_PSHUFD_XMM
+            // ── v54: SSE/FPU (Group A) ───────────────────────────────────
+            | OP_ADDSS_XMM | OP_ADDSD_XMM | OP_SUBSS_XMM | OP_SUBSD_XMM
+            | OP_MULSS_XMM | OP_MULSD_XMM | OP_DIVSS_XMM | OP_DIVSD_XMM
+            | OP_PAND_XMM | OP_POR_XMM | OP_PANDN_XMM
+            | OP_CVTSI2SD_XMM | OP_CVTSI2SS_XMM | OP_CVTSS2SD_XMM | OP_CVTSD2SS_XMM
+            | OP_CVTTSS2SI | OP_CVTTSD2SI | OP_CVTSS2SI | OP_CVTSD2SI
+            | OP_PEXTRD_XMM | OP_PINSRD_XMM => {
                 xmm::exec(state, mem, code, ip, op)?
             }
             // ── atomic ───────────────────────────────────────────────────

@@ -1,3 +1,44 @@
+# v54 — Phase 2.1 Group A: SSE/FPU opcodes + string-op x86-exactness fix
+
+## Changes
+- `src/vm/bytecode/registry.rs` — 21 new SSE/FPU opcodes (0x97..0xAB):
+  scalar FP ADDSS/ADDSD/SUBSS/SUBSD/MULSS/MULSD/DIVSS/DIVSD, packed logic
+  PAND/POR/PANDN, CVTSI2SD/CVTSI2SS, CVTSS2SD/CVTSD2SS,
+  CVTTSS2SI/CVTTSD2SI (trunc) / CVTSS2SI/CVTSD2SI (round-to-nearest-even),
+  PEXTRD/PINSRD. NUM_OPS 0x97 -> 0xAC (171 opcodes).
+- `src/vm/handlers/sse_arith.rs` — native x86-64 handlers (state-XMM file
+  addressing; scalar-FP ops preserve dst upper bytes, conversions zero them;
+  no status-flag capture, matching the interpreter).
+- `src/vm/interp/xmm.rs` — interpreter arms for all 21 opcodes (incl. the
+  round-ties-to-even helper for CVTSS2SI/CVTSD2SI and the x86 "integer
+  indefinite" 0x8000_0000 value for NaN/out-of-range converts).
+- `src/vm/lifter/sse.rs` — lift_sse_fp / lift_sse_logic / lift_cvt /
+  lift_pext_pins (+ width-exact m32/m64 scalar loads via a GPR so ADDSS xmm,
+  m32 never over-reads). `lifter/mod.rs` routes the new arms; PAND/POR/PANDN
+  are lifted correctly now (the legacy catch-all SSE arm emitted UNPCKLPD for
+  them), and PXOR is bit-identical-mapped to XORPS.
+- `src/vm/lifter/string.rs` — REP SCAS/CMPS lowering made x86-exact: the
+  terminating iteration consumes the count and advances the pointer(s) like
+  hardware (ZF decision captured via SETcc before bookeeping, final compare
+  flags re-generated on exit), compare direction fixed to
+  SCAS = acc - [rdi] / CMPS = [rsi] - [rdi], and all pointer bumps use LEA
+  (no flag clobber). Non-REP MOVS/STOS/LODS single forms likewise bump via
+  LEA so plain string ops write no rflags.
+- `src/vm/self_test/` — [38] A-1 SSE/FPU group test (sse_fpu.rs: interp ==
+  native == expected, incl. lift smoke test); [36] SCAS/CMPS expectations
+  updated to the x86-exact model (+ exit-ZF asserts); [21] Part B/C decode
+  REP-prefixed bytes (rep movsd/repe cmpsd regression from v52 fixed);
+  [15] negative-diagnostic probe retargeted from ADDSS (now supported) to
+  SQRTSS.
+- `docs/coverage.md`, `docs/milestones.md` — P2-1 group work marked done.
+
+## Verification
+- `cargo build --release`: OK (warnings only, pre-existing).
+- `cargo test`: 73 passed / 0 failed.
+- `--vm-test`: [1]..[38] ALL PASS (incl. [30] registry sync over 171 opcodes).
+
+---
+
 # v13.4e — two-stack VM model (separate bytecode return-IP stack from the architectural RSP)
 
 ## Root cause (per message.txt audit, applied to the v13.4e src)

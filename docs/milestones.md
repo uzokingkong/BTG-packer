@@ -44,10 +44,11 @@
 
 ## Phase 2 — 컴파일러 프론트엔드 (IR + 커버리지 + 전체 가상화) ⬜
 
-### 2.1 명령 커버리지 완결 ⬜
+### 2.1 명령 커버리지 완결 🔶
 - [ ] `--text-vm` 진단이 출력하는 미지원 명령 목록을 `coverage.md`로 고정.
-- [ ] SSE/FPU, BMI1/2(tzcnt/lzcnt/popcnt), 문자열 ops(movs/stos/scas),
-      CMOVcc를 그룹별(opcode+핸들러+리프터+인터프리터+테스트) 한 벌로 추가.
+- [x] SSE/FPU, BMI1/2(tzcnt/lzcnt/popcnt), 문자열 ops(movs/stos/scas),
+      CMOVcc를 그룹별(opcode+핸들러+리프터+인터프리터+테스트) 한 벌로 추가
+      (self-test [35] CMOVcc, [36] 문자열, [37] BMI1/2, [38] SSE/FPU — 2026-08-13).
 - [ ] 시스템/특권 명령은 명시적 제외로 문서화.
 
 ### 2.2 제외 블록 제거 ⬜

@@ -53,6 +53,7 @@ use self::shift::{lift_incdec, lift_not_neg, lift_shift_rotate};
 use self::sse::{
     lift_movq, lift_pinsrw, lift_sse, lift_sseshift_imm8, lift_sseshuffle, lift_tzcnt,
     lift_unpcklps,
+    lift_cvt, lift_pext_pins, lift_sse_fp, lift_sse_logic,
 };
 use self::string::{lift_cmps, lift_lods, lift_movs, lift_scas, lift_stos};
 
@@ -499,12 +500,21 @@ pub fn lift_one(
         Scasb_AL_m8 | Scasw_AX_m16 | Scasd_EAX_m32 | Scasq_RAX_m64 => lift_scas(b, inst)?,
         Cmpxchg_rm8_r8 | Cmpxchg_rm16_r16 | Cmpxchg_rm32_r32 | Cmpxchg_rm64_r64 => lift_cmpxchg(b, inst)?,
         Xadd_rm8_r8 | Xadd_rm16_r16 | Xadd_rm32_r32 | Xadd_rm64_r64 => lift_xadd(b, inst)?,
+        // ── v54: SSE/FPU (Group A) scalar FP / logic / cvt / pextrd-pinsrd ──
+        Addss_xmm_xmmm32 | Addsd_xmm_xmmm64 | Subss_xmm_xmmm32 | Subsd_xmm_xmmm64
+        | Mulss_xmm_xmmm32 | Mulsd_xmm_xmmm64 | Divss_xmm_xmmm32 | Divsd_xmm_xmmm64 => lift_sse_fp(b, inst)?,
+        Pand_xmm_xmmm128 | Por_xmm_xmmm128 | Pandn_xmm_xmmm128 => lift_sse_logic(b, inst)?,
+        Cvtsi2sd_xmm_rm32 | Cvtsi2sd_xmm_rm64 | Cvtsi2ss_xmm_rm32 | Cvtsi2ss_xmm_rm64
+        | Cvtss2sd_xmm_xmmm32 | Cvtsd2ss_xmm_xmmm64
+        | Cvttss2si_r32_xmmm32 | Cvttss2si_r64_xmmm32 | Cvttsd2si_r32_xmmm64 | Cvttsd2si_r64_xmmm64
+        | Cvtss2si_r32_xmmm32 | Cvtss2si_r64_xmmm32 | Cvtsd2si_r32_xmmm64 | Cvtsd2si_r64_xmmm64 => lift_cvt(b, inst)?,
+        Pextrd_rm32_xmm_imm8 | Pinsrd_xmm_rm32_imm8 => lift_pext_pins(b, inst)?,
         Movsd_xmm_xmmm64 | Movss_xmm_xmmm32 | Movq_xmm_xmmm64 | Movd_xmm_rm32
         | Movups_xmm_xmmm128 | Movdqu_xmm_xmmm128 | Movdqa_xmm_xmmm128 | Movaps_xmm_xmmm128
         | Movupd_xmm_xmmm128 | Movapd_xmm_xmmm128
         | Pcmpeqb_xmm_xmmm128 | Pcmpeqw_xmm_xmmm128 | Pcmpeqd_xmm_xmmm128
         | Pcmpgtb_xmm_xmmm128 | Pcmpgtw_xmm_xmmm128 | Pcmpgtd_xmm_xmmm128
-        | Pxor_xmm_xmmm128 | Pand_xmm_xmmm128 | Por_xmm_xmmm128 | Pandn_xmm_xmmm128
+        | Pxor_xmm_xmmm128
         | Paddb_xmm_xmmm128 | Paddw_xmm_xmmm128 | Paddd_xmm_xmmm128 | Paddq_xmm_xmmm128
         | Paddsb_xmm_xmmm128 | Paddsw_xmm_xmmm128 | Paddusb_xmm_xmmm128 | Paddusw_xmm_xmmm128
         | Psubb_xmm_xmmm128 | Psubw_xmm_xmmm128 | Psubd_xmm_xmmm128 | Psubq_xmm_xmmm128

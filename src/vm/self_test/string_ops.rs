@@ -10,6 +10,7 @@
 // and memory (interp == native == expected).
 
 use anyhow::{Result, anyhow};
+use crate::vm::bytecode::F_ZF;
 use crate::vm::lifter::{LiftedInstr, lift_block, diagnose_unsupported};
 use iced_x86::{Decoder, DecoderOptions, Instruction};
 
@@ -59,6 +60,15 @@ fn run_case(
 
 fn addr(base: u64, off: u64) -> u64 {
     base + BASE + off
+}
+
+/// Read the STATE_FLAGS word of a state buffer.
+fn flags(state: &[u8]) -> u64 {
+    u64::from_le_bytes(
+        state[crate::vm::interp::STATE_FLAGS..crate::vm::interp::STATE_FLAGS + 8]
+            .try_into()
+            .unwrap(),
+    )
 }
 
 /// Run the string-ops group check. Returns Ok(()) iff interp and native match.
@@ -120,12 +130,14 @@ fn run_cases() -> Result<()> {
     }
 
     // ── repe scasq: stop at the first qword != rax ────────────────────────────
-    // buffer = {0xAA, 0xAA, 0xBB}; rax = 0xAA; rcx = 3 → 2 matches then stop.
+    // buffer = {0xAA, 0xBB, 0xCC}; rax = 0xAA; rcx = 3 → 1 match, stop on BB.
+    // x86-exact: the terminating iteration still advances rdi and decrements
+    // rcx (rdi points PAST the mismatch, 1 iteration left, ZF=0 at exit).
     {
         let mut data = vec![0u8; 0x100];
         data[0x000..0x008].copy_from_slice(&0xAAu64.to_le_bytes());
-        data[0x008..0x010].copy_from_slice(&0xAAu64.to_le_bytes());
-        data[0x010..0x018].copy_from_slice(&0xBBu64.to_le_bytes());
+        data[0x008..0x010].copy_from_slice(&0xBBu64.to_le_bytes());
+        data[0x010..0x018].copy_from_slice(&0xCCu64.to_le_bytes());
         let seed = |s: &mut [u8], base: u64| {
             set_vreg(s, 0, 0xAA); // rax
             set_vreg(s, 7, addr(base, 0x000)); // rdi
@@ -133,19 +145,19 @@ fn run_cases() -> Result<()> {
         };
         let (si, sn) = run_case(decode(&[0xF3, 0x48, 0xAF]), &data, seed)?;
         for st in [&si, &sn] {
-            // stopped at the mismatch (not advanced past it); 1 iteration left
-            assert_eq!(vreg(st, 7), addr(0, 0x010), "scasq rdi (points at mismatch)");
+            assert_eq!(vreg(st, 7), addr(0, 0x010), "scasq rdi (past mismatch)");
             assert_eq!(vreg(st, 1), 1, "scasq rcx (1 iteration left)");
+            assert_eq!(flags(st) & F_ZF, 0, "scasq exit flags ZF=0 (mismatch)");
         }
     }
 
     // ── repne scasq: stop at the first qword == rax ───────────────────────────
-    // buffer = {0xBB, 0xBB, 0xAA}; rax = 0xAA; rcx = 3 → match at index 2.
+    // buffer = {0xBB, 0xAA, 0xCC}; rax = 0xAA; rcx = 3 → match at index 1.
     {
         let mut data = vec![0u8; 0x100];
         data[0x000..0x008].copy_from_slice(&0xBBu64.to_le_bytes());
-        data[0x008..0x010].copy_from_slice(&0xBBu64.to_le_bytes());
-        data[0x010..0x018].copy_from_slice(&0xAAu64.to_le_bytes());
+        data[0x008..0x010].copy_from_slice(&0xAAu64.to_le_bytes());
+        data[0x010..0x018].copy_from_slice(&0xCCu64.to_le_bytes());
         let seed = |s: &mut [u8], base: u64| {
             set_vreg(s, 0, 0xAA); // rax
             set_vreg(s, 7, addr(base, 0x000)); // rdi
@@ -153,9 +165,9 @@ fn run_cases() -> Result<()> {
         };
         let (si, sn) = run_case(decode(&[0xF2, 0x48, 0xAF]), &data, seed)?;
         for st in [&si, &sn] {
-            // stopped at the match (not advanced past it); 1 iteration left
-            assert_eq!(vreg(st, 7), addr(0, 0x010), "repne scasq rdi (at match)");
+            assert_eq!(vreg(st, 7), addr(0, 0x010), "repne scasq rdi (past match)");
             assert_eq!(vreg(st, 1), 1, "repne scasq rcx (1 iteration left)");
+            assert_eq!(flags(st) & F_ZF, F_ZF, "repne scasq exit flags ZF=1 (match)");
         }
     }
 

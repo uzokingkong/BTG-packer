@@ -510,6 +510,41 @@ impl BytecodeBuilder {
     pub fn andn_r(&mut self, op: u8, dst: u8, src1: u8, src2: u8) {
         self.bytes.extend_from_slice(&[op, dst, src1, src2]);
     }
+    // ---- v54: SSE/FPU (Group A) builder helpers -------------------------------
+    /// SSE scalar FP arithmetic: xmm[dst].low = xmm[dst].low OP xmm[src].low
+    /// (upper bytes of dst preserved). op = OP_ADDSS..OP_DIVSD_XMM.
+    pub fn sse_fp_xmm(&mut self, op: u8, dst_xmm: u8, src_xmm: u8) {
+        self.bytes.extend_from_slice(&[op, dst_xmm, src_xmm]);
+    }
+    /// SSE 128-bit logic: PAND (dst &= src) / POR (dst |= src) / PANDN
+    /// (dst = ~dst & src). op = OP_PAND_XMM / OP_POR_XMM / OP_PANDN_XMM.
+    pub fn sse_logic_xmm(&mut self, op: u8, dst_xmm: u8, src_xmm: u8) {
+        self.bytes.extend_from_slice(&[op, dst_xmm, src_xmm]);
+    }
+    /// Integer -> float: xmm[dst].low = (f32/f64)vreg[src_gpr] (upper bits
+    /// zeroed). op = OP_CVTSI2SS_XMM (32-bit int) / OP_CVTSI2SD_XMM (64-bit).
+    pub fn cvt_int_fp(&mut self, op: u8, dst_xmm: u8, src_gpr: u8) {
+        self.bytes.extend_from_slice(&[op, dst_xmm, src_gpr]);
+    }
+    /// Float <-> float: xmm[dst].low = convert(xmm[src].low) (upper bits
+    /// zeroed). op = OP_CVTSS2SD_XMM / OP_CVTSD2SS_XMM.
+    pub fn cvt_fp_fp(&mut self, op: u8, dst_xmm: u8, src_xmm: u8) {
+        self.bytes.extend_from_slice(&[op, dst_xmm, src_xmm]);
+    }
+    /// Float -> integer: vreg[dst_gpr] = (i32)(xmm[src].low), zero-extended.
+    /// op = OP_CVTTSS2SI/OP_CVTTSD2SI (trunc) / OP_CVTSS2SI/OP_CVTSD2SI
+    /// (round to nearest even).
+    pub fn cvt_fp_int(&mut self, op: u8, dst_gpr: u8, src_xmm: u8) {
+        self.bytes.extend_from_slice(&[op, dst_gpr, src_xmm]);
+    }
+    /// pextrd: vreg[dst_gpr] = xmm[src].dword[imm & 3] (zero-extended).
+    pub fn pextrd_xmm(&mut self, dst_gpr: u8, src_xmm: u8, imm: u8) {
+        self.bytes.extend_from_slice(&[OP_PEXTRD_XMM, dst_gpr, src_xmm, imm]);
+    }
+    /// pinsrd: xmm[dst].dword[imm & 3] = vreg[src_gpr].low32 (others kept).
+    pub fn pinsrd_xmm(&mut self, dst_xmm: u8, src_gpr: u8, imm: u8) {
+        self.bytes.extend_from_slice(&[OP_PINSRD_XMM, dst_xmm, src_gpr, imm]);
+    }
     /// ret imm16: pop return ip and add imm16 to SP (cdecl cleanup).
     pub fn ret_imm16(&mut self, imm: u16) {
         self.bytes.extend_from_slice(&[OP_RET_IMM16]);

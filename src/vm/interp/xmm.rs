@@ -2,7 +2,7 @@
 // BTG v21 - VM Interpreter: XMM moves / shuffles / packed shifts / PINSRW
 // ==============================================================================
 
-use super::state::{VmError, STATE_XMM, mem_get, mem_put, vreg64};
+use super::state::{VmError, STATE_XMM, mem_get, mem_put, vreg32, vreg64};
 use crate::vm::bytecode::*;
 
 /// Execute one XMM opcode. `ip` points at the first operand byte (opcode
@@ -190,6 +190,162 @@ pub(crate) fn exec(
             }
             Ok(ip)
         }
+        // ── v54: SSE/FPU (Group A) ──────────────────────────────────────────
+        // Scalar FP arithmetic: xmm[dst].low = xmm[dst].low OP xmm[src].low;
+        // all other bytes of dst are preserved. No status flags are touched
+        // (x86 SSE scalar FP writes MXCSR, not rflags).
+        OP_ADDSS_XMM | OP_ADDSD_XMM | OP_SUBSS_XMM | OP_SUBSD_XMM
+        | OP_MULSS_XMM | OP_MULSD_XMM | OP_DIVSS_XMM | OP_DIVSD_XMM => {
+            let dst = code[ip] as usize;
+            let src = code[ip + 1] as usize;
+            let ip = ip + 2;
+            let db = STATE_XMM + dst * 16;
+            let sb = STATE_XMM + src * 16;
+            match op {
+                OP_ADDSS_XMM | OP_SUBSS_XMM | OP_MULSS_XMM | OP_DIVSS_XMM => {
+                    let a = f32::from_le_bytes(state[db..db + 4].try_into().unwrap());
+                    let b = f32::from_le_bytes(state[sb..sb + 4].try_into().unwrap());
+                    let r = match op {
+                        OP_ADDSS_XMM => a + b,
+                        OP_SUBSS_XMM => a - b,
+                        OP_MULSS_XMM => a * b,
+                        _ => a / b,
+                    };
+                    state[db..db + 4].copy_from_slice(&r.to_le_bytes());
+                }
+                _ => {
+                    let a = f64::from_le_bytes(state[db..db + 8].try_into().unwrap());
+                    let b = f64::from_le_bytes(state[sb..sb + 8].try_into().unwrap());
+                    let r = match op {
+                        OP_ADDSD_XMM => a + b,
+                        OP_SUBSD_XMM => a - b,
+                        OP_MULSD_XMM => a * b,
+                        _ => a / b,
+                    };
+                    state[db..db + 8].copy_from_slice(&r.to_le_bytes());
+                }
+            }
+            Ok(ip)
+        }
+        // 128-bit packed logic: PAND (dst &= src), POR (dst |= src),
+        // PANDN (dst = ~dst & src).
+        OP_PAND_XMM | OP_POR_XMM | OP_PANDN_XMM => {
+            let dst = code[ip] as usize;
+            let src = code[ip + 1] as usize;
+            let ip = ip + 2;
+            let db = STATE_XMM + dst * 16;
+            let sb = STATE_XMM + src * 16;
+            for k in 0..16 {
+                state[db + k] = match op {
+                    OP_PAND_XMM => state[db + k] & state[sb + k],
+                    OP_POR_XMM => state[db + k] | state[sb + k],
+                    _ => !state[db + k] & state[sb + k],
+                };
+            }
+            Ok(ip)
+        }
+        // cvtsi2sd/cvtsi2ss: xmm[dst].low = (f64/f32)(signed vreg[src]);
+        // everything above the converted element is zeroed.
+        OP_CVTSI2SD_XMM | OP_CVTSI2SS_XMM => {
+            let dst = code[ip] as usize;
+            let src = code[ip + 1] as usize;
+            let ip = ip + 2;
+            let db = STATE_XMM + dst * 16;
+            if op == OP_CVTSI2SD_XMM {
+                let v = *vreg64(state, src)? as i64;
+                state[db..db + 16].fill(0);
+                state[db..db + 8].copy_from_slice(&(v as f64).to_le_bytes());
+            } else {
+                let v = vreg32(state, src)? as i32;
+                state[db..db + 16].fill(0);
+                state[db..db + 4].copy_from_slice(&(v as f32).to_le_bytes());
+            }
+            Ok(ip)
+        }
+        // cvtss2sd: xmm[dst].low64 = (f64)xmm[src].low32 (upper 64 bits zeroed).
+        // cvtsd2ss: xmm[dst].low32 = (f32)xmm[src].low64 (upper 96 bits zeroed).
+        OP_CVTSS2SD_XMM | OP_CVTSD2SS_XMM => {
+            let dst = code[ip] as usize;
+            let src = code[ip + 1] as usize;
+            let ip = ip + 2;
+            let db = STATE_XMM + dst * 16;
+            let sb = STATE_XMM + src * 16;
+            if op == OP_CVTSS2SD_XMM {
+                let v = f32::from_le_bytes(state[sb..sb + 4].try_into().unwrap()) as f64;
+                state[db..db + 16].fill(0);
+                state[db..db + 8].copy_from_slice(&v.to_le_bytes());
+            } else {
+                let v = f64::from_le_bytes(state[sb..sb + 8].try_into().unwrap()) as f32;
+                state[db..db + 16].fill(0);
+                state[db..db + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            Ok(ip)
+        }
+        // cvttss2si/cvttsd2si (truncate toward zero) and cvtss2si/cvtsd2si
+        // (round to nearest even): vreg[dst] = (i32)(low elem), zero-extended.
+        // NaN / out-of-range yield the x86 "integer indefinite" 0x8000_0000.
+        OP_CVTTSS2SI | OP_CVTTSD2SI | OP_CVTSS2SI | OP_CVTSD2SI => {
+            let dst = code[ip] as usize;
+            let src = code[ip + 1] as usize;
+            let ip = ip + 2;
+            let sb = STATE_XMM + src * 16;
+            let is_ss = matches!(op, OP_CVTTSS2SI | OP_CVTSS2SI);
+            let trunc = matches!(op, OP_CVTTSS2SI | OP_CVTTSD2SI);
+            let x = if is_ss {
+                f32::from_le_bytes(state[sb..sb + 4].try_into().unwrap()) as f64
+            } else {
+                f64::from_le_bytes(state[sb..sb + 8].try_into().unwrap())
+            };
+            *vreg64(state, dst)? = cvt_f64_i32(x, trunc) as u64;
+            Ok(ip)
+        }
+        // pextrd: vreg[dst] = xmm[src].dword[imm & 3] (zero-extended).
+        OP_PEXTRD_XMM => {
+            let dst = code[ip] as usize;
+            let src = code[ip + 1] as usize;
+            let lane = (code[ip + 2] & 3) as usize;
+            let ip = ip + 3;
+            let base = STATE_XMM + src * 16 + lane * 4;
+            let v = u32::from_le_bytes(state[base..base + 4].try_into().unwrap());
+            *vreg64(state, dst)? = v as u64;
+            Ok(ip)
+        }
+        // pinsrd: xmm[dst].dword[imm & 3] = vreg[src].low32 (others kept).
+        OP_PINSRD_XMM => {
+            let dst = code[ip] as usize;
+            let src = code[ip + 1] as usize;
+            let lane = (code[ip + 2] & 3) as usize;
+            let ip = ip + 3;
+            let v = (*vreg64(state, src)? & 0xFFFF_FFFF) as u32;
+            let base = STATE_XMM + dst * 16 + lane * 4;
+            state[base..base + 4].copy_from_slice(&v.to_le_bytes());
+            Ok(ip)
+        }
         other => Err(VmError::UnknownOpcode(other)),
     }
+}
+
+/// Round to nearest, ties to even (the default SSE MXCSR rounding mode).
+fn round_ties_even(x: f64) -> f64 {
+    let t = x.trunc();
+    let d = (x - t).abs();
+    if d < 0.5 {
+        t
+    } else if d > 0.5 {
+        t + x.signum()
+    } else if (t as i64) % 2 == 0 {
+        t
+    } else {
+        t + x.signum()
+    }
+}
+
+/// Float -> 32-bit integer with x86 CVT(T)Sx2SI semantics: NaN / out-of-range
+/// produce the "integer indefinite" value 0x8000_0000.
+fn cvt_f64_i32(x: f64, trunc: bool) -> u32 {
+    let r = if trunc { x.trunc() } else { round_ties_even(x) };
+    if !r.is_finite() || r < -2147483648.0 || r >= 2147483648.0 {
+        return 0x8000_0000;
+    }
+    r as i32 as u32
 }

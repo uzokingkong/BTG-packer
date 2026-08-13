@@ -40,8 +40,8 @@ macro_rules! opcodes {
             pub const $name: u8 = $val;
         )*
 
-        /// Handler-table slot count (opcodes 0x00..=0x89). 0x00 = invalid-opcode handler.
-        pub const NUM_OPS: usize = 0x97;
+        /// Handler-table slot count (opcodes 0x00..=0xAB). 0x00 = invalid-opcode handler.
+        pub const NUM_OPS: usize = 0xAC;
 
         /// Opcode -> (mnemonic, operand byte length after the opcode byte).
         pub const OPCODE_INFO: &[(u8, &'static str, usize)] = &[
@@ -248,6 +248,44 @@ opcodes! {
     OP_BLSI_R64    = 0x94 : "blsi64", 2 ;
     OP_ANDN_R_R32  = 0x95 : "andn32", 3 ;
     OP_ANDN_R_R64  = 0x96 : "andn64", 3 ;
+    // ── v54: SSE/FPU arithmetic + conversions (Group A, Phase 2.1) ─────────────
+    // Scalar FP arithmetic: xmm[dst].low = xmm[dst].low OP xmm[src].low; the
+    // upper 12 bytes of dst are preserved (x86 scalar semantics). Encoding
+    // [op, dst_xmm, src_xmm]; the register file lives at STATE_XMM + idx*16.
+    // These ops do NOT touch the modelled status flags (x86 SSE scalar FP
+    // writes MXCSR, not rflags).
+    OP_ADDSS_XMM   = 0x97 : "addss", 2 ;
+    OP_ADDSD_XMM   = 0x98 : "addsd", 2 ;
+    OP_SUBSS_XMM   = 0x99 : "subss", 2 ;
+    OP_SUBSD_XMM   = 0x9A : "subsd", 2 ;
+    OP_MULSS_XMM   = 0x9B : "mulss", 2 ;
+    OP_MULSD_XMM   = 0x9C : "mulsd", 2 ;
+    OP_DIVSS_XMM   = 0x9D : "divss", 2 ;
+    OP_DIVSD_XMM   = 0x9E : "divsd", 2 ;
+    // 128-bit packed bitwise logic [op, dst_xmm, src_xmm]:
+    // PAND dst&=src, POR dst|=src, PANDN dst = ~dst & src.
+    OP_PAND_XMM    = 0x9F : "pand", 2 ;
+    OP_POR_XMM     = 0xA0 : "por", 2 ;
+    OP_PANDN_XMM   = 0xA1 : "pandn", 2 ;
+    // Integer -> float [op, dst_xmm, src_gpr]: xmm[dst].low = (f64/f32)vreg[src];
+    // the upper 64 bits of the XMM slot are zeroed.
+    OP_CVTSI2SD_XMM = 0xA2 : "cvtsi2sd", 2 ;
+    OP_CVTSI2SS_XMM = 0xA3 : "cvtsi2ss", 2 ;
+    // Float <-> float [op, dst_xmm, src_xmm]: convert the low element; the bits
+    // above the converted element are zeroed (upper 64 / 96 bits).
+    OP_CVTSS2SD_XMM = 0xA4 : "cvtss2sd", 2 ;
+    OP_CVTSD2SS_XMM = 0xA5 : "cvtsd2ss", 2 ;
+    // Float -> integer [op, dst_gpr, src_xmm]: vreg[dst] = (i32)(xmm low elem),
+    // zero-extended. CVTT* truncates toward zero; CVT* rounds to nearest even.
+    OP_CVTTSS2SI   = 0xA6 : "cvttss2si", 2 ;
+    OP_CVTTSD2SI   = 0xA7 : "cvttsd2si", 2 ;
+    OP_CVTSS2SI    = 0xA8 : "cvtss2si", 2 ;
+    OP_CVTSD2SI    = 0xA9 : "cvtsd2si", 2 ;
+    // Packed dword extract/insert [op, dst, src, imm8] (lane = imm & 3):
+    //   PEXTRD: vreg[dst_gpr] = xmm[src].dword[lane] (zero-extended)
+    //   PINSRD: xmm[dst].dword[lane] = vreg[src_gpr].low32 (others preserved)
+    OP_PEXTRD_XMM  = 0xAA : "pextrd", 3 ;
+    OP_PINSRD_XMM  = 0xAB : "pinsrd", 3 ;
 }
 
 /// Index-slot sentinel for LEA: no index term (see opcodes! / OP_LEA).

@@ -6,12 +6,29 @@
 // clear/forward). STOS/MOVS/LODS use a plain count-down loop; SCAS/CMPS honour
 // the REPE/REPNE stop condition (ZF). The accumulator for STOS/LODS/SCAS is
 // vreg0 (RAX/EAX/AX/AL). Shared infra (`SCRATCH`, `SCRATCH2`) lives in `super`.
+//
+// x86-exactness notes (v52 fix):
+//   * The compare direction is the real one: SCAS is `accumulator - [RDI]`,
+//     CMPS is `[RSI] - [RDI]` (ZF unchanged by direction, CF/SF differ).
+//   * REP SCAS/CMPS consume the count and advance the pointer(s) on the
+//     terminating iteration too, exactly like the hardware: the ZF info is
+//     captured via SETcc (which preserves rflags) BEFORE advance/dec, the
+//     pointers/count are bumped, and the loop-exit flags are regenerated from
+//     the saved operand pair so the flags after the instruction are the flags
+//     of the *final* compare — the hardware's observable result.
+//   * Non-REP pointer bumps use LEA so the single-op forms do not clobber the
+//     compare's flags (x86 string primitives without REP leave rflags alone
+//     except for the compare itself).
 // ==============================================================================
 
 use super::{SCRATCH, SCRATCH2};
 use crate::vm::bytecode::*;
 use anyhow::Result;
 use iced_x86::Instruction;
+
+/// Extra lifter temporaries (vregs 18/19; 16/17 are SCRATCH/SCRATCH2).
+const TMP3: u8 = 18;
+const TMP4: u8 = 19;
 
 /// (load, store, width) triple for a given element width in bytes.
 fn width_ops(n: u64) -> (u8, u8, u32) {
@@ -35,13 +52,15 @@ fn has_any_rep(inst: &Instruction) -> bool {
 }
 
 /// STOS: [rdi] = AL/AX/EAX/RAX (vreg0); rdi += n. REP → count-down loop.
+/// The single-op form bumps rdi via LEA so the caller's flags stay untouched
+/// (plain STOS writes no rflags).
 pub(super) fn lift_stos(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     let n = stos_lods_width(inst.code());
     let (_, store, _) = width_ops(n);
     let rdi = 7u8; let rcx = 1u8;
     let single = |b: &mut BytecodeBuilder| {
         b.mem_store_a(store, rdi, 0);
-        b.binop_r_imm64(OP_ADD_R_IMM64, rdi, n as u32);
+        b.lea(rdi, rdi, ADDR_NO_INDEX, 0, n as i32);
     };
     if !has_any_rep(inst) {
         single(b);
@@ -67,7 +86,7 @@ pub(super) fn lift_lods(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
     let rsi = 6u8; let rcx = 1u8;
     let single = |b: &mut BytecodeBuilder| {
         b.mem_load_a(load, 0, rsi);
-        b.binop_r_imm64(OP_ADD_R_IMM64, rsi, n as u32);
+        b.lea(rsi, rsi, ADDR_NO_INDEX, 0, n as i32);
     };
     if !has_any_rep(inst) {
         single(b);
@@ -99,8 +118,8 @@ pub(super) fn lift_movs(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
     let single = |b: &mut BytecodeBuilder| {
         b.mem_load_a(load, SCRATCH, rsi);
         b.mem_store_a(store, rdi, SCRATCH);
-        b.binop_r_imm64(OP_ADD_R_IMM64, rsi, n as u32);
-        b.binop_r_imm64(OP_ADD_R_IMM64, rdi, n as u32);
+        b.lea(rsi, rsi, ADDR_NO_INDEX, 0, n as i32);
+        b.lea(rdi, rdi, ADDR_NO_INDEX, 0, n as i32);
     };
     if !has_any_rep(inst) {
         single(b);
@@ -118,85 +137,103 @@ pub(super) fn lift_movs(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
     Ok(())
 }
 
-/// SCAS: flags = [rdi] - AL/AX/EAX/RAX; rdi += n. REPE/REPNE honour ZF stop.
+/// The width-matched SUB used for SCAS/CMPS compares (32-bit, or 64-bit for
+/// qword operands). Narrow (8/16-bit) compares run the 32-bit SUB on
+/// pre-masked operands: ZF is exact, CF/SF/OF are the 32-bit approximations
+/// (the pre-existing model).
+fn cmp_sub(b: &mut BytecodeBuilder, n: u64, lhs: u8, rhs: u8) {
+    if is64(n) {
+        b.binop_r_r64(OP_SUB_R_R64, lhs, rhs);
+    } else {
+        b.binop_r_r(OP_SUB_R_R, lhs, rhs);
+    }
+}
+
+/// Emit the operand pair for a REP SCAS/CMPS loop: after this closure the
+/// masked compare operands live in (TMP3 = lhs, TMP4 = rhs) and STATE_FLAGS
+/// holds the real compare result (lhs - rhs).
+///   * SCAS: lhs = accumulator (vreg0, masked), rhs = [rdi]
+///   * CMPS: lhs = [rsi]  (masked), rhs = [rdi]
+fn rep_cmp_operands(b: &mut BytecodeBuilder, n: u64, is_cmps: bool) {
+    let rsi = 6u8; let rdi = 7u8;
+    let (load, _, mask) = width_ops(n);
+    // The width loads zero-extend, so memory operands are already masked; the
+    // accumulator (vreg0) must be masked down to the element width for SCAS.
+    if is_cmps {
+        b.mem_load_a(load, TMP3, rsi);
+    } else if is64(n) {
+        b.mov_r_r64(TMP3, 0);
+    } else {
+        b.mov_r_r(TMP3, 0);
+        if mask != 0xFFFF_FFFF { b.binop_r_imm32(OP_AND_R_IMM32, TMP3, mask); }
+    }
+    b.mem_load_a(load, TMP4, rdi);
+    // Compare through a scratch copy: SUB clobbers its destination, and TMP3
+    // must survive so REP loops can regenerate the final compare's exact
+    // flags on exit (`fix_flags`).
+    if is64(n) { b.mov_r_r64(SCRATCH, TMP3); } else { b.mov_r_r(SCRATCH, TMP3); }
+    cmp_sub(b, n, SCRATCH, TMP4);
+}
+
+/// SCAS: flags = AL/AX/EAX/RAX - [rdi]; rdi += n. REPE/REPNE honour ZF stop.
 pub(super) fn lift_scas(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     let n = scas_cmps_width(inst.code());
-    let (load, _, mask) = width_ops(n);
     let rdi = 7u8; let rcx = 1u8;
-    // compare body: SCRATCH = [rdi] - accumulator (vreg0), sets flags
-    let cmp_body = |b: &mut BytecodeBuilder| {
-        b.mem_load_a(load, SCRATCH, rdi);
-        if is64(n) {
-            b.mov_r_r64(SCRATCH2, 0);
-            b.binop_r_r64(OP_SUB_R_R64, SCRATCH, SCRATCH2);
-        } else {
-            b.mov_r_r(SCRATCH2, 0);
-            if mask != 0xFFFF_FFFF { b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH2, mask); }
-            b.binop_r_r(OP_SUB_R_R, SCRATCH, SCRATCH2);
-        }
-    };
-    let advance = |b: &mut BytecodeBuilder| {
-        b.binop_r_imm64(OP_ADD_R_IMM64, rdi, n as u32);
-    };
     if !has_any_rep(inst) {
-        cmp_body(b);
-        advance(b);
+        rep_cmp_operands(b, n, false);
+        b.lea(rdi, rdi, ADDR_NO_INDEX, 0, n as i32); // LEA: no flag clobber
         return Ok(());
     }
-    let exit_cond = rep_exit_cond(inst);
+    let exit_cond = rep_exit_cond(inst); // REP SCAS/CMPS is always REPE/REPNE
     let loop_lbl = b.new_label();
     let done = b.new_label();
+    let fix_flags = b.new_label();
     b.mark_label(loop_lbl);
     b.test_r_r32(rcx, rcx);
     b.jcc8(COND_JE, done);
-    cmp_body(b);
-    if let Some(c) = exit_cond {
-        b.jcc8(c, done);
-    }
-    advance(b);
-    b.dec_r(rcx);
+    rep_cmp_operands(b, n, false);
+    // Capture the ZF-stop decision BEFORE any flag-clobbering bookkeeping.
+    b.setcc(SCRATCH2, exit_cond.unwrap_or(COND_JNE));
+    b.lea(rdi, rdi, ADDR_NO_INDEX, 0, n as i32);
+    b.lea(rcx, rcx, ADDR_NO_INDEX, 0, -1);
+    b.test_r_r32(SCRATCH2, SCRATCH2);
+    b.jcc8(COND_JNE, fix_flags);
     b.jmp8(loop_lbl);
+    // Restore the final compare's exact flags on exit (rep count consumed,
+    // pointer advanced — the hardware result).
+    b.mark_label(fix_flags);
+    cmp_sub(b, n, TMP3, TMP4);
     b.mark_label(done);
     Ok(())
 }
 
-/// CMPS: flags = [rdi] - [rsi]; rsi += n; rdi += n. REPE/REPNE honour ZF stop.
+/// CMPS: flags = [rsi] - [rdi]; rsi += n; rdi += n. REPE/REPNE honour ZF stop.
 pub(super) fn lift_cmps(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     let n = scas_cmps_width(inst.code());
-    let (load, _, mask) = width_ops(n);
     let rsi = 6u8; let rdi = 7u8; let rcx = 1u8;
-    let cmp_body = |b: &mut BytecodeBuilder| {
-        b.mem_load_a(load, SCRATCH, rdi);
-        b.mem_load_a(load, SCRATCH2, rsi);
-        if is64(n) {
-            b.binop_r_r64(OP_SUB_R_R64, SCRATCH, SCRATCH2);
-        } else {
-            if mask != 0xFFFF_FFFF { b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH, mask); }
-            b.binop_r_r(OP_SUB_R_R, SCRATCH, SCRATCH2);
-        }
-    };
-    let advance = |b: &mut BytecodeBuilder| {
-        b.binop_r_imm64(OP_ADD_R_IMM64, rsi, n as u32);
-        b.binop_r_imm64(OP_ADD_R_IMM64, rdi, n as u32);
-    };
     if !has_any_rep(inst) {
-        cmp_body(b);
-        advance(b);
+        rep_cmp_operands(b, n, true);
+        b.lea(rsi, rsi, ADDR_NO_INDEX, 0, n as i32);
+        b.lea(rdi, rdi, ADDR_NO_INDEX, 0, n as i32);
         return Ok(());
     }
     let exit_cond = rep_exit_cond(inst);
     let loop_lbl = b.new_label();
     let done = b.new_label();
+    let fix_flags = b.new_label();
     b.mark_label(loop_lbl);
     b.test_r_r32(rcx, rcx);
     b.jcc8(COND_JE, done);
-    cmp_body(b);
-    if let Some(c) = exit_cond {
-        b.jcc8(c, done);
-    }
-    advance(b);
-    b.dec_r(rcx);
+    rep_cmp_operands(b, n, true);
+    b.setcc(SCRATCH2, exit_cond.unwrap_or(COND_JNE));
+    b.lea(rsi, rsi, ADDR_NO_INDEX, 0, n as i32);
+    b.lea(rdi, rdi, ADDR_NO_INDEX, 0, n as i32);
+    b.lea(rcx, rcx, ADDR_NO_INDEX, 0, -1);
+    b.test_r_r32(SCRATCH2, SCRATCH2);
+    b.jcc8(COND_JNE, fix_flags);
     b.jmp8(loop_lbl);
+    b.mark_label(fix_flags);
+    cmp_sub(b, n, TMP3, TMP4);
     b.mark_label(done);
     Ok(())
 }

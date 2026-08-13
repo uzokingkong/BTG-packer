@@ -297,6 +297,38 @@ pub fn disassemble(code: &[u8]) -> String {
             OP_MOVQ_GPR_XMM => { line += &format!("movq xmm{}, v{}", code[ip], code[ip+1]); ip += 2; }
             OP_PSRLQ_XMM_IMM8 => { line += &format!("psrlq xmm{}, 0x{:02X}", code[ip], code[ip+1]); ip += 2; }
             OP_PSLLQ_XMM_IMM8 => { line += &format!("psllq xmm{}, 0x{:02X}", code[ip], code[ip+1]); ip += 2; }
+            // ── v54: SSE/FPU (Group A) ──────────────────────────────────────
+            OP_ADDSS_XMM | OP_ADDSD_XMM | OP_SUBSS_XMM | OP_SUBSD_XMM
+            | OP_MULSS_XMM | OP_MULSD_XMM | OP_DIVSS_XMM | OP_DIVSD_XMM => {
+                let m = match op {
+                    OP_ADDSS_XMM => "addss", OP_ADDSD_XMM => "addsd",
+                    OP_SUBSS_XMM => "subss", OP_SUBSD_XMM => "subsd",
+                    OP_MULSS_XMM => "mulss", OP_MULSD_XMM => "mulsd",
+                    OP_DIVSS_XMM => "divss", _ => "divsd",
+                };
+                line += &format!("{} xmm{}, xmm{}", m, code[ip], code[ip+1]); ip += 2;
+            }
+            OP_PAND_XMM | OP_POR_XMM | OP_PANDN_XMM => {
+                let m = match op { OP_PAND_XMM => "pand", OP_POR_XMM => "por", _ => "pandn" };
+                line += &format!("{} xmm{}, xmm{}", m, code[ip], code[ip+1]); ip += 2;
+            }
+            OP_CVTSI2SD_XMM | OP_CVTSI2SS_XMM => {
+                let m = if op == OP_CVTSI2SD_XMM { "cvtsi2sd" } else { "cvtsi2ss" };
+                line += &format!("{} xmm{}, v{}", m, code[ip], code[ip+1]); ip += 2;
+            }
+            OP_CVTSS2SD_XMM | OP_CVTSD2SS_XMM => {
+                let m = if op == OP_CVTSS2SD_XMM { "cvtss2sd" } else { "cvtsd2ss" };
+                line += &format!("{} xmm{}, xmm{}", m, code[ip], code[ip+1]); ip += 2;
+            }
+            OP_CVTTSS2SI | OP_CVTTSD2SI | OP_CVTSS2SI | OP_CVTSD2SI => {
+                let m = match op {
+                    OP_CVTTSS2SI => "cvttss2si", OP_CVTTSD2SI => "cvttsd2si",
+                    OP_CVTSS2SI => "cvtss2si", _ => "cvtsd2si",
+                };
+                line += &format!("{} v{}, xmm{}", m, code[ip], code[ip+1]); ip += 2;
+            }
+            OP_PEXTRD_XMM => { line += &format!("pextrd v{}, xmm{}, 0x{:02X}", code[ip], code[ip+1], code[ip+2]); ip += 3; }
+            OP_PINSRD_XMM => { line += &format!("pinsrd xmm{}, v{}, 0x{:02X}", code[ip], code[ip+1], code[ip+2]); ip += 3; }
             // ── v31: multiply/divide + BSWAP ──────────────────────────────
             OP_MUL_R_R32 | OP_MUL_R_R64 => {
                 let w = if op == OP_MUL_R_R32 { "mul32" } else { "mul64" };

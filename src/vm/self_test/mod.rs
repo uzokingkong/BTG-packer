@@ -32,6 +32,7 @@ mod cmov;
 mod util;
 mod string_ops;
 mod bmi;
+mod sse_fpu;
 
 // ── test functions the orchestrator dispatches (from submodules) ──
 use self::a2_a5::run_a2_a5_test;
@@ -45,6 +46,7 @@ use self::exit::run_exit_teardown_test;
 use self::cmov::run_cmovcc_test;
 use self::string_ops::run_string_ops_test;
 use self::bmi::run_bmi_test;
+use self::sse_fpu::run_sse_fpu_test;
 use self::flags::run_flags_jcc_test;
 use self::abi::run_handler_abi_test;
 use self::addr::run_m2_addr_test;
@@ -698,6 +700,15 @@ pub fn run_self_test() -> Result<()> {
         Ok(_) => println!("[37] B-1 BMI1/2 (lzcnt/popcnt/blsr/blsmsk/blsi/andn; interp==native): PASS"),
         Err(e) => {
             println!("[37] B-1 BMI1/2:                                                                     FAIL ({})", e);
+            return Err(e);
+        }
+    }
+    let _ = std::io::stdout().flush();
+
+    match run_sse_fpu_test() {
+        Ok(_) => println!("[38] A-1 SSE/FPU (scalar FP, 128-bit logic, cvt family, pextrd/pinsrd + lift; interp==native): PASS"),
+        Err(e) => {
+            println!("[38] A-1 SSE/FPU:                                                                    FAIL ({})", e);
             return Err(e);
         }
     }
