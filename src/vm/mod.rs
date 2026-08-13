@@ -144,7 +144,7 @@ pub fn build_program_vm(
 // Submodules (extracted from the old monolith to keep mod.rs a re-export layer):
 //   arena.rs    - RWX native-execution arena (unix/windows)
 //   encode.rs   - native x86 reference encoders (self-test / bench)
-//   self_test.rs- --vm-test cross-validation suite
+//   self_test/   - --vm-test cross-validation suite (directory module)
 //   bench.rs    - --vm-bench interpreter vs native throughput
 // ═══════════════════════════════════════════════════════════════════════
 mod arena;
