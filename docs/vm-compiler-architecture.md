@@ -1,6 +1,6 @@
 # VM Compiler Architecture
 
-> 문서 상태: v13.5 정리 시작점. 작성: 2026-08-13.
+> 문서 상태: v13.5 — **Phase 1 분해 완료**. 작성: 2026-08-13.
 > 저장소: `vm-obf` (BTG Packer). 이 문서는 "완전한 VM 컴파일러"로 가는
 > 모듈 지도입니다. 실제 리팩터 진행 상황은 `milestones.md`를 보세요.
 
@@ -11,93 +11,60 @@
 목표는 "컴파일러급 프론트엔드(IR + 레지스터 할당 + 최적화) + 100% 커버리지
 + 전체 .text 가상화 + 부트 정합"이다.
 
-## 2. 현재 모듈 지도 (v13.4e)
+## 2. 현재 모듈 지도 (v13.5, Phase 1 분해 완료)
 
 ### 진입 / 파이프라인
-- `src/main.rs` — CLI 플래그 정규화 (`--full`/`--vm-oep` 우선순위, 566줄).
-- `src/cli.rs` — clap 인자 정의 (172줄).
-- `src/lib.rs` — 라이브러리 API `pack()` (37줄).
+- `src/main.rs` — CLI 플래그 정규화 (`--full`/`--vm-oep` 우선순위). 엔트로피
+  리포트는 `analysis/entropy.rs`로 이동됨.
+- `src/cli.rs` — clap 인자 정의.
+- `src/lib.rs` — 라이브러리 API `pack()`.
 - `src/pipeline/` — Pass1(CFG 슬라이스) → Pass2(셔플) → Pass3(인코드) →
   Pass4(섹션) → patch_data → crypto(부트스텁+암호화+VM 임베드) → build.
-  - `crypto.rs` (2793줄, 최대 단일 기능 파일), `text_lift.rs`(993),
-    `patch_data.rs`(872), `validate.rs`(712), `iat_hide.rs`(464),
-    `rsrc_register.rs`(427), `pass4_section.rs`(384), `pass3_encode.rs`(361),
-    `build.rs`(242), `pass1_slice.rs`(198), `mod.rs`(190), `pass2_shuffle.rs`(79),
-    `ondemand.rs`(114), `pack.rs`(58).
+  - `crypto/` — `{mod,rc4,bootstub,strings,vm_embed,scan,...}.rs` (분해 완료).
+  - `patch_data/` — `{mod,imports}.rs` (분해 완료: import-range 수집 분리).
+  - `validate/` — `{mod,rsrc,tests}.rs` (분해 완료: 리소스 검증 분리).
+  - `iat_hide.rs`, `rsrc_register.rs`, `pass4_section.rs`, `pass3_encode.rs`,
+    `build.rs`, `pass1_slice.rs`, `mod.rs`, `pass2_shuffle.rs`, `ondemand.rs`,
+    `pack.rs`.
+  - ~~`text_lift.rs`~~ — **삭제됨** (고아 중복; 실사용은 `vm::text_lift`).
 
-### VM 컴파일러 코어 (`src/vm/`)
-- `bytecode.rs` → **v13.5 분해 완료** → `src/vm/bytecode/` 디렉터리:
-  - `mod.rs`(재수출 레이어), `registry.rs`(opcodes! 매크로 + 상수 + 플래그),
-    `builder.rs`(BytecodeBuilder 에미터 + 브랜치 픽스업),
-    `disasm.rs`(디스어셈블러), `tests.rs`.
-- `handlers.rs` (2438줄) — `generate_vm_code`가 단일 함수로 ~2200줄.
-  섹션 마커(`// ──`)를 따라 opcode 그룹별로 쪼갤 수 있음(아래 §3).
-- `interp.rs` (1294줄) — `interpret()` 단일 match ~1100줄.
-- `lifter.rs` (2690줄) — `lift_one`(225~576)이 큰 `Code::` match.
-- `text_lift.rs` (1100줄) — 프로그램 CFG lift(`lift_program_cfg`),
-  switch 해석(`resolve_switch_cases`), panic/unwind 제외
-  (`detect_panic_unwind_ranges`).
-- `self_test.rs` (4285줄) — `--vm-test` 스위트.
+### VM 컴파일러 코어 (`src/vm/`) — 전부 디렉터리 모듈로 분해 완료
+- `bytecode/` — `{mod,registry,builder,disasm,tests}.rs`. `registry.rs`의
+  `opcodes!` 매크로가 opcode 집합의 단일 진실 공급원 (현재 138 opcode).
+- `handlers/` — `{mod,alu,mov,mem,branch,stack,xmm,atomic,muldiv}.rs`.
+- `interp/` — `{mod,state,arith,mov,mem,branch,stack,xmm,atomic,muldiv}.rs`.
+- `lifter/` — `{mod,arith,mov,mem,control,cfg,muldiv,shift,sse,string}.rs`.
+- `text_lift/` — `{mod,switch,exclusions,tests}.rs` (프로그램 CFG lift,
+  switch 해석, panic/unwind/lock-atomic 제외).
+- `self_test/` — `{mod,flags,mem,stack,addr,bridge,lift,a2_a5,abi,text,
+  multiblock,muldiv,sse,exit}.rs` (`--vm-test` 스위트 [1..34]).
 - 보조: `mapper.rs`, `mem_model.rs`, `flags.rs`, `arena.rs`, `encode.rs`,
   `bench.rs`, `ksa.rs`, `prga.rs`, `import_key.rs`.
 
 ### 기타
-- `dispatcher/mod.rs` (1218줄) — static 디스패처 + 재암호화 디스패처.
-- `graph/` — CFG 추출/슬라이서/셔플/픽스업. `pe/`, `assembler/`, `mba/`,
-  `obfuscation/`, `btg/`, `core/`, `antidebug/`, `analysis/`, `debug/`,
+- `dispatcher/` — `{mod,build,validate,reencrypt,tests,antidebug}.rs`
+  (static 디스패처 + 재암호화 디스패처, 분해 완료).
+- `obfuscation/mba/` — `{mod,codegen,tests}.rs` (MbaPolynomial 생성 +
+  `to_x86_64_code` 코드젠 분리, 분해 완료).
+- `graph/` — CFG 추출/슬라이서/셔플/픽스업. `pe/`, `assembler/`, `btg/`,
+  `core/`, `antidebug/`, `analysis/`(`metrics.rs`+`entropy.rs`), `debug/`,
   `qa/`, `util/`, `error.rs`.
 
-## 3. 분해 대상과 절단 지점 (Phase 1 로드맵)
+## 3. Phase 1 분해 — 완료 ✅
 
-순수 코드 이동(`pub use`로 공개면 유지 → 외부 API 불변). 각 파일 완료 후
-`cargo build --release` green + `cargo test` green + `--vm-test` ALL PASS.
+모든 긴 단일 파일이 디렉터리 모듈로 분해됨 (`milestones.md`의 표 참조).
+순수 코드 이동 원칙: 공개 API 불변, `cargo build --release` green +
+`cargo test`(68) + `--vm-test` ALL PASS + 문자열/hex 리터럴 회귀 0.
 
-### 3.1 `handlers.rs` → `src/vm/handlers/`
-`generate_vm_code`의 `// ── 0x.. / M.. / v..` 섹션 경계를 절단 지점으로:
-- `mod.rs` — 엔트리 스텁, 디스패치 루프, invalid-opcode, 2-pass 레이아웃/인코딩,
-  `validate_vm_code`, `Cl` enum, `hdr()` 헬퍼.
-- `alu.rs` — 0x01~0x0E 산술/논리/imm, ROL/ROR, INC/DEC, CMP, TEST, 시프트,
-  A-2(OR/NEG/NOT, 64비트 시프트), M2 64비트 산술.
-- `mov.rs` — MOV 계열, MOVZX/MOVSX, 폭별 메모리 load/store.
-- `mem.rs` — 어드레싱(LEA/LEA_RIP/LEA_GS, `mem_a`).
-- `branch.rs` — JMP/JCC/JB(rel8/rel32), SETCC(v50), HALT.
-- `stack.rs` — PUSH/POP/CALL/RET/RET_IMM16(두-스택), 네이티브 브리지.
-- `xmm.rs` — XMM 이동/unpckl/xorps/pshuf/psrlq/psllq/pinsrw.
-- `atomic.rs` — cmpxchg(v46/v49), xchg/xadd(v48).
-- `muldiv.rs` — MUL/DIV/IMUL/IDIV/BSWAP(v31/v33, 8/16/32/64).
-
-### 3.2 `lifter.rs` → `src/vm/lifter/`
-- `mod.rs` — `LiftedInstr`, `lift_one` 디스패치 프레임, `lift_ksa`,
-  `lift_block`, `lift_cfg`, `lift_cfg_switch`.
-- `arith.rs` / `mov.rs` / `mem.rs` / `xmm.rs` / `control.rs` / `atomic.rs` /
-  `diag.rs`(`diagnose_unsupported`) — `lift_one`의 `Code::` 팔을 그룹별로.
-
-### 3.3 `interp.rs` → `src/vm/interp/`
-- `mod.rs` — `interpret` 루프 + 디스패치.
-- 그룹별 팔 파일 + `state.rs`(vreg/flags/ptr_slot/sp 헬퍼).
-
-### 3.4 `self_test.rs`(4285줄) → `src/vm/self_test/`
-- `mod.rs` — `run_self_test` 오케스트레이터.
-- 테스트 그룹별: `flags.rs`/`mem.rs`/`stack.rs`/`addr.rs`/`bridge.rs`/
-  `lift.rs`/`a2_a5.rs`/`abi.rs`/`text.rs`/`multiblock.rs`/`muldiv.rs`/`sse.rs`.
-
-### 3.5 `pipeline/crypto.rs`(2793줄) → `src/pipeline/crypto/`
-- `mod.rs`(오케스트레이션), `rc4.rs`(RC4/chained), `bootstub.rs`(부트스텁),
-  `vm_embed.rs`(VM 임베드), `iat.rs`/`memharden.rs`/`integrity.rs`/
-  `payload.rs`/`reencrypt.rs`.
-
-### 3.6 `bytecode.rs` — ✅ v13.5 완료 (위 §2 참조)
-
-### 3.7 `text_lift.rs`(1100줄) → `src/vm/text_lift/`
-- `mod.rs` — `lift_program_cfg`/`analyze_text_lift`.
-- `exclusions.rs` — panic/unwind/lock-atomic 제외 휴리스틱.
-- `switch.rs` — `resolve_switch_cases`.
-- 주의: 이 파일은 UTF-8 한글 주석이 많아, PowerShell `Set-Content`로
-  슬라이싱하면 인코딩이 깨질 수 있음(이미 1회 경험). 반드시 UTF-8-safe
-  수단(code_edit / `-Encoding UTF8` 읽고 쓰기)으로만 편집할 것.
-
-### 3.8 `dispatcher/mod.rs`(1218줄)
-- `mod.rs`(`build_dispatcher`/static/validate), `reencrypt.rs`, `tests.rs`.
+각 파일의 절단 구조 (참고):
+- `handlers/` — `generate_vm_code`의 `// ── 0x.. / M.. / v..` 섹션 경계.
+- `lifter/` — `lift_one`의 `Code::` 팔 그룹별.
+- `interp/` — `interpret` 루프의 팔 그룹별 + `state.rs`.
+- `self_test/` — 테스트 그룹별.
+- `crypto/` — RC4/채널/부트스텁/문자열 런/테스트.
+- `validate/` — 리소스 트리 검증(`rsrc.rs`) 분리.
+- `patch_data/` — import/delay-import RVA 범위 수집(`imports.rs`) 분리.
+- `mba/` — `to_x86_64_code`를 별도 `impl` 블록(`codegen.rs`)으로 분리.
 
 ## 4. 컴파일러 프론트엔드 (Phase 2 로드맵)
 

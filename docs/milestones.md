@@ -1,38 +1,48 @@
 # Milestones — 완전한 VM 컴파일러 진행 체크리스트
 
 > 상태 마커: ✅ 완료 · 🔶 진행 중 · ⬜ 미착수 · ⚠️ 부분/리스크
-> 업데이트: 2026-08-13 (v13.5)
+> 업데이트: 2026-08-13 (v13.5, Phase 1 완료)
 
 ## Phase 0 — 기준점 & 저장소 정리 ✅
 - [x] baseline 커밋 (`4406b77`): v13.4e 두-스택 VM 상태의 미커밋 17개 소스 +
       미추적 CHANGES.md/리포트/test 픽스처를 정리해 커밋.
 - [x] `.gitignore` 추가 (빌드 산출물 / packed*.exe / 디버그 스크래치 / 로그).
-- [x] `cargo build --release` green (68 경고, 기준과 동일).
+- [x] `cargo build --release` green.
 - [x] `--vm-test` [1..34] ALL PASS 기록.
 
-## Phase 1 — 긴 .rs 파일 분해 (동작 변경 0, 순수 코드 이동)
+## Phase 1 — 긴 .rs 파일 분해 ✅ (동작 변경 0, 순수 코드 이동)
 
-| 파일 | 라인 | 상태 | 산출 |
+| 파일 | 라인 | 상태 | 산출 커밋 |
 |---|---|---|---|
-| `vm/bytecode.rs` | 1216 | ✅ 완료 | `vm/bytecode/{mod,registry,builder,disasm,tests}.rs`, 커밋 `bb706f4` |
-| `vm/handlers.rs` | 2438 | ⬜ | §architecture 3.1 |
-| `vm/lifter.rs` | 2690 | ⬜ | §architecture 3.2 |
-| `vm/interp.rs` | 1294 | ⬜ | §architecture 3.3 |
-| `vm/self_test.rs` | 4285 | ⬜ | §architecture 3.4 |
-| `pipeline/crypto.rs` | 2793 | ⬜ | §architecture 3.5 |
-| `vm/text_lift.rs` | 1100 | ⬜ | §architecture 3.7 (⚠️ UTF-8 한글 주석 — 인코딩 안전 수단 필수) |
-| `dispatcher/mod.rs` | 1218 | ⬜ | §architecture 3.8 |
+| `vm/bytecode.rs` | 1216 | ✅ | `vm/bytecode/{mod,registry,builder,disasm,tests}.rs` (`bb706f4`) |
+| `vm/handlers.rs` | 2438 | ✅ | `vm/handlers/` (`1988057`) |
+| `vm/lifter.rs` | 2690 | ✅ | `vm/lifter/` (`dd3ee48`) |
+| `vm/interp.rs` | 1294 | ✅ | `vm/interp/` (`194bb64`) |
+| `vm/self_test.rs` | 4285 | ✅ | `vm/self_test/` (`33daba2`) |
+| `vm/text_lift.rs` | 1100 | ✅ | `vm/text_lift/` (`02a3acc`) |
+| `pipeline/crypto.rs` | 2793 | ✅ | `pipeline/crypto/` (`819b11a`) |
+| `dispatcher/mod.rs` | 1218 | ✅ | `dispatcher/{mod,build,validate,reencrypt,tests}.rs` (`633cfaa`) |
+| `pipeline/validate.rs` | 718 | ✅ | `pipeline/validate/{mod,rsrc,tests}.rs` (`e5178ae`) |
+| `pipeline/patch_data.rs` | 896 | ✅ | `pipeline/patch_data/{mod,imports}.rs` (`a3d6795`) |
+| `obfuscation/mba.rs` | 571 | ✅ | `obfuscation/mba/{mod,codegen,tests}.rs` (`c7a4f2b`) |
+| `pipeline/text_lift.rs` | 1009 | ✅ 삭제 | 고아 중복 (선언 없음, 호출부 전부 `vm::text_lift`) (`9b7ec0d`) |
+| `main.rs` 엔트로피 | — | ✅ | → `analysis/entropy.rs` (`9b7ec0d`) |
 
 **검증 룰 (각 파일마다)**: `cargo build --release` green + `cargo test` green +
-`--vm-test` ALL PASS + 분해 전후 pack 출력 바이트 동일(회귀 0).
+`--vm-test` ALL PASS + 문자열/hex 리터럴 회귀 0.
 
 ### 진행 노트
 - 2026-08-13: `text_lift.rs` 분해를 PowerShell `Set-Content`로 시도했으나
   UTF-8 한글 주석이 깨져 **리버트**(`git checkout HEAD --`). 교훈: 한글 포함
-  파일은 code_edit / `-Encoding UTF8` 읽기+쓰기로만 편집. 아키텍처 문서에
-  주의로 기록.
+  파일은 code_edit / python io(utf-8) 로만 편집.
+- 2026-08-13: Phase 1 완료. 각 분해 후 `cargo build --release` green +
+  `cargo test`(68) + `--vm-test` ALL PASS + 리터럴 회귀 0 확인.
+  분해 시 주의점: (1) `mod tests`를 별도 파일로 뺄 때 이중 `mod tests` 중첩 방지
+  (mod.rs가 이미 `mod tests;` 선언), (2) 함수 앞 doc-comment가 절단 경계에 걸려
+  dangling이 되지 않게 이동, (3) `pub(crate)` 필드/타입 접근, (4) `pub`과
+  `pub(crate)`의 bin/lib 가시성 차이.
 
-## Phase 2 — 컴파일러 프론트엔드 (IR + 커버리지 + 전체 가상화)
+## Phase 2 — 컴파일러 프론트엔드 (IR + 커버리지 + 전체 가상화) ⬜
 
 ### 2.1 명령 커버리지 완결 ⬜
 - [ ] `--text-vm` 진단이 출력하는 미지원 명령 목록을 `coverage.md`로 고정.
@@ -61,4 +71,4 @@
 - [x] `docs/vm-compiler-architecture.md` — 모듈 지도 + 절단 지점.
 - [x] `docs/coverage.md` — 명령 커버리지 베이스라인.
 - [x] `docs/milestones.md` — 이 체크리스트.
-- [ ] 전체 `--vm-test` + `--full` pack 회귀 + 샘플 타깃 실행 확인.
+- [ ] 전체 `--vm-test` + `--full` pack 회귀 + 샘플 타깃 실행 확인 (Windows 호스트 필요).
