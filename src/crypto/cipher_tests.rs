@@ -156,3 +156,4 @@ fn native_keystream_matches_reference() {
     }
 }
 
+

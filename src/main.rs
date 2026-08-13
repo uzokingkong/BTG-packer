@@ -347,6 +347,8 @@ fn main() -> error::Result<()> {
     ctx.keep_pdata = args.keep_pdata;
     // v13.4d diag: 디스패처 ring-buffer (마지막 32개 block id) 주입 여부
     ctx.block_ring = args.block_ring;
+    // v59: BTG-C1 커스텀 사이퍼 (기본 RC4-256 유지, opt-in)
+    ctx.custom_cipher = args.custom_cipher;
     // M6 Phase-2: OEP→VM entry 전환 — 부트 스텁이 원본 .text를 평문 복호화하지
     // 않고 lift된 프로그램 VM 모듈로 디스패치. (--vm 필요)
     // v59: patch_data가 .rdata/.data 포인터 재배치를 vm_oep 모드에서 원본 .text

@@ -68,6 +68,13 @@ impl Arena {
             unsafe { std::mem::transmute(self.base + off) };
         f(a1, a2, a3, a4, a5);
     }
+
+    /// Execute machine code with 2 Win64 args (BTG-C1 crypt blob: buf, len).
+    pub(crate) fn call2(&self, off: usize, a1: usize, a2: u64) {
+        // SAFETY: generated code with the exact (ptr, u64) ABI.
+        let f: extern "C" fn(usize, u64) = unsafe { std::mem::transmute(self.base + off) };
+        f(a1, a2);
+    }
 }
 
 #[cfg(unix)]
@@ -154,6 +161,13 @@ mod arena_win {
             let f: extern "C" fn(usize, u64, u32, usize, usize) =
                 unsafe { std::mem::transmute(self.base + off) };
             f(a1, a2, a3, a4, a5);
+        }
+
+        /// Execute machine code with 2 Win64 args (BTG-C1 crypt blob: buf, len).
+        pub fn call2(&self, off: usize, a1: usize, a2: u64) {
+            // SAFETY: generated code with the exact (ptr, u64) ABI.
+            let f: extern "C" fn(usize, u64) = unsafe { std::mem::transmute(self.base + off) };
+            f(a1, a2);
         }
     }
 

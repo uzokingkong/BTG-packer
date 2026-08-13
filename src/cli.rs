@@ -180,4 +180,10 @@ pub struct CliArgs {
     /// 되돌아갔는지 덤프(cdb/winDbg)에서 읽어 좁히는 데 쓴다.
     #[arg(long, default_value_t = false)]
     pub block_ring: bool,
+
+    /// v59 (plan.txt 4~6단계): BTG-C1 커스텀 512-bit 스트림 사이퍼를 사용한다.
+    /// (기본은 RC4-256 — 부트 스텁/디스패처/VM 경로가 RC4에 결합되어 있어,
+    ///  이 플래그로만 새 사이퍼로 전환한다.)
+    #[arg(long, default_value_t = false)]
+    pub custom_cipher: bool,
 }

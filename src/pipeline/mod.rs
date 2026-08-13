@@ -116,6 +116,8 @@ pub struct PipelineContext {
     /// v13.4d diag: --block-ring — 표준 디스패처에 마지막 32개 logical block id
     /// ring-buffer 를 주입한다 (재암호화 디스패처는 미지원).
     pub block_ring: bool,
+    /// v59: --custom-cipher — BTG-C1 커스텀 512-bit 스트림 사이퍼 사용 (기본 RC4).
+    pub custom_cipher: bool,
 }
 
 impl PipelineContext {
@@ -167,6 +169,7 @@ impl PipelineContext {
             mem_ntprot_name_va: 0,
             keep_pdata: false,
             block_ring: false,
+            custom_cipher: false,
         }
     }
 
