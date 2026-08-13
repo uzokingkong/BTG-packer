@@ -29,7 +29,6 @@ pub mod switch;
 mod tests;
 
 pub use exclusions::{detect_panic_unwind_ranges, detect_seh_native_functions};
-use exclusions::block_refs_runtime_global;
 pub use switch::resolve_switch_cases;
 
 
@@ -304,19 +303,68 @@ pub fn lift_program_cfg(
     // non-atomic load->modify->store. What remains excluded is the structural
     // SEH set only: the panic/unwind runtime functions and every block touching
     // their shared-state globals.
-    let excl = detect_panic_unwind_ranges(
-        text_bytes, base_va, image_base, relayed_sections,
+    //
+    // v59 (VM coverage): switch from `detect_panic_unwind_ranges` (bidirectional
+    // call + shared-global closure, ~11,016 blocks = most of the program kept
+    // native) to `detect_seh_native_functions` (the same minimal rule the block-
+    // shuffle path uses): panic-string referencing fns U EHANDLER fns U the
+    // raise..catch frames, minus the entry fn. This keeps exactly the frames the
+    // OS unwinder walks native, so the Program VM actually virtualizes the rest
+    // of the program (previously ~1.1K of 12K blocks). The Once/atomicity
+    // concern is handled by the real lock VM opcodes (v46-v49/v55), so the old
+    // shared-global block net is dropped here too.
+    let excl = detect_seh_native_functions(
+        text_bytes, base_va, image_base, relayed_sections, entry_point_va,
     );
-    let runtime_globals: std::collections::HashSet<u64> =
-        excl.runtime_globals.iter().copied().collect();
     let mut excluded_blocks: std::collections::HashSet<u64> = blocks
         .iter()
         .filter(|bb| {
             excl.func_ranges.iter().any(|(s, e)| *s <= bb.start_va && bb.start_va < *e)
-                || block_refs_runtime_global(bb, &runtime_globals)
         })
         .map(|bb| bb.start_va)
         .collect();
+
+    // v59: 리프터가 처리 못 하는 명령을 포함한 블록을 네이티브로 유지 (전체
+    // 프로그램을 VM화할 때 SHLD/SHRD 같은 비커버 명령이 lift_cfg를 실패시킨다).
+    // 커버리지 확대로 새로 VM에 들어온 코드에서 미지원 명령이 나오면 그 함수를
+    // 제외해 패킹 실패를 막는다. (SHLD/SHRD 등은 향후 VM opcode 추가로 lift.)
+    loop {
+        let mut added = 0;
+        for bb in blocks.iter() {
+            if excluded_blocks.contains(&bb.start_va) {
+                continue;
+            }
+            let real: Vec<iced_x86::Instruction> = bb
+                .instructions
+                .iter()
+                .copied()
+                .filter(|i| !is_zero_padding(i))
+                .collect();
+            let seq: Vec<LiftedInstr> = real.iter().map(|i| LiftedInstr::plain(*i)).collect();
+            let bad = diagnose_unsupported(&seq);
+            if !bad.is_empty() {
+                // 블록 전체 대신 포함 함수 전체를 제외 (프롤로그/에필로그 일관성)
+                if let Some((s, e)) = excl.func_ranges.iter().find(|(s, e)| *s <= bb.start_va && bb.start_va < *e) {
+                    for other in blocks.iter() {
+                        if *s <= other.start_va && other.start_va < *e {
+                            if excluded_blocks.insert(other.start_va) {
+                                added += 1;
+                            }
+                        }
+                    }
+                } else if excluded_blocks.insert(bb.start_va) {
+                    added += 1;
+                }
+            }
+        }
+        if added == 0 {
+            break;
+        }
+    }
+    println!(
+        "[+] --vm-oep: excluded {} block(s) (SEH minimal + un-liftable-instruction functions)",
+        excluded_blocks.len()
+    );
 
     // FIX(v14 redesign -- whole-program VM must actually execute): the OEP was
     // landing in the panic/unwind/Once/lock exclusion net, which forced

@@ -27,9 +27,10 @@ use anyhow::Result;
 // 0x5000을 초과해 "Boot area layout overlap"이 났다. crypto.rs는 섹션을
 // 실제 boot_end로 잘라내므로(truncate) reserve는 임시 할당 상한일 뿐, 최종
 // 파일 크기는 늘지 않는다.
-pub const BOOT_AREA_RESERVE: usize = 0x40000;  // v46: 0xC000→0x40000 — --vm-oep program-VM module (~206KB for a 200KB target)
-    //          fits in the temp boot area. crypto.rs truncates the section to actual boot_end,
-    //          so final file size is unaffected.
+pub const BOOT_AREA_RESERVE: usize = 0x80000;  // v59: 0x40000→0x80000 — VM 커버리지 확대로
+    //          program-VM bytecode가 ~310KB (200KB 타깃 기준, 이전 ~177KB)까지 커진다.
+    //          crypto.rs truncates the section to actual boot_end, so final file size
+    //          is unaffected.
 
 /// Pass 4: 디스패처 셸코드, OEP Stub, 점프 테이블, 블록 바이트를 결합하여
 /// `.btg` 섹션 바이트 버퍼를 조립한다.
