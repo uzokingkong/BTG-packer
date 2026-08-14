@@ -119,6 +119,14 @@ pub struct PipelineContext {
     pub block_ring: bool,
     /// v59: --custom-cipher — BTG-C1 커스텀 512-bit 스트림 사이퍼 사용 (기본 RC4).
     pub custom_cipher: bool,
+    /// T1-1: 폴리모픽 VM 시드 (빌드마다 OsRng로 생성).
+    pub poly_vm_seed: u64,
+    /// T1-1: 폴리모픽 VM 시드 마스킹 분할 저장 값.
+    pub poly_vm_seed_masked: u64,
+    /// T1-3: SDK 마커 리전 lift 결과(폴리모픽 바이트코드+시드+오프셋). embed 단계가 소비.
+    pub poly_vm_regions: Vec<crate::pipeline::selective_vm::PolyVmRegion>,
+    /// T1-2: 리프트 불가로 거부된 리전 수.
+    pub poly_vm_regions_rejected: usize,
 }
 
 impl PipelineContext {
@@ -171,6 +179,10 @@ impl PipelineContext {
             keep_pdata: false,
             block_ring: false,
             custom_cipher: false,
+            poly_vm_seed: 0,
+            poly_vm_seed_masked: 0,
+            poly_vm_regions: Vec::new(),
+            poly_vm_regions_rejected: 0,
         }
     }
 

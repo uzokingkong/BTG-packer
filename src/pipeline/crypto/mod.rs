@@ -253,6 +253,7 @@ pub fn run(
         ctx,
         &mut rc4,
         &runs,
+        &seed_masked,
         &seed_stored,
         crc_source,
         payload_bytes,

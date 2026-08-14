@@ -11,6 +11,7 @@ use btg_packer::qa::{self, QaBenchmarkRunner};
 use btg_packer::vm;
 use btg_packer::debug;
 use clap::Parser;
+use rand::RngCore;
 use std::env;
 use std::fs;
 
@@ -357,7 +358,12 @@ fn main() -> error::Result<()> {
 
     // ── Phase 6: SDK Marker Selective VM Pass (if markers present) ───────────────
     if vm_enabled {
-        let _ = pipeline::selective_vm::SelectiveVmPass::run(&mut ctx, 0xCAFEBABE_1337BEEF);
+        // T1-1: 폴리모픽 VM 시드를 빌드마다 OS 엔트로피(OsRng)로 생성.
+        let poly_seed: u64 = rand::rngs::OsRng.next_u64();
+        ctx.poly_vm_seed = poly_seed;
+        ctx.poly_vm_seed_masked =
+            poly_seed ^ 0xA7B3C5D1E9F20486u64.wrapping_mul(ctx.mba_constant as u64);
+        let _ = pipeline::selective_vm::SelectiveVmPass::run(&mut ctx, poly_seed);
     }
 
     // ── Pass 1: CFG 추출 + MicroSlicer ────────────────────────────────────────────

@@ -17,6 +17,7 @@ pub(crate) fn place_boot_stub(
     ctx: &mut PipelineContext,
     rc4: &mut Rc4,
     runs: &[StringRun],
+    seed_masked: &[u8],
     seed_stored: &[u8],
     crc_source: Option<Vec<u8>>,
     payload_bytes: Vec<u8>,
@@ -645,7 +646,7 @@ pub(crate) fn place_boot_stub(
                 sec.characteristics |= 0x8000_0000; // IMAGE_SCN_MEM_WRITE (boot in-place decrypt)
             }
         }
-        let mut r = Rc4::new(seed_stored);
+        let mut r = Rc4::new(seed_masked);
         if vm_oep_text_len > 0 {
             if let Some(sec) = ctx.patched_sections.iter_mut().find(|s| s.name == ".text") {
                 r.crypt(&mut sec.bytes);
@@ -682,6 +683,11 @@ pub(crate) fn place_boot_stub(
     // v9: chained/plain = 평문 CRC, reencrypt = 파일 암호문 CRC. crypto-off는 없음.
     if integrity_effective {
         let crc_val = crc32(crc_source.as_deref().unwrap_or(&[]));
+        // T2-3: 키 결합 MAC — CRC32는 키 없는 손상검출용이라 변조 시 4바이트를 함께
+        // 바꾸면 우회된다. seed_stored를 키로 코드 영역 keyed-MAC을 계산해 로그로
+        // 남긴다 (변조 시 실행 거부용 — 부트 스텁 네이티브 검증은 별도 계층으로 확장).
+        let mac_val = crate::crypto::BtgKeyedMac::mac(seed_stored, crc_source.as_deref().unwrap_or(&[]));
+        println!("[+] T2-3 Integrity keyed-MAC over code region: {:016X} (keyed)", mac_val);
         btg.bytes[seed_off + 256..seed_off + 260].copy_from_slice(&crc_val.to_le_bytes());
         println!(
             "[+] v5 Integrity: code-region CRC32 = 0x{:08X} stored @0x{:X} (stub traps on mismatch)",
