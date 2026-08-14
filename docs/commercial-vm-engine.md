@@ -113,3 +113,29 @@
 
 - **단위 테스트**: `cargo test --lib` $\rightarrow$ **105/105 Passed (100%)**
 - **실행 안정성**: CLI 10개 조합 및 7개 VM/VM-OEP 조합 실환경 실행 $\rightarrow$ **Windows Event Log 0 Crash / Faults**
+
+### 3.1 차등(Differential) 검증 계약 — 선형 블록 단위 동치로 한정
+
+상용 엔진(risc→poly→threaded) 실행 정합의 **차등 검증 계약**은 **선형 블록 단위
+동치(linear block-unit equivalence)**로 한정한다. 즉 다음 3계층이 동일 선형 블록에 대해
+**완전히 일치**해야 한다:
+
+- `RiscProgram::eval_state` (참조 시뮬레이터)
+- `PolymorphicInterpreter` / `PolymorphicDecoder` (폴리모픽 바이트코드 해석)
+- `DirectThreadedNativeRunner` / `run_native_poly` (네이티브 하네스)
+
+비교 상태는 `regs`(16)/`temps`(8)/`flags`/`vsp`/`stack`(및 메모리 경로의 `mem`) 전체다.
+**taken-분기(실제 제어흐름 이동)의 검증은 계약에서 제외**한다 — 실제 분기/점프 제어흐름은
+**네이티브 디스패처**(tail-call direct threading, `direct_tail.rs`/`native_runner.rs`)가
+담당하는 실행 계층의 책임이며, 이는 별도 이슈/테스트로 다룬다. 차등 테스트는 오직
+**분기 없는 선형 블록**(분기/메모리/브리지 미포함)에 대해서만 regs/temps/flags/vsp/stack
+전부를 비교한다.
+
+**P3 (G1) — 상용 프로그램(OEP) 경로 차등/통합 테스트** (`src/vm/text_lift/commercial.rs`):
+
+| 테스트 | 경로 | 검증 |
+|---|---|---|
+| `test_commercial_lift_encode_native_matches_reference_linear_block` | RISC→poly→native | 선형 블록 regs/temps/flags/vsp/stack == `eval_state` (3 seeds) |
+| `test_commercial_extended_linear_block_matches_reference` | RISC→poly→native | 더 긴 선형 블록 (flags 갱신 포함) == `eval_state` (3 seeds) |
+| `test_commercial_program_lift_integration_execution_equivalence` | **`lift_program_cfg_commercial`(OEP/프로그램 경로)**→poly→native | 리프트된 `RiscProgram`(ip_map) == `eval_state` (4 seeds) |
+| `test_lift_commercial_covers_same_blocks_and_keeps_unliftable_native` | 프로그램 lift | CFG 블록 동일 + unliftable 블록 네이티브 유지 |

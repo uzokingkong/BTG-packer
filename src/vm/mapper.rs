@@ -68,11 +68,38 @@ pub struct MapBlock {
     pub native: bool,
 }
 
+/// P3 (G1): 상용(RISC→poly) 프로그램 lift에서 lift된 원본 명령 하나를 기록하는
+/// 매핑 엔트리 — "원본 VA → RISC micro-op 인덱스 → 폴리 바이트코드 오프셋" 체인의
+/// 명령 단위 레코드. `poly_bc_offset`은 lift 시점(commercial.rs)엔 0이고,
+/// `PolymorphicEncoder::encode_with_offsets` 후 [`fill_risc_poly_offsets`]가 첫
+/// micro-op의 오프셋으로 채운다.
+#[derive(Debug, Clone)]
+pub struct RiscMapEntry {
+    /// 원본 명령 가상 주소.
+    pub src_va: u64,
+    /// 원본 명령 길이(바이트).
+    pub len: usize,
+    /// 원본 명령 디스어셈블리.
+    pub disasm: String,
+    /// 이 명령이 lift된 첫 RISC micro-op 인덱스 (RiscProgram.instrs 기준).
+    pub risc_op_start: usize,
+    /// 이 명령이 만든 RISC micro-op 수.
+    pub risc_op_count: usize,
+    /// 첫 micro-op의 폴리 바이트코드 오프셋 (인코딩 후 채움).
+    pub poly_bc_offset: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct VmMapper {
     pub entries: Vec<MapEntry>,
     /// Block boundaries for the symbolic map (Program lift).
     pub blocks: Vec<MapBlock>,
+    /// 상용(RISC→poly) 프로그램 lift의 명령 단위 매핑 (P3).
+    pub risc_entries: Vec<RiscMapEntry>,
+    /// micro-op 인덱스 → 원본 VA (per-micro-op CSV 매핑용, lift 시점에 채움).
+    pub risc_op_src: Vec<u64>,
+    /// micro-op 인덱스 → 폴리 바이트코드 오프셋 (`fill_risc_poly_offsets`가 채움).
+    pub risc_offsets: Vec<usize>,
     /// Human label for the current map (e.g. "program" / "ksa").
     pub label: String,
 }
@@ -87,6 +114,9 @@ pub fn begin(label: &str) {
         *s.borrow_mut() = Some(VmMapper {
             entries: Vec::new(),
             blocks: Vec::new(),
+            risc_entries: Vec::new(),
+            risc_op_src: Vec::new(),
+            risc_offsets: Vec::new(),
             label: label.to_string(),
         })
     });
@@ -154,6 +184,55 @@ pub fn end_block(bc_end: usize, src_va_end: u64) {
     });
 }
 
+/// P3 (G1): 상용(RISC) 리프트의 원본 명령 하나를 매핑에 기록한다 (lift 시점,
+/// commercial.rs). 폴리 바이트코드 오프셋은 인코딩 후 [`fill_risc_poly_offsets`]가
+/// 채운다. `risc_op_start`는 프로그램(`RiscProgram.instrs`) 기준 절대 micro-op
+/// 인덱스다.
+pub fn record_risc_entry(
+    src_va: u64,
+    len: usize,
+    disasm: String,
+    risc_op_start: usize,
+    risc_op_count: usize,
+) {
+    SLOT.with(|s| {
+        if let Some(m) = s.borrow_mut().as_mut() {
+            m.risc_entries.push(RiscMapEntry {
+                src_va,
+                len,
+                disasm,
+                risc_op_start,
+                risc_op_count,
+                poly_bc_offset: 0,
+            });
+            // per-micro-op 원본 VA 맵 확장 (CSV per-micro-op 행용)
+            let end = risc_op_start + risc_op_count;
+            if m.risc_op_src.len() < end {
+                m.risc_op_src.resize(end, src_va);
+            }
+            for i in risc_op_start..end {
+                m.risc_op_src[i] = src_va;
+            }
+        }
+    });
+}
+
+/// P3 (G1): `PolymorphicEncoder::encode_with_offsets`가 계산한 per-micro-op 폴리
+/// 바이트코드 오프셋을 받아 각 RISC 엔트리의 첫 micro-op 오프셋을 채운다
+/// (place.rs가 상용 lift를 인코딩한 직후 호출).
+pub fn fill_risc_poly_offsets(offsets: &[usize]) {
+    SLOT.with(|s| {
+        if let Some(m) = s.borrow_mut().as_mut() {
+            m.risc_offsets = offsets.to_vec();
+            for e in m.risc_entries.iter_mut() {
+                if e.risc_op_count > 0 && e.risc_op_start < offsets.len() {
+                    e.poly_bc_offset = offsets[e.risc_op_start];
+                }
+            }
+        }
+    });
+}
+
 /// Take the accumulated map (disabling further recording) if any.
 pub fn take() -> Option<VmMapper> {
     SLOT.with(|s| s.borrow_mut().take())
@@ -182,6 +261,19 @@ pub fn render(m: &VmMapper) -> String {
         out.push_str(&format!(
             "0x{:X} {} 0x{:X} {} {}\n",
             e.bc_offset, e.kind, e.src_va, e.len, e.disasm
+        ));
+    }
+    out.push_str("; ----- commercial RISC lift (src_va -> micro-op -> poly bc offset) -----\n");
+    out.push_str("; format: poly_bc_offset RiscProg src_va len op=<start>..<end> disasm\n");
+    for e in &m.risc_entries {
+        out.push_str(&format!(
+            "0x{:X} RiscProg 0x{:X} {} op={}..{} {}\n",
+            e.poly_bc_offset,
+            e.src_va,
+            e.len,
+            e.risc_op_start,
+            e.risc_op_start + e.risc_op_count,
+            e.disasm
         ));
     }
     out
@@ -251,6 +343,19 @@ pub fn render_sym(m: &VmMapper, funcs: &[(u64, u64)], image_base: u64) -> String
             e.bc_offset, bid, e.src_va, e.len, e.disasm
         ));
     }
+    out.push_str("; ----- commercial RISC lifted instructions (reverse index) -----\n");
+    out.push_str("; format: poly_bc_offset op=<start>..<end> src_va len disasm\n");
+    for e in &m.risc_entries {
+        out.push_str(&format!(
+            "0x{:X} op={}..{} 0x{:X} {} {}\n",
+            e.poly_bc_offset,
+            e.risc_op_start,
+            e.risc_op_start + e.risc_op_count,
+            e.src_va,
+            e.len,
+            e.disasm
+        ));
+    }
     out
 }
 
@@ -265,6 +370,23 @@ pub fn write_sym_to(
     let mut f = std::fs::File::create(path)?;
     f.write_all(body.as_bytes())?;
     Ok(m.blocks.len())
+}
+
+/// P3 (G1): 상용(RISC) lift의 micro-op 단위 CSV를 `path`에 기록한다.
+/// 열: `src_va,risc_op_index,poly_bc_offset` — micro-op 하나마다 한 행으로
+/// "원본 VA → RISC micro-op 인덱스 → 폴리 바이트코드 오프셋" 체인을 담는다.
+/// 기록된 micro-op 수를 반환한다. (단순 CSV 포맷 — 매핑 파일 산출물.)
+pub fn write_risc_csv_to(m: &VmMapper, path: &std::path::Path) -> std::io::Result<usize> {
+    let mut out = String::new();
+    out.push_str("src_va,risc_op_index,poly_bc_offset\n");
+    let n = m.risc_offsets.len();
+    for i in 0..n {
+        let src = m.risc_op_src.get(i).copied().unwrap_or(0);
+        out.push_str(&format!("0x{:X},{},{}\n", src, i, m.risc_offsets[i]));
+    }
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(out.as_bytes())?;
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -284,5 +406,40 @@ mod tests {
         let body = render(&m);
         assert!(body.contains("0x10 Block 0x140001000"));
         assert!(body.contains("mov rax, rdx") || body.contains("mov rax,rdx"));
+    }
+
+    /// P3 (G1): 상용 RISC 리프트 매핑 기록 → 폴리 오프셋 채움 → .map/.sym 렌더링
+    /// + per-micro-op CSV 라운드트립 검증.
+    #[test]
+    fn risc_entry_render_and_csv() {
+        begin("test");
+        record_risc_entry(0x140001000, 7, "mov rax,100".to_string(), 0, 2);
+        record_risc_entry(0x140001007, 3, "add rax,rbx".to_string(), 2, 1);
+        fill_risc_poly_offsets(&[0, 6, 9]);
+        let m = take().expect("map present");
+        assert_eq!(m.risc_entries.len(), 2);
+        assert_eq!(m.risc_entries[0].poly_bc_offset, 0, "first op offset");
+        assert_eq!(m.risc_entries[1].poly_bc_offset, 9, "second op offset");
+        assert_eq!(m.risc_op_src, vec![0x140001000, 0x140001000, 0x140001007]);
+
+        let map_body = render(&m);
+        assert!(map_body.contains("RiscProg"));
+        assert!(map_body.contains("op=0..2"));
+        assert!(map_body.contains("0x140001000"));
+
+        let sym_body = render_sym(&m, &[], 0x140000000);
+        assert!(sym_body.contains("op=2..3"));
+        assert!(sym_body.contains("0x140001007"));
+
+        let dir = std::env::temp_dir();
+        let p = dir.join("btg_risc_map_test.csv");
+        let n = write_risc_csv_to(&m, &p).expect("write csv");
+        assert_eq!(n, 3);
+        let text = std::fs::read_to_string(&p).expect("read csv");
+        assert!(text.starts_with("src_va,risc_op_index,poly_bc_offset"));
+        assert!(text.contains("0x140001000,0,0"));
+        assert!(text.contains("0x140001000,1,6"));
+        assert!(text.contains("0x140001007,2,9"));
+        let _ = std::fs::remove_file(&p);
     }
 }

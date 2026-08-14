@@ -355,6 +355,10 @@ fn main() -> error::Result<()> {
     // v59: patch_data가 .rdata/.data 포인터 재배치를 vm_oep 모드에서 원본 .text
     // 유지로 바꾸므로 **pass1 이전에** 설정해야 한다. (기존엔 crypto 직전 설정)
     ctx.vm_oep = args.vm_oep && vm_enabled;
+    // P3 (G1): --vm-commercial — --vm-oep의 백엔드를 상용 엔진으로 전환 (회귀 안전).
+    // `--vm --vm-oep --vm-commercial` 모두 켜야 상용 경로를 쓰고, 레거시 --vm-oep
+    // 경로는 바이트 동일 유지한다.
+    ctx.vm_commercial = args.vm_commercial && args.vm_oep && vm_enabled;
 
     // ── Phase 6: SDK Marker Selective VM Pass (if markers present) ───────────────
     if vm_enabled {
@@ -491,6 +495,18 @@ fn main() -> error::Result<()> {
                     .map_err(|e| error::BtgError::Anyhow(anyhow::anyhow!(
                         "M10: failed to write VM symbol map {}: {}", sym_path.display(), e)))?;
                 println!("[+] M10 VM symbol map written: {} ({} blocks)", sym_path.display(), n);
+            }
+            // P3 (G1): 상용 RISC lift의 micro-op 단위 매핑 CSV
+            // (원본 VA → RISC micro-op 인덱스 → 폴리 바이트코드 오프셋).
+            if !m.risc_entries.is_empty() {
+                let mut csv_path = output_path.clone();
+                csv_path.set_extension(
+                    format!("{}.riscmap.csv", output_path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| String::from("out"))),
+                );
+                let n = vm::mapper::write_risc_csv_to(&m, &csv_path)
+                    .map_err(|e| error::BtgError::Anyhow(anyhow::anyhow!(
+                        "P3: failed to write commercial RISC map CSV {}: {}", csv_path.display(), e)))?;
+                println!("[+] P3 commercial RISC map CSV written: {} ({} micro-ops)", csv_path.display(), n);
             }
         } else {
             println!("[!] M9/M10: mapper enabled but no bytecode was lifted (nothing to map)");

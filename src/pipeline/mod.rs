@@ -90,6 +90,10 @@ pub struct PipelineContext {
     /// M6 Phase-2: --vm-oep — 부트 스텁이 원본 .text를 평문 복호화하지 않고
     /// lift된 프로그램 VM 모듈로 디스패치. (기본 false → 기존 경로 유지)
     pub vm_oep: bool,
+    /// P3 (G1): --vm-oep의 백엔드를 상용 엔진(risc→poly→threaded)으로 전환.
+    /// `--vm --vm-oep --vm-commercial` 모두 켜야 상용 경로를 쓰고, 레거시 경로는
+    /// 바이트 동일 유지. (기본 false → 레거시 1:1 프로그램 VM 유지)
+    pub vm_commercial: bool,
     /// M7: --m7 — on-demand 재암호화(anti-dump) 활성화 (기본 false → 기존 경로 유지)
     pub m7: bool,
     /// M8: --m8 — VM handler 테이블 MBA 난독화 (기본 false → 기존 경로 유지)
@@ -169,6 +173,7 @@ impl PipelineContext {
             mem_harden: false,
             reencrypt: false,
             vm_oep: false,
+            vm_commercial: false,
             m7: false,
             m8: false,
             call_target_block_ids: std::collections::HashSet::new(),

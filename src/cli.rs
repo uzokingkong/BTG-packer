@@ -135,6 +135,12 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false)]
     pub vm_oep: bool,
 
+    /// P3 (G1): --vm-oep의 프로그램 가상화 백엔드를 상용 엔진(risc→poly→threaded)으로
+    /// 전환한다. `--vm --vm-oep --vm-commercial` 모두 주어야 상용 경로를 쓰고,
+    /// 레거시 1:1 VM(--vm-oep 단독)은 바이트 동일하게 유지된다. (회귀 안전 토글)
+    #[arg(long, default_value_t = false)]
+    pub vm_commercial: bool,
+
     /// M7: on-demand 재암호화(anti-dump) — 원본 .text/.data/.rdata 런을 파일에는
     /// 암호문으로 저장하고 실행 중 on-demand로만 복호화→사용→재암호화해, 덤프 시
     /// 평문이 노출되지 않게 한다. (기본 false → 기존 경로 유지)

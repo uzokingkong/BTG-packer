@@ -89,6 +89,8 @@ pub fn run(
     let chained_effective = enabled && chained && !reencrypt;
     let vm_effective = enabled && vm && !chained_effective && !reencrypt;
     let vm_oep_effective = vm_effective && ctx.vm_oep;
+    // P3 (G1): --vm-commercial — 상용 엔진(risc→poly→threaded) 백엔드 선택.
+    let vm_commercial_effective = vm_oep_effective && ctx.vm_commercial;
     let m8_mod = ctx.m8 && vm_effective;
     let integrity_effective = integrity && enabled;
 
@@ -261,6 +263,7 @@ pub fn run(
         anti_debug,
         vm_effective,
         vm_oep_effective,
+        vm_commercial_effective,
         chained_effective,
         reencrypt,
         integrity_effective,

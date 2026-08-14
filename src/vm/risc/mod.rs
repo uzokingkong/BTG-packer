@@ -72,6 +72,17 @@ impl RiscProgram {
         }
     }
 
+    /// ip_map(소스-IP → 프로그램 인덱스)을 통해 분기 타깃 절대 x86 IP를
+    /// 프로그램 인덱스로 해석한다. (ip_map이 없으면 imm을 그대로 인덱스로 사용 —
+    /// eval_state의 VirtualBranch와 동일한 해석)
+    pub fn resolve_target(&self, imm: u64) -> usize {
+        self.ip_map
+            .as_ref()
+            .and_then(|m| m.get(&imm))
+            .copied()
+            .unwrap_or(imm as usize)
+    }
+
     /// RISC 가상 머신 인터프리터 시뮬레이션 (검증 및 테스트용)
     ///
     /// 하위 호환성용: NOR / AddWithCarry 만 처리하며, 그 외 op는 무시한다.

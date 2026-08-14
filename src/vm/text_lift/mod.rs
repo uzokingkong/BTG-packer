@@ -22,14 +22,19 @@ use crate::graph::{BasicBlock, CfgExtractor};
 use crate::vm::lifter::{LiftedInstr, diagnose_unsupported, lift_block, lift_cfg, lift_cfg_switch};
 use anyhow::{Result, anyhow};
 use iced_x86::Code;
+use iced_x86::Instruction;
+use std::collections::{HashMap, HashSet};
+use crate::vm::risc::{RiscLifter, RiscProgram};
 
 pub mod exclusions;
+pub mod commercial;
 pub mod switch;
 #[cfg(test)]
 mod tests;
 
 pub use exclusions::{detect_panic_unwind_ranges, detect_seh_native_functions};
 pub use switch::resolve_switch_cases;
+pub use commercial::{ProgramLiftCommercial, lift_program_cfg_commercial};
 
 
 /// 기본 블록 하나의 lift 결과.
@@ -457,7 +462,7 @@ pub fn lift_text_block(bb: &BasicBlock) -> Result<Vec<u8>> {
 
 
 /// Is this instruction compiler zero-fill padding (`add [rax],al`, opcode 00 00)?
-fn is_zero_padding(inst: &iced_x86::Instruction) -> bool {
+pub(crate) fn is_zero_padding(inst: &iced_x86::Instruction) -> bool {
     use iced_x86::{Code, OpKind, Register};
     inst.code() == Code::Add_rm8_r8
         && inst.op0_kind() == OpKind::Memory
