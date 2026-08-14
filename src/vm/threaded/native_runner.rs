@@ -197,7 +197,13 @@ impl DirectThreadedNativeRunner {
     /// ret
     /// ```
     pub fn build_halt_handler(target_va: u64) -> Result<Vec<u8>> {
+        // Win64 callee-saved(R12..R15) restore + RSP 16B alignment: the embedded
+        // commercial/poly Program VM entry stub pushes R12,R13,R14,R15, so HALT
+        // must pop them back (reverse) before ret -- matching harness.rs HALT.
         let mut instrs = Vec::new();
+        for r in [Register::R15, Register::R14, Register::R13, Register::R12] {
+            instrs.push(Instruction::with1(Code::Pop_r64, r).map_err(|e| anyhow!("{e}"))?);
+        }
         instrs.push(Instruction::with(Code::Retnq));
         DirectTailEmitter::assemble(instrs, target_va)
     }
@@ -242,7 +248,7 @@ mod tests {
         assert!(!halt_code.is_empty());
 
         // Halt handler ends with ret (0xC3)
-        assert_eq!(halt_code, vec![0xC3]);
+        assert!(halt_code.len() >= 5);
     }
 
     /// T1-3: 12개 RISC 핸들러 전부가 네이티브 기계어로 생성되고,
@@ -270,7 +276,7 @@ mod tests {
 
         // HALT는 단일 ret.
         let halt = handlers.iter().find(|(n, _, _)| n == "HALT").unwrap();
-        assert_eq!(halt.2, vec![0xC3]);
+        assert!(halt.2.len() >= 5);
     }
 
     /// 각 핸들러의 시맨틱 검증 (기계어 해독 후 예상 연산 존재 확인)
@@ -310,5 +316,40 @@ mod tests {
             }
         }
         assert!(has_sub && has_mov, "PUSH handler must sub/mov");
+    }
+
+    /// P3 (G1): Win64 callee-saved R12..R15 저장/복원 + RSP 16B 정렬 계약 검증.
+    /// 임베드 상용 프로그램 VM의 엔트리 스텁(`build_program_vm_commercial` /
+    /// `poly_embed`)은 R12→R15 순서로 push하므로, HALT 핸들러는 역순(R15→R12)
+    /// pop 후 ret하여 호출자의 callee-saved 레지스터와 RSP를 정확히 복원해야
+    /// 한다. 이 핸들러를 직접 디코드해 해당 명령 시퀀스를 검증한다.
+    #[test]
+    fn test_build_halt_restores_r12_r15_and_rsp() {
+        use iced_x86::{Decoder, DecoderOptions, Mnemonic, Register};
+
+        let halt = DirectThreadedNativeRunner::build_halt_handler(0x1400010A0).unwrap();
+        assert!(halt.len() >= 5, "HALT handler must be >= 5 bytes (4 pops + ret)");
+
+        let mut dec = Decoder::with_ip(64, &halt, 0x1400010A0, DecoderOptions::NONE);
+        let mut pops = Vec::new();
+        let mut saw_ret = false;
+        while dec.can_decode() {
+            let ins = dec.decode();
+            match ins.mnemonic() {
+                Mnemonic::Pop => {
+                    pops.push(ins.op0_register().full_register());
+                }
+                Mnemonic::Ret => saw_ret = true,
+                _ => {}
+            }
+        }
+        // 역순 pop: R15, R14, R13, R12 — 엔트리 push(R12,R13,R14,R15)와 짝을 이룬다.
+        assert_eq!(pops, vec![
+            Register::R15, Register::R14, Register::R13, Register::R12
+        ], "HALT must pop R15,R14,R13,R12 (reverse of entry push) to restore callee-saved regs");
+        assert!(saw_ret, "HALT must end with ret");
+        // RSP 16B 정렬: 4개 8B pop은 32B를 되돌려 엔트리 push 직전 RSP(=부트 스텁
+        // dispatch 직후, 16B 정렬)로 정확히 복원한다. 명령 수 기반 불변식으로 보강.
+        assert_eq!(pops.len() * 8, 32, "4 callee-saved regs = 32B = RSP restore amount");
     }
 }
