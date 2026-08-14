@@ -42,6 +42,10 @@
 - `PolymorphicInterpreter`(폴리모픽 바이트코드 해석기)와는 기존 지원 op(Nor/Add/Shift/Push/Pop/Halt)에
   대해 동일 의미를 유지. 폴리 엔코더가 메모리·분기 op를 표현하지 않으므로 해당 op의 차등 테스트는
   `eval_state` 참조로만 수행(추후 폴리 계층 확장 과제로 남김).
+  → **P1(2026-08-15)에서 해소**: 폴리 인코더/인터프리터가 `ArithmeticShiftRight`, `VirtualBranch`,
+  `MemoryRead/Write{1,2,4,8}`, `NativeCallBridge`를 인코딩·실행하며 `PolymorphicInterpreter` ==
+  `eval_state` **완전 상태 동치**(regs/temps/flags/vsp/stack/mem) 차등 테스트(≥3 seeds)가 green.
+  상세: `docs/COMMERCIAL-VM-UPGRADE-PLAN.md` §P1, `docs/milestones.md` Phase 5, `docs/journal/2026-08-15.md`.
 
 ## 4. 검증
 
@@ -100,3 +104,8 @@
 ```
 - 변경 파일: `src/vm/risc/opcodes.rs`, `src/vm/risc/flags.rs`, `src/vm/risc/mod.rs`,
   `src/vm/risc/lifter.rs`, `src/vm/threaded/harness.rs`(PF 동기화), `docs/T1-2-RISC-Lifter-Coverage-DONE.md`.
+
+### 후속 — P1 폴리 계층 완성 (2026-08-15, §3 과제 해소)
+- `vm/poly/isa_spec.rs`·`encoder.rs`·`interpreter.rs`가 메모리/분기/SAR/NativeCallBridge op를
+  인코딩·실행 → `PolymorphicInterpreter` == `RiscProgram::eval_state` 차등 검증 (≥3 seeds).
+- 커밋: `2a3d6c8`, `ece32c9`, `20af238` (feature branch `commercial/p1-poly-complete`).

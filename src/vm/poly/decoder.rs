@@ -10,7 +10,7 @@
 
 use super::isa_spec::VirtualIsaSpec;
 use super::rolling_key::RollingKeyEngine;
-use crate::vm::risc::{MicroInstr, MicroOperand, RiscOp, RiscProgram};
+use crate::vm::risc::{BranchCondition, MicroInstr, MicroOperand, RiscOp, RiscProgram};
 use anyhow::{anyhow, Result};
 
 /// 폴리모픽 바이트코드 → `RiscProgram` 복호화기.
@@ -30,8 +30,9 @@ impl PolymorphicDecoder {
     /// 암호화된 스트림을 한 인스트럭션씩 복호화해 `RiscProgram`으로 되돌린다.
     ///
     /// 복호화 순서·피연산자 디코딩은 `PolymorphicInterpreter::run`과 동일:
-    ///   opcode 1B → dst/src1/src2 3B → (src==Imm64 이면) 8B 즉시값 → (AddWithCarry
-    ///   이고 즉시 피연산자가 없으면) cin 8B. 즉시값은 `operand_mask`로 XOR 복원.
+    ///   opcode 1B → (VirtualBranch 면 조건 1B) → dst/src1/src2 3B → (src==Imm64 이면) 8B
+    ///   즉시값 → (AddWithCarry 이고 즉시 피연산자가 없으면) cin 8B → (VirtualBranch 의
+    ///   절대-인덱스 타깃(src1 없음)이면) 타깃 8B. 즉시값은 `operand_mask`로 XOR 복원.
     pub fn decode(&mut self, bytecode: &[u8]) -> Result<RiscProgram> {
         let mut instrs = Vec::new();
         let mut vip = 0usize;
@@ -46,6 +47,21 @@ impl PolymorphicDecoder {
                 .get(&raw_op)
                 .cloned()
                 .ok_or_else(|| anyhow!("poly decoder: unknown decrypted opcode 0x{raw_op:02X} at offset 0x{vip:X}"))?;
+
+            // 1b. VirtualBranch 조건 바이트 (opcode 직후)
+            let cond = if let RiscOp::VirtualBranch { .. } = risc_op {
+                let raw_cond = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
+                vip += 1;
+                self.spec
+                    .decode_cond(raw_cond)
+                    .ok_or_else(|| anyhow!("poly decoder: unknown branch cond 0x{raw_cond:02X} at offset 0x{vip:X}"))?
+            } else {
+                BranchCondition::Always
+            };
+            let risc_op = match risc_op {
+                RiscOp::VirtualBranch { .. } => RiscOp::VirtualBranch { cond },
+                other => other,
+            };
 
             if vip + 3 > bytecode.len() {
                 break;
@@ -96,6 +112,21 @@ impl PolymorphicDecoder {
                 0
             };
 
+            // VirtualBranch 절대-인덱스 타깃 (src1 이 없으면 8B 즉시값). src1 은 0x00 으로
+            // 부호화되므로 `op_src1 == 0x00` 이 곧 "src1 없음" 과 동치다.
+            let branch_target = if matches!(risc_op, RiscOp::VirtualBranch { .. }) && op_src1 == 0x00 {
+                let mut b = [0u8; 8];
+                for i in 0..8 {
+                    if vip < bytecode.len() {
+                        b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
+                        vip += 1;
+                    }
+                }
+                u64::from_le_bytes(b) ^ self.spec.operand_mask
+            } else {
+                0
+            };
+
             let decode_op = |raw: u8| -> Option<MicroOperand> {
                 let kind = raw & 0xC0;
                 let payload = raw & 0x3F;
@@ -129,7 +160,12 @@ impl PolymorphicDecoder {
                 0x01 => Some(MicroOperand::Imm64(imm2)),
                 _ => decode_op(op_src2),
             };
-            ins.imm = cin;
+            // VirtualBranch 절대-인덱스 타깃이면 imm 을 타깃으로, 아니면 cin.
+            ins.imm = if matches!(risc_op, RiscOp::VirtualBranch { .. }) && op_src1 == 0x00 {
+                branch_target
+            } else {
+                cin
+            };
 
             instrs.push(ins);
             if risc_op == RiscOp::Halt {

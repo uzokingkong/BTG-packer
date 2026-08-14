@@ -70,3 +70,33 @@
 - [x] `docs/commercial-vm-engine.md` — Themida/VMProtect급 4단계 상용 가상화 엔진 심층 설계서.
 - [x] `docs/coverage.md` — 명령어 커버리지 베이스라인.
 - [x] `docs/milestones.md` — 전체 마일스톤 체크리스트.
+
+---
+
+## Phase 5 — 상용 VM 컴파일러 업그레이드 플랜 (P0 / P1) 🔶
+
+> 상세: `docs/COMMERCIAL-VM-UPGRADE-PLAN.md` · 대상 브랜치: `commercial/p1-poly-complete`
+> (기준 `cc6b973` = `origin/main`).
+
+### P0 — 저장소 정리 (Repo Consolidation) ✅
+- [x] 상위 repo `asdfsadfecwecc`를 **canonical**로 확정 (`cc6b973`, RISC 32-bit 최신).
+- [x] 중첩 `vm-obf/` 스테일 clone(HEAD `0df672a`)이 **unique/unpushed 커밋 0개**임을 확인
+      (`merge-base --is-ancestor 0df672a cc6b973` → exit 0) 후 **삭제** → 단일 Cargo workspace.
+- [x] `cargo build --release` green.
+
+### P1 — 폴리모픽 ISA / 인터프리터 완성 (Complete Polymorphic Semantics) ✅
+- [x] `vm/poly/isa_spec.rs` opcode_map에 `ArithmeticShiftRight`, `VirtualBranch`(BranchCondition),
+      `MemoryRead/Write{1,2,4,8}`, `NativeCallBridge` 추가 → **전체 reachable opcode 인코딩**.
+- [x] `vm/poly/encoder.rs` 신규 op 인코딩 (즉시값 8B·width·분기 타깃·BranchCondition).
+- [x] `vm/poly/interpreter.rs`에서 5개 op 핸들러 구현 — `RiscProgram::eval_state`(참조)와
+      **완전 상태 동치**(regs/temps/flags/vsp/stack/mem). taken VirtualBranch의
+      인스트럭션-인덱스→바이트오프셋 변환 + rolling-key 동기화.
+- [x] 메모리 모델 `mem` 도입 — `eval_state`와 동일 계약.
+- [x] **차등 테스트 (≥3 seeds)** green: `test_poly_arith_shift_matches_reference`,
+      `test_poly_mem_rw_matches_reference`(1/2/4/8), `test_poly_branch_matches_reference`
+      (taken/not-taken + `CounterZero` 2/4/8), `test_poly_native_call_bridge_stub`,
+      `test_poly_opcode_map_uniqueness_complete_isa`.
+- [x] **`cargo build --release` green (exit 0)** · **`cargo test --release` → 162 passed; 0 failed**.
+- [x] 커밋: `2a3d6c8`(인터프리터) · `ece32c9`(인코더) · `20af238`(차등 테스트+분기 수정), pushed to `origin/commercial/p1-poly-complete`.
+
+> 진행: **P2 — RISC 리프터 커버리지 100%** (미착수, 다음 게이트).
