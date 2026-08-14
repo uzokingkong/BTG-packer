@@ -42,11 +42,16 @@ switch jump-table 해석을 그대로 재사용한다. 차이는 각 포함 블�
 ## 검증
 
 - `cargo build --release` → **exit 0**
-- `cargo test --release` → **163 passed; 0 failed** (162 베이스 + 신규 P3 2개 green)
+- `cargo test --release` → **165 passed; 0 failed** (162 베이스 + 신규 P3 4개 green)
   - `test_lift_commercial_covers_same_blocks_and_keeps_unliftable_native`
   - `test_commercial_lift_encode_native_matches_reference_linear_block`
     (x86 → RISC → 폴리 롤링키 → DirectThreadedNativeRunner 네이티브 실행 == `RiscProgram::eval_state` 참조,
     다중 시드)
+  - `test_commercial_extended_linear_block_matches_reference`
+    (더 긴 선형 블록, flags 갱신 포함 — 선형 블록 단위 동치)
+  - `test_commercial_program_lift_integration_execution_equivalence`
+    (**`lift_program_cfg_commercial` OEP/프로그램 경로** → 폴리 → 네이티브 == `eval_state`,
+     OEP VM화 + 전 상태 동치, 다중 시드)
 - 레거시 `--vm-oep` 단독 경로 무회귀 (상용 분기는 `vm_commercial`이 켜졌을 때만 선택)
 
 ## 알려진 사항

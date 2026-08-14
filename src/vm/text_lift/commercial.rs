@@ -453,4 +453,149 @@ mod tests {
         assert_eq!(ref_st.stack.len(), 0, "push+pop balanced");
         assert_eq!(ref_st.vsp, 0, "vsp balanced");
     }
+
+    /// P3 (G1) 통합 차등 검증 — **프로그램(OEP) 경로** 실행 동치.
+    ///
+    /// `lift_program_cfg_commercial`(실제 `--vm-commercial` 프로그램 lift 경로)가
+    /// 만든 `RiscProgram`(ip_map 포함)을 `PolymorphicEncoder`로 롤링키 바이트코드로
+    /// 인코딩해 `run_native_poly`(DirectThreadedNativeRunner 네이티브 하네스)로 실행한
+    /// 결과 상태가 `RiscProgram::eval_state` 참조 상태와 동치인지 검증한다.
+    ///
+    /// 전량-리프트 가능한 단일 선형 함수(분기 없음, 종단 ret)를 .text로 구성해
+    /// `lift_program_cfg_commercial`을 통과시키므로, OEP가 VM화(entry_native=false)되고
+    /// 만들어진 프로그램은 오직 네이티브 하네스 지원 op(NOR/ADD/SHR/SHL/PUSH/POP/HALT)만
+    /// 포함한다. 분기(taken)의 실제 제어흐름은 네이티브 디스패처가 담당하므로, 이 통합
+    /// 테스트는 **선형 블록 단위 동치**(regs/temps/flags/vsp/stack)만 계약으로 검증한다
+    /// (계약 문서 `docs/commercial-vm-engine.md` §3 참조).
+    #[test]
+    fn test_commercial_program_lift_integration_execution_equivalence() {
+        use crate::vm::poly::PolymorphicEncoder;
+        use crate::vm::threaded::harness::run_native_poly;
+
+        // 전량-RISC-lift 가능한 단일 함수 (분기 없음, ret 종단):
+        //   mov rax, 100 ; mov rbx, 50 ; add rax, rbx ; shl rax, 2 ; shr rax, 1
+        //   xor rax, 0x1234 ; push rbx ; pop rcx ; mov rdx, rax ; ret
+        let f0 = [
+            0x48, 0xC7, 0xC0, 0x64, 0x00, 0x00, 0x00, // mov rax, 100
+            0x48, 0xC7, 0xC3, 0x32, 0x00, 0x00, 0x00, // mov rbx, 50
+            0x48, 0x01, 0xD8,                         // add rax, rbx
+            0x48, 0xC1, 0xE0, 0x02,                   // shl rax, 2
+            0x48, 0xC1, 0xE8, 0x01,                   // shr rax, 1
+            0x48, 0x35, 0x34, 0x12, 0x00, 0x00,       // xor rax, 0x1234
+            0x53,                                     // push rbx
+            0x59,                                     // pop rcx
+            0x48, 0x89, 0xC2,                         // mov rdx, rax
+            0xC3,                                     // ret
+        ];
+        let base_va = 0x140001000u64;
+        let entry = base_va;
+
+        let lift = lift_program_cfg_commercial(&f0, base_va, entry, &[], 0x140000000)
+            .expect("commercial program lift");
+        // OEP가 RISC로 온전히 lift되므로 VM화(entry_native=false)되어야 한다.
+        assert!(!lift.entry_native, "OEP virtualized (entry_native=false)");
+        assert!(lift.virtualized_blocks >= 1, "at least one block virtualized");
+        assert!(!lift.program.instrs.is_empty(), "lifted program non-empty");
+
+        let init = [0u64; 16];
+        let ref_st = lift.program.eval_state(&init);
+
+        // 여러 시드에서: 리프트된 RiscProgram → 폴리 롤링키 인코딩 → 네이티브 실행 == 참조.
+        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789, 0x9E3779B97F4A7C15] {
+            let mut enc = PolymorphicEncoder::new(seed);
+            let bytecode = enc.encode(&lift.program).unwrap();
+            let nat = run_native_poly(&bytecode, seed, &init).unwrap();
+
+            assert_eq!(nat.regs, ref_st.regs, "seed {seed:#x}: regs mismatch");
+            assert_eq!(nat.temps, ref_st.temps, "seed {seed:#x}: temps mismatch");
+            assert_eq!(
+                nat.flags, ref_st.flags,
+                "seed {seed:#x}: flags mismatch (ref={:#x} nat={:#x})",
+                ref_st.flags, nat.flags
+            );
+            assert_eq!(nat.vsp, ref_st.vsp, "seed {seed:#x}: vsp mismatch");
+            assert_eq!(nat.stack, ref_st.stack, "seed {seed:#x}: stack mismatch");
+        }
+
+        // 결과 무결성 (프로그램 경로에서도 최종 값이 기대와 일치).
+        assert_eq!(ref_st.regs[0], ((100 + 50) << 2 >> 1) ^ 0x1234, "rax final");
+        assert_eq!(ref_st.regs[3], 50, "rbx = 50");
+        assert_eq!(ref_st.regs[1], 50, "pop rcx returns pushed rbx");
+        assert_eq!(ref_st.regs[2], ref_st.regs[0], "mov rdx, rax");
+        assert_eq!(ref_st.stack.len(), 0, "push+pop balanced");
+        assert_eq!(ref_st.vsp, 0, "vsp balanced");
+    }
+
+    /// P3 (G1) 확장 선형 블록 차등 검증 — 플래그 갱신(ADD/NOR/SHR/SHL)을 포함한
+    /// 더 긴 선형 블록을 RISC 리프트 → 폴리 인코딩 → 네이티브 하네스로 실행해
+    /// `eval_state` 참조와 regs/temps/flags/vsp/stack 전부 동치인지 여러 시드에서 검증.
+    ///
+    /// (선형 블록 단위 동치로 한정 — taken-분기 제어흐름은 네이티브 디스패처 담당.)
+    #[test]
+    fn test_commercial_extended_linear_block_matches_reference() {
+        use crate::vm::poly::PolymorphicEncoder;
+        use crate::vm::risc::RiscProgram;
+        use crate::vm::threaded::harness::run_native_poly;
+        use iced_x86::{Decoder, DecoderOptions};
+
+        // mov rax, 0x200 ; mov rbx, 5 ; add rax, rbx ; shl rax, 3 ; shr rax, 1
+        // sub rax, 0x10 ; and rax, 0xFFFF ; xor rcx, rcx ; push rax ; push rbx
+        // pop rdx ; pop rcx ; mov rsi, rax ; ret
+        let raw = [
+            0x48, 0xC7, 0xC0, 0x00, 0x02, 0x00, 0x00, // mov rax, 0x200
+            0x48, 0xC7, 0xC3, 0x05, 0x00, 0x00, 0x00, // mov rbx, 5
+            0x48, 0x01, 0xD8,                         // add rax, rbx
+            0x48, 0xC1, 0xE0, 0x03,                   // shl rax, 3
+            0x48, 0xC1, 0xE8, 0x01,                   // shr rax, 1
+            0x48, 0x83, 0xE8, 0x10,                   // sub rax, 0x10
+            0x48, 0x25, 0xFF, 0xFF, 0x00, 0x00,       // and rax, 0xFFFF
+            0x48, 0x31, 0xC9,                         // xor rcx, rcx
+            0x50,                                     // push rax
+            0x53,                                     // push rbx
+            0x5A,                                     // pop rdx
+            0x59,                                     // pop rcx
+            0x48, 0x89, 0xC6,                         // mov rsi, rax
+            0xC3,                                     // ret
+        ];
+        let base = 0x140001000u64;
+        let mut decoder = Decoder::with_ip(64, &raw, base, DecoderOptions::NONE);
+        let mut lifter = RiscLifter::new();
+        while decoder.can_decode() {
+            let inst = decoder.decode();
+            lifter.lift_instruction(&inst).expect("all instructions RISC-liftable");
+        }
+        let prog = RiscProgram::new(lifter.desynth.instrs);
+        assert!(!prog.instrs.is_empty(), "lifted program must be non-empty");
+
+        let init = [0u64; 16];
+        let ref_st = prog.eval_state(&init);
+
+        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
+            let mut enc = PolymorphicEncoder::new(seed);
+            let bytecode = enc.encode(&prog).unwrap();
+            let nat = run_native_poly(&bytecode, seed, &init).unwrap();
+
+            assert_eq!(nat.regs, ref_st.regs, "seed {seed:#x}: regs mismatch");
+            assert_eq!(nat.temps, ref_st.temps, "seed {seed:#x}: temps mismatch");
+            assert_eq!(
+                nat.flags, ref_st.flags,
+                "seed {seed:#x}: flags mismatch (ref={:#x} nat={:#x})",
+                ref_st.flags, nat.flags
+            );
+            assert_eq!(nat.vsp, ref_st.vsp, "seed {seed:#x}: vsp mismatch");
+            assert_eq!(nat.stack, ref_st.stack, "seed {seed:#x}: stack mismatch");
+        }
+
+        // 기대 값 직접 확인.
+        let exp_rax = ((((0x200u64 + 5) << 3) >> 1).wrapping_sub(0x10)) & 0xFFFF;
+        assert_eq!(ref_st.regs[0], exp_rax, "rax final");                  // reg[0] = rax
+        // push rax; push rbx; pop rdx; pop rcx → rdx=rbx(5), rcx=rax(exp_rax)
+        assert_eq!(ref_st.regs[1], exp_rax, "rcx = popped rax");         // reg[1] = rcx
+        assert_eq!(ref_st.regs[2], 5, "rdx = pushed rbx");               // reg[2] = rdx
+        assert_eq!(ref_st.regs[3], 5, "rbx still 5");                    // reg[3] = rbx
+        assert_eq!(ref_st.regs[6], exp_rax, "rsi = rax");                // reg[6] = rsi
+        assert_eq!(ref_st.stack.len(), 0, "push+pop balanced");
+        assert_eq!(ref_st.vsp, 0, "vsp balanced");
+    }
 }
+
