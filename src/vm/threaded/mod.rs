@@ -3,6 +3,7 @@
 // ==============================================================================
 
 pub mod direct_tail;
+pub mod harness;
 pub mod inline_mba;
 pub mod native_runner;
 pub mod super_ops;
