@@ -47,6 +47,16 @@ pub(crate) struct BootStubCtx {
     pub(crate) vm_oep_native_entry: bool,
     /// clean native entry가 사용할 원본 OEP VA (entry_point_rva + image_base).
     pub(crate) vm_oep_native_va: u64,
+    // ── M6 Phase-2.3 (--vm-oep at-rest encryption) ────────────────────────
+    /// Program VM 바이트코드 VA/길이. 파일에는 at-rest 암호화로 저장되고, 부트
+    /// 스텁이 디스패치 직전 fresh RC4(seed)로 복호화한다. (0이면 비활성)
+    pub(crate) vm_oep_bc_va: u64,
+    pub(crate) vm_oep_bc_len: u32,
+    /// 보존된 원본 .text VA/길이. TLS 콜백이 없는 타깃에서만 at-rest 암호화해,
+    /// 로더가 부트 전에 실행하는 콜백이 평문을 보게 하지 않으면서 정적 분석에서
+    /// 원본 .text 평문 노출을 제거한다. (0이면 비활성)
+    pub(crate) vm_oep_text_va: u64,
+    pub(crate) vm_oep_text_len: u32,
     // ── v7 chained-crypto ──────────────────────────────────────────────────
     /// true = RC4를 256B 청크 단위로 재키잉해 순차 복호화
     /// (Key_i = 이전 청크 평문, chunk0 = seed anchor → skip-ahead 불가)
@@ -324,6 +334,7 @@ pub(crate) fn build_rc4_block(stub: &BootStubCtx) -> Vec<u8> {
     emit_code_decrypt(&mut seq, stub);
     integrity::emit_integrity_crc(&mut seq, stub);
     emit_run_decrypt(&mut seq, stub);
+    emit_rest_decrypt(&mut seq, stub);
     iat::emit_iat_slots(&mut seq, stub);
     iat::emit_iat_resolve(&mut seq, stub);
     emit_self_wipe(&mut seq, stub);
@@ -567,6 +578,42 @@ fn emit_run_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStub
     seq.push((Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap(), Some(Label::RunLoop)));
     // run_done — NOP로 자리만 표시 (실제로는 다음 명령으로 fall-through)
     seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::R11D, Register::R11D).unwrap(), Some(Label::RunDone)));
+}
+
+/// M6 Phase-2.3 (--vm-oep at-rest encryption): Program VM 바이트코드와 (TLS
+/// 콜백 없는 경우) 보존된 원본 .text를 부트 스텁이 디스패치 직전에 복호화한다.
+/// 두 영역은 패커에서 fresh RC4(seed_stored) 하나로 `.text` → bytecode 순으로
+/// 연속 암호화되어 파일에는 평문이 없고, 이 블록이 실행되기 전까지 실행 불가능한
+/// 암호문 상태로 남는다.
+///
+/// 키스트림 동치: 패커 `Rc4::new(seed_stored)`(canonical PRGA i=j=0 시작)와
+/// 동일하게 `Ksa(key=seed@seed_va)` 후 ESI/EDI=0 재설정 → `Prga(.text)` →
+/// `Prga(bytecode)` 연속 호출로 복호화한다. (S-box base는 RSP — RBX를 재확정.)
+///
+/// 길이 불변성: 이 블록은 `stub.vm_oep`일 때 항상 전체를 emit한다 (len/va는
+/// imm이므로 값이 달라도 인코딩 길이가 동일). 이렇게 해야 부트 스텁 3-pass
+/// sizing(초기 len=0 vs 최종 len)이 일치해 `stub size changed` 불변식이 깨지지
+/// 않는다. len=0 범위는 `Prga`가 즉시 반환(Test RDX; Je)하므로 no-op이다.
+fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
+    if !stub.vm_oep {
+        return;
+    }
+    // fresh KSA: S-box base(RBX) = RSP, key = seed_va(256B)
+    seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::RSP).unwrap(), None));
+    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.seed_va).unwrap(), None));
+    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX, 0x100).unwrap(), None));
+    seq.push((Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(), Some(Label::Ksa)));
+    // canonical RC4 PRGA: i=0, j=0에서 시작
+    seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::ESI, Register::ESI).unwrap(), None));
+    seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::EDI, Register::EDI).unwrap(), None));
+    // .text 복호화 (len=0이면 no-op)
+    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.vm_oep_text_va).unwrap(), None));
+    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX, stub.vm_oep_text_len as u64).unwrap(), None));
+    seq.push((Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(), Some(Label::Prga)));
+    // bytecode 복호화 (len=0이면 no-op)
+    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.vm_oep_bc_va).unwrap(), None));
+    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX, stub.vm_oep_bc_len as u64).unwrap(), None));
+    seq.push((Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(), Some(Label::Prga)));
 }
 
 fn emit_self_wipe(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {

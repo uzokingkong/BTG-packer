@@ -163,6 +163,11 @@ pub(crate) fn place_boot_stub(
         vm_prog_state_va: 0, // imm64 라 길이 불변 — 0으로 두고 아래에서 채움
         vm_oep_native_entry: vm_oep_native_entry,
         vm_oep_native_va: oep_va,
+        // M6 Phase-2.3 at-rest: VM bytecode + 보존 .text VA/길이 (imm — 최종 패스에서 채움)
+        vm_oep_bc_va: 0,
+        vm_oep_bc_len: 0,
+        vm_oep_text_va: 0,
+        vm_oep_text_len: 0,
         // payload_va/crc_va는 imm64라 길이 불변 — 최종 패스(stub3)에서 채운다.
         payload_va: 0,
         payload_len: if payload_relocate { code_len } else { 0 },
@@ -266,6 +271,59 @@ pub(crate) fn place_boot_stub(
     cursor += vm_prog_total
         + if vm_prog_mod.is_some() { crate::vm::interp::CALL_STACK_SIZE } else { 0 };
     cursor = (cursor + 7) & !7; // align 8
+
+    // ── M6 Phase-2.3: at-rest 암호화 대상 확정 ──────────────────────────────
+    // Program VM bytecode offset/len (boot area — .textb는 이미 RWX라 in-place 복호화 가능)
+    let vm_prog_bc_len = if vm_oep_effective {
+        vm_prog_mod.as_ref().map(|m| m.bytecode.len() as u32).unwrap_or(0)
+    } else {
+        0
+    };
+    let vm_prog_bc_off = if vm_prog_bc_len > 0 {
+        let m = vm_prog_mod.as_ref().unwrap();
+        vm_prog_off + m.code.len() + m.table.len()
+    } else {
+        0
+    };
+    let vm_prog_bc_va = if vm_prog_bc_len > 0 {
+        dispatcher_va + vm_prog_bc_off as u64
+    } else {
+        0
+    };
+    // 보존 원본 .text at-rest 암호화는 TLS 콜백이 없는 타깃에서만. TLS 디렉터리
+    // (data directory #9)가 있으면 로더가 부트 스텁 전에 콜백을 실행하므로,
+    // 암호화된 .text를 실행해 0xC0000005로 크래시하는 회귀를 막기 위해 평문으로
+    // 유지한다. (TLS-first-callback decryptor는 Phase-2 별도 구현.)
+    let has_tls_dir = ctx
+        .target_info
+        .data_directories
+        .get(9)
+        .map(|d| d.virtual_address != 0)
+        .unwrap_or(false);
+    let text_enc = vm_oep_effective && !has_tls_dir;
+    let (vm_oep_text_va, vm_oep_text_len) = if text_enc {
+        match ctx.patched_sections.iter().find(|s| s.name == ".text") {
+            Some(sec) => (image_base + sec.virtual_address as u64, sec.bytes.len() as u32),
+            None => (0, 0),
+        }
+    } else {
+        (0, 0)
+    };
+    if vm_oep_effective {
+        println!(
+            "[+] --vm-oep at-rest: Program VM bytecode {}",
+            if vm_prog_bc_len > 0 {
+                format!("encrypted ({}B)", vm_prog_bc_len)
+            } else {
+                "(no bytecode)".to_string()
+            }
+        );
+        if text_enc && vm_oep_text_len > 0 {
+            println!("[+] --vm-oep at-rest: preserved .text encrypted ({}B, no TLS callbacks)", vm_oep_text_len);
+        } else if has_tls_dir {
+            println!("[!] --vm-oep at-rest: preserved .text kept plaintext (TLS callbacks present; TLS-first-callback decryptor = Phase-2)");
+        }
+    }
     // v16: 패킹당 레이아웃 난독화 — 부트 스텁/시드/문자열/리졸브 테이블의 절대
     // VMA를 빌드마다 랜덤 이동시켜, 정적 분석 스크립트가 하드코딩한 오프셋을
     // (0x1400143b0 등) 매 빌드 무력화한다. rng는 이 함수에서 이미 생성됨.
@@ -428,6 +486,11 @@ pub(crate) fn place_boot_stub(
     let stub3 = BootStubCtx {
         payload_va,
         crc_va,
+        // M6 Phase-2.3: at-rest 암호화 대상 VA/길이 확정 (imm64/imm32 — 길이 불변)
+        vm_oep_bc_va: vm_prog_bc_va,
+        vm_oep_bc_len: vm_prog_bc_len,
+        vm_oep_text_va,
+        vm_oep_text_len,
         // v6: 배치 확정 후 반영 (모두 imm64 — 길이 불변)
         iat_table_va: if !iat_table_blob.is_empty() {
             dispatcher_va + table_off as u64
@@ -563,6 +626,31 @@ pub(crate) fn place_boot_stub(
             vm::VM_STATE_SIZE,
             vm_prog_entry_va,
             vm_prog_state_va
+        );
+    }
+
+    // ── M6 Phase-2.3: at-rest 암호화 적용 ───────────────────────────────────
+    // fresh RC4(seed_stored) 하나로 .text → bytecode 순 연속 암호화. 부트 스텁의
+    // emit_rest_decrypt가 같은 순서로 복호화한다. (.textb는 RWX, .text는 WRITE
+    // 비트 추가로 in-place 복호화를 허용한다.)
+    if vm_oep_effective && (vm_oep_text_len > 0 || vm_prog_bc_len > 0) {
+        if vm_oep_text_len > 0 {
+            if let Some(sec) = ctx.patched_sections.iter_mut().find(|s| s.name == ".text") {
+                sec.characteristics |= 0x8000_0000; // IMAGE_SCN_MEM_WRITE (boot in-place decrypt)
+            }
+        }
+        let mut r = Rc4::new(seed_stored);
+        if vm_oep_text_len > 0 {
+            if let Some(sec) = ctx.patched_sections.iter_mut().find(|s| s.name == ".text") {
+                r.crypt(&mut sec.bytes);
+            }
+        }
+        if vm_prog_bc_len > 0 {
+            r.crypt(&mut btg.bytes[vm_prog_bc_off..vm_prog_bc_off + vm_prog_bc_len as usize]);
+        }
+        println!(
+            "[+] --vm-oep at-rest: fresh-RC4(seed) encryption applied (preserved .text {}B + Program VM bytecode {}B)",
+            vm_oep_text_len, vm_prog_bc_len
         );
     }
 
