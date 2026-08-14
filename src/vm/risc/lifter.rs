@@ -70,6 +70,23 @@ impl RiscLifter {
         Some(MicroOperand::VReg(base))
     }
 
+    /// x86 32비트 GPR(op0)을 목적지로 쓰는 명령어는 상위 32비트를 0으로 정리한다.
+    /// (x86 규칙: 32비트 레지스터 쓰기는 64비트 레지스터의 상위 절반을 0으로 만든다.)
+    /// 디서인시스가 산출한 결과 `dst`를 `AND dst, 0xFFFFFFFF` 로 마스크한다.
+    fn zero_extend_dst_if32(&mut self, inst: &Instruction, dst: MicroOperand) {
+        let reg = inst.op0_register();
+        let is32 = matches!(
+            reg,
+            Register::EAX | Register::ECX | Register::EDX | Register::EBX
+            | Register::ESP | Register::EBP | Register::ESI | Register::EDI
+            | Register::R8D | Register::R9D | Register::R10D | Register::R11D
+            | Register::R12D | Register::R13D | Register::R14D | Register::R15D
+        );
+        if is32 {
+            self.desynth.emit_and(dst, dst, MicroOperand::Imm64(0xFFFF_FFFF));
+        }
+    }
+
     /// 메모리 유효 주소 계산을 RISC 마이크로 연산으로 분해
     /// `addr = base + index*scale + disp`
     pub fn lower_effective_address(&mut self, inst: &Instruction, temp_dst: MicroOperand) -> Result<()> {
@@ -173,6 +190,8 @@ impl RiscLifter {
                 let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
                 let right = self.operand_value(inst, 1)?;
                 alu.emit(&mut self.desynth, dst, dst, right);
+                // 32비트 목적지(EAX..R15D)는 상위 32비트를 0으로 정리.
+                self.zero_extend_dst_if32(inst, dst);
             }
             OpKind::Memory => {
                 let addr = MicroOperand::Temp(4);
@@ -206,18 +225,40 @@ impl RiscLifter {
         Ok(())
     }
 
-    /// SHL/SHR (32/64-bit, count: imm8 / 1 / CL).
-    /// SAR(산술 시프트)는 기존 op로 표현 불가 → 별도 처리 안 함(문서 참고).
+    /// SHL/SHR/SAR (32/64-bit, count: imm8 / 1 / CL).
+    /// x86 시프트 횟수 마스크: 32비트 피연산자는 mod 32(31), 64비트는 mod 64(63).
+    /// 32비트 레지스터 시프트 결과는 상위 32비트를 0으로 정리한다.
     fn lift_shift(&mut self, inst: &Instruction, op: RiscOp) -> Result<()> {
+        // 32비트(rm32) 시프트 여부 — `_rm32_` 계열 코드.
+        let is32 = matches!(
+            inst.code(),
+            Code::Shl_rm32_imm8 | Code::Shl_rm32_1 | Code::Shl_rm32_CL
+            | Code::Shr_rm32_imm8 | Code::Shr_rm32_1 | Code::Shr_rm32_CL
+            | Code::Sar_rm32_imm8 | Code::Sar_rm32_1 | Code::Sar_rm32_CL
+        );
         let count = match inst.op1_kind() {
             OpKind::Immediate8
             | OpKind::Immediate8to64
             | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate32to64
-            | OpKind::Immediate64 => MicroOperand::Imm64(inst.immediate64()),
-            OpKind::Register => Self::reg_to_vreg(inst.op1_register())
-                .ok_or_else(|| anyhow!("invalid shift count register"))?,
+            | OpKind::Immediate64 => {
+                let v = inst.immediate64();
+                // 즉시 시프트 횟수는 리프트 시점에 마스크 (mod 32).
+                if is32 { MicroOperand::Imm64(v & 31) } else { MicroOperand::Imm64(v) }
+            }
+            OpKind::Register => {
+                let c = Self::reg_to_vreg(inst.op1_register())
+                    .ok_or_else(|| anyhow!("invalid shift count register"))?;
+                if is32 {
+                    // CL 등 레지스터 시프트 횟수를 31로 마스크해 Temp(2)에 저장.
+                    let masked = MicroOperand::Temp(2);
+                    self.desynth.emit_and(masked, c, MicroOperand::Imm64(31));
+                    masked
+                } else {
+                    c
+                }
+            }
             _ => return Err(anyhow!("risc lifter: unsupported shift count")),
         };
         match inst.op0_kind() {
@@ -226,6 +267,10 @@ impl RiscLifter {
                 self.desynth
                     .instrs
                     .push(MicroInstr::new(op).with_dst(dst).with_src1(dst).with_src2(count));
+                // 32비트 레지스터 시프트 결과는 상위 32비트를 0으로.
+                if is32 {
+                    self.zero_extend_dst_if32(inst, dst);
+                }
             }
             OpKind::Memory => {
                 let addr = MicroOperand::Temp(4);
@@ -281,6 +326,8 @@ impl RiscLifter {
                 .with_src1(t)
                 .with_src2(MicroOperand::Imm64(shift as u64)),
         );
+        // 32비트 목적지(Movsx_r32_*/Movsxd_r32_*)는 상위 32비트를 0으로.
+        self.zero_extend_dst_if32(inst, dst);
         Ok(())
     }
 
@@ -312,6 +359,7 @@ impl RiscLifter {
                 if inst.op1_kind() == OpKind::Register {
                     let src = Self::reg_to_vreg(inst.op1_register()).ok_or_else(|| anyhow!("invalid src"))?;
                     self.desynth.emit_add(dst, src, MicroOperand::Imm64(0));
+                    self.zero_extend_dst_if32(inst, dst);
                 } else if inst.op1_kind() == OpKind::Memory {
                     let t_addr = MicroOperand::Temp(4);
                     self.lower_effective_address(inst, t_addr)?;
@@ -327,6 +375,7 @@ impl RiscLifter {
                 if inst.op0_kind() == OpKind::Register {
                     let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
                     self.desynth.emit_add(dst, src, MicroOperand::Imm64(0));
+                    self.zero_extend_dst_if32(inst, dst);
                 } else if inst.op0_kind() == OpKind::Memory {
                     let t_addr = MicroOperand::Temp(4);
                     self.lower_effective_address(inst, t_addr)?;
@@ -349,6 +398,7 @@ impl RiscLifter {
                 if inst.op0_kind() == OpKind::Register {
                     let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
                     self.desynth.emit_add(dst, MicroOperand::Imm64(imm), MicroOperand::Imm64(0));
+                    self.zero_extend_dst_if32(inst, dst);
                 } else if inst.op0_kind() == OpKind::Memory {
                     let t_addr = MicroOperand::Temp(4);
                     self.lower_effective_address(inst, t_addr)?;
@@ -432,10 +482,12 @@ impl RiscLifter {
             Code::Neg_rm64 | Code::Neg_rm32 => {
                 let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
                 self.desynth.emit_neg(dst, dst);
+                self.zero_extend_dst_if32(inst, dst);
             }
             Code::Not_rm64 | Code::Not_rm32 => {
                 let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
                 self.desynth.emit_not(dst, dst);
+                self.zero_extend_dst_if32(inst, dst);
             }
 
             // ── CMP (플래그만 갱신) ─────────────────────────────────────────────
@@ -988,5 +1040,80 @@ mod tests {
         assert_eq!(regs(&st)[5], 0x200, "rbp restored by leave pop");
         assert_eq!(regs(&st)[4], 0x1000, "rsp = rbp after leave");
         assert_eq!(st.stack.len(), 0, "push/pop balanced");
+    }
+
+    /// 32비트 레지스터 쓰기 zero-extension: mov eax + add eax 는 상위 32비트를 0으로.
+    /// `add eax, ebx`(ebx=1)는 64비트로는 0x100000000(비트 32 세팅)이 되지만 x86은 0으로 감싼다.
+    #[test]
+    fn test_lift_32bit_write_zero_extends_upper_bits() {
+        // 0x140001000: mov eax, 0xFFFFFFFF   (B8 FF FF FF FF)
+        // 0x140001005: add eax, ebx          (01 D8)  — ebx = 1 (레지스터 소스)
+        // 0x140001007: ret
+        let raw = [
+            0xB8, 0xFF, 0xFF, 0xFF, 0xFF, // mov eax, 0xFFFFFFFF
+            0x01, 0xD8,                   // add eax, ebx
+            0xC3,                         // ret
+        ];
+        let mut init = [0u64; 16];
+        init[3] = 1; // ebx = 1
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(
+            regs(&st)[0] & 0xFFFF_FFFF_0000_0000,
+            0,
+            "32-bit write must zero the upper 32 bits"
+        );
+        assert_eq!(regs(&st)[0], 0, "0xFFFFFFFF + 1 == 0 (wraps, zero-extended)");
+    }
+
+    /// 32비트 레지스터 이동도 zero-extension: mov eax, ebx 는 RBX의 하위 32비트만 취하고
+    /// 상위 32비트를 0으로 정리한다.
+    #[test]
+    fn test_lift_32bit_mov_reg_source_zero_extends() {
+        // 0x140001000: mov rbx, 0xFFFFFFFF00000001  (48 BB 01 00 00 00 FF FF FF FF)
+        // 0x14000100A: mov eax, ebx                  (89 D8)
+        // 0x14000100C: ret
+        let raw = [
+            0x48, 0xBB, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, // mov rbx, imm64
+            0x89, 0xD8, // mov eax, ebx
+            0xC3,
+        ];
+        let st = run(&raw, 0x140001000, [0u64; 16]);
+        assert_eq!(regs(&st)[0], 1, "mov eax, ebx takes low 32 bits of rbx");
+        assert_eq!(
+            regs(&st)[0] & 0xFFFF_FFFF_0000_0000,
+            0,
+            "mov r32,r32 zero-extends the destination"
+        );
+    }
+
+    /// 32비트 시프트 횟수는 mod 32(31 마스크): shl eax,32 == shl eax,0, sar eax,32 == sar eax,0.
+    /// 레지스터(CL) 카운트 32도 0으로 마스크된다.
+    #[test]
+    fn test_lift_32bit_shift_count_masked_mod32() {
+        let mut init = [0u64; 16];
+        init[0] = 0x8000_0000; // bit 31 set
+
+        // shl eax, 32 (C1 E0 20) — count 32 → masked to 0
+        let raw_shl = [0xC1, 0xE0, 0x20, 0xC3]; // shl eax,32 ; ret
+        let st = run(&raw_shl, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 0x8000_0000, "shl eax,32 == shl eax,0");
+        assert_eq!(
+            regs(&st)[0] & 0xFFFF_FFFF_0000_0000,
+            0,
+            "32-bit shift result is zero-extended"
+        );
+
+        // sar eax, 32 (C1 F8 20) — count 32 → masked to 0
+        let raw_sar = [0xC1, 0xF8, 0x20, 0xC3]; // sar eax,32 ; ret
+        let st2 = run(&raw_sar, 0x140001000, init);
+        assert_eq!(regs(&st2)[0], 0x8000_0000, "sar eax,32 == sar eax,0");
+
+        // 레지스터 카운트: shl eax, cl with cl=32 → masked to 0
+        let raw_shl_cl = [0xD3, 0xE0, 0xC3]; // shl eax, cl ; ret
+        let mut init2 = [0u64; 16];
+        init2[0] = 0x8000_0000;
+        init2[1] = 32; // cl = 32 (하위 8비트)
+        let st3 = run(&raw_shl_cl, 0x140001000, init2);
+        assert_eq!(regs(&st3)[0], 0x8000_0000, "shl eax,cl(32) == shl eax,0");
     }
 }
