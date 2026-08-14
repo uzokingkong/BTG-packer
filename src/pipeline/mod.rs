@@ -12,6 +12,7 @@ pub mod crypto;
 pub mod iat_hide;
 pub mod pack;
 pub mod ondemand;
+pub mod poly_embed;
 pub mod rsrc_register;
 pub mod selective_vm;
 pub mod validate;
@@ -127,6 +128,10 @@ pub struct PipelineContext {
     pub poly_vm_regions: Vec<crate::pipeline::selective_vm::PolyVmRegion>,
     /// T1-2: 리프트 불가로 거부된 리전 수.
     pub poly_vm_regions_rejected: usize,
+    /// T1-3: 임베드된 `.btgvm` 섹션 (VM 진입 스텁 + 핸들러 테이블 + 폴리 바이트코드 + 시드).
+    pub poly_vm_section: Option<crate::pe::builder::SectionData>,
+    /// T1-3: 임베드된 VM 진입 스텁의 절대 VA (마커 트램펄린이 점프할 대상).
+    pub poly_vm_entry_va: u64,
 }
 
 impl PipelineContext {
@@ -183,6 +188,8 @@ impl PipelineContext {
             poly_vm_seed_masked: 0,
             poly_vm_regions: Vec::new(),
             poly_vm_regions_rejected: 0,
+            poly_vm_section: None,
+            poly_vm_entry_va: 0,
         }
     }
 
