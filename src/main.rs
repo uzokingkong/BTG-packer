@@ -433,6 +433,15 @@ fn main() -> error::Result<()> {
         pipeline::rsrc_register::run(&mut ctx)?;
     }
 
+    // ── T1-3: 폴리모픽 VM 스텁 임베드 + 마커 트램펄린 패치 ──────────────────
+    // SelectiveVmPass가 ctx.poly_vm_regions에 보존한 바이트코드/시드는 여기서
+    // 출력 PE의 .textb tail에 .btgvm 모듈로 실제로 심어지고, SDK 마커 리전
+    // 시작을 VM 진입 스텁으로 redirect하는 트램펄린이 .text에 패치된다.
+    // (마커가 없으면 no-op — 출력은 기존과 동일.)
+    if vm_enabled {
+        let _ = pipeline::poly_embed::embed_poly_vm_into_pipeline(&mut ctx)?;
+    }
+
     // ── Build: PE 합성 + 파일 기록 ───────────────────────────────────────────────
     let output_path = args.output;
     let output_pe_bytes = pipeline::build::run(&ctx, &output_path)?;
