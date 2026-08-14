@@ -17,6 +17,8 @@ pub struct PolymorphicInterpreter {
     pub temps: [u64; 8],
     pub flags: VirtualFlags,
     pub stack: Vec<u64>,
+    /// 가상 스택 포인터 (바이트 오프셋, 아래로 성장). `RiscProgram::eval_state`와 동일 계약.
+    pub vsp: u64,
 }
 
 impl PolymorphicInterpreter {
@@ -28,6 +30,7 @@ impl PolymorphicInterpreter {
             temps: [0u64; 8],
             flags: VirtualFlags::default(),
             stack: Vec::with_capacity(1024),
+            vsp: 0,
         }
     }
 
@@ -105,6 +108,7 @@ impl PolymorphicInterpreter {
                                    regs: &[u64; 16],
                                    temps: &[u64; 8],
                                    flags: u64,
+                                   vsp: u64,
                                    imm: u64|
              -> u64 {
                 let kind = raw & 0xC0;
@@ -119,7 +123,7 @@ impl PolymorphicInterpreter {
                         if payload == 0x01 {
                             flags
                         } else {
-                            0
+                            vsp
                         }
                     }
                     _ => {
@@ -135,26 +139,47 @@ impl PolymorphicInterpreter {
             // 4. Execute RiscOp
             match risc_op {
                 RiscOp::Nor => {
-                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, imm1);
-                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, imm2);
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
                     let res = !(a | b);
                     self.flags.update_logic64(res);
                     self.store_operand(op_dst_raw, res);
                 }
                 RiscOp::AddWithCarry => {
-                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, imm1);
-                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, imm2);
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
 
                     let (res, _cout) = self.flags.update_add64(a, b, cin);
                     self.store_operand(op_dst_raw, res);
                 }
+                RiscOp::ShiftRight => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let cnt = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2) & 63;
+                    let res = if cnt == 0 { a } else { a >> cnt };
+                    self.flags.update_logic64(res);
+                    self.store_operand(op_dst_raw, res);
+                }
+                RiscOp::ShiftLeft => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let cnt = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2) & 63;
+                    let res = if cnt == 0 { a } else { a << cnt };
+                    self.flags.update_logic64(res);
+                    self.store_operand(op_dst_raw, res);
+                }
                 RiscOp::VirtualPush => {
-                    let v = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, imm1);
+                    let v = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    self.vsp = self.vsp.wrapping_sub(8);
                     self.stack.push(v);
                 }
                 RiscOp::VirtualPop => {
-                    let v = self.stack.pop().unwrap_or(0);
-                    self.store_operand(op_dst_raw, v);
+                    if let Some(v) = self.stack.pop() {
+                        self.vsp = self.vsp.wrapping_add(8);
+                        self.store_operand(op_dst_raw, v);
+                    }
+                }
+                RiscOp::SetFlag => {
+                    let v = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    self.flags.raw = v & 0x8D5; // CF|PF|AF|ZF|SF|OF 마스크
                 }
                 RiscOp::Halt => {
                     break;
@@ -186,7 +211,7 @@ impl PolymorphicInterpreter {
 mod tests {
     use super::*;
     use crate::vm::poly::PolymorphicEncoder;
-    use crate::vm::risc::{MicroOperand, RiscDesynthesizer, RiscProgram};
+    use crate::vm::risc::{MicroInstr, MicroOperand, RiscDesynthesizer, RiscProgram, RiscOp};
 
     #[test]
     fn test_polymorphic_encoder_and_interpreter_roundtrip() {
@@ -214,5 +239,67 @@ mod tests {
 
         assert_eq!(interp.regs[0], (1200 - 450) ^ 0x55);
         assert_eq!(interp.regs[1], 450);
+    }
+
+    /// T1-4 차등 검증: 인터프리터(폴리모픽) == 참조 시뮬레이터(eval_state).
+    /// 두 구현이 같은 프로그램에 대해 동일한 레지스터/스택/플래그 상태를 내야 한다.
+    #[test]
+    fn test_poly_interp_matches_reference_state() {
+        let seed = 0x1122334455667788;
+        let mut d = RiscDesynthesizer::new();
+
+        // R0 = 0x200, R1 = 5
+        d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x200), MicroOperand::Imm64(0));
+        d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(5), MicroOperand::Imm64(0));
+        // R2 = R0 >> R1  (0x10)
+        d.instrs.push(
+            MicroInstr::new(RiscOp::ShiftRight)
+                .with_dst(MicroOperand::VReg(2))
+                .with_src1(MicroOperand::VReg(0))
+                .with_src2(MicroOperand::VReg(1)),
+        );
+        // R3 = R0 << 2 (0x800)
+        d.instrs.push(
+            MicroInstr::new(RiscOp::ShiftLeft)
+                .with_dst(MicroOperand::VReg(3))
+                .with_src1(MicroOperand::VReg(0))
+                .with_src2(MicroOperand::Imm64(2)),
+        );
+        // push R3, pop R4
+        d.emit_push(MicroOperand::VReg(3));
+        d.emit_pop(MicroOperand::VReg(4));
+        // NOR: R5 = ~(R2 | R1)
+        d.instrs.push(
+            MicroInstr::new(RiscOp::Nor)
+                .with_dst(MicroOperand::VReg(5))
+                .with_src1(MicroOperand::VReg(2))
+                .with_src2(MicroOperand::VReg(1)),
+        );
+        // Halt
+        d.instrs.push(MicroInstr::new(RiscOp::Halt));
+
+        let prog = RiscProgram::new(d.instrs);
+
+        // 참조 시뮬레이터
+        let ref_st = prog.eval_state(&[0u64; 16]);
+
+        // 폴리모픽 인코딩 + 인터프리터
+        let mut enc = PolymorphicEncoder::new(seed);
+        let bytecode = enc.encode(&prog).unwrap();
+        let mut interp = PolymorphicInterpreter::new(seed);
+        interp.run(&bytecode).unwrap();
+
+        assert_eq!(interp.regs[0], ref_st.regs[0]);
+        assert_eq!(interp.regs[1], ref_st.regs[1]);
+        assert_eq!(interp.regs[2], ref_st.regs[2], "shift right");
+        assert_eq!(interp.regs[3], ref_st.regs[3], "shift left");
+        assert_eq!(interp.regs[4], ref_st.regs[4], "pop");
+        assert_eq!(interp.regs[5], ref_st.regs[5], "nor");
+        assert_eq!(interp.flags.raw, ref_st.flags, "flags");
+        assert_eq!(interp.vsp, ref_st.vsp, "vsp");
+        assert_eq!(interp.stack.len(), ref_st.stack.len(), "stack depth");
+        assert_eq!(interp.regs[2], 0x10);
+        assert_eq!(interp.regs[3], 0x800);
+        assert_eq!(interp.regs[5], !(0x10 | 5));
     }
 }
