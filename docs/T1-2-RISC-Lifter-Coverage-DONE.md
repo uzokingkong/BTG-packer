@@ -66,17 +66,34 @@
   `eval_state` VIP/분기/메모리 실행, `branch_taken`/`mem_read`/`mem_write`, 테스트
 - (커밋 범위: 위 2개 소스 파일만. boot-stub·패킹 파이프라인·crypto·native threaded harness 비접촉.)
 
-## 6. 미지원 (의도적 제외, 후속 과제)
+## 6. 미지원 → 후속 확장 완료 (2026-08-14 저녁, 이어지는 작업)
 
-- **SAR(산술 우측 시프트)**: 현재 어휘의 `ShiftRight`는 논리 시프트뿐. 산술 시프트를 기존 op로
-  깔끔하게 표현 불가 → 미리프트. (새 `ArithmeticShiftRight` op 추가 시 수용 가능.)
-- **Jp/Jnp(패리티)**: 플래그 모델이 PF를 계산하지 않음 → 미지원(Err fallback).
-- **Jcxz/Jecxz(카운터 분기)**: ECX==0 조건이 flag 기반이 아니라 모델로 표현 불가 → 미지원.
-- **Ja/Jae(부호없는 above)와 Jb/Jbe(부호없는 below)**: 각각 `NotCarry`/`Carry`로 단순 매핑 —
-  Ja의 "(CF=0 ∧ ZF=0)" 및 Jbe의 "(CF=1 ∨ ZF=1)" 동치-경계 구분은 현재 분기 조건 모델로
-  근사(문서상 알려진 한계).
-- **MOVSX(부호 확장)**: 논리 시프트만으로는 부호 비트 확장 불가 → 미지원(MOVZX만 지원).
+아래 항목들은 이 문서의 초기 버전에서 "미지원(의도적 제외)"이었다. 이후 자동 Job에서
+**모두 구현·검증**(전체 테스트 141 passed)했다.
+
+- **SAR(산술 우측 시프트)** ✅: `RiscOp::ArithmeticShiftRight` op 추가. `eval_state`에서
+  `(a as i64) >> cnt`(부호 비트 유지)로 구현하고, 리프터가 `Sar_rm*/imm8·1·CL` 전 계열을 매핑.
+- **MOVSX(부호 확장)** ✅: `ArithmeticShiftRight`를 이용해 `(src << (64-w)) >> (64-w)`로
+  부호 비트를 복제(8/16/32-bit 소스, `Movsx_*`·`Movsxd_*`). MOVZX와 대칭.
+- **Jp/Jnp(패리티)** ✅: `VirtualFlags`가 `update_logic64`/`update_add64`에서 PF(bit 2, low byte
+  짝수 패리티)를 계산하도록 확장하고 `BranchCondition::Parity/NotParity` 추가. 네이티브 하네스의
+  `FLAG_MASK`도 PF를 포함하도록 동기화(참조↔네이티브 차등 유지).
+- **Jcxz/Jecxz/Jrcxz(카운터 분기)** ✅: `BranchCondition::CounterZero(width)` 추가 —
+  `regs[1]`(RCX) 하위 2/4/8 바이트가 0이면 분기. `eval_state`가 레지스터 상태로 평가.
+- **Ja/Jae/Jb/Jbe(부호없는 above/below, 정밀)** ✅: 단순 `NotCarry`/`Carry` 근사를
+  `Above`(CF=0∧ZF=0), `AboveOrEqual`(CF=0), `Below`(CF=1), `BelowOrEqual`(CF=1∨ZF=1)로
+  정밀 분리해 Ja≠Jae, Jb≠Jbe 경계를 올바르게 구분.
+
+### 남은 모델 한계 (의도적 유지)
 - **32-bit 레지스터 쓰기 시 상위 32비트 0-확장** 및 32-bit 시프트 카운트 31 마스크: 기존 모델 한계로
   유지(레지스터 이동/시프트가 64비트 의미론).
 - **RET**: 기존대로 `Halt`로 리프트(실제 복귀 분기/스택 복원은 런타임 네이티브 브리지 책임).
   CALL→RET 왕복 테스트는 push된 복귀 주소가 스택에 남음을 검증.
+
+## 7. 후속 커밋
+
+```
+<COMMIT_HASH_PLACEHOLDER> feat(vm/risc): T1-2 remainder — SAR, MOVSX, JP/JNP, Jcxz/Jecxz, precise unsigned Jcc
+```
+- 변경 파일: `src/vm/risc/opcodes.rs`, `src/vm/risc/flags.rs`, `src/vm/risc/mod.rs`,
+  `src/vm/risc/lifter.rs`, `src/vm/threaded/harness.rs`(PF 동기화), `docs/T1-2-RISC-Lifter-Coverage-DONE.md`.
