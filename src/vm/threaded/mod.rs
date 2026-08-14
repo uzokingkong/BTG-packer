@@ -6,11 +6,13 @@ pub mod direct_tail;
 pub mod harness;
 pub mod inline_mba;
 pub mod native_runner;
+pub mod poly_direct;
 pub mod super_ops;
 
 pub use direct_tail::DirectTailEmitter;
 pub use inline_mba::InlineMbaObfuscator;
 pub use native_runner::DirectThreadedNativeRunner;
+pub use poly_direct::run_native_poly_direct;
 pub use super_ops::{FusedPattern, SuperOperatorSynthesizer};
 
 #[cfg(test)]
