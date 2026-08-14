@@ -29,8 +29,11 @@ pub mod ksa;
 pub mod lifter;
 pub mod mapper;
 pub mod mem_model;
+pub mod poly;
 pub mod prga;
+pub mod risc;
 pub mod text_lift;
+pub mod threaded;
 
 use crate::vm::lifter::LiftedInstr;
 use anyhow::{Result, anyhow};

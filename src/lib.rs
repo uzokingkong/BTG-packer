@@ -22,6 +22,7 @@ pub mod obfuscation;
 pub mod pe;
 pub mod pipeline;
 pub mod qa;
+pub mod sdk;
 pub mod util;
 pub mod vm;
 

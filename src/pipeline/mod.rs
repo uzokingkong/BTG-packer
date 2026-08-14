@@ -13,6 +13,7 @@ pub mod iat_hide;
 pub mod pack;
 pub mod ondemand;
 pub mod rsrc_register;
+pub mod selective_vm;
 pub mod validate;
 
 use crate::graph::{BasicBlock, ShuffledLayout};

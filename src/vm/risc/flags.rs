@@ -1,0 +1,81 @@
+// ==============================================================================
+// BTG - Commercial-Grade VM: Micro-Flag Simulation & Evaluation
+// ==============================================================================
+// RISC 마이크로 연산 수행 시 발생하는 x86 RFLAGS 상태(CF, ZF, SF, OF)를
+// 비트 수준에서 기호적(Symbolic) 및 런타임으로 정밀 계산한다.
+// ==============================================================================
+
+pub const VFLAG_CF: u64 = 1 << 0;
+pub const VFLAG_PF: u64 = 1 << 2;
+pub const VFLAG_AF: u64 = 1 << 4;
+pub const VFLAG_ZF: u64 = 1 << 6;
+pub const VFLAG_SF: u64 = 1 << 7;
+pub const VFLAG_OF: u64 = 1 << 11;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VirtualFlags {
+    pub raw: u64,
+}
+
+impl VirtualFlags {
+    pub fn new(raw: u64) -> Self {
+        Self { raw }
+    }
+
+    #[inline]
+    pub fn cf(&self) -> bool {
+        (self.raw & VFLAG_CF) != 0
+    }
+
+    #[inline]
+    pub fn zf(&self) -> bool {
+        (self.raw & VFLAG_ZF) != 0
+    }
+
+    #[inline]
+    pub fn sf(&self) -> bool {
+        (self.raw & VFLAG_SF) != 0
+    }
+
+    #[inline]
+    pub fn of(&self) -> bool {
+        (self.raw & VFLAG_OF) != 0
+    }
+
+    /// 64비트 덧셈(a + b + cin)에 대한 RFLAGS 플래그 갱신
+    pub fn update_add64(&mut self, a: u64, b: u64, cin: u64) -> (u64, u64) {
+        let (sum1, c1) = a.overflowing_add(b);
+        let (res, c2) = sum1.overflowing_add(cin);
+        let cout = (c1 || c2) as u64;
+
+        let mut flags = 0u64;
+        if cout != 0 {
+            flags |= VFLAG_CF;
+        }
+        if res == 0 {
+            flags |= VFLAG_ZF;
+        }
+        if (res as i64) < 0 {
+            flags |= VFLAG_SF;
+        }
+        // OF = ((a ^ res) & (b ^ res)) >> 63
+        if ((a ^ res) & (b ^ res) & 0x8000_0000_0000_0000) != 0 {
+            flags |= VFLAG_OF;
+        }
+
+        self.raw = (self.raw & !(VFLAG_CF | VFLAG_ZF | VFLAG_SF | VFLAG_OF)) | flags;
+        (res, cout)
+    }
+
+    /// 비트 단위 논리 연산(NOR, AND, OR, XOR) 후 플래그 갱신 (CF=0, OF=0, ZF/SF 갱신)
+    pub fn update_logic64(&mut self, res: u64) {
+        let mut flags = 0u64;
+        if res == 0 {
+            flags |= VFLAG_ZF;
+        }
+        if (res as i64) < 0 {
+            flags |= VFLAG_SF;
+        }
+        self.raw = (self.raw & !(VFLAG_CF | VFLAG_OF | VFLAG_ZF | VFLAG_SF)) | flags;
+    }
+}

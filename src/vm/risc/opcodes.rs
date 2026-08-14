@@ -1,0 +1,122 @@
+// ==============================================================================
+// BTG - Commercial-Grade VM: Primitive RISC Micro-Op Definitions
+// ==============================================================================
+// 상용 VM(Themida/VMProtect)의 핵심 원리인 RISCification의 기초 원자 연산 정의.
+// 모든 x86 CISC 명령어(ADD, SUB, XOR, AND, OR, CMP 등)를 12개의 최소 원시
+// 마이크로 연산으로 분해(De-synthesis)하여 원본 연산의 시그니처를 파괴한다.
+// ==============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RiscOp {
+    /// 비트 단위 NOR 연산: dest = ~(src1 | src2)
+    /// 모든 불리언 논리(NOT, AND, OR, XOR, NAND, XNOR)를 단일 원자로 표현
+    Nor,
+
+    /// 64비트 캐리 포함 덧셈: (dest, cout) = src1 + src2 + cin
+    /// 모든 산술 덧셈/뺄셈/부호반전(NEG)의 기본 원자
+    AddWithCarry,
+
+    /// 64비트 비트 쉬프트 (우측 논리/산술)
+    ShiftRight,
+
+    /// 64비트 비트 쉬프트 (좌측)
+    ShiftLeft,
+
+    /// 가상 스택 푸시: VSP -= 8; [VSP] = val
+    VirtualPush,
+
+    /// 가상 스택 팝: val = [VSP]; VSP += 8
+    VirtualPop,
+
+    /// 가상 메모리 로드: dest = [addr] (1, 2, 4, 8 bytes)
+    MemoryRead { width: u8 },
+
+    /// 가상 메모리 스토어: [addr] = src (1, 2, 4, 8 bytes)
+    MemoryWrite { width: u8 },
+
+    /// 가상 조건부/무조건 브랜치: if (cond_flag) VIP = target
+    VirtualBranch { cond: BranchCondition },
+
+    /// 네이티브 API 및 런타임 콜 브릿지
+    NativeCallBridge,
+
+    /// 가상 플래그 레지스터 갱신 (CF, ZF, SF, OF)
+    SetFlag,
+
+    /// VM 실행 종료 및 네이티브 컨텍스트 복귀
+    Halt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BranchCondition {
+    Always,
+    Zero,
+    NotZero,
+    Carry,
+    NotCarry,
+    Sign,
+    NotSign,
+    Overflow,
+    NotOverflow,
+    Greater,
+    Less,
+    GreaterOrEqual,
+    LessOrEqual,
+}
+
+/// 가상 마이크로 레지스터 / 피연산자
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MicroOperand {
+    /// 가상 범용 레지스터 (0 ~ 15)
+    VReg(u8),
+    /// 64비트 즉시값
+    Imm64(u64),
+    /// 가상 스택 포인터 (VSP)
+    Vsp,
+    /// 가상 플래그 레지스터 (VFLAGS)
+    Vflags,
+    /// 임시 스크래치 레지스터 (T0, T1, T2)
+    Temp(u8),
+}
+
+/// 단일 RISC 마이크로 인스트럭션
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicroInstr {
+    pub op: RiscOp,
+    pub dst: Option<MicroOperand>,
+    pub src1: Option<MicroOperand>,
+    pub src2: Option<MicroOperand>,
+    pub imm: u64,
+}
+
+impl MicroInstr {
+    pub fn new(op: RiscOp) -> Self {
+        Self {
+            op,
+            dst: None,
+            src1: None,
+            src2: None,
+            imm: 0,
+        }
+    }
+
+    pub fn with_dst(mut self, dst: MicroOperand) -> Self {
+        self.dst = Some(dst);
+        self
+    }
+
+    pub fn with_src1(mut self, src1: MicroOperand) -> Self {
+        self.src1 = Some(src1);
+        self
+    }
+
+    pub fn with_src2(mut self, src2: MicroOperand) -> Self {
+        self.src2 = Some(src2);
+        self
+    }
+
+    pub fn with_imm(mut self, imm: u64) -> Self {
+        self.imm = imm;
+        self
+    }
+}
