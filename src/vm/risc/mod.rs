@@ -209,6 +209,13 @@ impl RiscProgram {
                     flags.update_logic64(res);
                     store(ins.dst, &mut st, res);
                 }
+                RiscOp::ArithmeticShiftRight => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let cnt = get_val(ins.src2, &st, flags.raw) & 63;
+                    let res = if cnt == 0 { a } else { ((a as i64) >> cnt) as u64 };
+                    flags.update_logic64(res);
+                    store(ins.dst, &mut st, res);
+                }
                 RiscOp::ShiftLeft => {
                     let a = get_val(ins.src1, &st, flags.raw);
                     let cnt = get_val(ins.src2, &st, flags.raw) & 63;
@@ -242,7 +249,7 @@ impl RiscProgram {
                     flags.raw = v & 0x8D5; // CF|PF|AF|ZF|SF|OF 마스크
                 }
                 RiscOp::VirtualBranch { cond } => {
-                    if branch_taken(cond, &flags) {
+                    if branch_taken_with_state(cond, &flags, &st.regs) {
                         // 타깃: src1(동적 값, 간접 call) 또는 imm(절대 x86 IP)
                         let target = match ins.src1 {
                             Some(op) => get_val(Some(op), &st, flags.raw),
@@ -286,7 +293,31 @@ fn branch_taken(cond: BranchCondition, flags: &VirtualFlags) -> bool {
         BranchCondition::Less => flags.sf() != flags.of(),                      // JL
         BranchCondition::GreaterOrEqual => flags.sf() == flags.of(),            // JGE
         BranchCondition::LessOrEqual => flags.zf() || (flags.sf() != flags.of()), // JLE
+        // unsigned comparisons (precise)
+        BranchCondition::Above => !flags.cf() && !flags.zf(),           // JA: CF=0 && ZF=0
+        BranchCondition::AboveOrEqual => !flags.cf(),                    // JAE: CF=0
+        BranchCondition::Below => flags.cf(),                            // JB: CF=1
+        BranchCondition::BelowOrEqual => flags.cf() || flags.zf(),       // JBE: CF=1 || ZF=1
+        // parity
+        BranchCondition::Parity => flags.pf(),      // JP
+        BranchCondition::NotParity => !flags.pf(),  // JNP
+        // counter-based (Jcxz/Jecxz/Jrcxz): handled by branch_taken_with_state
+        BranchCondition::CounterZero(_) => false,
     }
+}
+
+/// 분기 평가 — `CounterZero`(카운터 기반)는 레지스터 상태가 필요하므로 상태까지 전달.
+fn branch_taken_with_state(cond: BranchCondition, flags: &VirtualFlags, regs: &[u64; 16]) -> bool {
+    if let BranchCondition::CounterZero(width) = cond {
+        // Jcxz(2)/Jecxz(4)/Jrcxz(8): RCX(reg[1])의 하위 width 바이트가 0인지
+        let mask = match width {
+            2 => 0xFFFF,
+            4 => 0xFFFF_FFFF,
+            _ => u64::MAX,
+        };
+        return (regs[1] & mask) == 0;
+    }
+    branch_taken(cond, flags)
 }
 
 /// 리틀엔디언 `width`바이트 메모리 읽기. 미기입 주소는 0으로 취급.

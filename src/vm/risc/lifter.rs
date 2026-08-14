@@ -252,12 +252,46 @@ impl RiscLifter {
     }
 
     /// MOVZX: 8/16-bit 소스를 0-확장해 64비트 결과로. AND 마스크로 표현.
-    /// MOVSX(부호 확장)는 논리 시프트만으로는 표현 불가 → 미지원(문서 참고).
     fn lift_movzx(&mut self, inst: &Instruction, mask: u64) -> Result<()> {
         let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid movzx dst"))?;
         let src = self.operand_value(inst, 1)?;
         self.desynth.emit_and(dst, src, MicroOperand::Imm64(mask));
         Ok(())
+    }
+
+    /// MOVSX: 8/16/32-bit 소스를 부호 확장(sign-extend)해 64비트 결과로.
+    /// `ArithmeticShiftRight`를 이용해 `(src << (64-w)) >> (64-w)`(산술 시프트)로
+    /// 부호 비트를 복제한다. (MOVSX는 논리 시프트만으로는 표현 불가 — 산술 시프트 필요)
+    fn lift_movsx(&mut self, inst: &Instruction, src_bits: u8) -> Result<()> {
+        let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid movsx dst"))?;
+        let src = self.operand_value(inst, 1)?;
+        let shift = 64 - src_bits;
+        let t = MicroOperand::Temp(3);
+        // t = src << (64-w)
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::ShiftLeft)
+                .with_dst(t)
+                .with_src1(src)
+                .with_src2(MicroOperand::Imm64(shift as u64)),
+        );
+        // dst = t >> (64-w) (산술 — 부호 비트 복제)
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::ArithmeticShiftRight)
+                .with_dst(dst)
+                .with_src1(t)
+                .with_src2(MicroOperand::Imm64(shift as u64)),
+        );
+        Ok(())
+    }
+
+    /// Jcxz/Jecxz/Jrcxz: RCX(reg[1])의 하위 `width` 바이트가 0이면 분기 (카운터 분기).
+    fn emit_jcxz(&mut self, width: u8, target: u64) {
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::CounterZero(width),
+            })
+            .with_imm(target),
+        );
     }
 
     /// 조건부 분기 emit (타깃 = 절대 x86 IP)
@@ -332,6 +366,11 @@ impl RiscLifter {
             Code::Movzx_r64_rm16 | Code::Movzx_r32_rm16 => self.lift_movzx(inst, 0xFFFF)?,
             Code::Movzx_r64_rm8 | Code::Movzx_r32_rm8 | Code::Movzx_r16_rm8 => self.lift_movzx(inst, 0xFF)?,
             Code::Movzx_r16_rm16 => self.lift_movzx(inst, 0xFFFF)?,
+
+            // ── MOVSX (부호 확장) ──────────────────────────────────────────────
+            Code::Movsx_r64_rm16 | Code::Movsx_r32_rm16 | Code::Movsx_r16_rm16 => self.lift_movsx(inst, 16)?,
+            Code::Movsx_r64_rm8 | Code::Movsx_r32_rm8 | Code::Movsx_r16_rm8 => self.lift_movsx(inst, 8)?,
+            Code::Movsxd_r64_rm32 | Code::Movsxd_r32_rm32 | Code::Movsxd_r16_rm16 => self.lift_movsx(inst, 32)?,
 
             // ── LEA ─────────────────────────────────────────────────────────────
             Code::Lea_r64_m | Code::Lea_r32_m => {
@@ -416,7 +455,13 @@ impl RiscLifter {
             | Code::Shl_rm32_imm8 | Code::Shl_rm32_1 | Code::Shl_rm32_CL => self.lift_shift(inst, RiscOp::ShiftLeft)?,
             Code::Shr_rm64_imm8 | Code::Shr_rm64_1 | Code::Shr_rm64_CL
             | Code::Shr_rm32_imm8 | Code::Shr_rm32_1 | Code::Shr_rm32_CL => self.lift_shift(inst, RiscOp::ShiftRight)?,
-            // SAR(산술) 미지원: 논리 시프트로는 표현 불가.
+            // SAR (산술 우측 시프트 — 부호 비트 유지)
+            Code::Sar_rm64_imm8 | Code::Sar_rm64_1 | Code::Sar_rm64_CL
+            | Code::Sar_rm32_imm8 | Code::Sar_rm32_1 | Code::Sar_rm32_CL
+            | Code::Sar_rm16_imm8 | Code::Sar_rm16_1 | Code::Sar_rm16_CL
+            | Code::Sar_rm8_imm8 | Code::Sar_rm8_1 | Code::Sar_rm8_CL => {
+                self.lift_shift(inst, RiscOp::ArithmeticShiftRight)?
+            }
 
             // ── 스택 PUSH / POP ─────────────────────────────────────────────────
             Code::Push_r64 | Code::Push_r16 => {
@@ -486,13 +531,21 @@ impl RiscLifter {
                 let target = inst.near_branch_target();
                 self.emit_jcc(BranchCondition::LessOrEqual, target);
             }
-            Code::Ja_rel32_64 | Code::Ja_rel8_64 | Code::Jae_rel32_64 | Code::Jae_rel8_64 => {
+            Code::Ja_rel32_64 | Code::Ja_rel8_64 => {
                 let target = inst.near_branch_target();
-                self.emit_jcc(BranchCondition::NotCarry, target);
+                self.emit_jcc(BranchCondition::Above, target);
             }
-            Code::Jb_rel32_64 | Code::Jb_rel8_64 | Code::Jbe_rel32_64 | Code::Jbe_rel8_64 => {
+            Code::Jae_rel32_64 | Code::Jae_rel8_64 => {
                 let target = inst.near_branch_target();
-                self.emit_jcc(BranchCondition::Carry, target);
+                self.emit_jcc(BranchCondition::AboveOrEqual, target);
+            }
+            Code::Jb_rel32_64 | Code::Jb_rel8_64 => {
+                let target = inst.near_branch_target();
+                self.emit_jcc(BranchCondition::Below, target);
+            }
+            Code::Jbe_rel32_64 | Code::Jbe_rel8_64 => {
+                let target = inst.near_branch_target();
+                self.emit_jcc(BranchCondition::BelowOrEqual, target);
             }
             Code::Js_rel32_64 | Code::Js_rel8_64 => {
                 let target = inst.near_branch_target();
@@ -510,7 +563,27 @@ impl RiscLifter {
                 let target = inst.near_branch_target();
                 self.emit_jcc(BranchCondition::NotOverflow, target);
             }
-            // Jp/Jnp(패리티), Jcxz/Jecxz(카운터) 는 현재 플래그 모델로 표현 불가 → 미지원(Err).
+            Code::Jp_rel32_64 | Code::Jp_rel8_64 | Code::Jp_rel32_32 | Code::Jp_rel8_32 | Code::Jp_rel16 => {
+                let target = inst.near_branch_target();
+                self.emit_jcc(BranchCondition::Parity, target);
+            }
+            Code::Jnp_rel32_64 | Code::Jnp_rel8_64 | Code::Jnp_rel32_32 | Code::Jnp_rel8_32 | Code::Jnp_rel16 => {
+                let target = inst.near_branch_target();
+                self.emit_jcc(BranchCondition::NotParity, target);
+            }
+            // Jcxz/CX(16) · Jecxz/ECX(32) · Jrcxz/RCX(64): 카운터 분기 (reg[1] 하위 width 바이트==0)
+            Code::Jcxz_rel8_16 | Code::Jcxz_rel8_32 => {
+                let target = inst.near_branch_target();
+                self.emit_jcxz(2, target);
+            }
+            Code::Jecxz_rel8_16 | Code::Jecxz_rel8_32 | Code::Jecxz_rel8_64 => {
+                let target = inst.near_branch_target();
+                self.emit_jcxz(4, target);
+            }
+            Code::Jrcxz_rel8_16 | Code::Jrcxz_rel8_64 => {
+                let target = inst.near_branch_target();
+                self.emit_jcxz(8, target);
+            }
             Code::Retnq | Code::Retnw => {
                 self.desynth.instrs.push(MicroInstr::new(RiscOp::Halt));
             }
@@ -767,6 +840,129 @@ mod tests {
         init[3] = 0x0000_0000_0001_FFFF; // bx = 0xFFFF
         let st = run(&raw, 0x140001000, init);
         assert_eq!(regs(&st)[0], 0xFFFF, "movzx rax, bx zero-extends");
+    }
+
+    /// SAR (산술 우측 시프트): 음수 값은 부호 비트가 유지된다.
+    #[test]
+    fn test_lift_sar_arithmetic_shift() {
+        // 0x140001000: sar rax, 2   (rax = -16 >> 2 = -4)
+        // 0x140001003: sar rax, 1   (rax = -4 >> 1 = -2)
+        // 0x140001006: ret
+        let raw = [
+            0x48, 0xC1, 0xF8, 0x02, // sar rax, 2
+            0x48, 0xD1, 0xF8,       // sar rax, 1
+            0xC3,
+        ];
+        let mut init = [0u64; 16];
+        init[0] = (-16i64) as u64; // 0xFFFFFFFFFFFFFFF0
+        let st = run(&raw, 0x140001000, init);
+        // -16 >> 2 = -4 ; -4 >> 1 = -2
+        assert_eq!(regs(&st)[0] as i64, -2, "SAR preserves sign bit");
+    }
+
+    /// MOVSX (부호 확장): 8/16-bit 소스를 부호 확장.
+    #[test]
+    fn test_lift_movsx_sign_extension() {
+        // 0x140001000: movsx rax, al   (al = 0xFF → -1)
+        // 0x140001003: movsx rax, bx   (bx = 0x8000 → -32768)
+        // 0x140001007: ret
+        let raw = [
+            0x48, 0x0F, 0xBE, 0xC0, // movsx rax, al
+            0x48, 0x0F, 0xBF, 0xC3, // movsx rax, bx
+            0xC3,
+        ];
+        let mut init = [0u64; 16];
+        init[0] = 0xFF; // al = 0xFF → sign-extend → -1
+        init[3] = 0x8000; // bx = 0x8000 → -32768
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0] as i64, -32768, "movsx sign-extends 16-bit");
+    }
+
+    /// JP/JNP: 패리티 플래그에 따른 분기.
+    #[test]
+    fn test_lift_jp_jnp_parity() {
+        // cmp al, 3 (0b11 — 1의 개수 2 → 짝수 → PF=1) ; jp 0x14000100B ; ret
+        // 0x14000100B: mov rbx, 7
+        // 0x140001000: cmp rax,3 (4B: 48 83 F8 03)  0x140001004: jp +1 → 0x140001007 (mov rbx,7 시작)
+        // 3 - 3 = 0 → low byte 0b0 (0 ones, even) → PF=1 → JP taken.
+        let raw_jp = [
+            0x48, 0x83, 0xF8, 0x03, // cmp rax, 3
+            0x7A, 0x01,             // jp +1 → 0x140001007
+            0xC3,                   // ret (0x140001006) — 미실행
+            0x48, 0xC7, 0xC3, 0x07, 0x00, 0x00, 0x00, // mov rbx, 7 (0x140001007)
+            0xC3,
+        ];
+        let mut init = [0u64; 16];
+        init[0] = 3;
+        let st = run(&raw_jp, 0x140001000, init);
+        assert_eq!(regs(&st)[3], 7, "JP taken when parity even (PF set)");
+
+    }
+
+    /// JECXZ: ECX==0 이면 분기.
+    #[test]
+    fn test_lift_jrcxz_counter_jump() {
+        // 0x140001000: jrcxz +8 → 0x14000100A (mov rbx,7 시작); 0x140001002 mov rbx,1; 0x140001009 ret
+        // 64비트 모드에서 E3는 JRCXZ (RCX==0). 카운터 분기 로직 검증용.
+        let raw = [
+            0xE3, 0x08, // jrcxz +8 → 0x14000100A
+            0x48, 0xC7, 0xC3, 0x01, 0x00, 0x00, 0x00, // mov rbx, 1
+            0xC3,
+            0x48, 0xC7, 0xC3, 0x07, 0x00, 0x00, 0x00, // mov rbx, 7 (0x14000100A)
+            0xC3,
+        ];
+        // RCX == 0 → taken
+        let st = run(&raw, 0x140001000, [0u64; 16]);
+        assert_eq!(regs(&st)[3], 7, "JRCXZ taken when RCX==0");
+        // RCX != 0 → not taken
+        let mut init = [0u64; 16];
+        init[1] = 5;
+        let st2 = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st2)[3], 1, "JRCXZ not taken when RCX!=0");
+    }
+
+    /// 정밀 unsigned 분기: JA(CF=0∧ZF=0) vs JAE(CF=0) — 같을 때 차이 검증.
+    #[test]
+    fn test_lift_ja_jae_unsigned_boundary() {
+        // cmp rax, rbx (rax==rbx → ZF=1, CF=0)
+        // ja 0x14000100D → not taken (ZF=1)
+        // jae 0x14000100D → taken (CF=0)
+        let raw = [
+            0x48, 0x39, 0xD8, // cmp rax, rbx
+            0x77, 0x08,       // ja +8
+            0x48, 0xC7, 0xC1, 0x01, 0x00, 0x00, 0x00, // mov rcx, 1 (ja not taken)
+            0xC3,
+            0x48, 0xC7, 0xC2, 0x02, 0x00, 0x00, 0x00, // mov rdx, 2 (target)
+            0xC3,
+        ];
+        let mut init = [0u64; 16];
+        init[0] = 5;
+        init[3] = 5;
+        let st = run(&raw, 0x140001000, init);
+        // JA(Above): ZF=1 이므로 not taken → rcx=1 실행
+        assert_eq!(regs(&st)[1], 1, "JA not taken when operands equal (ZF=1)");
+        assert_eq!(regs(&st)[2], 0, "JA target not reached");
+    }
+
+    /// JBE(CF=1 ∨ ZF=1): 같을 때(CF=0, ZF=1) taken.
+    #[test]
+    fn test_lift_jbe_unsigned_boundary() {
+        // cmp rax, rbx (rax==rbx → ZF=1, CF=0)
+        // jbe 0x14000100D → taken (ZF=1)
+        let raw = [
+            0x48, 0x39, 0xD8, // cmp rax, rbx
+            0x76, 0x08,       // jbe +8
+            0x48, 0xC7, 0xC1, 0x01, 0x00, 0x00, 0x00, // mov rcx, 1 (not reached)
+            0xC3,
+            0x48, 0xC7, 0xC2, 0x02, 0x00, 0x00, 0x00, // mov rdx, 2 (target)
+            0xC3,
+        ];
+        let mut init = [0u64; 16];
+        init[0] = 5;
+        init[3] = 5;
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[2], 2, "JBE taken when equal (ZF=1)");
+        assert_eq!(regs(&st)[1], 0, "JBE target reached, fallthrough skipped");
     }
 
     /// 프로로귀/에필로그: push rbp; mov rbp,rsp ... leave; ret.

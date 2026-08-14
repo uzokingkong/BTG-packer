@@ -42,6 +42,23 @@ impl VirtualFlags {
         (self.raw & VFLAG_OF) != 0
     }
 
+    /// 패리티 플래그 (PF, bit 2) — low 8비트의 1의 개수가 짝수면 1.
+    /// 참조 시뮬레이터(eval_state)가 산술/논리 연산 후 `set_parity`로 갱신한다.
+    #[inline]
+    pub fn pf(&self) -> bool {
+        (self.raw & VFLAG_PF) != 0
+    }
+
+    /// 결과 low 8비트의 패리티를 계산해 PF 비트를 설정/해제한다.
+    pub fn set_parity(&mut self, res: u64) {
+        let ones = (res as u8).count_ones();
+        if ones % 2 == 0 {
+            self.raw |= VFLAG_PF;
+        } else {
+            self.raw &= !VFLAG_PF;
+        }
+    }
+
     /// 64비트 덧셈(a + b + cin)에 대한 RFLAGS 플래그 갱신
     pub fn update_add64(&mut self, a: u64, b: u64, cin: u64) -> (u64, u64) {
         let (sum1, c1) = a.overflowing_add(b);
@@ -62,8 +79,12 @@ impl VirtualFlags {
         if ((a ^ res) & (b ^ res) & 0x8000_0000_0000_0000) != 0 {
             flags |= VFLAG_OF;
         }
+        // PF = even parity of low byte
+        if (res as u8).count_ones() % 2 == 0 {
+            flags |= VFLAG_PF;
+        }
 
-        self.raw = (self.raw & !(VFLAG_CF | VFLAG_ZF | VFLAG_SF | VFLAG_OF)) | flags;
+        self.raw = (self.raw & !(VFLAG_CF | VFLAG_PF | VFLAG_ZF | VFLAG_SF | VFLAG_OF)) | flags;
         (res, cout)
     }
 
@@ -76,6 +97,9 @@ impl VirtualFlags {
         if (res as i64) < 0 {
             flags |= VFLAG_SF;
         }
-        self.raw = (self.raw & !(VFLAG_CF | VFLAG_OF | VFLAG_ZF | VFLAG_SF)) | flags;
+        if (res as u8).count_ones() % 2 == 0 {
+            flags |= VFLAG_PF;
+        }
+        self.raw = (self.raw & !(VFLAG_CF | VFLAG_PF | VFLAG_OF | VFLAG_ZF | VFLAG_SF)) | flags;
     }
 }

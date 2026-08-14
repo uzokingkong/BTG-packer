@@ -48,7 +48,7 @@ const VSP_OFF: usize = 0x0C8;    // u64
 const STATE_END: usize = 0x100;
 
 // 참조가 갱신하는 플래그 비트 (CF|ZF|SF|OF) — PF/AF는 보존.
-const FLAG_MASK: u64 = 0x8C1;
+const FLAG_MASK: u64 = 0x8C5; // CF|PF|ZF|SF|OF  (PF bit 2 added)
 
 /// 직접 스레디드 네이티브 VM 하네스.
 pub struct NativeVmHarness {
@@ -328,7 +328,7 @@ impl NativeVmHarness {
                 instrs.push(Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with(Code::Pushfq));
                 instrs.push(Instruction::with1(Code::Pop_r64, Register::RAX).map_err(|e| anyhow!("{e}"))?);
-                instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xC0).map_err(|e| anyhow!("{e}"))?); // ZF|SF
+                instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xC4).map_err(|e| anyhow!("{e}"))?); // ZF|SF|PF
                 // CF 비트 설정
                 instrs.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).map_err(|e| anyhow!("{e}"))?);
                 // OF = ((a^res)&(b^res))>>63

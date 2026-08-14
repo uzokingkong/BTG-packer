@@ -16,8 +16,11 @@ pub enum RiscOp {
     /// 모든 산술 덧셈/뺄셈/부호반전(NEG)의 기본 원자
     AddWithCarry,
 
-    /// 64비트 비트 쉬프트 (우측 논리/산술)
+    /// 64비트 비트 쉬프트 (우측 논리)
     ShiftRight,
+
+    /// 64비트 산술 우측 시프트 (부호 비트 유지) — SAR
+    ArithmeticShiftRight,
 
     /// 64비트 비트 쉬프트 (좌측)
     ShiftLeft,
@@ -62,6 +65,16 @@ pub enum BranchCondition {
     Less,
     GreaterOrEqual,
     LessOrEqual,
+    // unsigned comparisons (precise, not just CF)
+    Above,          // JA: CF=0 && ZF=0
+    AboveOrEqual,   // JAE: CF=0
+    Below,          // JB: CF=1
+    BelowOrEqual,   // JBE: CF=1 || ZF=1
+    // parity
+    Parity,         // JP
+    NotParity,      // JNP
+    // counter-based (Jcxz/Jecxz/Jrcxz): width in bytes (2/4/8). reg[1](RCX) low bytes == 0
+    CounterZero(u8),
 }
 
 /// 가상 마이크로 레지스터 / 피연산자
