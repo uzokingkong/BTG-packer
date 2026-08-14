@@ -355,6 +355,10 @@ fn main() -> error::Result<()> {
     // v59: patch_data가 .rdata/.data 포인터 재배치를 vm_oep 모드에서 원본 .text
     // 유지로 바꾸므로 **pass1 이전에** 설정해야 한다. (기존엔 crypto 직전 설정)
     ctx.vm_oep = args.vm_oep && vm_enabled;
+    // P3 (G1): --vm-commercial — --vm-oep의 백엔드를 상용 엔진으로 전환 (회귀 안전).
+    // `--vm --vm-oep --vm-commercial` 모두 켜야 상용 경로를 쓰고, 레거시 --vm-oep
+    // 경로는 바이트 동일 유지한다.
+    ctx.vm_commercial = args.vm_commercial && args.vm_oep && vm_enabled;
 
     // ── Phase 6: SDK Marker Selective VM Pass (if markers present) ───────────────
     if vm_enabled {

@@ -73,7 +73,7 @@ impl NativeVmHarness {
 
         // 1) 각 명령을 전문화 블록으로 컴파일 (VA-독립 길이 — 재배치/전역 ref 없음).
         let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(prog.instrs.len());
-        for ins in &prog.instrs {
+        for (i, ins) in prog.instrs.iter().enumerate() {
             let mut instrs = Vec::new();
             Self::emit_block(ins, &mut instrs, state_base)?;
             // HALT 외 블록은 tail-dispatch로 다음 명령 연결.

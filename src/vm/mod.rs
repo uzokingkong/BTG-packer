@@ -34,6 +34,8 @@ pub mod prga;
 pub mod risc;
 pub mod text_lift;
 pub mod threaded;
+pub mod commercial_build;
+pub use commercial_build::{build_program_vm_commercial, COMMERCIAL_STATE_SIZE};
 
 use crate::vm::lifter::LiftedInstr;
 use anyhow::{Result, anyhow};

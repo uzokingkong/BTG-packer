@@ -25,6 +25,7 @@ pub(crate) fn place_boot_stub(
     anti_debug: bool,
     vm_effective: bool,
     vm_oep_effective: bool,
+    vm_commercial: bool,
     chained_effective: bool,
     reencrypt: bool,
     integrity_effective: bool,
@@ -60,13 +61,18 @@ pub(crate) fn place_boot_stub(
             vm::build_vm_module(code_va, table_va, bytecode_va, bc, mode)
         }
     };
+    let vm_commercial_seed = ctx.poly_vm_seed;
     let build_prog_mod = |code_va: u64,
                           table_va: u64,
                           bytecode_va: u64,
                           bc: Vec<u8>,
                           state_va: u64|
      -> anyhow::Result<vm::VmModule> {
-        vm::build_program_vm(code_va, table_va, bytecode_va, bc, state_va, m8_mod)
+        if vm_commercial {
+            vm::build_program_vm_commercial(code_va, table_va, bytecode_va, bc, state_va, vm_commercial_seed)
+        } else {
+            vm::build_program_vm(code_va, table_va, bytecode_va, bc, state_va, m8_mod)
+        }
     };
 
     // ── 6. 부트 스텁 배치 ────────────────────────────────────────────────────
@@ -95,19 +101,33 @@ pub(crate) fn place_boot_stub(
     let (vm_prog_bytecode, vm_oep_native_entry, oep_va): (Vec<u8>, bool, u64) = if vm_oep_effective {
         let base_va = image_base + ctx.target_info.text_rva as u64;
         let ep_va = image_base + ctx.target_info.entry_point_rva as u64;
-        let lift = vm::text_lift::lift_program_cfg(
-            &ctx.target_info.text_bytes,
-            base_va,
-            ep_va,
-            &ctx.target_info.relayed_sections,
-            image_base,
-        )?;
-        if lift.bytecode.is_empty() {
+        let (prog_bytecode, entry_native): (Vec<u8>, bool) = if vm_commercial {
+            let lift = vm::text_lift::lift_program_cfg_commercial(
+                &ctx.target_info.text_bytes,
+                base_va,
+                ep_va,
+                &ctx.target_info.relayed_sections,
+                image_base,
+            )?;
+            let mut enc = crate::vm::poly::PolymorphicEncoder::new(ctx.poly_vm_seed);
+            (enc.encode(&lift.program)?, lift.entry_native)
+        } else {
+            let lift = vm::text_lift::lift_program_cfg(
+                &ctx.target_info.text_bytes,
+                base_va,
+                ep_va,
+                &ctx.target_info.relayed_sections,
+                image_base,
+            )?;
+            (lift.bytecode, lift.entry_native)
+        };
+        if prog_bytecode.is_empty() {
             return Err(anyhow::anyhow!(
-                "M6 Phase-2 --vm-oep: original .text lifted to empty VM program"
+                "M6 Phase-2 --vm-oep{}: original .text lifted to empty VM program",
+                if vm_commercial { " --vm-commercial" } else { "" }
             ));
         }
-        (lift.bytecode, lift.entry_native, ep_va)
+        (prog_bytecode, entry_native, ep_va)
     } else {
         (Vec::new(), false, 0)
     };
