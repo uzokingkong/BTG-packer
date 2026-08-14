@@ -231,11 +231,33 @@ pub fn lift_program_cfg_commercial(
         }
         if ok {
             let base = instrs.len();
-            for (ip, idx) in local_ip {
+            for &(ip, idx) in &local_ip {
                 ip_map.insert(ip, base + idx);
             }
+            let block_ops = lifter.desynth.instrs.len();
             instrs.extend(lifter.desynth.instrs);
             virtualized += 1;
+            // P3 (G1): 상용 엔진 리프트 매핑 기록 — 원본 VA → RISC micro-op 인덱스
+            // 범위. 폴리 바이트코드 오프셋은 인코딩 후 fill_risc_poly_offsets가 채운다.
+            if crate::vm::mapper::active() {
+                for (k, &(ip, idx)) in local_ip.iter().enumerate() {
+                    let end = local_ip
+                        .get(k + 1)
+                        .map(|&(_, n)| n)
+                        .unwrap_or(block_ops);
+                    let count = end.saturating_sub(idx);
+                    if count == 0 {
+                        continue;
+                    }
+                    crate::vm::mapper::record_risc_entry(
+                        ip,
+                        real[k].len(),
+                        format!("{:X} {}", ip, real[k]),
+                        base + idx,
+                        count,
+                    );
+                }
+            }
         } else {
             native_blocks += 1;
         }

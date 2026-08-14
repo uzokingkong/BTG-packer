@@ -110,7 +110,13 @@ pub(crate) fn place_boot_stub(
                 image_base,
             )?;
             let mut enc = crate::vm::poly::PolymorphicEncoder::new(ctx.poly_vm_seed);
-            (enc.encode(&lift.program)?, lift.entry_native)
+            // P3 (G1): 상용 리프트 매핑 — commercial.rs가 lift 시점에 기록한 RISC
+            // 엔트리에 per-micro-op 폴리 바이트코드 오프셋을 채운다 (--map/--sym-map).
+            let (bc, offsets) = enc.encode_with_offsets(&lift.program)?;
+            if crate::vm::mapper::active() {
+                crate::vm::mapper::fill_risc_poly_offsets(&offsets);
+            }
+            (bc, lift.entry_native)
         } else {
             let lift = vm::text_lift::lift_program_cfg(
                 &ctx.target_info.text_bytes,

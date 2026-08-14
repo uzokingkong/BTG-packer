@@ -36,10 +36,22 @@ impl PolymorphicEncoder {
     ///   없으면 `cin(imm)` 을 8B로 붙인다. `VirtualBranch` 의 절대-인덱스 타깃(src1 없음,
     ///   `imm` 을 타깃 인덱스로 사용)은 항상 8B로 붙인다. (간접 타깃은 `src1` 에 실린다.)
     pub fn encode(&mut self, prog: &RiscProgram) -> Result<Vec<u8>> {
+        Ok(self.encode_with_offsets(prog)?.0)
+    }
+
+    /// RiscProgram을 인코딩하면서 각 micro-op이 시작하는 폴리 바이트코드 오프셋도
+    /// 함께 돌려준다. `offsets[i]` = `prog.instrs[i]`(i번째 RISC micro-op)의
+    /// 인코딩 시작 오프셋. `offsets.len() == prog.instrs.len()`이며 오프셋은 단조
+    /// 증가한다. P3 상용 경로의 매퍼(M9)가 "원본 VA → RISC micro-op 인덱스 →
+    /// 폴리 바이트코드 오프셋" 매핑을 기록하는 데 쓴다. [`encode`]는 오프셋을
+    /// 버리고 동일한 바이트코드만 반환한다.
+    pub fn encode_with_offsets(&mut self, prog: &RiscProgram) -> Result<(Vec<u8>, Vec<usize>)> {
         let mut out = Vec::new();
+        let mut offsets = Vec::with_capacity(prog.instrs.len());
         let mut vip = 0u64;
 
         for ins in &prog.instrs {
+            offsets.push(out.len());
             // opcode — VirtualBranch 는 조건과 무관한 단일 canonical opcode.
             let opcode_byte = self
                 .spec
@@ -119,7 +131,7 @@ impl PolymorphicEncoder {
             }
         }
 
-        Ok(out)
+        Ok((out, offsets))
     }
 }
 
