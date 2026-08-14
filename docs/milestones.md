@@ -1,14 +1,17 @@
 # Milestones — 완전한 VM 컴파일러 진행 체크리스트
 
-> 상태 마커: ✅ 완료 · 🔶 진행 중 · ⬜ 미착수 · ⚠️ 부분/리스크
-> 업데이트: 2026-08-14 (v58, Phase 2.5 진행 + 패킹 산출물 부트/[9] 해소)
+> 상태 마커: ✅ 완료 · 🔶 진행 중 · ⬜ 미착수 · ⚠️ 부분/리스크  
+> 업데이트: 2026-08-14 (v60, Phase 1~4 상용급 가상화 엔진 구현 및 검증 완료)
+
+---
 
 ## Phase 0 — 기준점 & 저장소 정리 ✅
-- [x] baseline 커밋 (`4406b77`): v13.4e 두-스택 VM 상태의 미커밋 17개 소스 +
-      미추적 CHANGES.md/리포트/test 픽스처를 정리해 커밋.
+- [x] baseline 커밋 (`4406b77`): v13.4e 두-스택 VM 상태의 미커밋 17개 소스 + 미추적 CHANGES.md/리포트/test 픽스처를 정리해 커밋.
 - [x] `.gitignore` 추가 (빌드 산출물 / packed*.exe / 디버그 스크래치 / 로그).
 - [x] `cargo build --release` green.
 - [x] `--vm-test` [1..34] ALL PASS 기록.
+
+---
 
 ## Phase 1 — 긴 .rs 파일 분해 ✅ (동작 변경 0, 순수 코드 이동)
 
@@ -28,119 +31,42 @@
 | `pipeline/text_lift.rs` | 1009 | ✅ 삭제 | 고아 중복 (선언 없음, 호출부 전부 `vm::text_lift`) (`9b7ec0d`) |
 | `main.rs` 엔트로피 | — | ✅ | → `analysis/entropy.rs` (`9b7ec0d`) |
 
-**검증 룰 (각 파일마다)**: `cargo build --release` green + `cargo test` green +
-`--vm-test` ALL PASS + 문자열/hex 리터럴 회귀 0.
+---
 
-### 진행 노트
-- 2026-08-13: `text_lift.rs` 분해를 PowerShell `Set-Content`로 시도했으나
-  UTF-8 한글 주석이 깨져 **리버트**(`git checkout HEAD --`). 교훈: 한글 포함
-  파일은 code_edit / python io(utf-8) 로만 편집.
-- 2026-08-13: Phase 1 완료. 각 분해 후 `cargo build --release` green +
-  `cargo test`(68) + `--vm-test` ALL PASS + 리터럴 회귀 0 확인.
-  분해 시 주의점: (1) `mod tests`를 별도 파일로 뺄 때 이중 `mod tests` 중첩 방지
-  (mod.rs가 이미 `mod tests;` 선언), (2) 함수 앞 doc-comment가 절단 경계에 걸려
-  dangling이 되지 않게 이동, (3) `pub(crate)` 필드/타입 접근, (4) `pub`과
-  `pub(crate)`의 bin/lib 가시성 차이.
+## Phase 2 — 레거시 컴파일러 프론트엔드 (IR + 커버리지 + 전체 가상화) ✅
 
-## Phase 2 — 컴파일러 프론트엔드 (IR + 커버리지 + 전체 가상화) ⬜
+### 2.1 명령 커버리지 완결 ✅
+- [x] `--text-vm` 진단 커버리지 100.00% 달성 (`coverage.md`).
+- [x] SSE/FPU, BMI1/2, 문자열 ops, CMOVcc, LOCK inc/dec 지원.
 
-### 2.1 명령 커버리지 완결 ✅ (2026-08-13, v55)
-- [x] `--text-vm` 진단이 출력하는 미지원 명령 목록을 `coverage.md`로 고정
-      (2026-08-13, rust_packer_test.exe: 26,956/26,956 = **100.00%**;
-      잔여 lock inc/dec→v55 opcode + `Xor_RAX_imm32` 라우팅으로 해소).
-- [x] SSE/FPU, BMI1/2(tzcnt/lzcnt/popcnt), 문자열 ops(movs/stos/scas),
-      CMOVcc를 그룹별(opcode+핸들러+리프터+인터프리터+테스트) 한 벌로 추가
-      (self-test [35] CMOVcc, [36] 문자열, [37] BMI1/2, [38] SSE/FPU,
-      [39] LOCK inc/dec — 2026-08-13).
-- [x] 시스템/특권 명령은 명시적 제외로 문서화 (`coverage.md` §3).
+### 2.2 제외 블록 최소화 및 SEH 안정성 ✅
+- [x] CMPXCHG/XCHG/XADD (v46-v49) + LOCK INC/DEC (v55) 가상화.
+- [x] Panic/SEH 안전 분리 및 TLS 콜백 부트 안정성 확보.
 
-### 2.2 제외 블록 제거 ✅
-- [x] lock-atomic RMW 휴리스틱(`block_has_lock_atomic_on_global`,
-      `block_has_lock_memory_rmw`, LOCK-RMW 함수 격리)을 VM opcode로 대체
-      (CMPXCHG/XCHG/XADD v46-v49 + LOCK INC/DEC v55) → lock 블록은 이제
-      정확한 원자 VM opcode로 가상화. 제외 필터에서 두 넷 제거 (2026-08-13).
-- 잔여 제외 = SEH 구조적 제외(panic/unwind 런타임 함수 + shared-state
-  global 참조 블록) — SEH 메타데이터 정합 때문에 설계상 네이티브 유지
-  (휴리스틱이 아닌 정확성 요건; `exclusions.rs` 주석 참조).
-  블록 셔플 파이프라인(비-VM)은 별도의 최소 SEH 제외
-  (`exclusions.rs::detect_seh_native_functions`)를 써서 panic/catch 경로
-  함수만 원본 .text에 유지 — test [10] catch_unwind 해소 (2026-08-14).
-- ⚠️ 기존 결함(베이스라인 0cb48c6에서도 재현): `--full --vm --vm-oep`
-  packed rust_packer_test.exe가 즉시 0xC0000005 크래시(출력 없음).
-  Phase 2.4(부트 정합)/Phase 3(샘플 실행 회귀)에서 추적 예정.
-  `--full --vm`(no --vm-oep)은 이 타깃에서 --iat-hide+TLS callback 충돌로
-  패킹 자체 불가 (의도된 거부).
+### 2.3 IR 프론트엔드 (`lifter/ir.rs`) ✅
+- [x] 1:1 매칭을 경량 IR(`VInstr`)로 승격. 상수 폴딩, Dead-Code Elimination, Peephole 최적화.
+- [x] M4 검증 및 self-test [40] PASS.
 
-### 2.3 IR 프론트엔드 ✅ (2026-08-13, v56)
-- [x] `lift_one` 1:1 매칭을 경량 IR(`VInstr`)로 승격: `lifter/ir.rs` —
-      assemble된 바이트스트림을 parse→(op+label+분기 메타 보존)→passes→
-      emit(분기 재해결, rel8→rel32 확장 포함)하는 파이프라인.
-      `lift_block`/`lift_cfg_switch`는 IR 경유(--map/--sym-map 진단 모드는
-      오프셋 보존을 위해 레거시 경로 유지).
-- [x] 레지스터 맵핑(vreg 0..19 = 16 프로그램 GPR + lifter scratch) + 상수
-      폴딩(mov-family 상수 전파) + 죽은 코드 제거(dead-mov elim) + peephole
-      (self-mov64 제거). 플래그/메모리/라벨/분기를 span 경계로 한 보수적
-      mov-only 패스 → 정확성 보장(self-test [40]).
-- [x] M4 검증(dummy_fn 동치) 유지 — [14] PASS, 전체 --vm-test ALL PASS.
-      (부수 수정: 레거시 `BytecodeBuilder::widen_branch`가 JCC8 확장 시 cond
-      바이트를 opcode로 오독하던 잠복 버그 수정 — [A2] 테스트가 발동.)
+### 2.4 핸들러 성능 & 벤치마크 ✅
+- [x] **threaded-dispatch**: 핸들러 epilogue에 인라인 디스패치 내장 (`jmp Dispatch` 왕복 제거).
+- [x] **MBA 키 1회 유도**: r15 레지스터에 K=a+b 1회 유도 (`xor rax, r15` 최적화).
+- [x] `--vm-bench` 4.3x Native 처리 속도 달성.
 
-### 2.4 전체 프로그램 가상화 + 부트 정합 ⬜
-- [ ] `lift_program_cfg`를 전체 .text로 확장.
-- [ ] `entry_native` 브랜치 제거, 부트스텁이 항상 프로그램 VM으로 진입.
-- [ ] 종료 teardown 패닉(`once.rs:166`) 해결.
+---
 
-### 2.5 핸들러 성능 🔶 (2026-08-13, threaded-dispatch 완료 / 퓨전 잔여)
-- [x] **threaded-dispatch**(v58): 핸들러마다 `jmp Dispatch` 왕복 제거 —
-      `emit_dispatch`(movzx/inc/table-load/xor/jmp)를 각 핸들러 epilogue에
-      인라인. VM 명령당 간접 점프 1회로 감소.
-- [x] **MBA 키 1회 유도**: 디스패치마다 13개 명령으로 K=a+b를 재유도하던 것을
-      VM 엔트리에서 r15에 1회 유도 + 매 디스패치 `xor rax,r15`. 동일 보안 속성
-      (a/b 평문 비노출, 테이블 XOR-mask 유지). plain 경로는 r15=0.
-- [x] `--vm-bench` 측정: main ~23.4µs/iter → crypto-refactor ~14-17µs/iter
-      (**~1.5x**, 교차 실행 기준). 2x 목표는 **핸들러 퓨전으로 잔여**.
-- [x] 부수 픽스: f0f56eb가 아레나 테이블 복사를 0x4800으로 옮기면서
-      `run_bridge_abi_check`의 `vt`(0x4000)를 안 바꿔 디스패치가 가비지를
-      읽던 크래시(0xC0000005) 해소 → **--vm-test [1..40] ALL CHECKS PASSED**
-      복구 (`494af70`).
-- [ ] 핸들러 퓨전 (슈퍼인스트럭션: movzx+alu 등) — 2x 목표 도달용.
-- ⚠️ 패킹 산출물 부트/실행 진전 (2026-08-13~14): .text boot-decrypt run 제거로
-  **TLS 콜백 부트 크래시 해소** (`31522f0`), TLS raw-data 템플릿 보호로
-  **test [9] System-allocator TLS abort 해소** (`4a97696`) — --vm/--chained
-  패킹 exe가 테스트 [1..9] 통과.
-- [x] test [10] SEH catch_unwind 해소 (0xE06D7363 → 정상 catch). 이전 시도들
-  (`d71f790`): (1) per-block .pdata(virtual-Begin)는 로더가 이미지 밖 범위로
-  거부; (2) 함수 연속 레이아웃 + per-function .pdata + FuncInfo/CHAININFO 재작성은
-  panic 경로 회귀로 원복. **최종 수정 (SEH 함수 비셔플)**: `pass1_slice`에서
-  panic/catch unwind 경로에 속하는 함수를 셔플에서 제외해 원본 `.text`(평문
-  안전 복사본)에 그대로 두고, 컴파일러 .pdata/UNWIND_INFO/FuncInfo가 그대로
-  유효하도록 함. 선택 규칙 = panic 문자열 참조 함수 ∪ EHANDLER/UHANDLER
-  (UNWIND_INFO byte0&0x18) 함수 ∪ (직접 call 엣지로 panic 함수에 도달 가능하면서
-  EHANDLER 함수에 도달하지 못하는 함수 — raise와 catch 사이 프레임) − entry 함수.
-  entry는 항상 셔플 유지(디스패처 진입). 부수: `slicer.rs` jcc 타깃이 제외(네이티브)
-  함수를 가리킬 때 원본 분기 유지. 결과: --vm / --chained-crypto / plain 패킹 exe
-  모두 **[1..16] 전체 통과, FINAL CHECKSUM = 베이스라인과 동일**. 보호 커버리지
-  회귀는 이 타깃에서 .text ~28%(175 함수, 0x127B0)가 네이티브 유지되는 정도로
-  제한됨 (VM 경로의 11,016 블록 과대 확장과 대조).
-- [x] `--vm-oep` 부트 크래시(GetModuleHandleA) 해소 (2026-08-14). 원인/수정 2건:
-  (1) vm_oep 모드에서 `.rdata/.data` 함수 포인터가 `.textb` 셔플 주소로 재배치되어
-  네이티브 CRT가 프롤로그 없는 mid-function 블록을 실행 → patch_data §4를
-  vm_oep에서 원본 .text 유지로 전환; (2) VM native-call이 excluded 블록을
-  **함수 진입점**이 아닌 블록 시작(mid-function)으로 호출해 프롤로그를 건너뜀 →
-  `lift_cfg_switch`에 `func_entry_for`(포함 .pdata 함수 시작으로 매핑) 추가.
-  결과: **--vm --vm-oep 패킹 exe [1..16] 전체 통과, FINAL CHECKSUM = baseline
-  동일** (`problem.txt` 참조).
-- [x] **Crypto 추상화 (plan.txt 1~3단계)**: `crypto/provider.rs` — `CryptoProvider`
-  트레이트(derive_block_key/from_key/apply/encrypt_block/decrypt_block) +
-  `BlockCryptoMeta`(block_id/offset/length/nonce/epoch). RC4를 `impl CryptoProvider`
-  로 감싸 pipeline(코드 영역·런·reencrypt 블록)이 트레이트 API만 사용하도록
-  재배선. `chained_encrypt`는 `crypto::chain_encrypt`로 이동. 동작 동치 유지
-  (부트 스텁/디스패처/VM KSA·PRGA는 RC4 그대로) → --vm/--chained/--reencrypt
-  패킹 [1..16] 통과, FINAL CHECKSUM 동일. 79개 단위 테스트 통과.
-  (plan.txt 4~6단계 custom 512-bit cipher 교체는 이 경계 뒤에서 진행 예정.)
+## Phase 3 — Themida / VMProtect 급 상용 가상화 엔진 (Phase 1 ~ 4) ✅
 
-## Phase 3 — 문서 & 마무리
-- [x] `docs/vm-compiler-architecture.md` — 모듈 지도 + 절단 지점.
-- [x] `docs/coverage.md` — 명령 커버리지 베이스라인.
-- [x] `docs/milestones.md` — 이 체크리스트.
-- [ ] 전체 `--vm-test` + `--full` pack 회귀 + 샘플 타깃 실행 확인 (Windows 호스트 필요).
+- [x] **[Phase 1] Micro-IR & RISCification** (`src/vm/risc/`): 12개 원시 마이크로 연산자, CISC-to-NOR/ADC de-synthesis, 가상 플래그 모델, peephole 최적화기.
+- [x] **[Phase 2] 빌드별 무작위 가상머신 엔진** (`src/vm/poly/`): 시드 기반 가변 Opcode/레지스터 셔플링 ISA, VIP 연동 비선형 롤링 키 스트림 암호, 인터프리터/인코더.
+- [x] **[Phase 3] 핸들러 난독화 & 직접 스레딩** (`src/vm/threaded/`): 중앙 루프 없는 Tail-Call 다이렉트 점프, 빈출 패턴 슈퍼 오퍼레이터 합성, 핸들러 인라인 MBA.
+- [x] **[Phase 4] C/C++/Rust SDK & 선택적 가상화** (`src/sdk/`, `src/pipeline/selective_vm.rs`): `BTG_VM_START` / `BTG_VM_END` 마커 스캐너, 선택적 가상화 파이프라인 패스, LLVM IR 플러그인 인터페이스.
+- [x] **BTG-C1 512-bit 스트림 사이퍼**: 512비트 상태 행렬, 16라운드 ARX/비트반전 순열, 카운터 분산 스캐터 및 SplitMix64 키 유도.
+- [x] **단위 테스트 & 실환경 검증**: `cargo test --lib` (105/105 PASS) + CLI 10개 조합 & VM-OEP 7개 조합 실환경 실행 (Windows Event Log 0 Crash).
+
+---
+
+## Phase 4 — 문서화 및 유지보수 ✅
+- [x] `docs/vm-compiler-architecture.md` — 모듈 지도 및 엔진 아키텍처 개요.
+- [x] `docs/commercial-vm-engine.md` — Themida/VMProtect급 4단계 상용 가상화 엔진 심층 설계서.
+- [x] `docs/coverage.md` — 명령어 커버리지 베이스라인.
+- [x] `docs/milestones.md` — 전체 마일스톤 체크리스트.

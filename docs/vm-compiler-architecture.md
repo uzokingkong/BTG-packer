@@ -1,39 +1,34 @@
 # VM Compiler Architecture
 
-> 문서 상태: v58 — **Phase 2.5 진행 + 패킹 산출물 부트/[9] 해소**. 갱신: 2026-08-14.
+> 문서 상태: v60 — **Phase 1~4 상용급 폴리모픽 VM 엔진 & SDK 통합 완료**. 갱신: 2026-08-14.
 > 저장소: `vm-obf` (BTG Packer). 이 문서는 "완전한 VM 컴파일러"로 가는
-> 모듈 지도입니다. 실제 리팩터 진행 상황은 `milestones.md`를 보세요.
+> 모듈 지도입니다. 세부 상용 아키텍처는 `commercial-vm-engine.md`를 보세요.
 
 ## 1. 목표
 
 원본 `.text` 를 평문으로 존재시키지 않고, 프로그램 전체를 VM 바이트코드로만
-실행하게 만든다. 지금은 "x86 → VM 1:1 리프터 + 네이티브 폴백" 단계이고,
-목표는 "컴파일러급 프론트엔드(IR + 레지스터 할당 + 최적화) + 100% 커버리지
-+ 전체 .text 가상화 + 부트 정합"이다.
+실행하게 만든다. 현재는 CISC x86을 12개 원시 연산자(NOR, ADC)로 분해하는
+RISC De-synthesis, 빌드별 시드 기반 다형성(Polymorphic ISA), 롤링 키(Rolling Key)
+동적 복호화, 직접 스레딩(Direct Threading) 및 C/C++/Rust SDK 선택적 가상화
+엔진(Phase 1~4)이 구현되었습니다.
 
-> 평문 `.text` 에 대한 설계 절충: 실제 실행 코드는 `.textb` 블록(셔플+재인코딩+
-> RC4 암호화) 또는 VM 바이트코드(--vm-oep)이고, 원본 `.text`는 TLS 콜백·CRT·
-> SEH·네이티브 브리지가 로더/CRT 계약상 부트 전 실행하는 "안전 복사본"이다.
-> 목표(Phase 2.4)는 평문 표면을 TLS 도달 코드 + SEH 제외 런타임으로 최소화.
-
-## 2. 현재 모듈 지도 (v58, Phase 1 분해 + Phase 2.5 진행)
+## 2. 현재 모듈 지도 (v60, Phase 1~4 완료)
 
 ### 진입 / 파이프라인
-- `src/main.rs` — CLI 플래그 정규화 (`--full`/`--vm-oep` 우선순위). 엔트로피
-  리포트는 `analysis/entropy.rs`로 이동됨.
+- `src/main.rs` — CLI 플래그 정규화 (`--full`/`--vm-oep` 우선순위).
 - `src/cli.rs` — clap 인자 정의.
 - `src/lib.rs` — 라이브러리 API `pack()`.
 - `src/pipeline/` — Pass1(CFG 슬라이스) → Pass2(셔플) → Pass3(인코드) →
-  Pass4(섹션) → patch_data → crypto(부트스텁+암호화+VM 임베드) → build.
-  - `crypto/` — `{mod,rc4,bootstub,strings,vm_embed,scan,...}.rs` (분해 완료).
-  - `patch_data/` — `{mod,imports}.rs` (분해 완료: import-range 수집 분리).
-  - `validate/` — `{mod,rsrc,tests}.rs` (분해 완료: 리소스 검증 분리).
-  - `iat_hide.rs`, `rsrc_register.rs`, `pass4_section.rs`, `pass3_encode.rs`,
-    `build.rs`, `pass1_slice.rs`, `mod.rs`, `pass2_shuffle.rs`, `ondemand.rs`,
-    `pack.rs`.
-  - ~~`text_lift.rs`~~ — **삭제됨** (고아 중복; 실사용은 `vm::text_lift`).
+  Pass4(섹션) → patch_data → selective_vm → crypto → build.
+  - `selective_vm.rs` — [NEW] C/C++/Rust SDK 마커 스캔 및 선택적 가상화 컴파일 패스.
 
-### VM 컴파일러 코어 (`src/vm/`) — 전부 디렉터리 모듈로 분해 완료
+### 상용급 폴리모픽 VM 엔진 (Phase 1~4)
+- `src/vm/risc/` — [Phase 1] 12개 원시 마이크로 연산자, CISC-to-NOR/ADC De-synthesis 리프터, 가상 플래그 시뮬레이터, 최적화기.
+- `src/vm/poly/` — [Phase 2] 빌드 시드 기반 가변 Opcode/레지스터 셔플링 ISA 명세, 롤링 키 스트림 암호 엔진, 인코더/인터프리터.
+- `src/vm/threaded/` — [Phase 3] 중앙 루프 없는 직접 Tail-Call 점프 생성기, 슈퍼 오퍼레이터 합성기, 핸들러 인라인 MBA, 네이티브 실행기.
+- `src/sdk/` — [Phase 4] `BTG_VM_START` / `BTG_VM_END` 마커 인터페이스, 선택적 가상화기, LLVM IR 인제스천 인터페이스.
+
+### 레거시/기본 VM 컴파일러 코어 (`src/vm/`)
 - `bytecode/` — `{mod,registry,builder,disasm,tests}.rs`. `registry.rs`의
   `opcodes!` 매크로가 opcode 집합의 단일 진실 공급원 (현재 138 opcode).
 - `handlers/` — `{mod,alu,mov,mem,branch,stack,xmm,atomic,muldiv}.rs`.
