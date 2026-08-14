@@ -2,11 +2,13 @@
 // BTG - Commercial-Grade VM: Phase 2 Polymorphic ISA Module
 // ==============================================================================
 
+pub mod decoder;
 pub mod encoder;
 pub mod interpreter;
 pub mod isa_spec;
 pub mod rolling_key;
 
+pub use decoder::PolymorphicDecoder;
 pub use encoder::PolymorphicEncoder;
 pub use interpreter::PolymorphicInterpreter;
 pub use isa_spec::VirtualIsaSpec;

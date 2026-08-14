@@ -27,6 +27,7 @@
 
 use super::direct_tail::DirectTailEmitter;
 use crate::vm::arena::Arena;
+use crate::vm::poly::PolymorphicDecoder;
 use crate::vm::risc::{MicroInstr, MicroOperand, RiscEvalState, RiscOp, RiscProgram};
 use anyhow::{anyhow, Result};
 use iced_x86::{Code, Instruction, Register};
@@ -418,6 +419,22 @@ pub fn run_native_risc(prog: &RiscProgram, init_regs: &[u64; 16]) -> Result<Risc
     vm.run(init_regs)
 }
 
+/// 폴리모픽 롤링키 바이트코드 스트림을 네이티브로 실행하는 하네스.
+///
+/// T1-4 "네이티브↔폴리모픽 인터프리터 동치"의 핵심 경로: 출력 PE에 심긴(또는
+/// 인코더가 만든) **암호화된** 폴리모픽 바이트코드를 `PolymorphicDecoder`로
+/// 복호화해(인터프리터와 동일 계약) 원래 RISC 프로그램을 복원한 뒤, 그 프로그램을
+/// 전문화 네이티브 블록으로 컴파일해 실행한다. 결과 상태는
+/// `PolymorphicInterpreter`(인터프리터) 및 `RiscProgram::eval_state`(참조)와
+/// 완전히 일치해야 한다.
+pub fn run_native_poly(bytecode: &[u8], seed: u64, init_regs: &[u64; 16]) -> Result<RiscEvalState> {
+    let mut dec = PolymorphicDecoder::new(seed);
+    let prog = dec.decode(bytecode)?;
+    // 네이티브 블록은 피연산자가 코드젠 시점에 베이크되므로, 디스패치 키는 임의 값.
+    let mut vm = NativeVmHarness::compile(&prog, 0x5A)?;
+    vm.run(init_regs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,5 +511,77 @@ mod tests {
         let nat = run_native_risc(&prog, &[0u64; 16]).unwrap();
         assert_eq!(nat.regs[0], (1200 - 450) ^ 0x55);
         assert_eq!(nat.regs[1], 450);
+    }
+
+    /// T1-4 차등 검증: **암호화된** 폴리모픽 바이트코드 스트림을
+    /// (1) 네이티브 하네스(`run_native_poly`), (2) 폴리모픽 인터프리터,
+    /// (3) 참조 시뮬레이터(`eval_state`)에 각각 실행해 세 상태가 완전히 일치하는지 검증.
+    ///
+    /// 이는 "임베드된 .btgvm 스텁이 rolling-key 스트림을 네이티브로 해석·실행하는
+    /// 단계"의 검증 기준이다 — 네이티브 실행이 인터프리터·참조와 동치여야 한다.
+    #[test]
+    fn test_native_poly_matches_interpreter_and_reference() {
+        use crate::vm::poly::{PolymorphicEncoder, PolymorphicInterpreter};
+
+        // 인터프리터 테스트와 같은 프로그램 (shift/push/pop/nor/flags 혼합).
+        let mut d = RiscDesynthesizer::new();
+        d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x200), MicroOperand::Imm64(0));
+        d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(5), MicroOperand::Imm64(0));
+        d.instrs.push(
+            MicroInstr::new(RiscOp::ShiftRight)
+                .with_dst(MicroOperand::VReg(2))
+                .with_src1(MicroOperand::VReg(0))
+                .with_src2(MicroOperand::VReg(1)),
+        );
+        d.instrs.push(
+            MicroInstr::new(RiscOp::ShiftLeft)
+                .with_dst(MicroOperand::VReg(3))
+                .with_src1(MicroOperand::VReg(0))
+                .with_src2(MicroOperand::Imm64(2)),
+        );
+        d.instrs.push(
+            MicroInstr::new(RiscOp::AddWithCarry)
+                .with_dst(MicroOperand::VReg(7))
+                .with_src1(MicroOperand::VReg(0))
+                .with_src2(MicroOperand::VReg(1))
+                .with_imm(0),
+        );
+        d.emit_push(MicroOperand::VReg(3));
+        d.emit_push(MicroOperand::VReg(0));
+        d.emit_pop(MicroOperand::VReg(4));
+        d.instrs.push(
+            MicroInstr::new(RiscOp::Nor)
+                .with_dst(MicroOperand::VReg(5))
+                .with_src1(MicroOperand::VReg(2))
+                .with_src2(MicroOperand::VReg(1)),
+        );
+        d.instrs.push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Imm64(0x8C1)));
+        d.instrs.push(MicroInstr::new(RiscOp::Halt));
+        let prog = RiscProgram::new(d.instrs);
+
+        // 여러 시드에 대해 각각 폴리모픽 인코딩 후 세 경로 비교.
+        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
+            let mut enc = PolymorphicEncoder::new(seed);
+            let bytecode = enc.encode(&prog).unwrap();
+
+            // (1) 네이티브
+            let nat = run_native_poly(&bytecode, seed, &[0u64; 16]).unwrap();
+            // (2) 인터프리터
+            let mut interp = PolymorphicInterpreter::new(seed);
+            interp.run(&bytecode).unwrap();
+            // (3) 참조
+            let ref_st = prog.eval_state(&[0u64; 16]);
+
+            assert_eq!(nat.regs, ref_st.regs, "seed {seed:#x}: native regs != reference");
+            assert_eq!(interp.regs, ref_st.regs, "seed {seed:#x}: interp regs != reference");
+            assert_eq!(nat.temps, ref_st.temps, "seed {seed:#x}: native temps != reference");
+            assert_eq!(nat.flags, ref_st.flags, "seed {seed:#x}: native flags != reference");
+            assert_eq!(interp.flags.raw, ref_st.flags, "seed {seed:#x}: interp flags != reference");
+            assert_eq!(nat.vsp, ref_st.vsp, "seed {seed:#x}: native vsp != reference");
+            assert_eq!(nat.stack, ref_st.stack, "seed {seed:#x}: native stack != reference");
+            assert_eq!(nat.regs[2], 0x10);
+            assert_eq!(nat.regs[3], 0x800);
+            assert_eq!(nat.regs[5], !(0x10 | 5));
+        }
     }
 }
