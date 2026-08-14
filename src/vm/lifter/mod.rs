@@ -49,7 +49,7 @@ use self::control::{
 };
 use self::mem::{mem_emit, mem_emit_lea};
 use self::muldiv::{lift_bs, lift_bt, lift_bts, lift_muldiv};
-use self::shift::{lift_incdec, lift_not_neg, lift_shift_rotate};
+use self::shift::{lift_incdec, lift_not_neg, lift_shift_rotate, lift_shld_shrd};
 use self::sse::{
     lift_movq, lift_pinsrw, lift_sse, lift_sseshift_imm8, lift_sseshuffle, lift_tzcnt,
     lift_unpcklps,
@@ -422,6 +422,12 @@ pub fn lift_one(
         | Ror_rm8_1 | Ror_rm8_imm8 | Ror_rm8_CL | Ror_rm16_1 | Ror_rm16_imm8 | Ror_rm16_CL
         | Ror_rm32_1 | Ror_rm32_imm8 | Ror_rm32_CL | Ror_rm64_1 | Ror_rm64_imm8 | Ror_rm64_CL => {
             lift_shift_rotate(b, inst)?;
+        }
+        Shld_rm16_r16_imm8 | Shld_rm32_r32_imm8 | Shld_rm64_r64_imm8
+        | Shld_rm16_r16_CL | Shld_rm32_r32_CL | Shld_rm64_r64_CL
+        | Shrd_rm16_r16_imm8 | Shrd_rm32_r32_imm8 | Shrd_rm64_r64_imm8
+        | Shrd_rm16_r16_CL | Shrd_rm32_r32_CL | Shrd_rm64_r64_CL => {
+            lift_shld_shrd(b, inst)?;
         }
         Inc_rm32 | Inc_rm64 | Inc_rm8 | Inc_rm16
         | Dec_rm32 | Dec_rm64 | Dec_rm8 | Dec_rm16 => lift_incdec(b, inst)?,

@@ -443,6 +443,7 @@ pub fn generate_vm_code(
     alu::emit_blsmsk(&mut seq);
     alu::emit_blsi(&mut seq);
     alu::emit_andn(&mut seq);
+    alu::emit_shld_shrd(&mut seq);
     stack::emit_ret_imm16(&mut seq);
     muldiv::emit_mul_rr64(&mut seq);
     muldiv::emit_mul_rr32(&mut seq);

@@ -592,6 +592,15 @@ impl BytecodeBuilder {
         self.bytes.extend_from_slice(&[op, r]);
     }
 
+    /// SHLD / SHRD with immediate count
+    pub fn shld_imm(&mut self, op: u8, dst: u8, src: u8, imm: u8) {
+        self.bytes.extend_from_slice(&[op, dst, src, imm]);
+    }
+    /// SHLD / SHRD with CL count
+    pub fn shld_cl(&mut self, op: u8, dst: u8, src: u8) {
+        self.bytes.extend_from_slice(&[op, dst, src]);
+    }
+
     /// Finish: resolve branch offsets and return the bytecode.
     pub fn finish(mut self) -> Vec<u8> {
         self.fixup_all();

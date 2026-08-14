@@ -475,6 +475,78 @@ pub(crate) fn exec(
             }
             Ok(ip)
         }
+        OP_SHLD_R_R_IMM8 | OP_SHLD_R_R_CL => {
+            let d = code[ip] as usize;
+            let s = code[ip + 1] as usize;
+            let (cnt, next_ip) = if op == OP_SHLD_R_R_IMM8 {
+                (code[ip + 2] & 31, ip + 3)
+            } else {
+                ((vreg32(state, 1)? & 31) as u8, ip + 2)
+            };
+            if cnt > 0 {
+                let dst = vreg32(state, d)?;
+                let src = vreg32(state, s)?;
+                let res = (dst << cnt) | (src >> (32 - cnt));
+                *vreg64(state, d)? = res as u64;
+                set_flags(state, flags::logical_flags(res));
+            }
+            Ok(next_ip)
+        }
+        OP_SHRD_R_R_IMM8 | OP_SHRD_R_R_CL => {
+            let d = code[ip] as usize;
+            let s = code[ip + 1] as usize;
+            let (cnt, next_ip) = if op == OP_SHRD_R_R_IMM8 {
+                (code[ip + 2] & 31, ip + 3)
+            } else {
+                ((vreg32(state, 1)? & 31) as u8, ip + 2)
+            };
+            if cnt > 0 {
+                let dst = vreg32(state, d)?;
+                let src = vreg32(state, s)?;
+                let res = (dst >> cnt) | (src << (32 - cnt));
+                *vreg64(state, d)? = res as u64;
+                set_flags(state, flags::logical_flags(res));
+            }
+            Ok(next_ip)
+        }
+        OP_SHLD64_R_R_IMM8 | OP_SHLD64_R_R_CL => {
+            let d = code[ip] as usize;
+            let s = code[ip + 1] as usize;
+            let (cnt, next_ip) = if op == OP_SHLD64_R_R_IMM8 {
+                (code[ip + 2] & 63, ip + 3)
+            } else {
+                ((*vreg64(state, 1)? & 63) as u8, ip + 2)
+            };
+            if cnt > 0 {
+                let dst = *vreg64(state, d)?;
+                let src = *vreg64(state, s)?;
+                let res = (dst << cnt) | (src >> (64 - cnt));
+                *vreg64(state, d)? = res;
+                let zf = if res == 0 { F_ZF } else { 0 };
+                let sf = if (res as i64) < 0 { F_SF } else { 0 };
+                set_flags(state, zf | sf);
+            }
+            Ok(next_ip)
+        }
+        OP_SHRD64_R_R_IMM8 | OP_SHRD64_R_R_CL => {
+            let d = code[ip] as usize;
+            let s = code[ip + 1] as usize;
+            let (cnt, next_ip) = if op == OP_SHRD64_R_R_IMM8 {
+                (code[ip + 2] & 63, ip + 3)
+            } else {
+                ((*vreg64(state, 1)? & 63) as u8, ip + 2)
+            };
+            if cnt > 0 {
+                let dst = *vreg64(state, d)?;
+                let src = *vreg64(state, s)?;
+                let res = (dst >> cnt) | (src << (64 - cnt));
+                *vreg64(state, d)? = res;
+                let zf = if res == 0 { F_ZF } else { 0 };
+                let sf = if (res as i64) < 0 { F_SF } else { 0 };
+                set_flags(state, zf | sf);
+            }
+            Ok(next_ip)
+        }
         other => Err(VmError::UnknownOpcode(other)),
     }
 }

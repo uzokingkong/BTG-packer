@@ -648,3 +648,113 @@ pub(super) fn emit_andn(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         ]);
     }
 }
+
+// ── Phase 4: SHLD / SHRD double-precision shift handlers ─────────────────────
+pub(super) fn emit_shld_shrd(seq: &mut Vec<(Instruction, Option<Cl>)>) {
+    // 32-bit imm8
+    hdr(seq, OP_SHLD_R_R_IMM8, vec![
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, m(Register::R9, 2)).unwrap(), // imm8
+        Instruction::with2(Code::Mov_r32_rm32, Register::R11D, vreg(Register::RCX)).unwrap(), // dst
+        Instruction::with2(Code::Mov_r32_rm32, Register::EDX, vreg(Register::RDX)).unwrap(), // src
+        Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EAX).unwrap(), // count
+        Instruction::with3(Code::Shld_rm32_r32_CL, Register::R11D, Register::EDX, Register::CL).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::R11).unwrap(),
+        Instruction::with2(Code::Add_rm64_imm32, Register::R9, 3).unwrap(),
+    ]);
+    // 32-bit CL
+    hdr(seq, OP_SHLD_R_R_CL, vec![
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
+        Instruction::with2(Code::Mov_r32_rm32, Register::R11D, vreg(Register::RCX)).unwrap(), // dst
+        Instruction::with2(Code::Mov_r32_rm32, Register::EDX, vreg(Register::RDX)).unwrap(), // src
+        // count from vreg[1] (RCX)
+        Instruction::with2(Code::Mov_r32_imm32, Register::EAX, 1).unwrap(),
+        Instruction::with2(Code::Mov_r32_rm32, Register::ECX, vreg(Register::RAX)).unwrap(),
+        Instruction::with3(Code::Shld_rm32_r32_CL, Register::R11D, Register::EDX, Register::CL).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::R11).unwrap(),
+        Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap(),
+    ]);
+    // 32-bit SHRD imm8
+    hdr(seq, OP_SHRD_R_R_IMM8, vec![
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, m(Register::R9, 2)).unwrap(),
+        Instruction::with2(Code::Mov_r32_rm32, Register::R11D, vreg(Register::RCX)).unwrap(),
+        Instruction::with2(Code::Mov_r32_rm32, Register::EDX, vreg(Register::RDX)).unwrap(),
+        Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EAX).unwrap(),
+        Instruction::with3(Code::Shrd_rm32_r32_CL, Register::R11D, Register::EDX, Register::CL).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::R11).unwrap(),
+        Instruction::with2(Code::Add_rm64_imm32, Register::R9, 3).unwrap(),
+    ]);
+    // 32-bit SHRD CL
+    hdr(seq, OP_SHRD_R_R_CL, vec![
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
+        Instruction::with2(Code::Mov_r32_rm32, Register::R11D, vreg(Register::RCX)).unwrap(),
+        Instruction::with2(Code::Mov_r32_rm32, Register::EDX, vreg(Register::RDX)).unwrap(),
+        Instruction::with2(Code::Mov_r32_imm32, Register::EAX, 1).unwrap(),
+        Instruction::with2(Code::Mov_r32_rm32, Register::ECX, vreg(Register::RAX)).unwrap(),
+        Instruction::with3(Code::Shrd_rm32_r32_CL, Register::R11D, Register::EDX, Register::CL).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::R11).unwrap(),
+        Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap(),
+    ]);
+    // 64-bit SHLD imm8
+    hdr(seq, OP_SHLD64_R_R_IMM8, vec![
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, m(Register::R9, 2)).unwrap(),
+        Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
+        Instruction::with2(Code::Mov_r64_rm64, Register::RDX, vreg(Register::RDX)).unwrap(),
+        Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EAX).unwrap(),
+        Instruction::with3(Code::Shld_rm64_r64_CL, Register::R11, Register::RDX, Register::CL).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::R11).unwrap(),
+        Instruction::with2(Code::Add_rm64_imm32, Register::R9, 3).unwrap(),
+    ]);
+    // 64-bit SHLD CL
+    hdr(seq, OP_SHLD64_R_R_CL, vec![
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
+        Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
+        Instruction::with2(Code::Mov_r64_rm64, Register::RDX, vreg(Register::RDX)).unwrap(),
+        Instruction::with2(Code::Mov_r32_imm32, Register::EAX, 1).unwrap(),
+        Instruction::with2(Code::Mov_r32_rm32, Register::ECX, vreg(Register::RAX)).unwrap(),
+        Instruction::with3(Code::Shld_rm64_r64_CL, Register::R11, Register::RDX, Register::CL).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::R11).unwrap(),
+        Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap(),
+    ]);
+    // 64-bit SHRD imm8
+    hdr(seq, OP_SHRD64_R_R_IMM8, vec![
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, m(Register::R9, 2)).unwrap(),
+        Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
+        Instruction::with2(Code::Mov_r64_rm64, Register::RDX, vreg(Register::RDX)).unwrap(),
+        Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EAX).unwrap(),
+        Instruction::with3(Code::Shrd_rm64_r64_CL, Register::R11, Register::RDX, Register::CL).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::R11).unwrap(),
+        Instruction::with2(Code::Add_rm64_imm32, Register::R9, 3).unwrap(),
+    ]);
+    // 64-bit SHRD CL
+    hdr(seq, OP_SHRD64_R_R_CL, vec![
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
+        Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
+        Instruction::with2(Code::Mov_r64_rm64, Register::RDX, vreg(Register::RDX)).unwrap(),
+        Instruction::with2(Code::Mov_r32_imm32, Register::EAX, 1).unwrap(),
+        Instruction::with2(Code::Mov_r32_rm32, Register::ECX, vreg(Register::RAX)).unwrap(),
+        Instruction::with3(Code::Shrd_rm64_r64_CL, Register::R11, Register::RDX, Register::CL).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::R11).unwrap(),
+        Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap(),
+    ]);
+}
+

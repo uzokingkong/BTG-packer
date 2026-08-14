@@ -40,8 +40,8 @@ macro_rules! opcodes {
             pub const $name: u8 = $val;
         )*
 
-        /// Handler-table slot count (opcodes 0x00..=0xB3). 0x00 = invalid-opcode handler.
-        pub const NUM_OPS: usize = 0xB4;
+        /// Handler-table slot count (opcodes 0x00..=0xBB). 0x00 = invalid-opcode handler.
+        pub const NUM_OPS: usize = 0xBC;
 
         /// Opcode -> (mnemonic, operand byte length after the opcode byte).
         pub const OPCODE_INFO: &[(u8, &'static str, usize)] = &[
@@ -298,6 +298,15 @@ opcodes! {
     OP_LOCK_DEC_MEM16_A = 0xB1 : "lock_dec16", 1 ;
     OP_LOCK_DEC_MEM32_A = 0xB2 : "lock_dec32", 1 ;
     OP_LOCK_DEC_MEM64_A = 0xB3 : "lock_dec64", 1 ;
+    // ── Phase 4: SHLD / SHRD double-precision shift ──────────────────────────
+    OP_SHLD_R_R_IMM8    = 0xB4 : "shld", 3 ;
+    OP_SHLD_R_R_CL      = 0xB5 : "shld", 2 ;
+    OP_SHRD_R_R_IMM8    = 0xB6 : "shrd", 3 ;
+    OP_SHRD_R_R_CL      = 0xB7 : "shrd", 2 ;
+    OP_SHLD64_R_R_IMM8  = 0xB8 : "shld64", 3 ;
+    OP_SHLD64_R_R_CL    = 0xB9 : "shld64", 2 ;
+    OP_SHRD64_R_R_IMM8  = 0xBA : "shrd64", 3 ;
+    OP_SHRD64_R_R_CL    = 0xBB : "shrd64", 2 ;
 }
 
 /// Index-slot sentinel for LEA: no index term (see opcodes! / OP_LEA).

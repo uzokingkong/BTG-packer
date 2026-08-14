@@ -220,3 +220,36 @@ pub(super) fn lift_not_neg(b: &mut BytecodeBuilder, inst: &Instruction) -> Resul
     b.mem_store_a(store, addr, SCRATCH2);
     Ok(())
 }
+
+/// SHLD / SHRD double-precision shift lifter (Phase 4).
+pub(super) fn lift_shld_shrd(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
+    let code = inst.code();
+    let name = format!("{:?}", code);
+    let is_shld = name.starts_with("Shld_");
+    let is64 = name.contains("_rm64_");
+    let is_cl = name.ends_with("_CL");
+
+    let dst = vreg(inst.op0_register())?;
+    let src = vreg(inst.op1_register())?;
+
+    if is_shld {
+        if is_cl {
+            let op = if is64 { OP_SHLD64_R_R_CL } else { OP_SHLD_R_R_CL };
+            b.shld_cl(op, dst, src);
+        } else {
+            let imm = inst.immediate8();
+            let op = if is64 { OP_SHLD64_R_R_IMM8 } else { OP_SHLD_R_R_IMM8 };
+            b.shld_imm(op, dst, src, imm);
+        }
+    } else {
+        if is_cl {
+            let op = if is64 { OP_SHRD64_R_R_CL } else { OP_SHRD_R_R_CL };
+            b.shld_cl(op, dst, src);
+        } else {
+            let imm = inst.immediate8();
+            let op = if is64 { OP_SHRD64_R_R_IMM8 } else { OP_SHRD_R_R_IMM8 };
+            b.shld_imm(op, dst, src, imm);
+        }
+    }
+    Ok(())
+}

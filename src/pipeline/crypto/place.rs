@@ -290,17 +290,23 @@ pub(crate) fn place_boot_stub(
     } else {
         0
     };
-    // 보존 원본 .text at-rest 암호화는 TLS 콜백이 없는 타깃에서만. TLS 디렉터리
-    // (data directory #9)가 있으면 로더가 부트 스텁 전에 콜백을 실행하므로,
-    // 암호화된 .text를 실행해 0xC0000005로 크래시하는 회귀를 막기 위해 평문으로
-    // 유지한다. (TLS-first-callback decryptor는 Phase-2 별도 구현.)
-    let has_tls_dir = ctx
-        .target_info
-        .data_directories
-        .get(9)
-        .map(|d| d.virtual_address != 0)
-        .unwrap_or(false);
-    let text_enc = vm_oep_effective && !has_tls_dir;
+    // 보존 원본 .text at-rest 암호화는 실제 실행되는 TLS 콜백이 없는 타깃에서 활성화.
+    // TLS 디렉터리 내 AddressOfCallBacks가 가리키는 콜백 배열이 존재하지 않으면
+    // 로더가 사전 실행하는 콜백이 없으므로 .text 전체를 안전하게 100% 암호화한다.
+    let has_tls_cb = ctx.target_info.data_directories.get(9).map(|dir| {
+        if dir.virtual_address == 0 || dir.size < 0x20 {
+            return false;
+        }
+        ctx.patched_sections.iter().any(|sec| {
+            if dir.virtual_address < sec.virtual_address {
+                return false;
+            }
+            let off = (dir.virtual_address - sec.virtual_address) as usize;
+            off + 0x20 <= sec.bytes.len()
+                && u64::from_le_bytes(sec.bytes[off + 0x18..off + 0x20].try_into().unwrap()) != 0
+        })
+    }).unwrap_or(false);
+    let text_enc = vm_oep_effective && !has_tls_cb;
     let (vm_oep_text_va, vm_oep_text_len) = if text_enc {
         match ctx.patched_sections.iter().find(|s| s.name == ".text") {
             Some(sec) => (image_base + sec.virtual_address as u64, sec.bytes.len() as u32),
@@ -320,7 +326,7 @@ pub(crate) fn place_boot_stub(
         );
         if text_enc && vm_oep_text_len > 0 {
             println!("[+] --vm-oep at-rest: preserved .text encrypted ({}B, no TLS callbacks)", vm_oep_text_len);
-        } else if has_tls_dir {
+        } else if has_tls_cb {
             println!("[!] --vm-oep at-rest: preserved .text kept plaintext (TLS callbacks present; TLS-first-callback decryptor = Phase-2)");
         }
     }

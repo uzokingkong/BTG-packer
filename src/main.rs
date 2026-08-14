@@ -355,6 +355,11 @@ fn main() -> error::Result<()> {
     // 유지로 바꾸므로 **pass1 이전에** 설정해야 한다. (기존엔 crypto 직전 설정)
     ctx.vm_oep = args.vm_oep && vm_enabled;
 
+    // ── Phase 6: SDK Marker Selective VM Pass (if markers present) ───────────────
+    if vm_enabled {
+        let _ = pipeline::selective_vm::SelectiveVmPass::run(&mut ctx, 0xCAFEBABE_1337BEEF);
+    }
+
     // ── Pass 1: CFG 추출 + MicroSlicer ────────────────────────────────────────────
     pipeline::pass1_slice::run(&mut ctx)?;
 
