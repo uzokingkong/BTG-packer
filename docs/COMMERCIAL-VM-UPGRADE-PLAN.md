@@ -187,6 +187,12 @@ teardown으로 배제(132가 채택 최소치). `.pdata` 재생성(브리지 UNW
 
 **검증**: `verify_text.py` 재실행 → **`.text` first-bytes identical = False**, entropy 7.5 근접. 16개 테스트 + TLS/static-init(test [15]) 통과. 덤프(온디스크)에서 원본 x86 복원 불가.
 
+> **✅ 완료 (2026-08-15)**: `tls_guard.rs detect_tls_callback_ranges`(forward callee closure)로
+> 평문 유지 50함수/0x23EE 최소화, `place.rs text_enc_runs` + `bootstub emit_rest_decrypt`
+> run-table로 `.text` at-rest fresh-RC4 암호화·부트 복호화. `verify_text.py` → `.text`
+> identical = **False** (94.71%), entropy **7.988**; `--vm --vm-oep` 16테스트 + FINAL
+> CHECKSUM `0x2cdc0e4511d84a64`; cdb TLS 콜백 진입·복귀 정상 (0xC0000005 없음).
+
 ### P6 — 탈가상화 저항 강화 (Anti-De-virtualization)  [5–8일]
 **목표**: G6 해소 — 1:1 취약성 제거 + 핸들러/데이터 난독화 전역화.
 

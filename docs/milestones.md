@@ -111,3 +111,33 @@
       (baseline 동일).
 - [ ] 0 목표는 exit-time 0xC0000005 teardown으로 배제(132가 채택 최소치).
 - [ ] `.pdata` 재생성(브리지 UNWIND_INFO) 통한 전체 SEH 가상화 — 후속.
+
+### P5 — .text 온디스크 평문 0 (TLS-first-callback Decryptor) ✅ (2026-08-15)
+- [x] **블로커 실측**: 타깃은 TLS 콜백 1개(RVA `0x1C1A0`, CRT TLS-init) 보유 — 로더가
+      부트 스텁보다 먼저 콜백 실행 → `.text` 전체 암호화 시 0xC0000005.
+- [x] `src/vm/text_lift/tls_guard.rs` `detect_tls_callback_ranges` — TLS dir → `.pdata`
+      함수 → **forward(callee) transitive closure**로 평문 유지 범위 산출.
+      실측: **50 함수 / 0x23EE 바이트** 평문 유지 (양방향 closure 551 대비 최소).
+- [x] 부트 스텁 `emit_rest_decrypt` **run 기반 확장** — 콜백 외 `.text` 영역만 at-rest
+      fresh-RC4(seed)로 암호화·부트 시 복호화 (run-table `{va,len}`).
+- [x] `place.rs` `text_enc_runs` — `.text` 배타 보수 run 산출 + 부트 영역 run-table 배치
+      + 동일 순서 fresh-RC4 암호화. (run 없으면 run-table 미배치 — 레이아웃/트림 무회귀)
+- [x] **검증 (신선 회귀 2026-08-15)**: `verify_text.py` → `.text first-bytes identical
+      = **False** (186,880B 중 176,988B diff, 94.71%), packed `.text` entropy **7.988**
+      (≈7.5↑), `.textb` 7.539.
+- [x] `packed --headless` **16개 테스트 전체 통과** + FINAL CHECKSUM `0x2cdc0e4511d84a64`
+      (baseline 동일), test[15] TLS & statics `0x6599ff7a6e4706f4`.
+- [x] **cdb TLS 콜백 진입·복귀 확인** (VA `0x14001c1a0`): startup·스레드 생성(test[9])·
+      teardown 진입 전부 정상 복귀, **0xC0000005 없음**.
+- [x] `.text` 온디스크 평문 0 달성 (콜백 함수만 최소 평문 유지).
+
+### 회귀 — 3경로 최종 신선 실행 (2026-08-15, 최종 상태)
+- [x] `cargo build --release` green (exit 0) · `cargo test --release --lib`
+      → **225 passed; 0 failed**.
+- [x] `--vm` pack→run → **16개 테스트 전체 통과** + FINAL CHECKSUM
+      `0x2cdc0e4511d84a64` (baseline 동일).
+- [x] `--vm --vm-oep` pack→run → **16개 테스트 전체 통과** + FINAL CHECKSUM
+      `0x2cdc0e4511d84a64`, cdb clean exit (0xC0000005 없음), TLS 콜백 진입 확인.
+- [ ] `--vm --vm-oep --vm-commercial` — **pre-existing 0xC0000005** (P3 상용 엔진의
+      generic-10-handler 디스패치가 operand 디코딩/롤링키 해제를 구현하지 않은
+      통합 미완성 — baseline HEAD와 동일, P4/P5 범위 외).

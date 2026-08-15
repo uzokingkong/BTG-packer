@@ -215,3 +215,52 @@ CHECKSUM `0x2cdc0e4511d84a64`(baseline 동일)를 만족하며, 132가 더 공�
   0xC0000005**로 실행 불가 — baseline HEAD에서도 동일하게 크래시(이번 변경과
   무관, P3 엔진 통합 진행 중).
 
+---
+
+## 8. 최종 상태 신선 회귀 (2026-08-15, P4+P5 최종 HEAD `be35b8b`)
+
+> P4+P5를 함께 적용한 최종 상태에서 전체 회귀를 한 번 더 신선하게 재실행했다.
+> 결과: P4/P5 범위의 모든 게이트 통과. 유일한 미통과는 **pre-existing P3 상용
+> 엔진(`--vm-commercial`) 통합 미완성**으로, baseline HEAD와 동일하며 P4/P5
+> 변경과 무관함을 cdb로 재확인했다.
+
+### 신선 빌드/테스트
+- `cargo build --release` → **exit 0** (fresh).
+- `cargo test --release --lib` → **225 passed; 0 failed** (fresh).
+
+### 3경로 pack→run (모두 신선 재패킹)
+| 경로 | pack | run | FINAL CHECKSUM | 비고 |
+|---|---|---|---|---|
+| `--vm` | exit 0 | 16개 테스트 전체 통과 | `0x2cdc0e4511d84a64` | PASS |
+| `--vm --vm-oep` | exit 0 | 16개 테스트 전체 통과 | `0x2cdc0e4511d84a64` | PASS · cdb clean exit |
+| `--vm --vm-oep --vm-commercial` | exit 0 | **0xC0000005** (cdb `_fr_com+0x92645`) | — | pre-existing P3 |
+
+### cdb 분석 (`--vm-commercial` 크래시 지점)
+- 폴트: `_fr_com+0x92645: mov rax,[r15+rax*8]` — 상용 Program VM tail-dispatch가
+  핸들러 테이블을 거대한(가비지) opcode 인덱스로 조회. `rax=0xb0514875738de8be`
+  (roll-key 바이트 0x73 ^ **64비트 전체 키** XOR), r15=핸들러 테이블.
+- **근본 원인**: `build_program_vm_commercial`이 만드는 **generic 10-handler**
+  (NOR/ADD/SHR/SHL/PUSH/POP/MEM_RD/MEM_WR/SET_FLAG/HALT) 디스패치는 operand
+  디코딩을 수행하지 않으며, tail-dispatch `xor rax, r14`가 per-byte roll-key가
+  아닌 **full-64-bit 키**를 XOR해 인덱스가 폭발한다. (검증된 네이티브 경로는
+  `harness.rs`의 **명령별 전용 블록** 방식 — 이 generic 경로와는 상이.)
+- → P3 상용 엔진의 **통합 미완성**(operand 디코딩 + roll-key 해제 미구현)으로
+  판정. P4/P5 범위 외, 후속 P3 작업 대상.
+
+### P5 (.text 평문 0) 신선 검증
+- `verify_text.py test\target\release\rust_packer_test.exe _fr_vmoep.exe`:
+  - `.text first-bytes identical = **False**` (186,880B 중 176,988B diff, 94.71%)
+  - packed `.text` entropy **7.988** (≈7.5↑) · `.textb` 7.539
+- `_fr_vmoep.exe --headless` → **16개 테스트 전체 통과** + FINAL CHECKSUM
+  `0x2cdc0e4511d84a64`. test[10] SEH catch_unwind = `0x29cc76385dbdb6b6`
+  (SEH 네이티브 132 최소 세트 하에서 통과). test[15] TLS & statics =
+  `0x6599ff7a6e4706f4`.
+- cdb TLS 콜백(VA `0x14001c1a0`) 진입 → startup·test[9] 스레드(8회)·teardown
+  진입 전부 정상 복귀, **0xC0000005 없음**; `e06d7363` C++ EH 예외 3회는
+  test[10] catch_unwind의 정상 unwinding (first chance).
+
+### 문서 반영
+- `docs/milestones.md` — P5 완료 체크리스트 + 최종 회귀 섹션 추가.
+- `docs/journal/2026-08-15.md` — 본 회귀 세션 저널.
+- 커밋: `Co-authored-by: Attacca <attacca@walruslab.org>` + origin push.
+
