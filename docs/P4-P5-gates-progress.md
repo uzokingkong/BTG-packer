@@ -2,9 +2,13 @@
 
 > 작성: 2026-08-15 · repo `asdfsadfecwecc` · node `ujiwo-zyris-code`
 > 브랜치: `commercial/p3-engine-integration` (HEAD `de2560c`)
-> 기준: `cargo build --release` green, `cargo test --release --lib` **220 passed; 0 failed**
+> 기준: `cargo build --release` green, `cargo test --release --lib` **222 passed; 0 failed**
 > 검증 루프: `btg-packer --vm --vm-oep` → `packed --headless` 16개 테스트 + FINAL CHECKSUM
 > baseline = `0x2cdc0e4511d84a64` (재확인됨)
+>
+> ✅ **P5 완료 (본 세션)**: 부트 스텁 `emit_rest_decrypt` run 기반 + `place.rs`
+> `text_enc_runs` run-table + fresh-RC4 at-rest → `.text` **46 run / 177,682B
+> 암호화**, TLS 콜백 50함수/0x23EE만 평문 유지.
 
 ---
 
@@ -119,7 +123,8 @@ TLS RVA 0x36e80 size 40  (IMAGE_TLS_DIRECTORY64)
 - `cargo test --release --lib` → **220 passed; 0 failed**.
 - `btg-packer -i rust_packer_test.exe -o _p5_pack.exe --vm --vm-oep` → exit 0.
   - `entry_native=false`, Program VM bytecode 312,086B at-rest RC4 암호화.
-  - `.text` **평문 유지**(TLS 콜백 존재 → `TLS-first-callback decryptor = Phase-2`).
+  - `.text` **46 run / 177,682B at-rest RC4 암호화** (TLS 콜백 50함수/0x23EE만
+    평문 유지 — P5 완료).
   - SEH native 175함수 유지.
 - `_p5_pack.exe --headless` → **16개 테스트 전체 통과**, FINAL CHECKSUM =
   `0x2cdc0e4511d84a64` = baseline 동일.
@@ -134,10 +139,40 @@ TLS RVA 0x36e80 size 40  (IMAGE_TLS_DIRECTORY64)
       바이트** 평문 유지 (양방향 closure 551 함수 대비 최소). `cargo test --release
       --lib` → **222 passed; 0 failed**. `--vm --vm-oep` pack+run 16테스트 통과 +
       checksum baseline 동일 (`0x2cdc0e4511d84a64`) — 무회귀.
-- [ ] P5: 부트 스텁 `emit_rest_decrypt`를 run 기반으로 확장해 콜백 외 .text 영역
+- [x] P5: 부트 스텁 `emit_rest_decrypt`를 run 기반으로 확장해 콜백 외 .text 영역
       복호화 (2.4 단계 3) → 실제 `.text` 온디스크 평문 0 달성.
-- [ ] P5: 콜백 함수 평문 유지 & 나머지 .text 암호화 검증 (verify_text.py +
+- [x] P5: 콜백 함수 평문 유지 & 나머지 .text 암호화 검증 (verify_text.py +
       16테스트 + cdb).
 - [ ] P4: 브리지 진입 스텁 .pdata/UNWIND_INFO 생성기 (3.3).
 - [ ] P4: SEH 네이티브 175→최소, [10] 가상화 통과.
 - [ ] 문저: milestones.md / COMMERCIAL-VM-UPGRADE-PLAN.md 현재 상태 반영.
+
+---
+
+## 6. P5 완료 — 최종 검증 (본 세션, autonomous run)
+
+> branch `commercial/p3-engine-integration` · node `ujiwo-zyris-code` · repo `asdfsadfecwecc`
+
+`src/pipeline/crypto`(bootstub.rs / place.rs / tests.rs)의 P5 구현을 완성·검증 후 커밋했다.
+
+### 구현
+- `bootstub.rs` `emit_rest_decrypt`: `.text` at-rest 복호화 run-loop (`RBP` = run-table VA,
+  `R11` = run count, 16B(va,len) 쌍 순회, fresh RC4 keystream 연속 유지, count==0 즉시 no-op).
+- `place.rs` `place_boot_stub`: `detect_tls_callback_ranges`의 배타 보수로 `.text` 암호화
+  run(`text_enc_runs`) 산출 → 부트 영역에 run-table 배치·기록 + 동일 순서 fresh-RC4 암호화.
+  run이 없으면 run-table 미배치·미기록(레이아웃/트림 무회귀).
+- `tests.rs`: BootStubCtx 리터럴 3곳에 `vm_oep_text_runs_va/count` 1쌍씩 정리(중복 3회 제거).
+
+### 검증 (전부 통과)
+- `cargo build --release` → exit 0. `cargo test --release --lib` → **222 passed; 0 failed**.
+- `btg-packer -i rust_packer_test.exe -o _p5b_pack.exe --vm --vm-oep` → exit 0.
+  - `[VM-OEP-DIAG] entry_native = false`.
+  - `.text` at-rest: **46 run(s), 177,682B total** (TLS 콜백 50함수/0x23EE 평문 유지),
+    fresh-RC4 적용 로그 확인.
+- `_p5b_pack.exe --headless` → **16개 테스트 전체 통과**, FINAL CHECKSUM =
+  `0x2cdc0e4511d84a64` = baseline 동일.
+- `verify_text.py` → `.text first-bytes identical = **False**` (diff 94.68%),
+  packed `.text` entropy **7.988**(≈7.5↑).
+- cdb (TLS callback RVA 0x1C1A0 / VA 0x14001c1a0) → **진입 9회** (startup·스레드 생성·
+  teardown), 매번 정상 복귀, **0xC0000005 없음**. `e06d7363` C++ EH 예외 3회는
+  test[10] catch_unwind의 정상 SEH unwinding.
