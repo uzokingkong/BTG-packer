@@ -115,7 +115,7 @@ Themida/VMProtect급 VM 컴파일러가 갖춰야 할 최소 역량을 아래 6�
 `test_poly_arith_shift_matches_reference`, `test_poly_native_call_bridge_stub`.
 폴리 인터프리터 == eval_state == (가능하면) 네이티브 하네스, 3 seeds × 각 시나리오.
 
-### P2 — RISC 리프터 명령 커버리지 100% (Full RISC Lifting)  [5–7일]
+### P2 — RISC 리프터 명령 커버리지 100% (Full RISC Lifting)  [5–7일]  🔶 진행 중
 **목표**: G3 해소 — `vm/risc/lifter.rs`가 레거시 171-opcode 커버리지와 동등해지도록 확장.
 
 **작업 항목** (레거시 `vm/lifter/` + `vm/text_lift/` 커버리지와 대조하며):
