@@ -311,7 +311,7 @@ impl PolymorphicInterpreter {
                 RiscOp::BSwap { width } => {
                     let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
                     let res = if width == 4 {
-                        (a.swap_bytes() as u32) as u64
+                        ((a as u32).swap_bytes()) as u64
                     } else {
                         a.swap_bytes()
                     };

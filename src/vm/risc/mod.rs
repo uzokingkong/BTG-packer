@@ -317,7 +317,7 @@ impl RiscProgram {
                 RiscOp::BSwap { width } => {
                     let a = get_val(ins.src1, &st, flags.raw);
                     let res = if width == 4 {
-                        (a.swap_bytes() as u32) as u64
+                        ((a as u32).swap_bytes()) as u64
                     } else {
                         a.swap_bytes()
                     };
