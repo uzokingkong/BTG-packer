@@ -12,12 +12,19 @@ bt_cdb.txt
 _*.txt
 _*.ps1
 _*.log
+_*.py
+_*.diff
+packed_*.map
+packed_*.sym
+packed_*.riscmap.csv
 
 # Archives / scratch
 *.zip
 *.rar
 *.7z
 temp_iced_src/
+scratch/
+src/bin/
 src/vm/count.ps1
 pack_log.txt
 pack_keep_log.txt
