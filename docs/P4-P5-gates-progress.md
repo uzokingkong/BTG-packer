@@ -128,7 +128,14 @@ TLS RVA 0x36e80 size 40  (IMAGE_TLS_DIRECTORY64)
 
 ## 5. 남은 일 / 다음 단계
 
-- [ ] P5: `detect_tls_callback_ranges` + run 기반 .text 복호화 구현 (2.4).
+- [x] **P5 기반 구현 완료** (`4958e74`): `detect_tls_callback_ranges` (TLS dir
+      AddressOfCallBacks → .pdata 함수 → **forward(callee) transitive closure**),
+      `patch_data::collect_protected_rva_ranges` 배선. 실측: **50 함수 / 0x23EE
+      바이트** 평문 유지 (양방향 closure 551 함수 대비 최소). `cargo test --release
+      --lib` → **222 passed; 0 failed**. `--vm --vm-oep` pack+run 16테스트 통과 +
+      checksum baseline 동일 (`0x2cdc0e4511d84a64`) — 무회귀.
+- [ ] P5: 부트 스텁 `emit_rest_decrypt`를 run 기반으로 확장해 콜백 외 .text 영역
+      복호화 (2.4 단계 3) → 실제 `.text` 온디스크 평문 0 달성.
 - [ ] P5: 콜백 함수 평문 유지 & 나머지 .text 암호화 검증 (verify_text.py +
       16테스트 + cdb).
 - [ ] P4: 브리지 진입 스텁 .pdata/UNWIND_INFO 생성기 (3.3).
