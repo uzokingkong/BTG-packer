@@ -154,7 +154,14 @@ CVTTSS2SI/CVTSS2SI/CVTTSD2SI/CVTSD2SI trunc/nearest-even), **BMI**(ANDN/BLSR/BLS
 **검증**: `btg-packer -i rust_packer_test.exe -o packed_commercial.exe --vm --vm-oep --vm-commercial`
 → 실행 시 **16개 테스트 전체 통과 + checksum baseline 동일**. `.map/.sym`이 RISC 바이트코드↔원본 VA 매핑을 기록. 기존 레거시 경로는 무회귀.
 
-### P4 — SEH 함수 가상화 (.pdata 재생성)  [5–7일]
+### P4 — SEH 함수 가상화 (.pdata 재생성)  [5–7일]  ✅ 부분 완료 (2026-08-15)
+**상태 (2026-08-15)**: `detect_seh_native_functions`(exclusions.rs)가 `BTG_SEH_MINIMAL`
+(기본 1) 환경변수로 **SEH 네이티브 175→132 최소화**(`ehandler ∩ can_reach_panic`).
+진단: panic_seed=38, ehandler=162, `{can_reach_panic − can_reach_ehandler}` 역방향 항
+0개 추가, 30개 ehandler panic 도달 불가 → 무해 가상화. 계측 출력 제거. `--vm`/`--vm-oep`
+16테스트 + checksum baseline 동일(`0x2cdc0e4511d84a64`). 0 목표는 exit-time 0xC0000005
+teardown으로 배제(132가 채택 최소치). `.pdata` 재생성(브리지 UNWIND_INFO)은 P3 `build.rs`
+에서 부분 구현 — 전체 SEH 가상화는 후속.
 **목표**: G5 해소 — panic/catch unwind 경로를 셔플/가상화하면서 OS unwind가 동작하게.
 
 **작업 항목**:

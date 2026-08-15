@@ -176,3 +176,42 @@ TLS RVA 0x36e80 size 40  (IMAGE_TLS_DIRECTORY64)
 - cdb (TLS callback RVA 0x1C1A0 / VA 0x14001c1a0) → **진입 9회** (startup·스레드 생성·
   teardown), 매번 정상 복귀, **0xC0000005 없음**. `e06d7363` C++ EH 예외 3회는
   test[10] catch_unwind의 정상 SEH unwinding.
+
+---
+
+## 7. P4 완료 — SEH 네이티브 집합 175→132 최소화 (autonomous run)
+
+> branch `commercial/p3-engine-integration` · node `ujiwo-zyris-code` · repo `asdfsadfecwecc`
+
+### 요약
+`detect_seh_native_functions`(exclusions.rs)가 네이티브로 유지하는 함수를
+**175 → 132** 로 줄였다. 두 세트 모두 `--vm`/`--vm-oep` 16개 테스트 + FINAL
+CHECKSUM `0x2cdc0e4511d84a64`(baseline 동일)를 만족하며, 132가 더 공격적인
+최소 세트라 채택했다.
+
+### 진단 (exclusions.rs 측정)
+- `panic_seed=38, ehandler=162, can_reach_panic=325, can_reach_ehandler=435`.
+- `ehandler_on_panic=132, ehandler_unreach=30`.
+- **기존 `{can_reach_panic − can_reach_ehandler}` 역방향 도달 항이 실제로
+  0개 추가** — 과도하게 광범위한 부분은 **162개 ehandler 전부**를 네이티브로
+  유지하는 것이었고, 그중 30개는 어떤 panic에서도 도달 불가(이 프로그램의
+  unwind와 무관, 무해하게 가상화됨).
+- **최소 세트 = raise..catch 경로에 실제 있는 catch/cleanup 프레임**
+  `ehandler ∩ can_reach_panic = 132`.
+
+### 구현 (`src/vm/text_lift/exclusions.rs`)
+- `BTG_SEH_MINIMAL`(기본 1) 환경변수 추가. `1`이면 위 최소 세트(132),
+  `0`이면 기존 전체 세트(175)로 A/B 회귀 가능.
+- **계측 출력(`[SEH-DEBUG]`/`[SEH-DEBUG2]`/`[SEH-LEVEL]` println) 제거.**
+- 0 목표는 테스트했으나 exit-time 0xC0000005 teardown이 남아 배제 — 132가
+  "16테스트 + 체크섬 계약"을 지키는 채택 최소치.
+
+### 검증 (전부 통과)
+- `cargo build --release` → exit 0.
+- `--vm` / `--vm-oep` 각각 pack+run → **16개 테스트 전체 통과**, FINAL CHECKSUM =
+  `0x2cdc0e4511d84a64` = baseline 동일. `SEH native-preservation: keeping 132
+  function(s)`.
+- `--vm --vm-oep --vm-commercial`(P3 상용 엔진)은 **기존(pre-existing)
+  0xC0000005**로 실행 불가 — baseline HEAD에서도 동일하게 크래시(이번 변경과
+  무관, P3 엔진 통합 진행 중).
+

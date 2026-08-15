@@ -100,3 +100,14 @@
 - [x] 커밋: `2a3d6c8`(인터프리터) · `ece32c9`(인코더) · `20af238`(차등 테스트+분기 수정), pushed to `origin/commercial/p1-poly-complete`.
 
 > 진행: **P2 — RISC 리프터 커버리지 100%** (미착수, 다음 게이트).
+
+### P4 — SEH 네이티브 집합 175→132 최소화 ✅ (2026-08-15)
+- [x] `detect_seh_native_functions`가 `BTG_SEH_MINIMAL`(기본 1) 환경변수로 최소 세트
+      `ehandler ∩ can_reach_panic = 132`만 네이티브 유지 (175→132).
+- [x] 진단: panic_seed=38, ehandler=162, `{can_reach_panic − can_reach_ehandler}` 역방향
+      항 0개 추가, 30개 ehandler panic 도달 불가 → 무해 가상화.
+- [x] 계측 출력(`[SEH-DEBUG]`/`[SEH-DEBUG2]`/`[SEH-LEVEL]`) 제거.
+- [x] `--vm`/`--vm-oep` 16테스트 전체 통과 + FINAL CHECKSUM `0x2cdc0e4511d84a64`
+      (baseline 동일).
+- [ ] 0 목표는 exit-time 0xC0000005 teardown으로 배제(132가 채택 최소치).
+- [ ] `.pdata` 재생성(브리지 UNWIND_INFO) 통한 전체 SEH 가상화 — 후속.
