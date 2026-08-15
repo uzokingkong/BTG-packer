@@ -116,6 +116,15 @@ Themida/VMProtect급 VM 컴파일러가 갖춰야 할 최소 역량을 아래 6�
 폴리 인터프리터 == eval_state == (가능하면) 네이티브 하네스, 3 seeds × 각 시나리오.
 
 ### P2 — RISC 리프터 명령 커버리지 100% (Full RISC Lifting)  [5–7일]  🔶 진행 중
+**상태 (2026-08-15 후속)**: **문자열 ops**(MOVS/STOS/LODS/SCAS/CMPS 전 폭 + REP/REPE/REPNE 명시적 루프),
+**SSE/FPU 스칼라**(MOVSD/MOVSS 로드/스토어, ADDSS/SD·SUB·MUL·DIV, CVTSI2SS/SD·CVTSS2SD/CVTSD2SS·
+CVTTSS2SI/CVTSS2SI/CVTTSD2SI/CVTSD2SI trunc/nearest-even), **BMI**(ANDN/BLSR/BLSMSK/BLSI/BZHI) 를
+`src/vm/risc/lifter.rs`에서 리프트 완료. XMM 레지스터 파일은 가상 메모리 영역
+`XMM_SLOT_BASE + idx*16`(mem)으로 매핑, 스칼라 하위 요소만 접근. 신규 전용 원시 op
+`FloatAdd/FloatSub/FloatMul/FloatDiv/IntToFloat/FloatToInt/FloatToFloat`를 `opcodes.rs`+
+`eval_state`(참조)에 추가(FP 는 정수 원자로 분해 불가 — "strictly required"). 리프터 레벨
+선형 블록 단위 차등 테스트 22개 신설. `cargo test --release --lib` → **220 passed; 0 failed**
+(기준 198). 폴리/네이티브 해석·컴파일은 아직 이 FP op 미지원(isa_spec 미포함, no-op arm).
 **목표**: G3 해소 — `vm/risc/lifter.rs`가 레거시 171-opcode 커버리지와 동등해지도록 확장.
 
 **작업 항목** (레거시 `vm/lifter/` + `vm/text_lift/` 커버리지와 대조하며):

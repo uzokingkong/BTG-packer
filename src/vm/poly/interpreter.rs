@@ -402,6 +402,15 @@ impl PolymorphicInterpreter {
                 RiscOp::Halt => {
                     break;
                 }
+                // P2 SSE/FPU 스칼라 — 아직 폴리모픽 인코딩 대상이 아님 (isa_spec 미포함).
+                // 리프터 레벨 차등 검증은 `eval_state`(참조)를 기준으로 하므로 여기선 no-op.
+                RiscOp::FloatAdd { .. }
+                | RiscOp::FloatSub { .. }
+                | RiscOp::FloatMul { .. }
+                | RiscOp::FloatDiv { .. }
+                | RiscOp::IntToFloat { .. }
+                | RiscOp::FloatToInt { .. }
+                | RiscOp::FloatToFloat { .. } => {}
             }
         }
 

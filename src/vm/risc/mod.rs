@@ -406,6 +406,76 @@ impl RiscProgram {
                         flags.set_zf(false);
                     }
                 }
+                RiscOp::FloatAdd { width } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let res = if width == 4 {
+                        (f32::from_bits(a as u32) + f32::from_bits(b as u32)).to_bits() as u64
+                    } else {
+                        (f64::from_bits(a) + f64::from_bits(b)).to_bits()
+                    };
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::FloatSub { width } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let res = if width == 4 {
+                        (f32::from_bits(a as u32) - f32::from_bits(b as u32)).to_bits() as u64
+                    } else {
+                        (f64::from_bits(a) - f64::from_bits(b)).to_bits()
+                    };
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::FloatMul { width } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let res = if width == 4 {
+                        (f32::from_bits(a as u32) * f32::from_bits(b as u32)).to_bits() as u64
+                    } else {
+                        (f64::from_bits(a) * f64::from_bits(b)).to_bits()
+                    };
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::FloatDiv { width } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let res = if width == 4 {
+                        (f32::from_bits(a as u32) / f32::from_bits(b as u32)).to_bits() as u64
+                    } else {
+                        (f64::from_bits(a) / f64::from_bits(b)).to_bits()
+                    };
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::IntToFloat { src_bits, dst_bits } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let iv = if src_bits == 4 { (a as i32) as i64 } else { a as i64 };
+                    let res = if dst_bits == 4 {
+                        (iv as f32).to_bits() as u64
+                    } else {
+                        (iv as f64).to_bits()
+                    };
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::FloatToInt { src_bits, dst_bits, truncate } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let f = if src_bits == 4 { f32::from_bits(a as u32) as f64 } else { f64::from_bits(a) };
+                    let iv = if truncate {
+                        (f.trunc() as i64) as u64
+                    } else {
+                        round_ties_even(f) as u64
+                    };
+                    let res = if dst_bits == 8 { iv } else { iv & 0xFFFF_FFFF };
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::FloatToFloat { src_bits, dst_bits } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let res = if src_bits == 4 {
+                        (f32::from_bits(a as u32) as f64).to_bits()
+                    } else {
+                        (f64::from_bits(a) as f32).to_bits() as u64
+                    };
+                    store(ins.dst, &mut st, res);
+                }
             }
             vip += 1;
         }
@@ -485,6 +555,18 @@ fn width_mask(bits: u32) -> u64 {
         u64::MAX
     } else {
         (1u64 << bits) - 1
+    }
+}
+
+/// round-to-nearest-even (x86 MXCSR 기본 RC) — 정확히 half-way 인 경우 짝수 쪽으로 반올림.
+fn round_ties_even(x: f64) -> i64 {
+    let fl = x.floor();
+    let diff = x - fl;
+    if diff == 0.5 {
+        let f = fl as i64;
+        if f % 2 == 0 { f } else { f + 1 }
+    } else {
+        x.round() as i64
     }
 }
 

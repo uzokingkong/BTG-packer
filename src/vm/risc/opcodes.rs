@@ -96,6 +96,15 @@ pub enum RiscOp {
     /// CMPXCHG — `[src1] == RAX` 이면 `[src1] = src2`·ZF=1, 아니면 `RAX = [src1]`·ZF=0.
     /// (누산기 RAX = regs[0], 폭별 마스크. 폭 8 이면 RAX 전체.)
     CompareExchange { width: u8 },
+
+    // P2: SSE/FPU scalar
+    FloatAdd { width: u8 },
+    FloatSub { width: u8 },
+    FloatMul { width: u8 },
+    FloatDiv { width: u8 },
+    IntToFloat { src_bits: u8, dst_bits: u8 },
+    FloatToInt { src_bits: u8, dst_bits: u8, truncate: bool },
+    FloatToFloat { src_bits: u8, dst_bits: u8 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -13,6 +13,60 @@ use super::opcodes::{BranchCondition, MicroInstr, MicroOperand, RiscOp};
 use anyhow::{anyhow, Result};
 use iced_x86::{Code, Instruction, OpKind, Register};
 
+/// XMM 레지스터 파일이 위치하는 가상 메모리 영역 기준 주소.
+/// 각 XMM(i) 은 `mem[XMM_SLOT_BASE + i*16 .. +16]` 의 128비트 슬롯으로 존재한다.
+/// 스칼라 연산은 하위 요소(4/8B)만 접근 — 상위 바이트는 x86 스칼라 의미론대로 보존.
+const XMM_SLOT_BASE: u64 = 0xF000_0000_0000_0000;
+
+/// REP / REPE / REPNE 프리픽스 존재 여부 (string ops). `has_rep_prefix()` 는
+/// REPNE(0xF2) 에는 false 를 돌려주므로 둘 다 확인해야 한다.
+fn has_any_rep(inst: &Instruction) -> bool {
+    inst.has_rep_prefix() || inst.has_repne_prefix()
+}
+
+/// STOS/LODS 요소 폭 (bytes).
+fn stos_lods_width(code: Code) -> u8 {
+    use iced_x86::Code::*;
+    match code {
+        Stosb_m8_AL | Lodsb_AL_m8 => 1,
+        Stosw_m16_AX | Lodsw_AX_m16 => 2,
+        Stosd_m32_EAX | Lodsd_EAX_m32 => 4,
+        _ => 8,
+    }
+}
+
+/// SCAS/CMPS 요소 폭 (bytes).
+fn scas_cmps_width(code: Code) -> u8 {
+    use iced_x86::Code::*;
+    match code {
+        Scasb_AL_m8 | Cmpsb_m8_m8 => 1,
+        Scasw_AX_m16 | Cmpsw_m16_m16 => 2,
+        Scasd_EAX_m32 | Cmpsd_m32_m32 => 4,
+        _ => 8,
+    }
+}
+
+/// MOVS 요소 폭 (bytes).
+fn movs_width(code: Code) -> u8 {
+    use iced_x86::Code::*;
+    match code {
+        Movsb_m8_m8 => 1,
+        Movsw_m16_m16 => 2,
+        Movsd_m32_m32 => 4,
+        _ => 8,
+    }
+}
+
+/// 폭별 마스크 (0-확장용).
+fn width_mask_u64(width: u8) -> u64 {
+    match width {
+        1 => 0xFF,
+        2 => 0xFFFF,
+        4 => 0xFFFF_FFFF,
+        _ => u64::MAX,
+    }
+}
+
 /// 산술/논리 2항 연산의 디스패치 종류.
 #[derive(Clone, Copy)]
 enum Alu {
@@ -33,6 +87,15 @@ impl Alu {
             Alu::Or => d.emit_or(dst, a, b),
         }
     }
+}
+
+/// SSE/FPU 스칼라 산술 연산 종류 (ADDSS/SD·SUB·MUL·DIV).
+#[derive(Clone, Copy)]
+enum FPArith {
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
 pub struct RiscLifter {
@@ -527,6 +590,500 @@ impl RiscLifter {
             }
             _ => return Err(anyhow!("risc lifter: invalid xadd op0")),
         }
+        Ok(())
+    }
+
+    // ── P2: XMM 레지스터 파일 (mem[XMM_SLOT_BASE + idx*16]) ──────────────────
+
+    /// XMM0-15 레지스터 → XMM 슬롯 인덱스 (0..16). GPR 이면 None.
+    fn xmm_index(reg: Register) -> Option<u8> {
+        match reg {
+            Register::XMM0 => Some(0),
+            Register::XMM1 => Some(1),
+            Register::XMM2 => Some(2),
+            Register::XMM3 => Some(3),
+            Register::XMM4 => Some(4),
+            Register::XMM5 => Some(5),
+            Register::XMM6 => Some(6),
+            Register::XMM7 => Some(7),
+            Register::XMM8 => Some(8),
+            Register::XMM9 => Some(9),
+            Register::XMM10 => Some(10),
+            Register::XMM11 => Some(11),
+            Register::XMM12 => Some(12),
+            Register::XMM13 => Some(13),
+            Register::XMM14 => Some(14),
+            Register::XMM15 => Some(15),
+            _ => None,
+        }
+    }
+
+    /// XMM 슬롯 절대 주소(XMM_SLOT_BASE + idx*16)를 `dst`(Temp)에 계산.
+    fn xmm_slot_addr(&mut self, idx: u8, dst: MicroOperand) {
+        let t = MicroOperand::Temp(2);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::Mov).with_dst(t).with_src1(MicroOperand::Imm64(idx as u64)),
+        );
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::ShiftLeft)
+                .with_dst(t)
+                .with_src1(t)
+                .with_src2(MicroOperand::Imm64(4)),
+        );
+        self.desynth.emit_add(dst, MicroOperand::Imm64(XMM_SLOT_BASE), t);
+    }
+
+    /// XMM `idx` 슬롯 하위 `width`바이트 요소를 `val`(Temp)로 로드.
+    fn xmm_load_into(&mut self, idx: u8, width: u8, val: MicroOperand) {
+        let addr = MicroOperand::Temp(4);
+        self.xmm_slot_addr(idx, addr);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryRead { width }).with_dst(val).with_src1(addr),
+        );
+    }
+
+    /// `val`(하위 요소)을 XMM `idx` 슬롯에 `width`바이트로 기록.
+    fn xmm_store_from(&mut self, idx: u8, width: u8, val: MicroOperand) {
+        let addr = MicroOperand::Temp(4);
+        self.xmm_slot_addr(idx, addr);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryWrite { width }).with_src1(addr).with_src2(val),
+        );
+    }
+
+    /// MOVSS/MOVSD 로드 폼: dst XMM 슬롯의 상위(미저장) 바이트를 0으로
+    /// (x86: 스칼라 로드는 상위 요소를 0으로 만든다).
+    fn xmm_zero_upper(&mut self, idx: u8, low_width: u8) {
+        let base = MicroOperand::Temp(4);
+        self.xmm_slot_addr(idx, base);
+        let zero = MicroOperand::Imm64(0);
+        let mut off = low_width as u64;
+        while off < 16 {
+            let a = MicroOperand::Temp(2);
+            self.desynth.emit_add(a, base, MicroOperand::Imm64(off));
+            let w = if 16 - off >= 8 { 8 } else { 4 };
+            self.desynth.instrs.push(
+                MicroInstr::new(RiscOp::MemoryWrite { width: w }).with_src1(a).with_src2(zero),
+            );
+            off += w as u64;
+        }
+    }
+
+    // ── P2: 문자열 ops (MOVS/STOS/LODS/SCAS/CMPS + REP/REPE/REPNE) ───────────
+
+    /// MOVS: [rdi]=[rsi]; rsi+=n; rdi+=n. REP → 카운트-다운 루프.
+    fn lift_movs(&mut self, inst: &Instruction) -> Result<()> {
+        let n = movs_width(inst.code()) as u64;
+        let width = n as u8;
+        let rsi = MicroOperand::VReg(6);
+        let rdi = MicroOperand::VReg(7);
+        let rcx = MicroOperand::VReg(1);
+        if !has_any_rep(inst) {
+            let val = MicroOperand::Temp(5);
+            self.desynth.instrs.push(
+                MicroInstr::new(RiscOp::MemoryRead { width }).with_dst(val).with_src1(rsi),
+            );
+            self.desynth.instrs.push(
+                MicroInstr::new(RiscOp::MemoryWrite { width }).with_src1(rdi).with_src2(val),
+            );
+            self.desynth.emit_add(rsi, rsi, MicroOperand::Imm64(n));
+            self.desynth.emit_add(rdi, rdi, MicroOperand::Imm64(n));
+            return Ok(());
+        }
+        let loop_start = self.desynth.instrs.len();
+        let scratch = MicroOperand::Temp(0);
+        self.desynth.emit_and(scratch, rcx, rcx); // ZF = (rcx == 0)
+        let done_br = self.desynth.instrs.len();
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Zero }).with_imm(0),
+        );
+        let val = MicroOperand::Temp(5);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryRead { width }).with_dst(val).with_src1(rsi),
+        );
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryWrite { width }).with_src1(rdi).with_src2(val),
+        );
+        self.desynth.emit_add(rsi, rsi, MicroOperand::Imm64(n));
+        self.desynth.emit_add(rdi, rdi, MicroOperand::Imm64(n));
+        self.desynth.emit_sub(rcx, rcx, MicroOperand::Imm64(1));
+        self.desynth.emit_jmp(loop_start as u64);
+        let done_idx = self.desynth.instrs.len();
+        self.desynth.instrs[done_br].imm = done_idx as u64;
+        Ok(())
+    }
+
+    /// STOS: [rdi]=AL/AX/EAX/RAX(vreg0, 폭별); rdi+=n. REP → 루프.
+    fn lift_stos(&mut self, inst: &Instruction) -> Result<()> {
+        let n = stos_lods_width(inst.code()) as u64;
+        let width = n as u8;
+        let acc = MicroOperand::VReg(0);
+        let rdi = MicroOperand::VReg(7);
+        let rcx = MicroOperand::VReg(1);
+        if !has_any_rep(inst) {
+            self.desynth.instrs.push(
+                MicroInstr::new(RiscOp::MemoryWrite { width }).with_src1(rdi).with_src2(acc),
+            );
+            self.desynth.emit_add(rdi, rdi, MicroOperand::Imm64(n));
+            return Ok(());
+        }
+        let loop_start = self.desynth.instrs.len();
+        let scratch = MicroOperand::Temp(0);
+        self.desynth.emit_and(scratch, rcx, rcx);
+        let done_br = self.desynth.instrs.len();
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Zero }).with_imm(0),
+        );
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryWrite { width }).with_src1(rdi).with_src2(acc),
+        );
+        self.desynth.emit_add(rdi, rdi, MicroOperand::Imm64(n));
+        self.desynth.emit_sub(rcx, rcx, MicroOperand::Imm64(1));
+        self.desynth.emit_jmp(loop_start as u64);
+        let done_idx = self.desynth.instrs.len();
+        self.desynth.instrs[done_br].imm = done_idx as u64;
+        Ok(())
+    }
+
+    /// LODS: AL/AX/EAX/RAX(vreg0) = [rsi] (0-확장); rsi+=n. REP → 루프.
+    fn lift_lods(&mut self, inst: &Instruction) -> Result<()> {
+        let n = stos_lods_width(inst.code()) as u64;
+        let width = n as u8;
+        let acc = MicroOperand::VReg(0);
+        let rsi = MicroOperand::VReg(6);
+        let rcx = MicroOperand::VReg(1);
+        let mask = width_mask_u64(width);
+        if !has_any_rep(inst) {
+            let val = MicroOperand::Temp(5);
+            self.desynth.instrs.push(
+                MicroInstr::new(RiscOp::MemoryRead { width }).with_dst(val).with_src1(rsi),
+            );
+            if width == 8 {
+                self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(acc).with_src1(val));
+            } else {
+                self.desynth.emit_and(acc, val, MicroOperand::Imm64(mask));
+            }
+            self.desynth.emit_add(rsi, rsi, MicroOperand::Imm64(n));
+            return Ok(());
+        }
+        let loop_start = self.desynth.instrs.len();
+        let scratch = MicroOperand::Temp(0);
+        self.desynth.emit_and(scratch, rcx, rcx);
+        let done_br = self.desynth.instrs.len();
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Zero }).with_imm(0),
+        );
+        let val = MicroOperand::Temp(5);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryRead { width }).with_dst(val).with_src1(rsi),
+        );
+        if width == 8 {
+            self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(acc).with_src1(val));
+        } else {
+            self.desynth.emit_and(acc, val, MicroOperand::Imm64(mask));
+        }
+        self.desynth.emit_add(rsi, rsi, MicroOperand::Imm64(n));
+        self.desynth.emit_sub(rcx, rcx, MicroOperand::Imm64(1));
+        self.desynth.emit_jmp(loop_start as u64);
+        let done_idx = self.desynth.instrs.len();
+        self.desynth.instrs[done_br].imm = done_idx as u64;
+        Ok(())
+    }
+
+    /// SCAS/CMPS 비교 피연산자를 (lhs=Temp6, rhs=Temp7) 로 준비.
+    /// SCAS: lhs = acc(폭별 마스크), rhs = [rdi]. CMPS: lhs = [rsi], rhs = [rdi].
+    fn scas_cmps_operands(&mut self, width: u8, is_cmps: bool) {
+        let acc = MicroOperand::VReg(0);
+        let rsi = MicroOperand::VReg(6);
+        let rdi = MicroOperand::VReg(7);
+        let lhs = MicroOperand::Temp(6);
+        if is_cmps {
+            self.desynth.instrs.push(
+                MicroInstr::new(RiscOp::MemoryRead { width }).with_dst(lhs).with_src1(rsi),
+            );
+        } else if width == 8 {
+            self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(lhs).with_src1(acc));
+        } else {
+            self.desynth.emit_and(lhs, acc, MicroOperand::Imm64(width_mask_u64(width)));
+        }
+        let rhs = MicroOperand::Temp(7);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryRead { width }).with_dst(rhs).with_src1(rdi),
+        );
+    }
+
+    /// SCAS: flags = AL/AX/EAX/RAX - [rdi]; rdi+=n. REPE/REPNE → ZF 중단.
+    fn lift_scas(&mut self, inst: &Instruction) -> Result<()> {
+        let n = scas_cmps_width(inst.code()) as u64;
+        let width = n as u8;
+        let rdi = MicroOperand::VReg(7);
+        let rcx = MicroOperand::VReg(1);
+        if !has_any_rep(inst) {
+            self.scas_cmps_operands(width, false);
+            // [rdi] 읽기 후 rdi+=n (플래그 훼손 가능) — 비교 SUB 를 마지막에 내보내
+            // 최종 플래그가 비교 결과가 되도록 한다.
+            self.desynth.emit_add(rdi, rdi, MicroOperand::Imm64(n));
+            let scratch = MicroOperand::Temp(5);
+            self.desynth.emit_sub(scratch, MicroOperand::Temp(6), MicroOperand::Temp(7));
+            return Ok(());
+        }
+        let stop_cond = if inst.has_repne_prefix() {
+            BranchCondition::Zero // REPNE: 같으면(ZF) 중단
+        } else {
+            BranchCondition::NotZero // REPE/REP: 다르면(ZF=0) 중단
+        };
+        let loop_start = self.desynth.instrs.len();
+        let scratch = MicroOperand::Temp(0);
+        self.desynth.emit_and(scratch, rcx, rcx);
+        let done_br = self.desynth.instrs.len();
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Zero }).with_imm(0),
+        );
+        self.scas_cmps_operands(width, false);
+        self.desynth.emit_sub(scratch, MicroOperand::Temp(6), MicroOperand::Temp(7)); // 실비교 → 플래그
+        let captured = MicroOperand::Temp(2);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::Setcc { cond: stop_cond }).with_dst(captured),
+        );
+        self.desynth.emit_add(rdi, rdi, MicroOperand::Imm64(n));
+        self.desynth.emit_sub(rcx, rcx, MicroOperand::Imm64(1));
+        // captured 가 참이면 fix_flags 로 분기 (ZStop 조건 충족)
+        let tz = MicroOperand::Temp(0);
+        self.desynth.emit_sub(tz, captured, MicroOperand::Imm64(0)); // ZF = (captured==0)
+        let fix_br = self.desynth.instrs.len();
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::NotZero }).with_imm(0),
+        );
+        self.desynth.emit_jmp(loop_start as u64);
+        // fix_flags: 최종(중단) 비교의 정확한 플래그 재생성 (lhs/rhs 는 Temp6/7 보존)
+        let fix_idx = self.desynth.instrs.len();
+        self.desynth.emit_sub(scratch, MicroOperand::Temp(6), MicroOperand::Temp(7));
+        let done_idx = self.desynth.instrs.len();
+        self.desynth.instrs[done_br].imm = done_idx as u64;
+        self.desynth.instrs[fix_br].imm = fix_idx as u64;
+        Ok(())
+    }
+
+    /// CMPS: flags = [rsi] - [rdi]; rsi+=n; rdi+=n. REPE/REPNE → ZF 중단.
+    fn lift_cmps(&mut self, inst: &Instruction) -> Result<()> {
+        let n = scas_cmps_width(inst.code()) as u64;
+        let width = n as u8;
+        let rsi = MicroOperand::VReg(6);
+        let rdi = MicroOperand::VReg(7);
+        let rcx = MicroOperand::VReg(1);
+        if !has_any_rep(inst) {
+            self.scas_cmps_operands(width, true);
+            self.desynth.emit_add(rsi, rsi, MicroOperand::Imm64(n));
+            self.desynth.emit_add(rdi, rdi, MicroOperand::Imm64(n));
+            let scratch = MicroOperand::Temp(5);
+            self.desynth.emit_sub(scratch, MicroOperand::Temp(6), MicroOperand::Temp(7));
+            return Ok(());
+        }
+        let stop_cond = if inst.has_repne_prefix() {
+            BranchCondition::Zero
+        } else {
+            BranchCondition::NotZero
+        };
+        let loop_start = self.desynth.instrs.len();
+        let scratch = MicroOperand::Temp(0);
+        self.desynth.emit_and(scratch, rcx, rcx);
+        let done_br = self.desynth.instrs.len();
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Zero }).with_imm(0),
+        );
+        self.scas_cmps_operands(width, true);
+        self.desynth.emit_sub(scratch, MicroOperand::Temp(6), MicroOperand::Temp(7));
+        let captured = MicroOperand::Temp(2);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::Setcc { cond: stop_cond }).with_dst(captured),
+        );
+        self.desynth.emit_add(rsi, rsi, MicroOperand::Imm64(n));
+        self.desynth.emit_add(rdi, rdi, MicroOperand::Imm64(n));
+        self.desynth.emit_sub(rcx, rcx, MicroOperand::Imm64(1));
+        let tz = MicroOperand::Temp(0);
+        self.desynth.emit_sub(tz, captured, MicroOperand::Imm64(0));
+        let fix_br = self.desynth.instrs.len();
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::NotZero }).with_imm(0),
+        );
+        self.desynth.emit_jmp(loop_start as u64);
+        let fix_idx = self.desynth.instrs.len();
+        self.desynth.emit_sub(scratch, MicroOperand::Temp(6), MicroOperand::Temp(7));
+        let done_idx = self.desynth.instrs.len();
+        self.desynth.instrs[done_br].imm = done_idx as u64;
+        self.desynth.instrs[fix_br].imm = fix_idx as u64;
+        Ok(())
+    }
+
+    // ── P2: SSE/FPU 스칼라 ───────────────────────────────────────────────────
+
+    /// MOVSS/MOVSD 로드 폼 (xmm ← xmm/mem). 로드 시 상위 바이트는 0으로.
+    fn lift_sse_mov_load(&mut self, inst: &Instruction) -> Result<()> {
+        let width = if matches!(inst.code(), Code::Movsd_xmm_xmmm64) { 8 } else { 4 };
+        let dst_idx = Self::xmm_index(inst.op0_register())
+            .ok_or_else(|| anyhow!("invalid sse mov dst"))?;
+        match inst.op1_kind() {
+            OpKind::Register => {
+                let src_idx = Self::xmm_index(inst.op1_register())
+                    .ok_or_else(|| anyhow!("invalid sse mov src"))?;
+                let val = MicroOperand::Temp(6);
+                self.xmm_load_into(src_idx, width, val);
+                self.xmm_store_from(dst_idx, width, val);
+            }
+            OpKind::Memory => {
+                let val = self.operand_value(inst, 1)?;
+                self.xmm_store_from(dst_idx, width, val);
+            }
+            _ => return Err(anyhow!("risc lifter: invalid sse mov op1")),
+        }
+        self.xmm_zero_upper(dst_idx, width);
+        Ok(())
+    }
+
+    /// MOVSS/MOVSD 스토어 폼 (m ← xmm).
+    fn lift_sse_mov_store(&mut self, inst: &Instruction) -> Result<()> {
+        let width = if matches!(inst.code(), Code::Movsd_xmmm64_xmm) { 8 } else { 4 };
+        let src_idx = Self::xmm_index(inst.op1_register())
+            .ok_or_else(|| anyhow!("invalid sse mov src"))?;
+        if inst.op0_kind() == OpKind::Register {
+            let dst_idx = Self::xmm_index(inst.op0_register())
+                .ok_or_else(|| anyhow!("invalid sse mov dst"))?;
+            let val = MicroOperand::Temp(6);
+            self.xmm_load_into(src_idx, width, val);
+            self.xmm_store_from(dst_idx, width, val);
+            return Ok(());
+        }
+        // xmm_load_into 는 내부적으로 Temp(4) 를 주소 스크래치로 쓰므로, 스토어 주소는
+        // Temp(5) 에 보존해야 한다 (Temp(4) 면 덮여 XMM 슬롯에 잘못 기록된다).
+        let addr = MicroOperand::Temp(5);
+        self.lower_effective_address(inst, addr)?;
+        let val = MicroOperand::Temp(6);
+        self.xmm_load_into(src_idx, width, val);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryWrite { width }).with_src1(addr).with_src2(val),
+        );
+        Ok(())
+    }
+
+    /// ADDSS/ADDSD/SUBSS/SUBSD/MULSS/MULSD/DIVSS/DIVSD — dst.low OP= src.low.
+    fn lift_sse_fp_bin(&mut self, inst: &Instruction, arith: FPArith) -> Result<()> {
+        let width = if matches!(
+            inst.code(),
+            Code::Addsd_xmm_xmmm64 | Code::Subsd_xmm_xmmm64
+                | Code::Mulsd_xmm_xmmm64 | Code::Divsd_xmm_xmmm64
+        ) { 8 } else { 4 };
+        let dst_idx = Self::xmm_index(inst.op0_register())
+            .ok_or_else(|| anyhow!("invalid sse fp dst"))?;
+        let a = MicroOperand::Temp(5);
+        self.xmm_load_into(dst_idx, width, a);
+        let b = if inst.op1_kind() == OpKind::Register {
+            let src_idx = Self::xmm_index(inst.op1_register())
+                .ok_or_else(|| anyhow!("invalid sse fp src"))?;
+            let t = MicroOperand::Temp(6);
+            self.xmm_load_into(src_idx, width, t);
+            t
+        } else if inst.op1_kind() == OpKind::Memory {
+            self.operand_value(inst, 1)?
+        } else {
+            return Err(anyhow!("risc lifter: invalid sse fp op1"));
+        };
+        let dst = MicroOperand::Temp(7);
+        let op = match arith {
+            FPArith::Add => RiscOp::FloatAdd { width },
+            FPArith::Sub => RiscOp::FloatSub { width },
+            FPArith::Mul => RiscOp::FloatMul { width },
+            FPArith::Div => RiscOp::FloatDiv { width },
+        };
+        self.desynth.instrs.push(MicroInstr::new(op).with_dst(dst).with_src1(a).with_src2(b));
+        self.xmm_store_from(dst_idx, width, dst);
+        Ok(())
+    }
+
+    /// CVTSI2SS/CVTSI2SD — xmm[dst].low = (fp)vreg[src]; 상위 0.
+    fn lift_cvtsi2fp(&mut self, inst: &Instruction) -> Result<()> {
+        let dst_bits = if matches!(inst.code(), Code::Cvtsi2sd_xmm_rm32 | Code::Cvtsi2sd_xmm_rm64) {
+            8
+        } else {
+            4
+        };
+        let src_bits = if matches!(inst.code(), Code::Cvtsi2ss_xmm_rm64 | Code::Cvtsi2sd_xmm_rm64) {
+            8
+        } else {
+            4
+        };
+        let dst_idx = Self::xmm_index(inst.op0_register())
+            .ok_or_else(|| anyhow!("invalid cvt dst"))?;
+        let src = self.operand_value(inst, 1)?;
+        let val = MicroOperand::Temp(7);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::IntToFloat { src_bits, dst_bits }).with_dst(val).with_src1(src),
+        );
+        self.xmm_store_from(dst_idx, dst_bits, val);
+        self.xmm_zero_upper(dst_idx, dst_bits);
+        Ok(())
+    }
+
+    /// CVTSS2SD/CVTSD2SS — xmm[dst].low = convert(xmm[src].low); 상위 0.
+    fn lift_cvtfp2fp(&mut self, inst: &Instruction) -> Result<()> {
+        let (src_bits, dst_bits) =
+            if matches!(inst.code(), Code::Cvtss2sd_xmm_xmmm32) { (4u8, 8u8) } else { (8u8, 4u8) };
+        let dst_idx = Self::xmm_index(inst.op0_register())
+            .ok_or_else(|| anyhow!("invalid cvt dst"))?;
+        let src_val = if inst.op1_kind() == OpKind::Register {
+            let src_idx = Self::xmm_index(inst.op1_register())
+                .ok_or_else(|| anyhow!("invalid cvt src"))?;
+            let t = MicroOperand::Temp(6);
+            self.xmm_load_into(src_idx, src_bits, t);
+            t
+        } else if inst.op1_kind() == OpKind::Memory {
+            self.operand_value(inst, 1)?
+        } else {
+            return Err(anyhow!("risc lifter: invalid cvt op1"));
+        };
+        let val = MicroOperand::Temp(7);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::FloatToFloat { src_bits, dst_bits }).with_dst(val).with_src1(src_val),
+        );
+        self.xmm_store_from(dst_idx, dst_bits, val);
+        self.xmm_zero_upper(dst_idx, dst_bits);
+        Ok(())
+    }
+
+    /// CVTTSS2SI/CVTSS2SI/CVTTSD2SI/CVTSD2SI — vreg[dst] = (int)xmm[src].low.
+    fn lift_cvtfp2si(&mut self, inst: &Instruction) -> Result<()> {
+        let src_bits = if matches!(
+            inst.code(),
+            Code::Cvttsd2si_r32_xmmm64 | Code::Cvttsd2si_r64_xmmm64
+                | Code::Cvtsd2si_r32_xmmm64 | Code::Cvtsd2si_r64_xmmm64
+        ) { 8 } else { 4 };
+        let dst_bits = if matches!(
+            inst.code(),
+            Code::Cvttss2si_r64_xmmm32 | Code::Cvttsd2si_r64_xmmm64
+                | Code::Cvtss2si_r64_xmmm32 | Code::Cvtsd2si_r64_xmmm64
+        ) { 8 } else { 4 };
+        let truncate = matches!(
+            inst.code(),
+            Code::Cvttss2si_r32_xmmm32 | Code::Cvttss2si_r64_xmmm32
+                | Code::Cvttsd2si_r32_xmmm64 | Code::Cvttsd2si_r64_xmmm64
+        );
+        let dst = Self::reg_to_vreg(inst.op0_register())
+            .ok_or_else(|| anyhow!("invalid cvt si dst"))?;
+        let src_val = if inst.op1_kind() == OpKind::Register {
+            let src_idx = Self::xmm_index(inst.op1_register())
+                .ok_or_else(|| anyhow!("invalid cvt si src"))?;
+            let t = MicroOperand::Temp(6);
+            self.xmm_load_into(src_idx, src_bits, t);
+            t
+        } else if inst.op1_kind() == OpKind::Memory {
+            self.operand_value(inst, 1)?
+        } else {
+            return Err(anyhow!("risc lifter: invalid cvt si op1"));
+        };
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::FloatToInt { src_bits, dst_bits, truncate })
+                .with_dst(dst)
+                .with_src1(src_val),
+        );
         Ok(())
     }
 
@@ -1267,7 +1824,9 @@ impl RiscLifter {
             Code::VEX_Blsmsk_r64_rm64 | Code::VEX_Blsmsk_r32_rm32 => {
                 let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid blsmsk dst"))?;
                 let a = self.operand_value(inst, 1)?;
-                let t = MicroOperand::Temp(0);
+                // emit_xor 는 내부적으로 Temp(0..2) 를 쓰므로, 그와 별개 Temp(3) 을 사용해
+                // a-1 결과를 보존 (Temp(0) 이면 중간에 덮여 XOR 이 깨진다).
+                let t = MicroOperand::Temp(3);
                 self.desynth.emit_sub(t, a, MicroOperand::Imm64(1));
                 self.desynth.emit_xor(dst, t, a);
                 self.zero_extend_dst_if32(inst, dst);
@@ -1322,6 +1881,38 @@ impl RiscLifter {
                 }
             }
 
+            // ── P2: 문자열 ops ────────────────────────────────────────────────
+            Code::Movsb_m8_m8 | Code::Movsw_m16_m16 | Code::Movsd_m32_m32 | Code::Movsq_m64_m64 => {
+                self.lift_movs(inst)?
+            }
+            Code::Stosb_m8_AL | Code::Stosw_m16_AX | Code::Stosd_m32_EAX | Code::Stosq_m64_RAX => {
+                self.lift_stos(inst)?
+            }
+            Code::Lodsb_AL_m8 | Code::Lodsw_AX_m16 | Code::Lodsd_EAX_m32 | Code::Lodsq_RAX_m64 => {
+                self.lift_lods(inst)?
+            }
+            Code::Scasb_AL_m8 | Code::Scasw_AX_m16 | Code::Scasd_EAX_m32 | Code::Scasq_RAX_m64 => {
+                self.lift_scas(inst)?
+            }
+            Code::Cmpsb_m8_m8 | Code::Cmpsw_m16_m16 | Code::Cmpsd_m32_m32 | Code::Cmpsq_m64_m64 => {
+                self.lift_cmps(inst)?
+            }
+
+            // ── P2: SSE/FPU 스칼라 ────────────────────────────────────────────
+            Code::Movsd_xmm_xmmm64 | Code::Movss_xmm_xmmm32 => self.lift_sse_mov_load(inst)?,
+            Code::Movsd_xmmm64_xmm | Code::Movss_xmmm32_xmm => self.lift_sse_mov_store(inst)?,
+            Code::Addsd_xmm_xmmm64 | Code::Addss_xmm_xmmm32 => self.lift_sse_fp_bin(inst, FPArith::Add)?,
+            Code::Subsd_xmm_xmmm64 | Code::Subss_xmm_xmmm32 => self.lift_sse_fp_bin(inst, FPArith::Sub)?,
+            Code::Mulsd_xmm_xmmm64 | Code::Mulss_xmm_xmmm32 => self.lift_sse_fp_bin(inst, FPArith::Mul)?,
+            Code::Divsd_xmm_xmmm64 | Code::Divss_xmm_xmmm32 => self.lift_sse_fp_bin(inst, FPArith::Div)?,
+            Code::Cvtsi2sd_xmm_rm32 | Code::Cvtsi2sd_xmm_rm64
+            | Code::Cvtsi2ss_xmm_rm32 | Code::Cvtsi2ss_xmm_rm64 => self.lift_cvtsi2fp(inst)?,
+            Code::Cvtss2sd_xmm_xmmm32 | Code::Cvtsd2ss_xmm_xmmm64 => self.lift_cvtfp2fp(inst)?,
+            Code::Cvttss2si_r32_xmmm32 | Code::Cvttss2si_r64_xmmm32
+            | Code::Cvtss2si_r32_xmmm32 | Code::Cvtss2si_r64_xmmm32
+            | Code::Cvttsd2si_r32_xmmm64 | Code::Cvttsd2si_r64_xmmm64
+            | Code::Cvtsd2si_r32_xmmm64 | Code::Cvtsd2si_r64_xmmm64 => self.lift_cvtfp2si(inst)?,
+
             _ => {
                 // Fallback for unsupported complex instruction
                 return Err(anyhow!("risc lifter: unsupported opcode {:?}", code));
@@ -1337,6 +1928,7 @@ mod tests {
     use super::*;
     use crate::vm::risc::{RiscEvalState, RiscProgram};
     use iced_x86::{Decoder, DecoderOptions};
+    use iced_x86::{BlockEncoder, BlockEncoderOptions, Instruction, InstructionBlock};
     use std::collections::HashMap;
 
     /// 바이트 버퍼를 리프팅하고 소스-IP → 인덱스 맵을 첨부한 프로그램을 만든다.
@@ -2068,5 +2660,388 @@ mod tests {
         init[1] = 0xFF; // rcx (vreg 1)
         let st = run(&enc.code_buffer, 0x140001000, init);
         assert_eq!(regs(&st)[0], 0xF0, "ANDN = ~rbx & rcx = ~0x0F & 0xFF");
+    }
+
+    // ── P2: 문자열 ops 차등 검증 (선형 블록 단위 동치) ──────────────────────────
+
+    /// 테스트 메모리 헬퍼: 리틀엔디언 `width`바이트 기록.
+    fn seed_mem(mem: &mut HashMap<u64, u8>, addr: u64, width: u8, val: u64) {
+        for i in 0..width {
+            mem.insert(addr.wrapping_add(i as u64), (val >> (i as u64 * 8)) as u8);
+        }
+    }
+
+    /// 테스트 메모리 헬퍼: 리틀엔디언 `width`바이트 읽기.
+    fn read_mem(mem: &HashMap<u64, u8>, addr: u64, width: u8) -> u64 {
+        let mut v = 0u64;
+        for i in 0..width {
+            v |= (*mem.get(&addr.wrapping_add(i as u64)).unwrap_or(&0) as u64) << (i as u64 * 8);
+        }
+        v
+    }
+
+    /// lift + `eval_state_with_mem` 실행 헬퍼.
+    fn run_mem(raw: &[u8], ip: u64, init: [u64; 16], mem: HashMap<u64, u8>) -> RiscEvalState {
+        lift(raw, ip).eval_state_with_mem(&init, mem)
+    }
+
+    /// BlockEncoder 로 x86 명령 블록을 바이트로 인코딩.
+    fn enc_block(insts: Vec<Instruction>) -> Vec<u8> {
+        let blk = InstructionBlock::new(&insts, 0x140001000);
+        BlockEncoder::encode(64, blk, BlockEncoderOptions::NONE).unwrap().code_buffer
+    }
+
+    /// XMM(i) 슬롯 가상 주소 (리프터와 동일 계약).
+    fn xmm_slot(idx: u8) -> u64 {
+        super::XMM_SLOT_BASE + (idx as u64) * 16
+    }
+
+    /// MOVSB (단일) — [rdi]=[rsi]; rsi/rdi += 1.
+    #[test]
+    fn test_lift_movsb_single() {
+        let raw = [0xA4, 0xC3];
+        let mut init = [0u64; 16];
+        init[6] = 0x1000;
+        init[7] = 0x2000;
+        let mut mem = HashMap::new();
+        mem.insert(0x1000, 0xAB);
+        let st = run_mem(&raw, 0x140001000, init, mem);
+        assert_eq!(st.regs[6], 0x1001, "rsi advanced by 1");
+        assert_eq!(st.regs[7], 0x2001, "rdi advanced by 1");
+        assert_eq!(st.mem.get(&0x2000), Some(&0xAB), "byte copied");
+    }
+
+    /// STOSD (단일) — [rdi]=EAX; rdi+=4.
+    #[test]
+    fn test_lift_stosd_single() {
+        let raw = [0xAB, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 0xDEAD_BEEF;
+        init[7] = 0x2000;
+        let st = run_mem(&raw, 0x140001000, init, HashMap::new());
+        assert_eq!(st.regs[7], 0x2004, "rdi advanced by 4");
+        assert_eq!(read_mem(&st.mem, 0x2000, 4), 0xDEAD_BEEF, "dword stored");
+    }
+
+    /// LODSW (단일) — AX = [rsi] (0-확장); rsi+=2.
+    #[test]
+    fn test_lift_lodsw_single() {
+        let raw = [0x66, 0xAD, 0xC3];
+        let mut init = [0u64; 16];
+        init[6] = 0x1000;
+        let mut mem = HashMap::new();
+        seed_mem(&mut mem, 0x1000, 2, 0x7AB9);
+        let st = run_mem(&raw, 0x140001000, init, mem);
+        assert_eq!(st.regs[0], 0x7AB9, "AX = [rsi] zero-extended");
+        assert_eq!(st.regs[6], 0x1002, "rsi advanced by 2");
+    }
+
+    /// SCASB (단일) — flags = AL - [rdi]; rdi+=1.
+    #[test]
+    fn test_lift_scasb_single() {
+        let raw = [0xAE, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 0x20;
+        init[7] = 0x2000;
+        let mut mem = HashMap::new();
+        mem.insert(0x2000, 0x20);
+        let st = run_mem(&raw, 0x140001000, init, mem);
+        assert_eq!(st.regs[7], 0x2001, "rdi advanced");
+        assert_ne!(st.flags & crate::vm::risc::flags::VFLAG_ZF, 0, "AL == [rdi] -> ZF");
+    }
+
+    /// CMPSQ (단일) — flags = [rsi] - [rdi]; rsi+=8; rdi+=8.
+    #[test]
+    fn test_lift_cmpsq_single() {
+        let raw = [0x48, 0xA7, 0xC3];
+        let mut init = [0u64; 16];
+        init[6] = 0x1000;
+        init[7] = 0x2000;
+        let mut mem = HashMap::new();
+        seed_mem(&mut mem, 0x1000, 8, 0x1234);
+        seed_mem(&mut mem, 0x2000, 8, 0x1234);
+        let st = run_mem(&raw, 0x140001000, init, mem);
+        assert_eq!(st.regs[6], 0x1008, "rsi advanced by 8");
+        assert_eq!(st.regs[7], 0x2008, "rdi advanced by 8");
+        assert_ne!(st.flags & crate::vm::risc::flags::VFLAG_ZF, 0, "equal -> ZF");
+    }
+
+    /// REP MOVSB — 카운트-다운 루프: rcx 소비, rsi/rdi += n*count, 메모리 복사.
+    #[test]
+    fn test_lift_rep_movsb() {
+        let raw = [0xF3, 0xA4, 0xC3];
+        let mut init = [0u64; 16];
+        init[6] = 0x1000;
+        init[7] = 0x2000;
+        init[1] = 3;
+        let mut mem = HashMap::new();
+        mem.insert(0x1000, 0x11);
+        mem.insert(0x1001, 0x22);
+        mem.insert(0x1002, 0x33);
+        let st = run_mem(&raw, 0x140001000, init, mem);
+        assert_eq!(st.regs[1], 0, "rcx consumed");
+        assert_eq!(st.regs[6], 0x1003, "rsi += 3");
+        assert_eq!(st.regs[7], 0x2003, "rdi += 3");
+        assert_eq!(st.mem.get(&0x2000), Some(&0x11));
+        assert_eq!(st.mem.get(&0x2002), Some(&0x33));
+    }
+
+    /// REP STOSB — 루프로 메모리 채우기.
+    #[test]
+    fn test_lift_rep_stosb() {
+        let raw = [0xF3, 0xAA, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 0x5A;
+        init[7] = 0x2000;
+        init[1] = 4;
+        let st = run_mem(&raw, 0x140001000, init, HashMap::new());
+        assert_eq!(st.regs[1], 0, "rcx consumed");
+        assert_eq!(st.regs[7], 0x2004, "rdi += 4");
+        for i in 0..4u64 {
+            assert_eq!(st.mem.get(&(0x2000 + i)), Some(&0x5A), "byte {i} stored");
+        }
+    }
+
+    /// REP LODSQ — 루프로 RAX 갱신 (마지막 로드), rsi += 8*count.
+    #[test]
+    fn test_lift_rep_lodsq() {
+        let raw = [0xF3, 0x48, 0xAD, 0xC3];
+        let mut init = [0u64; 16];
+        init[6] = 0x1000;
+        init[1] = 3;
+        let mut mem = HashMap::new();
+        seed_mem(&mut mem, 0x1000, 8, 111);
+        seed_mem(&mut mem, 0x1008, 8, 222);
+        seed_mem(&mut mem, 0x1010, 8, 333);
+        let st = run_mem(&raw, 0x140001000, init, mem);
+        assert_eq!(st.regs[1], 0, "rcx consumed");
+        assert_eq!(st.regs[6], 0x1018, "rsi += 24");
+        assert_eq!(st.regs[0], 333, "last loaded qword");
+    }
+
+    /// REPE SCASB — 불일치에서 중단; rdi/rcx 는 중단 반복까지 진행, 최종 플래그 = 마지막 비교.
+    #[test]
+    fn test_lift_repe_scasb_stops_on_mismatch() {
+        let raw = [0xF3, 0xAE, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 0x20;
+        init[7] = 0x2000;
+        init[1] = 3;
+        let mut mem = HashMap::new();
+        mem.insert(0x2000, 0x20); // match -> continue
+        mem.insert(0x2001, 0x21); // mismatch -> stop
+        let st = run_mem(&raw, 0x140001000, init, mem);
+        assert_eq!(st.regs[7], 0x2002, "two iterations advanced rdi");
+        assert_eq!(st.regs[1], 1, "rcx = 3-2");
+        assert_eq!(st.flags & crate::vm::risc::flags::VFLAG_ZF, 0, "final compare not equal -> ZF clear");
+    }
+
+    /// REPNE CMPSW — 일치에서 중단 (REPNE 는 ZF=1 에서 정지).
+    #[test]
+    fn test_lift_repne_cmpsw_stops_on_match() {
+        let raw = [0xF2, 0x66, 0xA7, 0xC3];
+        let mut init = [0u64; 16];
+        init[6] = 0x1000;
+        init[7] = 0x2000;
+        init[1] = 4;
+        let mut mem = HashMap::new();
+        seed_mem(&mut mem, 0x1000, 2, 0x1111);
+        seed_mem(&mut mem, 0x2000, 2, 0x2222);
+        seed_mem(&mut mem, 0x1002, 2, 0x3333);
+        seed_mem(&mut mem, 0x2002, 2, 0x3333);
+        let st = run_mem(&raw, 0x140001000, init, mem);
+        assert_eq!(st.regs[6], 0x1004, "two iters advanced rsi");
+        assert_eq!(st.regs[7], 0x2004, "two iters advanced rdi");
+        assert_eq!(st.regs[1], 2, "rcx = 4-2");
+        assert_ne!(st.flags & crate::vm::risc::flags::VFLAG_ZF, 0, "final compare equal -> ZF set");
+    }
+
+    // ── P2: SSE/FPU 스칼라 차등 검증 ──────────────────────────────────────────
+
+    /// ADDSD xmm0, xmm1 — 1.5 + 2.25 = 3.75.
+    #[test]
+    fn test_lift_addsd() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::Addsd_xmm_xmmm64, Register::XMM0, Register::XMM1).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut mem = HashMap::new();
+        seed_mem(&mut mem, xmm_slot(0), 8, 1.5f64.to_bits());
+        seed_mem(&mut mem, xmm_slot(1), 8, 2.25f64.to_bits());
+        let st = run_mem(&raw, 0x140001000, [0u64; 16], mem);
+        assert_eq!(f64::from_bits(read_mem(&st.mem, xmm_slot(0), 8)), 3.75, "1.5 + 2.25");
+    }
+
+    /// MULSD + DIVSD — (3.0 * 2.0) / 4.0 = 1.5.
+    #[test]
+    fn test_lift_mulsd_divsd() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::Mulsd_xmm_xmmm64, Register::XMM0, Register::XMM1).unwrap(),
+            Instruction::with2(Code::Divsd_xmm_xmmm64, Register::XMM0, Register::XMM2).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut mem = HashMap::new();
+        seed_mem(&mut mem, xmm_slot(0), 8, 3.0f64.to_bits());
+        seed_mem(&mut mem, xmm_slot(1), 8, 2.0f64.to_bits());
+        seed_mem(&mut mem, xmm_slot(2), 8, 4.0f64.to_bits());
+        let st = run_mem(&raw, 0x140001000, [0u64; 16], mem);
+        assert_eq!(f64::from_bits(read_mem(&st.mem, xmm_slot(0), 8)), 1.5, "mul then div");
+    }
+
+    /// SUBSS (f32) — 5.5f32 - 1.25f32 = 4.25f32.
+    #[test]
+    fn test_lift_subss() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::Subss_xmm_xmmm32, Register::XMM0, Register::XMM1).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut mem = HashMap::new();
+        seed_mem(&mut mem, xmm_slot(0), 4, 5.5f32.to_bits() as u64);
+        seed_mem(&mut mem, xmm_slot(1), 4, 1.25f32.to_bits() as u64);
+        let st = run_mem(&raw, 0x140001000, [0u64; 16], mem);
+        assert_eq!(f32::from_bits(read_mem(&st.mem, xmm_slot(0), 4) as u32), 4.25f32);
+    }
+
+    /// CVTSI2SD xmm0, rax — 정수 -> double.
+    #[test]
+    fn test_lift_cvtsi2sd() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::Cvtsi2sd_xmm_rm64, Register::XMM0, Register::RAX).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut init = [0u64; 16];
+        init[0] = 42;
+        let st = run_mem(&raw, 0x140001000, init, HashMap::new());
+        assert_eq!(f64::from_bits(read_mem(&st.mem, xmm_slot(0), 8)), 42.0);
+    }
+
+    /// CVTSS2SD (f32->f64) + CVTSD2SS (f64->f32).
+    #[test]
+    fn test_lift_cvtss2sd_cvtsd2ss() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::Cvtss2sd_xmm_xmmm32, Register::XMM1, Register::XMM0).unwrap(),
+            Instruction::with2(Code::Cvtsd2ss_xmm_xmmm64, Register::XMM2, Register::XMM1).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut mem = HashMap::new();
+        seed_mem(&mut mem, xmm_slot(0), 4, 2.5f32.to_bits() as u64);
+        let st = run_mem(&raw, 0x140001000, [0u64; 16], mem);
+        assert_eq!(f64::from_bits(read_mem(&st.mem, xmm_slot(1), 8)), 2.5, "f32->f64");
+        assert_eq!(f32::from_bits(read_mem(&st.mem, xmm_slot(2), 4) as u32), 2.5f32, "f64->f32");
+    }
+
+    /// CVTTSS2SI(trunc) vs CVTSS2SI(nearest-even) — half-way 반올림 차이.
+    #[test]
+    fn test_lift_cvttss2si_trunc_vs_cvtss2si_round() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::Cvttss2si_r64_xmmm32, Register::RAX, Register::XMM0).unwrap(), // trunc(2.5)=2
+            Instruction::with2(Code::Cvtss2si_r64_xmmm32, Register::RBX, Register::XMM0).unwrap(), // rne(2.5)=2
+            Instruction::with2(Code::Cvttss2si_r64_xmmm32, Register::RCX, Register::XMM1).unwrap(), // trunc(3.5)=3
+            Instruction::with2(Code::Cvtss2si_r64_xmmm32, Register::RDX, Register::XMM1).unwrap(), // rne(3.5)=4
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut mem = HashMap::new();
+        seed_mem(&mut mem, xmm_slot(0), 4, 2.5f32.to_bits() as u64);
+        seed_mem(&mut mem, xmm_slot(1), 4, 3.5f32.to_bits() as u64);
+        let st = run_mem(&raw, 0x140001000, [0u64; 16], mem);
+        assert_eq!(st.regs[0] as i64, 2, "trunc(2.5)=2 (rax)");
+        assert_eq!(st.regs[3] as i64, 2, "rne(2.5)=2 even (rbx)");
+        assert_eq!(st.regs[1] as i64, 3, "trunc(3.5)=3 (rcx)");
+        assert_eq!(st.regs[2] as i64, 4, "rne(3.5)=4 even (rdx)");
+    }
+
+    /// MOVSD xmm0, xmm1 (레지스터 로드 폼) — 하위 8바이트 복사.
+    #[test]
+    fn test_lift_movsd_reg() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::Movsd_xmm_xmmm64, Register::XMM0, Register::XMM1).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut mem = HashMap::new();
+        seed_mem(&mut mem, xmm_slot(1), 8, 9.75f64.to_bits());
+        let st = run_mem(&raw, 0x140001000, [0u64; 16], mem);
+        assert_eq!(f64::from_bits(read_mem(&st.mem, xmm_slot(0), 8)), 9.75);
+    }
+
+    /// MOVSD [rax], xmm0 (메모리 스토어) + MOVSD xmm1, [rax] (메모리 로드).
+    #[test]
+    fn test_lift_movsd_mem_load_store() {
+        let raw = enc_block(vec![
+            Instruction::with2(
+                Code::Movsd_xmmm64_xmm,
+                iced_x86::MemoryOperand::with_base(Register::RAX),
+                Register::XMM0,
+            )
+            .unwrap(),
+            Instruction::with2(
+                Code::Movsd_xmm_xmmm64,
+                Register::XMM1,
+                iced_x86::MemoryOperand::with_base(Register::RAX),
+            )
+            .unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut init = [0u64; 16];
+        init[0] = 0x4000;
+        let mut mem = HashMap::new();
+        seed_mem(&mut mem, xmm_slot(0), 8, 1234.5f64.to_bits());
+        let st = run_mem(&raw, 0x140001000, init, mem);
+        assert_eq!(f64::from_bits(read_mem(&st.mem, 0x4000, 8)), 1234.5, "stored to mem");
+        assert_eq!(f64::from_bits(read_mem(&st.mem, xmm_slot(1), 8)), 1234.5, "loaded back to xmm1");
+    }
+
+    // ── P2: BMI (BLSR/BLSMSK/BLSI/BZHI) 차등 검증 ────────────────────────────
+
+    /// BLSR r64 — x & (x-1) (lowest set bit clear).
+    #[test]
+    fn test_lift_blsr() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::VEX_Blsr_r64_rm64, Register::RAX, Register::RBX).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut init = [0u64; 16];
+        init[3] = 0b1110;
+        let st = run_mem(&raw, 0x140001000, init, HashMap::new());
+        assert_eq!(st.regs[0], 0b1100, "BLSR(0b1110) = 0b1110 & 0b1101");
+    }
+
+    /// BLSMSK r64 — x ^ (x-1).
+    #[test]
+    fn test_lift_blsmsk() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::VEX_Blsmsk_r64_rm64, Register::RAX, Register::RBX).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut init = [0u64; 16];
+        init[3] = 0b1110;
+        let st = run_mem(&raw, 0x140001000, init, HashMap::new());
+        assert_eq!(st.regs[0], 0b0011, "BLSMSK(0b1110) = 0b1110 ^ 0b1101");
+    }
+
+    /// BLSI r64 — x & -x (lowest set bit).
+    #[test]
+    fn test_lift_blsi() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::VEX_Blsi_r64_rm64, Register::RAX, Register::RBX).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut init = [0u64; 16];
+        init[3] = 0x18;
+        let st = run_mem(&raw, 0x140001000, init, HashMap::new());
+        assert_eq!(st.regs[0], 0b1000, "BLSI(0x18) = lowest set bit");
+    }
+
+    /// BZHI r64, r/m64, r64 — dst = x & ((1<<idx)-1).
+    #[test]
+    fn test_lift_bzhi() {
+        let raw = enc_block(vec![
+            Instruction::with3(Code::VEX_Bzhi_r64_rm64_r64, Register::RAX, Register::RBX, Register::RCX).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut init = [0u64; 16];
+        init[3] = 0xFF;
+        init[1] = 4;
+        let st = run_mem(&raw, 0x140001000, init, HashMap::new());
+        assert_eq!(st.regs[0], 0x0F, "BZHI(0xFF, 4) = 0x0F");
     }
 }

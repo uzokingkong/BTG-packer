@@ -856,6 +856,15 @@ impl NativeVmHarness {
             RiscOp::Halt => {
                 // ret (caller?�서 처리)
             }
+            // P2 SSE/FPU scalar - not yet native-compilable (not poly-encodable).
+            // Lifter-level diff tests use eval_state (reference); no-op here.
+            RiscOp::FloatAdd { .. }
+            | RiscOp::FloatSub { .. }
+            | RiscOp::FloatMul { .. }
+            | RiscOp::FloatDiv { .. }
+            | RiscOp::IntToFloat { .. }
+            | RiscOp::FloatToInt { .. }
+            | RiscOp::FloatToFloat { .. } => {}
         }
         Ok(())
     }
