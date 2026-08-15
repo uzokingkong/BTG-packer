@@ -39,6 +39,52 @@ pub struct RiscLifter {
     pub desynth: RiscDesynthesizer,
 }
 
+/// SETcc 16 조건 → BranchCondition.
+fn cond_for_setcc(code: Code) -> Option<BranchCondition> {
+    match code {
+        Code::Seta_rm8 => Some(BranchCondition::Above),
+        Code::Setae_rm8 => Some(BranchCondition::AboveOrEqual),
+        Code::Setb_rm8 => Some(BranchCondition::Below),
+        Code::Setbe_rm8 => Some(BranchCondition::BelowOrEqual),
+        Code::Sete_rm8 => Some(BranchCondition::Zero),
+        Code::Setne_rm8 => Some(BranchCondition::NotZero),
+        Code::Setg_rm8 => Some(BranchCondition::Greater),
+        Code::Setge_rm8 => Some(BranchCondition::GreaterOrEqual),
+        Code::Setl_rm8 => Some(BranchCondition::Less),
+        Code::Setle_rm8 => Some(BranchCondition::LessOrEqual),
+        Code::Seto_rm8 => Some(BranchCondition::Overflow),
+        Code::Setno_rm8 => Some(BranchCondition::NotOverflow),
+        Code::Setp_rm8 => Some(BranchCondition::Parity),
+        Code::Setnp_rm8 => Some(BranchCondition::NotParity),
+        Code::Sets_rm8 => Some(BranchCondition::Sign),
+        Code::Setns_rm8 => Some(BranchCondition::NotSign),
+        _ => None,
+    }
+}
+
+/// CMOVcc (16 조건 × 16/32/64) → BranchCondition.
+fn cond_for_cmov(code: Code) -> Option<BranchCondition> {
+    match code {
+        Code::Cmova_r16_rm16 | Code::Cmova_r32_rm32 | Code::Cmova_r64_rm64 => Some(BranchCondition::Above),
+        Code::Cmovae_r16_rm16 | Code::Cmovae_r32_rm32 | Code::Cmovae_r64_rm64 => Some(BranchCondition::AboveOrEqual),
+        Code::Cmovb_r16_rm16 | Code::Cmovb_r32_rm32 | Code::Cmovb_r64_rm64 => Some(BranchCondition::Below),
+        Code::Cmovbe_r16_rm16 | Code::Cmovbe_r32_rm32 | Code::Cmovbe_r64_rm64 => Some(BranchCondition::BelowOrEqual),
+        Code::Cmove_r16_rm16 | Code::Cmove_r32_rm32 | Code::Cmove_r64_rm64 => Some(BranchCondition::Zero),
+        Code::Cmovne_r16_rm16 | Code::Cmovne_r32_rm32 | Code::Cmovne_r64_rm64 => Some(BranchCondition::NotZero),
+        Code::Cmovg_r16_rm16 | Code::Cmovg_r32_rm32 | Code::Cmovg_r64_rm64 => Some(BranchCondition::Greater),
+        Code::Cmovge_r16_rm16 | Code::Cmovge_r32_rm32 | Code::Cmovge_r64_rm64 => Some(BranchCondition::GreaterOrEqual),
+        Code::Cmovl_r16_rm16 | Code::Cmovl_r32_rm32 | Code::Cmovl_r64_rm64 => Some(BranchCondition::Less),
+        Code::Cmovle_r16_rm16 | Code::Cmovle_r32_rm32 | Code::Cmovle_r64_rm64 => Some(BranchCondition::LessOrEqual),
+        Code::Cmovo_r16_rm16 | Code::Cmovo_r32_rm32 | Code::Cmovo_r64_rm64 => Some(BranchCondition::Overflow),
+        Code::Cmovno_r16_rm16 | Code::Cmovno_r32_rm32 | Code::Cmovno_r64_rm64 => Some(BranchCondition::NotOverflow),
+        Code::Cmovp_r16_rm16 | Code::Cmovp_r32_rm32 | Code::Cmovp_r64_rm64 => Some(BranchCondition::Parity),
+        Code::Cmovnp_r16_rm16 | Code::Cmovnp_r32_rm32 | Code::Cmovnp_r64_rm64 => Some(BranchCondition::NotParity),
+        Code::Cmovs_r16_rm16 | Code::Cmovs_r32_rm32 | Code::Cmovs_r64_rm64 => Some(BranchCondition::Sign),
+        Code::Cmovns_r16_rm16 | Code::Cmovns_r32_rm32 | Code::Cmovns_r64_rm64 => Some(BranchCondition::NotSign),
+        _ => None,
+    }
+}
+
 impl RiscLifter {
     pub fn new() -> Self {
         Self {
@@ -145,15 +191,17 @@ impl RiscLifter {
     /// 메모리->유효주소를 Temp(4)에 계산 후 MemoryRead를 Temp(6)에 로드하여 Temp 반환.
     /// (x86은 인스트럭션당 메모리 피연산자가 최대 하나이므로 Temp(4)/Temp(6) 충돌 없음.)
     fn operand_value(&mut self, inst: &Instruction, which: u8) -> Result<MicroOperand> {
-        let kind = if which == 0 {
-            inst.op0_kind()
-        } else {
-            inst.op1_kind()
+        let kind = match which {
+            0 => inst.op0_kind(),
+            1 => inst.op1_kind(),
+            2 => inst.op2_kind(),
+            _ => inst.op1_kind(),
         };
-        let reg = if which == 0 {
-            inst.op0_register()
-        } else {
-            inst.op1_register()
+        let reg = match which {
+            0 => inst.op0_register(),
+            1 => inst.op1_register(),
+            2 => inst.op2_register(),
+            _ => inst.op1_register(),
         };
         match kind {
             OpKind::Register => Self::reg_to_vreg(reg).ok_or_else(|| anyhow!("invalid operand register")),
@@ -348,6 +396,140 @@ impl RiscLifter {
         );
     }
 
+    /// P2: 연산 결과를 `width`바이트 폭으로 잘라낸다 (8/16/32비트 INC/DEC 등).
+    /// 32비트는 기존 zero-extension 헬퍼, 8/16비트는 AND 마스크로 표현한다.
+    fn mask_result(&mut self, width: u8, inst: &Instruction, dst: MicroOperand) -> Result<()> {
+        let mask = match width {
+            1 => 0xFF,
+            2 => 0xFFFF,
+            4 => 0xFFFF_FFFF,
+            _ => return Ok(()),
+        };
+        self.desynth.emit_and(dst, dst, MicroOperand::Imm64(mask));
+        Ok(())
+    }
+
+    /// P2: 피연산자 값을 `width`바이트 폭으로 마스크해 Temp 로 돌려준다.
+    /// (BSF/BSR/TEST/INC 등에서 16/32비트 피연산자의 상위 비트 영향을 제거.)
+    fn mask_operand(&mut self, op: MicroOperand, width: u8) -> Result<MicroOperand> {
+        let mask = match width {
+            1 => 0xFF,
+            2 => 0xFFFF,
+            4 => 0xFFFF_FFFF,
+            _ => return Ok(op),
+        };
+        let t = MicroOperand::Temp(3);
+        self.desynth.emit_and(t, op, MicroOperand::Imm64(mask));
+        Ok(t)
+    }
+
+    /// P2: TEST — 두 피연산자를 폭별로 마스크한 뒤 AND 의 플래그만 사용한다.
+    /// AND 디서인시스의 최종 NOR 가 `update_logic64`로 CF=OF=0·ZF/SF/PF 를 갱신.
+    fn lift_test(&mut self, inst: &Instruction) -> Result<()> {
+        let w = match inst.code() {
+            Code::Test_rm64_r64 | Code::Test_rm64_imm32 | Code::Test_RAX_imm32 => 8,
+            Code::Test_rm32_r32 | Code::Test_rm32_imm32 | Code::Test_EAX_imm32 => 4,
+            Code::Test_rm16_imm16 | Code::Test_rm16_r16 | Code::Test_AX_imm16 => 2,
+            _ => 1,
+        };
+        let v0 = self.operand_value(inst, 0)?;
+        let a = self.mask_operand(v0, w)?;
+        let v1 = self.operand_value(inst, 1)?;
+        let b = self.mask_operand(v1, w)?;
+        let scratch = MicroOperand::Temp(7);
+        self.desynth.emit_and(scratch, a, b);
+        Ok(())
+    }
+
+    /// P2: XCHG — 레지스터 교환 또는 레지스터↔메모리 교환.
+    fn lift_xchg(&mut self, inst: &Instruction) -> Result<()> {
+        let r0 = inst.op0_kind() == OpKind::Register;
+        let r1 = inst.op1_kind() == OpKind::Register;
+        if r0 && r1 {
+            let a = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid xchg a"))?;
+            let b = Self::reg_to_vreg(inst.op1_register()).ok_or_else(|| anyhow!("invalid xchg b"))?;
+            let ta = MicroOperand::Temp(0);
+            let tb = MicroOperand::Temp(1);
+            self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(ta).with_src1(a));
+            self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(tb).with_src1(b));
+            self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(a).with_src1(tb));
+            self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(b).with_src1(ta));
+            return Ok(());
+        }
+        // 하나는 메모리, 하나는 레지스터 (x86은 메모리-메모리 XCHG 불가).
+        let (reg, addr) = if r0 {
+            (Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid xchg reg"))?, inst)
+        } else if r1 {
+            (Self::reg_to_vreg(inst.op1_register()).ok_or_else(|| anyhow!("invalid xchg reg"))?, inst)
+        } else {
+            return Err(anyhow!("risc lifter: xchg mem,mem impossible"));
+        };
+        let t_addr = MicroOperand::Temp(4);
+        self.lower_effective_address(inst, t_addr)?;
+        let width = inst.memory_size().size() as u8;
+        let old = MicroOperand::Temp(5);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryRead { width })
+                .with_dst(old)
+                .with_src1(t_addr),
+        );
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryWrite { width })
+                .with_src1(t_addr)
+                .with_src2(reg),
+        );
+        self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(reg).with_src1(old));
+        Ok(())
+    }
+
+    /// P2: XADD — [op0] += op1, op1 = 이전 [op0]. (플래그는 덧셈 기준 — Mov 로 보존.)
+    fn lift_xadd(&mut self, inst: &Instruction) -> Result<()> {
+        let width = match inst.code() {
+            Code::Xadd_rm8_r8 => 1,
+            Code::Xadd_rm16_r16 => 2,
+            Code::Xadd_rm32_r32 => 4,
+            _ => 8,
+        };
+        let reg = Self::reg_to_vreg(inst.op1_register()).ok_or_else(|| anyhow!("invalid xadd reg"))?;
+        match inst.op0_kind() {
+            OpKind::Register => {
+                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid xadd dst"))?;
+                let old = MicroOperand::Temp(0);
+                self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(old).with_src1(dst));
+                // dst = old + reg  (XADD 덧셈 → 플래그)
+                self.desynth.emit_add(dst, old, reg);
+                self.mask_result(width, inst, dst)?;
+                // reg = 이전 dst (폭별 마스크된 값, 플래그 보존)
+                let oldm = self.mask_operand(old, width)?;
+                self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(reg).with_src1(oldm));
+            }
+            OpKind::Memory => {
+                let addr = MicroOperand::Temp(4);
+                self.lower_effective_address(inst, addr)?;
+                let old = MicroOperand::Temp(5);
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::MemoryRead { width })
+                        .with_dst(old)
+                        .with_src1(addr),
+                );
+                // 이전 [addr] 값을 폭별 마스크해 reg 로 옮길 값을 보존 (덧셈 전).
+                let oldm = self.mask_operand(old, width)?;
+                // [addr] = old + reg (플래그)
+                self.desynth.emit_add(old, old, reg);
+                self.mask_result(width, inst, old)?;
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::MemoryWrite { width })
+                        .with_src1(addr)
+                        .with_src2(old),
+                );
+                // reg = 이전 [addr] (플래그 보존)
+                self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(reg).with_src1(oldm));
+            }
+            _ => return Err(anyhow!("risc lifter: invalid xadd op0")),
+        }
+        Ok(())
+    }
+
     /// 단일 x86 명령어 리프팅
     pub fn lift_instruction(&mut self, inst: &Instruction) -> Result<()> {
         let code = inst.code();
@@ -358,7 +540,9 @@ impl RiscLifter {
                 let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
                 if inst.op1_kind() == OpKind::Register {
                     let src = Self::reg_to_vreg(inst.op1_register()).ok_or_else(|| anyhow!("invalid src"))?;
-                    self.desynth.emit_add(dst, src, MicroOperand::Imm64(0));
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Mov).with_dst(dst).with_src1(src),
+                    );
                     self.zero_extend_dst_if32(inst, dst);
                 } else if inst.op1_kind() == OpKind::Memory {
                     let t_addr = MicroOperand::Temp(4);
@@ -374,7 +558,9 @@ impl RiscLifter {
                 let src = Self::reg_to_vreg(inst.op1_register()).ok_or_else(|| anyhow!("invalid src"))?;
                 if inst.op0_kind() == OpKind::Register {
                     let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
-                    self.desynth.emit_add(dst, src, MicroOperand::Imm64(0));
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Mov).with_dst(dst).with_src1(src),
+                    );
                     self.zero_extend_dst_if32(inst, dst);
                 } else if inst.op0_kind() == OpKind::Memory {
                     let t_addr = MicroOperand::Temp(4);
@@ -397,13 +583,17 @@ impl RiscLifter {
                 let imm = inst.immediate64();
                 if inst.op0_kind() == OpKind::Register {
                     let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
-                    self.desynth.emit_add(dst, MicroOperand::Imm64(imm), MicroOperand::Imm64(0));
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Mov).with_dst(dst).with_src1(MicroOperand::Imm64(imm)),
+                    );
                     self.zero_extend_dst_if32(inst, dst);
                 } else if inst.op0_kind() == OpKind::Memory {
                     let t_addr = MicroOperand::Temp(4);
                     self.lower_effective_address(inst, t_addr)?;
                     let t_val = MicroOperand::Temp(5);
-                    self.desynth.emit_add(t_val, MicroOperand::Imm64(imm), MicroOperand::Imm64(0));
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Mov).with_dst(t_val).with_src1(MicroOperand::Imm64(imm)),
+                    );
                     self.desynth.instrs.push(
                         MicroInstr::new(RiscOp::MemoryWrite { width: inst.memory_size().size() as u8 })
                             .with_src1(t_addr)
@@ -531,7 +721,9 @@ impl RiscLifter {
 
             // ── LEAVE: mov rsp, rbp; pop rbp ────────────────────────────────────
             Code::Leaveq | Code::Leaved | Code::Leavew => {
-                self.desynth.emit_add(MicroOperand::VReg(4), MicroOperand::VReg(5), MicroOperand::Imm64(0));
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::VReg(4)).with_src1(MicroOperand::VReg(5)),
+                );
                 self.desynth.emit_pop(MicroOperand::VReg(5));
             }
 
@@ -639,6 +831,497 @@ impl RiscLifter {
             Code::Retnq | Code::Retnw => {
                 self.desynth.instrs.push(MicroInstr::new(RiscOp::Halt));
             }
+            // RET imm16: RSP += imm 후 Halt.
+            Code::Retnq_imm16 | Code::Retnw_imm16 => {
+                let imm = inst.immediate16() as u64;
+                if imm != 0 {
+                    self.desynth.emit_add(
+                        MicroOperand::VReg(4),
+                        MicroOperand::VReg(4),
+                        MicroOperand::Imm64(imm),
+                    );
+                }
+                self.desynth.instrs.push(MicroInstr::new(RiscOp::Halt));
+            }
+
+            // ── P2: MUL / IMUL (1-피연산자, RAX 암시) ───────────────────────────
+            Code::Mul_rm8 | Code::Mul_rm16 | Code::Mul_rm32 | Code::Mul_rm64 => {
+                let width = match code {
+                    Code::Mul_rm8 => 1,
+                    Code::Mul_rm16 => 2,
+                    Code::Mul_rm32 => 4,
+                    _ => 8,
+                };
+                let rax = MicroOperand::VReg(0);
+                let right = self.operand_value(inst, 0)?;
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::Multiply { signed: false, width })
+                        .with_dst(rax)
+                        .with_src1(rax)
+                        .with_src2(right),
+                );
+                if width == 4 {
+                    self.zero_extend_dst_if32(inst, rax);
+                }
+            }
+            Code::Imul_rm8 | Code::Imul_rm16 | Code::Imul_rm32 | Code::Imul_rm64 => {
+                let width = match code {
+                    Code::Imul_rm8 => 1,
+                    Code::Imul_rm16 => 2,
+                    Code::Imul_rm32 => 4,
+                    _ => 8,
+                };
+                let rax = MicroOperand::VReg(0);
+                let right = self.operand_value(inst, 0)?;
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::Multiply { signed: true, width })
+                        .with_dst(rax)
+                        .with_src1(rax)
+                        .with_src2(right),
+                );
+                if width == 4 {
+                    self.zero_extend_dst_if32(inst, rax);
+                }
+            }
+
+            // ── P2: IMUL 2/3-피연산자 (dst = dst·src 또는 dst = src·imm) ────────
+            Code::Imul_r16_rm16
+            | Code::Imul_r32_rm32
+            | Code::Imul_r64_rm64
+            | Code::Imul_r16_rm16_imm8
+            | Code::Imul_r32_rm32_imm8
+            | Code::Imul_r64_rm64_imm8
+            | Code::Imul_r32_rm32_imm32
+            | Code::Imul_r64_rm64_imm32 => {
+                let width = match code {
+                    Code::Imul_r16_rm16 | Code::Imul_r16_rm16_imm8 => 2,
+                    Code::Imul_r32_rm32
+                    | Code::Imul_r32_rm32_imm8
+                    | Code::Imul_r32_rm32_imm32 => 4,
+                    _ => 8,
+                };
+                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid imul dst"))?;
+                let (a, b) = if inst.op_count() == 3 {
+                    (self.operand_value(inst, 1)?, MicroOperand::Imm64(inst.immediate64()))
+                } else {
+                    (dst, self.operand_value(inst, 1)?)
+                };
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::MultiplyLow { signed: true, width })
+                        .with_dst(dst)
+                        .with_src1(a)
+                        .with_src2(b),
+                );
+                if width == 4 {
+                    self.zero_extend_dst_if32(inst, dst);
+                }
+            }
+
+            // ── P2: DIV / IDIV (RDX:RAX 피제수, RAX 몫) ─────────────────────────
+            Code::Div_rm8 | Code::Div_rm16 | Code::Div_rm32 | Code::Div_rm64 => {
+                let width = match code {
+                    Code::Div_rm8 => 1,
+                    Code::Div_rm16 => 2,
+                    Code::Div_rm32 => 4,
+                    _ => 8,
+                };
+                let divisor = self.operand_value(inst, 0)?;
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::Divide { signed: false, width })
+                        .with_dst(MicroOperand::VReg(0))
+                        .with_src1(divisor),
+                );
+            }
+            Code::Idiv_rm8 | Code::Idiv_rm16 | Code::Idiv_rm32 | Code::Idiv_rm64 => {
+                let width = match code {
+                    Code::Idiv_rm8 => 1,
+                    Code::Idiv_rm16 => 2,
+                    Code::Idiv_rm32 => 4,
+                    _ => 8,
+                };
+                let divisor = self.operand_value(inst, 0)?;
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::Divide { signed: true, width })
+                        .with_dst(MicroOperand::VReg(0))
+                        .with_src1(divisor),
+                );
+            }
+
+            // ── P2: BSWAP ──────────────────────────────────────────────────────
+            Code::Bswap_r32 => {
+                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid bswap dst"))?;
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::BSwap { width: 4 }).with_dst(dst).with_src1(dst),
+                );
+            }
+            Code::Bswap_r64 => {
+                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid bswap dst"))?;
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::BSwap { width: 8 }).with_dst(dst).with_src1(dst),
+                );
+            }
+
+            // ── P2: BSF / BSR / TZCNT / LZCNT / POPCNT ─────────────────────────
+            Code::Bsf_r16_rm16 | Code::Bsf_r32_rm32 | Code::Bsf_r64_rm64 => {
+                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid bsf dst"))?;
+                let src = self.operand_value(inst, 1)?;
+                let w = match code {
+                    Code::Bsf_r16_rm16 => 2,
+                    Code::Bsf_r32_rm32 => 4,
+                    _ => 8,
+                };
+                let src = self.mask_operand(src, w)?;
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::BitScanForward).with_dst(dst).with_src1(src),
+                );
+                if w == 4 {
+                    self.zero_extend_dst_if32(inst, dst);
+                }
+            }
+            Code::Bsr_r16_rm16 | Code::Bsr_r32_rm32 | Code::Bsr_r64_rm64 => {
+                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid bsr dst"))?;
+                let src = self.operand_value(inst, 1)?;
+                let w = match code {
+                    Code::Bsr_r16_rm16 => 2,
+                    Code::Bsr_r32_rm32 => 4,
+                    _ => 8,
+                };
+                let src = self.mask_operand(src, w)?;
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::BitScanReverse).with_dst(dst).with_src1(src),
+                );
+                if w == 4 {
+                    self.zero_extend_dst_if32(inst, dst);
+                }
+            }
+            Code::Tzcnt_r16_rm16 | Code::Tzcnt_r32_rm32 | Code::Tzcnt_r64_rm64 => {
+                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid tzcnt dst"))?;
+                let src = self.operand_value(inst, 1)?;
+                let w = match code {
+                    Code::Tzcnt_r16_rm16 => 2,
+                    Code::Tzcnt_r32_rm32 => 4,
+                    _ => 8,
+                };
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::CountTrailingZeros { width: w })
+                        .with_dst(dst)
+                        .with_src1(src),
+                );
+                if w == 4 {
+                    self.zero_extend_dst_if32(inst, dst);
+                }
+            }
+            Code::Lzcnt_r16_rm16 | Code::Lzcnt_r32_rm32 | Code::Lzcnt_r64_rm64 => {
+                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid lzcnt dst"))?;
+                let src = self.operand_value(inst, 1)?;
+                let w = match code {
+                    Code::Lzcnt_r16_rm16 => 2,
+                    Code::Lzcnt_r32_rm32 => 4,
+                    _ => 8,
+                };
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::CountLeadingZeros { width: w })
+                        .with_dst(dst)
+                        .with_src1(src),
+                );
+                if w == 4 {
+                    self.zero_extend_dst_if32(inst, dst);
+                }
+            }
+            Code::Popcnt_r16_rm16 | Code::Popcnt_r32_rm32 | Code::Popcnt_r64_rm64 => {
+                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid popcnt dst"))?;
+                let src = self.operand_value(inst, 1)?;
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::PopCount).with_dst(dst).with_src1(src),
+                );
+                if matches!(code, Code::Popcnt_r32_rm32) {
+                    self.zero_extend_dst_if32(inst, dst);
+                }
+            }
+
+            // ── P2: SETcc (16 조건) ────────────────────────────────────────────
+            Code::Seta_rm8
+            | Code::Setae_rm8
+            | Code::Setb_rm8
+            | Code::Setbe_rm8
+            | Code::Sete_rm8
+            | Code::Setne_rm8
+            | Code::Setg_rm8
+            | Code::Setge_rm8
+            | Code::Setl_rm8
+            | Code::Setle_rm8
+            | Code::Seto_rm8
+            | Code::Setno_rm8
+            | Code::Setp_rm8
+            | Code::Setnp_rm8
+            | Code::Sets_rm8
+            | Code::Setns_rm8 => {
+                let cond = cond_for_setcc(code).expect("setcc cond");
+                match inst.op0_kind() {
+                    OpKind::Register => {
+                        let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid setcc dst"))?;
+                        self.desynth.instrs.push(
+                            MicroInstr::new(RiscOp::Setcc { cond }).with_dst(dst),
+                        );
+                    }
+                    OpKind::Memory => {
+                        let addr = MicroOperand::Temp(4);
+                        self.lower_effective_address(inst, addr)?;
+                        let val = MicroOperand::Temp(5);
+                        self.desynth.instrs.push(
+                            MicroInstr::new(RiscOp::Setcc { cond }).with_dst(val),
+                        );
+                        self.desynth.instrs.push(
+                            MicroInstr::new(RiscOp::MemoryWrite { width: 1 })
+                                .with_src1(addr)
+                                .with_src2(val),
+                        );
+                    }
+                    _ => return Err(anyhow!("risc lifter: invalid setcc op0")),
+                }
+            }
+
+            // ── P2: CMOVcc (16 조건 × 16/32/64) ───────────────────────────────
+            Code::Cmova_r16_rm16
+            | Code::Cmova_r32_rm32
+            | Code::Cmova_r64_rm64
+            | Code::Cmovae_r16_rm16
+            | Code::Cmovae_r32_rm32
+            | Code::Cmovae_r64_rm64
+            | Code::Cmovb_r16_rm16
+            | Code::Cmovb_r32_rm32
+            | Code::Cmovb_r64_rm64
+            | Code::Cmovbe_r16_rm16
+            | Code::Cmovbe_r32_rm32
+            | Code::Cmovbe_r64_rm64
+            | Code::Cmove_r16_rm16
+            | Code::Cmove_r32_rm32
+            | Code::Cmove_r64_rm64
+            | Code::Cmovne_r16_rm16
+            | Code::Cmovne_r32_rm32
+            | Code::Cmovne_r64_rm64
+            | Code::Cmovg_r16_rm16
+            | Code::Cmovg_r32_rm32
+            | Code::Cmovg_r64_rm64
+            | Code::Cmovge_r16_rm16
+            | Code::Cmovge_r32_rm32
+            | Code::Cmovge_r64_rm64
+            | Code::Cmovl_r16_rm16
+            | Code::Cmovl_r32_rm32
+            | Code::Cmovl_r64_rm64
+            | Code::Cmovle_r16_rm16
+            | Code::Cmovle_r32_rm32
+            | Code::Cmovle_r64_rm64
+            | Code::Cmovo_r16_rm16
+            | Code::Cmovo_r32_rm32
+            | Code::Cmovo_r64_rm64
+            | Code::Cmovno_r16_rm16
+            | Code::Cmovno_r32_rm32
+            | Code::Cmovno_r64_rm64
+            | Code::Cmovp_r16_rm16
+            | Code::Cmovp_r32_rm32
+            | Code::Cmovp_r64_rm64
+            | Code::Cmovnp_r16_rm16
+            | Code::Cmovnp_r32_rm32
+            | Code::Cmovnp_r64_rm64
+            | Code::Cmovs_r16_rm16
+            | Code::Cmovs_r32_rm32
+            | Code::Cmovs_r64_rm64
+            | Code::Cmovns_r16_rm16
+            | Code::Cmovns_r32_rm32
+            | Code::Cmovns_r64_rm64 => {
+                let cond = cond_for_cmov(code).expect("cmov cond");
+                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid cmov dst"))?;
+                let src = self.operand_value(inst, 1)?;
+                let w = inst.op0_register().full_register();
+                let is32 = matches!(w, Register::EAX | Register::ECX | Register::EDX | Register::EBX
+                    | Register::ESP | Register::EBP | Register::ESI | Register::EDI
+                    | Register::R8D | Register::R9D | Register::R10D | Register::R11D
+                    | Register::R12D | Register::R13D | Register::R14D | Register::R15D);
+                // 32비트: taken 경로만 0-확장해야 하므로 무조건 AND 대신 소스를
+                // 미리 마스크해 ConditionalMove 가 쓸 값을 32비트로 제한한다.
+                let src = if is32 {
+                    self.mask_operand(src, 4)?
+                } else {
+                    src
+                };
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::ConditionalMove { cond })
+                        .with_dst(dst)
+                        .with_src1(src),
+                );
+            }
+
+            // ── P2: TEST (AND-플래그, 결과 폐기) ───────────────────────────────
+            Code::Test_rm64_r64
+            | Code::Test_rm64_imm32
+            | Code::Test_RAX_imm32
+            | Code::Test_rm32_r32
+            | Code::Test_rm32_imm32
+            | Code::Test_EAX_imm32
+            | Code::Test_rm16_imm16
+            | Code::Test_rm16_r16
+            | Code::Test_AX_imm16
+            | Code::Test_AL_imm8 => self.lift_test(inst)?,
+
+            // ── P2: XCHG ───────────────────────────────────────────────────────
+            Code::Xchg_rm64_r64 | Code::Xchg_rm32_r32 | Code::Xchg_rm16_r16 | Code::Xchg_rm8_r8 => {
+                self.lift_xchg(inst)?;
+            }
+
+            // ── P2: XADD (메모리 RMW + 플래그) ─────────────────────────────────
+            Code::Xadd_rm8_r8 | Code::Xadd_rm16_r16 | Code::Xadd_rm32_r32 | Code::Xadd_rm64_r64 => {
+                self.lift_xadd(inst)?;
+            }
+
+            // ── P2: CMPXCHG (메모리 폼) ────────────────────────────────────────
+            Code::Cmpxchg_rm8_r8 | Code::Cmpxchg_rm16_r16 | Code::Cmpxchg_rm32_r32 | Code::Cmpxchg_rm64_r64 => {
+                if inst.op0_kind() == OpKind::Memory {
+                    let width = match code {
+                        Code::Cmpxchg_rm8_r8 => 1,
+                        Code::Cmpxchg_rm16_r16 => 2,
+                        Code::Cmpxchg_rm32_r32 => 4,
+                        _ => 8,
+                    };
+                    let addr = MicroOperand::Temp(4);
+                    self.lower_effective_address(inst, addr)?;
+                    let newv = Self::reg_to_vreg(inst.op1_register()).ok_or_else(|| anyhow!("invalid cmpxchg src"))?;
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::CompareExchange { width })
+                            .with_src1(addr)
+                            .with_src2(newv),
+                    );
+                } else {
+                    // CMPXCHG 레지스터 폼(r/m = 레지스터) — 극히 드묾. 네이티브 유지.
+                    return Err(anyhow!("risc lifter: CMPXCHG register form kept native"));
+                }
+            }
+
+            // ── P2: INC / DEC ──────────────────────────────────────────────────
+            Code::Inc_rm8 | Code::Inc_rm16 | Code::Inc_rm32 | Code::Inc_rm64
+            | Code::Dec_rm8 | Code::Dec_rm16 | Code::Dec_rm32 | Code::Dec_rm64 => {
+                let is_dec = matches!(code, Code::Dec_rm8 | Code::Dec_rm16 | Code::Dec_rm32 | Code::Dec_rm64);
+                let width = match code {
+                    Code::Inc_rm8 | Code::Dec_rm8 => 1,
+                    Code::Inc_rm16 | Code::Dec_rm16 => 2,
+                    Code::Inc_rm32 | Code::Dec_rm32 => 4,
+                    _ => 8,
+                };
+                let one = MicroOperand::Imm64(1);
+                match inst.op0_kind() {
+                    OpKind::Register => {
+                        let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid inc/dec dst"))?;
+                        let a = self.mask_operand(dst, width)?;
+                        if is_dec {
+                            self.desynth.emit_sub(dst, a, one);
+                        } else {
+                            self.desynth.emit_add(dst, a, one);
+                        }
+                        self.mask_result(width, inst, dst)?;
+                    }
+                    OpKind::Memory => {
+                        let addr = MicroOperand::Temp(4);
+                        self.lower_effective_address(inst, addr)?;
+                        let width_mem = inst.memory_size().size() as u8;
+                        let left = MicroOperand::Temp(5);
+                        self.desynth.instrs.push(
+                            MicroInstr::new(RiscOp::MemoryRead { width: width_mem })
+                                .with_dst(left)
+                                .with_src1(addr),
+                        );
+                        let a = self.mask_operand(left, width)?;
+                        if is_dec {
+                            self.desynth.emit_sub(left, a, one);
+                        } else {
+                            self.desynth.emit_add(left, a, one);
+                        }
+                        self.mask_result(width, inst, left)?;
+                        self.desynth.instrs.push(
+                            MicroInstr::new(RiscOp::MemoryWrite { width: width_mem })
+                                .with_src1(addr)
+                                .with_src2(left),
+                        );
+                    }
+                    _ => return Err(anyhow!("risc lifter: invalid inc/dec op0")),
+                }
+            }
+
+            // ── P2: BMI1/2 (ANDN/BLSR/BLSMSK/BLSI/BZHI) ────────────────────────
+            Code::VEX_Andn_r64_r64_rm64 | Code::VEX_Andn_r32_r32_rm32 => {
+                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid andn dst"))?;
+                let a = Self::reg_to_vreg(inst.op1_register()).ok_or_else(|| anyhow!("invalid andn src"))?;
+                let b = self.operand_value(inst, 2)?;
+                let not = MicroOperand::Temp(0);
+                self.desynth.emit_not(not, a);
+                self.desynth.emit_and(dst, not, b);
+                self.zero_extend_dst_if32(inst, dst);
+            }
+            Code::VEX_Blsr_r64_rm64 | Code::VEX_Blsr_r32_rm32 => {
+                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid blsr dst"))?;
+                let a = self.operand_value(inst, 1)?;
+                let t = MicroOperand::Temp(0);
+                self.desynth.emit_sub(t, a, MicroOperand::Imm64(1));
+                self.desynth.emit_and(dst, t, a);
+                self.zero_extend_dst_if32(inst, dst);
+            }
+            Code::VEX_Blsmsk_r64_rm64 | Code::VEX_Blsmsk_r32_rm32 => {
+                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid blsmsk dst"))?;
+                let a = self.operand_value(inst, 1)?;
+                let t = MicroOperand::Temp(0);
+                self.desynth.emit_sub(t, a, MicroOperand::Imm64(1));
+                self.desynth.emit_xor(dst, t, a);
+                self.zero_extend_dst_if32(inst, dst);
+            }
+            Code::VEX_Blsi_r64_rm64 | Code::VEX_Blsi_r32_rm32 => {
+                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid blsi dst"))?;
+                let a = self.operand_value(inst, 1)?;
+                let t = MicroOperand::Temp(0);
+                self.desynth.emit_neg(t, a);
+                self.desynth.emit_and(dst, t, a);
+                self.zero_extend_dst_if32(inst, dst);
+            }
+            Code::VEX_Bzhi_r64_rm64_r64 | Code::VEX_Bzhi_r32_rm32_r32 => {
+                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid bzhi dst"))?;
+                let a = self.operand_value(inst, 1)?;
+                let idx = Self::reg_to_vreg(inst.op2_register()).ok_or_else(|| anyhow!("invalid bzhi index"))?;
+                let t = MicroOperand::Temp(0);
+                let mask = MicroOperand::Temp(1);
+                self.desynth.emit_add(t, MicroOperand::Imm64(1), MicroOperand::Imm64(0));
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::ShiftLeft)
+                        .with_dst(mask)
+                        .with_src1(t)
+                        .with_src2(idx),
+                );
+                self.desynth.emit_sub(mask, mask, MicroOperand::Imm64(1));
+                self.desynth.emit_and(dst, a, mask);
+                self.zero_extend_dst_if32(inst, dst);
+            }
+
+            // ── P2: PUSH/POP 메모리 폼 ────────────────────────────────────────
+            Code::Push_rm64 => {
+                let v = self.operand_value(inst, 0)?;
+                self.desynth.emit_push(v);
+            }
+            Code::Pop_rm64 => {
+                if inst.op0_kind() == OpKind::Register {
+                    let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid pop dst"))?;
+                    self.desynth.emit_pop(dst);
+                } else if inst.op0_kind() == OpKind::Memory {
+                    let addr = MicroOperand::Temp(4);
+                    self.lower_effective_address(inst, addr)?;
+                    let val = MicroOperand::Temp(5);
+                    self.desynth.emit_pop(val);
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::MemoryWrite { width: 8 })
+                            .with_src1(addr)
+                            .with_src2(val),
+                    );
+                } else {
+                    return Err(anyhow!("risc lifter: invalid pop op0"));
+                }
+            }
+
             _ => {
                 // Fallback for unsupported complex instruction
                 return Err(anyhow!("risc lifter: unsupported opcode {:?}", code));
@@ -1115,5 +1798,275 @@ mod tests {
         init2[1] = 32; // cl = 32 (하위 8비트)
         let st3 = run(&raw_shl_cl, 0x140001000, init2);
         assert_eq!(regs(&st3)[0], 0x8000_0000, "shl eax,cl(32) == shl eax,0");
+    }
+
+    // ── P2: 새로 추가된 리프팅 경로 차등 검증 (선형 블록 단위 동치) ──────────────
+
+    /// MUL r64 — RDX:RAX = RAX * rm (unsigned). low → dst(RAX), high → RDX.
+    #[test]
+    fn test_lift_mul_rm64() {
+        // 0x140001000: mul rbx   (48 F7 E3)
+        // 0x140001003: ret
+        let raw = [0x48, 0xF7, 0xE3, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 0x8000_0000_0000_0000; // rax
+        init[3] = 2;                      // rbx
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 0, "MUL low word = 0x10000000000000000 mod 2^64");
+        assert_eq!(regs(&st)[2], 1, "MUL high = 1 (RDX)");
+    }
+
+    /// IMUL r64,r64 (2-op) — dst = low(src1*src2).
+    #[test]
+    fn test_lift_imul_2op() {
+        // 0x140001000: imul rax, rbx   (48 0F AF C3)
+        // 0x140001004: ret
+        let raw = [0x48, 0x0F, 0xAF, 0xC3, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 7;
+        init[3] = 6;
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 42, "IMUL 2-op product");
+    }
+
+    /// IMUL r64,r64,imm8 (3-op) — dst = src*imm.
+    #[test]
+    fn test_lift_imul_3op_imm() {
+        // 0x140001000: imul rax, rbx, 5   (48 6B C3 05)
+        // 0x140001004: ret
+        let raw = [0x48, 0x6B, 0xC3, 0x05, 0xC3];
+        let mut init = [0u64; 16];
+        init[3] = 9; // rbx
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 45, "IMUL 3-op imm product");
+    }
+
+    /// DIV r64 — RDX:RAX / rm → RAX=quotient, RDX=remainder.
+    #[test]
+    fn test_lift_div_rm64() {
+        // 0x140001000: div rbx   (48 F7 F3)
+        // 0x140001003: ret
+        let raw = [0x48, 0xF7, 0xF3, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 1000; // rax
+        init[2] = 0;    // rdx
+        init[3] = 7;    // rbx
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 142, "DIV quotient");
+        assert_eq!(regs(&st)[2], 6, "DIV remainder");
+    }
+
+    /// IDIV r64 — signed divide.
+    #[test]
+    fn test_lift_idiv_rm64() {
+        // 0x140001000: idiv rbx   (48 F7 FB)
+        // 0x140001003: ret
+        let raw = [0x48, 0xF7, 0xFB, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = (-1000i64) as u64; // rax
+        init[2] = (-1i64) as u64;     // rdx = sign-extended
+        init[3] = 7;                  // rbx
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0] as i64, -142, "IDIV quotient");
+        assert_eq!(regs(&st)[2] as i64, -6, "IDIV remainder");
+    }
+
+    /// BSWAP r64 — byte order reversal.
+    #[test]
+    fn test_lift_bswap() {
+        // 0x140001000: bswap rax   (48 0F C8)
+        // 0x140001003: ret
+        let raw = [0x48, 0x0F, 0xC8, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 0x0102_0304_0506_0708;
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 0x0807_0605_0403_0201, "BSWAP reverses bytes");
+    }
+
+    /// BSF / BSR — least/most-significant set bit index.
+    #[test]
+    fn test_lift_bsf_bsr() {
+        // 0x140001000: bsf rax, rbx   (48 0F BC C3)
+        // 0x140001004: bsr rcx, rbx   (48 0F BD CB)
+        // 0x140001008: ret
+        let raw = [0x48, 0x0F, 0xBC, 0xC3, 0x48, 0x0F, 0xBD, 0xCB, 0xC3];
+        let mut init = [0u64; 16];
+        init[3] = 0x1000; // rbx
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 12, "BSF index of bit 12");
+        assert_eq!(regs(&st)[1], 12, "BSR index of bit 12");
+    }
+
+    /// TZCNT / LZCNT / POPCNT.
+    #[test]
+    fn test_lift_tzcnt_lzcnt_popcnt() {
+        // tzcnt rax, rbx   F3 48 0F BC C3
+        // lzcnt rcx, rbx   F3 48 0F BD CB
+        // popcnt rdx, rbx  F3 48 0F B8 D3
+        let raw = [
+            0xF3, 0x48, 0x0F, 0xBC, 0xC3,
+            0xF3, 0x48, 0x0F, 0xBD, 0xCB,
+            0xF3, 0x48, 0x0F, 0xB8, 0xD3,
+            0xC3,
+        ];
+        let mut init = [0u64; 16];
+        init[3] = 0x1000; // rbx
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 12, "TZCNT = ctz(0x1000)");
+        assert_eq!(regs(&st)[1], 51, "LZCNT = 63-12");
+        assert_eq!(regs(&st)[2], 1, "POPCNT(0x1000) = 1");
+    }
+
+    /// SETcc — flag-conditional byte write (equal → SETE=1, SETNE=0).
+    #[test]
+    fn test_lift_setcc() {
+        // cmp rax, rbx (48 39 D8) ; sete al (0F 94 C0) ; setne bl (0F 95 C3) ; ret
+        let raw = [0x48, 0x39, 0xD8, 0x0F, 0x94, 0xC0, 0x0F, 0x95, 0xC3, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 5;
+        init[3] = 5;
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0] & 0xFF, 1, "SETE when equal");
+        assert_eq!(regs(&st)[3] & 0xFF, 0, "SETNE when equal → 0");
+    }
+
+    /// CMOVcc — conditional move (equal → CMOVE takes).
+    #[test]
+    fn test_lift_cmovcc() {
+        // cmp rax, rbx (48 39 D8) ; cmove rcx, rdx (48 0F 44 CA) ; ret
+        let raw = [0x48, 0x39, 0xD8, 0x48, 0x0F, 0x44, 0xCA, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 5;
+        init[3] = 5;
+        init[2] = 0xDEAD;
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[1], 0xDEAD, "CMOVE taken when equal");
+    }
+
+    /// TEST — AND flags without writing a destination.
+    #[test]
+    fn test_lift_test() {
+        // test rax, rbx (48 85 D8) ; ret
+        let raw = [0x48, 0x85, 0xD8, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 0;
+        init[3] = 0;
+        let st = run(&raw, 0x140001000, init);
+        assert_ne!(st.flags & crate::vm::risc::flags::VFLAG_ZF, 0, "TEST 0&0 → ZF");
+        // nonzero result → ZF clear
+        let mut init2 = [0u64; 16];
+        init2[0] = 0xF0;
+        init2[3] = 0xF0;
+        let st2 = run(&raw, 0x140001000, init2);
+        assert_eq!(st2.flags & crate::vm::risc::flags::VFLAG_ZF, 0, "TEST F0&F0 → !ZF");
+    }
+
+    /// XCHG r64,r64 — register swap.
+    #[test]
+    fn test_lift_xchg_reg() {
+        // 0x140001000: xchg rax, rbx (48 87 D8) ; ret
+        let raw = [0x48, 0x87, 0xD8, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 1;
+        init[3] = 2;
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 2, "XCHG rax");
+        assert_eq!(regs(&st)[3], 1, "XCHG rbx");
+    }
+
+    /// XADD r64,r64 — dst += src; src = old dst.
+    #[test]
+    fn test_lift_xadd_reg() {
+        // 0x140001000: xadd rax, rbx (48 0F C1 D8) ; ret
+        let raw = [0x48, 0x0F, 0xC1, 0xD8, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 3;
+        init[3] = 5;
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 8, "XADD dst = 3+5");
+        assert_eq!(regs(&st)[3], 3, "XADD src = old dst");
+    }
+
+    /// INC / DEC — width-masked register forms (INC preserves CF).
+    #[test]
+    fn test_lift_inc_dec() {
+        // inc eax (FF C0) ; dec rax (48 FF C8) ; ret
+        let raw = [0xFF, 0xC0, 0x48, 0xFF, 0xC8, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 5;
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 5, "inc eax(5→6) then dec rax(6→5)");
+    }
+
+    /// RET imm16 — RSP += imm before Halt.
+    #[test]
+    fn test_lift_ret_imm16() {
+        // 0x140001000: ret 8 (C2 08 00)
+        let raw = [0xC2, 0x08, 0x00];
+        let st = run(&raw, 0x140001000, [0u64; 16]);
+        assert_eq!(regs(&st)[4], 8, "RET imm16 advances RSP by 8");
+    }
+
+    /// PUSH r64 / POP r64 — stack roundtrip.
+    #[test]
+    fn test_lift_push_pop() {
+        // push rax (50) ; pop rbx (5B) ; ret
+        let raw = [0x50, 0x5B, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 0xCAFE;
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[3], 0xCAFE, "push rax; pop rbx");
+        assert_eq!(st.vsp, 0, "push/pop balanced");
+    }
+
+    /// CMPXCHG (mem form) — lift path emits CompareExchange micro-op.
+    #[test]
+    fn test_lift_cmpxchg_mem() {
+        // cmpxchg [rax], rbx (48 0F B1 18) ; ret
+        let raw = [0x48, 0x0F, 0xB1, 0x18, 0xC3];
+        let prog = lift(&raw, 0x140001000);
+        assert!(
+            prog.instrs.iter().any(|i| matches!(i.op, RiscOp::CompareExchange { width: 8 })),
+            "CMPXCHG mem lifts to CompareExchange"
+        );
+    }
+
+    /// XCHG mem↔reg — lift path emits memory RMW (read + write).
+    #[test]
+    fn test_lift_xchg_mem() {
+        // xchg [rax], rbx (48 87 18) ; ret
+        let raw = [0x48, 0x87, 0x18, 0xC3];
+        let prog = lift(&raw, 0x140001000);
+        let has_rd = prog.instrs.iter().any(|i| matches!(i.op, RiscOp::MemoryRead { .. }));
+        let has_wr = prog.instrs.iter().any(|i| matches!(i.op, RiscOp::MemoryWrite { .. }));
+        assert!(has_rd && has_wr, "XCHG mem lifts to memory RMW");
+    }
+
+    /// XADD (mem form) — lift path emits memory RMW.
+    #[test]
+    fn test_lift_xadd_mem() {
+        // xadd [rax], rbx (48 0F C1 18) ; ret
+        let raw = [0x48, 0x0F, 0xC1, 0x18, 0xC3];
+        let prog = lift(&raw, 0x140001000);
+        let has_rd = prog.instrs.iter().any(|i| matches!(i.op, RiscOp::MemoryRead { .. }));
+        let has_wr = prog.instrs.iter().any(|i| matches!(i.op, RiscOp::MemoryWrite { .. }));
+        assert!(has_rd && has_wr, "XADD mem lifts to memory RMW");
+    }
+
+    /// BMI1 ANDN — lift path emits NOT+AND (VEX encoding via BlockEncoder).
+    #[test]
+    fn test_lift_andn() {
+        use iced_x86::{BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, Register};
+        let insts = vec![
+            Instruction::with3(Code::VEX_Andn_r64_r64_rm64, Register::RAX, Register::RBX, Register::RCX).unwrap(),
+            Instruction::with(Code::Retnq),
+        ];
+        let blk = InstructionBlock::new(&insts, 0x140001000);
+        let enc = BlockEncoder::encode(64, blk, BlockEncoderOptions::NONE).unwrap();
+        let mut init = [0u64; 16];
+        init[3] = 0x0F; // rbx (vreg 3)
+        init[1] = 0xFF; // rcx (vreg 1)
+        let st = run(&enc.code_buffer, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 0xF0, "ANDN = ~rbx & rcx = ~0x0F & 0xFF");
     }
 }

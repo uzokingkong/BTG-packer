@@ -48,6 +48,54 @@ pub enum RiscOp {
 
     /// VM 실행 종료 및 네이티브 컨텍스트 복귀
     Halt,
+
+    /// 값 복사 (dst = src1) — **플래그를 변경하지 않는다**.
+    /// (MOV/XCHG/XADD/POP 등 플래그 보존이 필요한 복사에 사용.
+    /// AddWithCarry(+,0) 로는 플래그를 오염시키므로 전용 op 로 분리.)
+    Mov,
+
+    // ── P2: 정수/비트/제어 복합 연산 (x86 hard-to-decompose) ─────────────────────
+
+    /// 1-피연산자 MUL/IMUL (RDX:RAX = RAX * r/m, 폭별).
+    /// `dst` = low, `regs[2]`(RDX) = high(폭 ≥ 2), 폭 1 은 AX(=AL + AH) 를 dst 로.
+    /// CF = OF = overflow (unsigned: high != 0; signed: high != sign-extend(low)).
+    Multiply { signed: bool, width: u8 },
+
+    /// 2/3-피연산자 IMUL (dst = low(src1 * src2), RDX 미기록).
+    /// CF = OF = overflow. 폭은 `width`(2/4/8).
+    MultiplyLow { signed: bool, width: u8 },
+
+    /// DIV/IDIV — 피제수 = RDX:RAX(폭별), 제수 = src1, 몫 → dst(RAX), 나머지 → RDX.
+    /// 폭 1 은 AL=몫, AH=나머지, 결과를 AX(dst) 로.
+    Divide { signed: bool, width: u8 },
+
+    /// BSWAP (폭 4/8) — 바이트 순서 반전.
+    BSwap { width: u8 },
+
+    /// BSF — src == 0 이면 ZF=1·dst=0, 아니면 ZF=0·dst=최하위 세트 비트 인덱스.
+    BitScanForward,
+
+    /// BSR — src == 0 이면 ZF=1·dst=0, 아니면 ZF=0·dst=최상위 세트 비트 인덱스.
+    BitScanReverse,
+
+    /// TZCNT — dst = ctz(src); src == 0 이면 dst=폭·CF=1·ZF=1.
+    CountTrailingZeros { width: u8 },
+
+    /// LZCNT — dst = clz(src, 폭 한정); src == 0 이면 dst=폭·CF=1·ZF=1.
+    CountLeadingZeros { width: u8 },
+
+    /// POPCNT — dst = popcount(src); CF=OF=0, ZF/SF/PF 는 결과 기준.
+    PopCount,
+
+    /// SETcc — dst(8비트) = 조건 ? 1 : 0. (조건은 branch_cond_map 으로 부호화)
+    Setcc { cond: BranchCondition },
+
+    /// CMOVcc — dst = 조건 ? src1 : dst. (조건은 branch_cond_map 으로 부호화)
+    ConditionalMove { cond: BranchCondition },
+
+    /// CMPXCHG — `[src1] == RAX` 이면 `[src1] = src2`·ZF=1, 아니면 `RAX = [src1]`·ZF=0.
+    /// (누산기 RAX = regs[0], 폭별 마스크. 폭 8 이면 RAX 전체.)
+    CompareExchange { width: u8 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
