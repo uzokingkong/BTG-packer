@@ -102,4 +102,28 @@ impl VirtualFlags {
         }
         self.raw = (self.raw & !(VFLAG_CF | VFLAG_PF | VFLAG_OF | VFLAG_ZF | VFLAG_SF)) | flags;
     }
+
+    /// MUL/IMUL·DIV/IDIV 의 CF/OF 만 갱신 (다른 플래그는 보존 — x86 "undefined" 정책).
+    pub fn set_cf_of(&mut self, both: bool) {
+        self.raw &= !(VFLAG_CF | VFLAG_OF);
+        if both {
+            self.raw |= VFLAG_CF | VFLAG_OF;
+        }
+    }
+
+    /// ZF 만 갱신 (CMPXCHG — 다른 플래그는 x86 "undefined" 정책으로 보존).
+    pub fn set_zf(&mut self, z: bool) {
+        self.raw &= !VFLAG_ZF;
+        if z {
+            self.raw |= VFLAG_ZF;
+        }
+    }
+
+    /// CF 만 갱신 (TZCNT/LZCNT — ZF 는 별도). 그 외 플래그 보존.
+    pub fn set_cf(&mut self, c: bool) {
+        self.raw &= !VFLAG_CF;
+        if c {
+            self.raw |= VFLAG_CF;
+        }
+    }
 }

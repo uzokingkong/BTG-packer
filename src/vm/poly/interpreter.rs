@@ -74,9 +74,11 @@ impl PolymorphicInterpreter {
                 .cloned()
                 .ok_or_else(|| anyhow!("poly interp: unknown decrypted opcode 0x{raw_op:02X} at offset 0x{vip:X}"))?;
 
-            // 1b. VirtualBranch: 조건 바이트 (opcode 직후, decoder와 동일 계약)
+            // 1b. 조건 바이트 — VirtualBranch·Setcc·ConditionalMove (decoder 와 동일 계약)
             let risc_op = match risc_op {
-                RiscOp::VirtualBranch { .. } => {
+                RiscOp::VirtualBranch { .. }
+                | RiscOp::Setcc { .. }
+                | RiscOp::ConditionalMove { .. } => {
                     if vip >= bytecode.len() {
                         break;
                     }
@@ -86,7 +88,11 @@ impl PolymorphicInterpreter {
                         .spec
                         .decode_cond(raw_cond)
                         .ok_or_else(|| anyhow!("poly interp: unknown branch cond 0x{raw_cond:02X} at offset 0x{vip:X}"))?;
-                    RiscOp::VirtualBranch { cond }
+                    match risc_op {
+                        RiscOp::VirtualBranch { .. } => RiscOp::VirtualBranch { cond },
+                        RiscOp::Setcc { .. } => RiscOp::Setcc { cond },
+                        _ => RiscOp::ConditionalMove { cond },
+                    }
                 }
                 other => other,
             };
@@ -202,6 +208,11 @@ impl PolymorphicInterpreter {
                     self.flags.update_logic64(res);
                     self.store_operand(op_dst_raw, res);
                 }
+                RiscOp::Mov => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    // 플래그를 변경하지 않는 순수 복사.
+                    self.store_operand(op_dst_raw, a);
+                }
                 RiscOp::AddWithCarry => {
                     let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
                     let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
@@ -282,9 +293,124 @@ impl PolymorphicInterpreter {
                     // 인지된 no-op 스텁. 실제 네이티브/호스트 콜은 런타임 계층(Phase P3) 책임.
                     // 평가된 피연산자 바이트는 스트림에서 소비됐지만 VM 상태에는 영향을 주지 않는다.
                 }
+                // ── P2: 정수/비트/제어 복합 연산 (eval_state 와 동일 의미론) ────────
+                RiscOp::Multiply { signed, width } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    mul_wide_interp(&mut self.regs, &mut self.temps, &self.spec, &mut self.flags, a, b, signed, width, op_dst_raw);
+                }
+                RiscOp::MultiplyLow { signed, width } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    mul_low_interp(&mut self.regs, &mut self.temps, &self.spec, &mut self.flags, a, b, signed, width, op_dst_raw);
+                }
+                RiscOp::Divide { signed, width } => {
+                    let divisor = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    div_wide_interp(&mut self.regs, &mut self.temps, &self.spec, divisor, signed, width, op_dst_raw);
+                }
+                RiscOp::BSwap { width } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let res = if width == 4 {
+                        (a.swap_bytes() as u32) as u64
+                    } else {
+                        a.swap_bytes()
+                    };
+                    self.store_operand(op_dst_raw, res);
+                }
+                RiscOp::BitScanForward => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    if a == 0 {
+                        self.flags.set_zf(true);
+                        self.store_operand(op_dst_raw, 0);
+                    } else {
+                        self.flags.set_zf(false);
+                        self.store_operand(op_dst_raw, a.trailing_zeros() as u64);
+                    }
+                }
+                RiscOp::BitScanReverse => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    if a == 0 {
+                        self.flags.set_zf(true);
+                        self.store_operand(op_dst_raw, 0);
+                    } else {
+                        self.flags.set_zf(false);
+                        self.store_operand(op_dst_raw, 63 - a.leading_zeros() as u64);
+                    }
+                }
+                RiscOp::CountTrailingZeros { width } => {
+                    let bits = width as u32 * 8;
+                    let mask = width_mask_interp(bits);
+                    let s = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1) & mask;
+                    if s == 0 {
+                        self.flags.set_cf(true);
+                        self.flags.set_zf(true);
+                        self.store_operand(op_dst_raw, bits as u64);
+                    } else {
+                        self.flags.set_cf(false);
+                        let c = s.trailing_zeros() as u64;
+                        self.flags.set_zf(c == 0);
+                        self.store_operand(op_dst_raw, c);
+                    }
+                }
+                RiscOp::CountLeadingZeros { width } => {
+                    let bits = width as u32 * 8;
+                    let mask = width_mask_interp(bits);
+                    let s = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1) & mask;
+                    if s == 0 {
+                        self.flags.set_cf(true);
+                        self.flags.set_zf(true);
+                        self.store_operand(op_dst_raw, bits as u64);
+                    } else {
+                        self.flags.set_cf(false);
+                        let msb = 63 - s.leading_zeros() as u64;
+                        let c = (bits as u64 - 1) - msb;
+                        self.flags.set_zf(c == 0);
+                        self.store_operand(op_dst_raw, c);
+                    }
+                }
+                RiscOp::PopCount => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let res = a.count_ones() as u64;
+                    self.flags.update_logic64(res);
+                    self.store_operand(op_dst_raw, res);
+                }
+                RiscOp::Setcc { cond } => {
+                    let v = branch_taken_with_state(cond, &self.flags, &self.regs);
+                    self.store_operand(op_dst_raw, v as u64);
+                }
+                RiscOp::ConditionalMove { cond } => {
+                    if branch_taken_with_state(cond, &self.flags, &self.regs) {
+                        let v = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                        self.store_operand(op_dst_raw, v);
+                    }
+                }
+                RiscOp::CompareExchange { width } => {
+                    let addr = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let newv = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    let bits = width as u32 * 8;
+                    let mask = width_mask_interp(bits);
+                    let acc = self.regs[0] & mask;
+                    let old = mem_read(&self.mem, addr, width) & mask;
+                    if old == acc {
+                        mem_write(&mut self.mem, addr, width, newv & mask);
+                        self.flags.set_zf(true);
+                    } else {
+                        self.regs[0] = old;
+                        self.flags.set_zf(false);
+                    }
+                }
                 RiscOp::Halt => {
                     break;
                 }
+                // P2 SSE/FPU 스칼라 — 아직 폴리모픽 인코딩 대상이 아님 (isa_spec 미포함).
+                // 리프터 레벨 차등 검증은 `eval_state`(참조)를 기준으로 하므로 여기선 no-op.
+                RiscOp::FloatAdd { .. }
+                | RiscOp::FloatSub { .. }
+                | RiscOp::FloatMul { .. }
+                | RiscOp::FloatDiv { .. }
+                | RiscOp::IntToFloat { .. }
+                | RiscOp::FloatToInt { .. }
+                | RiscOp::FloatToFloat { .. } => {}
             }
         }
 
@@ -323,7 +449,9 @@ impl PolymorphicInterpreter {
                 break;
             };
             let risc_op = match risc_op {
-                RiscOp::VirtualBranch { .. } => {
+                RiscOp::VirtualBranch { .. }
+                | RiscOp::Setcc { .. }
+                | RiscOp::ConditionalMove { .. } => {
                     if vip >= bytecode.len() {
                         break;
                     }
@@ -433,6 +561,143 @@ fn mem_read(mem: &HashMap<u64, u8>, addr: u64, width: u8) -> u64 {
 fn mem_write(mem: &mut HashMap<u64, u8>, addr: u64, width: u8, val: u64) {
     for i in 0..width {
         mem.insert(addr.wrapping_add(i as u64), (val >> (i as u64 * 8)) as u8);
+    }
+}
+
+// ── P2: 정수/비트 복합 연산 인터프리터 헬퍼 (eval_state 와 동일 의미론) ──────────
+
+/// `width`바이트 폭의 비트 마스크.
+fn width_mask_interp(bits: u32) -> u64 {
+    if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    }
+}
+
+/// `bits` 비트 값 `v`를 i128 로 부호 확장 (bits < 128).
+fn sign_extend_i128_interp(v: u128, bits: u32) -> i128 {
+    let shift = 128 - bits;
+    ((v << shift) as i128) >> shift
+}
+
+/// 인터프리터 dst 저장 — `store_operand`와 동일.
+fn interp_store(regs: &mut [u64; 16], temps: &mut [u64; 8], spec: &VirtualIsaSpec, raw: u8, val: u64) {
+    let kind = raw & 0xC0;
+    let payload = raw & 0x3F;
+    match kind {
+        0x80 => {
+            let reg_idx = spec.decode_reg(payload);
+            regs[reg_idx as usize] = val;
+        }
+        0xC0 => {
+            temps[(payload & 0x07) as usize] = val;
+        }
+        _ => {}
+    }
+}
+
+/// 1-피연산자 MUL/IMUL — eval_state `mul_wide`와 동일.
+fn mul_wide_interp(
+    regs: &mut [u64; 16],
+    temps: &mut [u64; 8],
+    spec: &VirtualIsaSpec,
+    flags: &mut VirtualFlags,
+    a: u64,
+    b: u64,
+    signed: bool,
+    width: u8,
+    op_dst: u8,
+) {
+    let bits = width as u32 * 8;
+    let mask = width_mask_interp(bits);
+    let full = ((a & mask) as u128) * ((b & mask) as u128);
+    let low = full as u64;
+    let high = ((full >> bits) as u64) & mask;
+    let ovf = if signed {
+        let sign_ext = if low & (1u64 << (bits - 1)) != 0 { mask } else { 0 };
+        high != sign_ext
+    } else {
+        high != 0
+    };
+    flags.set_cf_of(ovf);
+    if width == 1 {
+        interp_store(regs, temps, spec, op_dst, (low & 0xFF) | ((high & 0xFF) << 8));
+    } else {
+        interp_store(regs, temps, spec, op_dst, low);
+        regs[2] = high; // RDX
+    }
+}
+
+/// 2/3-피연산자 IMUL — eval_state `mul_low`와 동일.
+fn mul_low_interp(
+    regs: &mut [u64; 16],
+    temps: &mut [u64; 8],
+    spec: &VirtualIsaSpec,
+    flags: &mut VirtualFlags,
+    a: u64,
+    b: u64,
+    signed: bool,
+    width: u8,
+    op_dst: u8,
+) {
+    let bits = width as u32 * 8;
+    let mask = width_mask_interp(bits);
+    let full = ((a & mask) as u128) * ((b & mask) as u128);
+    let low = full as u64;
+    let high = ((full >> bits) as u64) & mask;
+    let ovf = if signed {
+        let sign_ext = if low & (1u64 << (bits - 1)) != 0 { mask } else { 0 };
+        high != sign_ext
+    } else {
+        high != 0
+    };
+    flags.set_cf_of(ovf);
+    interp_store(regs, temps, spec, op_dst, low);
+}
+
+/// DIV/IDIV — eval_state `div_wide`와 동일. (제수 0 → 참조 기본값 0.)
+fn div_wide_interp(
+    regs: &mut [u64; 16],
+    temps: &mut [u64; 8],
+    spec: &VirtualIsaSpec,
+    divisor: u64,
+    signed: bool,
+    width: u8,
+    op_dst: u8,
+) {
+    let bits = width as u32 * 8;
+    let mask = width_mask_interp(bits);
+    // 폭 1(8비트)은 AX(reg0 low16)가 피제수 — RDX 미사용.
+    let (dividend, dvbits) = if width == 1 {
+        ((regs[0] & 0xFFFF) as u128, 16u32)
+    } else {
+        (
+            ((regs[2] & mask) as u128) << bits | (regs[0] & mask) as u128,
+            bits * 2,
+        )
+    };
+    let dv = (divisor & mask) as u128;
+    if dv == 0 {
+        interp_store(regs, temps, spec, op_dst, 0);
+        if width != 1 {
+            regs[2] = 0;
+        }
+        return;
+    }
+    let (q, r) = if signed {
+        let d = sign_extend_i128_interp(dividend, dvbits);
+        let s = sign_extend_i128_interp(dv as u64 as u128, bits);
+        let (q, r) = (d / s, d % s);
+        (q as u128, r as u128)
+    } else {
+        (dividend / dv, dividend % dv)
+    };
+    if width == 1 {
+        interp_store(regs, temps, spec, op_dst, ((r as u64) & 0xFF) << 8 | ((q as u64) & 0xFF));
+    } else {
+        interp_store(regs, temps, spec, op_dst, (q as u64) & mask);
+        regs[2] = (r as u64) & mask;
     }
 }
 
@@ -1009,6 +1274,22 @@ mod tests {
                 RiscOp::NativeCallBridge,
                 RiscOp::SetFlag,
                 RiscOp::Halt,
+                RiscOp::Mov,
+                RiscOp::Multiply { signed: false, width: 8 },
+                RiscOp::Multiply { signed: true, width: 4 },
+                RiscOp::MultiplyLow { signed: true, width: 8 },
+                RiscOp::Divide { signed: false, width: 8 },
+                RiscOp::Divide { signed: true, width: 4 },
+                RiscOp::BSwap { width: 4 },
+                RiscOp::BSwap { width: 8 },
+                RiscOp::BitScanForward,
+                RiscOp::BitScanReverse,
+                RiscOp::CountTrailingZeros { width: 8 },
+                RiscOp::CountLeadingZeros { width: 8 },
+                RiscOp::PopCount,
+                RiscOp::Setcc { cond: BranchCondition::Always },
+                RiscOp::ConditionalMove { cond: BranchCondition::Always },
+                RiscOp::CompareExchange { width: 8 },
             ];
 
             // 전 opcode 존재
@@ -1061,6 +1342,185 @@ mod tests {
             cond_bytes.sort_unstable();
             cond_bytes.dedup();
             assert_eq!(cond_bytes.len(), 22, "branch cond byte collision");
+        }
+    }
+
+    // ── P2: 신규 정수/비트/제어 연산 차등 검증 (인터프리터 == eval_state) ──────────
+
+    /// Mov — 플래그를 변경하지 않는 순수 복사 (MOV 뒤 Jcc 의 플래그 보존 핵심).
+    #[test]
+    fn test_poly_diff_mov_preserves_flags() {
+        for seed in DIFF_SEEDS {
+            let mut d = RiscDesynthesizer::new();
+            // ZF=1 설정 (플래그)
+            d.instrs.push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Imm64(0x40)));
+            // R0 = 0x1234 ; R1 = R0 (Mov — 플래그 무변경)
+            d.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::VReg(0)).with_src1(MicroOperand::Imm64(0x1234)));
+            d.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::VReg(1)).with_src1(MicroOperand::VReg(0)));
+            // ZF=1 인 상태에서 NotZero 분기가 not-taken 이어야 한다 (Mov 가 ZF 를 깨지 않음).
+            d.instrs.push(MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::NotZero }).with_imm(6));
+            d.instrs.push(MicroInstr::new(RiscOp::Halt)); // index4
+            d.emit_add(MicroOperand::VReg(7), MicroOperand::Imm64(999), MicroOperand::Imm64(0)); // index5: 도달 안 함
+            d.instrs.push(MicroInstr::new(RiscOp::Halt)); // index6
+            let prog = RiscProgram::new(d.instrs);
+            run_diff(seed, &prog, &[0u64; 16]);
+        }
+    }
+
+    /// Multiply / MultiplyLow (부호·폭별) — RDX(=reg2) 고/저 결과 + CF|OF.
+    #[test]
+    fn test_poly_diff_multiply() {
+        for seed in DIFF_SEEDS {
+            let mut d = RiscDesynthesizer::new();
+            // R0 = 0x1_0000_0001 (고/저 분리 확인), R1 = 3
+            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x1_0000_0001), MicroOperand::Imm64(0));
+            d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(3), MicroOperand::Imm64(0));
+            // unsigned MUL r64: RDX:RAX = R0 * R1
+            d.instrs.push(
+                MicroInstr::new(RiscOp::Multiply { signed: false, width: 8 })
+                    .with_dst(MicroOperand::VReg(0))
+                    .with_src1(MicroOperand::VReg(0))
+                    .with_src2(MicroOperand::VReg(1)),
+            );
+            // signed IMUL r32 (32비트 폭)
+            d.emit_add(MicroOperand::VReg(2), MicroOperand::Imm64(0x7FFF_FFFF), MicroOperand::Imm64(0));
+            d.instrs.push(
+                MicroInstr::new(RiscOp::MultiplyLow { signed: true, width: 4 })
+                    .with_dst(MicroOperand::VReg(3))
+                    .with_src1(MicroOperand::VReg(2))
+                    .with_src2(MicroOperand::Imm64(2)),
+            );
+            d.instrs.push(MicroInstr::new(RiscOp::Halt));
+            let prog = RiscProgram::new(d.instrs);
+            run_diff(seed, &prog, &[0u64; 16]);
+        }
+    }
+
+    /// Divide / IDivide (부호·폭별) — RDX:RAX 피제수, RAX 몫, RDX 나머지.
+    #[test]
+    fn test_poly_diff_divide() {
+        for seed in DIFF_SEEDS {
+            let mut d = RiscDesynthesizer::new();
+            // 64비트 unsigned: R2(RDX)=0, R0(RAX)=1000 ; divisor R1=7
+            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(1000), MicroOperand::Imm64(0));
+            d.emit_add(MicroOperand::VReg(2), MicroOperand::Imm64(0), MicroOperand::Imm64(0));
+            d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(7), MicroOperand::Imm64(0));
+            d.instrs.push(
+                MicroInstr::new(RiscOp::Divide { signed: false, width: 8 })
+                    .with_dst(MicroOperand::VReg(0))
+                    .with_src1(MicroOperand::VReg(1)),
+            );
+            // 32비트 signed IDIV: EDX:EAX = 0xFFFFFFFD:... → -1000 / 7
+            d.emit_add(MicroOperand::VReg(3), MicroOperand::Imm64(0), MicroOperand::Imm64(0));
+            d.instrs.push(
+                MicroInstr::new(RiscOp::Divide { signed: true, width: 4 })
+                    .with_dst(MicroOperand::VReg(3))
+                    .with_src1(MicroOperand::VReg(1)),
+            );
+            d.instrs.push(MicroInstr::new(RiscOp::Halt));
+            let prog = RiscProgram::new(d.instrs);
+            run_diff(seed, &prog, &[0u64; 16]);
+        }
+    }
+
+    /// BSwap / BitScan / Count* / PopCount — 비트 연산 전 계열.
+    #[test]
+    fn test_poly_diff_bitscan_and_count() {
+        for seed in DIFF_SEEDS {
+            let mut d = RiscDesynthesizer::new();
+            // R0 = 0x0102030405060708
+            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x0102_0304_0506_0708), MicroOperand::Imm64(0));
+            // BSWAP r64
+            d.instrs.push(MicroInstr::new(RiscOp::BSwap { width: 8 }).with_dst(MicroOperand::VReg(1)).with_src1(MicroOperand::VReg(0)));
+            // BSF / BSR
+            d.emit_add(MicroOperand::VReg(2), MicroOperand::Imm64(0x1000), MicroOperand::Imm64(0));
+            d.instrs.push(MicroInstr::new(RiscOp::BitScanForward).with_dst(MicroOperand::VReg(3)).with_src1(MicroOperand::VReg(2)));
+            d.instrs.push(MicroInstr::new(RiscOp::BitScanReverse).with_dst(MicroOperand::VReg(4)).with_src1(MicroOperand::VReg(2)));
+            // BSF src==0 → ZF=1, dst=0
+            d.instrs.push(MicroInstr::new(RiscOp::BitScanForward).with_dst(MicroOperand::VReg(5)).with_src1(MicroOperand::Imm64(0)));
+            // TZCNT / LZCNT (64비트 폭)
+            d.instrs.push(MicroInstr::new(RiscOp::CountTrailingZeros { width: 8 }).with_dst(MicroOperand::VReg(6)).with_src1(MicroOperand::Imm64(0x1000)));
+            d.instrs.push(MicroInstr::new(RiscOp::CountLeadingZeros { width: 8 }).with_dst(MicroOperand::VReg(7)).with_src1(MicroOperand::Imm64(0x8000_0000_0000_0000)));
+            // POPCNT
+            d.emit_add(MicroOperand::VReg(4), MicroOperand::Imm64(0xFF), MicroOperand::Imm64(0));
+            d.instrs.push(MicroInstr::new(RiscOp::PopCount).with_dst(MicroOperand::Temp(0)).with_src1(MicroOperand::VReg(4)));
+            d.instrs.push(MicroInstr::new(RiscOp::Halt));
+            let prog = RiscProgram::new(d.instrs);
+            run_diff(seed, &prog, &[0u64; 16]);
+        }
+    }
+
+    /// Setcc / ConditionalMove — 조건 평가 (하드웨어 setcc/cmovcc 와 동치).
+    #[test]
+    fn test_poly_diff_setcc_cmov() {
+        for seed in DIFF_SEEDS {
+            let mut d = RiscDesynthesizer::new();
+            // ZF=1|CF=0|SF=0|OF=0 → Equal/AboveOrEqual/Parity(짝수 패리티는 보장 안 됨)
+            d.instrs.push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Imm64(0x44)));
+            // SETcc: Zero → 1, NotZero → 0
+            d.instrs.push(MicroInstr::new(RiscOp::Setcc { cond: BranchCondition::Zero }).with_dst(MicroOperand::VReg(1)));
+            d.instrs.push(MicroInstr::new(RiscOp::Setcc { cond: BranchCondition::NotZero }).with_dst(MicroOperand::VReg(2)));
+            // CMOVcc: R3 = ZF ? R4 : R3 (R3=0, R4=7 → 7)
+            d.emit_add(MicroOperand::VReg(4), MicroOperand::Imm64(7), MicroOperand::Imm64(0));
+            d.instrs.push(
+                MicroInstr::new(RiscOp::ConditionalMove { cond: BranchCondition::Zero })
+                    .with_dst(MicroOperand::VReg(3))
+                    .with_src1(MicroOperand::VReg(4)),
+            );
+            // CMOVcc not-taken: R5 = NotZero ? 9 : R5 → 그대로 0
+            d.instrs.push(
+                MicroInstr::new(RiscOp::ConditionalMove { cond: BranchCondition::NotZero })
+                    .with_dst(MicroOperand::VReg(5))
+                    .with_src1(MicroOperand::Imm64(9)),
+            );
+            d.instrs.push(MicroInstr::new(RiscOp::Halt));
+            let prog = RiscProgram::new(d.instrs);
+            run_diff(seed, &prog, &[0u64; 16]);
+        }
+    }
+
+    /// CompareExchange — 시드된 메모리에서 일치/불일치 두 경로 (전 상태 비교).
+    #[test]
+    fn test_poly_diff_compare_exchange() {
+        for seed in DIFF_SEEDS {
+            let mut seed_mem = HashMap::new();
+            // 0x2000: 8바이트 0x1122334455667788 (acc 와 불일치)
+            for (i, b) in 0x1122_3344_5566_7788u64.to_le_bytes().iter().enumerate() {
+                seed_mem.insert(0x2000 + i as u64, *b);
+            }
+            // 0x3000: 8바이트 0x00000000DEADBEEF (acc 와 일치)
+            for (i, b) in 0x0000_0000_DEAD_BEEFu64.to_le_bytes().iter().enumerate() {
+                seed_mem.insert(0x3000 + i as u64, *b);
+            }
+            let mut d = RiscDesynthesizer::new();
+            // R0 = acc = 0xDEADBEEF (일치 케이스); R1 = 0x2000 주소; R2 = 0x3000 주소; R3 = new
+            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0xDEAD_BEEF), MicroOperand::Imm64(0));
+            d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(0x2000), MicroOperand::Imm64(0));
+            d.emit_add(MicroOperand::VReg(2), MicroOperand::Imm64(0x3000), MicroOperand::Imm64(0));
+            d.emit_add(MicroOperand::VReg(3), MicroOperand::Imm64(0xCAFE_F00D), MicroOperand::Imm64(0));
+            // 일치 케이스: [0x3000]==acc → [0x3000]=new, ZF=1
+            d.instrs.push(
+                MicroInstr::new(RiscOp::CompareExchange { width: 8 })
+                    .with_src1(MicroOperand::VReg(2))
+                    .with_src2(MicroOperand::VReg(3)),
+            );
+            // acc(RAX) 을 불일치 값으로: R0 = 0x9999
+            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x9999), MicroOperand::Imm64(0));
+            // 불일치 케이스: [0x2000] != acc → RAX = [0x2000], ZF=0
+            d.instrs.push(
+                MicroInstr::new(RiscOp::CompareExchange { width: 8 })
+                    .with_src1(MicroOperand::VReg(1))
+                    .with_src2(MicroOperand::VReg(3)),
+            );
+            // 다시 일치 케이스 (불일치 후 RAX 가 [0x2000] 값으로 바뀜)
+            d.instrs.push(
+                MicroInstr::new(RiscOp::CompareExchange { width: 8 })
+                    .with_src1(MicroOperand::VReg(2))
+                    .with_src2(MicroOperand::Imm64(0x1234)),
+            );
+            d.instrs.push(MicroInstr::new(RiscOp::Halt));
+            let prog = RiscProgram::new(d.instrs);
+            run_diff_mem(seed, &prog, &[0u64; 16], seed_mem);
         }
     }
 }

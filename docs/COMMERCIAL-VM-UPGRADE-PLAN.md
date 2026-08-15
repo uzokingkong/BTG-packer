@@ -115,7 +115,16 @@ Themida/VMProtect급 VM 컴파일러가 갖춰야 할 최소 역량을 아래 6�
 `test_poly_arith_shift_matches_reference`, `test_poly_native_call_bridge_stub`.
 폴리 인터프리터 == eval_state == (가능하면) 네이티브 하네스, 3 seeds × 각 시나리오.
 
-### P2 — RISC 리프터 명령 커버리지 100% (Full RISC Lifting)  [5–7일]
+### P2 — RISC 리프터 명령 커버리지 100% (Full RISC Lifting)  [5–7일]  🔶 진행 중
+**상태 (2026-08-15 후속)**: **문자열 ops**(MOVS/STOS/LODS/SCAS/CMPS 전 폭 + REP/REPE/REPNE 명시적 루프),
+**SSE/FPU 스칼라**(MOVSD/MOVSS 로드/스토어, ADDSS/SD·SUB·MUL·DIV, CVTSI2SS/SD·CVTSS2SD/CVTSD2SS·
+CVTTSS2SI/CVTSS2SI/CVTTSD2SI/CVTSD2SI trunc/nearest-even), **BMI**(ANDN/BLSR/BLSMSK/BLSI/BZHI) 를
+`src/vm/risc/lifter.rs`에서 리프트 완료. XMM 레지스터 파일은 가상 메모리 영역
+`XMM_SLOT_BASE + idx*16`(mem)으로 매핑, 스칼라 하위 요소만 접근. 신규 전용 원시 op
+`FloatAdd/FloatSub/FloatMul/FloatDiv/IntToFloat/FloatToInt/FloatToFloat`를 `opcodes.rs`+
+`eval_state`(참조)에 추가(FP 는 정수 원자로 분해 불가 — "strictly required"). 리프터 레벨
+선형 블록 단위 차등 테스트 22개 신설. `cargo test --release --lib` → **220 passed; 0 failed**
+(기준 198). 폴리/네이티브 해석·컴파일은 아직 이 FP op 미지원(isa_spec 미포함, no-op arm).
 **목표**: G3 해소 — `vm/risc/lifter.rs`가 레거시 171-opcode 커버리지와 동등해지도록 확장.
 
 **작업 항목** (레거시 `vm/lifter/` + `vm/text_lift/` 커버리지와 대조하며):
@@ -145,7 +154,14 @@ Themida/VMProtect급 VM 컴파일러가 갖춰야 할 최소 역량을 아래 6�
 **검증**: `btg-packer -i rust_packer_test.exe -o packed_commercial.exe --vm --vm-oep --vm-commercial`
 → 실행 시 **16개 테스트 전체 통과 + checksum baseline 동일**. `.map/.sym`이 RISC 바이트코드↔원본 VA 매핑을 기록. 기존 레거시 경로는 무회귀.
 
-### P4 — SEH 함수 가상화 (.pdata 재생성)  [5–7일]
+### P4 — SEH 함수 가상화 (.pdata 재생성)  [5–7일]  ✅ 부분 완료 (2026-08-15)
+**상태 (2026-08-15)**: `detect_seh_native_functions`(exclusions.rs)가 `BTG_SEH_MINIMAL`
+(기본 1) 환경변수로 **SEH 네이티브 175→132 최소화**(`ehandler ∩ can_reach_panic`).
+진단: panic_seed=38, ehandler=162, `{can_reach_panic − can_reach_ehandler}` 역방향 항
+0개 추가, 30개 ehandler panic 도달 불가 → 무해 가상화. 계측 출력 제거. `--vm`/`--vm-oep`
+16테스트 + checksum baseline 동일(`0x2cdc0e4511d84a64`). 0 목표는 exit-time 0xC0000005
+teardown으로 배제(132가 채택 최소치). `.pdata` 재생성(브리지 UNWIND_INFO)은 P3 `build.rs`
+에서 부분 구현 — 전체 SEH 가상화는 후속.
 **목표**: G5 해소 — panic/catch unwind 경로를 셔플/가상화하면서 OS unwind가 동작하게.
 
 **작업 항목**:
@@ -170,6 +186,12 @@ Themida/VMProtect급 VM 컴파일러가 갖춰야 할 최소 역량을 아래 6�
 3. 복호화 후 `.textb`/프로그램 VM과 동일한 rolling-key/MBA 보호를 `.text`에도 적용.
 
 **검증**: `verify_text.py` 재실행 → **`.text` first-bytes identical = False**, entropy 7.5 근접. 16개 테스트 + TLS/static-init(test [15]) 통과. 덤프(온디스크)에서 원본 x86 복원 불가.
+
+> **✅ 완료 (2026-08-15)**: `tls_guard.rs detect_tls_callback_ranges`(forward callee closure)로
+> 평문 유지 50함수/0x23EE 최소화, `place.rs text_enc_runs` + `bootstub emit_rest_decrypt`
+> run-table로 `.text` at-rest fresh-RC4 암호화·부트 복호화. `verify_text.py` → `.text`
+> identical = **False** (94.71%), entropy **7.988**; `--vm --vm-oep` 16테스트 + FINAL
+> CHECKSUM `0x2cdc0e4511d84a64`; cdb TLS 콜백 진입·복귀 정상 (0xC0000005 없음).
 
 ### P6 — 탈가상화 저항 강화 (Anti-De-virtualization)  [5–8일]
 **목표**: G6 해소 — 1:1 취약성 제거 + 핸들러/데이터 난독화 전역화.

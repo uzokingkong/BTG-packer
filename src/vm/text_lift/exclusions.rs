@@ -634,13 +634,48 @@ pub fn detect_seh_native_functions(
     let can_reach_panic = reverse_reach(&panic_seed_starts);
     let can_reach_ehandler = reverse_reach(&ehandler_starts);
 
-    // 6) native set = seeds ∪ {can reach panic but NOT can reach a handler}
+    // 6) native set = seeds | {can reach panic but NOT can reach a handler}
+    //
+    // P4 (SEH virtualization) -- SEH native set 175 -> minimal (132 verified;
+    //   0 target was tested but leaves an exit-time 0xC0000005 teardown, so 132 is
+    //   the accepted minimum that keeps the 16-test + checksum contract clean).
+    //
+    //   Rationale: x64 SEH unwind (panic -> 0xE06D7363 -> catch_unwind) needs a
+    //   valid .pdata RUNTIME_FUNCTION for every frame between the raise site and
+    //   the catch frame. The P4 bridge (.pdata bridge leaf + UNWIND_INFO, build.rs
+    //   update_pdata_seh) covers the boot/dispatcher frame for OS unwind, so the
+    //   intermediate "raise..catch" frames need not stay native -- they are
+    //   virtualized and the unwinder walks through the bridge .pdata to the VM
+    //   state restore point.
+    //
+    //   Measured on this target: panic_seed=38, ehandler=162, and the old
+    //   {can_reach_panic - can_reach_ehandler} reverse-reach term added 0 extra
+    //   functions. The over-broad part was keeping ALL 162 ehandler functions
+    //   native; of those, 30 are unreachable from any panic (irrelevant to this
+    //   program's unwinds) and are virtualized harmlessly.
+    //   -> minimal = the catch/cleanup frames actually on the raise..catch path
+    //      (ehandler & can_reach_panic) = 132.
+    //
+    //   Env BTG_SEH_MINIMAL (default 1) -- set to 0 to restore the old full set
+    //   (panic_seed | ehandler | {can_reach_panic - can_reach_ehandler} = 175) for
+    //   A/B regression.
+    let seh_minimal = std::env::var("BTG_SEH_MINIMAL").map_or(true, |v| v != "0");
     let mut native: HashSet<u64> = HashSet::new();
-    native.extend(panic_seed_starts.iter().copied());
-    native.extend(ehandler_starts.iter().copied());
-    for &s in &can_reach_panic {
-        if !can_reach_ehandler.contains(&s) {
-            native.insert(s);
+    if seh_minimal {
+        // P4 minimal: keep only the catch/cleanup frames on the raise..catch path
+        // (EHANDLER/UHANDLER functions reachable from a panic seed).
+        for &s in ehandler_starts.iter() {
+            if can_reach_panic.contains(&s) {
+                native.insert(s);
+            }
+        }
+    } else {
+        native.extend(panic_seed_starts.iter().copied());
+        native.extend(ehandler_starts.iter().copied());
+        for &s in &can_reach_panic {
+            if !can_reach_ehandler.contains(&s) {
+                native.insert(s);
+            }
         }
     }
     // The entry function must stay shuffled: the boot stub dispatches into it,

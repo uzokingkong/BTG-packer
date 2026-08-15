@@ -57,6 +57,13 @@ pub(crate) struct BootStubCtx {
     /// 원본 .text 평문 노출을 제거한다. (0이면 비활성)
     pub(crate) vm_oep_text_va: u64,
     pub(crate) vm_oep_text_len: u32,
+    /// P5: pointer to the .text at-rest decrypt run-table (array of {va:u64, len:u64} pairs),
+    /// covering exactly the non-TLS `.text` regions encrypted at rest. The boot stub decrypts
+    /// these runs (fresh RC4 seed keystream) in order, then the program-VM bytecode, so the
+    /// TLS-callback functions the loader runs pre-boot stay plaintext. (0 / 0 = no-op.)
+    pub(crate) vm_oep_text_runs_va: u64,
+    pub(crate) vm_oep_text_runs_count: u32,
+
     // ── v7 chained-crypto ──────────────────────────────────────────────────
     /// true = RC4를 256B 청크 단위로 재키잉해 순차 복호화
     /// (Key_i = 이전 청크 평문, chunk0 = seed anchor → skip-ahead 불가)
@@ -162,6 +169,9 @@ pub(crate) enum Label {
     Prga,
     PrgaLoop,
     PrgaDone,
+    TextRunLoop,
+    TextRunDone,
+
     // ── v19: base-bound key (rebase/rehost 방해) ──
     BaseBindLoop,
     // ── v5 integrity: CRC32 검증 루프 ──
@@ -606,10 +616,20 @@ fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStu
     // canonical RC4 PRGA: i=0, j=0에서 시작
     seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::ESI, Register::ESI).unwrap(), None));
     seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::EDI, Register::EDI).unwrap(), None));
-    // .text 복호화 (len=0이면 no-op)
-    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.vm_oep_text_va).unwrap(), None));
-    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX, stub.vm_oep_text_len as u64).unwrap(), None));
+    // P5: loop over .text at-rest decrypt run-table (va,len u64 pairs). Fresh
+    // keystream is continuous across runs -> same order/lengths as the packer
+    // encrypted them. count==0 -> immediate no-op (bytecode-only).
+    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RBP, stub.vm_oep_text_runs_va).unwrap(), None));
+    seq.push((Instruction::with2(Code::Mov_r32_imm32, Register::R11D, stub.vm_oep_text_runs_count).unwrap(), None));
+    seq.push((Instruction::with2(Code::Test_rm64_r64, Register::R11, Register::R11).unwrap(), Some(Label::TextRunLoop)));
+    seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Label::TextRunDone)));
+    seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RCX, MemoryOperand::with_base_displ(Register::RBP, 0)).unwrap(), None));
+    seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RDX, MemoryOperand::with_base_displ(Register::RBP, 8)).unwrap(), None));
     seq.push((Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(), Some(Label::Prga)));
+    seq.push((Instruction::with2(Code::Add_rm64_imm32, Register::RBP, 16).unwrap(), None));
+    seq.push((Instruction::with1(Code::Dec_rm64, Register::R11).unwrap(), None));
+    seq.push((Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap(), Some(Label::TextRunLoop)));
+    seq.push((Instruction::with(Code::Nopd), Some(Label::TextRunDone)));
     // bytecode 복호화 (len=0이면 no-op)
     seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.vm_oep_bc_va).unwrap(), None));
     seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX, stub.vm_oep_bc_len as u64).unwrap(), None));

@@ -532,6 +532,30 @@ pub(crate) fn collect_protected_rva_ranges(
         raw_ranges.push((cookie_rva, cookie_rva.saturating_add(32)));
     }
 
+    // P5 (.text on-disk plaintext 0): protect the full TLS-callback-reachable
+    // function ranges. The loader runs these before the boot stub, so they must
+    // never be encrypted even when a future at-rest `.text` encryptor is enabled.
+    // (collect_protected_rva_ranges is the single "must stay plaintext" registry
+    // that both patch_data fixup and the at-rest encryptor consult.)
+    {
+        use crate::vm::text_lift::detect_tls_callback_ranges;
+        let base_va = ctx.target_info.image_base + ctx.target_info.text_rva as u64;
+        let excl = detect_tls_callback_ranges(
+            &ctx.target_info.text_bytes,
+            base_va,
+            ctx.target_info.image_base,
+            sections,
+            &ctx.target_info.data_directories,
+        );
+        for (s, e) in excl.func_ranges {
+            let s_rva = (s.saturating_sub(ctx.target_info.image_base)) as u32;
+            let e_rva = (e.saturating_sub(ctx.target_info.image_base)) as u32;
+            if e_rva > s_rva {
+                raw_ranges.push((s_rva, e_rva));
+            }
+        }
+    }
+
     // v58 (Phase 2.5 SEH): 원본 .pdata의 UNWIND_INFO 주소를 보호한다. 로더가
     // 예외 디스패치(panic/catch_unwind) 시 런타임에 .pdata → UNWIND_INFO → EHANDLER
     // 를 읽는다. UNWIND_INFO가 v14 .rdata run에 포함돼 부트-복호화가 부분적으로

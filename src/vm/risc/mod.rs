@@ -72,7 +72,7 @@ impl RiscProgram {
         }
     }
 
-    /// ip_map(소스-IP → 프로그램 인덱스)을 통해 분기 타깃 절대 x86 IP를
+/// ip_map(소스-IP → 프로그램 인덱스)을 통해 분기 타깃 절대 x86 IP를
     /// 프로그램 인덱스로 해석한다. (ip_map이 없으면 imm을 그대로 인덱스로 사용 —
     /// eval_state의 VirtualBranch와 동일한 해석)
     pub fn resolve_target(&self, imm: u64) -> usize {
@@ -81,6 +81,12 @@ impl RiscProgram {
             .and_then(|m| m.get(&imm))
             .copied()
             .unwrap_or(imm as usize)
+    }
+
+    /// 분기 타깃 해석용 ip_map 접근자 (네이티브 하네스가 정적 분기 타깃을
+    /// 블록 인덱스로 베이크할 때 사용).
+    pub fn ip_map(&self) -> Option<&HashMap<u64, usize>> {
+        self.ip_map.as_ref()
     }
 
     /// RISC 가상 머신 인터프리터 시뮬레이션 (검증 및 테스트용)
@@ -126,6 +132,16 @@ impl RiscProgram {
                         match dst {
                             MicroOperand::VReg(i) => regs[i as usize] = res,
                             MicroOperand::Temp(i) => temps[i as usize] = res,
+                            _ => {}
+                        }
+                    }
+                }
+                RiscOp::Mov => {
+                    let a = get_val(ins.src1, &regs, &temps, flags.raw);
+                    if let Some(dst) = ins.dst {
+                        match dst {
+                            MicroOperand::VReg(i) => regs[i as usize] = a,
+                            MicroOperand::Temp(i) => temps[i as usize] = a,
                             _ => {}
                         }
                     }
@@ -207,6 +223,11 @@ impl RiscProgram {
                     flags.update_logic64(res);
                     store(ins.dst, &mut st, res);
                 }
+                RiscOp::Mov => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    // 플래그를 변경하지 않는 순수 복사.
+                    store(ins.dst, &mut st, a);
+                }
                 RiscOp::AddWithCarry => {
                     let a = get_val(ins.src1, &st, flags.raw);
                     let b = get_val(ins.src2, &st, flags.raw);
@@ -278,6 +299,183 @@ impl RiscProgram {
                 }
                 RiscOp::Halt => break,
                 RiscOp::NativeCallBridge => {}
+                // ── P2: 정수/비트/제어 복합 연산 ─────────────────────────────────
+                RiscOp::Multiply { signed, width } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    mul_wide(&mut st, &mut flags, a, b, signed, width, ins.dst);
+                }
+                RiscOp::MultiplyLow { signed, width } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    mul_low(&mut st, &mut flags, a, b, signed, width, ins.dst);
+                }
+                RiscOp::Divide { signed, width } => {
+                    let divisor = get_val(ins.src1, &st, flags.raw);
+                    div_wide(&mut st, divisor, signed, width, ins.dst);
+                }
+                RiscOp::BSwap { width } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let res = if width == 4 {
+                        (a.swap_bytes() as u32) as u64
+                    } else {
+                        a.swap_bytes()
+                    };
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::BitScanForward => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    if a == 0 {
+                        flags.set_zf(true);
+                        store(ins.dst, &mut st, 0);
+                    } else {
+                        flags.set_zf(false);
+                        store(ins.dst, &mut st, a.trailing_zeros() as u64);
+                    }
+                }
+                RiscOp::BitScanReverse => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    if a == 0 {
+                        flags.set_zf(true);
+                        store(ins.dst, &mut st, 0);
+                    } else {
+                        flags.set_zf(false);
+                        store(ins.dst, &mut st, 63 - a.leading_zeros() as u64);
+                    }
+                }
+                RiscOp::CountTrailingZeros { width } => {
+                    let bits = width as u32 * 8;
+                    let mask = width_mask(bits);
+                    let s = get_val(ins.src1, &st, flags.raw) & mask;
+                    if s == 0 {
+                        flags.set_cf(true);
+                        flags.set_zf(true);
+                        store(ins.dst, &mut st, bits as u64);
+                    } else {
+                        flags.set_cf(false);
+                        let c = s.trailing_zeros() as u64;
+                        flags.set_zf(c == 0);
+                        store(ins.dst, &mut st, c);
+                    }
+                }
+                RiscOp::CountLeadingZeros { width } => {
+                    let bits = width as u32 * 8;
+                    let mask = width_mask(bits);
+                    let s = get_val(ins.src1, &st, flags.raw) & mask;
+                    if s == 0 {
+                        flags.set_cf(true);
+                        flags.set_zf(true);
+                        store(ins.dst, &mut st, bits as u64);
+                    } else {
+                        flags.set_cf(false);
+                        // 폭 한정 clz: (bits-1) - msb_index
+                        let msb = 63 - s.leading_zeros() as u64;
+                        let c = (bits as u64 - 1) - msb;
+                        flags.set_zf(c == 0);
+                        store(ins.dst, &mut st, c);
+                    }
+                }
+                RiscOp::PopCount => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let res = a.count_ones() as u64;
+                    flags.update_logic64(res);
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::Setcc { cond } => {
+                    let v = branch_taken_with_state(cond, &flags, &st.regs);
+                    store(ins.dst, &mut st, v as u64);
+                }
+                RiscOp::ConditionalMove { cond } => {
+                    if branch_taken_with_state(cond, &flags, &st.regs) {
+                        let v = get_val(ins.src1, &st, flags.raw);
+                        store(ins.dst, &mut st, v);
+                    }
+                }
+                RiscOp::CompareExchange { width } => {
+                    let addr = get_val(ins.src1, &st, flags.raw);
+                    let newv = get_val(ins.src2, &st, flags.raw);
+                    let bits = width as u32 * 8;
+                    let mask = width_mask(bits);
+                    let acc = st.regs[0] & mask;
+                    let old = mem_read(&st.mem, addr, width) & mask;
+                    if old == acc {
+                        mem_write(&mut st.mem, addr, width, newv & mask);
+                        flags.set_zf(true);
+                    } else {
+                        st.regs[0] = old;
+                        flags.set_zf(false);
+                    }
+                }
+                RiscOp::FloatAdd { width } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let res = if width == 4 {
+                        (f32::from_bits(a as u32) + f32::from_bits(b as u32)).to_bits() as u64
+                    } else {
+                        (f64::from_bits(a) + f64::from_bits(b)).to_bits()
+                    };
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::FloatSub { width } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let res = if width == 4 {
+                        (f32::from_bits(a as u32) - f32::from_bits(b as u32)).to_bits() as u64
+                    } else {
+                        (f64::from_bits(a) - f64::from_bits(b)).to_bits()
+                    };
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::FloatMul { width } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let res = if width == 4 {
+                        (f32::from_bits(a as u32) * f32::from_bits(b as u32)).to_bits() as u64
+                    } else {
+                        (f64::from_bits(a) * f64::from_bits(b)).to_bits()
+                    };
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::FloatDiv { width } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let res = if width == 4 {
+                        (f32::from_bits(a as u32) / f32::from_bits(b as u32)).to_bits() as u64
+                    } else {
+                        (f64::from_bits(a) / f64::from_bits(b)).to_bits()
+                    };
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::IntToFloat { src_bits, dst_bits } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let iv = if src_bits == 4 { (a as i32) as i64 } else { a as i64 };
+                    let res = if dst_bits == 4 {
+                        (iv as f32).to_bits() as u64
+                    } else {
+                        (iv as f64).to_bits()
+                    };
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::FloatToInt { src_bits, dst_bits, truncate } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let f = if src_bits == 4 { f32::from_bits(a as u32) as f64 } else { f64::from_bits(a) };
+                    let iv = if truncate {
+                        (f.trunc() as i64) as u64
+                    } else {
+                        round_ties_even(f) as u64
+                    };
+                    let res = if dst_bits == 8 { iv } else { iv & 0xFFFF_FFFF };
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::FloatToFloat { src_bits, dst_bits } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let res = if src_bits == 4 {
+                        (f32::from_bits(a as u32) as f64).to_bits()
+                    } else {
+                        (f64::from_bits(a) as f32).to_bits() as u64
+                    };
+                    store(ins.dst, &mut st, res);
+                }
             }
             vip += 1;
         }
@@ -346,6 +544,151 @@ fn mem_read(mem: &HashMap<u64, u8>, addr: u64, width: u8) -> u64 {
 fn mem_write(mem: &mut HashMap<u64, u8>, addr: u64, width: u8, val: u64) {
     for i in 0..width {
         mem.insert(addr.wrapping_add(i as u64), (val >> (i as u64 * 8)) as u8);
+    }
+}
+
+// ── P2: 정수/비트 복합 연산 참조 헬퍼 ─────────────────────────────────────────
+
+/// `width`바이트 폭의 비트 마스크.
+fn width_mask(bits: u32) -> u64 {
+    if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    }
+}
+
+/// round-to-nearest-even (x86 MXCSR 기본 RC) — 정확히 half-way 인 경우 짝수 쪽으로 반올림.
+fn round_ties_even(x: f64) -> i64 {
+    let fl = x.floor();
+    let diff = x - fl;
+    if diff == 0.5 {
+        let f = fl as i64;
+        if f % 2 == 0 { f } else { f + 1 }
+    } else {
+        x.round() as i64
+    }
+}
+
+/// `bits` 비트 값 `v`를 i128 로 부호 확장 (bits < 128).
+fn sign_extend_i128(v: u128, bits: u32) -> i128 {
+    let shift = 128 - bits;
+    ((v << shift) as i128) >> shift
+}
+
+/// 1-피연산자 MUL/IMUL 참조: low → dst, high → RDX(폭 ≥ 2) 또는 AX(폭 1).
+fn mul_wide(
+    st: &mut RiscEvalState,
+    flags: &mut VirtualFlags,
+    a: u64,
+    b: u64,
+    signed: bool,
+    width: u8,
+    dst: Option<MicroOperand>,
+) {
+    let bits = width as u32 * 8;
+    let mask = width_mask(bits);
+    let am = a & mask;
+    let bm = b & mask;
+    let full = (am as u128) * (bm as u128);
+    let low = full as u64;
+    let high = ((full >> bits) as u64) & mask;
+    let ovf = if signed {
+        let sign_ext = if low & (1u64 << (bits - 1)) != 0 { mask } else { 0 };
+        high != sign_ext
+    } else {
+        high != 0
+    };
+    flags.set_cf_of(ovf);
+    if width == 1 {
+        // AX = AL·r/m8 — AH(high 8비트)를 RAX 비트 8..15 로.
+        store_dst(st, dst, (low & 0xFF) | ((high & 0xFF) << 8));
+    } else {
+        store_dst(st, dst, low);
+        st.regs[2] = high; // RDX
+    }
+}
+
+/// 2/3-피연산자 IMUL 참조: dst = low(src1·src2), RDX 미기록.
+fn mul_low(
+    st: &mut RiscEvalState,
+    flags: &mut VirtualFlags,
+    a: u64,
+    b: u64,
+    signed: bool,
+    width: u8,
+    dst: Option<MicroOperand>,
+) {
+    let bits = width as u32 * 8;
+    let mask = width_mask(bits);
+    let am = a & mask;
+    let bm = b & mask;
+    let full = (am as u128) * (bm as u128);
+    let low = full as u64;
+    let high = ((full >> bits) as u64) & mask;
+    let ovf = if signed {
+        let sign_ext = if low & (1u64 << (bits - 1)) != 0 { mask } else { 0 };
+        high != sign_ext
+    } else {
+        high != 0
+    };
+    flags.set_cf_of(ovf);
+    store_dst(st, dst, low);
+}
+
+/// DIV/IDIV 참조: 피제수 = RDX:RAX(폭별, 폭 1 은 AX), 제수 = divisor,
+/// 몫 → dst(RAX), 나머지 → RDX. (제수 0 또는 몫 오버플로는 x86 #DE — 참조에서는
+/// 결과 0 으로 취급해 크래시 회피.)
+fn div_wide(st: &mut RiscEvalState, divisor: u64, signed: bool, width: u8, dst: Option<MicroOperand>) {
+    let bits = width as u32 * 8;
+    let mask = width_mask(bits);
+    // 폭 1(8비트 DIV/IDIV)은 AX(reg0 low16)가 피제수 — RDX 미사용.
+    let (dividend, dvbits) = if width == 1 {
+        ((st.regs[0] & 0xFFFF) as u128, 16u32)
+    } else {
+        (
+            ((st.regs[2] & mask) as u128) << bits | (st.regs[0] & mask) as u128,
+            bits * 2,
+        )
+    };
+    let dv = (divisor & mask) as u128;
+    if dv == 0 {
+        // #DE → 참조 기본값 (0). 폭 1 은 AX(dst) 형태.
+        if width == 1 {
+            store_dst(st, dst, 0);
+        } else {
+            store_dst(st, dst, 0);
+            st.regs[2] = 0;
+        }
+        return;
+    }
+    let (q, r) = if signed {
+        let d = sign_extend_i128(dividend, dvbits);
+        let s = sign_extend_i128(dv as u64 as u128, bits);
+        // Rust 정수 나눗셈은 0 쪽으로 절단 — IDIV 와 동일.
+        let (q, r) = (d / s, d % s);
+        (q as u128, r as u128)
+    } else {
+        (dividend / dv, dividend % dv)
+    };
+    if width == 1 {
+        // AL = 몫, AH = 나머지 → AX(dst).
+        let ax = ((r as u64) & 0xFF) << 8 | ((q as u64) & 0xFF);
+        store_dst(st, dst, ax);
+    } else {
+        store_dst(st, dst, (q as u64) & mask);
+        st.regs[2] = (r as u64) & mask;
+    }
+}
+
+/// dst(Some VReg/Temp) 저장 — eval_state 의 `store` 클로저와 동일.
+fn store_dst(st: &mut RiscEvalState, dst: Option<MicroOperand>, val: u64) {
+    if let Some(d) = dst {
+        match d {
+            MicroOperand::VReg(i) => st.regs[i as usize] = val,
+            MicroOperand::Temp(i) => st.temps[i as usize] = val,
+            _ => {}
+        }
     }
 }
 

@@ -48,8 +48,11 @@ impl PolymorphicDecoder {
                 .cloned()
                 .ok_or_else(|| anyhow!("poly decoder: unknown decrypted opcode 0x{raw_op:02X} at offset 0x{vip:X}"))?;
 
-            // 1b. VirtualBranch 조건 바이트 (opcode 직후)
-            let cond = if let RiscOp::VirtualBranch { .. } = risc_op {
+            // 1b. 조건 바이트 — VirtualBranch·Setcc·ConditionalMove (opcode 직후)
+            let cond = if let RiscOp::VirtualBranch { .. }
+            | RiscOp::Setcc { .. }
+            | RiscOp::ConditionalMove { .. } = risc_op
+            {
                 let raw_cond = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
                 vip += 1;
                 self.spec
@@ -60,6 +63,8 @@ impl PolymorphicDecoder {
             };
             let risc_op = match risc_op {
                 RiscOp::VirtualBranch { .. } => RiscOp::VirtualBranch { cond },
+                RiscOp::Setcc { .. } => RiscOp::Setcc { cond },
+                RiscOp::ConditionalMove { .. } => RiscOp::ConditionalMove { cond },
                 other => other,
             };
 

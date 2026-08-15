@@ -63,11 +63,17 @@ impl PolymorphicEncoder {
             out.push(enc_op);
             vip += 1;
 
-            // 1b. VirtualBranch: 조건 바이트 (opcode 바로 뒤)
-            if let RiscOp::VirtualBranch { cond } = ins.op {
-                let cond_byte = self.spec.encode_cond(cond);
-                out.push(self.rolling.encrypt_byte(cond_byte, vip));
-                vip += 1;
+            // 1b. 조건 바이트 — VirtualBranch·Setcc·ConditionalMove 는 조건과 무관한
+            //     단일 Opcode 를 공유하고 조건은 `branch_cond_map` 으로 부호화한다.
+            match ins.op {
+                RiscOp::VirtualBranch { cond }
+                | RiscOp::Setcc { cond }
+                | RiscOp::ConditionalMove { cond } => {
+                    let cond_byte = self.spec.encode_cond(cond);
+                    out.push(self.rolling.encrypt_byte(cond_byte, vip));
+                    vip += 1;
+                }
+                _ => {}
             }
 
             // 2. Encode operands if present

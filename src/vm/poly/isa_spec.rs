@@ -64,6 +64,46 @@ impl VirtualIsaSpec {
         ops.push(RiscOp::NativeCallBridge);
         ops.push(RiscOp::SetFlag);
         ops.push(RiscOp::Halt);
+        ops.push(RiscOp::Mov);
+        // P2: 정수/비트/제어 복합 연산 — 부호/폭/모드별로 별도 Opcode.
+        // (signed/width/mode 는 variant 에 Bake — 각각 유일 Opcode.)
+        for signed in [false, true] {
+            for w in [1u8, 2, 4, 8] {
+                ops.push(RiscOp::Multiply { signed, width: w });
+            }
+        }
+        for signed in [false, true] {
+            for w in [2u8, 4, 8] {
+                ops.push(RiscOp::MultiplyLow { signed, width: w });
+            }
+        }
+        for signed in [false, true] {
+            for w in [1u8, 2, 4, 8] {
+                ops.push(RiscOp::Divide { signed, width: w });
+            }
+        }
+        for w in [4u8, 8] {
+            ops.push(RiscOp::BSwap { width: w });
+        }
+        ops.push(RiscOp::BitScanForward);
+        ops.push(RiscOp::BitScanReverse);
+        for w in [2u8, 4, 8] {
+            ops.push(RiscOp::CountTrailingZeros { width: w });
+        }
+        for w in [2u8, 4, 8] {
+            ops.push(RiscOp::CountLeadingZeros { width: w });
+        }
+        ops.push(RiscOp::PopCount);
+        // Setcc/ConditionalMove — 조건은 branch_cond_map 으로 별도 부호화, 단일 Opcode.
+        ops.push(RiscOp::Setcc {
+            cond: BranchCondition::Always,
+        });
+        ops.push(RiscOp::ConditionalMove {
+            cond: BranchCondition::Always,
+        });
+        for w in [1u8, 2, 4, 8] {
+            ops.push(RiscOp::CompareExchange { width: w });
+        }
 
         let mut used_bytes = std::collections::HashSet::new();
         let mut opcode_map = HashMap::new();
@@ -175,12 +215,18 @@ impl VirtualIsaSpec {
         self.reverse_branch_cond_map.get(&byte).copied()
     }
 
-    /// Opcode 조회 — VirtualBranch 는 조건과 무관한 단일 Opcode 를 공유하므로
-    /// 어떤 조건이든 canonical(Always) 항목으로 정규화해 찾는다.
+    /// Opcode 조회 — VirtualBranch/Setcc/ConditionalMove 는 조건과 무관한 단일
+    /// Opcode 를 공유하므로 어떤 조건이든 canonical(Always) 항목으로 정규화해 찾는다.
     #[inline]
     pub fn opcode_for(&self, op: RiscOp) -> Option<u8> {
         let canonical = match op {
             RiscOp::VirtualBranch { .. } => RiscOp::VirtualBranch {
+                cond: BranchCondition::Always,
+            },
+            RiscOp::Setcc { .. } => RiscOp::Setcc {
+                cond: BranchCondition::Always,
+            },
+            RiscOp::ConditionalMove { .. } => RiscOp::ConditionalMove {
                 cond: BranchCondition::Always,
             },
             other => other,

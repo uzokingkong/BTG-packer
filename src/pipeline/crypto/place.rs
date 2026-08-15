@@ -195,6 +195,8 @@ pub(crate) fn place_boot_stub(
         vm_oep_bc_len: 0,
         vm_oep_text_va: 0,
         vm_oep_text_len: 0,
+        vm_oep_text_runs_va: 0,
+        vm_oep_text_runs_count: 0,
         // payload_va/crc_va는 imm64라 길이 불변 — 최종 패스(stub3)에서 채운다.
         payload_va: 0,
         payload_len: if payload_relocate { code_len } else { 0 },
@@ -333,7 +335,48 @@ pub(crate) fn place_boot_stub(
                 && u64::from_le_bytes(sec.bytes[off + 0x18..off + 0x20].try_into().unwrap()) != 0
         })
     }).unwrap_or(false);
-    let text_enc = vm_oep_effective && !has_tls_cb;
+
+    // P5: partial .text at-rest encryption — encrypt every `.text` region EXCEPT
+    // the TLS-callback-reachable function ranges (the loader runs those before
+    // the boot stub, so they must stay plaintext on disk). The complement of
+    // `detect_tls_callback_ranges` within `.text` becomes the encryptable runs,
+    // decrypted by the boot stub (fresh RC4(seed)) in the same order before the
+    // program-VM bytecode. No TLS callbacks -> a single run over the whole
+    // `.text` (identical to the previous whole-region behaviour).
+    let mut text_enc_runs: Vec<(u64, u32)> = Vec::new(); // (VA, len)
+    if vm_oep_effective {
+        let base_va = image_base + ctx.target_info.text_rva as u64;
+        let excl = crate::vm::text_lift::detect_tls_callback_ranges(
+            &ctx.target_info.text_bytes,
+            base_va,
+            image_base,
+            &ctx.patched_sections,
+            &ctx.target_info.data_directories,
+        );
+        if let Some(sec) = ctx.patched_sections.iter().find(|s| s.name == ".text") {
+            let sec_start = image_base + sec.virtual_address as u64;
+            let sec_end = sec_start + sec.bytes.len() as u64;
+            let mut ranges = excl.func_ranges.clone();
+            ranges.sort_by_key(|r| r.0);
+            let mut cursor = sec_start;
+            for (s, e) in ranges {
+                let s = s.max(sec_start);
+                let e = e.min(sec_end);
+                if s >= e {
+                    continue;
+                }
+                if s > cursor {
+                    text_enc_runs.push((cursor, (s - cursor) as u32));
+                }
+                cursor = cursor.max(e);
+            }
+            if cursor < sec_end {
+                text_enc_runs.push((cursor, (sec_end - cursor) as u32));
+            }
+        }
+    }
+    let text_enc = vm_oep_effective && !text_enc_runs.is_empty();
+    let text_enc_total: u64 = text_enc_runs.iter().map(|&(_, l)| l as u64).sum();
     let (vm_oep_text_va, vm_oep_text_len) = if text_enc {
         match ctx.patched_sections.iter().find(|s| s.name == ".text") {
             Some(sec) => (image_base + sec.virtual_address as u64, sec.bytes.len() as u32),
@@ -351,10 +394,13 @@ pub(crate) fn place_boot_stub(
                 "(no bytecode)".to_string()
             }
         );
-        if text_enc && vm_oep_text_len > 0 {
-            println!("[+] --vm-oep at-rest: preserved .text encrypted ({}B, no TLS callbacks)", vm_oep_text_len);
+        if text_enc && !text_enc_runs.is_empty() {
+            println!(
+                "[+] --vm-oep at-rest: preserved .text encrypted in {} run(s), {}B total (TLS-callback funcs kept plaintext)",
+                text_enc_runs.len(), text_enc_total
+            );
         } else if has_tls_cb {
-            println!("[!] --vm-oep at-rest: preserved .text kept plaintext (TLS callbacks present; TLS-first-callback decryptor = Phase-2)");
+            println!("[!] --vm-oep at-rest: preserved .text fully TLS-reachable; no .text runs encrypted");
         }
     }
     // v16: 패킹당 레이아웃 난독화 — 부트 스텁/시드/문자열/리졸브 테이블의 절대
@@ -370,8 +416,24 @@ pub(crate) fn place_boot_stub(
     let seed_off = cursor;
     let seed_va = dispatcher_va + seed_off as u64;
 
+    // ── P5: .text at-rest decrypt run-table (va,len u64 pairs) ────────────────
+    // P5: .text at-rest decrypt run-table is only emitted when there is >=1 at-rest
+    // run; otherwise the boot stub sees count==0 and no-ops (no file table written).
+    let text_runs_block = if text_enc_runs.is_empty() {
+        0
+    } else {
+        8 + text_enc_runs.len() * 16
+    };
+    let text_runs_off = (seed_off + 256 + if integrity_effective { 4 } else { 0 } + 7) & !7;
+    let text_runs_va = if text_enc_runs.is_empty() {
+        0
+    } else {
+        dispatcher_va + (text_runs_off + 8) as u64
+    };
+    let text_runs_count = text_enc_runs.len() as u32;
+
     // ── v6: 더미 import / 리졸브 테이블 / mem 문자열 배치 (crc 뒤) ───────────
-    let iat_start = (seed_off + 256 + if integrity_effective { 4 } else { 0 } + 7) & !7;
+    let iat_start = text_runs_off + text_runs_block;
     let mut iat_cursor = iat_start;
     // 1st pass: 블록 길이 확정 (base_rva=0)
     let (dummy_blob0, _, _, _, _) = crate::pipeline::iat_hide::build_dummy_import_block(0);
@@ -466,6 +528,7 @@ pub(crate) fn place_boot_stub(
     let boot_end = stub_end
         .max(vm_off + vm_total)
         .max(runs_off + 8 + total_num_runs * 16)
+        .max(text_runs_off + text_runs_block)
         .max(boot_data_end);
     let old_section_len = btg.bytes.len();
     let new_section_len = (boot_end + 0xFF) & !0xFF;
@@ -524,6 +587,8 @@ pub(crate) fn place_boot_stub(
         vm_oep_bc_len: vm_prog_bc_len,
         vm_oep_text_va,
         vm_oep_text_len,
+        vm_oep_text_runs_va: text_runs_va,
+        vm_oep_text_runs_count: text_runs_count,
         // v6: 배치 확정 후 반영 (모두 imm64 — 길이 불변)
         iat_table_va: if !iat_table_blob.is_empty() {
             dispatcher_va + table_off as u64
@@ -666,24 +731,28 @@ pub(crate) fn place_boot_stub(
     // fresh RC4(seed_stored) 하나로 .text → bytecode 순 연속 암호화. 부트 스텁의
     // emit_rest_decrypt가 같은 순서로 복호화한다. (.textb는 RWX, .text는 WRITE
     // 비트 추가로 in-place 복호화를 허용한다.)
-    if vm_oep_effective && (vm_oep_text_len > 0 || vm_prog_bc_len > 0) {
-        if vm_oep_text_len > 0 {
+    if vm_oep_effective && (!text_enc_runs.is_empty() || vm_prog_bc_len > 0) {
+        if !text_enc_runs.is_empty() {
             if let Some(sec) = ctx.patched_sections.iter_mut().find(|s| s.name == ".text") {
                 sec.characteristics |= 0x8000_0000; // IMAGE_SCN_MEM_WRITE (boot in-place decrypt)
             }
         }
         let mut r = Rc4::new(seed_masked);
-        if vm_oep_text_len > 0 {
+        if !text_enc_runs.is_empty() {
             if let Some(sec) = ctx.patched_sections.iter_mut().find(|s| s.name == ".text") {
-                r.crypt(&mut sec.bytes);
+                let sec_start = image_base + sec.virtual_address as u64;
+                for &(va, len) in &text_enc_runs {
+                    let off = (va - sec_start) as usize;
+                    r.crypt(&mut sec.bytes[off..off + len as usize]);
+                }
             }
         }
         if vm_prog_bc_len > 0 {
             r.crypt(&mut btg.bytes[vm_prog_bc_off..vm_prog_bc_off + vm_prog_bc_len as usize]);
         }
         println!(
-            "[+] --vm-oep at-rest: fresh-RC4(seed) encryption applied (preserved .text {}B + Program VM bytecode {}B)",
-            vm_oep_text_len, vm_prog_bc_len
+            "[+] --vm-oep at-rest: fresh-RC4(seed) encryption applied (preserved .text {} run(s)/{}B + Program VM bytecode {}B)",
+            text_enc_runs.len(), text_enc_total, vm_prog_bc_len
         );
     }
 
@@ -704,6 +773,16 @@ pub(crate) fn place_boot_stub(
     // 시드 (masked)
     // v19: base-bound — 파일에는 seed_stored(=seed_masked ^ bind(preferred_base)) 저장.
     btg.bytes[seed_off..seed_off + 256].copy_from_slice(&seed_stored);
+
+    // ── P5: .text at-rest decrypt run-table 기록 (부트 스텁 emit_rest_decrypt가 소비) ──
+    if !text_enc_runs.is_empty() {
+        btg.bytes[text_runs_off..text_runs_off + 4].copy_from_slice(&text_runs_count.to_le_bytes());
+        for (i, &(va, len)) in text_enc_runs.iter().enumerate() {
+            let e = text_runs_off + 8 + i * 16;
+            btg.bytes[e..e + 8].copy_from_slice(&va.to_le_bytes());
+            btg.bytes[e + 8..e + 16].copy_from_slice(&(len as u64).to_le_bytes());
+        }
+    }
 
     // ── v5 --integrity: 코드 영역 CRC32 저장 (부트 스텁이 비교) ──────────────
     // v9: chained/plain = 평문 CRC, reencrypt = 파일 암호문 CRC. crypto-off는 없음.
