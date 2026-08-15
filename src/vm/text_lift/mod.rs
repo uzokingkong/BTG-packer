@@ -27,12 +27,14 @@ use std::collections::{HashMap, HashSet};
 use crate::vm::risc::{RiscLifter, RiscProgram};
 
 pub mod exclusions;
+pub mod tls_guard;
 pub mod commercial;
 pub mod switch;
 #[cfg(test)]
 mod tests;
 
 pub use exclusions::{detect_panic_unwind_ranges, detect_seh_native_functions};
+pub use tls_guard::{TlsCallbackExclusion, detect_tls_callback_ranges};
 pub use switch::resolve_switch_cases;
 pub use commercial::{ProgramLiftCommercial, lift_program_cfg_commercial};
 
