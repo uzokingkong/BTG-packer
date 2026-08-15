@@ -177,14 +177,37 @@ fn emit_read_imm8(b: &mut CodeBuilder, slot: i32, sub_decrypt: usize, mask: u64)
 // The native self-decoding dispatcher.
 // ==============================================================================
 
-pub fn run_native_poly_direct(bytecode: &[u8], seed: u64, init_regs: &[u64; 16]) -> Result<RiscEvalState> {
+/// P3 (G1): assembled self-decoding dispatcher pieces (machine code + tables).
+pub struct SelfDecodingParts {
+    pub code: Vec<u8>,
+    /// 256 x u64 handler table (decrypted opcode byte -> handler VA).
+    pub table: Vec<u64>,
+    /// 256 x u8 operand-offset table (operand-encoding -> state offset).
+    pub offs_tab: Vec<u8>,
+    /// 256 x u8 operand-kind table (0=reg/temp/vsp/flags, 1=imm, 2=none).
+    pub flags_tab: Vec<u8>,
+}
+
+/// P3 (G1): build the self-decoding rolling-key dispatcher machine code and its
+/// handler/operand tables, parameterized by the VAs the caller will place them
+/// at. This is the *verified* commercial execution engine (T1-4): the native
+/// runtime itself decrypts the poly bytecode with the rolling key, decodes
+/// operands and dispatches through the handler table.
+///
+/// `code_base` = where the assembled `code` is placed, `table_base` = handler
+/// table VA, `bytecode_base` = encrypted poly stream VA, `state_base` = VM state
+/// buffer VA, `stack_base` = virtual stack top VA. The `code` embeds these as
+/// absolute immediates in the entry stub.
+pub fn build_self_decoding_parts(
+    bytecode: &[u8],
+    seed: u64,
+    code_base: u64,
+    table_base: u64,
+    bytecode_base: u64,
+    state_base: u64,
+    stack_base: u64,
+) -> Result<SelfDecodingParts> {
     let spec = VirtualIsaSpec::from_seed(seed);
-    let mut arena = Arena::new(ARENA_SIZE)?;
-    let code_base = (arena.base + OFF_CODE) as u64;
-    let state_base = (arena.base + OFF_STATE) as u64;
-    let table_base = (arena.base + OFF_TABLE) as u64;
-    let bytecode_base = (arena.base + OFF_BYTECODE) as u64;
-    let stack_base = (arena.base + OFF_STACK_BASE) as u64;
     let init_key = seed.wrapping_mul(C1) ^ 0x517CC1B727220A95;
 
     // operand offset / flag tables
@@ -650,6 +673,159 @@ pub fn run_native_poly_direct(bytecode: &[u8], seed: u64, init_regs: &[u64; 16])
         b.push(Instruction::with(Code::Retnq));
     }
 
+    // ── P3: MOV — dst = src1 (no flags). ──
+    let h_mov = b.len();
+    {
+        b.call(sub_dec_ops);
+        movzx8_m(&mut b, Register::EAX, DEC_SRC1);
+        mov_m(&mut b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RAX).unwrap());
+        b.call(sub_store);
+        b.jmp(dispatch);
+    }
+
+    // ── P3: ARITHMETIC_SHIFT_RIGHT — sar r10, cl (flags via test). ──
+    let h_ashr = b.len();
+    {
+        b.call(sub_dec_ops);
+        movzx8_m(&mut b, Register::EAX, DEC_SRC1);
+        mov_m(&mut b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        movzx8_m(&mut b, Register::EAX, DEC_SRC2);
+        mov_m(&mut b, Register::R11, DEC_IMM2);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
+        b.push(Instruction::with2(Code::And_rm64_imm32, Register::R11, 63).unwrap());
+        b.push(Instruction::with2(Code::Test_rm64_r64, Register::R11, Register::R11).unwrap());
+        let skip0 = b.len() + 1;
+        b.je(skip0);
+        b.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R11D).unwrap());
+        b.push(Instruction::with2(Code::Sar_rm64_CL, Register::R10, Register::CL).unwrap());
+        let done0 = b.len();
+        for &mut (bi, ref mut ti) in b.branches.iter_mut() {
+            if *ti == skip0 {
+                *ti = done0;
+            }
+        }
+        b.push(Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).unwrap());
+        emit_store_flags(&mut b);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
+        b.call(sub_store);
+        b.jmp(dispatch);
+    }
+
+    // ── P3: MEMORY_READ{width} — R10 = addr; R10 = *(addr, width); store dst. ──
+    let h_memrd8 = b.len();
+    {
+        b.call(sub_dec_ops);
+        movzx8_m(&mut b, Register::EAX, DEC_SRC1);
+        mov_m(&mut b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        let m = MemoryOperand::with_base(Register::R10);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m).unwrap());
+        b.call(sub_store);
+        b.jmp(dispatch);
+    }
+    let h_memrd4 = b.len();
+    {
+        b.call(sub_dec_ops);
+        movzx8_m(&mut b, Register::EAX, DEC_SRC1);
+        mov_m(&mut b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        let m = MemoryOperand::with_base(Register::R10);
+        // Writing R10D zero-extends into R10 (x86-64 semantics).
+        b.push(Instruction::with2(Code::Mov_r32_rm32, Register::R10D, m).unwrap());
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
+        b.call(sub_store);
+        b.jmp(dispatch);
+    }
+    let h_memrd2 = b.len();
+    {
+        b.call(sub_dec_ops);
+        movzx8_m(&mut b, Register::EAX, DEC_SRC1);
+        mov_m(&mut b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        let m = MemoryOperand::with_base(Register::R10);
+        b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::EAX, m).unwrap());
+        b.call(sub_store);
+        b.jmp(dispatch);
+    }
+    let h_memrd1 = b.len();
+    {
+        b.call(sub_dec_ops);
+        movzx8_m(&mut b, Register::EAX, DEC_SRC1);
+        mov_m(&mut b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        let m = MemoryOperand::with_base(Register::R10);
+        b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, m).unwrap());
+        b.call(sub_store);
+        b.jmp(dispatch);
+    }
+
+    // ── P3: MEMORY_WRITE{width} — R10=addr, R11=value; *(addr,width)=value. ──
+    let h_memwr8 = b.len();
+    {
+        b.call(sub_dec_ops);
+        movzx8_m(&mut b, Register::EAX, DEC_SRC1);
+        mov_m(&mut b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        movzx8_m(&mut b, Register::EAX, DEC_SRC2);
+        mov_m(&mut b, Register::R11, DEC_IMM2);
+        b.call(sub_resolve);
+        let m = MemoryOperand::with_base(Register::R10);
+        b.push(Instruction::with2(Code::Mov_rm64_r64, m, Register::RAX).unwrap());
+        b.jmp(dispatch);
+    }
+    let h_memwr4 = b.len();
+    {
+        b.call(sub_dec_ops);
+        movzx8_m(&mut b, Register::EAX, DEC_SRC1);
+        mov_m(&mut b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        movzx8_m(&mut b, Register::EAX, DEC_SRC2);
+        mov_m(&mut b, Register::R11, DEC_IMM2);
+        b.call(sub_resolve);
+        let m = MemoryOperand::with_base(Register::R10);
+        b.push(Instruction::with2(Code::Mov_rm32_r32, m, Register::EAX).unwrap());
+        b.jmp(dispatch);
+    }
+    let h_memwr2 = b.len();
+    {
+        b.call(sub_dec_ops);
+        movzx8_m(&mut b, Register::EAX, DEC_SRC1);
+        mov_m(&mut b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        movzx8_m(&mut b, Register::EAX, DEC_SRC2);
+        mov_m(&mut b, Register::R11, DEC_IMM2);
+        b.call(sub_resolve);
+        let m = MemoryOperand::with_base(Register::R10);
+        b.push(Instruction::with2(Code::Mov_rm16_r16, m, Register::AX).unwrap());
+        b.jmp(dispatch);
+    }
+    let h_memwr1 = b.len();
+    {
+        b.call(sub_dec_ops);
+        movzx8_m(&mut b, Register::EAX, DEC_SRC1);
+        mov_m(&mut b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        movzx8_m(&mut b, Register::EAX, DEC_SRC2);
+        mov_m(&mut b, Register::R11, DEC_IMM2);
+        b.call(sub_resolve);
+        let m = MemoryOperand::with_base(Register::R10);
+        b.push(Instruction::with2(Code::Mov_rm8_r8, m, Register::AL).unwrap());
+        b.jmp(dispatch);
+    }
+
     let handlers: std::collections::HashMap<RiscOp, usize> = {
         use std::collections::HashMap;
         let mut h = HashMap::new();
@@ -657,9 +833,19 @@ pub fn run_native_poly_direct(bytecode: &[u8], seed: u64, init_regs: &[u64; 16])
         h.insert(RiscOp::AddWithCarry, h_add);
         h.insert(RiscOp::ShiftRight, h_shr);
         h.insert(RiscOp::ShiftLeft, h_shl);
+        h.insert(RiscOp::ArithmeticShiftRight, h_ashr);
+        h.insert(RiscOp::Mov, h_mov);
         h.insert(RiscOp::VirtualPush, h_push);
         h.insert(RiscOp::VirtualPop, h_pop);
         h.insert(RiscOp::SetFlag, h_setflag);
+        h.insert(RiscOp::MemoryRead { width: 8 }, h_memrd8);
+        h.insert(RiscOp::MemoryRead { width: 4 }, h_memrd4);
+        h.insert(RiscOp::MemoryRead { width: 2 }, h_memrd2);
+        h.insert(RiscOp::MemoryRead { width: 1 }, h_memrd1);
+        h.insert(RiscOp::MemoryWrite { width: 8 }, h_memwr8);
+        h.insert(RiscOp::MemoryWrite { width: 4 }, h_memwr4);
+        h.insert(RiscOp::MemoryWrite { width: 2 }, h_memwr2);
+        h.insert(RiscOp::MemoryWrite { width: 1 }, h_memwr1);
         h.insert(RiscOp::Halt, h_halt);
         h
     };
@@ -692,15 +878,32 @@ pub fn run_native_poly_direct(bytecode: &[u8], seed: u64, init_regs: &[u64; 16])
         }
     }
 
+    Ok(SelfDecodingParts { code, table, offs_tab, flags_tab })
+}
+
+/// Run the self-decoding dispatcher in an RWX arena (host-side test/bench path):
+/// build the parts at arena-relative VAs, copy them in, set the initial regs in
+/// the state buffer and jump to the dispatcher entry.
+pub fn run_native_poly_direct(bytecode: &[u8], seed: u64, init_regs: &[u64; 16]) -> Result<RiscEvalState> {
+    let mut arena = Arena::new(ARENA_SIZE)?;
+    let code_base = (arena.base + OFF_CODE) as u64;
+    let state_base = (arena.base + OFF_STATE) as u64;
+    let table_base = (arena.base + OFF_TABLE) as u64;
+    let bytecode_base = (arena.base + OFF_BYTECODE) as u64;
+    let stack_base = (arena.base + OFF_STACK_BASE) as u64;
+    let parts = build_self_decoding_parts(
+        bytecode, seed, code_base, table_base, bytecode_base, state_base, stack_base,
+    )?;
+
     // Copy into arena.
     {
         let buf = arena.bytes();
-        buf[OFF_CODE..OFF_CODE + code.len()].copy_from_slice(&code);
-        for (i, v) in table.iter().enumerate() {
+        buf[OFF_CODE..OFF_CODE + parts.code.len()].copy_from_slice(&parts.code);
+        for (i, v) in parts.table.iter().enumerate() {
             buf[OFF_TABLE + i * 8..OFF_TABLE + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
         }
-        buf[OFF_OP_OFFS..OFF_OP_OFFS + 256].copy_from_slice(&offs_tab);
-        buf[OFF_OP_FLAGS..OFF_OP_FLAGS + 256].copy_from_slice(&flags_tab);
+        buf[OFF_OP_OFFS..OFF_OP_OFFS + 256].copy_from_slice(&parts.offs_tab);
+        buf[OFF_OP_FLAGS..OFF_OP_FLAGS + 256].copy_from_slice(&parts.flags_tab);
         buf[OFF_BYTECODE..OFF_BYTECODE + bytecode.len()].copy_from_slice(bytecode);
         buf[OFF_STATE..OFF_STATE + STATE_END as usize].fill(0);
         buf[OFF_STACK_BASE - 0x2000..OFF_STACK_BASE].fill(0);
