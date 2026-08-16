@@ -272,7 +272,10 @@ fn main() -> error::Result<()> {
     }
 
     if crypto_enabled {
-        println!("[+] Composite VM Crypto: ENABLED (RC4 keyed stream — code region + string literals)");
+        println!(
+            "[+] Composite VM Crypto: ENABLED ({} keyed stream — code region + string literals)",
+            if !args.rc4 { "BTG-C1" } else { "RC4" }
+        );
     } else {
         println!("[!] Composite VM Crypto: DISABLED (--no-crypto)");
     }
@@ -356,8 +359,12 @@ fn main() -> error::Result<()> {
     ctx.keep_pdata = args.keep_pdata;
     // v13.4d diag: 디스패처 ring-buffer (마지막 32개 block id) 주입 여부
     ctx.block_ring = args.block_ring;
-    // v59: BTG-C1 커스텀 사이퍼 (기본 RC4-256 유지, opt-in)
-    ctx.custom_cipher = args.custom_cipher;
+    // v62: BTG-C1을 기본 암호로 (--rc4로 RC4 복귀). --custom-cipher는 기본값이라
+    // 명시적 동의에만 쓰이고, --rc4와 함께 주면 --rc4가 우선한다.
+    if args.rc4 && args.custom_cipher {
+        eprintln!("[!] --rc4 takes precedence over --custom-cipher (BTG-C1 is the default cipher; --rc4 forces RC4-256)");
+    }
+    ctx.custom_cipher = !args.rc4;
     // M6 Phase-2: OEP→VM entry 전환 — 부트 스텁이 원본 .text를 평문 복호화하지
     // 않고 lift된 프로그램 VM 모듈로 디스패치. (--vm 필요)
     // v59: patch_data가 .rdata/.data 포인터 재배치를 vm_oep 모드에서 원본 .text

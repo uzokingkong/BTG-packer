@@ -187,9 +187,14 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false)]
     pub block_ring: bool,
 
-    /// v59 (plan.txt 4~6단계): BTG-C1 커스텀 512-bit 스트림 사이퍼를 사용한다.
-    /// (기본은 RC4-256 — 부트 스텁/디스패처/VM 경로가 RC4에 결합되어 있어,
-    ///  이 플래그로만 새 사이퍼로 전환한다.)
+    /// v62 (기본): BTG-C1 커스텀 512-bit 스트림 사이퍼를 기본 암호로 사용한다.
+    /// (plan.txt 4~6단계 완료 — 벌크/스테이트풀 per-block/재암호화/VM 경로 배선.
+    ///  이 플래그는 이제 기본값이므로 명시적으로만 의미가 있고, 해제는 --rc4.)
     #[arg(long, default_value_t = false)]
     pub custom_cipher: bool,
+
+    /// v62: RC4-256으로 되돌린다 (--custom-cipher 해제). C1 비호환 경로
+    /// (chained/--vm-oep)의 폴백/디버그/테스트용 — 기본은 BTG-C1.
+    #[arg(long, default_value_t = false)]
+    pub rc4: bool,
 }
