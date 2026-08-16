@@ -54,6 +54,26 @@ pub enum RiscOp {
     /// AddWithCarry(+,0) 로는 플래그를 오염시키므로 전용 op 로 분리.)
     Mov,
 
+    // ── P0-1 (canonical semantics): x86 정확 플래그가 필요한 전용 산술 op ───────
+    // desynth의 AddWithCarry(+~b+1)로는 x86 SUB/NEG의 borrow-CF를 재현할 수 없다
+    // (a<b일 때 CF=1). 분기(JB/JAE 등)가 플래그를 소비하므로 실질 버그다.
+    // 각 op는 x86 폭(1/2/4/8)의 플래그 경계(bit 7/15/31/63)로 계산한다.
+
+    /// x86 SUB/CMP — dst = src1 - src2. CF=borrow(a<b), OF/AF/SF/ZF/PF 정확.
+    SubWithBorrow { width: u8 },
+
+    /// x86 ADD — dst = src1 + src2. 폭별(bit 7/15/31/63) CF/OF/AF/SF/ZF/PF 정확.
+    Add { width: u8 },
+
+    /// x86 INC — dst = src1 + 1. CF **보존**, OF=res==MIN, AF/ZF/SF/PF 갱신.
+    Inc { width: u8 },
+
+    /// x86 DEC — dst = src1 - 1. CF **보존**, OF=res==MAX, AF/ZF/SF/PF 갱신.
+    Dec { width: u8 },
+
+    /// x86 NOT — dst = ~src1. **플래그 변경 없음** (x86 NOT은 RFLAGS 불변).
+    Not { width: u8 },
+
     // ── P2: 정수/비트/제어 복합 연산 (x86 hard-to-decompose) ─────────────────────
 
     /// 1-피연산자 MUL/IMUL (RDX:RAX = RAX * r/m, 폭별).

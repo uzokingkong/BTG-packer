@@ -104,6 +104,14 @@ impl VirtualIsaSpec {
         for w in [1u8, 2, 4, 8] {
             ops.push(RiscOp::CompareExchange { width: w });
         }
+        // P0-1: x86 정확 플래그 전용 산술 op (ADD/SUB borrow-CF, INC/DEC CF 보존, NOT 무변경).
+        for w in [1u8, 2, 4, 8] {
+            ops.push(RiscOp::Add { width: w });
+            ops.push(RiscOp::SubWithBorrow { width: w });
+            ops.push(RiscOp::Inc { width: w });
+            ops.push(RiscOp::Dec { width: w });
+            ops.push(RiscOp::Not { width: w });
+        }
 
         let mut used_bytes = std::collections::HashSet::new();
         let mut opcode_map = HashMap::new();

@@ -6,13 +6,36 @@ use super::*;
 
 impl RiscLifter {
     pub(super) fn lift_binary_alu(&mut self, inst: &Instruction, alu: Alu) -> Result<()> {
+        // P0-1: x86 SUB은 borrow-CF(네이티브 플래그 소비 분기 정합)를 위해
+        // desynth(AddWithCarry) 대신 전용 SubWithBorrow(width)로 lift한다.
+        let width = Self::operand_width(inst);
         match inst.op0_kind() {
             OpKind::Register => {
                 let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
                 let right = self.operand_value(inst, 1)?;
-                alu.emit(&mut self.desynth, dst, dst, right);
-                // 32비트 목적지(EAX..R15D)는 상위 32비트를 0으로 정리.
-                self.zero_extend_dst_if32(inst, dst);
+                if alu == Alu::Sub {
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::SubWithBorrow { width })
+                            .with_dst(dst)
+                            .with_src1(dst)
+                            .with_src2(right),
+                    );
+                } else if alu == Alu::Add {
+                    // P0-1: 폭별(32/64) ADD — bit 31/63 플래그 경계 정확.
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Add { width })
+                            .with_dst(dst)
+                            .with_src1(dst)
+                            .with_src2(right),
+                    );
+                } else {
+                    alu.emit(&mut self.desynth, dst, dst, right);
+                }
+                // P0-1: Add/Sub{width}는 eval에서 폭별 마스킹+플래그를 처리하므로
+                // zero-extend(AND)로 플래그를 클로버하지 않는다. (다른 ALU만 제로확장)
+                if alu != Alu::Add && alu != Alu::Sub {
+                    self.zero_extend_dst_if32(inst, dst);
+                }
             }
             OpKind::Memory => {
                 let addr = MicroOperand::Temp(4);
@@ -25,7 +48,23 @@ impl RiscLifter {
                         .with_src1(addr),
                 );
                 let right = self.operand_value(inst, 1)?;
-                alu.emit(&mut self.desynth, left, left, right);
+                if alu == Alu::Sub {
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::SubWithBorrow { width })
+                            .with_dst(left)
+                            .with_src1(left)
+                            .with_src2(right),
+                    );
+                } else if alu == Alu::Add {
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Add { width })
+                            .with_dst(left)
+                            .with_src1(left)
+                            .with_src2(right),
+                    );
+                } else {
+                    alu.emit(&mut self.desynth, left, left, right);
+                }
                 self.desynth.instrs.push(
                     MicroInstr::new(RiscOp::MemoryWrite { width })
                         .with_src1(addr)
@@ -38,12 +77,18 @@ impl RiscLifter {
     }
 
     /// CMP: 플래그만 갱신(CF/ZF/SF/OF)하고 결과를 버리는 SUB. 스크래치로 Temp(7) 사용.
-
+    /// P0-1: borrow-CF 정확 — 전용 SubWithBorrow(width).
     pub(super) fn lift_cmp(&mut self, inst: &Instruction) -> Result<()> {
         let left = self.operand_value(inst, 0)?;
         let right = self.operand_value(inst, 1)?;
         let scratch = MicroOperand::Temp(7);
-        self.desynth.emit_sub(scratch, left, right);
+        let width = Self::operand_width(inst);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::SubWithBorrow { width })
+                .with_dst(scratch)
+                .with_src1(left)
+                .with_src2(right),
+        );
         Ok(())
     }
 
@@ -202,6 +247,44 @@ impl RiscLifter {
         let t = MicroOperand::Temp(3);
         self.desynth.emit_and(t, op, MicroOperand::Imm64(mask));
         Ok(t)
+    }
+
+    /// 산술/논리 명령의 피연산자 폭(바이트) — 플래그 경계(bit 7/15/31/63) 결정.
+    /// op0이 레지스터면 그 폭, 메모리면 memory_size, 즉시면 op1에서 유추.
+    pub(super) fn operand_width(inst: &Instruction) -> u8 {
+        if let OpKind::Register = inst.op0_kind() {
+            let reg = inst.op0_register();
+            if reg.is_gpr64() {
+                return 8;
+            }
+            if reg.is_gpr32() {
+                return 4;
+            }
+            if reg.is_gpr16() {
+                return 2;
+            }
+            return 1;
+        }
+        if let OpKind::Memory = inst.op0_kind() {
+            let sz = inst.memory_size().size();
+            if sz != 0 {
+                return sz.min(8) as u8;
+            }
+        }
+        // op0이 즉시(예: 비교에서 즉시가 좌측) — op1 폭 사용
+        if let OpKind::Register = inst.op1_kind() {
+            let reg = inst.op1_register();
+            if reg.is_gpr64() {
+                return 8;
+            }
+            if reg.is_gpr32() {
+                return 4;
+            }
+            if reg.is_gpr16() {
+                return 2;
+            }
+        }
+        4 // fallback: 32-bit
     }
 
     /// P2: TEST — 두 피연산자를 폭별로 마스크한 뒤 AND 의 플래그만 사용한다.
