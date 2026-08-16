@@ -207,7 +207,7 @@ pub fn flag_contract(op: u8) -> (u64, u64) {
         | OP_SHL64_R_CL | OP_SHR64_R_CL | OP_SAR64_R_CL => {
             (F_CF | F_PF | F_ZF | F_SF, 0) // OF/AF defined 0
         }
-        OP_INC_R | OP_DEC_R | OP_LOCK_INC_MEM8_A | OP_LOCK_INC_MEM16_A
+        OP_INC_R | OP_DEC_R | OP_INC_R64 | OP_DEC_R64 | OP_LOCK_INC_MEM8_A | OP_LOCK_INC_MEM16_A
         | OP_LOCK_INC_MEM32_A | OP_LOCK_INC_MEM64_A
         | OP_LOCK_DEC_MEM8_A | OP_LOCK_DEC_MEM16_A | OP_LOCK_DEC_MEM32_A | OP_LOCK_DEC_MEM64_A => {
             (F_PF | F_AF | F_ZF | F_SF | F_OF, F_CF) // CF preserved

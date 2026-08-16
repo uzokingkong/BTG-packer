@@ -115,6 +115,24 @@ pub(crate) fn exec(
             set_flags(state, flags::dec_flags(a, prev));
             Ok(ip)
         }
+        OP_INC_R64 => {
+            let r = code[ip] as usize;
+            let ip = ip + 1;
+            let a = vreg64(state, r)?;
+            let prev = flags_of(state);
+            set_vreg64(state, r, a.wrapping_add(1))?;
+            set_flags(state, flags::inc_flags64(a, prev));
+            Ok(ip)
+        }
+        OP_DEC_R64 => {
+            let r = code[ip] as usize;
+            let ip = ip + 1;
+            let a = vreg64(state, r)?;
+            let prev = flags_of(state);
+            set_vreg64(state, r, a.wrapping_sub(1))?;
+            set_flags(state, flags::dec_flags64(a, prev));
+            Ok(ip)
+        }
         OP_CMP_R_IMM32 => {
             let r = code[ip] as usize;
             let imm = u32::from_le_bytes(code[ip + 1..ip + 5].try_into().unwrap());
