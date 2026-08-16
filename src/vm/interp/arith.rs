@@ -503,7 +503,9 @@ pub(crate) fn exec(
                 let src = vreg32(state, s)?;
                 let res = (dst << cnt) | (src >> (32 - cnt));
                 set_vreg64(state, d, res as u64)?;
-                set_flags(state, flags::logical_flags(res));
+                // x86 SHLD: SF/ZF/PF from result; CF = last bit shifted out of
+                // dst; OF/AF undefined (defined 0). Mirrors shift_flags(Shl).
+                set_flags(state, flags::shift_flags(flags::ShiftKind::Shl, dst, cnt as u32, res));
             }
             Ok(next_ip)
         }
@@ -520,7 +522,7 @@ pub(crate) fn exec(
                 let src = vreg32(state, s)?;
                 let res = (dst >> cnt) | (src << (32 - cnt));
                 set_vreg64(state, d, res as u64)?;
-                set_flags(state, flags::logical_flags(res));
+                set_flags(state, flags::shift_flags(flags::ShiftKind::Shr, dst, cnt as u32, res));
             }
             Ok(next_ip)
         }
@@ -537,9 +539,7 @@ pub(crate) fn exec(
                 let src = vreg64(state, s)?;
                 let res = (dst << cnt) | (src >> (64 - cnt));
                 set_vreg64(state, d, res)?;
-                let zf = if res == 0 { F_ZF } else { 0 };
-                let sf = if (res as i64) < 0 { F_SF } else { 0 };
-                set_flags(state, zf | sf);
+                set_flags(state, flags::shift_flags64(flags::ShiftKind::Shl, dst, cnt as u32, res));
             }
             Ok(next_ip)
         }
@@ -556,9 +556,7 @@ pub(crate) fn exec(
                 let src = vreg64(state, s)?;
                 let res = (dst >> cnt) | (src << (64 - cnt));
                 set_vreg64(state, d, res)?;
-                let zf = if res == 0 { F_ZF } else { 0 };
-                let sf = if (res as i64) < 0 { F_SF } else { 0 };
-                set_flags(state, zf | sf);
+                set_flags(state, flags::shift_flags64(flags::ShiftKind::Shr, dst, cnt as u32, res));
             }
             Ok(next_ip)
         }

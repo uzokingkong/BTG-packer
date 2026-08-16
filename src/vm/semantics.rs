@@ -192,10 +192,14 @@ pub fn flag_contract(op: u8) -> (u64, u64) {
         OP_AND_R_R | OP_AND_R_IMM32 | OP_AND_R_R64 | OP_AND_R_IMM64
         | OP_XOR_R_R | OP_XOR_R_IMM32 | OP_XOR_R_R64 | OP_XOR_R_IMM64
         | OP_OR_R_R | OP_OR_R_R64 | OP_OR_R_IMM32 | OP_OR_R_IMM64
-        | OP_TEST_R_R32 | OP_TEST_R_IMM32
-        | OP_SHLD_R_R_IMM8 | OP_SHLD_R_R_CL | OP_SHRD_R_R_IMM8 | OP_SHRD_R_R_CL
-        | OP_SHLD64_R_R_IMM8 | OP_SHLD64_R_R_CL | OP_SHRD64_R_R_IMM8 | OP_SHRD64_R_R_CL => {
+        | OP_TEST_R_R32 | OP_TEST_R_IMM32 => {
             (F_PF | F_ZF | F_SF, 0) // logical: CF/OF/AF cleared
+        }
+        // SHLD/SHRD (count>0): CF = last bit shifted out of dst; SF/ZF/PF from
+        // the result; OF/AF undefined (defined 0). count==0 preserves all flags.
+        OP_SHLD_R_R_IMM8 | OP_SHLD_R_R_CL | OP_SHRD_R_R_IMM8 | OP_SHRD_R_R_CL
+        | OP_SHLD64_R_R_IMM8 | OP_SHLD64_R_R_CL | OP_SHRD64_R_R_IMM8 | OP_SHRD64_R_R_CL => {
+            (F_CF | F_PF | F_ZF | F_SF, 0)
         }
         OP_SHL_R_IMM8 | OP_SHR_R_IMM8 | OP_SAR_R_IMM8
         | OP_SHL_R_CL | OP_SHR_R_CL | OP_SAR_R_CL
