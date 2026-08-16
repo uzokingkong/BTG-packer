@@ -226,4 +226,62 @@ mod tests {
             "MBA builds must produce different handler layouts (build-specific randomization)"
         );
     }
+
+    /// Obufscated MBA handler_offsets 가 전부 유효한 handler 시작점을 가리켜야
+    /// 한다 (junk NOP, decoy, dispatch-epilogue, Ud2 로 잘못 걸리는 경우를 잡는다).
+    /// 이 검증이 실패하면 디스패치가 쓰레기 주소로 jmp 해 0xC0000005 가 난다.
+    /// 랜덤 시드(각 빌드는 다른 키)를 여러 번 반복해 시드 의존 실패도 잡는다.
+    #[test]
+    fn obfuscated_handler_offsets_point_to_real_handlers() {
+        use crate::vm::handlers::EntryMode;
+        use iced_x86::{Decoder, DecoderOptions};
+        let mut bc = BytecodeBuilder::new();
+        bc.mov_r_imm64(3, 0x1122);
+        bc.binop_r_r64(crate::vm::bytecode::OP_ADD_R_R64, 3, 4);
+        bc.inc_r64(3);
+        bc.halt();
+        let prog = bc.finish();
+
+        // non-obfuscated (plain) reference handler bodies for each op.
+        let plain = crate::vm::build_vm_module(
+            0x14000_1000, 0x14000_9000, 0x14000_A000, prog.clone(), EntryMode::Ksa,
+        )
+        .expect("build plain vm");
+
+        let mut bad: Vec<String> = Vec::new();
+        for trial in 0..100 {
+            let m = crate::vm::build_vm_module_mba(
+                0x14000_1000, 0x14000_9000, 0x14000_A000, prog.clone(), EntryMode::Ksa,
+            )
+            .expect("build mba vm");
+            for op in 1..crate::vm::bytecode::NUM_OPS {
+                let off = m.handler_offsets[op];
+                let mut dec = Decoder::with_ip(64, &m.code, 0x14000_1000 + off as u64, DecoderOptions::NONE);
+                let inst = dec.decode();
+                let is_bad = inst.is_invalid()
+                    || inst.code() == iced_x86::Code::Ud2
+                    || inst.code() == iced_x86::Code::Jmp_rm64
+                    || inst.code() == iced_x86::Code::Nopw;
+                // shuffle 이 올바른 블록을 배치했는지: plain 핸들러의 첫 명령과
+                // 바이트 단위로 일치해야 한다 (다른 핸들러로 치환되면 크래시).
+                let poff = plain.handler_offsets[op];
+                let pdec = {
+                    let mut d = Decoder::with_ip(64, &plain.code, 0x14000_1000 + poff as u64, DecoderOptions::NONE);
+                    d.decode()
+                };
+                let body_mismatch = inst.code() != pdec.code()
+                    || inst.mnemonic() != pdec.mnemonic()
+                    || (poff + pdec.len() <= plain.code.len()
+                        && off + inst.len() <= m.code.len()
+                        && &plain.code[poff..poff + inst.len()] != &m.code[off..off + inst.len()]);
+                if is_bad || body_mismatch {
+                    bad.push(format!(
+                        "trial {trial} op 0x{op:02X} @ obf 0x{off:X} (plain 0x{poff:X}) -> {:?} vs plain {:?}",
+                        inst.code(), pdec.code()
+                    ));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "obfuscated handler_offsets point into wrong code:\n  {}", bad.join("\n  "));
+    }
 }

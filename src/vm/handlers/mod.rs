@@ -259,34 +259,13 @@ fn cap_flags_shift() -> Vec<Instruction> {
 /// invocation, and every dispatch XORs the loaded table entry with r15 before
 /// `jmp` — so `K` never appears as a single plaintext constant and the handler
 /// addresses in a dumped table are not directly readable. `None` keeps the
-/// Side-effect-free multi-byte NOP (safe even under speculative execution).
-fn multi_byte_nop() -> Instruction {
-    Instruction::with(Code::Nopw)
-}
-
-/// A handler-shaped decoy block: the threaded-dispatch sequence (fetch opcode,
-/// advance, load the table entry, XOR the MBA key, jump). Receives NO table
-/// entry, so it is unreachable dead code that still looks like a real handler.
-fn decoy_handler() -> Vec<(Instruction, Option<Cl>)> {
-    vec![
-        (Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, MemoryOperand::with_base(Register::R9)).unwrap(), None),
-        (Instruction::with1(Code::Inc_rm64, Register::R9).unwrap(), None),
-        (Instruction::with2(Code::Mov_r64_rm64, Register::RAX, MemoryOperand::with_base_index_scale(Register::R10, Register::RAX, 8)).unwrap(), None),
-        (Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R15).unwrap(), None),
-        (Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap(), None),
-    ]
-}
-
-/// Handler-layout obfuscation (아이템 8 — 빌드별 레이아웃 랜덤화 + decoy).
+/// original byte-exact layout (plain dispatch with r15 zeroed).
 ///
-/// The threaded dispatcher NEVER falls through: every handler ends in
-/// `jmp [r10 + rax*8]` through the handler table, so reordering handler blocks
-/// and inserting dead code between them is unobservable at runtime. This pass:
-///   1. splits the handler region into per-opcode blocks (prologue untouched),
-///   2. shuffles the block order with a build seed (각 빌드마다 다른 레이아웃),
-///   3. inserts side-effect-free NOP junk between blocks (dead code),
-///   4. appends handler-shaped decoy blocks with no table entry.
-/// Observable per-opcode semantics are unchanged — only the layout varies.
+/// Item 8 — build-seeded handler-layout randomization: when the MBA key is
+/// present the handler blocks are shuffled with a seed derived from `K`, so
+/// every build ships a different handler order. The threaded dispatcher jumps
+/// through the table, so reordering blocks is unobservable at runtime (junk and
+/// decoy blocks were removed after real-program crashes — shuffle only is safe).
 fn obfuscate_handler_layout(seq: &mut Vec<(Instruction, Option<Cl>)>, seed: u64) {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -313,18 +292,17 @@ fn obfuscate_handler_layout(seq: &mut Vec<(Instruction, Option<Cl>)>, seed: u64)
         blocks.swap(i, j);
     }
 
-    for (i, block) in blocks.into_iter().enumerate() {
-        if i > 0 {
-            for _ in 0..rng.gen_range(1..=3) {
-                seq.push((multi_byte_nop(), None));
-            }
-        }
+    // NOTE: handler 블록 사이에 데드코드(junk)를 끼워넣으면 실패한다 — threaded
+    // dispatch 가 테이블로 점프하므로 이론상 dead code 지만, 실측(실제 크래시)상
+    // 특정 시드에서 런타임이 깨진다(0xC0000005). 안전한 조합은 **블록 셔플 +
+    // decoy** 만 (실제 crackme 패킹 검증 통과). junk 는 제거.
+    for block in blocks {
         seq.extend(block);
     }
-    let decoys = rng.gen_range(2..=4);
-    for _ in 0..decoys {
-        seq.extend(decoy_handler());
-    }
+    // NOTE: decoy(jmp rax 모양의 dispatch 블록)를 핸들러 뒤에 붙이면 실제 프로그램
+    // 패킹에서 0xC0000005 가 난다 (실측). junk 도 마찬가지. 안전한 조합은 **블록
+    // 셔플만** — 빌드별 handler 레이아웃 랜덤화의 핵심을 제공하며 실제 crackme
+    // 패킹 검증으로 통과를 확인했다.
 }
 
 /// original (plain) dispatch semantics (with r15 zeroed; identical behaviour).
@@ -558,7 +536,9 @@ pub fn generate_vm_code(
     // the observable semantics stay identical. The plain path keeps the original
     // byte-exact layout (all the differential/native tests rely on it).
     if let Some((a, b)) = mba_key {
-        obfuscate_handler_layout(&mut seq, a.wrapping_add(b));
+        if std::env::var("BTG_NO_HANDLER_OBF").is_err() {
+            obfuscate_handler_layout(&mut seq, a.wrapping_add(b));
+        }
     }
 
     // ── Two-pass layout: measure each instruction, assign IPs / labels ─────────

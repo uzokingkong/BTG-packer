@@ -548,7 +548,9 @@ fn run_qa_suite() -> error::Result<()> {
 
     for target in &targets {
         if let Ok(res) = QaBenchmarkRunner::run_benchmark_test(target, &current_exe) {
-            log::debug!(
+            // stdout 으로 출력 (env_logger 가 120자에서 로그를 잘라 PASS/FAIL 이
+            // 사라지는 문제 방지).
+            println!(
                 " {:<24} | {:<20} | {:<9} | {:<11} | {:<8} | {}",
                 res.target_name,
                 res.compiler,
@@ -557,6 +559,9 @@ fn run_qa_suite() -> error::Result<()> {
                 res.relayed_sections_count,
                 if res.execution_success { "PASS [OK]" } else { "FAIL" }
             );
+            if !res.execution_success {
+                println!("      → {}", res.exec_detail);
+            }
         }
     }
     println!("---------------------------------------------------------------------------------------------\n");

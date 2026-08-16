@@ -1,4 +1,4 @@
-// ==============================================================================
+﻿// ==============================================================================
 // BTG v3 - Composite VM Module
 // ==============================================================================
 //
@@ -57,6 +57,10 @@ pub struct VmModule {
     pub table: Vec<u8>,
     /// virtualized routine bytecode
     pub bytecode: Vec<u8>,
+    /// handler offset per opcode (index 0 = invalid-opcode handler) ??the
+    /// offset of each handler's first instruction within `code`. Exposed for
+    /// the obfuscation self-test to verify offsets point at real handlers.
+    pub handler_offsets: Vec<usize>,
 }
 
 impl VmModule {
@@ -83,14 +87,14 @@ pub fn build_vm_module(
         let handler_va = code_va + vmc.handler_offsets[op] as u64;
         table.extend_from_slice(&handler_va.to_le_bytes());
     }
-    Ok(VmModule { code: vmc.code, table, bytecode })
+    Ok(VmModule { code: vmc.code, table, bytecode, handler_offsets: vmc.handler_offsets.clone() })
 }
 
 /// M8: build a VM module with an MBA-obfuscated handler table.
 ///
 /// The dispatch derives `K = a + b (mod 2^64)` at runtime via the MBA identity
 /// `a + b == (a ^ b) + 2 * (a & b)` from two embedded immediates, and XORs each
-/// loaded handler entry with `K` before `jmp` — so handler addresses are never
+/// loaded handler entry with `K` before `jmp` ??so handler addresses are never
 /// stored (nor `K` embedded) as a single plaintext constant. This is the opt-in
 /// `--m8` path; the default `build_vm_module` above is byte-identical to pre-M8.
 pub fn build_vm_module_mba(
@@ -119,7 +123,7 @@ pub fn build_vm_module_mba(
         let handler_va = code_va + vmc.handler_offsets[op] as u64;
         table.extend_from_slice(&(handler_va ^ key).to_le_bytes());
     }
-    Ok(VmModule { code: vmc.code, table, bytecode })
+    Ok(VmModule { code: vmc.code, table, bytecode, handler_offsets: vmc.handler_offsets.clone() })
 }
 
 /// M6 Phase-2 embed helper: wrap a lifted program's VM bytecode (from
@@ -139,20 +143,20 @@ pub fn build_program_vm(
     } else {
         build_vm_module(code_va, table_va, bytecode_va, bytecode, handlers::EntryMode::Program)?
     };
-    // The Ksa entry stub snapshots RBX→ptr_sbox/RDX→ptr_seed from the caller; for a
+    // The Ksa entry stub snapshots RBX?뭦tr_sbox/RDX?뭦tr_seed from the caller; for a
     // program VM the boot stub will instead pre-load the original entry GPRs into the
     // state vregs before calling. Keep the entry convention Ksa (state in RCX).
     let _ = state_va;
     Ok(m)
 }
 
-// ═══════════════════════════════════════════════════════════════════════
+// ?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧??
 // Submodules (extracted from the old monolith to keep mod.rs a re-export layer):
 //   arena.rs    - RWX native-execution arena (unix/windows)
 //   encode.rs   - native x86 reference encoders (self-test / bench)
 //   self_test/   - --vm-test cross-validation suite (directory module)
 //   bench.rs    - --vm-bench interpreter vs native throughput
-// ═══════════════════════════════════════════════════════════════════════
+// ?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧??
 pub(crate) mod arena;
 mod encode;
 mod self_test;
@@ -160,3 +164,4 @@ mod bench;
 
 pub use self_test::run_self_test;
 pub use bench::run_vm_bench;
+
