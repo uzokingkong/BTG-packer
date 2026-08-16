@@ -1499,4 +1499,38 @@ mod tests {
         assert_eq!(cvt_f64_int(-9_223_372_036_854_775_809.0, 8, true), 0x8000_0000_0000_0000);
         assert_eq!(cvt_f64_int(-1.9, 8, true), (-1i64) as u64);
     }
+
+    /// P1-3 (exception-adjacent): x86 DIV/IDIV divisor-0(#DE) — VM 참조는 크래시
+    /// 대신 결정적 0을 반환한다. eval_state가 이 정책을 지키는지 + 폴리 인터프리터
+    /// (동일 VirtualFlags/div_wide)와 동치인지 검증한다.
+    #[test]
+    fn div_by_zero_returns_deterministic_zero_not_crash() {
+        // RDX:RAX = 0x... : 100, divisor = 0 (reg[5]) → 몫/나머지 0
+        let mut d = RiscDesynthesizer::new();
+        d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(100), MicroOperand::Imm64(0)); // RAX = 100
+        d.emit_add(MicroOperand::VReg(2), MicroOperand::Imm64(0), MicroOperand::Imm64(0)); // RDX = 0
+        d.instrs.push(
+            MicroInstr::new(RiscOp::Divide { signed: false, width: 8 })
+                .with_dst(MicroOperand::VReg(0))
+                .with_src1(MicroOperand::VReg(5)), // divisor = reg[5] = 0
+        );
+        d.instrs.push(MicroInstr::new(RiscOp::Halt));
+        let prog = RiscProgram::new(d.instrs);
+
+        // eval_state: divisor 0 → #DE 회피(결정적 0)
+        let regs = [0u64; 16];
+        let st = prog.eval_state(&regs);
+        assert_eq!(st.regs[0], 0, "RAX(quotient) must be 0 on div-by-zero");
+        assert_eq!(st.regs[2], 0, "RDX(remainder) must be 0 on div-by-zero");
+
+        // 폴리 인터프리터와 동치 (동일 reference 경로)
+        use crate::vm::poly::{PolymorphicEncoder, PolymorphicInterpreter};
+        let seed = 0x12345678u64;
+        let mut enc = PolymorphicEncoder::new(seed);
+        let bc = enc.encode(&prog).unwrap();
+        let mut interp = PolymorphicInterpreter::new(seed);
+        interp.run(&bc).unwrap();
+        assert_eq!(interp.regs[0], 0, "poly interp: RAX must be 0 on div-by-zero");
+        assert_eq!(interp.regs[2], 0, "poly interp: RDX must be 0 on div-by-zero");
+    }
 }
