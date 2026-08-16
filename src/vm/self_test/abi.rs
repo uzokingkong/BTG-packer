@@ -441,9 +441,12 @@ pub(crate) fn run_m8_handler_mba_test() -> Result<()> {
         let sbox_va = arena.base + 0x2000;
         let seed_va = arena.base + 0x3000;
         let code_va = arena.base + 0x5000;
-        let table_va = arena.base + 0x8800;
-        let bc_va = arena.base + 0x9000;
-        let state_va = arena.base + 0xA000;
+        // Code region 0x5000..0x9800 (0x4800 bytes) comfortably fits the ~14.3KB
+        // handler set that keeps growing with every opcode (previously 0x8800,
+        // which the MBA variant's ~14.36KB code overflowed and corrupted).
+        let table_va = arena.base + 0x9800;
+        let bc_va = arena.base + 0xA000;
+        let state_va = arena.base + 0xA800;
         let vsbox_va = arena.base + 0xB000;
         let tramp_va = arena.base + 0xC000;
         let module = if use_mba {
@@ -458,9 +461,9 @@ pub(crate) fn run_m8_handler_mba_test() -> Result<()> {
             b[0x2000..0x2000 + 256].fill(0);
             b[0x3000..0x3000 + 256].copy_from_slice(&seed_masked);
             b[0x5000..0x5000 + module.code.len()].copy_from_slice(&module.code);
-            b[0x8800..0x8800 + module.table.len()].copy_from_slice(&module.table);
-            b[0x9000..0x9000 + module.bytecode.len()].copy_from_slice(&module.bytecode);
-            b[0xA000..0xA000 + VM_STATE_SIZE].fill(0);
+            b[0x9800..0x9800 + module.table.len()].copy_from_slice(&module.table);
+            b[0xA000..0xA000 + module.bytecode.len()].copy_from_slice(&module.bytecode);
+            b[0xA800..0xA800 + VM_STATE_SIZE].fill(0);
             b[0xB000..0xB000 + 256].fill(0);
             b[0xC000..0xC000 + tramp.len()].copy_from_slice(&tramp);
         }

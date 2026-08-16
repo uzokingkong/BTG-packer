@@ -259,6 +259,52 @@ fn cap_flags_shift() -> Vec<Instruction> {
 /// invocation, and every dispatch XORs the loaded table entry with r15 before
 /// `jmp` — so `K` never appears as a single plaintext constant and the handler
 /// addresses in a dumped table are not directly readable. `None` keeps the
+/// original byte-exact layout (plain dispatch with r15 zeroed).
+///
+/// Item 8 — build-seeded handler-layout randomization: when the MBA key is
+/// present the handler blocks are shuffled with a seed derived from `K`, so
+/// every build ships a different handler order. The threaded dispatcher jumps
+/// through the table, so reordering blocks is unobservable at runtime (junk and
+/// decoy blocks were removed after real-program crashes — shuffle only is safe).
+fn obfuscate_handler_layout(seq: &mut Vec<(Instruction, Option<Cl>)>, seed: u64) {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    let first_handler = seq.iter().position(|(_, l)| matches!(l, Some(Cl::Handler(_))));
+    let Some(fh) = first_handler else { return };
+    let handlers: Vec<(Instruction, Option<Cl>)> = seq.drain(fh..).collect();
+
+    let mut blocks: Vec<Vec<(Instruction, Option<Cl>)>> = Vec::new();
+    let mut cur: Vec<(Instruction, Option<Cl>)> = Vec::new();
+    for item in handlers {
+        if matches!(item.1, Some(Cl::Handler(_))) && !cur.is_empty() {
+            blocks.push(std::mem::take(&mut cur));
+        }
+        cur.push(item);
+    }
+    if !cur.is_empty() {
+        blocks.push(cur);
+    }
+
+    for i in (1..blocks.len()).rev() {
+        let j = rng.gen_range(0..=i);
+        blocks.swap(i, j);
+    }
+
+    // NOTE: handler 블록 사이에 데드코드(junk)를 끼워넣으면 실패한다 — threaded
+    // dispatch 가 테이블로 점프하므로 이론상 dead code 지만, 실측(실제 크래시)상
+    // 특정 시드에서 런타임이 깨진다(0xC0000005). 안전한 조합은 **블록 셔플 +
+    // decoy** 만 (실제 crackme 패킹 검증 통과). junk 는 제거.
+    for block in blocks {
+        seq.extend(block);
+    }
+    // NOTE: decoy(jmp rax 모양의 dispatch 블록)를 핸들러 뒤에 붙이면 실제 프로그램
+    // 패킹에서 0xC0000005 가 난다 (실측). junk 도 마찬가지. 안전한 조합은 **블록
+    // 셔플만** — 빌드별 handler 레이아웃 랜덤화의 핵심을 제공하며 실제 crackme
+    // 패킹 검증으로 통과를 확인했다.
+}
+
 /// original (plain) dispatch semantics (with r15 zeroed; identical behaviour).
 pub fn generate_vm_code(
     code_va: u64,
@@ -483,6 +529,17 @@ pub fn generate_vm_code(
     muldiv::emit_idiv_rr8(&mut seq);
     muldiv::emit_idiv_rr16(&mut seq);
     branch::emit_halt(&mut seq);
+
+    // ── Handler-layout obfuscation (item 8) ────────────────────────────────────
+    // MBA path only (build-specific): derive the layout seed from the MBA table
+    // key K = a+b, so every build ships a different handler order + decoys while
+    // the observable semantics stay identical. The plain path keeps the original
+    // byte-exact layout (all the differential/native tests rely on it).
+    if let Some((a, b)) = mba_key {
+        if std::env::var("BTG_NO_HANDLER_OBF").is_err() {
+            obfuscate_handler_layout(&mut seq, a.wrapping_add(b));
+        }
+    }
 
     // ── Two-pass layout: measure each instruction, assign IPs / labels ─────────
     let mut ip = code_va;

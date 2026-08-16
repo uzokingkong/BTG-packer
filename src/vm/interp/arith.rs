@@ -115,6 +115,24 @@ pub(crate) fn exec(
             set_flags(state, flags::dec_flags(a, prev));
             Ok(ip)
         }
+        OP_INC_R64 => {
+            let r = code[ip] as usize;
+            let ip = ip + 1;
+            let a = vreg64(state, r)?;
+            let prev = flags_of(state);
+            set_vreg64(state, r, a.wrapping_add(1))?;
+            set_flags(state, flags::inc_flags64(a, prev));
+            Ok(ip)
+        }
+        OP_DEC_R64 => {
+            let r = code[ip] as usize;
+            let ip = ip + 1;
+            let a = vreg64(state, r)?;
+            let prev = flags_of(state);
+            set_vreg64(state, r, a.wrapping_sub(1))?;
+            set_flags(state, flags::dec_flags64(a, prev));
+            Ok(ip)
+        }
         OP_CMP_R_IMM32 => {
             let r = code[ip] as usize;
             let imm = u32::from_le_bytes(code[ip + 1..ip + 5].try_into().unwrap());
@@ -353,7 +371,11 @@ pub(crate) fn exec(
             let v = if is64 { vreg64(state, sr)? } else { vreg32(state, sr)? as u64 };
             let lz = if is64 { v.leading_zeros() as u64 } else { (v as u32).leading_zeros() as u64 };
             set_vreg64(state, d, lz)?;
-            if v == 0 { set_flags(state, F_CF | F_ZF); } else if lz == 0 { set_flags(state, F_ZF); } else { set_flags(state, 0); }
+            // Real x86 (probe-verified): CF=1 iff src==0; ZF follows the RESULT
+            // (lzcnt(0)=width → ZF=0; lzcnt(msb-set)=0 → ZF=1). OF/SF/AF cleared.
+            let cf = if v == 0 { F_CF } else { 0 };
+            let zf = if lz == 0 { F_ZF } else { 0 };
+            set_flags(state, cf | zf);
             Ok(ip)
         }
         OP_POPCNT_R32 | OP_POPCNT_R64 => {
@@ -422,7 +444,11 @@ pub(crate) fn exec(
             let lsb = v.wrapping_neg() & v;
             let cnt = lsb.wrapping_sub(1).count_ones() as u64; // == tzcnt, 32 when v==0
             set_vreg64(state, d, cnt)?;
-            if v == 0 { set_flags(state, F_CF | F_ZF); } else { set_flags(state, 0); }
+            // Real x86 (probe-verified): CF=1 iff src==0; ZF follows the RESULT
+            // (tzcnt(0)=width → ZF=0; tzcnt(odd)=0 → ZF=1). OF/SF/AF cleared.
+            let cf = if v == 0 { F_CF } else { 0 };
+            let zf = if cnt == 0 { F_ZF } else { 0 };
+            set_flags(state, cf | zf);
             Ok(ip)
         }
         OP_CPUID => {
@@ -495,7 +521,9 @@ pub(crate) fn exec(
                 let src = vreg32(state, s)?;
                 let res = (dst << cnt) | (src >> (32 - cnt));
                 set_vreg64(state, d, res as u64)?;
-                set_flags(state, flags::logical_flags(res));
+                // x86 SHLD: SF/ZF/PF from result; CF = last bit shifted out of
+                // dst; OF/AF undefined (defined 0). Mirrors shift_flags(Shl).
+                set_flags(state, flags::shift_flags(flags::ShiftKind::Shl, dst, cnt as u32, res));
             }
             Ok(next_ip)
         }
@@ -512,7 +540,7 @@ pub(crate) fn exec(
                 let src = vreg32(state, s)?;
                 let res = (dst >> cnt) | (src << (32 - cnt));
                 set_vreg64(state, d, res as u64)?;
-                set_flags(state, flags::logical_flags(res));
+                set_flags(state, flags::shift_flags(flags::ShiftKind::Shr, dst, cnt as u32, res));
             }
             Ok(next_ip)
         }
@@ -529,9 +557,7 @@ pub(crate) fn exec(
                 let src = vreg64(state, s)?;
                 let res = (dst << cnt) | (src >> (64 - cnt));
                 set_vreg64(state, d, res)?;
-                let zf = if res == 0 { F_ZF } else { 0 };
-                let sf = if (res as i64) < 0 { F_SF } else { 0 };
-                set_flags(state, zf | sf);
+                set_flags(state, flags::shift_flags64(flags::ShiftKind::Shl, dst, cnt as u32, res));
             }
             Ok(next_ip)
         }
@@ -548,9 +574,7 @@ pub(crate) fn exec(
                 let src = vreg64(state, s)?;
                 let res = (dst >> cnt) | (src << (64 - cnt));
                 set_vreg64(state, d, res)?;
-                let zf = if res == 0 { F_ZF } else { 0 };
-                let sf = if (res as i64) < 0 { F_SF } else { 0 };
-                set_flags(state, zf | sf);
+                set_flags(state, flags::shift_flags64(flags::ShiftKind::Shr, dst, cnt as u32, res));
             }
             Ok(next_ip)
         }

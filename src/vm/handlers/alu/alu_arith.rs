@@ -99,7 +99,12 @@ pub(crate) fn emit_ror_r_imm8(seq: &mut Vec<(Instruction, Option<Cl>)>) {
 
 // ?? 0x0C / 0x0D INC/DEC r  (op, r) ??sets flags, CF preserved ?????????????
 pub(crate) fn emit_inc_dec(seq: &mut Vec<(Instruction, Option<Cl>)>) {
-    for (op, code) in [(OP_INC_R, Code::Inc_rm32), (OP_DEC_R, Code::Dec_rm32)] {
+    for (op, code) in [
+        (OP_INC_R, Code::Inc_rm32),
+        (OP_DEC_R, Code::Dec_rm32),
+        (OP_INC_R64, Code::Inc_rm64),
+        (OP_DEC_R64, Code::Dec_rm64),
+    ] {
         let mut body = vec![
             Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
             Instruction::with1(code, vreg(Register::RCX)).unwrap(),

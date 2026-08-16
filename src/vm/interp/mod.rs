@@ -85,6 +85,7 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
             | OP_ROR_R_IMM8 | OP_INC_R | OP_DEC_R | OP_CMP_R_IMM32 | OP_SETCC
             | OP_ADD_R_R64 | OP_SUB_R_R64 | OP_XOR_R_R64 | OP_AND_R_R64 | OP_IMUL_R_R64
             | OP_ADD_R_IMM64 | OP_XOR_R_IMM64 | OP_AND_R_IMM64
+            | OP_INC_R64 | OP_DEC_R64
             | OP_SHL_R_IMM8 | OP_SHR_R_IMM8 | OP_SAR_R_IMM8
             | OP_SHL_R_CL | OP_SHR_R_CL | OP_SAR_R_CL
             | OP_TEST_R_R32 | OP_TEST_R_IMM32
@@ -97,7 +98,9 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
             | OP_BSR_R32 | OP_BSR_R64 | OP_BSF_R32 | OP_BSF_R64
             | OP_LZCNT_R32 | OP_LZCNT_R64 | OP_POPCNT_R32 | OP_POPCNT_R64
             | OP_BLSR_R32 | OP_BLSR_R64 | OP_BLSMSK_R32 | OP_BLSMSK_R64
-            | OP_BLSI_R32 | OP_BLSI_R64 | OP_ANDN_R_R32 | OP_ANDN_R_R64 => {
+            | OP_BLSI_R32 | OP_BLSI_R64 | OP_ANDN_R_R32 | OP_ANDN_R_R64
+            | OP_SHLD_R_R_IMM8 | OP_SHLD_R_R_CL | OP_SHRD_R_R_IMM8 | OP_SHRD_R_R_CL
+            | OP_SHLD64_R_R_IMM8 | OP_SHLD64_R_R_CL | OP_SHRD64_R_R_IMM8 | OP_SHRD64_R_R_CL => {
                 arith::exec(state, mem, code, ip, op)?
             }
             // ── memory / addressing modes ────────────────────────────────

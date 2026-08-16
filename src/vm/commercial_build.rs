@@ -111,7 +111,8 @@ pub fn build_program_vm_commercial(
     debug_assert_eq!(table.len(), 0xB00, "module table blob must be 0xB00 bytes");
     table.extend_from_slice(&parts.branch_map); // at +0xB00 (VirtualBranch resolution)
 
-    Ok(VmModule { code: parts.code, table, bytecode })
+    // 상용(poly) 모듈은 bytecode handler 테이블을 쓰지 않으므로 handler_offsets 없음.
+    Ok(VmModule { code: parts.code, table, bytecode, handler_offsets: Vec::new() })
 }
 
 #[cfg(test)]

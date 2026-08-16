@@ -68,6 +68,14 @@ pub fn disassemble(code: &[u8]) -> String {
                 line += &format!("dec v{}", code[ip]);
                 ip += 1;
             }
+            OP_INC_R64 => {
+                line += &format!("inc64 v{}", code[ip]);
+                ip += 1;
+            }
+            OP_DEC_R64 => {
+                line += &format!("dec64 v{}", code[ip]);
+                ip += 1;
+            }
             OP_CMP_R_IMM32 => {
                 let r = code[ip];
                 let imm = u32::from_le_bytes(code[ip + 1..ip + 5].try_into().unwrap());

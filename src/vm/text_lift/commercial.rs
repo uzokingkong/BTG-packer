@@ -388,7 +388,7 @@ mod tests {
         let entry = base_va;
 
         let lift_legacy = crate::vm::text_lift::lift_program_cfg(
-            &text, base_va, entry, &[], 0x140000000,
+            &text, base_va, entry, &[], 0x140000000, &[],
         )
         .expect("legacy lift");
         let lift_com = lift_program_cfg_commercial(&text, base_va, entry, &[], 0x140000000)

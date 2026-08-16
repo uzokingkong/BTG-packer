@@ -183,6 +183,16 @@ impl BytecodeBuilder {
         self.bytes.extend_from_slice(&[OP_DEC_R, r]);
     }
 
+    /// 64-bit INC (CF preserved). op = OP_INC_R64.
+    pub fn inc_r64(&mut self, r: u8) {
+        self.bytes.extend_from_slice(&[OP_INC_R64, r]);
+    }
+
+    /// 64-bit DEC (CF preserved). op = OP_DEC_R64.
+    pub fn dec_r64(&mut self, r: u8) {
+        self.bytes.extend_from_slice(&[OP_DEC_R64, r]);
+    }
+
     pub fn cmp_r_imm32(&mut self, r: u8, imm: u32) {
         self.bytes.push(OP_CMP_R_IMM32);
         self.bytes.push(r);

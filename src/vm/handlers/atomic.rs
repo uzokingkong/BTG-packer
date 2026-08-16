@@ -58,7 +58,12 @@ pub(super) fn emit_cmpxchg(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         body.push(Instruction::with1(Code::Pop_r64, Register::R11).unwrap());
         body.push(Instruction::with2(Code::And_rm64_imm32, Register::R11, F_ZF as i32).unwrap());
         body.push(Instruction::with2(Code::Mov_r64_rm64, Register::RDX, state_flags_mem()).unwrap());
-        body.push(Instruction::with2(Code::And_rm64_imm32, Register::RDX, (F_ZF as u32).wrapping_neg() as i32).unwrap());
+        // Clear ONLY the ZF bit from the preserved word. NOTE: the mask is
+        // `!F_ZF` (0xFFFFFFBF), NOT `F_ZF.wrapping_neg()` (0xFFFFFFC0) — the
+        // latter sign-extends to 0xFFFFFFFFFFFFFFC0 which also clears bits 0-5
+        // (CF/PF/AF), silently dropping the "other flags preserved" contract
+        // whenever a preceding op had set them (caught by the atomic fuzz).
+        body.push(Instruction::with2(Code::And_rm64_imm32, Register::RDX, (!(F_ZF as u32)) as i32).unwrap());
         body.push(Instruction::with2(Code::Or_rm64_r64, Register::RDX, Register::R11).unwrap());
         body.push(Instruction::with2(Code::Mov_rm64_r64, state_flags_mem(), Register::RDX).unwrap());
         body.push(Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap());

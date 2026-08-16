@@ -46,6 +46,7 @@ pub(crate) fn lift_program(
                 ep_va,
                 &ctx.target_info.relayed_sections,
                 image_base,
+                &ctx.target_info.original_pe_bytes,
             )?;
             (lift.bytecode, lift.entry_native)
         };

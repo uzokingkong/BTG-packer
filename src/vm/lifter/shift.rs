@@ -159,7 +159,14 @@ pub(super) fn lift_incdec(b: &mut BytecodeBuilder, inst: &Instruction) -> Result
     }
     if inst.op0_kind() == OpKind::Register {
         let r = vreg(inst.op0_register())?;
-        if is_inc { b.inc_r(r); } else { b.dec_r(r); }
+        let is64 = matches!(inst.code(), Inc_rm64 | Dec_rm64);
+        if is_inc {
+            if is64 { b.inc_r64(r); } else { b.inc_r(r); }
+        } else if is64 {
+            b.dec_r64(r);
+        } else {
+            b.dec_r(r);
+        }
         return Ok(());
     }
     let addr = mem_emit(b, inst, 0)?;
@@ -172,7 +179,13 @@ pub(super) fn lift_incdec(b: &mut BytecodeBuilder, inst: &Instruction) -> Result
     let load = match sz { 8 => OP_MOVZX_R_MEM8_A, 16 => OP_MOVZX_R_MEM16_A, 32 => OP_MOVZX_R_MEM32_A, _ => OP_MOV_R_MEM64_A };
     let store = match sz { 8 => OP_MOV_MEM8_A, 16 => OP_MOV_MEM16_A, 32 => OP_MOV_MEM32_A, _ => OP_MOV_MEM64_A };
     b.mem_load_a(load, SCRATCH2, addr);
-    if is_inc { b.inc_r(SCRATCH2); } else { b.dec_r(SCRATCH2); }
+    if is_inc {
+        if sz == 64 { b.inc_r64(SCRATCH2); } else { b.inc_r(SCRATCH2); }
+    } else if sz == 64 {
+        b.dec_r64(SCRATCH2);
+    } else {
+        b.dec_r(SCRATCH2);
+    }
     b.mem_store_a(store, addr, SCRATCH2);
     Ok(())
 }

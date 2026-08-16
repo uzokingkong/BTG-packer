@@ -56,6 +56,17 @@ impl Default for RiscEvalState {
     }
 }
 
+/// 한 micro-instruction 실행의 제어 흐름 결과.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExecResult {
+    /// 다음 명령으로 진행.
+    Next,
+    /// 분기 — vip 를 타깃 인덱스로 설정.
+    Jump(usize),
+    /// Halt — 프로그램 종료.
+    Halt,
+}
+
 impl RiscProgram {
     pub fn new(instrs: Vec<MicroInstr>) -> Self {
         Self {
@@ -490,6 +501,375 @@ impl RiscProgram {
         st.flags = flags.raw;
         st
     }
+
+    /// 하나의 micro-instruction을 (평문) 상태에 대해 실행한다. `eval_state_impl`
+    /// 의 각 op 본문과 **동일한 의미론**을 가져야 하며, 상태-암호화 참조 평가기
+    /// (`eval_state_encrypted`)가 이 함수를 "handler"로 사용한다. 차등 테스트가
+    /// 두 경로의 일치를 강제한다.
+    fn exec_one(&self, ins: &MicroInstr, st: &mut RiscEvalState, flags: &mut VirtualFlags) -> ExecResult {
+        let get_val = |op: Option<MicroOperand>, st: &RiscEvalState, flags_raw: u64| -> u64 {
+            match op {
+                Some(MicroOperand::VReg(i)) => st.regs[i as usize],
+                Some(MicroOperand::Imm64(v)) => v,
+                Some(MicroOperand::Temp(i)) => st.temps[i as usize],
+                Some(MicroOperand::Vflags) => flags_raw,
+                Some(MicroOperand::Vsp) => st.vsp,
+                _ => 0,
+            }
+        };
+        let store = |dst: Option<MicroOperand>, st: &mut RiscEvalState, val: u64| {
+            if let Some(d) = dst {
+                match d {
+                    MicroOperand::VReg(i) => st.regs[i as usize] = val,
+                    MicroOperand::Temp(i) => st.temps[i as usize] = val,
+                    _ => {}
+                }
+            }
+        };
+
+        match ins.op {
+            RiscOp::Nor => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                let res = !(a | b);
+                flags.update_logic64(res);
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::Mov => {
+                let a = get_val(ins.src1, st, flags.raw);
+                store(ins.dst, st, a);
+                ExecResult::Next
+            }
+            RiscOp::AddWithCarry => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                let (res, _cout) = flags.update_add64(a, b, ins.imm);
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::ShiftRight => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let cnt = get_val(ins.src2, st, flags.raw) & 63;
+                let res = if cnt == 0 { a } else { a >> cnt };
+                if cnt != 0 {
+                    flags.update_logic64(res);
+                }
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::ArithmeticShiftRight => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let cnt = get_val(ins.src2, st, flags.raw) & 63;
+                let res = if cnt == 0 { a } else { ((a as i64) >> cnt) as u64 };
+                if cnt != 0 {
+                    flags.update_logic64(res);
+                }
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::ShiftLeft => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let cnt = get_val(ins.src2, st, flags.raw) & 63;
+                let res = if cnt == 0 { a } else { a << cnt };
+                if cnt != 0 {
+                    flags.update_logic64(res);
+                }
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::VirtualPush => {
+                let v = get_val(ins.src1, st, flags.raw);
+                st.vsp = st.vsp.wrapping_sub(8);
+                st.stack.push(v);
+                ExecResult::Next
+            }
+            RiscOp::VirtualPop => {
+                if let Some(v) = st.stack.pop() {
+                    st.vsp = st.vsp.wrapping_add(8);
+                    store(ins.dst, st, v);
+                }
+                ExecResult::Next
+            }
+            RiscOp::MemoryRead { width } => {
+                let addr = get_val(ins.src1, st, flags.raw);
+                let val = mem_read(&st.mem, addr, width);
+                store(ins.dst, st, val);
+                ExecResult::Next
+            }
+            RiscOp::MemoryWrite { width } => {
+                let addr = get_val(ins.src1, st, flags.raw);
+                let val = get_val(ins.src2, st, flags.raw);
+                mem_write(&mut st.mem, addr, width, val);
+                ExecResult::Next
+            }
+            RiscOp::SetFlag => {
+                let v = get_val(ins.src1, st, flags.raw);
+                flags.raw = v & (0x8D5 | VFLAG_DF);
+                ExecResult::Next
+            }
+            RiscOp::VirtualBranch { cond } => {
+                if branch_taken_with_state(cond, flags, &st.regs) {
+                    let target = match ins.src1 {
+                        Some(op) => get_val(Some(op), st, flags.raw),
+                        None => ins.imm,
+                    };
+                    let idx = self
+                        .ip_map
+                        .as_ref()
+                        .and_then(|m| m.get(&target))
+                        .copied()
+                        .unwrap_or(target as usize);
+                    return ExecResult::Jump(idx);
+                }
+                ExecResult::Next
+            }
+            RiscOp::Halt => ExecResult::Halt,
+            RiscOp::NativeCallBridge => ExecResult::Next,
+            RiscOp::Multiply { signed, width } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                mul_wide(st, flags, a, b, signed, width, ins.dst);
+                ExecResult::Next
+            }
+            RiscOp::MultiplyLow { signed, width } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                mul_low(st, flags, a, b, signed, width, ins.dst);
+                ExecResult::Next
+            }
+            RiscOp::Divide { signed, width } => {
+                let divisor = get_val(ins.src1, st, flags.raw);
+                div_wide(st, divisor, signed, width, ins.dst);
+                ExecResult::Next
+            }
+            RiscOp::BSwap { width } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let res = if width == 4 {
+                    ((a as u32).swap_bytes()) as u64
+                } else {
+                    a.swap_bytes()
+                };
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::BitScanForward => {
+                let a = get_val(ins.src1, st, flags.raw);
+                if a == 0 {
+                    flags.set_zf(true);
+                    store(ins.dst, st, 0);
+                } else {
+                    flags.set_zf(false);
+                    store(ins.dst, st, a.trailing_zeros() as u64);
+                }
+                ExecResult::Next
+            }
+            RiscOp::BitScanReverse => {
+                let a = get_val(ins.src1, st, flags.raw);
+                if a == 0 {
+                    flags.set_zf(true);
+                    store(ins.dst, st, 0);
+                } else {
+                    flags.set_zf(false);
+                    store(ins.dst, st, 63 - a.leading_zeros() as u64);
+                }
+                ExecResult::Next
+            }
+            RiscOp::CountTrailingZeros { width } => {
+                let bits = width as u32 * 8;
+                let mask = width_mask(bits);
+                let s = get_val(ins.src1, st, flags.raw) & mask;
+                if s == 0 {
+                    flags.set_cf(true);
+                    flags.set_zf(true);
+                    store(ins.dst, st, bits as u64);
+                } else {
+                    flags.set_cf(false);
+                    let c = s.trailing_zeros() as u64;
+                    flags.set_zf(c == 0);
+                    store(ins.dst, st, c);
+                }
+                ExecResult::Next
+            }
+            RiscOp::CountLeadingZeros { width } => {
+                let bits = width as u32 * 8;
+                let mask = width_mask(bits);
+                let s = get_val(ins.src1, st, flags.raw) & mask;
+                if s == 0 {
+                    flags.set_cf(true);
+                    flags.set_zf(true);
+                    store(ins.dst, st, bits as u64);
+                } else {
+                    flags.set_cf(false);
+                    let msb = 63 - s.leading_zeros() as u64;
+                    let c = (bits as u64 - 1) - msb;
+                    flags.set_zf(c == 0);
+                    store(ins.dst, st, c);
+                }
+                ExecResult::Next
+            }
+            RiscOp::PopCount => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let res = a.count_ones() as u64;
+                flags.update_logic64(res);
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::Setcc { cond } => {
+                let v = branch_taken_with_state(cond, flags, &st.regs);
+                store(ins.dst, st, v as u64);
+                ExecResult::Next
+            }
+            RiscOp::ConditionalMove { cond } => {
+                if branch_taken_with_state(cond, flags, &st.regs) {
+                    let v = get_val(ins.src1, st, flags.raw);
+                    store(ins.dst, st, v);
+                }
+                ExecResult::Next
+            }
+            RiscOp::CompareExchange { width } => {
+                let addr = get_val(ins.src1, st, flags.raw);
+                let newv = get_val(ins.src2, st, flags.raw);
+                let bits = width as u32 * 8;
+                let mask = width_mask(bits);
+                let acc = st.regs[0] & mask;
+                let old = mem_read(&st.mem, addr, width) & mask;
+                if old == acc {
+                    mem_write(&mut st.mem, addr, width, newv & mask);
+                    flags.set_zf(true);
+                } else {
+                    st.regs[0] = old;
+                    flags.set_zf(false);
+                }
+                ExecResult::Next
+            }
+            RiscOp::FloatAdd { width } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                let res = if width == 4 {
+                    (f32::from_bits(a as u32) + f32::from_bits(b as u32)).to_bits() as u64
+                } else {
+                    (f64::from_bits(a) + f64::from_bits(b)).to_bits()
+                };
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::FloatSub { width } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                let res = if width == 4 {
+                    (f32::from_bits(a as u32) - f32::from_bits(b as u32)).to_bits() as u64
+                } else {
+                    (f64::from_bits(a) - f64::from_bits(b)).to_bits()
+                };
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::FloatMul { width } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                let res = if width == 4 {
+                    (f32::from_bits(a as u32) * f32::from_bits(b as u32)).to_bits() as u64
+                } else {
+                    (f64::from_bits(a) * f64::from_bits(b)).to_bits()
+                };
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::FloatDiv { width } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                let res = if width == 4 {
+                    (f32::from_bits(a as u32) / f32::from_bits(b as u32)).to_bits() as u64
+                } else {
+                    (f64::from_bits(a) / f64::from_bits(b)).to_bits()
+                };
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::IntToFloat { src_bits, dst_bits } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let iv = if src_bits == 4 { (a as i32) as i64 } else { a as i64 };
+                let res = if dst_bits == 4 {
+                    (iv as f32).to_bits() as u64
+                } else {
+                    (iv as f64).to_bits()
+                };
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::FloatToInt { src_bits, dst_bits, truncate } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let f = if src_bits == 4 { f32::from_bits(a as u32) as f64 } else { f64::from_bits(a) };
+                let res = cvt_f64_int(f, dst_bits, truncate);
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::FloatToFloat { src_bits, dst_bits } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let res = if src_bits == 4 {
+                    (f32::from_bits(a as u32) as f64).to_bits()
+                } else {
+                    (f64::from_bits(a) as f32).to_bits() as u64
+                };
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+        }
+    }
+
+    /// 상태-암호화 참조 평가기 (아이템 7 — Themida-class 상태 암호화).
+    ///
+    /// 가상 레지스터 파일과 flags 를 **롤링 키로 XOR 암호화된 채로** 유지하고,
+    /// 각 micro-instruction("handler")이 접근 시 복호화 → 계산 → **다음 키**로
+    /// 재암호화한다. 키는 실행된 명령마다 한 번씩 전진하므로 상태는 명령 사이
+    /// 항상 암호화되어 있다. 결과는 투명하다 — `eval_state_encrypted` 의 최종
+    /// 상태는 평문 `eval_state` 와 반드시 일치해야 하며, 차등 테스트가 강제한다.
+    /// (메모리 아레나는 게스트 메모리이므로 암호화 범위에서 제외.)
+    pub fn eval_state_encrypted(&self, init_regs: &[u64; 16], seed_key: u64) -> RiscEvalState {
+        let mut st = RiscEvalState::default();
+        st.regs = *init_regs;
+        st.mem = HashMap::new();
+        let mut flags = VirtualFlags::default();
+
+        // 롤링 키 스텝 (LCG — 폴리 바이트코드 키 스케줄과 동일한 성격).
+        let step = |k: u64| k.wrapping_mul(0x5851_F42D_4C95_7F2D).wrapping_add(0x1405_7B7E_F767_814F);
+        let xors = |st: &mut RiscEvalState, flags: &mut VirtualFlags, k: u64| {
+            for r in st.regs.iter_mut() {
+                *r ^= k;
+            }
+            for t in st.temps.iter_mut() {
+                *t ^= k;
+            }
+            flags.raw ^= k;
+        };
+
+        let mut key = seed_key;
+        xors(&mut st, &mut flags, key); // 초기 상태는 암호화 상태로 시작
+
+        let mut vip = 0usize;
+        loop {
+            if vip >= self.instrs.len() {
+                break;
+            }
+            // handler: 현재 키로 복호화 후 계산
+            xors(&mut st, &mut flags, key);
+            let res = self.exec_one(&self.instrs[vip], &mut st, &mut flags);
+            // 명령 사이 상태는 항상 암호화: 다음 키로 재암호화
+            let nk = step(key);
+            xors(&mut st, &mut flags, nk);
+            key = nk;
+            match res {
+                ExecResult::Next => vip += 1,
+                ExecResult::Jump(idx) => vip = idx,
+                ExecResult::Halt => break,
+            }
+        }
+        // 마지막으로 암호화한 키로 복호화해 평문 상태를 반환
+        xors(&mut st, &mut flags, key);
+        st.flags = flags.raw;
+        st
+    }
 }
 
 /// 조건 분기가 걸리는지 평가 (x86 조건 코드 의미론).
@@ -731,6 +1111,77 @@ fn store_dst(st: &mut RiscEvalState, dst: Option<MicroOperand>, val: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 아이템 7: 상태-암호화 참조 평가기가 평문 eval_state 와 동일한 최종 상태를
+    /// 내는지 검증한다 (롤링 키로 암호화된 vreg/flags 를 handler(exec_one) 안에서만
+    /// 복호화하는 모델). 랜덤 시드 키 × 랜덤 프로그램/입력으로 차등 확인.
+    #[test]
+    fn eval_state_encrypted_matches_plaintext() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, RngCore, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(0x51A7E_5EED);
+
+        for trial in 0..10 {
+            let a = rng.next_u64();
+            let b = rng.next_u64();
+            let mut d = RiscDesynthesizer::new();
+            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(a), MicroOperand::Imm64(0));
+            d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(b), MicroOperand::Imm64(0));
+            d.emit_add(MicroOperand::VReg(2), MicroOperand::VReg(0), MicroOperand::VReg(1));
+            d.emit_xor(MicroOperand::VReg(3), MicroOperand::VReg(0), MicroOperand::VReg(1));
+            d.instrs.push(
+                MicroInstr::new(RiscOp::ShiftLeft)
+                    .with_dst(MicroOperand::VReg(4))
+                    .with_src1(MicroOperand::VReg(0))
+                    .with_src2(MicroOperand::VReg(1)),
+            );
+            d.emit_neg(MicroOperand::VReg(5), MicroOperand::VReg(0));
+            d.emit_sub(MicroOperand::VReg(6), MicroOperand::VReg(0), MicroOperand::VReg(1));
+            d.instrs.push(
+                MicroInstr::new(RiscOp::BSwap { width: 8 })
+                    .with_dst(MicroOperand::VReg(7))
+                    .with_src1(MicroOperand::VReg(0)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::PopCount)
+                    .with_dst(MicroOperand::VReg(8))
+                    .with_src1(MicroOperand::VReg(0)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::CountTrailingZeros { width: 8 })
+                    .with_dst(MicroOperand::VReg(9))
+                    .with_src1(MicroOperand::VReg(0)),
+            );
+            d.emit_sub(MicroOperand::Temp(0), MicroOperand::VReg(0), MicroOperand::VReg(0));
+            d.instrs.push(
+                MicroInstr::new(RiscOp::ConditionalMove { cond: BranchCondition::Zero })
+                    .with_dst(MicroOperand::VReg(10))
+                    .with_src1(MicroOperand::VReg(1)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::MultiplyLow { signed: false, width: 8 })
+                    .with_dst(MicroOperand::VReg(11))
+                    .with_src1(MicroOperand::VReg(0))
+                    .with_src2(MicroOperand::VReg(1)),
+            );
+            // push/pop (stack) — branch paths are covered by the existing tests
+            d.emit_push(MicroOperand::VReg(2));
+            d.emit_pop(MicroOperand::VReg(12));
+            d.instrs.push(MicroInstr::new(RiscOp::Halt));
+
+            let prog = RiscProgram::new(d.instrs);
+            let regs = [0u64; 16];
+            let plain = prog.eval_state(&regs);
+            for _ in 0..4 {
+                let key = rng.next_u64();
+                let enc = prog.eval_state_encrypted(&regs, key);
+                assert_eq!(enc.regs, plain.regs, "trial {trial} key 0x{key:X}: regs mismatch");
+                assert_eq!(enc.flags, plain.flags, "trial {trial} key 0x{key:X}: flags 0x{:X} != 0x{:X}", enc.flags, plain.flags);
+                assert_eq!(enc.vsp, plain.vsp, "trial {trial}: vsp mismatch");
+                assert_eq!(enc.stack, plain.stack, "trial {trial}: stack mismatch");
+            }
+        }
+    }
 
     #[test]
     fn test_risc_desynth_not() {

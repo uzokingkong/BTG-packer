@@ -28,9 +28,11 @@ pub fn run_native(
     let mut arena = Arena::new(0x40000)?;
     let (vc, vt, vb, vs, vtr, vdata) = (
         arena.base + 0x1000,
-        arena.base + 0x4800,
-        arena.base + 0x5000,
+        // NOTE: the code region (0x1000..vt) must comfortably fit the growing
+        // handler set; it is ~14.3KB today and grows with every opcode.
+        arena.base + 0x5800,
         arena.base + 0x6000,
+        arena.base + 0x6800,
         arena.base + 0x8000,
         arena.base + 0x9000,
     );
@@ -41,18 +43,18 @@ pub fn run_native(
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
+        b[0x5800..0x5800 + module.table.len()].copy_from_slice(&module.table);
         b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
-        b[0x5000..0x5000 + prog.len()].copy_from_slice(prog);
-        b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+        b[0x6000..0x6000 + prog.len()].copy_from_slice(prog);
+        b[0x6800..0x6800 + interp::STATE_SIZE].fill(0);
         if !data.is_empty() {
             b[0x9000 + data_off..0x9000 + data_off + data.len()].copy_from_slice(data);
         }
-        seed(&mut b[0x6000..0x6000 + interp::STATE_SIZE], vbase);
+        seed(&mut b[0x6800..0x6800 + interp::STATE_SIZE], vbase);
     }
     arena.call(0x8000);
     let b = arena.bytes();
-    Ok((b[0x6000..0x6000 + interp::STATE_SIZE].to_vec(), vbase))
+    Ok((b[0x6800..0x6800 + interp::STATE_SIZE].to_vec(), vbase))
 }
 
 /// Like `run_native`, but also returns the data region (vdata..vdata+cap) after
@@ -67,9 +69,9 @@ pub fn run_native_with_data(
     let mut arena = Arena::new(0x40000)?;
     let (vc, vt, vb, vs, vtr, vdata) = (
         arena.base + 0x1000,
-        arena.base + 0x4800,
-        arena.base + 0x5000,
+        arena.base + 0x5800,
         arena.base + 0x6000,
+        arena.base + 0x6800,
         arena.base + 0x8000,
         arena.base + 0x9000,
     );
@@ -80,19 +82,19 @@ pub fn run_native_with_data(
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
+        b[0x5800..0x5800 + module.table.len()].copy_from_slice(&module.table);
         b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
-        b[0x5000..0x5000 + prog.len()].copy_from_slice(prog);
-        b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
+        b[0x6000..0x6000 + prog.len()].copy_from_slice(prog);
+        b[0x6800..0x6800 + interp::STATE_SIZE].fill(0);
         if !data.is_empty() {
             b[0x9000 + data_off..0x9000 + data_off + data.len()].copy_from_slice(data);
         }
-        seed(&mut b[0x6000..0x6000 + interp::STATE_SIZE], vbase);
+        seed(&mut b[0x6800..0x6800 + interp::STATE_SIZE], vbase);
     }
     arena.call(0x8000);
     let b = arena.bytes();
     Ok((
-        b[0x6000..0x6000 + interp::STATE_SIZE].to_vec(),
+        b[0x6800..0x6800 + interp::STATE_SIZE].to_vec(),
         vbase,
         b[0x9000..0x9000 + data_cap].to_vec(),
     ))

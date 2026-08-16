@@ -49,54 +49,33 @@ pub(crate) fn emit_xgetbv(seq: &mut Vec<(Instruction, Option<Cl>)>) {
 }
 
 // 0x7B tzcnt32 vreg[dst], vreg[src] (2 operands).
-// cnt = popcount((src & -src) - 1)  (== trailing zeros; == 32 when src==0).
-// flags: CF=ZF=1 if src==0 else 0. Branch-free, portable (no POPCNT/BSF dep).
+// Real `tzcnt r32, r/m32` (probe-verified semantics): CF=1 iff src==0, ZF
+// follows the RESULT (tzcnt(0)=32 → ZF=0; tzcnt(odd)=0 → ZF=1), OF/SF/AF
+// cleared, PF undefined → masked out. Captured with the same CF|ZF mask the
+// LZCNT/POPCNT handlers use, matching the reference interpreter. (Replaces the
+// old portable popcount emulation whose "CF=ZF=1 iff src==0" flags did NOT
+// match real x86.)
 pub(crate) fn emit_tzcnt(seq: &mut Vec<(Instruction, Option<Cl>)>) {
-    hdr(
-        seq,
-        OP_TZCNT_R32,
-        vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ESI, MemoryOperand::with_base(Register::R9)).unwrap(),
-            Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
-            Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RDX)).unwrap(),
-            Instruction::with2(Code::Mov_r32_rm32, Register::R11D, Register::EAX).unwrap(),
-            // cnt: EBX = popcount((src & -src) - 1)
-            Instruction::with2(Code::Mov_r32_rm32, Register::EBX, Register::EAX).unwrap(),
-            Instruction::with1(Code::Neg_rm32, Register::EBX).unwrap(),
-            Instruction::with2(Code::And_r32_rm32, Register::EBX, Register::EAX).unwrap(),
-            Instruction::with1(Code::Dec_rm32, Register::EBX).unwrap(),
-            Instruction::with2(Code::Mov_r32_rm32, Register::EAX, Register::EBX).unwrap(),
-            Instruction::with2(Code::Shr_rm32_imm8, Register::EAX, 1).unwrap(),
-            Instruction::with2(Code::And_rm32_imm32, Register::EAX, 0x55555555).unwrap(),
-            Instruction::with2(Code::Sub_r32_rm32, Register::EBX, Register::EAX).unwrap(),
-            Instruction::with2(Code::Mov_r32_rm32, Register::EAX, Register::EBX).unwrap(),
-            Instruction::with2(Code::And_rm32_imm32, Register::EAX, 0x33333333).unwrap(),
-            Instruction::with2(Code::Shr_rm32_imm8, Register::EBX, 2).unwrap(),
-            Instruction::with2(Code::And_rm32_imm32, Register::EBX, 0x33333333).unwrap(),
-            Instruction::with2(Code::Add_r32_rm32, Register::EBX, Register::EAX).unwrap(),
-            Instruction::with2(Code::Mov_r32_rm32, Register::EAX, Register::EBX).unwrap(),
-            Instruction::with2(Code::Shr_rm32_imm8, Register::EAX, 4).unwrap(),
-            Instruction::with2(Code::Add_r32_rm32, Register::EBX, Register::EAX).unwrap(),
-            Instruction::with2(Code::And_rm32_imm32, Register::EBX, 0x0F0F0F0F).unwrap(),
-            Instruction::with2(Code::Mov_r32_rm32, Register::EAX, Register::EBX).unwrap(),
-            Instruction::with2(Code::Shr_rm32_imm8, Register::EAX, 8).unwrap(),
-            Instruction::with2(Code::Add_r32_rm32, Register::EBX, Register::EAX).unwrap(),
-            Instruction::with2(Code::Mov_r32_rm32, Register::EAX, Register::EBX).unwrap(),
-            Instruction::with2(Code::Shr_rm32_imm8, Register::EAX, 16).unwrap(),
-            Instruction::with2(Code::Add_r32_rm32, Register::EBX, Register::EAX).unwrap(),
-            Instruction::with2(Code::And_rm32_imm32, Register::EBX, 0xFF).unwrap(),
-            Instruction::with2(Code::Mov_r32_rm32, Register::EAX, Register::EBX).unwrap(),
-            Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RSI), Register::RAX).unwrap(),
-            // flags: CF=ZF=1 iff src==0
-            Instruction::with2(Code::Mov_r32_rm32, Register::EDI, Register::R11D).unwrap(),
-            Instruction::with1(Code::Neg_rm32, Register::EDI).unwrap(),
-            Instruction::with2(Code::Or_r32_rm32, Register::EDI, Register::R11D).unwrap(),
-            Instruction::with2(Code::Shr_rm32_imm8, Register::EDI, 31).unwrap(),
-            Instruction::with1(Code::Neg_rm32, Register::EDI).unwrap(),
-            Instruction::with1(Code::Not_rm32, Register::EDI).unwrap(),
-            Instruction::with2(Code::And_rm32_imm32, Register::EDI, (F_CF | F_ZF) as u32).unwrap(),
-            Instruction::with2(Code::Mov_rm64_r64, m(Register::R8, STATE_FLAGS as i32), Register::RDI).unwrap(),
-            Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap(),
-        ],
-    );
+    let mut body = vec![
+        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
+        Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RDX)).unwrap(),
+        Instruction::with2(Code::Tzcnt_r32_rm32, Register::EAX, Register::EAX).unwrap(),
+        // EAX writes zero-extend into RAX; store the full 64-bit slot.
+        Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(),
+    ];
+    // Capture CF|ZF right after tzcnt (mov above does not touch flags); DF kept.
+    body.extend(vec![
+        Instruction::with(Code::Pushfq),
+        Instruction::with1(Code::Pop_r64, Register::R11).unwrap(),
+        Instruction::with2(
+            Code::And_rm64_imm32,
+            Register::R11,
+            ((F_CF | F_ZF) | F_DF) as u32 as i32,
+        )
+        .unwrap(),
+        Instruction::with2(Code::Mov_rm64_r64, state_flags_mem(), Register::R11).unwrap(),
+    ]);
+    body.push(Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap());
+    hdr(seq, OP_TZCNT_R32, body);
 }

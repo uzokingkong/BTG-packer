@@ -40,8 +40,8 @@ macro_rules! opcodes {
             pub const $name: u8 = $val;
         )*
 
-        /// Handler-table slot count (opcodes 0x00..=0xBF). 0x00 = invalid-opcode handler.
-        pub const NUM_OPS: usize = 0xC0;
+        /// Handler-table slot count (opcodes 0x00..=0xC1). 0x00 = invalid-opcode handler.
+        pub const NUM_OPS: usize = 0xC2;
 
         /// Opcode -> (mnemonic, operand byte length after the opcode byte).
         pub const OPCODE_INFO: &[(u8, &'static str, usize)] = &[
@@ -72,8 +72,13 @@ opcodes! {
     OP_XOR_R_IMM32 = 0x09 : "xor" , 5 ;
     OP_ADD_R_IMM32 = 0x0A : "add" , 5 ;
     OP_ROL_R_IMM8 = 0x0B : "rol" , 2 ;
-    OP_INC_R = 0x0C : "inc" , 1 ;
+        OP_INC_R = 0x0C : "inc" , 1 ;
     OP_DEC_R = 0x0D : "dec" , 1 ;
+    // 64-bit INC/DEC: identical semantics to the 32-bit forms but at r64 width
+    // (x86 INC/DEC preserve CF, all other flags per ADD/SUB-with-1). Added so
+    // the lifter stops truncating `inc rax`/`dec rax` to 32 bits.
+    OP_INC_R64 = 0xC0 : "inc64" , 1 ;
+    OP_DEC_R64 = 0xC1 : "dec64" , 1 ;
     OP_CMP_R_IMM32 = 0x0E : "cmp" , 5 ;
     OP_MOVZX_R_MEM8 = 0x0F : "movzx" , 3 ;
     OP_MOV_MEM8_R = 0x10 : "mov" , 3 ;
