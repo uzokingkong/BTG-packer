@@ -46,7 +46,11 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
             crate::dispatcher::build_dispatcher_m7(0, 0, num_blocks, ctx.mba_constant, true).len()
         }
     } else if ctx.reencrypt {
-        crate::dispatcher::build_dispatcher_reencrypt(0, 0, num_blocks, ctx.mba_constant, true).len()
+        if ctx.custom_cipher {
+            crate::dispatcher::build_dispatcher_reencrypt_c1(0, 0, num_blocks, ctx.mba_constant, true, 0, 0).len()
+        } else {
+            crate::dispatcher::build_dispatcher_reencrypt(0, 0, num_blocks, ctx.mba_constant, true).len()
+        }
     } else if ctx.block_ring {
         // v13.4d diag: --block-ring 은 표준 디스패처에 ring-write ~24B 를 더한다.
         // 실제 셸코드가 0x80을 넘지 않도록 여유(+0x40)를 둔다. (테이블 앞 공간만 더
@@ -64,8 +68,8 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
     // v8: 재암호화 시 점프 테이블 뒤에 블록 길이 테이블(num_blocks*4)이 붙는다.
     // v61: --m7은 상태 테이블(num_blocks*4)까지 추가한다 (점프 + 길이 + 상태).
     // v61(+custom-cipher): C1 상태 버퍼(0x80) + S-box 상수 테이블(0x100)을
-    // 테이블 직후(first_block_offset 직전)에 예약한다.
-    let c1_reserve = if ctx.m7 && ctx.custom_cipher { 0x180 } else { 0 };
+    // 테이블 직후(first_block_offset 직전)에 예약한다 (reencrypt/m7 per-block).
+    let c1_reserve = if ctx.reencrypt && ctx.custom_cipher { 0x180 } else { 0 };
     let required_table_end = table_offset
         + num_blocks * 4
         + if ctx.reencrypt { num_blocks * 4 } else { 0 }

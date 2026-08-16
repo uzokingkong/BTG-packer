@@ -325,9 +325,10 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
                     );
                 }
             } else {
-                // v61: --m7 + --custom-cipher면 per-block 키를 BTG-C1(repeat4)로
-                // 복호화해 패커 암호화 ↔ C1 디스패처 복호화 동치를 검증한다.
-                let c1 = ctx.m7 && ctx.custom_cipher;
+                // v61: reencrypt/m7 + --custom-cipher면 per-block 키를 BTG-C1
+                // (repeat4)로 복호화해 패커 암호화 ↔ C1 디스패처 복호화 동치를
+                // 검증한다.
+                let c1 = ctx.custom_cipher && ctx.reencrypt;
                 let mut dec = out[file_off..file_off + len].to_vec();
                 if c1 {
                     let key32 = crate::pipeline::crypto::cipher::repeat4(key);

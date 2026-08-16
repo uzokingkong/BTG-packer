@@ -13,6 +13,7 @@ mod build;
 mod m7;
 mod m7_c1;
 mod reencrypt;
+mod reencrypt_c1;
 mod validate;
 
 pub use build::{
@@ -21,6 +22,7 @@ pub use build::{
 pub use m7::build_dispatcher_m7;
 pub use m7_c1::build_dispatcher_m7_c1;
 pub use reencrypt::build_dispatcher_reencrypt;
+pub use reencrypt_c1::build_dispatcher_reencrypt_c1;
 pub use validate::validate_dispatcher;
 
 /// Marker for an 8-byte stack push that needs no register restore (pushfq,

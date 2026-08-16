@@ -116,17 +116,16 @@ pub fn run(
     // ── v60 (--custom-cipher): BTG-C1 활성 판정 ───────────────────────────────
     // chained/VM(PRGA·KSA) 경로는 RC4 전용 부트 스텁 서브루틴/가상화를 쓰므로
     // 이 조합에서는 --custom-cipher를 무시하고 RC4로 폴백한다.
-    // v61: 평문(벌크) 경로와 --m7(per-block C1 디스패처) 경로에서 C1 활성.
-    //     --dispatcher-reencrypt(비-m7)는 아직 RC4 reencrypt 디스패처를 쓰므로
-    //     C1을 활성화하지 않는다 (후속: reencrypt-C1 디스패처).
-    let c1_mode = ctx.custom_cipher && !chained_effective && !vm_effective && (!reencrypt || ctx.m7);
+    // v61: 평문(벌크)·reencrypt·--m7(per-block) 경로는 모두 BTG-C1 per-block
+    //     디스패처/부트 스텁 blob으로 교체되어 C1을 활성화한다.
+    let c1_mode = ctx.custom_cipher && !chained_effective && !vm_effective;
     if ctx.custom_cipher && !c1_mode {
         println!(
-            "[!] --custom-cipher (BTG-C1) ignored for this mode: chained/VM use the RC4 boot-stub/VM subroutines, and non-m7 reencrypt still uses the RC4 reencrypt dispatcher (falls back to RC4)"
+            "[!] --custom-cipher (BTG-C1) ignored for this mode: chained/VM use the RC4 boot-stub/VM subroutines (falls back to RC4)"
         );
     }
     if c1_mode {
-        println!("[+] v60 Custom Cipher: BTG-C1 512-bit stream cipher ENABLED (string runs via seed stream; --m7 per-block via per-block C1 keys)");
+        println!("[+] v60 Custom Cipher: BTG-C1 512-bit stream cipher ENABLED (string runs via seed stream; reencrypt/m7 per-block via per-block C1 keys)");
     }
 
     // ── M7: on-demand 재암호화(anti-dump) — refcount-safe 디스패처가 블록을
