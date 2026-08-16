@@ -175,6 +175,15 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, needs_boot_stub: bool, t
         )
     };
     dispatcher::validate_dispatcher(&dispatcher_bytes)?;
+    // P0-2 (VM ABI): 생성된 디스패처가 Win64 callee-saved GPR을 저장 후에만
+    // 사용하는지 정적 검증 (위반 시 빌드 거부).
+    let abi_violations = crate::vm::abi::validate_win64_abi(&dispatcher_bytes, dispatcher_va + 0x20)?;
+    if !abi_violations.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Win64 ABI violation in generated dispatcher:\n  {}",
+            abi_violations.join("\n  ")
+        ));
+    }
 
     println!(
         "[+] Dispatcher: table_offset=0x{:X}, shellcode_len={} bytes, available={} bytes, anti_debug={}, block_ring={}",
