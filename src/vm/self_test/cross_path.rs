@@ -192,4 +192,38 @@ mod tests {
             region
         );
     }
+
+    /// 아이템 8: 빌드별 handler 레이아웃 랜덤화. MBA 빌드마다 (a) 다른 핸들러
+    /// 순서 + junk + decoy 로 서로 다른 코드를 만들고, (b) 두 빌드 모두 검증을
+    /// 통과해야 한다. 관측 의미론(interp/native/fuzz)은 테이블 기반 디스패치라
+    /// 변하지 않는다 — 실제 실행은 [28] M8 MBA 테스트가 end-to-end로 검증한다.
+    #[test]
+    fn handler_layout_randomized_per_mba_build() {
+        use crate::vm::handlers::{EntryMode, validate_vm_code};
+        // a small program exercising a few opcodes
+        let mut bc = BytecodeBuilder::new();
+        bc.mov_r_imm64(3, 0x1234_5678_9ABC_DEF0);
+        bc.binop_r_r64(crate::vm::bytecode::OP_ADD_R_R64, 3, 4);
+        bc.inc_r64(3);
+        bc.halt();
+        let prog = bc.finish();
+
+        let mut codes = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let m = crate::vm::build_vm_module_mba(
+                0x14000_1000,
+                0x14000_9000,
+                0x14000_A000,
+                prog.clone(),
+                EntryMode::Ksa,
+            )
+            .expect("build mba vm");
+            validate_vm_code(&m.code).expect("obfuscated MBA code must validate");
+            codes.insert(m.code);
+        }
+        assert!(
+            codes.len() >= 2,
+            "MBA builds must produce different handler layouts (build-specific randomization)"
+        );
+    }
 }

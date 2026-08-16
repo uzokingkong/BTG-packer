@@ -259,6 +259,74 @@ fn cap_flags_shift() -> Vec<Instruction> {
 /// invocation, and every dispatch XORs the loaded table entry with r15 before
 /// `jmp` — so `K` never appears as a single plaintext constant and the handler
 /// addresses in a dumped table are not directly readable. `None` keeps the
+/// Side-effect-free multi-byte NOP (safe even under speculative execution).
+fn multi_byte_nop() -> Instruction {
+    Instruction::with(Code::Nopw)
+}
+
+/// A handler-shaped decoy block: the threaded-dispatch sequence (fetch opcode,
+/// advance, load the table entry, XOR the MBA key, jump). Receives NO table
+/// entry, so it is unreachable dead code that still looks like a real handler.
+fn decoy_handler() -> Vec<(Instruction, Option<Cl>)> {
+    vec![
+        (Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, MemoryOperand::with_base(Register::R9)).unwrap(), None),
+        (Instruction::with1(Code::Inc_rm64, Register::R9).unwrap(), None),
+        (Instruction::with2(Code::Mov_r64_rm64, Register::RAX, MemoryOperand::with_base_index_scale(Register::R10, Register::RAX, 8)).unwrap(), None),
+        (Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R15).unwrap(), None),
+        (Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap(), None),
+    ]
+}
+
+/// Handler-layout obfuscation (아이템 8 — 빌드별 레이아웃 랜덤화 + decoy).
+///
+/// The threaded dispatcher NEVER falls through: every handler ends in
+/// `jmp [r10 + rax*8]` through the handler table, so reordering handler blocks
+/// and inserting dead code between them is unobservable at runtime. This pass:
+///   1. splits the handler region into per-opcode blocks (prologue untouched),
+///   2. shuffles the block order with a build seed (각 빌드마다 다른 레이아웃),
+///   3. inserts side-effect-free NOP junk between blocks (dead code),
+///   4. appends handler-shaped decoy blocks with no table entry.
+/// Observable per-opcode semantics are unchanged — only the layout varies.
+fn obfuscate_handler_layout(seq: &mut Vec<(Instruction, Option<Cl>)>, seed: u64) {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    let first_handler = seq.iter().position(|(_, l)| matches!(l, Some(Cl::Handler(_))));
+    let Some(fh) = first_handler else { return };
+    let handlers: Vec<(Instruction, Option<Cl>)> = seq.drain(fh..).collect();
+
+    let mut blocks: Vec<Vec<(Instruction, Option<Cl>)>> = Vec::new();
+    let mut cur: Vec<(Instruction, Option<Cl>)> = Vec::new();
+    for item in handlers {
+        if matches!(item.1, Some(Cl::Handler(_))) && !cur.is_empty() {
+            blocks.push(std::mem::take(&mut cur));
+        }
+        cur.push(item);
+    }
+    if !cur.is_empty() {
+        blocks.push(cur);
+    }
+
+    for i in (1..blocks.len()).rev() {
+        let j = rng.gen_range(0..=i);
+        blocks.swap(i, j);
+    }
+
+    for (i, block) in blocks.into_iter().enumerate() {
+        if i > 0 {
+            for _ in 0..rng.gen_range(1..=3) {
+                seq.push((multi_byte_nop(), None));
+            }
+        }
+        seq.extend(block);
+    }
+    let decoys = rng.gen_range(2..=4);
+    for _ in 0..decoys {
+        seq.extend(decoy_handler());
+    }
+}
+
 /// original (plain) dispatch semantics (with r15 zeroed; identical behaviour).
 pub fn generate_vm_code(
     code_va: u64,
@@ -483,6 +551,15 @@ pub fn generate_vm_code(
     muldiv::emit_idiv_rr8(&mut seq);
     muldiv::emit_idiv_rr16(&mut seq);
     branch::emit_halt(&mut seq);
+
+    // ── Handler-layout obfuscation (item 8) ────────────────────────────────────
+    // MBA path only (build-specific): derive the layout seed from the MBA table
+    // key K = a+b, so every build ships a different handler order + decoys while
+    // the observable semantics stay identical. The plain path keeps the original
+    // byte-exact layout (all the differential/native tests rely on it).
+    if let Some((a, b)) = mba_key {
+        obfuscate_handler_layout(&mut seq, a.wrapping_add(b));
+    }
 
     // ── Two-pass layout: measure each instruction, assign IPs / labels ─────────
     let mut ip = code_va;
