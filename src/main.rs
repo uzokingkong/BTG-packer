@@ -448,7 +448,7 @@ fn main() -> error::Result<()> {
 
     // ── Build: PE 합성 + 파일 기록 ───────────────────────────────────────────────
     let output_path = args.output;
-    let output_pe_bytes = pipeline::build::run(&ctx, &output_path)?;
+    let output_pe_bytes = pipeline::build::run(&ctx, Some(&output_path))?;
 
     // ── v4: 섹션별 엔트로피 리포트 (탐지 도구의 엔트로피 지표 확인용) ─────────────
     btg_packer::analysis::entropy::print_entropy_report(&output_pe_bytes);

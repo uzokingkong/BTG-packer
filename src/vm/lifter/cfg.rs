@@ -1,5 +1,5 @@
 // ==============================================================================
-// BTG v24 - x86-64 → VM Bytecode Lifter: multi-block CFG orchestration
+// BTG v24 - x86-64 ??VM Bytecode Lifter: multi-block CFG orchestration
 // ==============================================================================
 // `lift_block` (single straight-line basic block), `lift_cfg` / `lift_cfg_switch`
 // (multi-block control-flow lift with switch jump-table dispatch and panic/
@@ -127,14 +127,14 @@ pub fn lift_block(seq: &[LiftedInstr], seq_base_va: u64) -> Result<Vec<u8>> {
     // --map/--sym-map diagnostics (mapper active) keep the legacy byte-exact
     // path so recorded offsets stay valid.
     if crate::vm::mapper::active() {
-        Ok(b.finish())
+        Ok(b.try_finish()?)
     } else {
         let (bytes, branches, labels) = b.into_parts();
         super::ir::run_ir_pipeline(&bytes, &branches, &labels)
     }
 }
 
-/// M5 (v30) — multi-block control-flow lift driver.
+/// M5 (v30) ??multi-block control-flow lift driver.
 pub fn lift_cfg(blocks: &[crate::graph::BasicBlock]) -> Result<Vec<u8>> {
     lift_cfg_switch(blocks, &[], &std::collections::HashMap::new(), None, &Default::default(), &[])
 }
@@ -146,7 +146,7 @@ pub fn lift_cfg(blocks: &[crate::graph::BasicBlock]) -> Result<Vec<u8>> {
 /// belong to. When bridging to an excluded block, we must jump to the
 /// **function entry** (its prologue), NOT the mid-function block start:
 /// calling a mid-function block skips the prologue, so the callee's RSP/frame
-/// is wrong and any internal `call` is 8-byte misaligned → 0xC0000005 inside
+/// is wrong and any internal `call` is 8-byte misaligned ??0xC0000005 inside
 /// e.g. GetModuleHandleA (--vm-oep boot crash, problem.txt).
 pub fn lift_cfg_switch(
     blocks: &[crate::graph::BasicBlock],
@@ -341,7 +341,7 @@ pub fn lift_cfg_switch(
     // Phase 2.3 (v56): IR pipeline (see lift_block); --map/--sym-map keeps the
     // legacy byte-exact path for offset validity.
     if crate::vm::mapper::active() {
-        Ok(b.finish())
+        Ok(b.try_finish()?)
     } else {
         let (bytes, branches, labels) = b.into_parts();
         super::ir::run_ir_pipeline(&bytes, &branches, &labels)

@@ -15,6 +15,7 @@
 use super::isa_spec::VirtualIsaSpec;
 use super::rolling_key::RollingKeyEngine;
 use crate::vm::risc::{BranchCondition, RiscOp, VirtualFlags};
+use crate::vm::risc::flags::VFLAG_DF;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
@@ -59,7 +60,9 @@ impl PolymorphicInterpreter {
         let mut vip = 0usize;
         // 각 인스트럭션 **opcode 의 시작 바이트 오프셋** (인덱스 순). taken 분기의
         // 인스트럭션-인덱스 타깃을 바이트 오프셋으로 변환해 `eval_state`와 일치시킨다.
-        let instr_starts = self.instr_starts(bytecode);
+        // 각 시작점의 롤링 키 스냅샷도 함께 캡처 — backward 분기(loop)에서 타깃
+        // 위치의 키 상태를 복원하기 위함 (항상 선형 실행과 동일한 키 스트림 유지).
+        let (instr_starts, key_snapshots) = self.instr_starts(bytecode);
 
         while vip < bytecode.len() {
             // 1. Decrypt Opcode
@@ -224,21 +227,30 @@ impl PolymorphicInterpreter {
                     let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
                     let cnt = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2) & 63;
                     let res = if cnt == 0 { a } else { a >> cnt };
-                    self.flags.update_logic64(res);
+                    // x86: count==0 이면 RFLAGS 불변.
+                    if cnt != 0 {
+                        self.flags.update_logic64(res);
+                    }
                     self.store_operand(op_dst_raw, res);
                 }
                 RiscOp::ArithmeticShiftRight => {
                     let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
                     let cnt = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2) & 63;
                     let res = if cnt == 0 { a } else { ((a as i64) >> cnt) as u64 };
-                    self.flags.update_logic64(res);
+                    // x86: count==0 이면 RFLAGS 불변.
+                    if cnt != 0 {
+                        self.flags.update_logic64(res);
+                    }
                     self.store_operand(op_dst_raw, res);
                 }
                 RiscOp::ShiftLeft => {
                     let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
                     let cnt = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2) & 63;
                     let res = if cnt == 0 { a } else { a << cnt };
-                    self.flags.update_logic64(res);
+                    // x86: count==0 이면 RFLAGS 불변.
+                    if cnt != 0 {
+                        self.flags.update_logic64(res);
+                    }
                     self.store_operand(op_dst_raw, res);
                 }
                 RiscOp::VirtualPush => {
@@ -273,21 +285,25 @@ impl PolymorphicInterpreter {
                             branch_target
                         };
                         // 범위 밖 타깃 → eval_state 와 동일하게 실행 종료 (vip 를 스트림 끝으로).
-                        let Some(&target_off) = instr_starts.get(target as usize) else {
+                        let Some((&target_off, &target_key)) = instr_starts
+                            .get(target as usize)
+                            .zip(key_snapshots.get(target as usize))
+                        else {
                             vip = bytecode.len();
                             continue;
                         };
-                        // 건너뛴 [vip, target_off) 구간의 롤링 키스트림을 전진시켜 동기화한 뒤 점프.
-                        if target_off > vip {
-                            fast_forward_roll(&mut self.rolling, bytecode, vip, target_off);
-                        }
+                        // 롤링 키를 타깃 인스트럭션 시작 시점의 **선형 실행 키 상태**로 복원.
+                        // forward 점프뿐 아니라 backward 점프(loop)에서도 정확하다.
+                        // (기존 `fast_forward_roll`은 forward만 동기화해 backward에서
+                        //  키가 desync 되어 두 번째 loop부터 스트림을 잘못 복호화했다.)
+                        self.rolling.current_key = target_key;
                         vip = target_off;
                         continue;
                     }
                 }
                 RiscOp::SetFlag => {
                     let v = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
-                    self.flags.raw = v & 0x8D5; // CF|PF|AF|ZF|SF|OF 마스크
+                    self.flags.raw = v & (0x8D5 | VFLAG_DF); // status bits + DF
                 }
                 RiscOp::NativeCallBridge => {
                     // 인지된 no-op 스텁. 실제 네이티브/호스트 콜은 런타임 계층(Phase P3) 책임.
@@ -311,7 +327,7 @@ impl PolymorphicInterpreter {
                 RiscOp::BSwap { width } => {
                     let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
                     let res = if width == 4 {
-                        (a.swap_bytes() as u32) as u64
+                        ((a as u32).swap_bytes()) as u64
                     } else {
                         a.swap_bytes()
                     };
@@ -433,16 +449,21 @@ impl PolymorphicInterpreter {
     }
 
     /// 바이트코드를 선형 디코드해 각 인스트럭션 **opcode 의 시작 바이트 오프셋** 을
-    /// 인덱스 순으로 모은 테이블을 만든다. `eval_state` 는 `vip` 를 인스트럭션 인덱스로
-    /// 쓰지만 폴리 스트림의 `vip` 는 바이트 오프셋이므로, taken 분기의 인덱스 타깃을
-    /// 이 테이블로 바이트 오프셋으로 변환해 일치시킨다. 디코드 스텝핑은 decoder/run 과
-    /// 정확히 동일하며, 롤링 키는 `Copy` 복제본으로 전진시켜 원본 상태를 건드리지 않는다.
-    fn instr_starts(&self, bytecode: &[u8]) -> Vec<usize> {
+    /// 인덱스 순으로 모은 테이블과, 각 시작점에서의 **롤링 키 상태**(`current_key`)
+    /// 스냅샷을 함께 만든다. `eval_state` 는 `vip` 를 인스트럭션 인덱스로 쓰지만
+    /// 폴리 스트림의 `vip` 는 바이트 오프셋이므로, taken 분기의 인덱스 타깃을
+    /// 이 테이블로 바이트 오프셋으로 변환해 일치시킨다. 키 스냅샷은 분기(특히
+    /// backward) 시 타깃 위치의 키 상태를 복원해 선형 실행과 동일한 키 스트림을
+    /// 유지하는 데 쓴다. 디코드 스텝핑은 decoder/run 과 정확히 동일하며, 롤링
+    /// 키는 `Copy` 복제본으로 전진시켜 원본 상태를 건드리지 않는다.
+    fn instr_starts(&self, bytecode: &[u8]) -> (Vec<usize>, Vec<u64>) {
         let mut starts = Vec::new();
+        let mut keys = Vec::new();
         let mut vip = 0usize;
         let mut rolling = self.rolling; // Copy — 선형 스캔 전용 복제본
         while vip < bytecode.len() {
             starts.push(vip);
+            keys.push(rolling.current_key);
             let raw_op = rolling.decrypt_byte(bytecode[vip], vip as u64);
             vip += 1;
             let Some(risc_op) = self.spec.reverse_opcode_map.get(&raw_op).copied() else {
@@ -497,219 +518,17 @@ impl PolymorphicInterpreter {
                 break;
             }
         }
-        starts
+        (starts, keys)
     }
 }
 
-/// 조건 분기가 걸리는지 평가 (x86 조건 코드 의미론). `src/vm/risc/mod.rs::branch_taken`과 동일.
-fn branch_taken(cond: BranchCondition, flags: &VirtualFlags) -> bool {
-    match cond {
-        BranchCondition::Always => true,
-        BranchCondition::Zero => flags.zf(),
-        BranchCondition::NotZero => !flags.zf(),
-        BranchCondition::Carry => flags.cf(),
-        BranchCondition::NotCarry => !flags.cf(),
-        BranchCondition::Sign => flags.sf(),
-        BranchCondition::NotSign => !flags.sf(),
-        BranchCondition::Overflow => flags.of(),
-        BranchCondition::NotOverflow => !flags.of(),
-        // signed comparisons
-        BranchCondition::Greater => !flags.zf() && (flags.sf() == flags.of()), // JG
-        BranchCondition::Less => flags.sf() != flags.of(),                      // JL
-        BranchCondition::GreaterOrEqual => flags.sf() == flags.of(),            // JGE
-        BranchCondition::LessOrEqual => flags.zf() || (flags.sf() != flags.of()), // JLE
-        // unsigned comparisons (precise)
-        BranchCondition::Above => !flags.cf() && !flags.zf(),           // JA: CF=0 && ZF=0
-        BranchCondition::AboveOrEqual => !flags.cf(),                    // JAE: CF=0
-        BranchCondition::Below => flags.cf(),                            // JB: CF=1
-        BranchCondition::BelowOrEqual => flags.cf() || flags.zf(),       // JBE: CF=1 || ZF=1
-        // parity
-        BranchCondition::Parity => flags.pf(),      // JP
-        BranchCondition::NotParity => !flags.pf(),  // JNP
-        // counter-based (Jcxz/Jecxz/Jrcxz): handled by branch_taken_with_state
-        BranchCondition::CounterZero(_) => false,
-    }
-}
+mod arith;
+mod branch;
+mod mem;
 
-/// 분기 평가 — `CounterZero`(카운터 기반)는 레지스터 상태가 필요하므로 상태까지 전달.
-/// `src/vm/risc/mod.rs::branch_taken_with_state`과 동일: RCX(reg[1])의 하위 width 바이트가 0인지.
-fn branch_taken_with_state(cond: BranchCondition, flags: &VirtualFlags, regs: &[u64; 16]) -> bool {
-    if let BranchCondition::CounterZero(width) = cond {
-        let mask = match width {
-            2 => 0xFFFF,
-            4 => 0xFFFF_FFFF,
-            _ => u64::MAX,
-        };
-        return (regs[1] & mask) == 0;
-    }
-    branch_taken(cond, flags)
-}
-
-/// 리틀엔디언 `width`바이트 메모리 읽기. 미기입 주소는 0으로 취급.
-/// `src/vm/risc/mod.rs::mem_read`과 동일.
-fn mem_read(mem: &HashMap<u64, u8>, addr: u64, width: u8) -> u64 {
-    let mut v = 0u64;
-    for i in 0..width {
-        if let Some(&b) = mem.get(&addr.wrapping_add(i as u64)) {
-            v |= (b as u64) << (i as u64 * 8);
-        }
-    }
-    v
-}
-
-/// 리틀엔디언 `width`바이트 메모리 쓰기. `src/vm/risc/mod.rs::mem_write`과 동일.
-fn mem_write(mem: &mut HashMap<u64, u8>, addr: u64, width: u8, val: u64) {
-    for i in 0..width {
-        mem.insert(addr.wrapping_add(i as u64), (val >> (i as u64 * 8)) as u8);
-    }
-}
-
-// ── P2: 정수/비트 복합 연산 인터프리터 헬퍼 (eval_state 와 동일 의미론) ──────────
-
-/// `width`바이트 폭의 비트 마스크.
-fn width_mask_interp(bits: u32) -> u64 {
-    if bits >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << bits) - 1
-    }
-}
-
-/// `bits` 비트 값 `v`를 i128 로 부호 확장 (bits < 128).
-fn sign_extend_i128_interp(v: u128, bits: u32) -> i128 {
-    let shift = 128 - bits;
-    ((v << shift) as i128) >> shift
-}
-
-/// 인터프리터 dst 저장 — `store_operand`와 동일.
-fn interp_store(regs: &mut [u64; 16], temps: &mut [u64; 8], spec: &VirtualIsaSpec, raw: u8, val: u64) {
-    let kind = raw & 0xC0;
-    let payload = raw & 0x3F;
-    match kind {
-        0x80 => {
-            let reg_idx = spec.decode_reg(payload);
-            regs[reg_idx as usize] = val;
-        }
-        0xC0 => {
-            temps[(payload & 0x07) as usize] = val;
-        }
-        _ => {}
-    }
-}
-
-/// 1-피연산자 MUL/IMUL — eval_state `mul_wide`와 동일.
-fn mul_wide_interp(
-    regs: &mut [u64; 16],
-    temps: &mut [u64; 8],
-    spec: &VirtualIsaSpec,
-    flags: &mut VirtualFlags,
-    a: u64,
-    b: u64,
-    signed: bool,
-    width: u8,
-    op_dst: u8,
-) {
-    let bits = width as u32 * 8;
-    let mask = width_mask_interp(bits);
-    let full = ((a & mask) as u128) * ((b & mask) as u128);
-    let low = full as u64;
-    let high = ((full >> bits) as u64) & mask;
-    let ovf = if signed {
-        let sign_ext = if low & (1u64 << (bits - 1)) != 0 { mask } else { 0 };
-        high != sign_ext
-    } else {
-        high != 0
-    };
-    flags.set_cf_of(ovf);
-    if width == 1 {
-        interp_store(regs, temps, spec, op_dst, (low & 0xFF) | ((high & 0xFF) << 8));
-    } else {
-        interp_store(regs, temps, spec, op_dst, low);
-        regs[2] = high; // RDX
-    }
-}
-
-/// 2/3-피연산자 IMUL — eval_state `mul_low`와 동일.
-fn mul_low_interp(
-    regs: &mut [u64; 16],
-    temps: &mut [u64; 8],
-    spec: &VirtualIsaSpec,
-    flags: &mut VirtualFlags,
-    a: u64,
-    b: u64,
-    signed: bool,
-    width: u8,
-    op_dst: u8,
-) {
-    let bits = width as u32 * 8;
-    let mask = width_mask_interp(bits);
-    let full = ((a & mask) as u128) * ((b & mask) as u128);
-    let low = full as u64;
-    let high = ((full >> bits) as u64) & mask;
-    let ovf = if signed {
-        let sign_ext = if low & (1u64 << (bits - 1)) != 0 { mask } else { 0 };
-        high != sign_ext
-    } else {
-        high != 0
-    };
-    flags.set_cf_of(ovf);
-    interp_store(regs, temps, spec, op_dst, low);
-}
-
-/// DIV/IDIV — eval_state `div_wide`와 동일. (제수 0 → 참조 기본값 0.)
-fn div_wide_interp(
-    regs: &mut [u64; 16],
-    temps: &mut [u64; 8],
-    spec: &VirtualIsaSpec,
-    divisor: u64,
-    signed: bool,
-    width: u8,
-    op_dst: u8,
-) {
-    let bits = width as u32 * 8;
-    let mask = width_mask_interp(bits);
-    // 폭 1(8비트)은 AX(reg0 low16)가 피제수 — RDX 미사용.
-    let (dividend, dvbits) = if width == 1 {
-        ((regs[0] & 0xFFFF) as u128, 16u32)
-    } else {
-        (
-            ((regs[2] & mask) as u128) << bits | (regs[0] & mask) as u128,
-            bits * 2,
-        )
-    };
-    let dv = (divisor & mask) as u128;
-    if dv == 0 {
-        interp_store(regs, temps, spec, op_dst, 0);
-        if width != 1 {
-            regs[2] = 0;
-        }
-        return;
-    }
-    let (q, r) = if signed {
-        let d = sign_extend_i128_interp(dividend, dvbits);
-        let s = sign_extend_i128_interp(dv as u64 as u128, bits);
-        let (q, r) = (d / s, d % s);
-        (q as u128, r as u128)
-    } else {
-        (dividend / dv, dividend % dv)
-    };
-    if width == 1 {
-        interp_store(regs, temps, spec, op_dst, ((r as u64) & 0xFF) << 8 | ((q as u64) & 0xFF));
-    } else {
-        interp_store(regs, temps, spec, op_dst, (q as u64) & mask);
-        regs[2] = (r as u64) & mask;
-    }
-}
-
-/// taken 분기로 건너뛴 `[from, to)` 구간의 바이트를 복호화·폐기하며 롤링 키를 전진시켜,
-/// 선형 인코딩과 동일한 키 상태에 도달하게 한다 (키스트림 동기화).
-fn fast_forward_roll(rolling: &mut RollingKeyEngine, bytecode: &[u8], from: usize, to: usize) {
-    let mut p = from;
-    while p < to {
-        let _ = rolling.decrypt_byte(bytecode[p], p as u64);
-        p += 1;
-    }
-}
+pub(crate) use arith::{div_wide_interp, interp_store, mul_low_interp, mul_wide_interp, sign_extend_i128_interp, width_mask_interp};
+pub(crate) use branch::{branch_taken, branch_taken_with_state};
+pub(crate) use mem::{mem_read, mem_write};
 
 #[cfg(test)]
 mod tests {
@@ -1221,6 +1040,67 @@ mod tests {
         }
     }
 
+    /// backward 분기(루프) 차등 — 리뷰 지적 #2 검증. backward 점프에서 타깃 위치의
+    /// 롤링 키가 복원되지 않으면 두 번째 loop부터 스트림이 desync 되어(오류/잘못된
+    /// 실행) reference 와 어긋나야 한다. 수정 후에는 N회 루프를 돌아도 전체 상태가
+    /// eval_state 와 일치해야 한다.
+    #[test]
+    fn test_poly_backward_branch_loop_matches_reference() {
+        for seed in DIFF_SEEDS {
+            // R1 = 카운터(5) → 루프 헤드에서 10씩 더하고 1씩 감소.
+            // ZF=0(카운터 != 0) 동안 backward 분기(NotZero -> index1)로 반복.
+            let mut d = RiscDesynthesizer::new();
+            d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(5), MicroOperand::Imm64(0)); // index0
+            // ── loop head (index1) ──
+            d.emit_add(MicroOperand::VReg(0), MicroOperand::VReg(0), MicroOperand::Imm64(10)); // index1: R0 += 10
+            d.emit_sub(MicroOperand::VReg(1), MicroOperand::VReg(1), MicroOperand::Imm64(1)); // index2(NOT)+index3(SUB): R1 -= 1
+            d.instrs.push(
+                MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::NotZero }).with_imm(1), // index4: ZF=0 → loop
+            );
+            d.instrs.push(MicroInstr::new(RiscOp::Halt)); // index5
+
+            let prog = RiscProgram::new(d.instrs);
+            let ref_st = prog.eval_state(&[0u64; 16]);
+            assert_eq!(ref_st.regs[0], 50, "R0 must be 5 iterations x 10");
+            assert_eq!(ref_st.regs[1], 0, "R1 counter must hit 0");
+
+            let mut enc = PolymorphicEncoder::new(seed);
+            let bytecode = enc.encode(&prog).unwrap();
+            let mut interp = PolymorphicInterpreter::new(seed);
+            interp.run(&bytecode).unwrap();
+            assert_full_state_eq(&interp, &ref_st);
+
+            // 추가: backward 분기가 여러 개 연속(중첩 감소 루프)일 때도 동일.
+            let mut d = RiscDesynthesizer::new();
+            d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(3), MicroOperand::Imm64(0)); // outer=3
+            let outer_head = d.instrs.len(); // ── outer 루프 헤드 ──
+            d.emit_add(MicroOperand::VReg(2), MicroOperand::Imm64(4), MicroOperand::Imm64(0)); // inner=4 (외부 반복마다 리셋)
+            let inner_head = d.instrs.len(); // ── inner 루프 헤드 ──
+            d.emit_add(MicroOperand::VReg(0), MicroOperand::VReg(0), MicroOperand::Imm64(100)); // R0 += 100 (3x4회)
+            d.emit_sub(MicroOperand::VReg(2), MicroOperand::VReg(2), MicroOperand::Imm64(1)); // inner -= 1
+            d.instrs.push(
+                MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::NotZero })
+                    .with_imm(inner_head as u64), // inner 루프 (backward)
+            );
+            d.emit_sub(MicroOperand::VReg(1), MicroOperand::VReg(1), MicroOperand::Imm64(1)); // outer -= 1
+            d.instrs.push(
+                MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::NotZero })
+                    .with_imm(outer_head as u64), // outer 루프 (backward)
+            );
+            d.instrs.push(MicroInstr::new(RiscOp::Halt));
+
+            let prog = RiscProgram::new(d.instrs);
+            let ref_st = prog.eval_state(&[0u64; 16]);
+            assert_eq!(ref_st.regs[0], 3 * 4 * 100, "nested loop iterations");
+
+            let mut enc = PolymorphicEncoder::new(seed);
+            let bytecode = enc.encode(&prog).unwrap();
+            let mut interp = PolymorphicInterpreter::new(seed);
+            interp.run(&bytecode).unwrap();
+            assert_full_state_eq(&interp, &ref_st);
+        }
+    }
+
     /// NativeCallBridge no-op 스텁 차등 — 브리지 양쪽(즉시/레지스터 인자 포함)에서 상태 불변,
     /// 이후 연산이 스트림 동기를 유지하며 정상 실행됨을 전체 상태로 확인.
     #[test]
@@ -1521,6 +1401,192 @@ mod tests {
             d.instrs.push(MicroInstr::new(RiscOp::Halt));
             let prog = RiscProgram::new(d.instrs);
             run_diff_mem(seed, &prog, &[0u64; 16], seed_mem);
+        }
+    }
+
+    // ── v64: 결정적 랜덤 차등 퍼즈 ────────────────────────────────────────────
+    // 산술/비트/시프트(count 0 포함)/메모리/유계 루프(backward 분기)를 무작위로
+    // 조합한 프로그램을 다수 생성해 `eval_state`(참조)와 폴리 인터프리터의 전체
+    // 상태를 비교한다. 리뷰 #2(backward 분기 키 복원)·#3/#4(shift count=0 플래그)를
+    // 같은 시드로 반복해 되짚는다. PRNG 는 결정적이므로 실패 시 재현 가능.
+    /// 실패 시 프로그램 전체를 출력하기 위한 간단한 포매터.
+    fn format_prog(prog: &RiscProgram) -> String {
+        use crate::vm::risc::MicroOperand;
+        let mo = |o: &Option<MicroOperand>| match o {
+            Some(MicroOperand::VReg(i)) => format!("v{i}"),
+            Some(MicroOperand::Temp(i)) => format!("t{i}"),
+            Some(MicroOperand::Imm64(v)) => format!("0x{v:X}"),
+            Some(MicroOperand::Vflags) => "fl".into(),
+            Some(MicroOperand::Vsp) => "sp".into(),
+            None => "-".into(),
+        };
+        let mut s = String::new();
+        for (i, ins) in prog.instrs.iter().enumerate() {
+            s.push_str(&format!(
+                "  {i:04}: {:?} dst={} src1={} src2={} imm=0x{:X}\n",
+                ins.op,
+                mo(&ins.dst),
+                mo(&ins.src1),
+                mo(&ins.src2),
+                ins.imm
+            ));
+        }
+        s
+    }
+
+    #[test]
+    fn test_poly_fuzz_random_programs_match_reference() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+
+        use crate::vm::risc::{BranchCondition, MicroInstr, MicroOperand, RiscDesynthesizer, RiscOp};
+
+        fn rand_operand(rng: &mut Rng, max_reg: u8) -> MicroOperand {
+            if rng.below(3) == 0 {
+                MicroOperand::Imm64(rng.next())
+            } else {
+                MicroOperand::VReg(rng.below(max_reg as u64) as u8)
+            }
+        }
+
+        fn emit_random_op(rng: &mut Rng, d: &mut RiscDesynthesizer) {
+            let dst = MicroOperand::VReg(rng.below(8) as u8);
+            let a = rand_operand(rng, 8);
+            let b = rand_operand(rng, 8);
+            match rng.below(8) {
+                0 => d.emit_add(dst, a, b),
+                1 => d.emit_sub(dst, a, b),
+                2 => d.emit_xor(dst, a, b),
+                3 => {
+                    // count 0..63 — 0 을 자주 포함해 count==0 플래그 보존 검증.
+                    let cnt = if rng.below(4) == 0 {
+                        MicroOperand::Imm64(0)
+                    } else {
+                        MicroOperand::Imm64(rng.below(64))
+                    };
+                    let op = match rng.below(3) {
+                        0 => RiscOp::ShiftRight,
+                        1 => RiscOp::ShiftLeft,
+                        _ => RiscOp::ArithmeticShiftRight,
+                    };
+                    d.instrs
+                        .push(MicroInstr::new(op).with_dst(dst).with_src1(a).with_src2(cnt));
+                }
+                4 => d.emit_and(dst, a, b),
+                5 => d.emit_or(dst, a, b),
+                6 => {
+                    let addr = MicroOperand::VReg(rng.below(4) as u8);
+                    d.instrs
+                        .push(MicroInstr::new(RiscOp::MemoryWrite { width: 8 }).with_src1(addr).with_src2(a));
+                }
+                _ => {
+                    let addr = MicroOperand::VReg(rng.below(4) as u8);
+                    d.instrs
+                        .push(MicroInstr::new(RiscOp::MemoryRead { width: 8 }).with_dst(dst).with_src1(addr));
+                }
+            }
+        }
+
+        fn gen_random_prog(rng: &mut Rng) -> RiscProgram {
+            let mut d = RiscDesynthesizer::new();
+            let chunks = 2 + rng.below(4); // 2..5 청크
+            for _ in 0..chunks {
+                if rng.below(2) == 0 {
+                    // 유계 루프 (backward 분기): 반복 종료가 보장되어 퍼즈가 안전.
+                    // 카운터는 바디가 절대 쓰지 않는 VReg(15) 사용 (바디는 0..8만 접근).
+                    let iters = 1 + rng.below(4);
+                    d.emit_add(MicroOperand::VReg(15), MicroOperand::Imm64(iters), MicroOperand::Imm64(0));
+                    let head = d.instrs.len();
+                    let body = 2 + rng.below(4);
+                    for _ in 0..body {
+                        emit_random_op(rng, &mut d);
+                    }
+                    d.emit_sub(MicroOperand::VReg(15), MicroOperand::VReg(15), MicroOperand::Imm64(1));
+                    d.instrs.push(
+                        MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::NotZero })
+                            .with_imm(head as u64),
+                    );
+                } else {
+                    let body = 2 + rng.below(4);
+                    for _ in 0..body {
+                        emit_random_op(rng, &mut d);
+                    }
+                }
+            }
+            d.instrs.push(MicroInstr::new(RiscOp::Halt));
+            RiscProgram::new(d.instrs)
+        }
+
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        for seed in DIFF_SEEDS {
+            for case in 0..80usize {
+                let prog = gen_random_prog(&mut rng);
+                let ref_st = prog.eval_state(&[0u64; 16]);
+                let mut enc = PolymorphicEncoder::new(seed);
+                let bytecode = enc.encode(&prog).unwrap();
+                // 인코더/디코더 라운드트립도 동시에 검증 (문제 소스 분리용).
+                let mut dec = super::super::decoder::PolymorphicDecoder::new(seed);
+                let decoded = dec.decode(&bytecode).unwrap();
+                assert_eq!(
+                    decoded.instrs.len(),
+                    prog.instrs.len(),
+                    "seed={seed:#X} case={case}: decoder lost instructions"
+                );
+                for (a, b) in decoded.instrs.iter().zip(prog.instrs.iter()) {
+                    assert_eq!(
+                        (a.op, a.dst, a.src1, a.src2, a.imm),
+                        (b.op, b.dst, b.src1, b.src2, b.imm),
+                        "seed={seed:#X} case={case}: decode round-trip mismatch"
+                    );
+                }
+                let mut interp = PolymorphicInterpreter::new(seed);
+                interp
+                    .run(&bytecode)
+                    .unwrap_or_else(|e| panic!("seed={seed:#X} case={case}: poly run failed: {e:?}"));
+                let mut ok = true;
+                let mut where_fail = String::new();
+                if interp.regs != ref_st.regs {
+                    ok = false;
+                    where_fail.push_str(&format!("regs:\n  interp={:#X?}\n  ref={:#X?}\n", interp.regs, ref_st.regs));
+                }
+                if interp.temps != ref_st.temps {
+                    ok = false;
+                    where_fail.push_str(&format!("temps: {:#X?} vs {:#X?}\n", interp.temps, ref_st.temps));
+                }
+                if interp.flags.raw != ref_st.flags {
+                    ok = false;
+                    where_fail.push_str(&format!("flags: {:#X} vs {:#X}\n", interp.flags.raw, ref_st.flags));
+                }
+                if interp.vsp != ref_st.vsp {
+                    ok = false;
+                    where_fail.push_str(&format!("vsp: {:#X} vs {:#X}\n", interp.vsp, ref_st.vsp));
+                }
+                if interp.stack != ref_st.stack {
+                    ok = false;
+                    where_fail.push_str(&format!("stack: {:#X?} vs {:#X?}\n", interp.stack, ref_st.stack));
+                }
+                if interp.mem != ref_st.mem {
+                    ok = false;
+                    where_fail.push_str(&format!("mem:\n  interp={:#X?}\n  ref={:#X?}\n", interp.mem, ref_st.mem));
+                }
+                assert!(
+                    ok,
+                    "seed={seed:#X} case={case}: poly != reference\n{where_fail}prog:\n{}",
+                    format_prog(&prog)
+                );
+            }
         }
     }
 }

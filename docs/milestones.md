@@ -133,11 +133,29 @@
 
 ### 회귀 — 3경로 최종 신선 실행 (2026-08-15, 최종 상태)
 - [x] `cargo build --release` green (exit 0) · `cargo test --release --lib`
-      → **225 passed; 0 failed**.
+      → **236 passed; 0 failed** (VirtualBranch/Setcc/CMOV/div 검증 완료 포함).
 - [x] `--vm` pack→run → **16개 테스트 전체 통과** + FINAL CHECKSUM
       `0x2cdc0e4511d84a64` (baseline 동일).
 - [x] `--vm --vm-oep` pack→run → **16개 테스트 전체 통과** + FINAL CHECKSUM
       `0x2cdc0e4511d84a64`, cdb clean exit (0xC0000005 없음), TLS 콜백 진입 확인.
-- [ ] `--vm --vm-oep --vm-commercial` — **pre-existing 0xC0000005** (P3 상용 엔진의
-      generic-10-handler 디스패치가 operand 디코딩/롤링키 해제를 구현하지 않은
-      통합 미완성 — baseline HEAD와 동일, P4/P5 범위 외).
+- [x] `--vm --vm-oep --vm-commercial` → **pack exit 0** + **run green**: self-decoding
+      디스패처에 **네이티브 콜 브리지**(레거시 `OP_NATIVE_CALL`급 — not-found 타깃에서
+      ret_ip pop → GPR 실장 → Win64 콜 → 동기화 → ret_ip 재개) + 상용 리프트 **OEP
+      entry-jump** 추가로 0xC0000005 해소. **16개 테스트 전체 통과 + FINAL CHECKSUM
+      `0x2cdc0e4511d84a64`** (= baseline, 3회 반복 안정). (기록:
+      `docs/P3-handlers-wired-and-verified.md` §5, `docs/VirtualBranch-Native-Handler-DONE.md`.)
+
+### P3 — 상용 self-decoding 핸들러 전수 구현·와이어·검증 ✅ (2026-08-15)
+- [x] VirtualBranch (taken/not-taken, ip_map 분기 해석, rolling-key 재동기화) — 차등 2개 green.
+- [x] Setcc / ConditionalMove (22 조건, CounterZero 포함) — 차등 green.
+- [x] Multiply / MultiplyLow / Divide (signed×width, 오버플로 CF/OF) — 차등 green.
+- [x] BSwap / BitScanForward/Reverse / TZCNT / LZCNT / PopCount — 차등 green.
+- [x] CompareExchange {1,2,4,8} — 차등 green.
+- [x] NativeCallBridge no-op (스트림 소비, 상태 불변) — 차등 green.
+- [x] DEC_COND 상태 슬롯 + cond 바이트 디코딩 (`sub_dec_ops_cond`, OFF_COND_CODES) — green.
+- [x] 와이어: 256-entry 핸들러 테이블 + operand-offset/kind + cond-code + branch_map 배선,
+      `build_program_vm_commercial` 테이블 0xB00 + branch_map, `place.rs` ip_map 전달.
+- [x] **네이티브 콜 브리지** (h_branch not-found 경로 → 레거시 OP_NATIVE_CALL급) + 상용
+      리프트 **OEP entry-jump** — `--vm-commercial` whole-program run 16-test + checksum
+      `0x2cdc0e4511d84a64` green (0xC0000005 해소).
+- [x] `cargo test --release --lib` → **236 passed; 0 failed**; `--vm`/`--vm-oep` 16-test + checksum 무회귀.

@@ -27,7 +27,12 @@ use anyhow::Result;
 // 0x5000을 초과해 "Boot area layout overlap"이 났다. crypto.rs는 섹션을
 // 실제 boot_end로 잘라내므로(truncate) reserve는 임시 할당 상한일 뿐, 최종
 // 파일 크기는 늘지 않는다.
-pub const BOOT_AREA_RESERVE: usize = 0x80000;  // v59: 0x40000→0x80000 — VM 커버리지 확대로
+pub const BOOT_AREA_RESERVE: usize = 0x4000000; // v61: 0x120000→0x4000000 (64 MiB) — 대형 commercial 타깃
+                                                  // (SNK-RAT hello.exe: 프로그램 VM 바이트코드 11.6MB + branch_map
+                                                  //  ~1.16M ip_map 엔트리 x 16B ≈ 18MB) 에서 "Boot area layout
+                                                  //  overlap" (runs_off≈0x1B57AC8≈28MB) 가 났다. crypto.rs 는
+                                                  //  섹션을 실제 boot_end 로 잘라내므로 reserve 는 임시 할당
+                                                  //  상한일 뿐, 최종 파일 크기는 늘지 않는다.
     //          program-VM bytecode가 ~310KB (200KB 타깃 기준, 이전 ~177KB)까지 커진다.
     //          crypto.rs truncates the section to actual boot_end, so final file size
     //          is unaffected.

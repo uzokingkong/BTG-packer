@@ -10,7 +10,11 @@ pub const VFLAG_PF: u64 = 1 << 2;
 pub const VFLAG_AF: u64 = 1 << 4;
 pub const VFLAG_ZF: u64 = 1 << 6;
 pub const VFLAG_SF: u64 = 1 << 7;
+pub const VFLAG_DF: u64 = 1 << 10; // direction (string ops; not a status flag)
 pub const VFLAG_OF: u64 = 1 << 11;
+
+/// Status flags mask (arithmetic never touches DF — bit 10).
+pub const VFLAG_STATUS_MASK: u64 = VFLAG_CF | VFLAG_PF | VFLAG_AF | VFLAG_ZF | VFLAG_SF | VFLAG_OF;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VirtualFlags {

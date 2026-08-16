@@ -95,12 +95,36 @@ impl RiscDesynthesizer {
         );
     }
 
+    /// 즉시값 피연산자를 임시 레지스터로 옮긴다.
+    ///
+    /// 폴리 인코딩 계약상 `AddWithCarry`의 cin(imm) 필드는 **양쪽 피연산자가
+    /// 즉시값이 아닐 때만** 스트림에 실린다 (encoder.rs / poly_direct native 런타임이
+    /// 동일 규칙). 따라서 `src1=Imm64` + `cin=1` 조합이 생기면 poly/native 런타임이
+    /// cin 을 0 으로 잘못 읽어 결과가 1 만큼 틀어진다 (랜덤 차등 퍼즈로 발견).
+    /// 즉시값 src1 을 임시 레지스터로 옮겨 계약을 지킨다.
+    fn imm_to_temp(&mut self, op: MicroOperand, temp: MicroOperand) -> MicroOperand {
+        if let MicroOperand::Imm64(_) = op {
+            // temp = op + 0 (cin=0 — 즉시 피연산자 조합이라 cin 필드가 없어도 무손실)
+            self.instrs.push(
+                MicroInstr::new(RiscOp::AddWithCarry)
+                    .with_dst(temp)
+                    .with_src1(op)
+                    .with_src2(MicroOperand::Imm64(0))
+                    .with_imm(0),
+            );
+            temp
+        } else {
+            op
+        }
+    }
+
     /// SUB(a, b) -> a + NOT(b) + 1
     /// 1. T0 = NOT(b) -> NOR(b, b)
-    /// 2. dst = AddWithCarry(a, T0, cin=1)
+    /// 2. dst = AddWithCarry(a, T0, cin=1)  (a 가 즉시값이면 T1 로 옮김 — cin 보존)
     pub fn emit_sub(&mut self, dst: MicroOperand, a: MicroOperand, b: MicroOperand) {
         let t0 = MicroOperand::Temp(0);
         self.emit_not(t0, b);
+        let a = self.imm_to_temp(a, MicroOperand::Temp(1));
         self.instrs.push(
             MicroInstr::new(RiscOp::AddWithCarry)
                 .with_dst(dst)
@@ -122,13 +146,15 @@ impl RiscDesynthesizer {
     }
 
     /// NEG(a) -> NOT(a) + 1
+    /// (0 은 즉시 피연산자라 cin 필드 유실을 피하기 위해 T1 로 옮긴다 — 위 SUB 와 동일.)
     pub fn emit_neg(&mut self, dst: MicroOperand, a: MicroOperand) {
         let t0 = MicroOperand::Temp(0);
         self.emit_not(t0, a);
+        let z = self.imm_to_temp(MicroOperand::Imm64(0), MicroOperand::Temp(1));
         self.instrs.push(
             MicroInstr::new(RiscOp::AddWithCarry)
                 .with_dst(dst)
-                .with_src1(MicroOperand::Imm64(0))
+                .with_src1(z)
                 .with_src2(t0)
                 .with_imm(1),
         );

@@ -86,19 +86,23 @@ impl MbaPolynomial {
     /// 랜덤 상쇄족/XOR-분할을 새로 뽑아 만들어 정적 시그니처가 빌드마다 다르고,
     /// 개별 variant는 릴리스에서도 등가성 검증된다. 동일한 value에 대해 매번
     /// 같은 코드가 나오는 단일 다항식 생성과 달리, 폴리모픽 변이를 제공한다.
-    pub fn generate_polymorphic(value: u32, complexity: usize, n_variants: usize) -> Vec<MbaPolynomial> {
+    pub fn generate_polymorphic(
+        value: u32,
+        complexity: usize,
+        n_variants: usize,
+    ) -> crate::error::Result<Vec<MbaPolynomial>> {
         let mut out = Vec::with_capacity(n_variants);
         let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         let mut guard = 0;
         while out.len() < n_variants && guard < n_variants * 8 {
             guard += 1;
             let p = Self::generate(value, complexity);
-            let code = p.to_x86_64_code();
+            let code = p.to_x86_64_code()?; // 코드생성 실패는 오류로 전파 (조용한 폴백 금지)
             if seen.insert(code) {
                 out.push(p);
             }
         }
-        out
+        Ok(out)
     }
 
     /// Level 1 (Basic): 값 상수 + 상쇄족 1개

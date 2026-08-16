@@ -12,13 +12,18 @@ use crate::pe::TargetPeInfo;
 use crate::pipeline::PipelineContext;
 use crate::pipeline::{pass1_slice, pass2_shuffle, pass3_encode, pass4_section, patch_data, build, crypto};
 use anyhow::Result;
+use std::path::Path;
 
 /// Run the full protection pipeline over an input PE and return the protected
 /// PE bytes. `obf_level` is 1..3 (default 3); `crypto_coverage` is 0..100.
+/// `output_path`가 `Some`이면 결과를 그 경로에 기록하고, `None`이면 바이트만
+/// 반환한다 (리뷰 지적 #29: 라이브러리 API가 호출자 cwd에 부수 파일을 만들지
+/// 않도록 — 파일 기록은 호출자가 명시적으로 요청할 때만).
 pub fn run_full(
     input_pe: &[u8],
     obf_level: u32,
     crypto_coverage: u32,
+    output_path: Option<&Path>,
 ) -> Result<Vec<u8>> {
     let info = TargetPeInfo::parse(input_pe)?;
 
@@ -51,8 +56,8 @@ pub fn run_full(
 
     crypto::run(&mut ctx, true, false, false, crypto_coverage, true, false, false, false)?;
 
-    // build::run writes to a path; emit into a temp buffer in the caller's cwd.
-    let out_path = std::path::PathBuf::from("protected_btg_lib.exe");
-    let bytes = build::run(&ctx, &out_path)?;
+    // build::run writes to the given path; pass the caller's optional path.
+    // None → build in-memory only (no side-effect file in the caller's cwd).
+    let bytes = build::run(&ctx, output_path)?;
     Ok(bytes)
 }

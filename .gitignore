@@ -37,5 +37,24 @@ pack_novm_log.txt
 Thumbs.db
 .DS_Store
 
+# Dev-only scratch / debug artifacts (not source)
+*.exe
+*.log
+*.ps1
+*.cdb.txt
+.cdb_nat.txt
+_head_*.rs
+_bld_head.rs
+_baseline_pack.exe
+nowaction.txt
+plan.txt
+w_fix.txt
+dbg_err.txt
+dbg_out.txt
+ntt*.txt
+read.txt
+읽어.txt
+test_analysis.exe
+
 # Local test scratch dir
 /test/target

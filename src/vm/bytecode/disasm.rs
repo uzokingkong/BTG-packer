@@ -105,6 +105,8 @@ pub fn disassemble(code: &[u8]) -> String {
                 line += &format!("{} {:+} (-> {:04X})", name, rel, (ip as i64 + rel as i64) as usize);
             }
             OP_HALT => line += "halt",
+            OP_CLD => line += "cld",
+            OP_STD => line += "std",
             // ── M2 disassembly ──────────────────────────────────────────────
             OP_MOV_R_R64 => {
                 line += &format!("mov r64 v{}, v{}", code[ip], code[ip + 1]);

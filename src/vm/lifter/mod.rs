@@ -196,7 +196,7 @@ pub fn lift_ksa(seq: &[KsaInstr]) -> Result<Vec<u8>> {
     }
 
     b.halt();
-    Ok(b.finish())
+    Ok(b.try_finish()?)
 }
 
 /// Both operands must be registers; returns (dst vreg, src vreg).
@@ -346,7 +346,7 @@ pub fn lift_one(
             }
             }
         }
-        Movzx_r32_rm8 | Movzx_r32_rm16 | Movzx_r64_rm8 | Movzx_r64_rm16 | Movsx_r64_rm8 | Movsx_r64_rm16 | Movsx_r32_rm8 | Movsx_r32_rm16 => {
+        Movzx_r32_rm8 | Movzx_r32_rm16 | Movzx_r64_rm8 | Movzx_r64_rm16 => {
             let d = vreg(inst.op0_register())?;
             if inst.op1_kind() == OpKind::Register {
                 let s = vreg(inst.op1_register())?;
@@ -357,11 +357,31 @@ pub fn lift_one(
                 let addr = mem_emit(b, inst, 1)?;
                 let load = match code {
                     Movzx_r32_rm8 | Movzx_r64_rm8 => OP_MOVZX_R_MEM8_A,
-                    Movzx_r32_rm16 | Movzx_r64_rm16 => OP_MOVZX_R_MEM16_A,
-                    Movsx_r64_rm8 | Movsx_r32_rm8 => OP_MOVSX_R_MEM8_A,
-                    _ => OP_MOVSX_R_MEM16_A,
+                    _ => OP_MOVZX_R_MEM16_A,
                 };
                 b.mem_load_a(load, d, addr);
+            }
+        }
+        Movsx_r64_rm8 | Movsx_r64_rm16 | Movsx_r32_rm8 | Movsx_r32_rm16 => {
+            let d = vreg(inst.op0_register())?;
+            let src_bits = if matches!(code, Movsx_r64_rm8 | Movsx_r32_rm8) { 8 } else { 16 };
+            let is32 = matches!(code, Movsx_r32_rm8 | Movsx_r32_rm16);
+            if inst.op1_kind() == OpKind::Register {
+                let s = vreg(inst.op1_register())?;
+                b.mov_r_r(d, s);
+            } else {
+                let addr = mem_emit(b, inst, 1)?;
+                let load = if src_bits == 8 { OP_MOVSX_R_MEM8_A } else { OP_MOVSX_R_MEM16_A };
+                b.mem_load_a(load, d, addr);
+            }
+            // Sign-extend the low `src_bits` to 64 via SHL+SAR (matches the RISC
+            // lifter's `(src << (64-w)) >> (64-w)`; the memory form already
+            // sign-extends in interp/handlers, this is a no-op for it).
+            b.shift64_r_imm8(OP_SHL64_R_IMM8, d, 64 - src_bits);
+            b.shift64_r_imm8(OP_SAR64_R_IMM8, d, 64 - src_bits);
+            if is32 {
+                // x86: a 32-bit MOVSX result zero-extends into the 64-bit reg.
+                b.binop_r_imm32(OP_AND_R_IMM32, d, 0xFFFF_FFFF);
             }
         }
         Movsxd_r64_rm32 => {
@@ -433,6 +453,8 @@ pub fn lift_one(
         | Dec_rm32 | Dec_rm64 | Dec_rm8 | Dec_rm16 => lift_incdec(b, inst)?,
 
         Fninit => b.nop(),
+        Cld => b.cld(),
+        Std => b.std(),
         Xchg_rm64_r64 | Xchg_rm32_r32 | Xchg_r64_RAX | Xchg_r32_EAX
         | Xchg_rm8_r8 | Xchg_rm16_r16 => lift_xchg(b, inst)?,
         Imul_r32_rm32_imm8 | Imul_r32_rm32_imm32 | Imul_r64_rm64_imm8 | Imul_r64_rm64_imm32 => lift_imul_imm(b, inst)?,
@@ -633,9 +655,24 @@ fn reg_bits(r: Register) -> usize {
 }
 
 /// Map any GPR (or sub-register) to its vreg index = full GPR number.
+///
+/// The VM's register model stores each GPR as a single 64-bit vreg and
+/// zero-extends every 8/16/32-bit write into it. High-byte registers
+/// (AH/BH/CH/DH — bits 8..15 of the GPR) are NOT representable in that model:
+/// `vreg(AH)` would alias to the full GPR and be treated as the low byte,
+/// silently corrupting both the operand and the destination. Reject them
+/// explicitly at lift time instead of emitting wrong bytecode.
 pub fn vreg(r: Register) -> Result<u8> {
     if !r.is_gpr() {
         return Err(anyhow!("lifter: non-GPR register {:?}", r));
+    }
+    if matches!(r, Register::AH | Register::BH | Register::CH | Register::DH) {
+        return Err(anyhow!(
+            "lifter: high-byte register {:?} not representable in the 64-bit vreg model \
+             (8/16-bit operands are stored zero-extended into the full GPR vreg; \
+             AH/BH/CH/DH would alias the low byte)",
+            r
+        ));
     }
     Ok(r.full_register().number() as u8)
 }
@@ -663,6 +700,34 @@ mod tests {
         assert!(lift_one(&mut b, &inst).is_ok());
         let bc = b.finish();
         assert!(!bc.is_empty());
+    }
+
+    /// v65: MOVSX register-register form must SIGN-extend (a plain `mov` + AND
+    /// mask would zero-extend). 0x80 -> 0xFFFFFFFFFFFFFF80.
+    #[test]
+    fn test_lift_movsx_reg_reg_sign_extends() {
+        use crate::vm::bytecode::disassemble;
+        // movsx rax, al
+        let inst = Instruction::with2(Code::Movsx_r64_rm8, Register::RAX, Register::AL).unwrap();
+        let mut b = BytecodeBuilder::new();
+        assert!(lift_one(&mut b, &inst).is_ok());
+        let bc = b.finish();
+        let dis = disassemble(&bc);
+        // Must contain a 64-bit arithmetic shift right (SAR64), i.e. the value is
+        // sign-extended, not AND-masked.
+        assert!(dis.contains("sar64") || dis.contains("sar"), "movsx reg-reg must sign-extend; disasm:\n{dis}");
+    }
+
+    /// v65: AH/BH/CH/DH cannot be represented in the 64-bit vreg model — the
+    /// lifter must reject them explicitly instead of silently aliasing the low byte.
+    #[test]
+    fn test_lift_rejects_high_byte_register() {
+        let inst = Instruction::with2(Code::Mov_r8_rm8, Register::AH, Register::AL).unwrap();
+        let mut b = BytecodeBuilder::new();
+        assert!(
+            lift_one(&mut b, &inst).is_err(),
+            "AH must be rejected at lift time (not representable in the vreg model)"
+        );
     }
 }
 

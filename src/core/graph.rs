@@ -33,11 +33,17 @@ impl BidirectionalGraph {
             .entry(from)
             .or_default()
             .push((to, edge_type, cost));
-        
+
         self.backward_edges
             .entry(to)
             .or_default()
             .push((from, edge_type, cost));
+
+        // 리뷰 지적 #14: 그래프가 변했으므로 경로 캐시를 무효화한다. 캐시가
+        // 남아 있으면 이전 쿼리 결과(예: `A→C` 미도달)가 새 엣지 추가 후에도
+        // stale 하게 남아 잘못된 `can_reach_*` 를 반환한다.
+        self.forward_paths.clear();
+        self.backward_paths.clear();
     }
 
     pub fn can_reach_forward(&mut self, from: u32, to: u32) -> Result<bool> {
@@ -213,6 +219,29 @@ mod tests {
         assert!(graph.can_reach_forward(1, 4)?);
         assert!(graph.can_reach_backward(4, 1)?);
         assert!(graph.validate_bidirectionality().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_edge_invalidates_path_cache() -> Result<()> {
+        // 리뷰 지적 #14 회귀: A→C 쿼리가 "미도달"로 캐시된 뒤 엣지를 추가하면
+        // 캐시가 무효화돼 새 경로를 반영해야 한다.
+        let mut graph = BidirectionalGraph::new();
+        graph.add_edge(1, 2, EdgeType::Unconditional, 1);
+        assert!(!graph.can_reach_forward(1, 3)?, "1→3 must be unreachable initially");
+
+        // 엣지 추가 (2 → 3). 캐시가 지워지지 않으면 1→3 이 여전히 false 로 남는다.
+        graph.add_edge(2, 3, EdgeType::Unconditional, 1);
+        assert!(graph.can_reach_forward(1, 3)?, "1→3 must be reachable after adding 2→3");
+
+        // backward 방향도 마찬가지.
+        assert!(graph.can_reach_backward(3, 1)?, "3→1 backward must also reflect the new edge");
+
+        // 엣지 추가 후 이전에 캐시된 경로가 있는지 재확인 (무효화 확인).
+        let cached_before = graph.forward_paths.contains_key(&(1, 2));
+        graph.add_edge(3, 4, EdgeType::Unconditional, 1);
+        assert!(graph.can_reach_forward(1, 4)?, "1→4 via the new edge");
+        let _ = cached_before;
         Ok(())
     }
 }

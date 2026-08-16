@@ -2,10 +2,10 @@
 // BTG v24 - x86-64 → VM Bytecode Lifter: string ops
 // ==============================================================================
 // MOVS / STOS / LODS / SCAS / CMPS, all widths (byte/word/dword/qword), with and
-// without the REP prefix. REP forms are lowered to explicit VM loops (DF assumed
-// clear/forward). STOS/MOVS/LODS use a plain count-down loop; SCAS/CMPS honour
-// the REPE/REPNE stop condition (ZF). The accumulator for STOS/LODS/SCAS is
-// vreg0 (RAX/EAX/AX/AL). Shared infra (`SCRATCH`, `SCRATCH2`) lives in `super`.
+// without the REP prefix. REP forms are lowered to explicit VM loops. STOS/MOVS/
+// LODS use a plain count-down loop; SCAS/CMPS honour the REPE/REPNE stop
+// condition (ZF). The accumulator for STOS/LODS/SCAS is vreg0 (RAX/EAX/AX/AL).
+// Shared infra (`SCRATCH`, `SCRATCH2`) lives in `super`.
 //
 // x86-exactness notes (v52 fix):
 //   * The compare direction is the real one: SCAS is `accumulator - [RDI]`,
@@ -19,6 +19,14 @@
 //   * Non-REP pointer bumps use LEA so the single-op forms do not clobber the
 //     compare's flags (x86 string primitives without REP leave rflags alone
 //     except for the compare itself).
+//
+// v65 — Direction Flag (DF): string ops bump the pointer by +n when DF=0 and
+// by -n when DF=1. DF lives in STATE_FLAGS bit 10 (F_DF), changed only by the
+// lifted CLD/STD bytecodes. Because DF is loop-invariant, the bump direction is
+// selected ONCE per string op: `emit_dir_delta` computes a signed delta (±n)
+// into a scratch vreg from the DF bit, and every pointer bump becomes an LEA by
+// that register (LEA stays flag-neutral, so the SCAS/CMPS compare flags and the
+// non-REP preserved rflags are unaffected).
 // ==============================================================================
 
 use super::{SCRATCH, SCRATCH2};
@@ -29,6 +37,24 @@ use iced_x86::Instruction;
 /// Extra lifter temporaries (vregs 18/19; 16/17 are SCRATCH/SCRATCH2).
 const TMP3: u8 = 18;
 const TMP4: u8 = 19;
+
+/// Emit code to compute a signed element delta into `delta`:
+///   delta = +n  (DF clear — forward)   |   delta = -n  (DF set — backward)
+/// `flags_tmp` is a scratch vreg clobbered by the DF test. STATE_FLAGS is
+/// clobbered by the test (callers that must preserve flags save/restore around
+/// this; SCAS/CMPS re-set STATE_FLAGS with the compare afterwards).
+fn emit_dir_delta(b: &mut BytecodeBuilder, flags_tmp: u8, delta: u8, n: u64) {
+    let fwd = b.new_label();
+    let done = b.new_label();
+    b.get_flags(flags_tmp);
+    b.test_r_imm32(flags_tmp, F_DF as u32); // ZF = (DF == 0)
+    b.jcc8(COND_JE, fwd);                    // DF clear → forward (+n)
+    b.mov_r_imm64(delta, (-(n as i64)) as u64); // DF set → backward (-n)
+    b.jmp8(done);
+    b.mark_label(fwd);
+    b.mov_r_imm64(delta, n as u64);
+    b.mark_label(done);
+}
 
 /// (load, store, width) triple for a given element width in bytes.
 fn width_ops(n: u64) -> (u8, u8, u32) {
@@ -51,60 +77,81 @@ fn has_any_rep(inst: &Instruction) -> bool {
     inst.has_rep_prefix() || inst.has_repne_prefix()
 }
 
-/// STOS: [rdi] = AL/AX/EAX/RAX (vreg0); rdi += n. REP → count-down loop.
+/// STOS: [rdi] = AL/AX/EAX/RAX (vreg0); rdi += DF ? -n : n. REP → count-down loop.
 /// The single-op form bumps rdi via LEA so the caller's flags stay untouched
-/// (plain STOS writes no rflags).
+/// (plain STOS writes no rflags). REP STOS likewise writes no rflags — the loop
+/// control (TEST/DEC) would clobber them, so we save/restore STATE_FLAGS
+/// around the loop (v64; x86 `rep stosb` leaves RFLAGS unchanged).
+///
+/// v65: the bump direction honours DF. `emit_dir_delta` computes a signed
+/// element delta (±n) into TMP4 from STATE_FLAGS once, and every bump becomes
+/// `lea(rdi, rdi, TMP4, 0, 0)` (LEA is flag-neutral).
 pub(super) fn lift_stos(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     let n = stos_lods_width(inst.code());
     let (_, store, _) = width_ops(n);
     let rdi = 7u8; let rcx = 1u8;
-    let single = |b: &mut BytecodeBuilder| {
+    let single = |b: &mut BytecodeBuilder, delta: u8| {
         b.mem_store_a(store, rdi, 0);
-        b.lea(rdi, rdi, ADDR_NO_INDEX, 0, n as i32);
+        b.lea(rdi, rdi, delta, 0, 0);
     };
     if !has_any_rep(inst) {
-        single(b);
+        // Preserve the caller's flags: the delta computation clobbers STATE_FLAGS.
+        b.get_flags(TMP3);
+        emit_dir_delta(b, SCRATCH2, TMP4, n);
+        b.set_flags(TMP3);
+        single(b, TMP4);
         return Ok(());
     }
     let loop_lbl = b.new_label();
     let done = b.new_label();
+    b.get_flags(TMP3); // REP string ops는 RFLAGS를 변경하지 않는다 — 진입 시 저장
+    emit_dir_delta(b, SCRATCH2, TMP4, n);
     b.mark_label(loop_lbl);
     b.test_r_r32(rcx, rcx);
     b.jcc8(COND_JE, done);
-    single(b);
+    single(b, TMP4);
     b.dec_r(rcx);
     b.jmp8(loop_lbl);
     b.mark_label(done);
+    b.set_flags(TMP3);
     Ok(())
 }
 
-/// LODS: AL/AX/EAX/RAX (vreg0) = [rsi]; rsi += n. REP → count-down loop.
+/// LODS: AL/AX/EAX/RAX (vreg0) = [rsi]; rsi += DF ? -n : n. REP → count-down loop.
 /// Note: x86 LODSB only writes AL; we zero-extend into vreg0 for simplicity.
+/// REP LODS leaves RFLAGS unchanged — saved/restored around the loop (v64).
 pub(super) fn lift_lods(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     let n = stos_lods_width(inst.code());
     let (load, _, _) = width_ops(n);
     let rsi = 6u8; let rcx = 1u8;
-    let single = |b: &mut BytecodeBuilder| {
+    let single = |b: &mut BytecodeBuilder, delta: u8| {
         b.mem_load_a(load, 0, rsi);
-        b.lea(rsi, rsi, ADDR_NO_INDEX, 0, n as i32);
+        b.lea(rsi, rsi, delta, 0, 0);
     };
     if !has_any_rep(inst) {
-        single(b);
+        b.get_flags(TMP3);
+        emit_dir_delta(b, SCRATCH2, TMP4, n);
+        b.set_flags(TMP3);
+        single(b, TMP4);
         return Ok(());
     }
     let loop_lbl = b.new_label();
     let done = b.new_label();
+    b.get_flags(TMP3); // REP string ops는 RFLAGS를 변경하지 않는다 — 진입 시 저장
+    emit_dir_delta(b, SCRATCH2, TMP4, n);
     b.mark_label(loop_lbl);
     b.test_r_r32(rcx, rcx);
     b.jcc8(COND_JE, done);
-    single(b);
+    single(b, TMP4);
     b.dec_r(rcx);
     b.jmp8(loop_lbl);
     b.mark_label(done);
+    b.set_flags(TMP3);
     Ok(())
 }
 
-/// MOVS: [rdi] = [rsi]; rsi += n; rdi += n. REP → count-down loop.
+/// MOVS: [rdi] = [rsi]; rsi += ±n; rdi += ±n. REP → count-down loop.
+/// REP MOVS leaves RFLAGS unchanged — saved/restored around the loop (v64).
 pub(super) fn lift_movs(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     use iced_x86::Code::*;
     let n = match inst.code() {
@@ -115,25 +162,31 @@ pub(super) fn lift_movs(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
     };
     let (load, store, _) = width_ops(n);
     let rsi = 6u8; let rdi = 7u8; let rcx = 1u8;
-    let single = |b: &mut BytecodeBuilder| {
+    let single = |b: &mut BytecodeBuilder, delta: u8| {
         b.mem_load_a(load, SCRATCH, rsi);
         b.mem_store_a(store, rdi, SCRATCH);
-        b.lea(rsi, rsi, ADDR_NO_INDEX, 0, n as i32);
-        b.lea(rdi, rdi, ADDR_NO_INDEX, 0, n as i32);
+        b.lea(rsi, rsi, delta, 0, 0);
+        b.lea(rdi, rdi, delta, 0, 0);
     };
     if !has_any_rep(inst) {
-        single(b);
+        b.get_flags(TMP3);
+        emit_dir_delta(b, SCRATCH2, TMP4, n);
+        b.set_flags(TMP3);
+        single(b, TMP4);
         return Ok(());
     }
     let loop_lbl = b.new_label();
     let done = b.new_label();
+    b.get_flags(TMP3); // REP string ops는 RFLAGS를 변경하지 않는다 — 진입 시 저장
+    emit_dir_delta(b, SCRATCH2, TMP4, n);
     b.mark_label(loop_lbl);
     b.test_r_r32(rcx, rcx);
     b.jcc8(COND_JE, done);
-    single(b);
+    single(b, TMP4);
     b.dec_r(rcx);
     b.jmp8(loop_lbl);
     b.mark_label(done);
+    b.set_flags(TMP3);
     Ok(())
 }
 
@@ -175,55 +228,100 @@ fn rep_cmp_operands(b: &mut BytecodeBuilder, n: u64, is_cmps: bool) {
     cmp_sub(b, n, SCRATCH, TMP4);
 }
 
-/// SCAS: flags = AL/AX/EAX/RAX - [rdi]; rdi += n. REPE/REPNE honour ZF stop.
+/// SCAS: flags = AL/AX/EAX/RAX - [rdi]; rdi += DF ? -n : n. REPE/REPNE honour
+/// ZF stop. v64: REPE/REPNE SCAS 의 종료 플래그는 항상 **마지막 비교**의 플래그이며,
+/// count==0 이면 아무 것도 하지 않고 RFLAGS 를 유지한다 (x86). 기존 코드는
+/// 루프 제어의 TEST/DEC 가 플래그를 덮어쓰고, 0회·카운트 소진 경로에서 마지막
+/// 비교 플래그 대신 TEST 플래그를 남겼다.
+///
+/// v65: the SCAS/CMPS loop bodies use all four scratch vregs (TMP3=lhs,
+/// TMP4=rhs, SCRATCH=cmp copy, SCRATCH2=setcc capture), so instead of a delta
+/// register the direction is baked into two loop variants selected ONCE at
+/// entry (DF is loop-invariant — only the lifted CLD/STD change it).
 pub(super) fn lift_scas(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     let n = scas_cmps_width(inst.code());
     let rdi = 7u8; let rcx = 1u8;
     if !has_any_rep(inst) {
+        // Direction via a delta vreg before the compare; the compare's flags are
+        // the instruction result and the LEA bump (by delta) does not clobber them.
+        emit_dir_delta(b, TMP4, SCRATCH2, n);
         rep_cmp_operands(b, n, false);
-        b.lea(rdi, rdi, ADDR_NO_INDEX, 0, n as i32); // LEA: no flag clobber
+        b.lea(rdi, rdi, SCRATCH2, 0, 0); // LEA: no flag clobber
         return Ok(());
     }
     let exit_cond = rep_exit_cond(inst); // REP SCAS/CMPS is always REPE/REPNE
-    let loop_lbl = b.new_label();
+    let fwd_loop = b.new_label();
+    let bwd_loop = b.new_label();
     let done = b.new_label();
     let fix_flags = b.new_label();
-    b.mark_label(loop_lbl);
+    let zero_exit = b.new_label();
+    // 0회 비교(진입 시 RCX==0) 경로에서만 복원할 진입 플래그를 TMP4 에 저장.
+    // (반복이 한 번이라도 시작되면 rep_cmp_operands 가 TMP4 를 rhs 로 덮어쓴다.)
+    b.get_flags(TMP4);
     b.test_r_r32(rcx, rcx);
-    b.jcc8(COND_JE, done);
+    b.jcc8(COND_JE, zero_exit);
+    // DF dispatch — test the saved entry flags (TMP4 still holds them here).
+    b.test_r_imm32(TMP4, F_DF as u32); // ZF = (DF == 0)
+    b.jcc8(COND_JNE, bwd_loop);        // DF set → backward
+    b.mark_label(fwd_loop);
     rep_cmp_operands(b, n, false);
     // Capture the ZF-stop decision BEFORE any flag-clobbering bookkeeping.
     b.setcc(SCRATCH2, exit_cond.unwrap_or(COND_JNE));
     b.lea(rdi, rdi, ADDR_NO_INDEX, 0, n as i32);
     b.lea(rcx, rcx, ADDR_NO_INDEX, 0, -1);
+    // stop 조건이면 → fix_flags; 아니면 카운트가 남았는지 재확인해 반복.
     b.test_r_r32(SCRATCH2, SCRATCH2);
     b.jcc8(COND_JNE, fix_flags);
-    b.jmp8(loop_lbl);
+    b.test_r_r32(rcx, rcx);
+    b.jcc8(COND_JNE, fwd_loop);
+    b.jmp8(fix_flags); // count exhausted
+    b.mark_label(bwd_loop);
+    rep_cmp_operands(b, n, false);
+    b.setcc(SCRATCH2, exit_cond.unwrap_or(COND_JNE));
+    b.lea(rdi, rdi, ADDR_NO_INDEX, 0, -(n as i32));
+    b.lea(rcx, rcx, ADDR_NO_INDEX, 0, -1);
+    b.test_r_r32(SCRATCH2, SCRATCH2);
+    b.jcc8(COND_JNE, fix_flags);
+    b.test_r_r32(rcx, rcx);
+    b.jcc8(COND_JNE, bwd_loop);
+    // 카운트 소진(마지막 비교 플래그 유지) → fix_flags 로 합류.
     // Restore the final compare's exact flags on exit (rep count consumed,
     // pointer advanced — the hardware result).
     b.mark_label(fix_flags);
     cmp_sub(b, n, TMP3, TMP4);
+    b.jmp8(done);
+    // 0회 비교 → 진입 시점 RFLAGS 복원.
+    b.mark_label(zero_exit);
+    b.set_flags(TMP4);
     b.mark_label(done);
     Ok(())
 }
 
-/// CMPS: flags = [rsi] - [rdi]; rsi += n; rdi += n. REPE/REPNE honour ZF stop.
+/// CMPS: flags = [rsi] - [rdi]; rsi += ±n; rdi += ±n. REPE/REPNE honour ZF stop.
+/// v64: 위 SCAS 와 동일한 종료 플래그/0-count 정합.
 pub(super) fn lift_cmps(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     let n = scas_cmps_width(inst.code());
     let rsi = 6u8; let rdi = 7u8; let rcx = 1u8;
     if !has_any_rep(inst) {
+        emit_dir_delta(b, TMP4, SCRATCH2, n);
         rep_cmp_operands(b, n, true);
-        b.lea(rsi, rsi, ADDR_NO_INDEX, 0, n as i32);
-        b.lea(rdi, rdi, ADDR_NO_INDEX, 0, n as i32);
+        b.lea(rsi, rsi, SCRATCH2, 0, 0);
+        b.lea(rdi, rdi, SCRATCH2, 0, 0);
         return Ok(());
     }
     let exit_cond = rep_exit_cond(inst);
-    let loop_lbl = b.new_label();
+    let fwd_loop = b.new_label();
+    let bwd_loop = b.new_label();
     let done = b.new_label();
     let fix_flags = b.new_label();
-    b.mark_label(loop_lbl);
+    let zero_exit = b.new_label();
+    // 0회 비교 경로에서만 복원할 진입 플래그를 TMP4 에 저장.
+    b.get_flags(TMP4);
     b.test_r_r32(rcx, rcx);
-    b.jcc8(COND_JE, done);
+    b.jcc8(COND_JE, zero_exit);
+    b.test_r_imm32(TMP4, F_DF as u32); // ZF = (DF == 0)
+    b.jcc8(COND_JNE, bwd_loop);        // DF set → backward
+    b.mark_label(fwd_loop);
     rep_cmp_operands(b, n, true);
     b.setcc(SCRATCH2, exit_cond.unwrap_or(COND_JNE));
     b.lea(rsi, rsi, ADDR_NO_INDEX, 0, n as i32);
@@ -231,9 +329,26 @@ pub(super) fn lift_cmps(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
     b.lea(rcx, rcx, ADDR_NO_INDEX, 0, -1);
     b.test_r_r32(SCRATCH2, SCRATCH2);
     b.jcc8(COND_JNE, fix_flags);
-    b.jmp8(loop_lbl);
+    b.test_r_r32(rcx, rcx);
+    b.jcc8(COND_JNE, fwd_loop);
+    b.jmp8(fix_flags);
+    b.mark_label(bwd_loop);
+    rep_cmp_operands(b, n, true);
+    b.setcc(SCRATCH2, exit_cond.unwrap_or(COND_JNE));
+    b.lea(rsi, rsi, ADDR_NO_INDEX, 0, -(n as i32));
+    b.lea(rdi, rdi, ADDR_NO_INDEX, 0, -(n as i32));
+    b.lea(rcx, rcx, ADDR_NO_INDEX, 0, -1);
+    b.test_r_r32(SCRATCH2, SCRATCH2);
+    b.jcc8(COND_JNE, fix_flags);
+    b.test_r_r32(rcx, rcx);
+    b.jcc8(COND_JNE, bwd_loop);
+    // 카운트 소진 → 마지막 비교 플래그.
     b.mark_label(fix_flags);
     cmp_sub(b, n, TMP3, TMP4);
+    b.jmp8(done);
+    // 0회 비교 → 진입 시점 RFLAGS 복원.
+    b.mark_label(zero_exit);
+    b.set_flags(TMP4);
     b.mark_label(done);
     Ok(())
 }
