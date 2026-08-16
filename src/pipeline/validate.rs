@@ -85,10 +85,12 @@ pub(crate) fn section_for_rva<'a>(sections: &'a [SectionInfo], rva: u32) -> Opti
     sections.iter().find(|s| s.contains_rva(rva))
 }
 
+mod pe;
 mod rsrc;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use pe::validate_pe_structure;
 pub(crate) use rsrc::{ResDataEntry, expected_chunks, validate_rsrc, walk_dir, walk_resource_tree};
 
 /// Post-build structural self-validation of the synthesized output PE.
@@ -122,6 +124,12 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
         }
     }
     println!("[VALIDATE] OK  all section raw ranges within file");
+
+    // 1b. P0-4: PE 구조적/로더 호환 전수 검증 (Notes #4)
+    //     DOS/NT/Optional 헤더, 정렬, 섹션 RVA/raw 경계·겹침, 16개 데이터
+    //     디렉터리 RVA/size, SizeOfImage, 보안 디렉터리 정책.
+    validate_pe_structure(out, &pe, ctx, &sections)?;
+    println!("[VALIDATE] OK  PE structural/loader-compat (headers, alignments, sections, 16 data dirs)");
 
     // 2. Entry point inside an executable section.
     let entry_rva = if (pe.entry as u64) >= pe.image_base as u64 {
