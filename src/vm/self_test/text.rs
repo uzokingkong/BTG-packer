@@ -277,7 +277,7 @@ pub(crate) fn run_m6_phase2_lift_test() -> Result<()> {
     assert_eq!(native_rax, want, "[23] native reference self-consistency (got {} want {})", native_rax, want);
 
     // 2) Whole-CFG lift via lift_program_cfg
-    let lift = lift_program_cfg(&native, base, base, &[], 0)?;
+    let lift = lift_program_cfg(&native, base, base, &[], 0, &[])?;
     assert!(!lift.bytecode.is_empty(), "[23] whole-CFG lift empty");
     assert!(lift.unsupported.is_empty(), "[23] unexpected unsupported {:?}", lift.unsupported);
     assert_eq!(lift.entry_va, base, "[23] entry block should be at base");
@@ -372,7 +372,7 @@ pub(crate) fn run_m6_phase2_native_program_test() -> Result<()> {
     assert_eq!(native_rax, want, "[26] native reference self-consistency (got {} want {})", native_rax, want);
 
     // 2) Lift the whole reachable CFG to a single VM program.
-    let lift = lift_program_cfg(&native, base, base, &[], 0)?;
+    let lift = lift_program_cfg(&native, base, base, &[], 0, &[])?;
     let bc = &lift.bytecode;
     assert!(!bc.is_empty(), "[26] whole-CFG lift empty");
     assert!(lift.unsupported.is_empty(), "[26] unexpected unsupported {:?}", lift.unsupported);

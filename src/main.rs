@@ -172,6 +172,7 @@ fn main() -> error::Result<()> {
             ep_va,
             &info.relayed_sections,
             info.image_base,
+            &input_pe_bytes,
         )?;
         println!("==================================================================");
         println!(" [M6 Phase-2] OEP→VM entry 전환 진단 (도달 CFG → 단일 VM 프로그램)");

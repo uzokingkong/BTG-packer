@@ -34,6 +34,8 @@ pub struct TargetPeInfo {
     pub relayed_sections: Vec<SectionData>,
     pub original_headers_bytes: Vec<u8>,
     pub original_pdata_entries: Vec<RuntimeFunction>,
+    /// 원본 입력 PE 바이트 전체 (import-name 기반 검출 — setjmp/longjmp 경계 등).
+    pub original_pe_bytes: Vec<u8>,
 }
 
 impl TargetPeInfo {
@@ -209,6 +211,7 @@ impl TargetPeInfo {
             relayed_sections,
             original_headers_bytes,
             original_pdata_entries,
+            original_pe_bytes: pe_bytes.to_vec(),
         })
     }
 }

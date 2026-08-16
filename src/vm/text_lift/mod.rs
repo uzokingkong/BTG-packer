@@ -33,7 +33,9 @@ pub mod switch;
 #[cfg(test)]
 mod tests;
 
-pub use exclusions::{detect_panic_unwind_ranges, detect_seh_native_functions};
+pub use exclusions::{
+    detect_panic_unwind_ranges, detect_seh_native_functions, detect_setjmp_longjmp_functions,
+};
 pub use tls_guard::{TlsCallbackExclusion, detect_tls_callback_ranges};
 pub use switch::resolve_switch_cases;
 pub use commercial::{ProgramLiftCommercial, lift_program_cfg_commercial};
@@ -254,6 +256,7 @@ pub fn lift_program_cfg(
     entry_point_va: u64,
     relayed_sections: &[crate::pe::builder::SectionData],
     image_base: u64,
+    pe_bytes: &[u8],
 ) -> Result<ProgramLift> {
     let (blocks, _g) = CfgExtractor::extract(
         text_bytes,
@@ -323,6 +326,16 @@ pub fn lift_program_cfg(
     let excl = detect_seh_native_functions(
         text_bytes, base_va, image_base, relayed_sections, entry_point_va,
     );
+    let mut excl = excl;
+    // setjmp/longjmp boundary: keep every non-local-jump user (and its call
+    // closure) native — a longjmp through virtualized code restores the host
+    // register file and diverges from the VM's virtual registers.
+    let sjlj = detect_setjmp_longjmp_functions(
+        pe_bytes, text_bytes, base_va, image_base, relayed_sections,
+    );
+    excl.func_ranges.extend(sjlj);
+    excl.func_ranges.sort_by_key(|r| r.0);
+    excl.func_ranges.dedup();
     let mut excluded_blocks: std::collections::HashSet<u64> = blocks
         .iter()
         .filter(|bb| {
