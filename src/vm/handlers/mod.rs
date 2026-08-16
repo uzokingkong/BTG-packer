@@ -90,11 +90,13 @@ pub(crate) enum Cl {
 ///   * Ksa     — RCX=state, RBX=sbox base, RDX=seed VA   (snapshot SBOX+SEED slots)
 ///   * Prga    — RCX=state, RBX=sbox base, RDX=buf, R8=len (snapshot SBOX+BUF, v3=len)
 ///   * Program — RCX=state (pre-populated by boot stub; no pointer slot clobber)
+///   * C1Init  — RCX=state, RDX=seed VA, R8=C1 상태 버퍼 VA (snapshot SEED+BUF slots)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryMode {
     Ksa,
     Prga,
     Program,
+    C1Init,
 }
 
 /// Result of VM code generation.
@@ -382,6 +384,18 @@ pub fn generate_vm_code(
             // v3 = R8 (buffer length); VREGS+3*8 = 0 + 24 = 24
             seq.push((
                 Instruction::with2(Code::Mov_rm64_r64, m(Register::RCX, 24), Register::R8).unwrap(),
+                None,
+            ));
+        }
+        EntryMode::C1Init => {
+            // v61 (--custom-cipher + --vm): C1 상태 초기화 — RDX=seed VA → MEM_SEED,
+            // R8=C1 상태 버퍼 VA → MEM_BUF. (C1 키 유도가 VM 안에서만 일어난다.)
+            seq.push((
+                Instruction::with2(Code::Mov_rm64_r64, m(Register::RCX, 0x118), Register::RDX).unwrap(),
+                None,
+            ));
+            seq.push((
+                Instruction::with2(Code::Mov_rm64_r64, m(Register::RCX, 0x120), Register::R8).unwrap(),
                 None,
             ));
         }

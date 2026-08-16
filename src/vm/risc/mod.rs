@@ -7,32 +7,32 @@ pub mod opt;
 use std::collections::HashMap;
 
 pub use desynth::RiscDesynthesizer;
-pub use flags::VFLAG_DF;
+pub use flags::{VFLAG_CF, VFLAG_DF};
 pub use flags::VirtualFlags;
 pub use lifter::RiscLifter;
 pub use opcodes::{BranchCondition, MicroInstr, MicroOperand, RiscOp};
 pub use opt::RiscOptimizer;
 
-/// RISC 가상 프로그램 컨테이너
+/// RISC ?띠럾????熬곣뫁夷?윜諛몄굡?????쳜??????
 #[derive(Debug, Clone)]
 pub struct RiscProgram {
     pub instrs: Vec<MicroInstr>,
-    /// 선택적 소스-IP → 인덱스 맵. `VirtualBranch`의 타깃(절대 x86 IP)을
-    /// `instrs` 벡터 내 시작 인덱스로 변환해 `eval_state`가 분기를 실행하게 한다.
-    /// `None`이면 `VirtualBranch.imm`을 직접 인덱스로 해석한다(선형 실행 보조).
+    /// ??ルㅎ臾?????裕?IP ???筌뤾퍓???嶺? `VirtualBranch`????濚???? x86 IP)??
+    /// `instrs` ?뺢껴?㎬땻?????戮곗굚 ?筌뤾퍓????댁Ŧ ?곌떠???臾먰돵 `eval_state`?띠럾? ?釉뚯뫅?깃퀋紐????덈뺄???우벟 ??類ｋ펲.
+    /// `None`?????`VirtualBranch.imm`??嶺뚯쉳????筌뤾퍓????댁Ŧ ??怨댄맍??類ｋ펲(??ル쪇援????덈뺄 ?곌랜???.
     ip_map: Option<HashMap<u64, usize>>,
 }
 
-/// `RiscProgram::eval_state` 실행 결과로 돌려받는 가상 머신 상태.
-/// 인터프리터(`PolymorphicInterpreter`)와의 **차등(differential) 검증**을 위한
-/// 직렬화 가능한 참조 상태 표현이다. T1-4 기준 계약:
+/// `RiscProgram::eval_state` ???덈뺄 ?롪퍒???앹뿉?????사뛾?녿즴???띠럾????誘⑹굣????⑤객臾?
+/// ?筌뤿굛??熬곣뱿遊??`PolymorphicInterpreter`)????**嶺뚢뼰維甕?differential) ?롪틵?嶺?*???熬곥굥由?
+/// 嶺뚯쉳?????띠럾??繞③뇡?嶺뚣볦굣????⑤객臾????ш껑????? T1-4 ?リ옇?? ??ｌ뫒??
 ///
-/// * `regs`  — 16개 가상 범용 레지스터
-/// * `temps` — 8개 스크래치 임시 레지스터
-/// * `flags` — 가상 RFLAGS (VFLAG_* 비트)
-/// * `vsp`   — 가상 스택 포인터 (아래로 성장, 바이트 단위 오프셋)
-/// * `stack` — 가상 스택 (index 0 = 최저 주소, 맨 끝 = 최고 주소/최근 push)
-/// * `mem`   — 가상 메모리 (주소 → 바이트, `MemoryRead`/`MemoryWrite` 대상)
+/// * `regs`  ??16???띠럾????뺢퀡?????????꾩댉
+/// * `temps` ??8?????꾩씩??瑜귣뭵 ?熬곣뫖六???????꾩댉
+/// * `flags` ???띠럾???RFLAGS (VFLAG_* ?????
+/// * `vsp`   ???띠럾??????꾨Ц ?????(?熬곣뫁?뗥슖??繹먮냱?? ?꾩룆??????關留????덈뒆??
+/// * `stack` ???띠럾??????꾨Ц (index 0 = 嶺뚣끉裕? ?낅슣??? 嶺???= 嶺뚣끉裕???낅슣???嶺뚣끉裕??push)
+/// * `mem`   ???띠럾???嶺뚮∥???꾨뎨?(?낅슣??????꾩룆???? `MemoryRead`/`MemoryWrite` ????
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RiscEvalState {
     pub regs: [u64; 16],
@@ -56,14 +56,14 @@ impl Default for RiscEvalState {
     }
 }
 
-/// 한 micro-instruction 실행의 제어 흐름 결과.
+/// ??micro-instruction ???덈뺄????戮?꽑 ??????롪퍒???
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExecResult {
-    /// 다음 명령으로 진행.
+    /// ???깅쾳 嶺뚮ㅏ援앲???怨쀬Ŧ 嶺뚯쉳?듸쭛?
     Next,
-    /// 분기 — vip 를 타깃 인덱스로 설정.
+    /// ?釉뚯뫅????vip ????濚??筌뤾퍓????댁Ŧ ???깆젧.
     Jump(usize),
-    /// Halt — 프로그램 종료.
+    /// Halt ???熬곣뫁夷?윜諛몄굡????リ턁筌?
     Halt,
 }
 
@@ -75,8 +75,8 @@ impl RiscProgram {
         }
     }
 
-    /// 리프터가 기록한 소스-IP → 인덱스 맵을 가진 프로그램을 만든다.
-    /// (분기 타깃을 실행 가능한 VIP 인덱스로 해석하기 위함.)
+    /// ?洹먮뿫???? ?リ옇?▽빳?????裕?IP ???筌뤾퍓???嶺뚮씭踰???띠럾?嶺??熬곣뫁夷?윜諛몄굡???嶺뚮씭??キ??
+    /// (?釉뚯뫅????濚밸Þ??????덈뺄 ?띠럾??繞③뇡?VIP ?筌뤾퍓????댁Ŧ ??怨댄맍???얄뵛 ?熬곥굥留?)
     pub fn with_ip_map(instrs: Vec<MicroInstr>, ip_map: HashMap<u64, usize>) -> Self {
         Self {
             instrs,
@@ -84,9 +84,9 @@ impl RiscProgram {
         }
     }
 
-/// ip_map(소스-IP → 프로그램 인덱스)을 통해 분기 타깃 절대 x86 IP를
-    /// 프로그램 인덱스로 해석한다. (ip_map이 없으면 imm을 그대로 인덱스로 사용 —
-    /// eval_state의 VirtualBranch와 동일한 해석)
+/// ip_map(???裕?IP ???熬곣뫁夷?윜諛몄굡???筌뤾퍓???????????釉뚯뫅????濚???? x86 IP??
+    /// ?熬곣뫁夷?윜諛몄굡???筌뤾퍓????댁Ŧ ??怨댄맍??類ｋ펲. (ip_map????怨몃さ嶺?imm???잙갭梨????筌뤾퍓????댁Ŧ ??????
+    /// eval_state??VirtualBranch?? ???됰뎄????怨댄맍)
     pub fn resolve_target(&self, imm: u64) -> usize {
         self.ip_map
             .as_ref()
@@ -95,16 +95,16 @@ impl RiscProgram {
             .unwrap_or(imm as usize)
     }
 
-    /// 분기 타깃 해석용 ip_map 접근자 (네이티브 하네스가 정적 분기 타깃을
-    /// 블록 인덱스로 베이크할 때 사용).
+    /// ?釉뚯뫅????濚???怨댄맍??ip_map ??얜∥???(???깅턄??⑤벤????濡ろ맟??? ?筌먦끉???釉뚯뫅????濚밸Þ???
+    /// ??곕?餓??筌뤾퍓????댁Ŧ ?뺢퀣伊???????????.
     pub fn ip_map(&self) -> Option<&HashMap<u64, usize>> {
         self.ip_map.as_ref()
     }
 
-    /// RISC 가상 머신 인터프리터 시뮬레이션 (검증 및 테스트용)
+    /// RISC ?띠럾????誘⑹굣???筌뤿굛??熬곣뱿遊????????깅턄??(?롪틵?嶺??????裕?筌뤾쑴??
     ///
-    /// 하위 호환성용: NOR / AddWithCarry 만 처리하며, 그 외 op는 무시한다.
-    /// 모든 op를 다루는 차등 검증 기준은 [`RiscProgram::eval_state`]를 사용한다.
+    /// ??瑜곷쭊 ?筌뤿굞??繹먮냱?? NOR / AddWithCarry 嶺?嶺뚳퐣瑗????? ????op????쒕샍???類ｋ펲.
+    /// 嶺뚮ㅄ維獄?op?????쇳렩??嶺뚢뼰維甕??롪틵?嶺??リ옇???? [`RiscProgram::eval_state`]???????類ｋ펲.
     pub fn eval_registers(&self, init_regs: &[u64; 16]) -> [u64; 16] {
         let mut regs = *init_regs;
         let mut temps = [0u64; 8];
@@ -158,6 +158,68 @@ impl RiscProgram {
                         }
                     }
                 }
+                RiscOp::Add { width } => {
+                    let a = get_val(ins.src1, &regs, &temps, flags.raw);
+                    let b = get_val(ins.src2, &regs, &temps, flags.raw);
+                    let m = crate::vm::risc::flags::mask_for_width(width);
+                    let r = a.wrapping_add(b) & m;
+                    if let Some(dst) = ins.dst {
+                        match dst {
+                            MicroOperand::VReg(i) => regs[i as usize] = r,
+                            MicroOperand::Temp(i) => temps[i as usize] = r,
+                            _ => {}
+                        }
+                    }
+                }
+                RiscOp::SubWithBorrow { width } => {
+                    let a = get_val(ins.src1, &regs, &temps, flags.raw);
+                    let b = get_val(ins.src2, &regs, &temps, flags.raw);
+                    let m = crate::vm::risc::flags::mask_for_width(width);
+                    let r = a.wrapping_sub(b) & m;
+                    if let Some(dst) = ins.dst {
+                        match dst {
+                            MicroOperand::VReg(i) => regs[i as usize] = r,
+                            MicroOperand::Temp(i) => temps[i as usize] = r,
+                            _ => {}
+                        }
+                    }
+                }
+                RiscOp::Inc { width } => {
+                    let a = get_val(ins.src1, &regs, &temps, flags.raw);
+                    let m = crate::vm::risc::flags::mask_for_width(width);
+                    let r = a.wrapping_add(1) & m;
+                    if let Some(dst) = ins.dst {
+                        match dst {
+                            MicroOperand::VReg(i) => regs[i as usize] = r,
+                            MicroOperand::Temp(i) => temps[i as usize] = r,
+                            _ => {}
+                        }
+                    }
+                }
+                RiscOp::Dec { width } => {
+                    let a = get_val(ins.src1, &regs, &temps, flags.raw);
+                    let m = crate::vm::risc::flags::mask_for_width(width);
+                    let r = a.wrapping_sub(1) & m;
+                    if let Some(dst) = ins.dst {
+                        match dst {
+                            MicroOperand::VReg(i) => regs[i as usize] = r,
+                            MicroOperand::Temp(i) => temps[i as usize] = r,
+                            _ => {}
+                        }
+                    }
+                }
+                RiscOp::Not { width } => {
+                    let a = get_val(ins.src1, &regs, &temps, flags.raw);
+                    let m = crate::vm::risc::flags::mask_for_width(width);
+                    let r = !a & m;
+                    if let Some(dst) = ins.dst {
+                        match dst {
+                            MicroOperand::VReg(i) => regs[i as usize] = r,
+                            MicroOperand::Temp(i) => temps[i as usize] = r,
+                            _ => {}
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -165,31 +227,31 @@ impl RiscProgram {
         regs
     }
 
-    /// 전체 12개 RISC 마이크로 연산을 처리하는 **참조(정본) 시뮬레이터**.
+    /// ?熬곣뫕??12??RISC 嶺뚮씭????餓???⑥ろ뀰??嶺뚳퐣瑗???濡ル츎 **嶺뚣볦굣???筌먲퐢沅? ??????깅턄??*.
     ///
-    /// `PolymorphicInterpreter`(폴리모픽 바이트코드 해석기)와 동일한 의미를 가져야
-    /// 하며, 이 함수와 해석기를 같은 프로그램에 대해 실행한 결과가 일치해야 한다
-    /// (T1-4 차등 테스트). op별 의미론:
+    /// `PolymorphicInterpreter`(????怨살춻?????꾩룆???筌뤾쑵留????怨댄맍???? ???됰뎄????????띠럾??筌뤾쑬??
+    /// ???? ????貫??? ??怨댄맍?リ옇?? ?띠룇?? ?熬곣뫁夷?윜諛몄굡??????????덈뺄???롪퍒???쒖쾸? ??源딅뭵??怨룻뒍 ??類ｋ펲
+    /// (T1-4 嶺뚢뼰維甕????裕??. op???????
     ///
-    /// * `Nor`            : dst = ~(src1 | src2); 논리 플래그 갱신
-    /// * `AddWithCarry`   : dst = src1 + src2 + imm(cin); 산술 플래그 갱신
-    /// * `ShiftRight`     : dst = src1 >> (src2 & 63) (논리 쉬프트)
+    /// * `Nor`            : dst = ~(src1 | src2); ??寃몃뉴 ????뗥윜??띠룄???
+    /// * `AddWithCarry`   : dst = src1 + src2 + imm(cin); ??⑥ル뻿 ????뗥윜??띠룄???
+    /// * `ShiftRight`     : dst = src1 >> (src2 & 63) (??寃몃뉴 ?????
     /// * `ShiftLeft`      : dst = src1 << (src2 & 63)
     /// * `VirtualPush`    : vsp -= 8; stack.push(src1)
     /// * `VirtualPop`     : dst = stack.pop(); vsp += 8
-    /// * `MemoryRead`     : dst = *src1 (width 바이트, 리틀엔디언)
-    /// * `MemoryWrite`    : *src1 = src2 (width 바이트, 리틀엔디언)
-    /// * `SetFlag`        : flags = src1 (VFLAG 마스크 적용)
-    /// * `Halt`           : 실행 종료
-    /// * `VirtualBranch`  : 조건이 참이면 VIP = 타깃(src1이 있으면 그 값, 없으면 imm).
-    ///                      ip_map이 있으면 타깃 절대 IP → 인덱스로 변환.
-    /// * `NativeCallBridge` : 여기서는 무시(호스트 콜은 런타임 계층 책임).
+    /// * `MemoryRead`     : dst = *src1 (width ?꾩룆???? ?洹???븐뼔???
+    /// * `MemoryWrite`    : *src1 = src2 (width ?꾩룆???? ?洹???븐뼔???
+    /// * `SetFlag`        : flags = src1 (VFLAG 嶺뚮씭??????⑤챷??
+    /// * `Halt`           : ???덈뺄 ??リ턁筌?
+    /// * `VirtualBranch`  : ?브퀗?쀦뤃??嶺뚣볦굣?醫묒춺?VIP = ??濚?src1?????깅さ嶺????? ??怨몃さ嶺?imm).
+    ///                      ip_map?????깅さ嶺???濚???? IP ???筌뤾퍓????댁Ŧ ?곌떠???
+    /// * `NativeCallBridge` : ?????類ｋ츎 ??쒕샍???筌뤾쑬裕???袁⑸츋? ???????ｌ뫒筌?嶺?援??.
     pub fn eval_state(&self, init_regs: &[u64; 16]) -> RiscEvalState {
         self.eval_state_impl(init_regs, &HashMap::new())
     }
 
-    /// 메모리를 사전 초기화한 상태에서 참조 시뮬레이터 실행.
-    /// (메모리 피연산자 차등 테스트에서 초기 `.data`/`.bss`를 주입하기 위함.)
+    /// 嶺뚮∥???꾨뎨?? ?????貫?껆뵳??됀????⑤객臾?????嶺뚣볦굣????????깅턄?????덈뺄.
+    /// (嶺뚮∥???꾨뎨???源낆뿼??⑥ъ겱 嶺뚢뼰維甕????裕?筌뤾쑬????貫?껆뵳?`.data`/`.bss`???낅슣?????얄뵛 ?熬곥굥留?)
     pub fn eval_state_with_mem(
         &self,
         init_regs: &[u64; 16],
@@ -237,7 +299,7 @@ impl RiscProgram {
                 }
                 RiscOp::Mov => {
                     let a = get_val(ins.src1, &st, flags.raw);
-                    // 플래그를 변경하지 않는 순수 복사.
+                    // ????뗥윜諛몄굡? ?곌떠??롪퍔???彛? ???낅츎 ??戮?빢 ?곌랜踰딀쾮?
                     store(ins.dst, &mut st, a);
                 }
                 RiscOp::AddWithCarry => {
@@ -250,9 +312,12 @@ impl RiscProgram {
                     let a = get_val(ins.src1, &st, flags.raw);
                     let cnt = get_val(ins.src2, &st, flags.raw) & 63;
                     let res = if cnt == 0 { a } else { a >> cnt };
-                    // x86: count==0 이면 RFLAGS 불변 (shl/shr/sar count 0 은 flags 유지).
+                    // x86: count==0 ?????RFLAGS ?釉띾쐞?
                     if cnt != 0 {
                         flags.update_logic64(res);
+                        if (a >> (cnt - 1)) & 1 != 0 {
+                            flags.raw |= VFLAG_CF;
+                        }
                     }
                     store(ins.dst, &mut st, res);
                 }
@@ -260,9 +325,11 @@ impl RiscProgram {
                     let a = get_val(ins.src1, &st, flags.raw);
                     let cnt = get_val(ins.src2, &st, flags.raw) & 63;
                     let res = if cnt == 0 { a } else { ((a as i64) >> cnt) as u64 };
-                    // x86: count==0 이면 RFLAGS 불변.
                     if cnt != 0 {
                         flags.update_logic64(res);
+                        if (a >> (cnt - 1)) & 1 != 0 {
+                            flags.raw |= VFLAG_CF;
+                        }
                     }
                     store(ins.dst, &mut st, res);
                 }
@@ -270,10 +337,39 @@ impl RiscProgram {
                     let a = get_val(ins.src1, &st, flags.raw);
                     let cnt = get_val(ins.src2, &st, flags.raw) & 63;
                     let res = if cnt == 0 { a } else { a << cnt };
-                    // x86: count==0 이면 RFLAGS 불변.
                     if cnt != 0 {
                         flags.update_logic64(res);
+                        if (a >> (64 - cnt)) & 1 != 0 {
+                            flags.raw |= VFLAG_CF;
+                        }
                     }
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::Add { width } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let res = flags.update_add(a, b, width);
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::SubWithBorrow { width } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let res = flags.update_sub(a, b, width);
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::Inc { width } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let res = flags.update_inc(a, width);
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::Dec { width } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let res = flags.update_dec(a, width);
+                    store(ins.dst, &mut st, res);
+                }
+                RiscOp::Not { width } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let res = !a & crate::vm::risc::flags::mask_for_width(width);
                     store(ins.dst, &mut st, res);
                 }
                 RiscOp::VirtualPush => {
@@ -299,13 +395,13 @@ impl RiscProgram {
                 }
                 RiscOp::SetFlag => {
                     let v = get_val(ins.src1, &st, flags.raw);
-                    // CF|PF|AF|ZF|SF|OF status bits, plus DF (bit 10) — CLD/STD
+                    // CF|PF|AF|ZF|SF|OF status bits, plus DF (bit 10) ??CLD/STD
                     // lower to `SetFlag(flags & ~DF)` / `SetFlag(flags | DF)`.
                     flags.raw = v & (0x8D5 | VFLAG_DF);
                 }
                 RiscOp::VirtualBranch { cond } => {
                     if branch_taken_with_state(cond, &flags, &st.regs) {
-                        // 타깃: src1(동적 값, 간접 call) 또는 imm(절대 x86 IP)
+                        // ??濚? src1(???됱쓤 ?? ?띠룄???call) ???裕?imm(??? x86 IP)
                         let target = match ins.src1 {
                             Some(op) => get_val(Some(op), &st, flags.raw),
                             None => ins.imm,
@@ -322,7 +418,7 @@ impl RiscProgram {
                 }
                 RiscOp::Halt => break,
                 RiscOp::NativeCallBridge => {}
-                // ── P2: 정수/비트/제어 복합 연산 ─────────────────────────────────
+                // ???? P2: ?筌먦끇?????????戮?꽑 ?곌랜踰뤻뜮? ??⑥ろ뀰 ??????????????????????????????????????????????????????????????????
                 RiscOp::Multiply { signed, width } => {
                     let a = get_val(ins.src1, &st, flags.raw);
                     let b = get_val(ins.src2, &st, flags.raw);
@@ -391,7 +487,7 @@ impl RiscProgram {
                         store(ins.dst, &mut st, bits as u64);
                     } else {
                         flags.set_cf(false);
-                        // 폭 한정 clz: (bits-1) - msb_index
+                        // ????戮곗젧 clz: (bits-1) - msb_index
                         let msb = 63 - s.leading_zeros() as u64;
                         let c = (bits as u64 - 1) - msb;
                         flags.set_zf(c == 0);
@@ -502,10 +598,10 @@ impl RiscProgram {
         st
     }
 
-    /// 하나의 micro-instruction을 (평문) 상태에 대해 실행한다. `eval_state_impl`
-    /// 의 각 op 본문과 **동일한 의미론**을 가져야 하며, 상태-암호화 참조 평가기
-    /// (`eval_state_encrypted`)가 이 함수를 "handler"로 사용한다. 차등 테스트가
-    /// 두 경로의 일치를 강제한다.
+    /// ??濡る룎??micro-instruction??(??寃? ??⑤객臾?????????덈뺄??類ｋ펲. `eval_state_impl`
+    /// ????op ?곌랜梨뜻룇??**???됰뎄???????*???띠럾??筌뤾쑬?????? ??⑤객臾???됀???嶺뚣볦굣???????
+    /// (`eval_state_encrypted`)?띠럾? ????貫???"handler"???????類ｋ펲. 嶺뚢뼰維甕????裕?筌?
+    /// ???롪퍔?δ빳????源딅뭵???띠룆踰???類ｋ펲.
     fn exec_one(&self, ins: &MicroInstr, st: &mut RiscEvalState, flags: &mut VirtualFlags) -> ExecResult {
         let get_val = |op: Option<MicroOperand>, st: &RiscEvalState, flags_raw: u64| -> u64 {
             match op {
@@ -554,6 +650,9 @@ impl RiscProgram {
                 let res = if cnt == 0 { a } else { a >> cnt };
                 if cnt != 0 {
                     flags.update_logic64(res);
+                    if (a >> (cnt - 1)) & 1 != 0 {
+                        flags.raw |= VFLAG_CF;
+                    }
                 }
                 store(ins.dst, st, res);
                 ExecResult::Next
@@ -564,6 +663,9 @@ impl RiscProgram {
                 let res = if cnt == 0 { a } else { ((a as i64) >> cnt) as u64 };
                 if cnt != 0 {
                     flags.update_logic64(res);
+                    if (a >> (cnt - 1)) & 1 != 0 {
+                        flags.raw |= VFLAG_CF;
+                    }
                 }
                 store(ins.dst, st, res);
                 ExecResult::Next
@@ -574,7 +676,42 @@ impl RiscProgram {
                 let res = if cnt == 0 { a } else { a << cnt };
                 if cnt != 0 {
                     flags.update_logic64(res);
+                    if (a >> (64 - cnt)) & 1 != 0 {
+                        flags.raw |= VFLAG_CF;
+                    }
                 }
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::Add { width } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                let res = flags.update_add(a, b, width);
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::SubWithBorrow { width } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                let res = flags.update_sub(a, b, width);
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::Inc { width } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let res = flags.update_inc(a, width);
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::Dec { width } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let res = flags.update_dec(a, width);
+                store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            RiscOp::Not { width } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let res = !a & crate::vm::risc::flags::mask_for_width(width);
                 store(ins.dst, st, res);
                 ExecResult::Next
             }
@@ -818,21 +955,21 @@ impl RiscProgram {
         }
     }
 
-    /// 상태-암호화 참조 평가기 (아이템 7 — Themida-class 상태 암호화).
+    /// ??⑤객臾???됀???嶺뚣볦굣???????(?熬곣뫗逾??7 ??Themida-class ??⑤객臾???됀???.
     ///
-    /// 가상 레지스터 파일과 flags 를 **롤링 키로 XOR 암호화된 채로** 유지하고,
-    /// 각 micro-instruction("handler")이 접근 시 복호화 → 계산 → **다음 키**로
-    /// 재암호화한다. 키는 실행된 명령마다 한 번씩 전진하므로 상태는 명령 사이
-    /// 항상 암호화되어 있다. 결과는 투명하다 — `eval_state_encrypted` 의 최종
-    /// 상태는 평문 `eval_state` 와 반드시 일치해야 하며, 차등 테스트가 강제한다.
-    /// (메모리 아레나는 게스트 메모리이므로 암호화 범위에서 제외.)
+    /// ?띠럾?????????꾩댉 ???逾??flags ??**?β뼯?뉐퐲????댁Ŧ XOR ??됀???븐뼔彛?嶺??т빳?* ??????겶?
+    /// ??micro-instruction("handler")????얜∥?????곌랜踰???????ｌ뫒亦???**???깅쾳 ??*??
+    /// ????筌뤿굞???類ｋ펲. ???노츎 ???덈뺄??嶺뚮ㅏ援앲??됱춹??덈펲 ???뺢퀡?녽??熬곣뫗異???????⑤객臾??嶺뚮ㅏ援앲??????
+    /// ??疫???됀???븐뼔??????덈펲. ?롪퍒??????筌??濡ル펲 ??`eval_state_encrypted` ??嶺뚣끉裕뉏펺?
+    /// ??⑤객臾????寃?`eval_state` ?? ?꾩룇瑗띈キ????源딅뭵??怨룻뒍 ???? 嶺뚢뼰維甕????裕?筌? ?띠룆踰???類ｋ펲.
+    /// (嶺뚮∥???꾨뎨??熬곣뫁???濡ル츎 ?롪퍓????嶺뚮∥???꾨뎨??醫꾩쾵?????됀????뺢퀡?????????戮곕뇶.)
     pub fn eval_state_encrypted(&self, init_regs: &[u64; 16], seed_key: u64) -> RiscEvalState {
         let mut st = RiscEvalState::default();
         st.regs = *init_regs;
         st.mem = HashMap::new();
         let mut flags = VirtualFlags::default();
 
-        // 롤링 키 스텝 (LCG — 폴리 바이트코드 키 스케줄과 동일한 성격).
+        // ?β뼯?뉐퐲??????댟?(LCG ????????꾩룆???筌뤾쑵留???????繞벿븐뫅?????됰뎄???繹먭퍒遊?.
         let step = |k: u64| k.wrapping_mul(0x5851_F42D_4C95_7F2D).wrapping_add(0x1405_7B7E_F767_814F);
         let xors = |st: &mut RiscEvalState, flags: &mut VirtualFlags, k: u64| {
             for r in st.regs.iter_mut() {
@@ -845,17 +982,17 @@ impl RiscProgram {
         };
 
         let mut key = seed_key;
-        xors(&mut st, &mut flags, key); // 초기 상태는 암호화 상태로 시작
+        xors(&mut st, &mut flags, key); // ?貫?껆뵳???⑤객臾????됀?????⑤객臾뜹슖???戮곗굚
 
         let mut vip = 0usize;
         loop {
             if vip >= self.instrs.len() {
                 break;
             }
-            // handler: 현재 키로 복호화 후 계산
+            // handler: ?熬곣뫗?????댁Ŧ ?곌랜踰???????ｌ뫒亦?
             xors(&mut st, &mut flags, key);
             let res = self.exec_one(&self.instrs[vip], &mut st, &mut flags);
-            // 명령 사이 상태는 항상 암호화: 다음 키로 재암호화
+            // 嶺뚮ㅏ援앲????????⑤객臾????疫???됀??? ???깅쾳 ???댁Ŧ ????筌뤿굞??
             let nk = step(key);
             xors(&mut st, &mut flags, nk);
             key = nk;
@@ -865,14 +1002,14 @@ impl RiscProgram {
                 ExecResult::Halt => break,
             }
         }
-        // 마지막으로 암호화한 키로 복호화해 평문 상태를 반환
+        // 嶺뚮씭??嶺뚮씭留???뿉???됀???됀?????댁Ŧ ?곌랜踰???됀????寃???⑤객臾???꾩룇瑗??
         xors(&mut st, &mut flags, key);
         st.flags = flags.raw;
         st
     }
 }
 
-/// 조건 분기가 걸리는지 평가 (x86 조건 코드 의미론).
+/// ?브퀗?쀦뤃??釉뚯뫅?깃꼈泥? 濾곌쑬梨???? ??? (x86 ?브퀗?쀦뤃??袁⑤?獄??????.
 fn branch_taken(cond: BranchCondition, flags: &VirtualFlags) -> bool {
     match cond {
         BranchCondition::Always => true,
@@ -902,10 +1039,10 @@ fn branch_taken(cond: BranchCondition, flags: &VirtualFlags) -> bool {
     }
 }
 
-/// 분기 평가 — `CounterZero`(카운터 기반)는 레지스터 상태가 필요하므로 상태까지 전달.
+/// ?釉뚯뫅????? ??`CounterZero`(?곸궠?????リ옇?↑?????????꾩댉 ??⑤객臾뜻뤆?쎛 ?熬곣뫗????????⑤객臾띄뭐癒?뒩? ?熬곣뫀堉?
 fn branch_taken_with_state(cond: BranchCondition, flags: &VirtualFlags, regs: &[u64; 16]) -> bool {
     if let BranchCondition::CounterZero(width) = cond {
-        // Jcxz(2)/Jecxz(4)/Jrcxz(8): RCX(reg[1])의 하위 width 바이트가 0인지
+        // Jcxz(2)/Jecxz(4)/Jrcxz(8): RCX(reg[1])????瑜곷쭊 width ?꾩룆???筌? 0?筌?
         let mask = match width {
             2 => 0xFFFF,
             4 => 0xFFFF_FFFF,
@@ -916,7 +1053,7 @@ fn branch_taken_with_state(cond: BranchCondition, flags: &VirtualFlags, regs: &[
     branch_taken(cond, flags)
 }
 
-/// 리틀엔디언 `width`바이트 메모리 읽기. 미기입 주소는 0으로 취급.
+/// ?洹???븐뼔???`width`?꾩룆????嶺뚮∥???꾨뎨???袁ⓥ뵛. 亦껋꼶?뉒뵳???낅슣????0??怨쀬Ŧ ???た??
 fn mem_read(mem: &HashMap<u64, u8>, addr: u64, width: u8) -> u64 {
     let mut v = 0u64;
     for i in 0..width {
@@ -927,16 +1064,16 @@ fn mem_read(mem: &HashMap<u64, u8>, addr: u64, width: u8) -> u64 {
     v
 }
 
-/// 리틀엔디언 `width`바이트 메모리 쓰기.
+/// ?洹???븐뼔???`width`?꾩룆????嶺뚮∥???꾨뎨???⑤슢??
 fn mem_write(mem: &mut HashMap<u64, u8>, addr: u64, width: u8, val: u64) {
     for i in 0..width {
         mem.insert(addr.wrapping_add(i as u64), (val >> (i as u64 * 8)) as u8);
     }
 }
 
-// ── P2: 정수/비트 복합 연산 참조 헬퍼 ─────────────────────────────────────────
+// ???? P2: ?筌먦끇????????곌랜踰뤻뜮? ??⑥ろ뀰 嶺뚣볦굣????????????????????????????????????????????????????????????????????????????????????????
 
-/// `width`바이트 폭의 비트 마스크.
+/// `width`?꾩룆?????????????嶺뚮씭????
 fn width_mask(bits: u32) -> u64 {
     if bits >= 64 {
         u64::MAX
@@ -945,7 +1082,7 @@ fn width_mask(bits: u32) -> u64 {
     }
 }
 
-/// round-to-nearest-even (x86 MXCSR 기본 RC) — 정확히 half-way 인 경우 짝수 쪽으로 반올림.
+/// round-to-nearest-even (x86 MXCSR ?リ옇???RC) ???筌먐쇰꼪??half-way ???롪퍔???嶺뚯쉸鍮??嶺뚯옕????뿉??꾩룇瑗?湲븍뎨?
 fn round_ties_even(x: f64) -> i64 {
     let fl = x.floor();
     let diff = x - fl;
@@ -958,10 +1095,10 @@ fn round_ties_even(x: f64) -> i64 {
 }
 
 /// x86 CVT(T)Sx2SI reference semantics (must match the bytecode interpreter's
-/// `cvt_f64_i32` in interp/xmm.rs). NaN / ±∞ / out-of-range produce the
+/// `cvt_f64_i32` in interp/xmm.rs). NaN / 筌??/ out-of-range produce the
 /// "integer indefinite": 0x8000_0000 for a 32-bit destination, and
 /// 0x8000_0000_0000_0000 for a 64-bit destination. Rust's `as i64` saturates
-/// instead (NaN→0, +∞→i64::MAX), so it CANNOT be used directly.
+/// instead (NaN??, +???⑷샵i64::MAX), so it CANNOT be used directly.
 fn cvt_f64_int(f: f64, dst_bits: u8, truncate: bool) -> u64 {
     let r = if truncate {
         f.trunc()
@@ -986,13 +1123,13 @@ fn cvt_f64_int(f: f64, dst_bits: u8, truncate: bool) -> u64 {
     }
 }
 
-/// `bits` 비트 값 `v`를 i128 로 부호 확장 (bits < 128).
+/// `bits` ???????`v`??i128 ???遊붋???筌먦끉??(bits < 128).
 fn sign_extend_i128(v: u128, bits: u32) -> i128 {
     let shift = 128 - bits;
     ((v << shift) as i128) >> shift
 }
 
-/// 1-피연산자 MUL/IMUL 참조: low → dst, high → RDX(폭 ≥ 2) 또는 AX(폭 1).
+/// 1-??源낆뿼??⑥ъ겱 MUL/IMUL 嶺뚣볦굣?? low ??dst, high ??RDX(????2) ???裕?AX(??1).
 fn mul_wide(
     st: &mut RiscEvalState,
     flags: &mut VirtualFlags,
@@ -1017,7 +1154,7 @@ fn mul_wide(
     };
     flags.set_cf_of(ovf);
     if width == 1 {
-        // AX = AL·r/m8 — AH(high 8비트)를 RAX 비트 8..15 로.
+        // AX = AL鸚룸삺/m8 ??AH(high 8???????RAX ?????8..15 ??
         store_dst(st, dst, (low & 0xFF) | ((high & 0xFF) << 8));
     } else {
         store_dst(st, dst, low);
@@ -1025,7 +1162,7 @@ fn mul_wide(
     }
 }
 
-/// 2/3-피연산자 IMUL 참조: dst = low(src1·src2), RDX 미기록.
+/// 2/3-??源낆뿼??⑥ъ겱 IMUL 嶺뚣볦굣?? dst = low(src1鸚룸삻rc2), RDX 亦껋꼶?뉒뵳寃쎌뿉?
 fn mul_low(
     st: &mut RiscEvalState,
     flags: &mut VirtualFlags,
@@ -1052,13 +1189,13 @@ fn mul_low(
     store_dst(st, dst, low);
 }
 
-/// DIV/IDIV 참조: 피제수 = RDX:RAX(폭별, 폭 1 은 AX), 제수 = divisor,
-/// 몫 → dst(RAX), 나머지 → RDX. (제수 0 또는 몫 오버플로는 x86 #DE — 참조에서는
-/// 결과 0 으로 취급해 크래시 회피.)
+/// DIV/IDIV 嶺뚣볦굣?? ??源놁젷??= RDX:RAX(???? ??1 ?? AX), ??戮?빢 = divisor,
+/// 嶺???dst(RAX), ??濡?룫嶺뚯솘? ??RDX. (??戮?빢 0 ???裕?嶺????댁뮅???夷??x86 #DE ??嶺뚣볦굣???????
+/// ?롪퍒???0 ??怨쀬Ŧ ???た??????????怨뺣룛.)
 fn div_wide(st: &mut RiscEvalState, divisor: u64, signed: bool, width: u8, dst: Option<MicroOperand>) {
     let bits = width as u32 * 8;
     let mask = width_mask(bits);
-    // 폭 1(8비트 DIV/IDIV)은 AX(reg0 low16)가 피제수 — RDX 미사용.
+    // ??1(8?????DIV/IDIV)?? AX(reg0 low16)?띠럾? ??源놁젷????RDX 亦껋꼶梨룡쾮??
     let (dividend, dvbits) = if width == 1 {
         ((st.regs[0] & 0xFFFF) as u128, 16u32)
     } else {
@@ -1069,7 +1206,7 @@ fn div_wide(st: &mut RiscEvalState, divisor: u64, signed: bool, width: u8, dst: 
     };
     let dv = (divisor & mask) as u128;
     if dv == 0 {
-        // #DE → 참조 기본값 (0). 폭 1 은 AX(dst) 형태.
+        // #DE ??嶺뚣볦굣???リ옇???泥?(0). ??1 ?? AX(dst) ?筌먐븍Ф.
         if width == 1 {
             store_dst(st, dst, 0);
         } else {
@@ -1081,14 +1218,14 @@ fn div_wide(st: &mut RiscEvalState, divisor: u64, signed: bool, width: u8, dst: 
     let (q, r) = if signed {
         let d = sign_extend_i128(dividend, dvbits);
         let s = sign_extend_i128(dv as u64 as u128, bits);
-        // Rust 정수 나눗셈은 0 쪽으로 절단 — IDIV 와 동일.
+        // Rust ?筌먦끇????濡ル빟??? 0 嶺뚯옕????뿉????덈펺 ??IDIV ?? ???됰뎄.
         let (q, r) = (d / s, d % s);
         (q as u128, r as u128)
     } else {
         (dividend / dv, dividend % dv)
     };
     if width == 1 {
-        // AL = 몫, AH = 나머지 → AX(dst).
+        // AL = 嶺? AH = ??濡?룫嶺뚯솘? ??AX(dst).
         let ax = ((r as u64) & 0xFF) << 8 | ((q as u64) & 0xFF);
         store_dst(st, dst, ax);
     } else {
@@ -1097,7 +1234,7 @@ fn div_wide(st: &mut RiscEvalState, divisor: u64, signed: bool, width: u8, dst: 
     }
 }
 
-/// dst(Some VReg/Temp) 저장 — eval_state 의 `store` 클로저와 동일.
+/// dst(Some VReg/Temp) ??????eval_state ??`store` ???餓???? ???됰뎄.
 fn store_dst(st: &mut RiscEvalState, dst: Option<MicroOperand>, val: u64) {
     if let Some(d) = dst {
         match d {
@@ -1112,9 +1249,9 @@ fn store_dst(st: &mut RiscEvalState, dst: Option<MicroOperand>, val: u64) {
 mod tests {
     use super::*;
 
-    /// 아이템 7: 상태-암호화 참조 평가기가 평문 eval_state 와 동일한 최종 상태를
-    /// 내는지 검증한다 (롤링 키로 암호화된 vreg/flags 를 handler(exec_one) 안에서만
-    /// 복호화하는 모델). 랜덤 시드 키 × 랜덤 프로그램/입력으로 차등 확인.
+    /// ?熬곣뫗逾??7: ??⑤객臾???됀???嶺뚣볦굣??????リ옇?? ??寃?eval_state ?? ???됰뎄??嶺뚣끉裕뉏펺???⑤객臾??
+    /// ???????? ?롪틵?嶺뚯빘鍮쒒뇡??(?β뼯?뉐퐲????댁Ŧ ??됀???븐뼔彛?vreg/flags ??handler(exec_one) ???고뱺??類ㅼ떳
+    /// ?곌랜踰???됀???嶺뚮ㅄ維??. ??類ｌ몓 ??類ｊ덧 ??????類ｌ몓 ?熬곣뫁夷?윜諛몄굡?????놁졑??怨쀬Ŧ 嶺뚢뼰維甕??筌먦끉逾?
     #[test]
     fn eval_state_encrypted_matches_plaintext() {
         use rand::rngs::StdRng;
@@ -1164,7 +1301,7 @@ mod tests {
                     .with_src1(MicroOperand::VReg(0))
                     .with_src2(MicroOperand::VReg(1)),
             );
-            // push/pop (stack) — branch paths are covered by the existing tests
+            // push/pop (stack) ??branch paths are covered by the existing tests
             d.emit_push(MicroOperand::VReg(2));
             d.emit_pop(MicroOperand::VReg(12));
             d.instrs.push(MicroInstr::new(RiscOp::Halt));
@@ -1265,7 +1402,7 @@ mod tests {
 
     #[test]
     fn test_risc_eval_state_full_op_coverage() {
-        // 모든 처리가능 op를 조합해 참조 시뮬레이터가 정확히 실행되는지 검증.
+        // 嶺뚮ㅄ維獄?嶺뚳퐣瑗?怨⑹쾸???op???브퀗?ч뜮???嶺뚣볦굣????????깅턄??? ?筌먐쇰꼪?????덈뺄??濡ル츎嶺뚯솘? ?롪틵?嶺?
         let mut d = RiscDesynthesizer::new();
         // R0 = 10, R1 = 3
         d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(10), MicroOperand::Imm64(0));
@@ -1284,7 +1421,7 @@ mod tests {
                 .with_src1(MicroOperand::VReg(0))
                 .with_src2(MicroOperand::Imm64(1)),
         );
-        // push R3 (스택 1개), pop R4
+        // push R3 (???꾨Ц 1??, pop R4
         d.emit_push(MicroOperand::VReg(3));
         d.emit_pop(MicroOperand::VReg(4));
         // Halt
@@ -1345,8 +1482,8 @@ mod tests {
 
     #[test]
     fn test_cvt_f64_int_x86_indefinite() {
-        // 32-bit dst: NaN / ±∞ / out-of-range -> 0x8000_0000 (x86 indefinite),
-        // NOT Rust's saturating cast (NaN->0, +∞->i64::MAX).
+        // 32-bit dst: NaN / 筌??/ out-of-range -> 0x8000_0000 (x86 indefinite),
+        // NOT Rust's saturating cast (NaN->0, +??>i64::MAX).
         assert_eq!(cvt_f64_int(f64::NAN, 4, true), 0x8000_0000);
         assert_eq!(cvt_f64_int(f64::INFINITY, 4, true), 0x8000_0000);
         assert_eq!(cvt_f64_int(f64::NEG_INFINITY, 4, true), 0x8000_0000);

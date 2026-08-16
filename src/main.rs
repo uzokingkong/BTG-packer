@@ -272,7 +272,10 @@ fn main() -> error::Result<()> {
     }
 
     if crypto_enabled {
-        println!("[+] Composite VM Crypto: ENABLED (RC4 keyed stream — code region + string literals)");
+        println!(
+            "[+] Composite VM Crypto: ENABLED ({} keyed stream — code region + string literals)",
+            if !args.rc4 { "BTG-C1" } else { "RC4" }
+        );
     } else {
         println!("[!] Composite VM Crypto: DISABLED (--no-crypto)");
     }
@@ -339,8 +342,15 @@ fn main() -> error::Result<()> {
     ctx.anti_debug = anti_debug || args.trace_blocks;
     // v6: MBA 키 스케줄 상수 (패킹당 1회 랜덤 — 슬라이서/패스3/패스4/디스패처 공유)
     ctx.mba_constant = { use rand::RngCore; rand::thread_rng().next_u32() };
+    // ── v61: M7 (on-demand 재암호화) 판정 — per-block reencrypt 계열 디스패처를
+    // 쓰므로 --dispatcher-reencrypt와 상호 배타, --vm/--vm-oep(일괄 복호화 부트
+    // 흐름)와도 배타. crypto 필수. (ctx.reencrypt가 아래에서 이를 반영)
+    let m7_effective = args.m7 && crypto_enabled && !vm_enabled && !dispatcher_reencrypt;
     // v8: Phase 0.3 디스패처 재암호화 (pass2 테이블 배치/디스패처/부트 스텁에 전달)
-    ctx.reencrypt = dispatcher_reencrypt;
+    // v61: --m7(on-demand 재암호화)도 per-block reencrypt 플러밍(블록별 암호화 +
+    // 3-푸시 규약 + 부트 스텁 일괄 복호화 생략)을 재사용하므로 reencrypt로 묶는다.
+    // 단, M7은 v14의 "평문 유지" 대신 refcount-safe "실행 후 재암호화" 디스패처를 쓴다.
+    ctx.reencrypt = dispatcher_reencrypt || m7_effective;
     // v6: IAT 은닉/메모리 하드닝 — pass4가 부트 영역/특성을 결정하기 전에 설정
     // (crypto off여도 부트 스텁이 필요할 수 있으므로 pass4보다 먼저 알아야 한다)
     ctx.iat_hide = iat_hide;
@@ -349,8 +359,12 @@ fn main() -> error::Result<()> {
     ctx.keep_pdata = args.keep_pdata;
     // v13.4d diag: 디스패처 ring-buffer (마지막 32개 block id) 주입 여부
     ctx.block_ring = args.block_ring;
-    // v59: BTG-C1 커스텀 사이퍼 (기본 RC4-256 유지, opt-in)
-    ctx.custom_cipher = args.custom_cipher;
+    // v62: BTG-C1을 기본 암호로 (--rc4로 RC4 복귀). --custom-cipher는 기본값이라
+    // 명시적 동의에만 쓰이고, --rc4와 함께 주면 --rc4가 우선한다.
+    if args.rc4 && args.custom_cipher {
+        eprintln!("[!] --rc4 takes precedence over --custom-cipher (BTG-C1 is the default cipher; --rc4 forces RC4-256)");
+    }
+    ctx.custom_cipher = !args.rc4;
     // M6 Phase-2: OEP→VM entry 전환 — 부트 스텁이 원본 .text를 평문 복호화하지
     // 않고 lift된 프로그램 VM 모듈로 디스패치. (--vm 필요)
     // v59: patch_data가 .rdata/.data 포인터 재배치를 vm_oep 모드에서 원본 .text
@@ -360,6 +374,16 @@ fn main() -> error::Result<()> {
     // `--vm --vm-oep --vm-commercial` 모두 켜야 상용 경로를 쓰고, 레거시 --vm-oep
     // 경로는 바이트 동일 유지한다.
     ctx.vm_commercial = args.vm_commercial && args.vm_oep && vm_enabled;
+    // ── M7: on-demand 재암호화(anti-dump) — 실행 후 블록을 즉시 재암호화하는
+    // refcount-safe 디스패처로, 어느 순간에도 "실행 중인 블록만 평문"이다.
+    // (m7_effective는 위에서 crypto/vm/reencrypt 배타성과 함께 판정됨.
+    //  ⚠ pass2가 상태 테이블을 예약하므로 **pass1 이전에** 설정해야 한다.)
+    if args.m7 && !m7_effective {
+        eprintln!(
+            "[!] --m7 (on-demand re-encrypt) requires the crypto layer and conflicts with --dispatcher-reencrypt / --vm / --vm-oep (per-block dispatcher vs bulk-decrypt boot flow); ignored"
+        );
+    }
+    ctx.m7 = m7_effective;
 
     // ── Phase 6: SDK Marker Selective VM Pass (if markers present) ───────────────
     if vm_enabled {
@@ -401,10 +425,6 @@ fn main() -> error::Result<()> {
     // 않고 lift된 프로그램 VM 모듈로 디스패치. (--vm 필요, 기본 false → 기존 경로 유지)
     // (v59: vm_oep는 pass1 이전에 이미 설정됨 — 위의 초기화 참조)
 
-    // ── M7: on-demand 재암호화(anti-dump) — 원본 .text/.data/.rdata 런을 파일에는
-    // 암호문으로 저장하고 실행 중 on-demand 복호화→사용→재암호화. (--vm 필요)
-    ctx.m7 = args.m7 && vm_enabled;
-
     // ── M8: VM handler 테이블 MBA 난독화 (--vm 필요, 기본 false → 기존 경로 유지)
     ctx.m8 = args.m8 && vm_enabled;
 
@@ -420,6 +440,9 @@ fn main() -> error::Result<()> {
             if args.sym_map { " + .sym" } else { "" });
     }
 
+    // v61: --dispatcher-reencrypt OR --m7 (둘 다 per-block) — ctx.reencrypt를
+    // 빌림으로 읽기 전에 값만 캡처한다 (crypto::run이 &mut ctx를 받으므로).
+    let reencrypt_effective = ctx.reencrypt;
     pipeline::crypto::run(
         &mut ctx,
         crypto_enabled,
@@ -429,7 +452,7 @@ fn main() -> error::Result<()> {
         payload_relocate,
         integrity,
         args.chained_crypto,
-        dispatcher_reencrypt,
+        reencrypt_effective,
     )?;
 
 

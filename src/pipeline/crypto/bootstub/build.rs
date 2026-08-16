@@ -5,8 +5,8 @@
 // build_rc4_block (orchestrates the full RC4 boot stub).
 // ==============================================================================
 
-use super::emit::{emit_base_bind_loop, emit_code_decrypt, emit_dispatcher_entry, emit_ksa_init,
-    emit_rest_decrypt, emit_run_decrypt, emit_self_wipe, trashformer_junk};
+use super::emit::{emit_base_bind_loop, emit_c1_init, emit_code_decrypt, emit_dispatcher_entry,
+    emit_ksa_init, emit_rest_decrypt, emit_run_decrypt, emit_self_wipe, trashformer_junk};
 use super::ctx::BootStubCtx;
 use super::super::{cipher, encode, iat, integrity, memharden, payload, vm_embed};
 use iced_x86::{Code, Instruction, Register};
@@ -84,7 +84,19 @@ pub(crate) fn build_rc4_block(stub: &BootStubCtx) -> Vec<u8> {
         emit_base_bind_loop(&mut seq, stub.seed_va);
     }
 
-    emit_ksa_init(&mut seq, stub);
+    // v60 (--custom-cipher): BTG-C1 경로는 RC4 KSA 대신 C1 상태 초기화를 수행한다.
+    // (chained/vm-oep는 RC4 전용 — c1_mode는 place.rs가 비활성화해 이 분기에
+    //  도달하지 않는다.) v61: --vm과 함께면 C1 상태 초기화를 VM으로 virtualize
+    //  (emit_ksa_init의 c1_mode && vm 분기), 아니면 네이티브 emit_c1_init.
+    if stub.c1_mode {
+        if stub.vm {
+            emit_ksa_init(&mut seq, stub);
+        } else {
+            emit_c1_init(&mut seq, stub);
+        }
+    } else {
+        emit_ksa_init(&mut seq, stub);
+    }
     payload::emit_payload_copy(&mut seq, stub);
     emit_code_decrypt(&mut seq, stub);
     integrity::emit_integrity_crc(&mut seq, stub);

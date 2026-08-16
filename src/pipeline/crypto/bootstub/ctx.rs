@@ -110,6 +110,18 @@ pub(crate) struct BootStubCtx {
     pub(crate) mba_master: u32,
     /// 리졸브 테이블 이름 XOR 키 유도용 MBA 상수
     pub(crate) mba_c: u32,
+    // ── v60: --custom-cipher (BTG-C1) 부트 스텁 경로 ───────────────────────
+    /// true = 부트 스텁이 RC4 KSA/PRGA 대신 BTG-C1 상태형 키스트림 blob을 쓴다.
+    /// (--custom-cipher + 평문/재암호화 불포함 경로에서만 활성 — chained/reencrypt/
+    /// vm/vm-oep는 RC4 전용 서브루틴을 쓰므로 이 모드에서는 자동으로 비활성.)
+    pub(crate) c1_mode: bool,
+    /// BTG-C1 crypt blob 엔트리 VA (rcx=buf, rdx=len — 상태는 c1_state_va 유지).
+    pub(crate) c1_blob_va: u64,
+    /// BTG-C1 256B S-box 상수 테이블 VA (패커가 boot 데이터 영역에 기록).
+    pub(crate) c1_sbox_va: u64,
+    /// BTG-C1 상태 버퍼 VA (0x80B: key[32]@+0x00, ctr[8]@+0x20, nonce[4]@+0x28,
+    /// ks[64]@+0x30, ks_off[4]@+0x70). 부트 스텁 emit_c1_init이 런타임에 초기화.
+    pub(crate) c1_state_va: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -170,6 +182,8 @@ pub(crate) enum Label {
     UxFuncMain,
     UxFuncTail,
     UxFuncDone,
+    // ── v60: BTG-C1 상태 초기화 (키/카운터/nonce/ks_off 기록) ──
+    C1KeyLoop,
 }
 
 /// 단일 Instruction을 어셈블해 정확한 인코딩 길이를 측정한다.

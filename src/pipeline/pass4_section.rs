@@ -69,9 +69,14 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, needs_boot_stub: bool, t
     }
 
     // v8: 재암호화 시 점프 테이블 뒤에 블록 길이 테이블(num_blocks*4)이 붙는다.
+    // v61: --m7은 상태 테이블(num_blocks*4)까지 추가한다 (점프 + 길이 + 상태).
+    // v61(+custom-cipher): C1 상태(0x80) + S-box 상수(0x100) 예약 (first_block 직전).
+    let c1_reserve = if ctx.reencrypt && ctx.custom_cipher { 0x180 } else { 0 };
     let required_table_end = table_offset
         + num_blocks * 4
-        + if ctx.reencrypt { num_blocks * 4 } else { 0 };
+        + if ctx.reencrypt { num_blocks * 4 } else { 0 }
+        + if ctx.m7 { num_blocks * 4 } else { 0 }
+        + c1_reserve;
     let min_section_size = max_phys_offset.max(required_table_end);
     let mut total_section_size = ((min_section_size + 0xFF) & !0xFF) + 0x100;
 
@@ -104,17 +109,60 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, needs_boot_stub: bool, t
     // v8(Phase 0.3): 재암호화 디스패처는 블록별 RC4 KSA/PRGA 서브루틴을 내장한다.
     // v13.4d diag: ring-buffer 는 표준 디스패처(build_dispatcher)에서만 지원한다.
     // 재암호화 디스패처는 핸들러가 빡빡해 안정성 리스크 — 경고 후 무시.
-    let dispatcher_bytes = if ctx.reencrypt {
+    // v61: --m7은 refcount-safe 실행 후 재암호화 디스패처, --dispatcher-reencrypt는
+    //      decrypt-once 디스패처를 쓴다. 둘 다 --custom-cipher면 BTG-C1 per-block
+    //      변형을 쓴다. (C1 상태/sbox는 first_block_offset 직전 예약 영역에 배치)
+    let (c1_state_va, c1_sbox_va) = if ctx.reencrypt && ctx.custom_cipher {
+        (
+            dispatcher_va + (first_block_offset - 0x180) as u64,
+            dispatcher_va + (first_block_offset - 0x100) as u64,
+        )
+    } else {
+        (0, 0)
+    };
+    let dispatcher_bytes = if ctx.m7 {
+        if ctx.custom_cipher {
+            dispatcher::build_dispatcher_m7_c1(
+                dispatcher_va,
+                table_offset,
+                num_blocks,
+                ctx.mba_constant,
+                trace_blocks,
+                c1_state_va,
+                c1_sbox_va,
+            )
+        } else {
+            dispatcher::build_dispatcher_m7(
+                dispatcher_va,
+                table_offset,
+                num_blocks,
+                ctx.mba_constant,
+                trace_blocks,
+            )
+        }
+    } else if ctx.reencrypt {
         if block_ring {
             println!("[!] --block-ring: reencrypt dispatcher is not instrumented (standard-dispatcher only); ignored for this build.");
         }
-        dispatcher::build_dispatcher_reencrypt(
-            dispatcher_va,
-            table_offset,
-            num_blocks,
-            ctx.mba_constant,
-            trace_blocks,
-        )
+        if ctx.custom_cipher {
+            dispatcher::build_dispatcher_reencrypt_c1(
+                dispatcher_va,
+                table_offset,
+                num_blocks,
+                ctx.mba_constant,
+                trace_blocks,
+                c1_state_va,
+                c1_sbox_va,
+            )
+        } else {
+            dispatcher::build_dispatcher_reencrypt(
+                dispatcher_va,
+                table_offset,
+                num_blocks,
+                ctx.mba_constant,
+                trace_blocks,
+            )
+        }
     } else {
         dispatcher::build_dispatcher(
             dispatcher_va,
@@ -127,6 +175,15 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, needs_boot_stub: bool, t
         )
     };
     dispatcher::validate_dispatcher(&dispatcher_bytes)?;
+    // P0-2 (VM ABI): 생성된 디스패처가 Win64 callee-saved GPR을 저장 후에만
+    // 사용하는지 정적 검증 (위반 시 빌드 거부).
+    let abi_violations = crate::vm::abi::validate_win64_abi(&dispatcher_bytes, dispatcher_va + 0x20)?;
+    if !abi_violations.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Win64 ABI violation in generated dispatcher:\n  {}",
+            abi_violations.join("\n  ")
+        ));
+    }
 
     println!(
         "[+] Dispatcher: table_offset=0x{:X}, shellcode_len={} bytes, available={} bytes, anti_debug={}, block_ring={}",
@@ -284,6 +341,53 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, needs_boot_stub: bool, t
         println!(
             "[+] v8 Dispatcher Re-Encrypt: length table ({} entries, key-XORed) @0x{:X} ({} call-target plaintext sentinels)",
             num_blocks, length_table_offset, call_target_count
+        );
+    }
+
+    // ── v61 (--m7): on-demand 상태 테이블 (num_blocks×4) ──────────────────────
+    // 0xFFFFFFFF = 암호화 (복호화 필요), 0 = 복호화/미접근(또는 call-target 평문),
+    // 그 외 k = 복호화 + k개 컨텍스트 실행 중 (refcount). 실행은 디스패처가 원자적
+    // 상태 전이로 관리한다 — 파일에는 전부 0xFFFFFFFF(암호화) 또는 call-target 0.
+    if ctx.m7 {
+        let state_table_offset = table_offset + num_blocks * 8;
+        let mut call_target_count = 0usize;
+        for block in &layout.shuffled_blocks {
+            let id = block.id as usize;
+            let state: u32 = if ctx.call_target_block_ids.contains(&block.id) {
+                call_target_count += 1;
+                0 // call-target(평문) — 디스패처가 length 센티널로 상태 머신 스킵
+            } else {
+                0xFFFF_FFFF // 암호화 상태로 시작
+            };
+            let tbl_pos = state_table_offset + id * 4;
+            if tbl_pos + 4 <= btg_bytes.len() {
+                btg_bytes[tbl_pos..tbl_pos + 4].copy_from_slice(&state.to_le_bytes());
+            }
+        }
+        println!(
+            "[+] v61 M7: on-demand state table ({} entries: ENC/call-target) @0x{:X} ({} call-target plaintext)",
+            num_blocks, state_table_offset, call_target_count
+        );
+    }
+
+    // ── v61 (--custom-cipher + reencrypt/m7): C1 S-box 상수 테이블 배치 ────────
+    // [first_block_offset-0x180 .. first_block_offset-0x100) = C1 상태 버퍼(0x80,
+    // 디스패처 C1Init이 런타임에 초기화), [..-0x100 .. first_block_offset) =
+    // 256B S-box 상수 테이블 (패커가 기록 — 디스패처 blob이 c1_sbox_va로 참조).
+    if ctx.reencrypt && ctx.custom_cipher {
+        let sbox_off = first_block_offset - 0x100;
+        let sbox = crate::crypto::nonlinear::sbox();
+        if sbox_off + 0x100 <= btg_bytes.len() {
+            btg_bytes[sbox_off..sbox_off + 0x100].copy_from_slice(&sbox);
+        }
+        // C1 상태 버퍼는 0으로 초기화 (디스패처 C1Init이 key/ctr/nonce/ks_off 기록)
+        let state_off = first_block_offset - 0x180;
+        if state_off + 0x80 <= btg_bytes.len() {
+            btg_bytes[state_off..state_off + 0x80].fill(0);
+        }
+        println!(
+            "[+] v61 C1: sbox @0x{:X} (256B), state @0x{:X} (0x80B) reserved before first_block 0x{:X}",
+            sbox_off, state_off, first_block_offset
         );
     }
 

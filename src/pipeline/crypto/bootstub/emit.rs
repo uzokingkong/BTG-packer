@@ -90,6 +90,49 @@ pub(crate) fn trashformer_junk(seed: u32) -> Vec<Instruction> {
     out
 }
 
+/// v60 (--custom-cipher): BTG-C1 상태형 키스트림 blob 호출.
+/// RCX=buf, RDX=len (Win64 규약) — blob이 c1_state_va의 카운터/키스트림을 유지한다.
+/// 길이 불변성: c1_blob_va는 rel32 타깃이라 값과 무관하게 5바이트 고정.
+pub(crate) fn emit_c1_call(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
+    seq.push((
+        Instruction::with_branch(Code::Call_rel32_64, stub.c1_blob_va).unwrap(),
+        None,
+    ));
+}
+
+/// v60 (--custom-cipher): BTG-C1 상태 초기화.
+///   key[32]   = seed_va[0..32]              → c1_state_va+0x00
+///   ctr       = 0                            → c1_state_va+0x20
+///   nonce     = le32(seed_va[32..36])        → c1_state_va+0x28
+///   ks_off    = 0x40 (첫 사용 시 gen_block)  → c1_state_va+0x70
+/// (S-box 256B 상수 테이블은 패커가 c1_sbox_va에 기록 — 스텁은 쓰지 않는다.)
+/// 사용 레지스터(rax/rcx/rdx/r8/r9)는 이후 경로에서 덮어쓰므로 안전. RBX는
+/// C1 경로에서 S-box base로 쓰지 않지만 RSP 프레임으로 유지한다.
+pub(crate) fn emit_c1_init(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
+    use iced_x86::MemoryOperand as M;
+    // rsi = seed_va ; rdi = c1_state_va ; r8d = 32 ; r9 = key byte staging
+    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RSI, stub.seed_va).unwrap(), None));
+    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDI, stub.c1_state_va).unwrap(), None));
+    seq.push((Instruction::with2(Code::Mov_r32_imm32, Register::R8D, 32).unwrap(), None));
+    // C1KeyLoop: key[rdi] = seed[rsi] ; advance ; loop
+    seq.push((Instruction::with2(Code::Movzx_r32_rm8, Register::R9D, M::with_base(Register::RSI)).unwrap(), Some(Label::C1KeyLoop)));
+    seq.push((Instruction::with2(Code::Mov_rm8_r8, M::with_base(Register::RDI), Register::R9L).unwrap(), None));
+    seq.push((Instruction::with1(Code::Inc_rm64, Register::RSI).unwrap(), None));
+    seq.push((Instruction::with1(Code::Inc_rm64, Register::RDI).unwrap(), None));
+    seq.push((Instruction::with1(Code::Dec_rm32, Register::R8D).unwrap(), None));
+    seq.push((Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(), Some(Label::C1KeyLoop)));
+    // ctr = 0 → c1_state_va+0x20
+    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDI, stub.c1_state_va).unwrap(), None));
+    seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::EAX, Register::EAX).unwrap(), None));
+    seq.push((Instruction::with2(Code::Mov_rm64_r64, M::with_base_displ(Register::RDI, 0x20), Register::RAX).unwrap(), None));
+    // nonce = le32(seed_va[32..36]) → c1_state_va+0x28
+    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RSI, stub.seed_va).unwrap(), None));
+    seq.push((Instruction::with2(Code::Mov_r32_rm32, Register::R8D, M::with_base_displ(Register::RSI, 32)).unwrap(), None));
+    seq.push((Instruction::with2(Code::Mov_rm32_r32, M::with_base_displ(Register::RDI, 0x28), Register::R8D).unwrap(), None));
+    // ks_off = 0x40 → c1_state_va+0x70
+    seq.push((Instruction::with2(Code::Mov_rm32_imm32, M::with_base_displ(Register::RDI, 0x70), 0x40u32).unwrap(), None));
+}
+
 pub(crate) fn emit_ksa_init(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
     // ── v9: crypto-off 경량 스텁 — RC4 키 스케줄/복호화 전체 생략 ────────────────
     // (안티디버그 → 페이로드 복사 → [CRC] → IAT 해석 → 메모리 하드닝 → 디스패치)
@@ -97,6 +140,16 @@ pub(crate) fn emit_ksa_init(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &
     if stub.chained {
         // ── v7 chained-crypto: 초기 KSA 없음 — 아래 체인 루프가 청크별로 KSA 수행 ──
         // (청크 0의 키 = seed anchor, 이후 청크의 키 = 직전 청크 평문)
+    } else if stub.c1_mode && stub.vm {
+        // ── v61 (--custom-cipher + --vm): C1 상태 초기화를 VM으로 virtualize ────
+        // RC4의 KSA-virtualize에 대응: seed → key32/ctr/nonce/ks_off 유도가 VM
+        // 바이트코드(C1Init 모드) 안에서만 일어난다.
+        // 호출 규약: RCX = VM 상태 버퍼 VA, RDX = seed VA(→MEM_SEED),
+        //           R8 = C1 상태 버퍼 VA(→MEM_BUF), call vm_entry_va.
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX, stub.seed_va).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R8, stub.c1_state_va).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.vm_state_va).unwrap(), None));
+        seq.push((Instruction::with_branch(Code::Call_rel32_64, stub.vm_entry_va).unwrap(), None));
     } else if stub.vm {
         // ── v3-composite VM 경로 ──────────────────────────────────────────────
         // S-box 초기화 + KSA(키 스케줄)는 가상화된 VM 모듈이 수행한다.
@@ -269,8 +322,11 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
 
         // PRGA i,j 초기화 (canonical RC4: j=0에서 시작) — 복사 블록 이후에 수행해
         // 어떤 복사 경로가 RSI/RDI를 쓰더라도 RC4 i/j 카운터가 보존되게 한다.
-        seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::ESI, Register::ESI).unwrap(), None));
-        seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::EDI, Register::EDI).unwrap(), None));
+        // (v60 --custom-cipher: BTG-C1 blob은 자체 상태를 쓰므로 RC4 i/j 불필요)
+        if !stub.c1_mode {
+            seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::ESI, Register::ESI).unwrap(), None));
+            seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::EDI, Register::EDI).unwrap(), None));
+        }
 
         // ── 코드 영역 복호화 ──
         // v8(Phase 0.3): 재암호화 모드에서는 생략 — 블록이 개별 암호화 상태로
@@ -279,7 +335,9 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
         if !stub.reencrypt {
             seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.code_va).unwrap(), None));
             seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX, stub.code_len as u64).unwrap(), None));
-            if stub.vm_prga {
+            if stub.c1_mode {
+                emit_c1_call(seq, stub);
+            } else if stub.vm_prga {
                 vm_embed::emit_prga_vm_init(seq, stub);
                 vm_embed::emit_prga_vm_call(seq, stub);
             } else {
@@ -312,7 +370,9 @@ pub(crate) fn emit_run_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stub
         ).unwrap(),
         None,
     ));
-    if stub.vm_prga {
+    if stub.c1_mode {
+        emit_c1_call(seq, stub);
+    } else if stub.vm_prga {
         vm_embed::emit_prga_vm_call(seq, stub);
     } else {
         seq.push((Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(), Some(Label::Prga)));
@@ -394,6 +454,14 @@ pub(crate) fn emit_self_wipe(seq: &mut Vec<(Instruction, Option<Label>)>, stub: 
         // ⚠ 페이로드 원본(.vdata) 소거는 생략 — .vdata가 read-only(R)로 매핑되어
         //   쓰면 0xC0000005. 어차피 seed/S-box를 지우면 RC4 keystream을 재구성할 수
         //   없어 덤프→재복호화는 불가능하므로, R-only .vdata는 그대로 둔다.
+        // v60 (--custom-cipher): BTG-C1 상태 버퍼(key/ctr/nonce/ks)도 소거해
+        //   덤프에서 키스트림을 재구성하지 못하게 한다. (S-box 상수 테이블은
+        //   고정 상수라 소거 불필요 — 키가 없으면 무의미.)
+        if stub.c1_mode {
+            seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.c1_state_va).unwrap(), None));
+            seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX, 0x80).unwrap(), None));
+            seq.push((Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(), Some(Label::ZeroMem)));
+        }
     }
 }
 

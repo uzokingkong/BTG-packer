@@ -230,6 +230,9 @@ impl PolymorphicInterpreter {
                     // x86: count==0 이면 RFLAGS 불변.
                     if cnt != 0 {
                         self.flags.update_logic64(res);
+                        if (a >> (cnt - 1)) & 1 != 0 {
+                            self.flags.raw |= crate::vm::risc::flags::VFLAG_CF;
+                        }
                     }
                     self.store_operand(op_dst_raw, res);
                 }
@@ -240,6 +243,9 @@ impl PolymorphicInterpreter {
                     // x86: count==0 이면 RFLAGS 불변.
                     if cnt != 0 {
                         self.flags.update_logic64(res);
+                        if (a >> (cnt - 1)) & 1 != 0 {
+                            self.flags.raw |= crate::vm::risc::flags::VFLAG_CF;
+                        }
                     }
                     self.store_operand(op_dst_raw, res);
                 }
@@ -250,7 +256,37 @@ impl PolymorphicInterpreter {
                     // x86: count==0 이면 RFLAGS 불변.
                     if cnt != 0 {
                         self.flags.update_logic64(res);
+                        if (a >> (64 - cnt)) & 1 != 0 {
+                            self.flags.raw |= crate::vm::risc::flags::VFLAG_CF;
+                        }
                     }
+                    self.store_operand(op_dst_raw, res);
+                }
+                RiscOp::Add { width } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    let res = self.flags.update_add(a, b, width);
+                    self.store_operand(op_dst_raw, res);
+                }
+                RiscOp::SubWithBorrow { width } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    let res = self.flags.update_sub(a, b, width);
+                    self.store_operand(op_dst_raw, res);
+                }
+                RiscOp::Inc { width } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let res = self.flags.update_inc(a, width);
+                    self.store_operand(op_dst_raw, res);
+                }
+                RiscOp::Dec { width } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let res = self.flags.update_dec(a, width);
+                    self.store_operand(op_dst_raw, res);
+                }
+                RiscOp::Not { width } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let res = !a & crate::vm::risc::flags::mask_for_width(width);
                     self.store_operand(op_dst_raw, res);
                 }
                 RiscOp::VirtualPush => {

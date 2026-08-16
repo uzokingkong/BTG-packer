@@ -148,14 +148,15 @@ pub(crate) fn run_cross_path_test() -> Result<()> {
             reg_bad.join("\n  ")
         ));
     }
+    // P0-1: RISC flag 모델이 bytecode(실측 x86)와 일치하도록 canonical화 완료 —
+    // 플래그 drift도 이제 하드 게이트로 승격한다. drift는 분기(Jcc/CMOV/SETcc)가
+    // 잘못된 쪽으로 가는 실질 버그다.
     if !flag_drift.is_empty() {
-        eprintln!(
-            "[cross-path] RISC flag-modeling drift ({} cases — needs the flag-kind micro-op architecture, see cross_path.rs):",
-            flag_drift.len()
-        );
-        for d in &flag_drift {
-            eprintln!("  {d}");
-        }
+        return Err(anyhow!(
+            "cross-path FLAG drift (real x86 flag-semantics bug, {}):\n  {}",
+            flag_drift.len(),
+            flag_drift.join("\n  ")
+        ));
     }
     Ok(())
 }

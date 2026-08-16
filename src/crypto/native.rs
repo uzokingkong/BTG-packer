@@ -34,19 +34,31 @@ fn lab(s: &mut Seq, name: &str) {
 
 /// 두 패스 라벨 해석: 1) 더미 타깃으로 길이/IP 수집, 2) rel32 타깃 패치.
 /// rel32 분기만 쓰므로 길이가 변하지 않는다.
+/// ⚠ DONT_FIX_BRANCHES 필수: NONE(기본)은 2-pass에서 근거리 분기를 rel8로 축소해
+/// pass1 측정 길이와 pass2 인코딩 길이가 어긋나고, 그 뒤 모든 라벨/명령이
+/// 엉키며 (크래시/무한루프) — 부트 스텁 `encode_rc4_block`과 동일한 방침이다.
 fn encode_with_labels(seq: &Seq, base: u64) -> Vec<u8> {
+    let opts = iced_x86::BlockEncoderOptions::DONT_FIX_BRANCHES;
+    let is_branch = |inst: &Instruction| {
+        inst.flow_control() != iced_x86::FlowControl::Next
+            && inst.flow_control() != iced_x86::FlowControl::Return
+    };
     let mut label_ip: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    // pass 1: 길이/IP
+    // pass 1: 길이/IP. ⚠ 분기 명령의 라벨은 "정의"가 아니라 "참조"이므로 label_ip를
+    // 덮어쓰면 안 된다 (라벨 정의(`lab` = Nopd+라벨)가 참조보다 앞에 있으면 그 IP가
+    // 참조 분기 주소로 오염 → 무한 루프/오분기). 부트 스텁 encode_rc4_block과 동일.
     let mut ips = Vec::with_capacity(seq.len());
     let mut lens = Vec::with_capacity(seq.len());
     let mut ip = base;
     for (inst, lbl) in seq {
         if let Some(l) = lbl {
-            label_ip.insert(l.clone(), ip);
+            if !is_branch(inst) {
+                label_ip.insert(l.clone(), ip);
+            }
         }
         let arr = [*inst];
         let blk = iced_x86::InstructionBlock::new(&arr, ip);
-        let len = match iced_x86::BlockEncoder::encode(64, blk, iced_x86::BlockEncoderOptions::NONE) {
+        let len = match iced_x86::BlockEncoder::encode(64, blk, opts) {
             Ok(res) => res.code_buffer.len(),
             Err(_) => 5,
         };
@@ -66,7 +78,7 @@ fn encode_with_labels(seq: &Seq, base: u64) -> Vec<u8> {
         }
         let arr = [ins];
         let blk = iced_x86::InstructionBlock::new(&arr, ips[i]);
-        if let Ok(res) = iced_x86::BlockEncoder::encode(64, blk, iced_x86::BlockEncoderOptions::NONE) {
+        if let Ok(res) = iced_x86::BlockEncoder::encode(64, blk, opts) {
             out.extend_from_slice(&res.code_buffer);
         } else {
             out.extend_from_slice(&[0x90; 1]);

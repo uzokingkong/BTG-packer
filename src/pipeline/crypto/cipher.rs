@@ -79,6 +79,31 @@ pub(crate) fn derive_seed_and_key(
     (seed_masked, seed_stored, key)
 }
 
+/// v60 (--custom-cipher): BTG-C1 키/논스 유도 (패커 ↔ 부트 스텁 단일 소스).
+///
+/// seed_masked(256B, 매 패킹 랜덤)의 앞 32바이트를 256-bit 키로, 그 다음
+/// 4바이트를 32-bit nonce로 쓴다. 부트 스텁 `emit_c1_init`이 seed_va에서 같은
+/// 바이트를 그대로 복사하므로 패커와 런타임이 항상 일치하며, 별도 상수를 코드에
+/// 박지 않아도 된다 (키/논스는 전부 시드 엔트로피에서 파생).
+pub(crate) fn derive_c1_key_nonce(seed_masked: &[u8]) -> ([u8; 32], u32) {
+    debug_assert!(seed_masked.len() >= 36, "seed must be 256 bytes for BTG-C1");
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&seed_masked[..32]);
+    let nonce = u32::from_le_bytes(seed_masked[32..36].try_into().unwrap());
+    (key, nonce)
+}
+
+/// v61 (--custom-cipher + reencrypt/m7): 4바이트 MBA per-block 키 → 32바이트
+/// BTG-C1 키 (8회 반복). M7/reencrypt C1 디스패처의 C1Init이 같은 확장을
+/// 어셈블리로 수행한다 — 패커와 런타임이 항상 일치해야 한다.
+pub(crate) fn repeat4(key: u32) -> [u8; 32] {
+    let mut k = [0u8; 32];
+    for i in 0..8usize {
+        k[i * 4..i * 4 + 4].copy_from_slice(&key.to_le_bytes());
+    }
+    k
+}
+
 pub(crate) fn emit_prga_sub(seq: &mut Vec<(Instruction, Option<Label>)>, _stub: &BootStubCtx) {
     // ── PRGA 서브루틴: rcx=buf, rdx=len ──
     seq.push((Instruction::with2(Code::Test_rm64_r64, Register::RDX, Register::RDX).unwrap(), Some(Label::Prga)));
