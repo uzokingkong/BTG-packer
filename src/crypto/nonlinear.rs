@@ -47,13 +47,24 @@ fn rotl8(x: u8, n: u32) -> u8 {
     x.rotate_left(n)
 }
 
-/// 커스텀 256B S-box 생성 (매번 계산 — 호출 비용은 무시 가능).
+/// 커스텀 256B S-box (1회 생성 후 캐시).
+///
+/// 리뷰 지적 #19: 매 호출마다 GF(2^8) 곱셈역을 전탐색(256×~128 gf_mul)하던 것을
+/// `OnceLock` 으로 캐시한다. S-box 는 결정적(상수 POLY/AFFINE_C)이므로 첫 호출
+/// 이후 결과는 불변이다. 공개 반환형은 그대로 `[u8; 256]`(사본)이라 기존 호출부
+/// (native/VM 삽입 테이블)와 호환된다.
 ///
 /// 아핀은 **홀수 개**의 항(identity + 회전 2개)을 쓴다 — 항 수가 짝수면
 /// x=1에서 다항식이 0이 되어 x^8+1과 공약수(x+1)를 갖고 비가역이 된다.
 /// (AES 아핀은 {1,2,3,4} 4개 회전 + 0x63이지만 GF역이 비선형성을 제공해
 ///  여전히 가역 — 여기서는 3항 아핀으로 전단사를 보장한다.)
 pub fn sbox() -> [u8; 256] {
+    use std::sync::OnceLock;
+    static SBOX: OnceLock<[u8; 256]> = OnceLock::new();
+    *SBOX.get_or_init(build_sbox)
+}
+
+fn build_sbox() -> [u8; 256] {
     let mut t = [0u8; 256];
     for x in 0..256u32 {
         let inv = gf_inv(x as u8);

@@ -9,11 +9,15 @@ use iced_x86::{
 };
 
 /// Generates x64 assembly bytes for a Trigger Block with a Dispatcher Bridge JMP at the end.
+///
+/// `state_key` 는 디스패처가 `push imm32` 로 받는 32비트 값이다. (리뷰 지적 #21:
+/// 이전에는 `u64` 로 받아 `Pushq_imm32(state_key as i32)` 로 상위 32비트를 조용히
+/// 잘랐다 — 계약과 타입이 모순. `u32` 로 선언해 명시적으로 만든다.)
 pub fn assemble_block_with_bridge(
     payload_code: &FnPayload,
     current_block_va: u64,
     next_block_id: u32,
-    state_key: u64,
+    state_key: u32,
     dispatcher_va: u64,
 ) -> Result<Vec<u8>> {
     let mut instructions = Vec::new();

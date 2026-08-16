@@ -27,7 +27,7 @@ impl BytecodeBuilder {
         self.labels.insert(label, self.bytes.len());
     }
 
-    fn fixup_all(&mut self) {
+    fn fixup_all(&mut self) -> Result<(), crate::vm::interp::VmError> {
         // Bug-3 fix: widen any rel8 branch whose offset falls outside [-128, 127] to
         // its rel32 form instead of truncating to i8 (which would jump to the wrong
         // address). Widenings splice bytes and shift later offsets, so iterate to a
@@ -40,7 +40,7 @@ impl BytecodeBuilder {
                 if width == 1 {
                     let target = match self.labels.get(&label) {
                         Some(&t) => t,
-                        None => panic!("vm bytecode: unresolved label {}", label),
+                        None => return Err(crate::vm::interp::VmError::UnresolvedLabel(label)),
                     };
                     let rel = target as i64 - (rel_off as i64 + 1);
                     if !(-128..=127).contains(&rel) {
@@ -59,26 +59,23 @@ impl BytecodeBuilder {
         for (rel_off, label, width) in &self.branches {
             let target = match self.labels.get(label) {
                 Some(&t) => t,
-                None => panic!("vm bytecode: unresolved label {}", label),
+                None => return Err(crate::vm::interp::VmError::UnresolvedLabel(*label)),
             };
             if *width == 1 {
                 let rel = target as i64 - (*rel_off as i64 + 1);
-                assert!(
-                    (-128..=127).contains(&rel),
-                    "vm bytecode: branch out of rel8 range (rel={})",
-                    rel
-                );
+                if !(-128..=127).contains(&rel) {
+                    return Err(crate::vm::interp::VmError::BranchRelOverflow(*label));
+                }
                 self.bytes[*rel_off] = rel as i8 as u8;
             } else {
                 let rel = target as i64 - (*rel_off as i64 + 4);
-                assert!(
-                    (-(1i64 << 31)..(1i64 << 31)).contains(&rel),
-                    "vm bytecode: branch out of rel32 range (rel={})",
-                    rel
-                );
+                if !(-(1i64 << 31)..(1i64 << 31)).contains(&rel) {
+                    return Err(crate::vm::interp::VmError::BranchRelOverflow(*label));
+                }
                 self.bytes[*rel_off..*rel_off + 4].copy_from_slice(&(rel as i32).to_le_bytes());
             }
         }
+        Ok(())
     }
 
     /// Widen the rel8 branch at `idx` to its rel32 sibling, splicing bytes into
@@ -375,6 +372,28 @@ impl BytecodeBuilder {
         self.bytes.extend_from_slice(&[OP_SETCC, dst, cond]);
     }
 
+    // ── v64: flags 저장/복원 (REP 문자열 루프가 x86 RFLAGS 를 보존) ──────────
+
+    /// vreg[dst] = STATE_FLAGS (플래그 저장).
+    pub fn get_flags(&mut self, dst: u8) {
+        self.bytes.extend_from_slice(&[OP_MOV_R_FLAGS, dst]);
+    }
+
+    /// STATE_FLAGS = vreg[src] (플래그 복원).
+    pub fn set_flags(&mut self, src: u8) {
+        self.bytes.extend_from_slice(&[OP_MOV_FLAGS_R, src]);
+    }
+
+    /// v65: CLD — clear the direction flag (DF=0 → string ops bump forward).
+    pub fn cld(&mut self) {
+        self.bytes.push(OP_CLD);
+    }
+
+    /// v65: STD — set the direction flag (DF=1 → string ops bump backward).
+    pub fn std(&mut self) {
+        self.bytes.push(OP_STD);
+    }
+
     // ── M3 follow-up: native API bridge builder (v24) ────────────────────────
 
     /// OP_NATIVE_CALL target_vreg: Win64 call to vreg[target].
@@ -602,15 +621,27 @@ impl BytecodeBuilder {
     }
 
     /// Finish: resolve branch offsets and return the bytecode.
+    ///
+    /// 리뷰 지적 #23: production 파이프라인은 `try_finish`(Result)를 쓰고, 이
+    /// `finish` 는 내부 불변식이 깨졌을 때 panic(expect) 하도록 호환 래퍼로 남긴다.
     pub fn finish(mut self) -> Vec<u8> {
-        self.fixup_all();
+        match self.try_finish() {
+            Ok(v) => v,
+            Err(e) => panic!("vm bytecode: finish failed: {e}"),
+        }
+    }
+
+    /// 실패 가능 버전 — 분기 라벨 미해석/rel 범위 초과를 panic 대신 `VmError` 로
+    /// 올린다. production pack 경로(리프터/상용 리프트)는 이 함수를 사용한다.
+    pub fn try_finish(mut self) -> Result<Vec<u8>, crate::vm::interp::VmError> {
+        self.fixup_all()?;
         // Bug-5 fix: guarantee the bytecode is self-terminating so neither the
         // interpreter (Err(OobIp)) nor the native VM (dispatch on a raw byte past the
         // buffer) can run off the end. Harmless if a HALT was already emitted.
         if self.bytes.last().copied() != Some(OP_HALT) {
             self.bytes.push(OP_HALT);
         }
-        self.bytes
+        Ok(self.bytes)
     }
 
     /// Phase 2.3 (v56): decompose the builder into its pre-fixup parts for the

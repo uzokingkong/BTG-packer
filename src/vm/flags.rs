@@ -305,6 +305,28 @@ pub fn logical_flags64(r: u64) -> u64 {
     f
 }
 
+/// Flags for BMI BLSR/BLSMSK/BLSI (32/64-bit). Intel SDM Vol. 2: SF, OF and
+/// CF are *cleared*, ZF is set iff the result is zero. PF/AF are undefined on
+/// x86 so we define them 0 (same "define undefined as 0" convention as the
+/// logical ops; the native handlers mask to FLAG_MASK identically).
+pub fn bls_flags(r: u64) -> u64 {
+    if r == 0 {
+        F_ZF
+    } else {
+        0
+    }
+}
+
+/// Flags for BMI ANDN (32/64-bit). Intel SDM Vol. 2: SF and ZF are updated
+/// from the result, CF and OF are cleared; AF/PF undefined (defined 0 here).
+pub fn andn_flags(r: u64, is64: bool) -> u64 {
+    let mut f = if r == 0 { F_ZF } else { 0 };
+    if (is64 && (r >> 63) != 0) || (!is64 && (r & 0x8000_0000) != 0) {
+        f |= F_SF;
+    }
+    f
+}
+
 /// Flags for 64-bit INC / DEC (CF preserved).
 pub fn inc_flags64(a: u64, prev: u64) -> u64 {
     let mut f = add_flags64(a, 1);

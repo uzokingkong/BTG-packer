@@ -30,9 +30,10 @@
 // into the state buffer at `state_va` and calls the module entry).
 // ==============================================================================
 
-use crate::vm::threaded::poly_direct::build_self_decoding_parts;
+use crate::vm::threaded::poly_direct::build_self_decoding_parts_with;
 use crate::vm::VmModule;
 use anyhow::Result;
+use std::collections::HashMap;
 
 /// Commercial VM state buffer size (harness layout: REGS 0x80 + TEMPS 0x40 +
 /// FLAGS + VSP + padding = 0x100). Used to place the virtual stack top (R13)
@@ -70,13 +71,14 @@ pub fn build_program_vm_commercial(
     bytecode: Vec<u8>,
     state_va: u64,
     seed: u64,
+    ip_map: Option<&HashMap<u64, usize>>,
 ) -> Result<VmModule> {
     // Virtual stack top: right after the state buffer (COMMERCIAL_STATE_SIZE),
     // growing down into the reserved VIRTUAL_STACK_SIZE region. Keeps the
     // dispatcher's R13-based push/pop isolated from both state and bytecode.
     let stack_base = state_va.wrapping_add(COMMERCIAL_STATE_SIZE).wrapping_add(VIRTUAL_STACK_SIZE);
 
-    let parts = build_self_decoding_parts(
+    let parts = build_self_decoding_parts_with(
         &bytecode,
         seed,
         code_va,
@@ -84,22 +86,30 @@ pub fn build_program_vm_commercial(
         bytecode_va,
         state_va,
         stack_base,
+        ip_map,
     )?;
 
-    // ── table blob: [256x8 handler][256x8 op-offset][256 op-kind] = 0xA00 ──
+    // ── table blob: [256x8 handler][256x8 op-offset][256 op-kind][256 cond-code][branch_map] ──
     // The dispatcher reads operand tables relative to R15 (handler table base):
     //   sub_resolve / sub_store use [R15 + (OFF_OP_OFFS - OFF_TABLE)] = +0x800
     //   and [R15 + (OFF_OP_FLAGS - OFF_TABLE)] = +0x900.
-    // So the embedded table must place op-offset at table_va+0x800 and op-kind
-    // at table_va+0x900.
-    let mut table = Vec::with_capacity(0xA00);
+    //   sub_dec_ops_cond uses [R15 + (OFF_COND_CODES - OFF_TABLE)] = +0xA00.
+    //   h_branch's branch-map base uses [R15 + (OFF_BRANCH_MAP - OFF_TABLE)] = +0xB00.
+    // So the embedded table must place op-offset at table_va+0x800, op-kind at
+    // table_va+0x900, cond-code at table_va+0xA00 and the branch map at
+    // table_va+0xB00 (the whole-program commercial lift resolves VirtualBranch
+    // targets through ip_map -> bytecode byte offsets; without it the branch
+    // handler scans past the map -> AV).
+    let mut table = Vec::with_capacity(0xB00 + parts.branch_map.len());
     for v in &parts.table {
         table.extend_from_slice(&v.to_le_bytes());
     }
     debug_assert_eq!(table.len(), 0x800, "handler table must be 0x800 bytes");
     table.extend_from_slice(&parts.offs_tab); // at +0x800
     table.extend_from_slice(&parts.flags_tab); // at +0x900
-    debug_assert_eq!(table.len(), 0xA00, "module table blob must be 0xA00 bytes");
+    table.extend_from_slice(&parts.cond_codes); // at +0xA00
+    debug_assert_eq!(table.len(), 0xB00, "module table blob must be 0xB00 bytes");
+    table.extend_from_slice(&parts.branch_map); // at +0xB00 (VirtualBranch resolution)
 
     Ok(VmModule { code: parts.code, table, bytecode })
 }
@@ -165,11 +175,14 @@ mod tests {
         // Sizing pass: code/table/bytecode lengths are VA-independent (all
         // absolute references are fixed-size imm64/rel encodings), so build once
         // with dummy VAs to learn lengths, then lay out and rebuild with real VAs.
-        let dummy = build_program_vm_commercial(0, 0x100000, 0x200000, bytecode.clone(), 0x300000, seed)
+        let dummy = build_program_vm_commercial(0, 0x100000, 0x200000, bytecode.clone(), 0x300000, seed, None)
             .expect("commercial module sizing");
         let code_len = dummy.code.len();
         let table_len = dummy.table.len();
-        assert_eq!(table_len, 0xA00, "table blob must be 0xA00");
+        // table blob = 0xB00 (handlers/offs/flags/cond-codes) + branch_map
+        // (u32 count + entries); the linear block has no VirtualBranch so the
+        // map is just the 4-byte zero count.
+        assert_eq!(table_len, 0xB00 + 4, "table blob must be 0xB00 + branch_map");
 
         // Real layout inside the arena (matching place.rs: [code][table][bytecode][state]).
         let code_off = 0x1000usize;
@@ -186,7 +199,7 @@ mod tests {
         let state_va = (base + state_off) as u64;
 
         let module = build_program_vm_commercial(
-            code_va, table_va, bytecode_va, bytecode.clone(), state_va, seed,
+            code_va, table_va, bytecode_va, bytecode.clone(), state_va, seed, None,
         )
         .expect("commercial module build");
 

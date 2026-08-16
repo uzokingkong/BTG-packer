@@ -232,6 +232,59 @@ pub(crate) fn run_flags_jcc_test() -> Result<()> {
                 assert_eq!(got & FLAG_MASK, ef & FLAG_MASK, "shift cl fl op=0x{:02X} x=0x{:X} n={}", op, x, n);
             }
         }
+        // count == 0 → RFLAGS 불변 (x86: shl/shr/sar count 0 은 flags 유지).
+        // 이전 버그: native handler 가 count==0 에도 `and ecx, mask`/디스패처가
+        // 세운 플래그를 capture 해 STATE_FLAGS 를 덮어썼다 (interp 와 차등 불일치).
+        for (op, kind) in [
+            (OP_SHL_R_IMM8, flags::ShiftKind::Shl),
+            (OP_SHR_R_IMM8, flags::ShiftKind::Shr),
+            (OP_SAR_R_IMM8, flags::ShiftKind::Sar),
+        ] {
+            let x = 0x9ABC_DE01u32;
+            let expect = flags::shift_flags(
+                kind,
+                x,
+                1,
+                match kind {
+                    flags::ShiftKind::Shl => x.wrapping_shl(1),
+                    flags::ShiftKind::Shr => x.wrapping_shr(1),
+                    flags::ShiftKind::Sar => ((x as i32) >> 1) as u32,
+                },
+            );
+            let mut bc = BytecodeBuilder::new();
+            bc.mov_r_imm32(0, x);
+            bc.shift_r_imm8(op, 0, 1); // flags 세팅 (count 1)
+            bc.shift_r_imm8(op, 0, 0); // count==0 → flags 불변
+            bc.halt();
+            let (got, _) = run_prog(&bc.finish());
+            assert_eq!(got & FLAG_MASK, expect & FLAG_MASK, "count==0 shift must preserve flags (imm8 0x{:02X})", op);
+        }
+        for (op, kind) in [
+            (OP_SHL_R_CL, flags::ShiftKind::Shl),
+            (OP_SHR_R_CL, flags::ShiftKind::Shr),
+            (OP_SAR_R_CL, flags::ShiftKind::Sar),
+        ] {
+            let x = 0x9ABC_DE01u32;
+            let expect = flags::shift_flags(
+                kind,
+                x,
+                1,
+                match kind {
+                    flags::ShiftKind::Shl => x.wrapping_shl(1),
+                    flags::ShiftKind::Shr => x.wrapping_shr(1),
+                    flags::ShiftKind::Sar => ((x as i32) >> 1) as u32,
+                },
+            );
+            let mut bc = BytecodeBuilder::new();
+            bc.mov_r_imm32(0, x);
+            bc.mov_r_imm32(1, 1);
+            bc.shift_r_cl(op, 0); // flags 세팅 (count 1)
+            bc.mov_r_imm32(1, 0);
+            bc.shift_r_cl(op, 0); // count==0 → flags 불변
+            bc.halt();
+            let (got, _) = run_prog(&bc.finish());
+            assert_eq!(got & FLAG_MASK, expect & FLAG_MASK, "count==0 shift must preserve flags (cl 0x{:02X})", op);
+        }
         // TEST (rr and imm)
         for _ in 0..16 {
             let (a, b) = (rng2.next_u32(), rng2.next_u32());

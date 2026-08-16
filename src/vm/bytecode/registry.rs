@@ -40,8 +40,8 @@ macro_rules! opcodes {
             pub const $name: u8 = $val;
         )*
 
-        /// Handler-table slot count (opcodes 0x00..=0xBB). 0x00 = invalid-opcode handler.
-        pub const NUM_OPS: usize = 0xBC;
+        /// Handler-table slot count (opcodes 0x00..=0xBF). 0x00 = invalid-opcode handler.
+        pub const NUM_OPS: usize = 0xC0;
 
         /// Opcode -> (mnemonic, operand byte length after the opcode byte).
         pub const OPCODE_INFO: &[(u8, &'static str, usize)] = &[
@@ -144,6 +144,11 @@ opcodes! {
     OP_SHR64_R_CL = 0x4E : "shr64" , 1 ;
     OP_SAR64_R_CL = 0x4F : "sar64" , 1 ;
     OP_NOP = 0x50 : "nop" , 0 ;
+    // v64: flags ↔ vreg 이동 (REP 문자열 루프가 x86 RFLAGS 를 보존하기 위함).
+    //   OP_MOV_R_FLAGS (op, dst): vreg[dst] = STATE_FLAGS
+    //   OP_MOV_FLAGS_R (op, src): STATE_FLAGS = vreg[src]
+    OP_MOV_R_FLAGS = 0xBC : "mov_flags" , 1 ;
+    OP_MOV_FLAGS_R = 0xBD : "mov_flags" , 1 ;
     OP_MOVSD_XMM_MEM = 0x51 : "movsd" , 2 ;
     OP_MOVSD_MEM_XMM = 0x52 : "movsd" , 2 ;
     OP_MOVUPS_XMM_MEM = 0x53 : "movups" , 2 ;
@@ -234,7 +239,10 @@ opcodes! {
     OP_UNPCKLPS_XMM = 0x8A : "unpcklps", 2 ;
     // ── v52: BMI1/2 (Group B, Phase 2.1) ─────────────────────────────────────
     // Register-register bit-manipulation. LZCNT/POPCNT mirror TZCNT's portable
-    // (no-CPU-dep) emulation; BLSR/BLSMSK/BLSI/ANDN are plain bit arithmetic.
+    // (no-CPU-dep) emulation; BLSR/BLSMSK/BLSI/ANDN are NOT plain bit
+    // arithmetic — Intel SDM gives them flag semantics (BLS*: ZF on result,
+    // SF/OF/CF cleared; ANDN: SF/ZF on result, CF/OF cleared). The interpreter
+    // and native handlers both set these flags.
     // Encoding [op, dst_vreg, src_vreg]; ANDN is [op, dst, src1, src2].
     OP_LZCNT_R32   = 0x8B : "lzcnt32", 2 ;
     OP_LZCNT_R64   = 0x8C : "lzcnt64", 2 ;
@@ -307,6 +315,13 @@ opcodes! {
     OP_SHLD64_R_R_CL    = 0xB9 : "shld64", 2 ;
     OP_SHRD64_R_R_IMM8  = 0xBA : "shrd64", 3 ;
     OP_SHRD64_R_R_CL    = 0xBB : "shrd64", 2 ;
+    // ── v65: Direction Flag — CLD clears DF, STD sets DF (string-op direction).
+    // DF (x86 RFLAGS bit 10) is stored in STATE_FLAGS. Unlike the status flags it
+    // is NOT recomputed by arithmetic: `set_flags` preserves the modelled DF bit
+    // and these two ops change only it. REP string ops read it to pick the pointer
+    // bump direction (+n when clear, -n when set). Encoding: no operands.
+    OP_CLD = 0xBE : "cld", 0 ;
+    OP_STD = 0xBF : "std", 0 ;
 }
 
 /// Index-slot sentinel for LEA: no index term (see opcodes! / OP_LEA).
@@ -328,6 +343,7 @@ pub const F_PF: u64 = 1 << 2;  // parity (even # of 1s in low byte)
 pub const F_AF: u64 = 1 << 4;  // auxiliary carry (bit 3)
 pub const F_ZF: u64 = 1 << 6;  // zero
 pub const F_SF: u64 = 1 << 7;  // sign
+pub const F_DF: u64 = 1 << 10; // direction (string ops; NOT a status flag)
 pub const F_OF: u64 = 1 << 11; // overflow (signed)
 /// The 6 modelled status-flag bits. STATE_FLAGS may hold other (unused) bits,
 /// but all comparisons / Jcc evaluation mask against this.

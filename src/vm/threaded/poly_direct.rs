@@ -26,217 +26,22 @@ use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, MemoryOperand, Register,
 };
 
-// ── arena layout ─────────────────────────────────────────────────────────────
-const OFF_CODE: usize = 0x1000;      // entry + dispatch + handlers + helpers
-const OFF_TABLE: usize = 0x8000;     // handler table: decrypted opcode byte -> handler VA (256 x u64)
-const OFF_OP_OFFS: usize = 0x8800;   // operand-encoding -> state offset (256 x u8)
-const OFF_OP_FLAGS: usize = 0x8900;  // operand-encoding -> kind flag (256 x u8): 0=reg/temp/vsp/flags,1=imm,2=none
-const OFF_COND_CODES: usize = 0x8A00; // decrypted cond byte -> canonical COND_* code (256 x u8)
-const OFF_BRANCH_MAP: usize = 0x8B00; // branch-resolution table: u32 count + count x (u64 target_value, u64 byte_offset)
-const OFF_BYTECODE: usize = 0x9000;  // encrypted polymorphic stream (copied)
-const OFF_STATE: usize = 0xA000;     // VM state buffer
-const OFF_STACK_BASE: usize = 0xE000; // virtual stack (grows down)
-const ARENA_SIZE: usize = 0x40000;
+mod codegen_util;
 
-// state buffer offsets (relative to state_base, held in RDX)
-const REGS_OFF: i32 = 0x000;
-const TEMPS_OFF: i32 = 0x080;
-const FLAGS_OFF: i32 = 0x0C0;
-const VSP_OFF: i32 = 0x0C8;
-const DEC_DST: i32 = 0x0D0;  // u8
-const DEC_SRC1: i32 = 0x0D1; // u8
-const DEC_SRC2: i32 = 0x0D2; // u8
-const DEC_COND: i32 = 0x0D3; // u8  — decoded branch condition byte (VirtualBranch/Setcc/CMOV)
-const DEC_IMM1: i32 = 0x0D8; // u64
-const DEC_IMM2: i32 = 0x0E0; // u64
-const DEC_CIN: i32 = 0x0E8;  // u64
-const STATE_END: i32 = 0x100;
-
-// operand kind flags (OFF_OP_FLAGS)
-const K_REG: u8 = 0;
-const K_IMM: u8 = 1;
-const K_NONE: u8 = 2;
-
-// ── canonical branch-condition codes (OFF_COND_CODES table values) ───────────
-// Mirror the BranchCondition variant ordering in src/vm/risc/opcodes.rs so the
-// native VirtualBranch/Setcc/CMOV handlers can switch on a stable code instead of
-// the seed-randomized cond bytes. 0xFF = unknown/invalid cond byte.
-pub const COND_ALWAYS: u8 = 0;
-pub const COND_ZERO: u8 = 1;
-pub const COND_NOT_ZERO: u8 = 2;
-pub const COND_CARRY: u8 = 3;
-pub const COND_NOT_CARRY: u8 = 4;
-pub const COND_SIGN: u8 = 5;
-pub const COND_NOT_SIGN: u8 = 6;
-pub const COND_OVERFLOW: u8 = 7;
-pub const COND_NOT_OVERFLOW: u8 = 8;
-pub const COND_GREATER: u8 = 9;
-pub const COND_LESS: u8 = 10;
-pub const COND_GREATER_OR_EQUAL: u8 = 11;
-pub const COND_LESS_OR_EQUAL: u8 = 12;
-pub const COND_ABOVE: u8 = 13;
-pub const COND_ABOVE_OR_EQUAL: u8 = 14;
-pub const COND_BELOW: u8 = 15;
-pub const COND_BELOW_OR_EQUAL: u8 = 16;
-pub const COND_PARITY: u8 = 17;
-pub const COND_NOT_PARITY: u8 = 18;
-pub const COND_COUNTER_ZERO_2: u8 = 19;
-pub const COND_COUNTER_ZERO_4: u8 = 20;
-pub const COND_COUNTER_ZERO_8: u8 = 21;
-pub const COND_INVALID: u8 = 0xFF;
-
-const FLAG_MASK: u64 = 0x8C1; // CF|ZF|SF|OF
-
-/// Map a `BranchCondition` to its canonical native code (OFF_COND_CODES value).
-fn cond_code(cond: BranchCondition) -> u8 {
-    use BranchCondition::*;
-    match cond {
-        Always => COND_ALWAYS,
-        Zero => COND_ZERO,
-        NotZero => COND_NOT_ZERO,
-        Carry => COND_CARRY,
-        NotCarry => COND_NOT_CARRY,
-        Sign => COND_SIGN,
-        NotSign => COND_NOT_SIGN,
-        Overflow => COND_OVERFLOW,
-        NotOverflow => COND_NOT_OVERFLOW,
-        Greater => COND_GREATER,
-        Less => COND_LESS,
-        GreaterOrEqual => COND_GREATER_OR_EQUAL,
-        LessOrEqual => COND_LESS_OR_EQUAL,
-        Above => COND_ABOVE,
-        AboveOrEqual => COND_ABOVE_OR_EQUAL,
-        Below => COND_BELOW,
-        BelowOrEqual => COND_BELOW_OR_EQUAL,
-        Parity => COND_PARITY,
-        NotParity => COND_NOT_PARITY,
-        CounterZero(2) => COND_COUNTER_ZERO_2,
-        CounterZero(4) => COND_COUNTER_ZERO_4,
-        CounterZero(_) => COND_COUNTER_ZERO_8,
-    }
-}
-
-// Rolling-key engine constants (must match `RollingKeyEngine`).
-const C1: u64 = 0x9E3779B97F4A7C15;
-const C2: u64 = 0xBF58476D1CE4E5B9;
-const C3: u64 = 0x517CC1B727220A95;
-const C4: u64 = 0x1337BEEFCAFE0001;
-const C5: u64 = 0x94D049BB133111EB;
-
-// ── small code builder (two-pass branch patching, mirroring pass3) ──────────
-struct CodeBuilder {
-    instrs: Vec<Instruction>,
-    /// (branch instruction index, target instruction index)
-    branches: Vec<(usize, usize)>,
-}
-
-impl CodeBuilder {
-    fn new() -> Self {
-        Self { instrs: Vec::new(), branches: Vec::new() }
-    }
-    fn push(&mut self, i: Instruction) -> usize {
-        self.instrs.push(i);
-        self.instrs.len() - 1
-    }
-    fn len(&self) -> usize {
-        self.instrs.len()
-    }
-    fn br(&mut self, code: Code, target: usize) {
-        let idx = self.push(Instruction::with_branch(code, 0).unwrap());
-        self.branches.push((idx, target));
-    }
-    fn jmp(&mut self, target: usize) {
-        self.br(Code::Jmp_rel32_64, target);
-    }
-    fn jne(&mut self, target: usize) {
-        self.br(Code::Jne_rel32_64, target);
-    }
-    fn je(&mut self, target: usize) {
-        self.br(Code::Je_rel32_64, target);
-    }
-    fn call(&mut self, target: usize) {
-        self.br(Code::Call_rel32_64, target);
-    }
-
-    fn assemble(&mut self, base_va: u64) -> Result<(Vec<u8>, Vec<u64>)> {
-        // Branch sizes may be shrunk by BlockEncoder (rel32 -> rel8), so the layout
-        // is not known a priori. Iterate: guess branch targets, encode, read back the
-        // true per-instruction offsets, and re-target until it converges.
-        let mut ips: Vec<u64> = (0..self.instrs.len()).map(|_| base_va).collect();
-        let mut code = Vec::new();
-        for _ in 0..16 {
-            for &(bi, ti) in &self.branches {
-                self.instrs[bi].set_near_branch64(ips[ti]);
-            }
-            let blk = InstructionBlock::new(&self.instrs, base_va);
-            let enc = BlockEncoder::encode(
-                64,
-                blk,
-                BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
-            )
-            .map_err(|e| anyhow!("block: {e:?}"))?;
-            let new_ips: Vec<u64> = enc
-                .new_instruction_offsets
-                .iter()
-                .map(|o| base_va + *o as u64)
-                .collect();
-            code = enc.code_buffer;
-            if new_ips == ips {
-                ips = new_ips;
-                break;
-            }
-            ips = new_ips;
-        }
-        Ok((code, ips))
-    }
-}
-
-fn m(disp: i32) -> MemoryOperand {
-    MemoryOperand::with_base_index_scale_displ_size(Register::RDX, Register::None, 1, disp as i64, 8)
-}
-fn m8(disp: i32) -> MemoryOperand {
-    MemoryOperand::with_base_index_scale_displ_size(Register::RDX, Register::None, 1, disp as i64, 1)
-}
-fn movi(b: &mut CodeBuilder, r: Register, v: u64) {
-    b.push(Instruction::with2(Code::Mov_r64_imm64, r, v).unwrap());
-}
-fn mov_m(b: &mut CodeBuilder, r: Register, disp: i32) {
-    b.push(Instruction::with2(Code::Mov_r64_rm64, r, m(disp)).unwrap());
-}
-fn store_m(b: &mut CodeBuilder, disp: i32, r: Register) {
-    b.push(Instruction::with2(Code::Mov_rm64_r64, m(disp), r).unwrap());
-}
-fn movzx8_m(b: &mut CodeBuilder, r: Register, disp: i32) {
-    b.push(Instruction::with2(Code::Movzx_r32_rm8, r, m8(disp)).unwrap());
-}
-
-/// 8-byte little-endian immediate read via decrypt_byte calls, XOR operand_mask.
-/// Result stored in the state DEC_* slot. Clobbers RAX,RCX,RBX,R11 (stream advanced).
-///
-/// NOTE: the 64-bit accumulator MUST be a register that `sub_decrypt` preserves.
-/// `sub_decrypt` clobbers RAX/RCX/R9/R10/R11/R12/R14 but keeps RBX/R13/R15/RDX, so
-/// we accumulate in RBX. The original code used R9 — on the 2nd..8th `call` the
-/// partial immediate was destroyed by the callee, corrupting every decoded value.
-fn emit_read_imm8(b: &mut CodeBuilder, slot: i32, sub_decrypt: usize, mask: u64) {
-    b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RBX, Register::RBX).unwrap());
-    for i in 0..8 {
-        b.call(sub_decrypt);
-        b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::AL).unwrap());
-        if i == 0 {
-            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::RAX).unwrap());
-        } else {
-            b.push(Instruction::with2(Code::Shl_rm64_imm8, Register::RAX, (i * 8) as i32).unwrap());
-            b.push(Instruction::with2(Code::Or_rm64_r64, Register::RBX, Register::RAX).unwrap());
-        }
-    }
-    movi(b, Register::RCX, mask);
-    b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RBX, Register::RCX).unwrap());
-    store_m(b, slot, Register::RBX);
-}
-
-// ==============================================================================
-// The native self-decoding dispatcher.
-// ==============================================================================
+pub(crate) use codegen_util::{
+    cond_code, emit_read_imm8, m, m8, mov_m, movi, movzx8_m, store_m, CodeBuilder,
+    ARENA_SIZE, C1, C2, C3, C4, C5, DEC_CIN, DEC_DST, DEC_IMM1, DEC_IMM2, DEC_SRC1, DEC_SRC2, DEC_COND,
+    FLAG_MASK, FLAGS_OFF, K_IMM, K_NONE, K_REG, OFF_BRANCH_MAP, OFF_BYTECODE, OFF_COND_CODES, OFF_CODE,
+    OFF_OP_FLAGS, OFF_OP_OFFS, OFF_STACK_BASE, OFF_STATE, OFF_TABLE, REGS_OFF, STATE_END,
+    TEMPS_OFF, VSP_OFF,
+    COND_ABOVE, COND_ABOVE_OR_EQUAL, COND_ALWAYS, COND_BELOW, COND_BELOW_OR_EQUAL, COND_CARRY,
+    COND_COUNTER_ZERO_2, COND_COUNTER_ZERO_4, COND_COUNTER_ZERO_8, COND_GREATER,
+    COND_GREATER_OR_EQUAL, COND_INVALID, COND_LESS, COND_LESS_OR_EQUAL, COND_NOT_CARRY,
+    COND_NOT_OVERFLOW, COND_NOT_PARITY, COND_NOT_SIGN, COND_NOT_ZERO, COND_OVERFLOW,
+    COND_PARITY, COND_SIGN, COND_ZERO,
+};
+#[cfg(test)]
+mod poly_direct_tests;
 
 /// P3 (G1): assembled self-decoding dispatcher pieces (machine code + tables).
 pub struct SelfDecodingParts {
@@ -249,6 +54,11 @@ pub struct SelfDecodingParts {
     pub flags_tab: Vec<u8>,
     /// 256 x u8 cond-code table (decrypted cond byte -> canonical COND_* code, 0xFF invalid).
     pub cond_codes: Vec<u8>,
+    /// Branch-resolution table (u32 count + count x (u64 target_value, u64 byte_offset)),
+    /// embedded at OFF_BRANCH_MAP / table_va+0xB00. The VirtualBranch handler scans it
+    /// to map a target (source-IP via ip_map, or direct micro-op index) to a bytecode
+    /// byte offset for the rolling-key re-sync.
+    pub branch_map: Vec<u8>,
 }
 
 /// P3 (G1): build the self-decoding rolling-key dispatcher machine code and its
@@ -261,6 +71,7 @@ pub struct SelfDecodingParts {
 /// table VA, `bytecode_base` = encrypted poly stream VA, `state_base` = VM state
 /// buffer VA, `stack_base` = virtual stack top VA. The `code` embeds these as
 /// absolute immediates in the entry stub.
+/// Backward-compatible 7-arg builder (no ip_map) — delegates to `_with` with None.
 pub fn build_self_decoding_parts(
     bytecode: &[u8],
     seed: u64,
@@ -269,6 +80,23 @@ pub fn build_self_decoding_parts(
     bytecode_base: u64,
     state_base: u64,
     stack_base: u64,
+) -> Result<SelfDecodingParts> {
+    build_self_decoding_parts_with(
+        bytecode, seed, code_base, table_base, bytecode_base, state_base, stack_base, None,
+    )
+}
+
+/// Full builder with optional ip_map (source-IP -> program index) for VirtualBranch
+/// branch resolution.
+pub fn build_self_decoding_parts_with(
+    bytecode: &[u8],
+    seed: u64,
+    code_base: u64,
+    table_base: u64,
+    bytecode_base: u64,
+    state_base: u64,
+    stack_base: u64,
+    ip_map: Option<&HashMap<u64, usize>>,
 ) -> Result<SelfDecodingParts> {
     let spec = VirtualIsaSpec::from_seed(seed);
     let init_key = seed.wrapping_mul(C1) ^ 0x517CC1B727220A95;
@@ -326,12 +154,27 @@ pub fn build_self_decoding_parts(
     // backward), decrypting intermediate bytes so the key state matches the encoder's.
     // ip_map is optional; when absent, absolute-index VirtualBranch targets fall
     // back to direct micro-op index resolution (matching `resolve_target`).
-    let ip_map: Option<&HashMap<u64, usize>> = None;
+    let ip_map: Option<&HashMap<u64, usize>> = ip_map;
     let mut dec = PolymorphicDecoder::new(seed);
-    let prog = dec.decode(bytecode)?;
+    let prog = dec.decode_full(bytecode, false)?;
     let mut reenc = PolymorphicEncoder::new(seed);
-    let (_re_bc, op_offsets) = reenc.encode_with_offsets(&prog)?;
-    debug_assert_eq!(_re_bc, bytecode, "decode+re-encode must reproduce the bytecode");
+    let (re_bc, op_offsets) = reenc.encode_with_offsets(&prog)?;
+    if re_bc != bytecode {
+        return Err(anyhow!(
+            "self-decoding branch-map: decode+re-encode diverged from the placed bytecode ({} vs {} bytes); \
+             branch-map offsets would be invalid",
+            re_bc.len(),
+            bytecode.len()
+        ));
+    }
+    for (i, &off) in op_offsets.iter().enumerate() {
+        if off >= bytecode.len() {
+            return Err(anyhow!(
+                "self-decoding branch-map: micro-op {i} byte offset {off:#x} exceeds bytecode len {:#x}",
+                bytecode.len()
+            ));
+        }
+    }
     let resolve_off = |tgt: u64, op_offsets: &[usize], ip_map: &Option<&HashMap<u64, usize>>| -> Option<u64> {
         if let Some(im) = ip_map {
             if let Some(&idx) = im.get(&tgt) {
@@ -519,7 +362,11 @@ pub fn build_self_decoding_parts(
 
     // eval_cond subroutine: DEC_COND (canonical code) + FLAGS slot + regs[1] -> taken.
     // in: RDX=state; R8/R12/R14 untouched. out: AL = 1 (taken) / 0 (not taken).
-    // Clobbers RAX, RCX, R8; preserves RBX, R9, R10, R11, R12, R13, R14, R15, RDX.
+    // Clobbers RAX, RCX only; preserves RBX, R8, R9, R10, R11, R12, R13, R14, R15, RDX.
+    // NOTE: R8 (bytecode_base) must survive — VirtualBranch calls sub_resync ->
+    // sub_decrypt (reads [R8+R12]) right after this. The setcc result is staged in
+    // AL, not R8L (previous code clobbered R8L, corrupting bytecode_base -> wrong
+    // rolling key -> garbage dispatch target -> AV on taken backward branches).
     let sub_eval_cond = b.len();
     {
         b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, m8(DEC_COND)).unwrap());
@@ -538,31 +385,33 @@ pub fn build_self_decoding_parts(
                 // Always
                 b.push(Instruction::with2(Code::Mov_r32_imm32, Register::EAX, 1).unwrap());
             } else if k >= 19 {
-                // CounterZero(w): virtual RCX (regs[1]) low w bytes == 0
+                // CounterZero(w): virtual RCX (regs[1]) low w bytes == 0. Load the
+                // full 64-bit regs[1] (qword memory operand) and isolate the low w
+                // bytes with shifts (avoids iced's 16-bit MemoryOperand quirks).
                 let width = if k == 19 { 2 } else if k == 20 { 4 } else { 8 };
-                let mem = MemoryOperand::with_base_index_scale_displ_size(
-                    Register::RDX, Register::None, 1, (REGS_OFF + 8) as i64, width as u32,
-                );
-                match width {
-                    2 => b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::EAX, mem).unwrap()),
-                    4 => b.push(Instruction::with2(Code::Mov_r32_rm32, Register::EAX, mem).unwrap()),
-                    _ => b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, mem).unwrap()),
+                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(REGS_OFF + 8)).unwrap());
+                if width == 2 {
+                    b.push(Instruction::with2(Code::Shl_rm64_imm8, Register::RAX, 48).unwrap());
+                    b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RAX, 48).unwrap());
+                } else if width == 4 {
+                    b.push(Instruction::with2(Code::Shl_rm64_imm8, Register::RAX, 32).unwrap());
+                    b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RAX, 32).unwrap());
                 }
                 b.push(Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap());
-                b.push(Instruction::with1(Code::Setz_rm8, Register::R8L).unwrap());
-                b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::R8L).unwrap());
+                b.push(Instruction::with1(Code::Sete_rm8, Register::AL).unwrap());
+                b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::AL).unwrap());
             } else {
                 // flag-based: the FLAGS slot uses x86 RFLAGS bit layout (CF=1,ZF=0x40,
                 // SF=0x80,OF=0x800,PF=4), so load it into RFLAGS and use the setcc
                 // matching the x86 condition code semantics.
                 b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(FLAGS_OFF)).unwrap());
-                b.push(Instruction::with(Code::Pushfq));
-                b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
+                b.push(Instruction::with1(Code::Push_r64, Register::RAX).unwrap());
+                b.push(Instruction::with(Code::Popfq));
                 let setcc = match k {
-                    1 => Code::Setz_rm8,
-                    2 => Code::Setnz_rm8,
-                    3 => Code::Setc_rm8,
-                    4 => Code::Setnc_rm8,
+                    1 => Code::Sete_rm8,
+                    2 => Code::Setne_rm8,
+                    3 => Code::Setb_rm8,
+                    4 => Code::Setae_rm8,
                     5 => Code::Sets_rm8,
                     6 => Code::Setns_rm8,
                     7 => Code::Seto_rm8,
@@ -578,8 +427,8 @@ pub fn build_self_decoding_parts(
                     17 => Code::Setp_rm8,
                     _ => Code::Setnp_rm8,
                 };
-                b.push(Instruction::with1(setcc, Register::R8L).unwrap());
-                b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::R8L).unwrap());
+                b.push(Instruction::with1(setcc, Register::AL).unwrap());
+                b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::AL).unwrap());
             }
             b.br(Code::Jmp_rel32_64, 0x9000);
         }
@@ -748,6 +597,16 @@ pub fn build_self_decoding_parts(
         b.push(Instruction::with1(Code::Push_r64, Register::R13).unwrap());
         b.push(Instruction::with1(Code::Push_r64, Register::R14).unwrap());
         b.push(Instruction::with1(Code::Push_r64, Register::R15).unwrap());
+        // FIX(ABI): the dispatcher is invoked via an `extern "C"` call (arena.call
+        // / boot stub), which requires the callee to preserve ALL Win64
+        // callee-saved registers (RDI, RSI, RBX, RBP in addition to R12-R15).
+        // Handlers (CompareExchange uses RBX, others use RDI/RSI/RBX/RBP) clobber
+        // them; without saving here the Rust caller's state is corrupted after the
+        // call returns (AV in the differential tests). HALT pops them in reverse.
+        b.push(Instruction::with1(Code::Push_r64, Register::RDI).unwrap());
+        b.push(Instruction::with1(Code::Push_r64, Register::RSI).unwrap());
+        b.push(Instruction::with1(Code::Push_r64, Register::RBX).unwrap());
+        b.push(Instruction::with1(Code::Push_r64, Register::RBP).unwrap());
         movi(&mut b, Register::R8, bytecode_base);
         b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R12, Register::R12).unwrap());
         movi(&mut b, Register::R13, stack_base);
@@ -799,6 +658,10 @@ pub fn build_self_decoding_parts(
     {
         b.call(sub_dec_ops);
         // cin is present only when src1 and src2 are both non-immediate (encoder contract).
+        // Zero the DEC_CIN slot first so immediate-operand adds don't add a stale cin
+        // left by an earlier register-operand add/sub (emit_sub writes cin=1 there).
+        b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RAX).unwrap());
+        store_m(&mut b, DEC_CIN, Register::RAX);
         movzx8_m(&mut b, Register::EAX, DEC_SRC1);
         b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 0x01).unwrap());
         let no_cin = b.len() + 1;
@@ -837,11 +700,12 @@ pub fn build_self_decoding_parts(
         b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
         b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 1).unwrap());
         b.push(Instruction::with2(Code::Or_rm64_r64, Register::RCX, Register::RAX).unwrap()); // CF = c1|c2
-        // ZF|SF from res (test)
+        // ZF|SF|PF from res (test sets x86 PF = parity of low byte, matching the
+        // reference update_add64 which recomputes PF from the result)
         b.push(Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).unwrap());
         b.push(Instruction::with(Code::Pushfq));
         b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
-        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xC0).unwrap()); // ZF|SF
+        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xC4).unwrap()); // ZF|SF|PF
         b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap()); // +CF
         // OF = ((a^res)&(b^res))>>63, placed at bit 11
         b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RBX, Register::R10).unwrap()); // a^res
@@ -996,7 +860,7 @@ pub fn build_self_decoding_parts(
         b.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, MemoryOperand::with_base(Register::RBX)).unwrap()); // count
         b.push(Instruction::with2(Code::Test_rm64_r64, Register::RCX, Register::RCX).unwrap());
         b.br(Code::Je_rel32_64, 0x9400); // count == 0 -> not found
-        b.push(Instruction::with2(Code::Lea_r64_m64, Register::R11, MemoryOperand::with_base_displ_size(Register::RBX, 4, 8)).unwrap());
+        b.push(Instruction::with2(Code::Lea_r64_m, Register::R11, MemoryOperand::with_base_displ_size(Register::RBX, 4, 8)).unwrap());
         let scan_top = b.len();
         {
             b.push(Instruction::with2(Code::Cmp_rm64_r64, MemoryOperand::with_base(Register::R11), Register::R10).unwrap());
@@ -1006,10 +870,176 @@ pub fn build_self_decoding_parts(
             b.push(Instruction::with2(Code::Test_rm64_r64, Register::RCX, Register::RCX).unwrap());
             b.jne(scan_top);
         }
-        // not found (fallback): treat the target value as a direct byte offset.
+        // ── NATIVE CALL BRIDGE (legacy OP_NATIVE_CALL equivalent) ─────────────
+        // The target was NOT found in the branch map → it is an excluded (SEH /
+        // RISC-unliftable) function kept native. The lifted call was
+        // `VirtualPush(ret_ip); VirtualBranch(Always, target)`, so the virtual
+        // stack top holds the return address. Bridge to the native function:
+        //   1. pop ret_ip from the virtual stack,
+        //   2. save the VM infra the callee will clobber (state_base/bytecode_base)
+        //      in callee-saved registers (re-synced after the call),
+        //   3. materialize the program's real GPRs (regs[0..15]) for the Win64 call,
+        //   4. build a fresh 16-aligned native frame + forward stack args,
+        //   5. `call target`, sync the clobbered volatile GPRs + RFLAGS back,
+        //   6. restore the VM infra and resume at ret_ip (branch-map → rolling-key
+        //      re-sync → dispatch).
+        // Register contract across the call (Win64 callee-saved, preserved by the
+        // callee): RBX/RBP/RSI/RDI/R12-R15. We use them as scratch for the infra:
+        //   RBX = original RSP, RBP = ret_ip, RSI = align remainder,
+        //   RDI = target, R12 = state_base, R14 = bytecode_base.
+        //   R13 (vstack top) / R15 (table) stay intact throughout.
         let nf_real = b.len();
-        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::R10).unwrap());
-        b.br(Code::Jmp_rel32_64, 0x9500);
+        {
+            // 1. pop ret_ip from the virtual stack (R13 top).
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBP, MemoryOperand::with_base(Register::R13)).unwrap());
+            b.push(Instruction::with2(Code::Add_rm64_imm8, Register::R13, 8).unwrap());
+            mov_m(&mut b, Register::RAX, VSP_OFF);
+            b.push(Instruction::with2(Code::Add_rm64_imm8, Register::RAX, 8).unwrap());
+            store_m(&mut b, VSP_OFF, Register::RAX);
+
+            // 2. stage infra in callee-saved regs.
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R12, Register::RDX).unwrap()); // state_base
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::R8).unwrap());  // bytecode_base
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RDI, Register::R10).unwrap()); // target
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::RSP).unwrap()); // original S
+
+            // 3. load the program's real GPRs from the state buffer (R12 = state_base).
+            //    RAX/RCX/RDX/R8/R9/R10/R11 are the call args + return + volatile scratch.
+            //    RBX/RBP/RSI/RDI/R12..R15 are NOT loaded (they hold the VM infra /
+            //    bridge scratch); regs[3,5,6,7,12..15] keep their pre-call values in
+            //    the state buffer, which is correct — they are callee-saved.
+            let sl = |b: &mut CodeBuilder, dst: Register, off: i32| {
+                b.push(Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    dst,
+                    MemoryOperand::with_base_displ_size(Register::R12, off as i64, 8),
+                ).unwrap());
+            };
+            sl(&mut b, Register::RAX, 0x00);
+            sl(&mut b, Register::RCX, 0x08);
+            sl(&mut b, Register::RDX, 0x10);
+            sl(&mut b, Register::R8, 0x40);
+            sl(&mut b, Register::R9, 0x48);
+            sl(&mut b, Register::R10, 0x50);
+            sl(&mut b, Register::R11, 0x58);
+
+            // 4. native frame: align RSP to 16, allocate 0x70 (ret + 0x20 home +
+            //    0x40 stack args). RSI = align remainder for the restore.
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSI, Register::RBX).unwrap());
+            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RSI, 15).unwrap());
+            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RSP, -16).unwrap());
+            b.push(Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, 0x70).unwrap());
+
+            // 5. forward stack args (5..12) from the virtual stack to [RSP+0x28..].
+            //    pending = |VSP|/8 (after the ret_ip pop) capped at 8; VSP >= 0 → none.
+            //    NOTE: RDX no longer holds state_base here (it was loaded with regs[2]),
+            //    so the VSP slot is read via R12.
+            b.push(Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base_displ_size(Register::R12, VSP_OFF as i64, 8),
+            ).unwrap());
+            b.push(Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap());
+            b.br(Code::Jns_rel32_64, 0xB0FF); // VSP >= 0 -> no pending entries
+            b.push(Instruction::with1(Code::Neg_rm64, Register::RAX).unwrap());
+            b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RAX, 3).unwrap());
+            // cap pending at 8: RAX = min(RAX, 8).
+            b.push(Instruction::with2(Code::Mov_r64_imm64, Register::RCX, 8).unwrap());
+            b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::RAX, Register::RCX).unwrap());
+            b.push(Instruction::with2(Code::Cmova_r64_rm64, Register::RAX, Register::RCX).unwrap());
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::RAX).unwrap());
+            let fwd_top = b.len();
+            {
+                b.push(Instruction::with2(Code::Test_rm64_r64, Register::RCX, Register::RCX).unwrap());
+                let fwd_done = b.len() + 1;
+                b.je(fwd_done);
+                // index = RCX-1 (forward from the top of the virtual stack).
+                b.push(Instruction::with2(Code::Lea_r64_m, Register::R10, MemoryOperand::with_base_index_scale_displ_size(Register::R13, Register::RCX, 8, -8, 8)).unwrap());
+                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, MemoryOperand::with_base(Register::R10)).unwrap());
+                // slot = RSP + 0x28 + (RCX-1)*8
+                b.push(Instruction::with2(Code::Lea_r64_m, Register::R11, MemoryOperand::with_base_index_scale_displ_size(Register::RSP, Register::RCX, 8, 0x20, 8)).unwrap());
+                b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base(Register::R11), Register::R10).unwrap());
+                b.push(Instruction::with1(Code::Dec_rm64, Register::RCX).unwrap());
+                b.jmp(fwd_top);
+                let loop_end = b.len();
+                for &mut (bi, ref mut ti) in b.branches.iter_mut() {
+                    if *ti == fwd_done {
+                        *ti = loop_end;
+                    }
+                }
+            }
+            let after_fwd = b.len();
+            for &mut (bi, ref mut ti) in b.branches.iter_mut() {
+                if *ti == 0xB0FF {
+                    *ti = after_fwd;
+                }
+            }
+
+            // 6. Win64 call target (RDI). args are already in RCX/RDX/R8/R9, stack
+            //    args 5..12 in [RSP+0x28..0x68], home space at [RSP+0x08..0x28].
+            b.push(Instruction::with1(Code::Call_rm64, Register::RDI).unwrap());
+
+            // 7. after the call: RSP == RSP_call. Sync volatile GPRs + RFLAGS back.
+            b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x00, 8), Register::RAX).unwrap());
+            b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x08, 8), Register::RCX).unwrap());
+            b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x10, 8), Register::RDX).unwrap());
+            b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x40, 8), Register::R8).unwrap());
+            b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x48, 8), Register::R9).unwrap());
+            b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x50, 8), Register::R10).unwrap());
+            b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x58, 8), Register::R11).unwrap());
+            // RFLAGS (whatever the callee left) → FLAGS slot.
+            b.push(Instruction::with(Code::Pushfq));
+            b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
+            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x8D5).unwrap());
+            b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0xC0, 8), Register::RAX).unwrap());
+
+            // 8. restore the VM real stack (RSP = original S) and infra.
+            b.push(Instruction::with2(Code::Add_rm64_imm32, Register::RSP, 0x70).unwrap());
+            b.push(Instruction::with2(Code::Add_rm64_r64, Register::RSP, Register::RSI).unwrap());
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::R12).unwrap()); // state_base
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R8, Register::R14).unwrap());  // bytecode_base
+
+            // 9. resume at ret_ip (RBP): branch-map lookup -> byte offset.
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::R15).unwrap());
+            b.push(Instruction::with2(Code::Add_rm64_imm32, Register::RBX, (OFF_BRANCH_MAP - OFF_TABLE) as i32).unwrap());
+            b.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, MemoryOperand::with_base(Register::RBX)).unwrap());
+            b.push(Instruction::with2(Code::Test_rm64_r64, Register::RCX, Register::RCX).unwrap());
+            b.br(Code::Je_rel32_64, 0xB100); // count == 0 -> not found
+            b.push(Instruction::with2(Code::Lea_r64_m, Register::R11, MemoryOperand::with_base_displ_size(Register::RBX, 4, 8)).unwrap());
+            let rscan_top = b.len();
+            {
+                b.push(Instruction::with2(Code::Cmp_rm64_r64, MemoryOperand::with_base(Register::R11), Register::RBP).unwrap());
+                b.br(Code::Je_rel32_64, 0xB101); // found
+                b.push(Instruction::with2(Code::Add_rm64_imm32, Register::R11, 16).unwrap());
+                b.push(Instruction::with1(Code::Dec_rm64, Register::RCX).unwrap());
+                b.push(Instruction::with2(Code::Test_rm64_r64, Register::RCX, Register::RCX).unwrap());
+                b.jne(rscan_top);
+                b.br(Code::Jmp_rel32_64, 0xB100); // not found
+            }
+            // found: RBX = [R11+8] (byte offset).
+            let resume_found_real = b.len();
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, MemoryOperand::with_base_displ_size(Register::R11, 8, 8)).unwrap());
+            b.br(Code::Jmp_rel32_64, 0xB200);
+            // not found: fall back to treating ret_ip as a direct byte offset.
+            let resume_nf_real = b.len();
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::RBP).unwrap());
+            // re-sync the rolling key from bytecode start to the resume offset.
+            let resume_sync = b.len();
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R12, Register::R12).unwrap());
+            movi(&mut b, Register::R14, init_key);
+            b.call(sub_resync);
+            b.jmp(dispatch);
+            for i in 0..b.branches.len() {
+                let t = b.branches[i].1;
+                if t == 0xB100 {
+                    b.branches[i].1 = resume_nf_real;
+                } else if t == 0xB101 {
+                    b.branches[i].1 = resume_found_real;
+                } else if t == 0xB200 {
+                    b.branches[i].1 = resume_sync;
+                }
+            }
+        }
         // found: byte offset = [R11 + 8].
         let found_real = b.len();
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, MemoryOperand::with_base_displ_size(Register::R11, 8, 8)).unwrap());
@@ -1041,6 +1071,11 @@ pub fn build_self_decoding_parts(
 
     let h_halt = b.len();
     {
+        // restore ALL callee-saved registers pushed at entry (reverse order).
+        b.push(Instruction::with1(Code::Pop_r64, Register::RBP).unwrap());
+        b.push(Instruction::with1(Code::Pop_r64, Register::RBX).unwrap());
+        b.push(Instruction::with1(Code::Pop_r64, Register::RSI).unwrap());
+        b.push(Instruction::with1(Code::Pop_r64, Register::RDI).unwrap());
         b.push(Instruction::with1(Code::Pop_r64, Register::R15).unwrap());
         b.push(Instruction::with1(Code::Pop_r64, Register::R14).unwrap());
         b.push(Instruction::with1(Code::Pop_r64, Register::R13).unwrap());
@@ -1418,6 +1453,228 @@ pub fn build_self_decoding_parts(
         b.jmp(dispatch);
     }
 
+    // ── P3: SETCC / CONDITIONAL_MOVE — cond-byte native handlers. ──────────────
+    // Both decode a single cond byte (right after the opcode) via `sub_dec_ops_cond`,
+    // which maps it through the OFF_COND_CODES table into the DEC_COND state slot
+    // (canonical COND_* code). The cond is evaluated from the FLAGS slot
+    // (CF/ZF/SF/OF at 0x1/0x40/0x80/0x800, PF at 0x4) plus regs[1] (CounterZero),
+    // producing a 0/1 boolean in R10. Reference semantics (eval_state / interpreter):
+    //   Setcc:            dst = taken ? 1 : 0           (flags untouched)
+    //   ConditionalMove:  if taken: dst = src1          (flags untouched)
+    // A dispatch chain branches on the canonical cond code; each cond block sets
+    // R10 = 0/1 branch-free (test+setcc, arithmetic for the signed pairs), then
+    // jumps to the handler continuation. Unknown cond (0xFF) falls through with
+    // R10 = 0 (Setcc -> 0, CMOV -> no-op).
+    /// Emit the body of one cond block: set R10 = 0/1 for canonical cond code `c`,
+    /// given R11 = flags and R9 = regs[1]. RAX/RCX are scratch.
+    fn emit_cond_block_body(b: &mut CodeBuilder, c: u8) {
+        let setne = |b: &mut CodeBuilder| {
+            b.push(Instruction::with1(Code::Setne_rm8, Register::R10L).unwrap());
+            b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).unwrap());
+        };
+        let sete = |b: &mut CodeBuilder| {
+            b.push(Instruction::with1(Code::Sete_rm8, Register::R10L).unwrap());
+            b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).unwrap());
+        };
+        // delta = SF^OF (0 iff SF==OF) computed in RAX.
+        let emit_delta = |b: &mut CodeBuilder| {
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R11).unwrap());
+            b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RAX, 7).unwrap());
+            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 1).unwrap());
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::R11).unwrap());
+            b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RCX, 11).unwrap());
+            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, 1).unwrap());
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RCX).unwrap());
+        };
+        match c {
+            COND_ALWAYS => {
+                b.push(Instruction::with2(Code::Mov_r64_imm64, Register::R10, 1).unwrap());
+            }
+            COND_ZERO => {
+                b.push(Instruction::with2(Code::Test_rm64_imm32, Register::R11, 0x40).unwrap());
+                setne(b);
+            }
+            COND_NOT_ZERO => {
+                b.push(Instruction::with2(Code::Test_rm64_imm32, Register::R11, 0x40).unwrap());
+                sete(b);
+            }
+            COND_CARRY => {
+                b.push(Instruction::with2(Code::Test_rm64_imm32, Register::R11, 0x1).unwrap());
+                setne(b);
+            }
+            COND_NOT_CARRY => {
+                b.push(Instruction::with2(Code::Test_rm64_imm32, Register::R11, 0x1).unwrap());
+                sete(b);
+            }
+            COND_SIGN => {
+                b.push(Instruction::with2(Code::Test_rm64_imm32, Register::R11, 0x80).unwrap());
+                setne(b);
+            }
+            COND_NOT_SIGN => {
+                b.push(Instruction::with2(Code::Test_rm64_imm32, Register::R11, 0x80).unwrap());
+                sete(b);
+            }
+            COND_OVERFLOW => {
+                b.push(Instruction::with2(Code::Test_rm64_imm32, Register::R11, 0x800).unwrap());
+                setne(b);
+            }
+            COND_NOT_OVERFLOW => {
+                b.push(Instruction::with2(Code::Test_rm64_imm32, Register::R11, 0x800).unwrap());
+                sete(b);
+            }
+            COND_GREATER => {
+                // G = !ZF && (SF==OF) = e & nz
+                emit_delta(b);
+                b.push(Instruction::with2(Code::Xor_rm64_imm32, Register::RAX, 1).unwrap()); // e = SF==OF
+                b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 1).unwrap());
+                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::R11).unwrap());
+                b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RCX, 6).unwrap());
+                b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, 1).unwrap());
+                b.push(Instruction::with2(Code::Xor_rm64_imm32, Register::RCX, 1).unwrap()); // nz = !ZF
+                b.push(Instruction::with2(Code::And_rm64_r64, Register::RAX, Register::RCX).unwrap());
+                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+            }
+            COND_LESS => {
+                // L = SF!=OF = delta
+                emit_delta(b);
+                b.push(Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap());
+                setne(b);
+            }
+            COND_GREATER_OR_EQUAL => {
+                // GE = SF==OF = !delta
+                emit_delta(b);
+                b.push(Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap());
+                sete(b);
+            }
+            COND_LESS_OR_EQUAL => {
+                // LE = ZF || (SF!=OF) = z | delta
+                emit_delta(b);
+                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::R11).unwrap());
+                b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RCX, 6).unwrap());
+                b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, 1).unwrap());
+                b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap());
+                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+            }
+            COND_ABOVE => {
+                // A = !CF && !ZF
+                b.push(Instruction::with2(Code::Test_rm64_imm32, Register::R11, 0x41).unwrap());
+                sete(b);
+            }
+            COND_ABOVE_OR_EQUAL => {
+                // AE = !CF
+                b.push(Instruction::with2(Code::Test_rm64_imm32, Register::R11, 0x1).unwrap());
+                sete(b);
+            }
+            COND_BELOW => {
+                b.push(Instruction::with2(Code::Test_rm64_imm32, Register::R11, 0x1).unwrap());
+                setne(b);
+            }
+            COND_BELOW_OR_EQUAL => {
+                // BE = CF || ZF
+                b.push(Instruction::with2(Code::Test_rm64_imm32, Register::R11, 0x41).unwrap());
+                setne(b);
+            }
+            COND_PARITY => {
+                b.push(Instruction::with2(Code::Test_rm64_imm32, Register::R11, 0x4).unwrap());
+                setne(b);
+            }
+            COND_NOT_PARITY => {
+                b.push(Instruction::with2(Code::Test_rm64_imm32, Register::R11, 0x4).unwrap());
+                sete(b);
+            }
+            COND_COUNTER_ZERO_2 => {
+                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R9).unwrap());
+                b.push(Instruction::with2(Code::Shl_rm64_imm8, Register::RAX, 48).unwrap());
+                b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RAX, 48).unwrap());
+                b.push(Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap());
+                sete(b);
+            }
+            COND_COUNTER_ZERO_4 => {
+                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R9).unwrap());
+                b.push(Instruction::with2(Code::Shl_rm64_imm8, Register::RAX, 32).unwrap());
+                b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RAX, 32).unwrap());
+                b.push(Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap());
+                sete(b);
+            }
+            COND_COUNTER_ZERO_8 => {
+                b.push(Instruction::with2(Code::Test_rm64_r64, Register::R9, Register::R9).unwrap());
+                sete(b);
+            }
+            _ => {
+                // invalid cond: R10 stays 0.
+            }
+        }
+    }
+
+    fn emit_setcc_cmov_handler(
+        b: &mut CodeBuilder,
+        sub_dec_ops_cond: usize,
+        sub_dec_ops: usize,
+        sub_resolve: usize,
+        sub_store: usize,
+        dispatch: usize,
+        is_cmov: bool,
+    ) -> usize {
+        let h = b.len();
+        {
+            // consume cond byte -> DEC_COND, then dst/src1/src2 + imms.
+            b.call(sub_dec_ops_cond);
+            b.call(sub_dec_ops);
+            // prelude: flags -> R11, regs[1] -> R9, result R10 = 0, cond -> ECX.
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(FLAGS_OFF)).unwrap());
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, m(REGS_OFF + 8)).unwrap());
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R10, Register::R10).unwrap());
+            movzx8_m(b, Register::ECX, DEC_COND);
+            // dispatch chain over the canonical cond codes.
+            let conds: [u8; 22] = [
+                COND_ALWAYS, COND_ZERO, COND_NOT_ZERO, COND_CARRY, COND_NOT_CARRY,
+                COND_SIGN, COND_NOT_SIGN, COND_OVERFLOW, COND_NOT_OVERFLOW, COND_GREATER,
+                COND_LESS, COND_GREATER_OR_EQUAL, COND_LESS_OR_EQUAL, COND_ABOVE,
+                COND_ABOVE_OR_EQUAL, COND_BELOW, COND_BELOW_OR_EQUAL, COND_PARITY,
+                COND_NOT_PARITY, COND_COUNTER_ZERO_2, COND_COUNTER_ZERO_4, COND_COUNTER_ZERO_8,
+            ];
+            let mut je_bi: Vec<(u8, usize)> = Vec::with_capacity(conds.len());
+            for c in conds {
+                b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::ECX, c as i32).unwrap());
+                je_bi.push((c, b.br(Code::Je_rel32_64, 0)));
+            }
+            // continuation (unknown cond falls through here with R10 = 0).
+            let cont = b.len();
+            if is_cmov {
+                b.push(Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).unwrap());
+                let skip_guess = b.len() + 1;
+                b.je(skip_guess);
+                movzx8_m(b, Register::EAX, DEC_SRC1);
+                mov_m(b, Register::R11, DEC_IMM1);
+                b.call(sub_resolve);
+                b.call(sub_store);
+                let djmp = b.len();
+                b.jmp(dispatch);
+                for &mut (bi, ref mut ti) in b.branches.iter_mut() {
+                    if *ti == skip_guess {
+                        *ti = djmp;
+                    }
+                }
+            } else {
+                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
+                b.call(sub_store);
+                b.jmp(dispatch);
+            }
+            // per-cond blocks (after the continuation): set R10 then jump to cont.
+            for &(c, bi) in &je_bi {
+                let blk = b.len();
+                for &mut (bii, ref mut ti) in b.branches.iter_mut() {
+                    if bii == bi {
+                        *ti = blk;
+                    }
+                }
+                emit_cond_block_body(b, c);
+                b.jmp(cont);
+            }
+        }
+        h
+    }
+
     // ── P2: emit Multiply / MultiplyLow / Divide handler sets (signed × width). ──
     let mut mul_h: [[usize; 4]; 2] = [[0; 4]; 2];
     for (si, signed) in [false, true].iter().enumerate() {
@@ -1676,6 +1933,10 @@ pub fn build_self_decoding_parts(
         b.jmp(dispatch);
     }
 
+    // ── P3: SETCC / CONDITIONAL_MOVE handler sets (cond byte via DEC_COND). ────
+    let h_setcc = emit_setcc_cmov_handler(&mut b, sub_dec_ops_cond, sub_dec_ops, sub_resolve, sub_store, dispatch, false);
+    let h_cmov = emit_setcc_cmov_handler(&mut b, sub_dec_ops_cond, sub_dec_ops, sub_resolve, sub_store, dispatch, true);
+
     let handlers: std::collections::HashMap<RiscOp, usize> = {
         use std::collections::HashMap;
         let mut h = HashMap::new();
@@ -1712,6 +1973,8 @@ pub fn build_self_decoding_parts(
         h.insert(RiscOp::CountLeadingZeros { width: 4 }, h_lzcnt4);
         h.insert(RiscOp::CountLeadingZeros { width: 8 }, h_lzcnt8);
         h.insert(RiscOp::PopCount, h_popcnt);
+        h.insert(RiscOp::Setcc { cond: BranchCondition::Always }, h_setcc);
+        h.insert(RiscOp::ConditionalMove { cond: BranchCondition::Always }, h_cmov);
         h.insert(RiscOp::VirtualBranch { cond: BranchCondition::Always }, h_branch);
         for (si, signed) in [false, true].iter().enumerate() {
             for (wi, w) in [1u8, 2, 4, 8].iter().enumerate() {
@@ -1766,7 +2029,18 @@ pub fn build_self_decoding_parts(
 /// Run the self-decoding dispatcher in an RWX arena (host-side test/bench path):
 /// build the parts at arena-relative VAs, copy them in, set the initial regs in
 /// the state buffer and jump to the dispatcher entry.
+/// Backward-compatible 3-arg runner (no ip_map) — delegates to `_with` with None.
 pub fn run_native_poly_direct(
+    bytecode: &[u8],
+    seed: u64,
+    init_regs: &[u64; 16],
+) -> Result<RiscEvalState> {
+    run_native_poly_direct_with(bytecode, seed, init_regs, None)
+}
+
+/// Full runner with optional ip_map (source-IP -> program index) for VirtualBranch
+/// branch resolution.
+pub fn run_native_poly_direct_with(
     bytecode: &[u8],
     seed: u64,
     init_regs: &[u64; 16],
@@ -1778,7 +2052,7 @@ pub fn run_native_poly_direct(
     let table_base = (arena.base + OFF_TABLE) as u64;
     let bytecode_base = (arena.base + OFF_BYTECODE) as u64;
     let stack_base = (arena.base + OFF_STACK_BASE) as u64;
-    let parts = build_self_decoding_parts(
+    let parts = build_self_decoding_parts_with(
         bytecode, seed, code_base, table_base, bytecode_base, state_base, stack_base, ip_map,
     )?;
 
@@ -1836,516 +2110,3 @@ pub fn run_native_poly_direct(
 // ==============================================================================
 // Tests
 // ==============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::vm::poly::{PolymorphicEncoder, PolymorphicInterpreter};
-    use crate::vm::risc::RiscDesynthesizer;
-
-    /// Differential: native self-decoding == interpreter == reference.
-    #[test]
-    fn test_native_poly_direct_matches_interpreter_and_reference() {
-        let mut d = RiscDesynthesizer::new();
-        d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x200), MicroOperand::Imm64(0));
-        d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(5), MicroOperand::Imm64(0));
-        d.instrs.push(
-            MicroInstr::new(RiscOp::ShiftRight)
-                .with_dst(MicroOperand::VReg(2))
-                .with_src1(MicroOperand::VReg(0))
-                .with_src2(MicroOperand::VReg(1)),
-        );
-        d.instrs.push(
-            MicroInstr::new(RiscOp::ShiftLeft)
-                .with_dst(MicroOperand::VReg(3))
-                .with_src1(MicroOperand::VReg(0))
-                .with_src2(MicroOperand::Imm64(2)),
-        );
-        d.instrs.push(
-            MicroInstr::new(RiscOp::AddWithCarry)
-                .with_dst(MicroOperand::VReg(7))
-                .with_src1(MicroOperand::VReg(0))
-                .with_src2(MicroOperand::VReg(1))
-                .with_imm(0),
-        );
-        d.emit_push(MicroOperand::VReg(3));
-        d.emit_push(MicroOperand::VReg(0));
-        d.emit_pop(MicroOperand::VReg(4));
-        d.instrs.push(
-            MicroInstr::new(RiscOp::Nor)
-                .with_dst(MicroOperand::VReg(5))
-                .with_src1(MicroOperand::VReg(2))
-                .with_src2(MicroOperand::VReg(1)),
-        );
-        d.instrs.push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Imm64(0x8C1)));
-        d.instrs.push(MicroInstr::new(RiscOp::Halt));
-        let prog = RiscProgram::new(d.instrs);
-
-        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
-            let mut enc = PolymorphicEncoder::new(seed);
-            let bytecode = enc.encode(&prog).unwrap();
-
-            let native = run_native_poly_direct(&bytecode, seed, &[0u64; 16], None).unwrap();
-
-            let mut interp = PolymorphicInterpreter::new(seed);
-            interp.run(&bytecode).unwrap();
-
-            let ref_st = prog.eval_state(&[0u64; 16]);
-
-            assert_eq!(native.regs, ref_st.regs, "seed {seed:#x}: native regs != ref");
-            assert_eq!(interp.regs, ref_st.regs, "seed {seed:#x}: interp regs != ref");
-            assert_eq!(native.temps, ref_st.temps, "seed {seed:#x}: native temps != ref");
-            assert_eq!(
-                native.flags, ref_st.flags,
-                "seed {seed:#x}: native flags {:#x} != ref {:#x}",
-                native.flags, ref_st.flags
-            );
-            assert_eq!(interp.flags.raw, ref_st.flags, "seed {seed:#x}: interp flags != ref");
-            assert_eq!(native.vsp, ref_st.vsp, "seed {seed:#x}: native vsp != ref");
-            assert_eq!(native.stack, ref_st.stack, "seed {seed:#x}: native stack != ref");
-            assert_eq!(native.regs[2], 0x10);
-            assert_eq!(native.regs[3], 0x800);
-            assert_eq!(native.regs[5], !(0x10 | 5));
-        }
-    }
-
-    /// Simple add/xor/sub path.
-    #[test]
-    fn test_native_poly_direct_matches_decoder_path() {
-        let seed = 0x8899AABBCCDDEEFF;
-        let mut d = RiscDesynthesizer::new();
-        d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(1200), MicroOperand::Imm64(0));
-        d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(450), MicroOperand::Imm64(0));
-        d.emit_sub(MicroOperand::VReg(0), MicroOperand::VReg(0), MicroOperand::VReg(1));
-        d.emit_xor(MicroOperand::VReg(0), MicroOperand::VReg(0), MicroOperand::Imm64(0x55));
-        d.instrs.push(MicroInstr::new(RiscOp::Halt));
-        let prog = RiscProgram::new(d.instrs);
-
-        let mut enc = PolymorphicEncoder::new(seed);
-        let bytecode = enc.encode(&prog).unwrap();
-
-        let native = run_native_poly_direct(&bytecode, seed, &[0u64; 16]).unwrap();
-        let ref_st = prog.eval_state(&[0u64; 16]);
-        assert_eq!(native.regs[0], ref_st.regs[0]);
-        assert_eq!(native.regs[1], ref_st.regs[1]);
-        assert_eq!(native.regs[0], (1200 - 450) ^ 0x55);
-    }
-
-    /// NativeCallBridge no-op: the self-decoding dispatcher must CONSUME the
-    /// stream (opcode + 3 operand bytes + immediates) without changing any VM
-    /// state, so a following op is still reached. Differential: native
-    /// self-decoding == interpreter == reference (which treat NativeCallBridge
-    /// as a no-op), across multiple seeds and with both imm & vreg operands.
-    #[test]
-    fn test_native_poly_direct_native_call_bridge_noop() {
-        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
-            let mut d = RiscDesynthesizer::new();
-            // R0 = 0x200
-            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x200), MicroOperand::Imm64(0));
-            // Bridge with imm src1 + dst: must consume stream, change nothing.
-            d.instrs.push(
-                MicroInstr::new(RiscOp::NativeCallBridge)
-                    .with_dst(MicroOperand::VReg(1))
-                    .with_src1(MicroOperand::Imm64(0x9999)),
-            );
-            // Bridge with vreg src1/src2 + dst: must consume stream, change nothing.
-            d.instrs.push(
-                MicroInstr::new(RiscOp::NativeCallBridge)
-                    .with_dst(MicroOperand::VReg(2))
-                    .with_src1(MicroOperand::VReg(0))
-                    .with_src2(MicroOperand::VReg(1)),
-            );
-            // State-changing op AFTER the bridges: only reached if the stream was
-            // consumed by the no-op handlers (no desync / no premature stop).
-            d.emit_add(MicroOperand::VReg(6), MicroOperand::VReg(0), MicroOperand::Imm64(1));
-            d.instrs.push(MicroInstr::new(RiscOp::Halt));
-            let prog = RiscProgram::new(d.instrs);
-
-            let mut enc = PolymorphicEncoder::new(seed);
-            let bytecode = enc.encode(&prog).unwrap();
-
-            let native = run_native_poly_direct(&bytecode, seed, &[0u64; 16], None).unwrap();
-
-            let mut interp = PolymorphicInterpreter::new(seed);
-            interp.run(&bytecode).unwrap();
-
-            let ref_st = prog.eval_state(&[0u64; 16]);
-
-            // Bridge must not have written regs 1/2 (no-op), and the post-bridge
-            // op must have run (stream consumed correctly).
-            assert_eq!(ref_st.regs[1], 0, "seed {seed:#x}: bridge wrote dst VReg(1)");
-            assert_eq!(ref_st.regs[2], 0, "seed {seed:#x}: bridge wrote dst VReg(2)");
-            assert_eq!(ref_st.regs[6], 0x201, "seed {seed:#x}: post-bridge op not reached");
-
-            assert_eq!(native.regs, ref_st.regs, "seed {seed:#x}: native regs != ref");
-            assert_eq!(interp.regs, ref_st.regs, "seed {seed:#x}: interp regs != ref");
-            assert_eq!(native.temps, ref_st.temps, "seed {seed:#x}: native temps != ref");
-            assert_eq!(
-                native.flags, ref_st.flags,
-                "seed {seed:#x}: native flags {:#x} != ref {:#x}",
-                native.flags, ref_st.flags
-            );
-            assert_eq!(interp.flags.raw, ref_st.flags, "seed {seed:#x}: interp flags != ref");
-            assert_eq!(native.vsp, ref_st.vsp, "seed {seed:#x}: native vsp != ref");
-            assert_eq!(native.stack, ref_st.stack, "seed {seed:#x}: native stack != ref");
-        }
-    }
-
-    /// P3: CompareExchange{1,2,4,8} — native self-decoding handler == eval_state
-    /// (linear-block unit equivalence; success and failure paths, all widths).
-    #[test]
-    fn test_poly_direct_compare_exchange_all_widths_matches_reference() {
-        use std::collections::HashMap;
-
-        let seed = 0x13579BDF2468ACE0u64;
-        let mut arena = Arena::new(ARENA_SIZE).unwrap();
-        let base = arena.base;
-        let code_off = OFF_CODE;
-        let table_off = OFF_TABLE;
-        let bytecode_off = OFF_BYTECODE;
-        let state_off = OFF_STATE;
-        let window_off = 0x30000usize; // clear of code/table/bytecode/state/stack
-        let addr = (base + window_off) as u64;
-        let code_va = (base + code_off) as u64;
-        let table_va = (base + table_off) as u64;
-        let bytecode_va = (base + bytecode_off) as u64;
-        let state_va = (base + state_off) as u64;
-        let stack_base = (base + OFF_STACK_BASE) as u64;
-
-        for width in [1u8, 2, 4, 8] {
-            let newv: u64 = 0x0BAD_F00D_CAFE_1234;
-            let mut d = RiscDesynthesizer::new();
-            d.instrs.push(
-                MicroInstr::new(RiscOp::CompareExchange { width })
-                    .with_src1(MicroOperand::VReg(1)) // addr (set in init_regs)
-                    .with_src2(MicroOperand::Imm64(newv)),
-            );
-            d.instrs.push(MicroInstr::new(RiscOp::Halt));
-            let prog = RiscProgram::new(d.instrs);
-
-            let mut enc = PolymorphicEncoder::new(seed);
-            let bytecode = enc.encode(&prog).unwrap();
-
-            let parts = build_self_decoding_parts(
-                &bytecode, seed, code_va, table_va, bytecode_va, state_va, stack_base,
-            )
-            .expect("build self-decoding parts");
-            assert!(
-                parts.code.len() + OFF_CODE <= OFF_TABLE,
-                "dispatcher code overflowed into table region: code_len={}",
-                parts.code.len()
-            );
-
-            // Place parts into arena once per width; state/memory re-seeded per scenario.
-            {
-                let buf = arena.bytes();
-                buf[code_off..code_off + parts.code.len()].copy_from_slice(&parts.code);
-                for (i, v) in parts.table.iter().enumerate() {
-                    buf[table_off + i * 8..table_off + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
-                }
-                buf[OFF_OP_OFFS..OFF_OP_OFFS + 256].copy_from_slice(&parts.offs_tab);
-                buf[OFF_OP_FLAGS..OFF_OP_FLAGS + 256].copy_from_slice(&parts.flags_tab);
-                buf[bytecode_off..bytecode_off + bytecode.len()].copy_from_slice(&bytecode);
-            }
-
-            let old: u64 = 0xFEDC_BA98_7654_3210;
-            let scenarios: [(&str, u64, u64, bool); 2] = [
-                ("success", old, old, true),
-                ("failure", old ^ 0x1, old, false),
-            ];
-            for (label, acc, old, success) in scenarios {
-                let mask = if width == 8 { u64::MAX } else { (1u64 << (width * 8)) - 1 };
-
-                // init regs: reg[0]=acc (expected), reg[1]=addr
-                let mut init = [0u64; 16];
-                init[0] = acc;
-                init[1] = addr;
-
-                // seed window + state identically in native arena and reference HashMap.
-                {
-                    let buf = arena.bytes();
-                    buf[window_off..window_off + 8].copy_from_slice(&old.to_le_bytes());
-                    buf[state_off..state_off + STATE_END as usize].fill(0);
-                    for (i, v) in init.iter().enumerate() {
-                        buf[state_off + REGS_OFF as usize + i * 8..state_off + REGS_OFF as usize + i * 8 + 8]
-                            .copy_from_slice(&v.to_le_bytes());
-                    }
-                }
-                let mut seed_mem = HashMap::new();
-                for (k, b) in old.to_le_bytes().iter().enumerate() {
-                    seed_mem.insert(addr.wrapping_add(k as u64), *b);
-                }
-
-                let ref_st = prog.eval_state_with_mem(&init, seed_mem);
-
-                arena.call(code_off);
-
-                let buf = arena.bytes();
-                let s = state_off;
-                let mut nat = RiscEvalState::default();
-                for i in 0..16 {
-                    nat.regs[i] = u64::from_le_bytes(
-                        buf[s + REGS_OFF as usize + i * 8..s + REGS_OFF as usize + i * 8 + 8]
-                            .try_into()
-                            .unwrap(),
-                    );
-                }
-                for i in 0..8 {
-                    nat.temps[i] = u64::from_le_bytes(
-                        buf[s + TEMPS_OFF as usize + i * 8..s + TEMPS_OFF as usize + i * 8 + 8]
-                            .try_into()
-                            .unwrap(),
-                    );
-                }
-                nat.flags = u64::from_le_bytes(buf[s + FLAGS_OFF as usize..s + FLAGS_OFF as usize + 8].try_into().unwrap());
-                nat.vsp = u64::from_le_bytes(buf[s + VSP_OFF as usize..s + VSP_OFF as usize + 8].try_into().unwrap());
-
-                assert_eq!(nat.regs, ref_st.regs, "w{width} {label}: regs mismatch (nat={:?} ref={:?})", nat.regs, ref_st.regs);
-                assert_eq!(nat.flags, ref_st.flags, "w{width} {label}: flags nat={:#x} ref={:#x}", nat.flags, ref_st.flags);
-                assert_eq!(nat.temps, ref_st.temps, "w{width} {label}: temps mismatch");
-                assert_eq!(nat.vsp, ref_st.vsp, "w{width} {label}: vsp mismatch");
-
-                // memory side-effect: width low bytes written/unchanged == reference.
-                let nat_mem = u64::from_le_bytes(buf[window_off..window_off + 8].try_into().unwrap());
-                let mut ref_mem = 0u64;
-                for k in 0..width as usize {
-                    ref_mem |= (*ref_st.mem.get(&addr.wrapping_add(k as u64)).unwrap_or(&0) as u64) << (k * 8);
-                }
-                assert_eq!(nat_mem & mask, ref_mem, "w{width} {label}: mem mismatch nat={:#x} ref={:#x}", nat_mem & mask, ref_mem);
-                assert_eq!(
-                    nat_mem & mask,
-                    if success { newv & mask } else { old & mask },
-                    "w{width} {label}: mem side-effect wrong (expect {:#x})",
-                    if success { newv & mask } else { old & mask }
-                );
-                assert_eq!(nat.flags & 0x40 != 0, success, "w{width} {label}: ZF wrong (nat.flags={:#x})", nat.flags);
-            }
-        }
-    }
-
-    /// Differential: native self-decoding Multiply/MultiplyLow == interpreter ==
-    /// reference (linear-block unit equivalence), signed/unsigned across widths —
-    /// including RDX(high)/regs[2] and the CF=OF overflow flags, and the width-1
-    /// AX packing ((high<<8)|low).
-    #[test]
-    fn test_poly_direct_multiply_matches_reference() {
-        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
-            let mut d = RiscDesynthesizer::new();
-            // Load operands via adds (interpreter starts from zero regs).
-            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x1_0000_0001), MicroOperand::Imm64(0));
-            d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(3), MicroOperand::Imm64(0));
-            d.emit_add(MicroOperand::VReg(3), MicroOperand::Imm64(0x7FFF_FFFF), MicroOperand::Imm64(0));
-            d.emit_add(MicroOperand::VReg(4), MicroOperand::Imm64(0xFF), MicroOperand::Imm64(0));
-            // Clean flag base: isolates the multiply CF/OF handling from the
-            // AddWithCarry setup (native h_add preserves PF/AF instead of recomputing).
-            d.instrs.push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Imm64(0)));
-            // unsigned MUL r64: R0=0x1_0000_0001, R1=3 -> RDX:RAX, low->R0, high->R2.
-            d.instrs.push(
-                MicroInstr::new(RiscOp::Multiply { signed: false, width: 8 })
-                    .with_dst(MicroOperand::VReg(0))
-                    .with_src1(MicroOperand::VReg(0))
-                    .with_src2(MicroOperand::VReg(1)),
-            );
-            // signed IMUL r32 (MultiplyLow): 0x7FFFFFFF * 2 = 0xFFFFFFFE, CF=OF=1.
-            d.instrs.push(
-                MicroInstr::new(RiscOp::MultiplyLow { signed: true, width: 4 })
-                    .with_dst(MicroOperand::VReg(6))
-                    .with_src1(MicroOperand::VReg(3))
-                    .with_src2(MicroOperand::Imm64(2)),
-            );
-            // signed IMUL r8 (Multiply width 1): 0xFF * 0xFF -> AX = 0xFE01, CF=OF=1.
-            d.instrs.push(
-                MicroInstr::new(RiscOp::Multiply { signed: true, width: 1 })
-                    .with_dst(MicroOperand::VReg(7))
-                    .with_src1(MicroOperand::VReg(4))
-                    .with_src2(MicroOperand::VReg(4)),
-            );
-            d.instrs.push(MicroInstr::new(RiscOp::Halt));
-            let prog = RiscProgram::new(d.instrs);
-
-            let mut enc = PolymorphicEncoder::new(seed);
-            let bytecode = enc.encode(&prog).unwrap();
-            let native = run_native_poly_direct(&bytecode, seed, &[0u64; 16], None).unwrap();
-            let mut interp = PolymorphicInterpreter::new(seed);
-            interp.run(&bytecode).unwrap();
-            let ref_st = prog.eval_state(&[0u64; 16]);
-
-            assert_eq!(native.regs, ref_st.regs, "seed {seed:#x}: mul native regs != ref");
-            assert_eq!(interp.regs, ref_st.regs, "seed {seed:#x}: mul interp regs != ref");
-            assert_eq!(native.temps, ref_st.temps, "seed {seed:#x}: mul native temps != ref");
-            assert_eq!(
-                native.flags, ref_st.flags,
-                "seed {seed:#x}: mul native flags {:#x} != ref {:#x}",
-                native.flags, ref_st.flags
-            );
-            assert_eq!(interp.flags.raw, ref_st.flags, "seed {seed:#x}: mul interp flags != ref");
-            assert_eq!(native.regs[0], 0x3_0000_0003, "seed {seed:#x}: MUL low wrong");
-            assert_eq!(native.regs[2], 0, "seed {seed:#x}: MUL high wrong");
-            assert_eq!(native.regs[6], 0xFFFF_FFFE, "seed {seed:#x}: IMUL low wrong");
-            assert_eq!(native.regs[7], 0xFE01, "seed {seed:#x}: IMUL r8 AX pack wrong");
-            assert_eq!(native.flags & 0x801, 0x801, "seed {seed:#x}: CF|OF not set");
-        }
-    }
-
-    /// Differential: native self-decoding Divide/IDivide == interpreter ==
-    /// reference, unsigned/signed across widths — quotient -> dst, remainder ->
-    /// RDX (regs[2], w>=2), width-1 AX packing, and div-by-zero -> 0.
-    #[test]
-    fn test_poly_direct_divide_matches_reference() {
-        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
-            let mut d = RiscDesynthesizer::new();
-            // Load all operands first (interpreter starts from zero regs).
-            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(1000), MicroOperand::Imm64(0));
-            d.emit_add(MicroOperand::VReg(2), MicroOperand::Imm64(0), MicroOperand::Imm64(0));
-            d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(7), MicroOperand::Imm64(0));
-            d.emit_add(MicroOperand::VReg(3), MicroOperand::Imm64(1000), MicroOperand::Imm64(0));
-            d.emit_add(MicroOperand::VReg(4), MicroOperand::Imm64(0), MicroOperand::Imm64(0));
-            d.emit_add(MicroOperand::VReg(5), MicroOperand::Imm64((-3i64) as u64), MicroOperand::Imm64(0));
-            d.emit_add(MicroOperand::VReg(6), MicroOperand::Imm64(0), MicroOperand::Imm64(0));
-            // Clean flag base (divide does not touch flags).
-            d.instrs.push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Imm64(0)));
-            // unsigned DIV r64: R0=1000, R2(RDX)=0, divisor R1=7 -> q=142, r=6.
-            d.instrs.push(
-                MicroInstr::new(RiscOp::Divide { signed: false, width: 8 })
-                    .with_dst(MicroOperand::VReg(0))
-                    .with_src1(MicroOperand::VReg(1)),
-            );
-            // signed IDIV r32: R3=1000, R4(RDX)=0, divisor R5=-3 -> q=-333, r=1.
-            d.instrs.push(
-                MicroInstr::new(RiscOp::Divide { signed: true, width: 4 })
-                    .with_dst(MicroOperand::VReg(3))
-                    .with_src1(MicroOperand::VReg(5)),
-            );
-            // div-by-zero: divisor 0 -> 0 (dst stays 0, regs[2]=0).
-            d.instrs.push(
-                MicroInstr::new(RiscOp::Divide { signed: false, width: 8 })
-                    .with_dst(MicroOperand::VReg(6))
-                    .with_src1(MicroOperand::VReg(6)),
-            );
-            d.instrs.push(MicroInstr::new(RiscOp::Halt));
-            let prog = RiscProgram::new(d.instrs);
-
-            let mut enc = PolymorphicEncoder::new(seed);
-            let bytecode = enc.encode(&prog).unwrap();
-            let native = run_native_poly_direct(&bytecode, seed, &[0u64; 16], None).unwrap();
-            let mut interp = PolymorphicInterpreter::new(seed);
-            interp.run(&bytecode).unwrap();
-            let ref_st = prog.eval_state(&[0u64; 16]);
-
-            assert_eq!(native.regs, ref_st.regs, "seed {seed:#x}: div native regs != ref");
-            assert_eq!(interp.regs, ref_st.regs, "seed {seed:#x}: div interp regs != ref");
-            assert_eq!(native.temps, ref_st.temps, "seed {seed:#x}: div native temps != ref");
-            assert_eq!(
-                native.flags, ref_st.flags,
-                "seed {seed:#x}: div native flags {:#x} != ref {:#x}",
-                native.flags, ref_st.flags
-            );
-            assert_eq!(interp.flags.raw, ref_st.flags, "seed {seed:#x}: div interp flags != ref");
-            assert_eq!(native.regs[0], 142, "seed {seed:#x}: DIV w8 quotient wrong");
-            assert_eq!(native.regs[3] as i32, -333, "seed {seed:#x}: IDIV w4 quotient wrong");
-            assert_eq!(native.regs[4], 1, "seed {seed:#x}: IDIV w4 remainder wrong");
-            assert_eq!(native.regs[6], 0, "seed {seed:#x}: div-by-zero must yield 0");
-            assert_eq!(native.regs[2], 0, "seed {seed:#x}: div-by-zero clears regs[2]");
-        }
-    }
-
-    /// P2 differential: BSwap / BitScanForward/Reverse / TZCNT / LZCNT / PopCount
-    /// native self-decoding handlers == eval_state (regs/temps/flags/vsp/stack).
-    #[test]
-    fn test_native_poly_direct_bitscan_count_popcnt_matches_reference() {
-        let seeds = [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789];
-        for seed in seeds {
-            let mut d = RiscDesynthesizer::new();
-            // BSWAP r64
-            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x0102_0304_0506_0708), MicroOperand::Imm64(0));
-            d.instrs.push(MicroInstr::new(RiscOp::BSwap { width: 8 }).with_dst(MicroOperand::VReg(8)).with_src1(MicroOperand::VReg(0)));
-            // BSWAP r32 (low 32 bits swapped, high bits discarded)
-            d.instrs.push(MicroInstr::new(RiscOp::BSwap { width: 4 }).with_dst(MicroOperand::VReg(9)).with_src1(MicroOperand::VReg(0)));
-            // BSF / BSR
-            d.emit_add(MicroOperand::VReg(3), MicroOperand::Imm64(0x1000), MicroOperand::Imm64(0));
-            d.instrs.push(MicroInstr::new(RiscOp::BitScanForward).with_dst(MicroOperand::VReg(4)).with_src1(MicroOperand::VReg(3)));
-            d.instrs.push(MicroInstr::new(RiscOp::BitScanReverse).with_dst(MicroOperand::VReg(5)).with_src1(MicroOperand::VReg(3)));
-            // BSF src==0 -> ZF=1, dst=0
-            d.instrs.push(MicroInstr::new(RiscOp::BitScanForward).with_dst(MicroOperand::VReg(6)).with_src1(MicroOperand::Imm64(0)));
-            // TZCNT / LZCNT across widths, incl. width-truncated-zero (bit above width)
-            d.emit_add(MicroOperand::VReg(7), MicroOperand::Imm64(0x8000_0000_0000_1000), MicroOperand::Imm64(0));
-            d.instrs.push(MicroInstr::new(RiscOp::CountTrailingZeros { width: 8 }).with_dst(MicroOperand::Temp(0)).with_src1(MicroOperand::VReg(7)));
-            d.instrs.push(MicroInstr::new(RiscOp::CountLeadingZeros { width: 8 }).with_dst(MicroOperand::Temp(1)).with_src1(MicroOperand::VReg(7)));
-            d.instrs.push(MicroInstr::new(RiscOp::CountTrailingZeros { width: 4 }).with_dst(MicroOperand::Temp(2)).with_src1(MicroOperand::VReg(7)));
-            d.instrs.push(MicroInstr::new(RiscOp::CountLeadingZeros { width: 4 }).with_dst(MicroOperand::Temp(3)).with_src1(MicroOperand::VReg(7)));
-            // width 2 with low 16 bits == 0 -> dst=16, CF=1, ZF=1
-            d.instrs.push(MicroInstr::new(RiscOp::CountTrailingZeros { width: 2 }).with_dst(MicroOperand::Temp(4)).with_src1(MicroOperand::VReg(7)));
-            // LZCNT w2 on odd low value
-            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(1), MicroOperand::Imm64(0));
-            d.instrs.push(MicroInstr::new(RiscOp::CountLeadingZeros { width: 2 }).with_dst(MicroOperand::Temp(5)).with_src1(MicroOperand::VReg(0)));
-            // POPCNT (even popcount -> PF set) and POPCNT(0) -> ZF=1
-            d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(0xFF), MicroOperand::Imm64(0));
-            d.instrs.push(MicroInstr::new(RiscOp::PopCount).with_dst(MicroOperand::Temp(6)).with_src1(MicroOperand::VReg(1)));
-            d.instrs.push(MicroInstr::new(RiscOp::PopCount).with_dst(MicroOperand::Temp(7)).with_src1(MicroOperand::Imm64(0)));
-            d.instrs.push(MicroInstr::new(RiscOp::Halt));
-
-            let prog = RiscProgram::new(d.instrs);
-            let init = [0u64; 16];
-            let mut enc = PolymorphicEncoder::new(seed);
-            let bytecode = enc.encode(&prog).unwrap();
-            let native = run_native_poly_direct(&bytecode, seed, &init, None).unwrap();
-            let ref_st = prog.eval_state(&init);
-
-            assert_eq!(native.regs, ref_st.regs, "seed {seed:#x}: regs");
-            assert_eq!(native.temps, ref_st.temps, "seed {seed:#x}: temps");
-            assert_eq!(native.flags, ref_st.flags, "seed {seed:#x}: flags ref={:#x} native={:#x}", ref_st.flags, native.flags);
-            assert_eq!(native.vsp, ref_st.vsp, "seed {seed:#x}: vsp");
-            assert_eq!(native.stack, ref_st.stack, "seed {seed:#x}: stack");
-            assert_eq!(native.regs[8], 0x0807_0605_0403_0201, "seed {seed:#x}: bswap64");
-            assert_eq!(native.regs[9], 0x0807_0605, "seed {seed:#x}: bswap32");
-            assert_eq!(native.regs[4], 12, "seed {seed:#x}: bsf(0x1000)");
-            assert_eq!(native.regs[5], 12, "seed {seed:#x}: bsr(0x1000)");
-            assert_eq!(native.regs[6], 0, "seed {seed:#x}: bsf(0)");
-        }
-    }
-
-    /// Cond-byte decode foundation: the cond-codes table built from the spec's
-    /// branch_cond_map must map every BranchCondition's encoded byte to the
-    /// canonical COND_* code (and unknown bytes to COND_INVALID). This is the
-    /// table `sub_dec_ops_cond` reads to decode the cond byte of
-    /// VirtualBranch/Setcc/ConditionalMove into the DEC_COND state slot.
-    #[test]
-    fn test_cond_codes_table_matches_branch_cond_map() {
-        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
-            let spec = VirtualIsaSpec::from_seed(seed);
-            let parts = build_self_decoding_parts(
-                &[],
-                seed,
-                0x100000,
-                0x200000,
-                0x300000,
-                0x400000,
-                0x500000,
-            )
-            .unwrap();
-            // Every encoded cond byte -> its canonical code; everything else invalid.
-            for (cond, &byte) in &spec.branch_cond_map {
-                assert_eq!(
-                    parts.cond_codes[byte as usize],
-                    cond_code(*cond),
-                    "seed {seed:#x}: cond {cond:?} (byte {byte:#04x}) code mismatch"
-                );
-            }
-            for raw in 0u16..256 {
-                let raw = raw as u8;
-                if !spec.branch_cond_map.values().any(|&b| b == raw) {
-                    assert_eq!(
-                        parts.cond_codes[raw as usize],
-                        COND_INVALID,
-                        "seed {seed:#x}: stray byte {raw:#04x} must be invalid"
-                    );
-                }
-            }
-            // cond_code() is injective across the 22 supported conditions.
-            let mut seen = std::collections::HashSet::new();
-            for cond in spec.branch_cond_map.keys() {
-                assert!(seen.insert(cond_code(*cond)), "seed {seed:#x}: dup code for {cond:?}");
-            }
-        }
-    }
-}

@@ -7,6 +7,7 @@ pub mod opt;
 use std::collections::HashMap;
 
 pub use desynth::RiscDesynthesizer;
+pub use flags::VFLAG_DF;
 pub use flags::VirtualFlags;
 pub use lifter::RiscLifter;
 pub use opcodes::{BranchCondition, MicroInstr, MicroOperand, RiscOp};
@@ -238,21 +239,30 @@ impl RiscProgram {
                     let a = get_val(ins.src1, &st, flags.raw);
                     let cnt = get_val(ins.src2, &st, flags.raw) & 63;
                     let res = if cnt == 0 { a } else { a >> cnt };
-                    flags.update_logic64(res);
+                    // x86: count==0 이면 RFLAGS 불변 (shl/shr/sar count 0 은 flags 유지).
+                    if cnt != 0 {
+                        flags.update_logic64(res);
+                    }
                     store(ins.dst, &mut st, res);
                 }
                 RiscOp::ArithmeticShiftRight => {
                     let a = get_val(ins.src1, &st, flags.raw);
                     let cnt = get_val(ins.src2, &st, flags.raw) & 63;
                     let res = if cnt == 0 { a } else { ((a as i64) >> cnt) as u64 };
-                    flags.update_logic64(res);
+                    // x86: count==0 이면 RFLAGS 불변.
+                    if cnt != 0 {
+                        flags.update_logic64(res);
+                    }
                     store(ins.dst, &mut st, res);
                 }
                 RiscOp::ShiftLeft => {
                     let a = get_val(ins.src1, &st, flags.raw);
                     let cnt = get_val(ins.src2, &st, flags.raw) & 63;
                     let res = if cnt == 0 { a } else { a << cnt };
-                    flags.update_logic64(res);
+                    // x86: count==0 이면 RFLAGS 불변.
+                    if cnt != 0 {
+                        flags.update_logic64(res);
+                    }
                     store(ins.dst, &mut st, res);
                 }
                 RiscOp::VirtualPush => {
@@ -278,7 +288,9 @@ impl RiscProgram {
                 }
                 RiscOp::SetFlag => {
                     let v = get_val(ins.src1, &st, flags.raw);
-                    flags.raw = v & 0x8D5; // CF|PF|AF|ZF|SF|OF 마스크
+                    // CF|PF|AF|ZF|SF|OF status bits, plus DF (bit 10) — CLD/STD
+                    // lower to `SetFlag(flags & ~DF)` / `SetFlag(flags | DF)`.
+                    flags.raw = v & (0x8D5 | VFLAG_DF);
                 }
                 RiscOp::VirtualBranch { cond } => {
                     if branch_taken_with_state(cond, &flags, &st.regs) {
@@ -459,12 +471,7 @@ impl RiscProgram {
                 RiscOp::FloatToInt { src_bits, dst_bits, truncate } => {
                     let a = get_val(ins.src1, &st, flags.raw);
                     let f = if src_bits == 4 { f32::from_bits(a as u32) as f64 } else { f64::from_bits(a) };
-                    let iv = if truncate {
-                        (f.trunc() as i64) as u64
-                    } else {
-                        round_ties_even(f) as u64
-                    };
-                    let res = if dst_bits == 8 { iv } else { iv & 0xFFFF_FFFF };
+                    let res = cvt_f64_int(f, dst_bits, truncate);
                     store(ins.dst, &mut st, res);
                 }
                 RiscOp::FloatToFloat { src_bits, dst_bits } => {
@@ -567,6 +574,35 @@ fn round_ties_even(x: f64) -> i64 {
         if f % 2 == 0 { f } else { f + 1 }
     } else {
         x.round() as i64
+    }
+}
+
+/// x86 CVT(T)Sx2SI reference semantics (must match the bytecode interpreter's
+/// `cvt_f64_i32` in interp/xmm.rs). NaN / ±∞ / out-of-range produce the
+/// "integer indefinite": 0x8000_0000 for a 32-bit destination, and
+/// 0x8000_0000_0000_0000 for a 64-bit destination. Rust's `as i64` saturates
+/// instead (NaN→0, +∞→i64::MAX), so it CANNOT be used directly.
+fn cvt_f64_int(f: f64, dst_bits: u8, truncate: bool) -> u64 {
+    let r = if truncate {
+        f.trunc()
+    } else {
+        round_ties_even(f) as f64
+    };
+    match dst_bits {
+        4 => {
+            if !r.is_finite() || r < -2147483648.0 || r >= 2147483648.0 {
+                0x8000_0000
+            } else {
+                r as i32 as u32 as u64
+            }
+        }
+        _ => {
+            if !r.is_finite() || r < -9_223_372_036_854_775_808.0 || r >= 9_223_372_036_854_775_808.0 {
+                0x8000_0000_0000_0000
+            } else {
+                r as i64 as u64
+            }
+        }
     }
 }
 
@@ -854,5 +890,25 @@ mod tests {
         let prog = RiscProgram::new(d.instrs);
         let st = prog.eval_state(&[0u64; 16]);
         assert_eq!(st.regs[7], 99, "branch taken (ZF set)");
+    }
+
+    #[test]
+    fn test_cvt_f64_int_x86_indefinite() {
+        // 32-bit dst: NaN / ±∞ / out-of-range -> 0x8000_0000 (x86 indefinite),
+        // NOT Rust's saturating cast (NaN->0, +∞->i64::MAX).
+        assert_eq!(cvt_f64_int(f64::NAN, 4, true), 0x8000_0000);
+        assert_eq!(cvt_f64_int(f64::INFINITY, 4, true), 0x8000_0000);
+        assert_eq!(cvt_f64_int(f64::NEG_INFINITY, 4, true), 0x8000_0000);
+        assert_eq!(cvt_f64_int(2147483648.0, 4, true), 0x8000_0000); // 2^31
+        assert_eq!(cvt_f64_int(-2147483649.0, 4, true), 0x8000_0000);
+        assert_eq!(cvt_f64_int(-1.9, 4, true), (-1i32 as u32) as u64); // trunc toward 0
+        assert_eq!(cvt_f64_int(1.9, 4, true), 1);
+        assert_eq!(cvt_f64_int(2.5, 4, false), 2); // ties-to-even
+        assert_eq!(cvt_f64_int(3.5, 4, false), 4); // ties-to-even
+        // 64-bit dst: indefinite is 0x8000_0000_0000_0000.
+        assert_eq!(cvt_f64_int(f64::NAN, 8, true), 0x8000_0000_0000_0000);
+        assert_eq!(cvt_f64_int(9_223_372_036_854_775_808.0, 8, true), 0x8000_0000_0000_0000);
+        assert_eq!(cvt_f64_int(-9_223_372_036_854_775_809.0, 8, true), 0x8000_0000_0000_0000);
+        assert_eq!(cvt_f64_int(-1.9, 8, true), (-1i64) as u64);
     }
 }

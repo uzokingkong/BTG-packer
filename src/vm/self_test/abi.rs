@@ -81,9 +81,15 @@ pub fn run_handler_abi_test() -> anyhow::Result<()> {
     if i.code() != Code::Sub_rm64_imm32 || i.op0_register() != Register::RSP || (i.immediate32() as u32) != 0xA0 {
         return Err(anyhow!("[33] entry[0] expected sub rsp,0xA0, got {:?} (imm=0x{:X})", i.code(), i.immediate32()));
     }
+    // v65: entry[1] = cld (normalize host DF so pushfq-based cap_flags captures
+    // the guest's modelled DF exactly). Offsets below are shifted by +1.
+    let i = &insns[e0 + 1].1;
+    if i.code() != Code::Cld {
+        return Err(anyhow!("[33] entry[1] expected cld (v65 host-DF normalization), got {:?}", i.code()));
+    }
     // 10× movdqu [rsp+16k], xmm(6+k)
     for k in 0..10 {
-        let i = &insns[e0 + 1 + k].1;
+        let i = &insns[e0 + 2 + k].1;
         let want_xmm = Register::XMM6 + k as i32;
         if i.code() != Code::Movdqu_xmmm128_xmm
             || i.memory_base() != Register::RSP
@@ -99,35 +105,35 @@ pub fn run_handler_abi_test() -> anyhow::Result<()> {
         Register::R11, Register::R15, Register::R14, Register::R13, Register::R12,
     ];
     for (k, want) in push_order.iter().enumerate() {
-        let i = &insns[e0 + 11 + k].1;
+        let i = &insns[e0 + 12 + k].1;
         if i.code() != Code::Push_r64 || i.op0_register() != *want {
             return Err(anyhow!("[33] entry push #{}: expected push {:?}, got {:?}", k, want, i));
         }
     }
     // Ksa: 2 pointer snapshots
-    let s = &insns[e0 + 26].1; // mov [rcx+0x110], rbx
+    let s = &insns[e0 + 27].1; // mov [rcx+0x110], rbx
     if s.code() != Code::Mov_rm64_r64 || s.memory_base() != Register::RCX || s.memory_displacement64() != 0x110 || s.op1_register() != Register::RBX {
         return Err(anyhow!("[33] entry Ksa snapshot[0] mismatch: {:?}", s));
     }
-    let s = &insns[e0 + 27].1; // mov [rcx+0x118], rdx
+    let s = &insns[e0 + 28].1; // mov [rcx+0x118], rdx
     if s.code() != Code::Mov_rm64_r64 || s.memory_base() != Register::RCX || s.memory_displacement64() != 0x118 || s.op1_register() != Register::RDX {
         return Err(anyhow!("[33] entry Ksa snapshot[1] mismatch: {:?}", s));
     }
-    let s = &insns[e0 + 28].1; // mov r8, rcx
+    let s = &insns[e0 + 29].1; // mov r8, rcx
     if s.code() != Code::Mov_r64_rm64 || s.op0_register() != Register::R8 || s.op1_register() != Register::RCX {
         return Err(anyhow!("[33] entry r8=rcx mismatch: {:?}", s));
     }
-    let s = &insns[e0 + 29].1; // mov r9, bc_va
+    let s = &insns[e0 + 30].1; // mov r9, bc_va
     if s.code() != Code::Mov_r64_imm64 || s.op0_register() != Register::R9 || s.immediate64() != bc_va {
         return Err(anyhow!("[33] entry r9=bc_va mismatch: {:?}", s));
     }
-    let s = &insns[e0 + 30].1; // mov r10, table_va
+    let s = &insns[e0 + 31].1; // mov r10, table_va
     if s.code() != Code::Mov_r64_imm64 || s.op0_register() != Register::R10 || s.immediate64() != table_va {
         return Err(anyhow!("[33] entry r10=table_va mismatch: {:?}", s));
     }
-    let s = &insns[e0 + 32].1; // jmp dispatch (r15 MBA-key zeroing inserted at [31])
+    let s = &insns[e0 + 33].1; // jmp dispatch (r15 MBA-key zeroing inserted at [32])
     if s.code() != Code::Jmp_rel32_64 {
-        return Err(anyhow!("[33] entry[32] expected jmp dispatch, got {:?}", s.code()));
+        return Err(anyhow!("[33] entry[33] expected jmp dispatch, got {:?}", s.code()));
     }
 
     // (b) dispatch loop 검증 ────────────────────────────────────────────────

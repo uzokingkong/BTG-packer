@@ -2,7 +2,7 @@
 // BTG v21 - VM Interpreter: XMM moves / shuffles / packed shifts / PINSRW
 // ==============================================================================
 
-use super::state::{VmError, STATE_XMM, mem_get, mem_put, vreg32, vreg64};
+use super::state::{VmError, STATE_XMM, mem_get, mem_put, set_vreg64, vreg32, vreg64};
 use crate::vm::bytecode::*;
 
 /// Execute one XMM opcode. `ip` points at the first operand byte (opcode
@@ -20,14 +20,14 @@ pub(crate) fn exec(
             let src = code[ip + 1] as usize;
             let lane = code[ip + 2];
             let ip = ip + 3;
-            let v = (*vreg64(state, src)? & 0xFFFF) as u16;
+            let v = (vreg64(state, src)? & 0xFFFF) as u16;
             let base = STATE_XMM + dst * 16 + (lane as usize & 7) * 2;
             state[base..base + 2].copy_from_slice(&v.to_le_bytes());
             Ok(ip)
         }
         OP_MOVSD_XMM_MEM => {
             let xmm = code[ip] as usize;
-            let addr = *vreg64(state, code[ip + 1] as usize)? as usize;
+            let addr = vreg64(state, code[ip + 1] as usize)? as usize;
             let ip = ip + 2;
             let v = u64::from_le_bytes(mem_get(mem, addr, 8).ok_or(VmError::OobMem)?.try_into().unwrap());
             let base = STATE_XMM + xmm * 16;
@@ -41,7 +41,7 @@ pub(crate) fn exec(
             let ip = ip + 2;
             let base = STATE_XMM + xmm * 16;
             let lo = u64::from_le_bytes(state[base..base + 8].try_into().unwrap());
-            *vreg64(state, gpr)? = lo;
+            set_vreg64(state, gpr, lo)?;
             Ok(ip)
         }
         OP_MOVQ_GPR_XMM => {
@@ -49,13 +49,13 @@ pub(crate) fn exec(
             let gpr = code[ip + 1] as usize;
             let ip = ip + 2;
             let base = STATE_XMM + xmm * 16;
-            let v = *vreg64(state, gpr)?;
+            let v = vreg64(state, gpr)?;
             state[base..base + 8].copy_from_slice(&v.to_le_bytes());
             state[base + 8..base + 16].fill(0);
             Ok(ip)
         }
         OP_MOVSD_MEM_XMM => {
-            let addr = *vreg64(state, code[ip] as usize)? as usize;
+            let addr = vreg64(state, code[ip] as usize)? as usize;
             let xmm = code[ip + 1] as usize;
             let ip = ip + 2;
             let base = STATE_XMM + xmm * 16;
@@ -65,7 +65,7 @@ pub(crate) fn exec(
         }
         OP_MOVUPS_XMM_MEM => {
             let xmm = code[ip] as usize;
-            let addr = *vreg64(state, code[ip + 1] as usize)? as usize;
+            let addr = vreg64(state, code[ip + 1] as usize)? as usize;
             let ip = ip + 2;
             let bytes = mem_get(mem, addr, 8).ok_or(VmError::OobMem)?.to_vec();
             let bytes2 = mem_get(mem, addr + 8, 8).ok_or(VmError::OobMem)?.to_vec();
@@ -75,7 +75,7 @@ pub(crate) fn exec(
             Ok(ip)
         }
         OP_MOVUPS_MEM_XMM => {
-            let addr = *vreg64(state, code[ip] as usize)? as usize;
+            let addr = vreg64(state, code[ip] as usize)? as usize;
             let xmm = code[ip + 1] as usize;
             let ip = ip + 2;
             let base = STATE_XMM + xmm * 16;
@@ -190,7 +190,7 @@ pub(crate) fn exec(
             }
             Ok(ip)
         }
-        // ── v54: SSE/FPU (Group A) ──────────────────────────────────────────
+        // ?? v54: SSE/FPU (Group A) ??????????????????????????????????????????
         // Scalar FP arithmetic: xmm[dst].low = xmm[dst].low OP xmm[src].low;
         // all other bytes of dst are preserved. No status flags are touched
         // (x86 SSE scalar FP writes MXCSR, not rflags).
@@ -252,7 +252,7 @@ pub(crate) fn exec(
             let ip = ip + 2;
             let db = STATE_XMM + dst * 16;
             if op == OP_CVTSI2SD_XMM {
-                let v = *vreg64(state, src)? as i64;
+                let v = vreg64(state, src)? as i64;
                 state[db..db + 16].fill(0);
                 state[db..db + 8].copy_from_slice(&(v as f64).to_le_bytes());
             } else {
@@ -296,7 +296,7 @@ pub(crate) fn exec(
             } else {
                 f64::from_le_bytes(state[sb..sb + 8].try_into().unwrap())
             };
-            *vreg64(state, dst)? = cvt_f64_i32(x, trunc) as u64;
+            set_vreg64(state, dst, cvt_f64_i32(x, trunc) as u64)?;
             Ok(ip)
         }
         // pextrd: vreg[dst] = xmm[src].dword[imm & 3] (zero-extended).
@@ -307,7 +307,7 @@ pub(crate) fn exec(
             let ip = ip + 3;
             let base = STATE_XMM + src * 16 + lane * 4;
             let v = u32::from_le_bytes(state[base..base + 4].try_into().unwrap());
-            *vreg64(state, dst)? = v as u64;
+            set_vreg64(state, dst, v as u64)?;
             Ok(ip)
         }
         // pinsrd: xmm[dst].dword[imm & 3] = vreg[src].low32 (others kept).
@@ -316,7 +316,7 @@ pub(crate) fn exec(
             let src = code[ip + 1] as usize;
             let lane = (code[ip + 2] & 3) as usize;
             let ip = ip + 3;
-            let v = (*vreg64(state, src)? & 0xFFFF_FFFF) as u32;
+            let v = (vreg64(state, src)? & 0xFFFF_FFFF) as u32;
             let base = STATE_XMM + dst * 16 + lane * 4;
             state[base..base + 4].copy_from_slice(&v.to_le_bytes());
             Ok(ip)

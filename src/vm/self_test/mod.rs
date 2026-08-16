@@ -35,6 +35,7 @@ mod bmi;
 mod sse_fpu;
 mod lock_incdec;
 mod ir;
+mod fuzz;
 
 // ── test functions the orchestrator dispatches (from submodules) ──
 use self::a2_a5::run_a2_a5_test;
@@ -51,6 +52,7 @@ use self::bmi::run_bmi_test;
 use self::sse_fpu::run_sse_fpu_test;
 use self::lock_incdec::run_lock_incdec_test;
 use self::ir::run_ir_test;
+use self::fuzz::{run_fuzz_arith_test, run_fuzz_bmi_test};
 use self::flags::run_flags_jcc_test;
 use self::abi::run_handler_abi_test;
 use self::addr::run_m2_addr_test;
@@ -704,6 +706,24 @@ pub fn run_self_test() -> Result<()> {
         Ok(_) => println!("[37] B-1 BMI1/2 (lzcnt/popcnt/blsr/blsmsk/blsi/andn; interp==native): PASS"),
         Err(e) => {
             println!("[37] B-1 BMI1/2:                                                                     FAIL ({})", e);
+            return Err(e);
+        }
+    }
+    let _ = std::io::stdout().flush();
+
+    match run_fuzz_bmi_test() {
+        Ok(_) => println!("[37a] FUZZ BMI flags (random operands, interp==native==ref):                PASS"),
+        Err(e) => {
+            println!("[37a] FUZZ BMI flags:                                                              FAIL ({})", e);
+            return Err(e);
+        }
+    }
+    let _ = std::io::stdout().flush();
+
+    match run_fuzz_arith_test() {
+        Ok(_) => println!("[37b] FUZZ arith/popcnt (random operands, interp==native==ref):              PASS"),
+        Err(e) => {
+            println!("[37b] FUZZ arith/popcnt:                                                            FAIL ({})", e);
             return Err(e);
         }
     }

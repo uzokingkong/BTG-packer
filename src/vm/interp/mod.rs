@@ -59,10 +59,25 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
         }
         let op = code[ip];
         ip += 1;
+        // 리뷰 지적 #13: 핸들러들이 code[ip+1], code[ip+1..ip+5] 등을 직접 읽으므로
+        // 잘린 바이트코드가 들어오면 Rust panic 이 났다. opcode 의 고정 피연산자
+        // 길이(opcode_operand_len)로 미리 범위를 확인해 `VmError::OobIp` 로 돌린다.
+        if let Some(olen) = opcode_operand_len(op) {
+            if ip.checked_add(olen).map(|end| end > code.len()).unwrap_or(true) {
+                return Err(VmError::OobIp(ip));
+            }
+        }
         ip = match op {
             // ── register / immediate moves ───────────────────────────────
-            OP_MOV_R_IMM32 | OP_MOV_R_IMM64 | OP_MOV_R_R | OP_MOV_R_R64 => {
+            OP_MOV_R_IMM32 | OP_MOV_R_IMM64 | OP_MOV_R_R | OP_MOV_R_R64
+            | OP_MOV_R_FLAGS | OP_MOV_FLAGS_R => {
                 mov::exec(state, mem, code, ip, op)?
+            }
+            // ── v65: Direction Flag (CLD/STD) ─────────────────────────────
+            OP_CLD | OP_STD => {
+                let df = op == OP_STD;
+                state::set_df(state, df);
+                ip
             }
             // ── arithmetic / logical / shifts / bitwise ──────────────────
             OP_XOR_R_R | OP_ADD_R_R | OP_IMUL_R_R | OP_SUB_R_R | OP_AND_R_R
@@ -141,5 +156,88 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
             OP_NOP | OP_NATIVE_CALL => ip,
             other => return Err(VmError::UnknownOpcode(other)),
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 리뷰 지적 #13: 잘린(truncated) 바이트코드가 panic 이 아니라 `VmError::OobIp`
+    /// 를 반환해야 한다 (핸들러가 code[ip+1..] 등을 직접 읽기 전 사전검증).
+    #[test]
+    fn truncated_bytecode_returns_oob_ip_not_panic() {
+        let mut st = vec![0u8; state::STATE_SIZE];
+        let mut mem = vec![0u8; 0x1000];
+
+        // OP_MOV_R_IMM32 (0x01) — 피연산자 5바이트 필요, 1바이트만 제공.
+        let truncated = [0x01u8, 0x00];
+        let r = interpret(&mut st, &mut mem, &truncated);
+        assert!(
+            matches!(r, Err(VmError::OobIp(_))),
+            "truncated MOV_R_IMM32 must return OobIp, got {r:?}"
+        );
+
+        // OP_LEA (0x34) — 피연산자 8바이트 필요, 3바이트만 제공.
+        let truncated2 = [0x34u8, 0x00, 0x01, 0x02];
+        let r2 = interpret(&mut st, &mut mem, &truncated2);
+        assert!(
+            matches!(r2, Err(VmError::OobIp(_))),
+            "truncated LEA must return OobIp, got {r2:?}"
+        );
+
+        // 정상 바이트코드는 여전히 동작 (MOV_R_IMM32 + HALT).
+        let mut b = BytecodeBuilder::new();
+        b.mov_r_imm32(0, 42);
+        b.halt();
+        let ok = interpret(&mut st, &mut mem, &b.finish());
+        assert!(ok.is_ok(), "valid bytecode must still interpret: {ok:?}");
+    }
+
+    /// 리뷰 지적 #9: RET without CALL must be an explicit error, not a silent
+    /// wrapping read of the (empty) return-IP stack.
+    #[test]
+    fn ret_without_call_returns_call_stack_underflow() {
+        let mut st = vec![0u8; state::STATE_SIZE];
+        let mut mem = vec![0u8; 0x1000];
+        // Empty return-IP stack (the VM entry convention): csp == CALL_STACK_SIZE.
+        st[state::STATE_CALL_SP..state::STATE_CALL_SP + 8]
+            .copy_from_slice(&(state::CALL_STACK_SIZE as u64).to_le_bytes());
+        let prog = [OP_RET];
+        let r = interpret(&mut st, &mut mem, &prog);
+        assert!(
+            matches!(r, Err(VmError::CallStackUnderflow)),
+            "RET with an empty return-IP stack must error, got {r:?}"
+        );
+    }
+
+    /// 리뷰 지적 #9: exceeding the reserved return-IP stack depth (CALL_STACK_SIZE
+    /// bytes = 1024 entries) must be an explicit overflow error.
+    #[test]
+    fn call_depth_overflow_returns_call_stack_overflow() {
+        let mut st = vec![0u8; state::STATE_SIZE];
+        let mut mem = vec![0u8; 0x20000];
+        // Reserve the call-stack buffer region so deep calls have room in `mem`.
+        // base must be >= CALL_STACK_SIZE so even the deepest slot stays >= 0.
+        let base = 0x10000usize;
+        st[state::STATE_PTR_CALL_STACK..state::STATE_PTR_CALL_STACK + 8]
+            .copy_from_slice(&(base as u64).to_le_bytes());
+        // Empty stack top.
+        st[state::STATE_CALL_SP..state::STATE_CALL_SP + 8]
+            .copy_from_slice(&(state::CALL_STACK_SIZE as u64).to_le_bytes());
+
+        let mut prog = Vec::new();
+        for _ in 0..(state::CALL_STACK_SIZE / 8 + 2) {
+            // OP_CALL8, rel=0 (self-call keeps ip advancing past this instr is
+            // irrelevant — we only need the push to accumulate).
+            prog.push(OP_CALL8);
+            prog.push(0i8 as u8);
+        }
+        prog.push(OP_HALT);
+        let r = interpret(&mut st, &mut mem, &prog);
+        assert!(
+            matches!(r, Err(VmError::CallStackOverflow(_))),
+            "call depth past 1024 must error, got {r:?}"
+        );
     }
 }

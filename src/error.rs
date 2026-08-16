@@ -67,6 +67,9 @@ pub enum ObfuscationError {
     #[error("MBA polynomial generation failed: {0}")]
     MbaGenerationFailed(String),
 
+    #[error("MBA polynomial codegen failed: {0}")]
+    MbaCodegenFailed(String),
+
     #[error("Expression simplification error: {0}")]
     ExpressionError(String),
 }

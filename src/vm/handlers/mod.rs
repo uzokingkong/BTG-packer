@@ -80,6 +80,9 @@ pub(crate) enum Cl {
     HaltSearchFound,
     // v24: native API bridge
     Bridge,
+    // v64: shift count==0 → RFLAGS 유지 (x86: shl/shr/sar count 0 은 플래그 불변).
+    // shift 핸들러가 cap_flags_shift 를 건너뛰는 타깃 라벨 (opcode 파라미터로 유일).
+    ShiftSkip(u8),
 }
 
 /// Which routine the VM entry stub is wired to execute. The entry stub snapshots
@@ -193,11 +196,16 @@ fn state_flags_mem() -> MemoryOperand {
 /// STATE_FLAGS slot, masked to the modelled flag bits. `full=true` keeps all six
 /// bits (ADD/SUB/CMP); `full=false` keeps only ZF/SF/PF (logical AND/XOR —
 /// matching flags::logical_flags). Masking to FLAG_MASK keeps the stored word
-/// identical to what the interpreter writes.
+/// identical to what the interpreter writes. DF (bit 10) is carried through from
+/// the host RFLAGS: the entry stub issues `cld` so the host DF starts clear, and
+/// the lifted CLD/STD handlers execute a real `cld`/`std` (plus update the
+/// modelled bit), so pushfq here captures the guest's DF exactly. x86 arithmetic
+/// never touches DF, so including it in the mask preserves it.
 /// Must be emitted immediately after the result store (mov), before any
 /// instruction that changes flags (e.g. `add r9, N`).
 fn cap_flags(full: bool) -> Vec<Instruction> {
     let keep = if full { FLAG_MASK } else { F_ZF | F_SF | F_PF };
+    let keep = keep | F_DF;
     vec![
         Instruction::with(Code::Pushfq),
         Instruction::with1(Code::Pop_r64, Register::R11).unwrap(),
@@ -208,8 +216,10 @@ fn cap_flags(full: bool) -> Vec<Instruction> {
 
 /// Capture INC/DEC flags: like cap_flags(true) but CF is *preserved* (x86 INC/DEC
 /// do not modify CF). Old CF is read from the VM slot, merged into the new flags,
-/// then masked to FLAG_MASK.
+/// then masked to FLAG_MASK. DF is carried through from the host RFLAGS (see
+/// cap_flags).
 fn cap_flags_incdec() -> Vec<Instruction> {
+    let keep = FLAG_MASK | F_DF;
     vec![
         Instruction::with2(Code::Mov_r64_rm64, Register::R11, state_flags_mem()).unwrap(),
         Instruction::with(Code::Pushfq),
@@ -218,19 +228,20 @@ fn cap_flags_incdec() -> Vec<Instruction> {
         // clear CF (bit0) in the new flags: and rcx, -2
         Instruction::with2(Code::And_rm64_imm32, Register::RCX, -2).unwrap(),
         Instruction::with2(Code::Or_rm64_r64, Register::RCX, Register::R11).unwrap(),
-        Instruction::with2(Code::And_rm64_imm32, Register::RCX, (FLAG_MASK as u32) as i32).unwrap(),
+        Instruction::with2(Code::And_rm64_imm32, Register::RCX, (keep as u32) as i32).unwrap(),
         Instruction::with2(Code::Mov_rm64_r64, state_flags_mem(), Register::RCX).unwrap(),
     ]
 }
 
 /// Capture shift flags: like cap_flags(true) but OF and AF are *defined as 0*
 /// (x86 leaves OF/AF undefined for shifts; we define them 0 and the interpreter
-/// agrees via flags::shift_flags).
+/// agrees via flags::shift_flags). DF is carried through from the host RFLAGS.
 fn cap_flags_shift() -> Vec<Instruction> {
+    let keep = (FLAG_MASK & !(F_OF | F_AF)) | F_DF;
     vec![
         Instruction::with(Code::Pushfq),
         Instruction::with1(Code::Pop_r64, Register::R11).unwrap(),
-        Instruction::with2(Code::And_rm64_imm32, Register::R11, ((FLAG_MASK & !(F_OF | F_AF)) as u32) as i32).unwrap(),
+        Instruction::with2(Code::And_rm64_imm32, Register::R11, (keep as u32) as i32).unwrap(),
         Instruction::with2(Code::Mov_rm64_r64, state_flags_mem(), Register::R11).unwrap(),
     ]
 }
@@ -269,6 +280,9 @@ pub fn generate_vm_code(
     // Bug-6 fix: also save the Win64 callee-saved XMM6..XMM15 (160 bytes) first.
     // 160 is a multiple of 16, so RSP%16 is unchanged before the GPR pushes below.
     seq.push((Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, 0xA0).unwrap(), Some(Cl::Entry)));
+    // v65: normalize the host DF so the threaded dispatch's pushfq-based cap_flags
+    // captures the guest's modelled DF (only the lifted CLD/STD change it).
+    seq.push((Instruction::with(Code::Cld), None));
     for (i, xr) in XMM_SAVE.iter().enumerate() {
         seq.push((
             Instruction::with2(
@@ -370,6 +384,10 @@ pub fn generate_vm_code(
     mov::emit_mov_r_imm32(&mut seq);
     mov::emit_mov_r_imm64(&mut seq);
     mov::emit_mov_r_r(&mut seq);
+    mov::emit_mov_r_flags(&mut seq);
+    mov::emit_mov_flags_r(&mut seq);
+    mov::emit_cld(&mut seq);
+    mov::emit_std(&mut seq);
     alu::emit_alu_rr(&mut seq);
     alu::emit_alu_imm32(&mut seq);
     alu::emit_rol_r_imm8(&mut seq);

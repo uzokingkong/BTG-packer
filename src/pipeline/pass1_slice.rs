@@ -216,8 +216,8 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
     println!("  Total Trigger Blocks:        {}", metrics.total_trigger_blocks);
     println!("  Overlapped Blocks:           {}", metrics.overlapped_blocks);
     println!("  Instruction Overlap Density: {:.2}%", metrics.overlap_density);
-    println!("  Control Flow Flattening:     {:.2}%", metrics.flattening_ratio);
-    println!("  MBA Key Entropy Score:       {:.0}-bit", metrics.mba_entropy_score);
+    println!("  Control Flow Flattening:     {:.2}% (design constant — all transitions route via dispatcher)", metrics.flattening_ratio);
+    println!("  MBA Key Entropy Score:       {:.0}-bit (theoretical upper bound = key size)", metrics.mba_entropy_score);
     println!("------------------------------------------------------------------\n");
 
     ctx.basic_blocks = basic_blocks;

@@ -13,6 +13,12 @@ use super::rolling_key::RollingKeyEngine;
 use crate::vm::risc::{BranchCondition, MicroInstr, MicroOperand, RiscOp, RiscProgram};
 use anyhow::{anyhow, Result};
 
+/// 디코드 시 최대 마이크로-op 수 (리소스 가드). 루프는 어차피 스트림 끝에서
+/// 종료되므로 이 캡은 병리적 입력 방어용이다. 상용(`--vm-commercial`) 전체
+/// 프로그램은 수백만 op 로 커질 수 있어 기존 200k 캡은 너무 낮았다
+/// (self-decoding branch-map 검증 실패). 4M op ≈ 소스 20MB 이상을 커버.
+pub const MAX_DECODE_INSTRS: usize = 4_000_000;
+
 /// 폴리모픽 바이트코드 → `RiscProgram` 복호화기.
 pub struct PolymorphicDecoder {
     pub spec: VirtualIsaSpec,
@@ -34,6 +40,14 @@ impl PolymorphicDecoder {
     ///   즉시값 → (AddWithCarry 이고 즉시 피연산자가 없으면) cin 8B → (VirtualBranch 의
     ///   절대-인덱스 타깃(src1 없음)이면) 타깃 8B. 즉시값은 `operand_mask`로 XOR 복원.
     pub fn decode(&mut self, bytecode: &[u8]) -> Result<RiscProgram> {
+        self.decode_full(bytecode, true)
+    }
+
+    /// `decode` + `decode_full(.., stop_at_halt=false)`: decode the ENTIRE stream
+    /// without stopping at Halt. The whole-program commercial lift contains many
+    /// Halt ops (one per `ret`), and the branch-map builder needs byte offsets for
+    /// every micro-op, so it must not truncate at the first Halt.
+    pub fn decode_full(&mut self, bytecode: &[u8], stop_at_halt: bool) -> Result<RiscProgram> {
         let mut instrs = Vec::new();
         let mut vip = 0usize;
 
@@ -46,7 +60,7 @@ impl PolymorphicDecoder {
                 .reverse_opcode_map
                 .get(&raw_op)
                 .cloned()
-                .ok_or_else(|| anyhow!("poly decoder: unknown decrypted opcode 0x{raw_op:02X} at offset 0x{vip:X}"))?;
+                .ok_or_else(|| anyhow!("poly decoder: unknown decrypted opcode 0x{raw_op:02X} at offset 0x{vip:X} (enc byte 0x{:02X}) after {} instrs", bytecode[vip - 1], instrs.len()))?;
 
             // 1b. 조건 바이트 — VirtualBranch·Setcc·ConditionalMove (opcode 직후)
             let cond = if let RiscOp::VirtualBranch { .. }
@@ -173,7 +187,10 @@ impl PolymorphicDecoder {
             };
 
             instrs.push(ins);
-            if risc_op == RiscOp::Halt {
+            if stop_at_halt && risc_op == RiscOp::Halt {
+                break;
+            }
+            if instrs.len() > MAX_DECODE_INSTRS {
                 break;
             }
         }
@@ -222,5 +239,41 @@ mod tests {
         assert_eq!(dec_st.regs[0], ref_st.regs[0]);
         assert_eq!(dec_st.regs[1], ref_st.regs[1]);
         assert_eq!(dec_st.flags, ref_st.flags);
+    }
+
+    /// decode_full must recover EVERY instruction (including those after a Halt —
+    /// the whole-program commercial lift emits one Halt per `ret`, so the stream
+    /// has many Halts and decoding must not truncate at the first one).
+    #[test]
+    fn test_decode_full_keeps_instructions_after_halt() {
+        use crate::vm::risc::{MicroInstr, MicroOperand, RiscOp};
+        let seed = 0x1122334455667788u64;
+        let mut instrs = Vec::new();
+        for i in 0..5u64 {
+            instrs.push(
+                MicroInstr::new(RiscOp::Mov)
+                    .with_dst(MicroOperand::VReg(0))
+                    .with_src1(MicroOperand::Imm64(i)),
+            );
+            instrs.push(MicroInstr::new(RiscOp::Halt));
+        }
+        let prog = RiscProgram::new(instrs);
+        let mut enc = PolymorphicEncoder::new(seed);
+        let bc = enc.encode(&prog).unwrap();
+
+        let mut dec = PolymorphicDecoder::new(seed);
+        let full = dec.decode_full(&bc, false).unwrap();
+        assert_eq!(
+            full.instrs.len(),
+            prog.instrs.len(),
+            "decode_full must keep every instruction (incl. after Halt)"
+        );
+        for (a, b) in full.instrs.iter().zip(prog.instrs.iter()) {
+            assert_eq!(a.op, b.op);
+            assert_eq!(a.dst, b.dst);
+            assert_eq!(a.src1, b.src1);
+            assert_eq!(a.src2, b.src2);
+            assert_eq!(a.imm, b.imm);
+        }
     }
 }

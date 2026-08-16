@@ -8,9 +8,36 @@
 // STATE_PTR_CALL_STACK) and keep the program's observed return VA on [v4].
 
 use super::state::{
-    VmError, call_sp_of, call_stack_addr, mem_get, mem_put, set_call_sp, set_sp, sp_of, vreg64,
+    VmError, call_sp_of, call_stack_addr, mem_get, mem_put, set_call_sp, set_sp, set_vreg64, sp_of, vreg64,
+    CALL_STACK_SIZE,
 };
 use crate::vm::bytecode::*;
+
+/// Depth bound for the bytecode return-IP stack. Convention (matches the boot
+/// stub / native VM): STATE_CALL_SP starts at CALL_STACK_SIZE (= the empty/top
+/// position) and grows *downward* by 8 per CALL. Valid offsets are therefore
+/// in `[0, CALL_STACK_SIZE]`. Malformed bytecode (e.g. CALL × 1025, or RET
+/// without a matching CALL) must be rejected explicitly instead of silently
+/// wrapping into an out-of-bounds slot.
+#[inline]
+fn check_call_push(csp: u64) -> Result<(), VmError> {
+    // `csp` is the offset AFTER the 8-byte decrement. A wrapped value (the
+    // stack was already full) lands above CALL_STACK_SIZE → overflow.
+    if csp as u64 > CALL_STACK_SIZE as u64 {
+        return Err(VmError::CallStackOverflow(csp as i64));
+    }
+    Ok(())
+}
+
+#[inline]
+fn check_call_pop(csp: u64) -> Result<(), VmError> {
+    // `csp` is the offset BEFORE the pop. Empty = at/above CALL_STACK_SIZE
+    // (or a corrupted wrapped value) → RET without a matching CALL.
+    if csp as u64 >= CALL_STACK_SIZE as u64 {
+        return Err(VmError::CallStackUnderflow);
+    }
+    Ok(())
+}
 
 /// Execute one stack/call opcode. `ip` points at the first operand byte
 /// (opcode already consumed). Returns the updated ip.
@@ -37,7 +64,7 @@ pub(crate) fn exec(
             let sp = sp_of(state);
             let addr = sp as usize;
             let val = u64::from_le_bytes(mem_get(mem, addr, 8).ok_or(VmError::OobMem)?.try_into().unwrap());
-            *vreg64(state, r)? = val;
+            set_vreg64(state, r, val)?;
             set_sp(state, sp.wrapping_add(8));
             Ok(ip)
         }
@@ -50,6 +77,7 @@ pub(crate) fn exec(
             // pushed to [v4] separately by the lifter before the call.
             let ret_ip = ip as u64;
             let csp = call_sp_of(state).wrapping_sub(8);
+            check_call_push(csp)?;
             set_call_sp(state, csp);
             let caddr = call_stack_addr(state, csp);
             mem_put(mem, caddr, &ret_ip.to_le_bytes())?;
@@ -60,6 +88,7 @@ pub(crate) fn exec(
             // flow); advance the architectural RSP (v4) past the caller's
             // pushed return VA.
             let csp = call_sp_of(state);
+            check_call_pop(csp)?;
             let val = u64::from_le_bytes(mem_get(mem, call_stack_addr(state, csp), 8).ok_or(VmError::OobMem)?.try_into().unwrap());
             set_call_sp(state, csp.wrapping_add(8));
             set_sp(state, sp_of(state).wrapping_add(8));
@@ -69,6 +98,7 @@ pub(crate) fn exec(
             let imm = u16::from_le_bytes(code[ip..ip + 2].try_into().unwrap());
             let ip = ip + 2;
             let csp = call_sp_of(state);
+            check_call_pop(csp)?;
             let val = u64::from_le_bytes(mem_get(mem, call_stack_addr(state, csp), 8).ok_or(VmError::OobMem)?.try_into().unwrap());
             set_call_sp(state, csp.wrapping_add(8));
             set_sp(state, sp_of(state).wrapping_add(8 + imm as u64));
@@ -79,6 +109,7 @@ pub(crate) fn exec(
             let ip = ip + 4;
             let ret_ip = ip as u64;
             let csp = call_sp_of(state).wrapping_sub(8);
+            check_call_push(csp)?;
             set_call_sp(state, csp);
             let caddr = call_stack_addr(state, csp);
             mem_put(mem, caddr, &ret_ip.to_le_bytes())?;

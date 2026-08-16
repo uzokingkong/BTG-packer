@@ -233,6 +233,20 @@ impl VirtualIsaSpec {
         };
         self.opcode_map.get(&canonical).copied()
     }
+
+    /// 폴리 인코딩 가능한 opcode 인지 — **시드 무관** (opcode 바이트는 시드 의존이지만
+    /// opcode **집합**은 고정이다). `opcode_for`와 동일하게 VirtualBranch/Setcc/
+    /// ConditionalMove 조건은 canonicalize 한다.
+    ///
+    /// 상용(`--vm-commercial`) 리프트가 RISC 로는 lift 되지만 폴리 ISA 에 없는
+    /// op(Float 스칼라 등)를 조기 감지해 해당 함수를 네이티브로 유지하는 데 쓴다.
+    /// (폴리 인터프리터/네이티브 러너가 Float 를 아직 실행하지 않으므로, 인코딩만
+    /// 추가하면 참조와 불일치 — 제외가 올바른 경로.)
+    pub fn is_encodable(op: RiscOp) -> bool {
+        use std::sync::OnceLock;
+        static SPEC: OnceLock<VirtualIsaSpec> = OnceLock::new();
+        SPEC.get_or_init(|| VirtualIsaSpec::from_seed(0)).opcode_for(op).is_some()
+    }
 }
 
 #[cfg(test)]

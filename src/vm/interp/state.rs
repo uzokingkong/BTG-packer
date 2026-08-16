@@ -13,14 +13,22 @@
 // All handlers (and the mod.rs dispatch) read/write the VM state exclusively
 // through these helpers so the layout stays defined in one place.
 //
-// State layout (matches handlers.rs / the packer integration):
-//   [0x000] vregs[16] x u64
-//   [0x100] flags u64       (x86 RFLAGS bit positions: CF/PF/AF/ZF/SF/OF — v21)
-//   [0x110] ptr_sbox u64     (offset into mem)
+// State layout (matches handlers.rs / the packer integration) — v64 동기화:
+//   [0x000] vregs[NREG=20] x u64   (16 GPR RAX..R15 + lifter SCRATCH/SCRATCH2/TMP/TMP4)
+//   [0x0A0] (예약 패딩)
+//   [0x100] flags u64             (x86 RFLAGS: CF/PF/AF/ZF/SF/OF)
+//   [0x108] sp u64                (M3 legacy — vreg[4]=RSP 가 단일 스택 포인터)
+//   [0x110] ptr_sbox u64          (offset into mem / native는 절대 VA)
 //   [0x118] ptr_seed u64
 //   [0x120] ptr_buf u64
 //   [0x128] ptr_runs u64
-//   [0x130] STATE_SIZE (end)
+//   [0x130] ptr_stack u64         (M3 legacy)
+//   [0x138] rip u64               (v24: 현재 lift 명령의 기준 VA)
+//   [0x140] xmm[16] x 16B         (0x100 바이트)
+//   [0x240] seg_gs u64            (v43: GS base = TEB)
+//   [0x248] call_sp u64           (VM 바이트코드 return-IP 스택 오프셋)
+//   [0x250] ptr_call_stack u64    (VM 바이트코드 return-IP 스택 base)
+//   [0x258] STATE_SIZE (end)      (call stack buffer는 state 버퍼 밖)
 // ==============================================================================
 
 use crate::vm::bytecode::*;
@@ -28,8 +36,8 @@ use crate::vm::bytecode::*;
 pub const STATE_VREGS: usize = 0x000;
 /// Number of valid virtual registers (indices 0..NREG).
 /// 0..=15 = the 16 program GPRs (RAX..R15), 16/17 = lifter SCRATCH/SCRATCH2,
-/// 18 = lifter TMP, 19 = lifter temp. Anything >= NREG would overrun into the
-/// control slots (STATE_FLAGS at vreg 32) or past the state buffer.
+/// 18/19 = lifter TMP/TMP4. Anything >= NREG would overrun into the control slots
+/// (STATE_FLAGS at offset 0x100) or past the state buffer.
 pub const NREG: usize = 20;
 pub const STATE_FLAGS: usize = 0x100;
 pub const STATE_SP: usize = 0x108;      // M3: stack pointer (offset from stack base)
@@ -71,18 +79,48 @@ pub enum VmError {
     DivByZero,
     #[error("Virtual register index out of bounds: r = {0}")]
     OobReg(u8),
+    #[error("Bytecode return-IP stack overflow: call depth exceeded {0}")]
+    CallStackOverflow(i64),
+    #[error("Bytecode return-IP stack underflow: RET without a matching CALL")]
+    CallStackUnderflow,
+    #[error("Bytecode build failed: unresolved branch label {0}")]
+    UnresolvedLabel(u32),
+    #[error("Bytecode build failed: branch rel range overflow for label {0}")]
+    BranchRelOverflow(u32),
 }
 
-/// Mutable borrow of a 64-bit virtual register slot.
+/// Read a 64-bit virtual register slot (byte-copy — alignment-agnostic, bounds-checked).
+///
+/// v64: 이전 구현은 `&mut [u8]` 의 원시 포인터를 `*mut u64` 로 캐스팅해
+/// `&mut u64` 를 반환했다. `u8` 슬라이스는 8바이트 정렬을 보장하지 않으므로
+/// 이는 UB 였고, 경계 검증도 없었다. 지금은 `from_le_bytes`/`to_le_bytes` 바이트
+/// 복사로 정렬 요구 없이 안전하게 읽고 쓴다.
 #[inline]
-pub(crate) fn vreg64(state: &mut [u8], r: usize) -> Result<&mut u64, VmError> {
+pub(crate) fn vreg64(state: &[u8], r: usize) -> Result<u64, VmError> {
     if r >= NREG {
         return Err(VmError::OobReg(r as u8));
     }
     let off = STATE_VREGS + r * 8;
-    // SAFETY: byte-slice reinterpretation of a u64 slot; layout is controlled
-    // and the index is bounded by NREG above.
-    Ok(unsafe { &mut *(state.as_mut_ptr().add(off) as *mut u64) })
+    let end = off.checked_add(8).ok_or(VmError::OobReg(r as u8))?;
+    if end > state.len() {
+        return Err(VmError::OobReg(r as u8));
+    }
+    Ok(u64::from_le_bytes(state[off..end].try_into().unwrap()))
+}
+
+/// Write a 64-bit virtual register slot (byte-copy, alignment-agnostic, bounds-checked).
+#[inline]
+pub(crate) fn set_vreg64(state: &mut [u8], r: usize, v: u64) -> Result<(), VmError> {
+    if r >= NREG {
+        return Err(VmError::OobReg(r as u8));
+    }
+    let off = STATE_VREGS + r * 8;
+    let end = off.checked_add(8).ok_or(VmError::OobReg(r as u8))?;
+    if end > state.len() {
+        return Err(VmError::OobReg(r as u8));
+    }
+    state[off..end].copy_from_slice(&v.to_le_bytes());
+    Ok(())
 }
 
 /// Read the low 32 bits of a virtual register.
@@ -92,7 +130,11 @@ pub(crate) fn vreg32(state: &[u8], r: usize) -> Result<u32, VmError> {
         return Err(VmError::OobReg(r as u8));
     }
     let off = STATE_VREGS + r * 8;
-    Ok(u32::from_le_bytes(state[off..off + 4].try_into().unwrap()))
+    let end = off.checked_add(4).ok_or(VmError::OobReg(r as u8))?;
+    if end > state.len() {
+        return Err(VmError::OobReg(r as u8));
+    }
+    Ok(u32::from_le_bytes(state[off..end].try_into().unwrap()))
 }
 
 /// Read the current flags word (low 64-bit slot at STATE_FLAGS).
@@ -101,10 +143,23 @@ pub(crate) fn flags_of(state: &[u8]) -> u64 {
     u64::from_le_bytes(state[STATE_FLAGS..STATE_FLAGS + 8].try_into().unwrap())
 }
 
-/// Write the flags word (masked to the modelled flag bits).
+/// Write the flags word (masked to the modelled flag bits, DF preserved).
+///
+/// Arithmetic/logic ops recompute only the six status bits (CF/PF/AF/ZF/SF/OF);
+/// DF (bit 10) is a *control* flag that x86 arithmetic never touches, so it is
+/// carried through unchanged. Only OP_CLD/OP_STD ([`set_df`]) change it.
 #[inline]
 pub(crate) fn set_flags(state: &mut [u8], v: u64) {
-    let v = v & FLAG_MASK;
+    let df = flags_of(state) & F_DF;
+    let v = (v & FLAG_MASK) | df;
+    state[STATE_FLAGS..STATE_FLAGS + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Set or clear the DF bit (CLD/STD). The six status flags are untouched.
+#[inline]
+pub(crate) fn set_df(state: &mut [u8], on: bool) {
+    let cur = flags_of(state);
+    let v = if on { cur | F_DF } else { cur & !F_DF };
     state[STATE_FLAGS..STATE_FLAGS + 8].copy_from_slice(&v.to_le_bytes());
 }
 
@@ -160,14 +215,18 @@ pub(crate) fn call_stack_addr(state: &[u8], csp: u64) -> usize {
 /// Read `n` bytes from the arena at `addr` (n = 1..=8).
 pub(crate) fn mem_get(mem: &[u8], addr: usize, n: usize) -> Option<[u8; 8]> {
     let mut out = [0u8; 8];
-    let s = mem.get(addr..addr + n)?;
+    // `addr + n` can wrap for a crafted address; use checked_add so malformed
+    // bytecode is rejected instead of reading a wrong (wrapped) window.
+    let end = addr.checked_add(n)?;
+    let s = mem.get(addr..end)?;
     out[..n].copy_from_slice(s);
     Some(out)
 }
 
 /// Write `bytes` (LE, 1..=8) to the arena at `addr`.
 pub(crate) fn mem_put(mem: &mut [u8], addr: usize, bytes: &[u8]) -> Result<(), VmError> {
-    let dst = mem.get_mut(addr..addr + bytes.len()).ok_or(VmError::OobMem)?;
+    let end = addr.checked_add(bytes.len()).ok_or(VmError::OobMem)?;
+    let dst = mem.get_mut(addr..end).ok_or(VmError::OobMem)?;
     dst.copy_from_slice(bytes);
     Ok(())
 }

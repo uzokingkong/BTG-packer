@@ -69,7 +69,7 @@
     #[test]
     fn test_mba_code_generation() {
         let poly = MbaPolynomial::generate(0x12345678, 2);
-        let code = poly.to_x86_64_code();
+        let code = poly.to_x86_64_code().unwrap();
         assert!(!code.is_empty());
         assert!(code.len() > 10, "MBA code should be substantial");
         assert_eq!(code[code.len() - 1], 0xC3, "Last byte should be RET");
@@ -88,9 +88,9 @@
     fn test_mba_code_different_each_time() {
         // 고급 레벨은 난수 노이즈를 사용하므로 매번 다른 코드가 생성됨
         let poly1 = MbaPolynomial::generate(0xABCDEF01, 3);
-        let code1 = poly1.to_x86_64_code();
+        let code1 = poly1.to_x86_64_code().unwrap();
         let poly2 = MbaPolynomial::generate(0xABCDEF01, 3);
-        let code2 = poly2.to_x86_64_code();
+        let code2 = poly2.to_x86_64_code().unwrap();
         // 코드 길이는 같을 수 있지만 바이트는 다를 가능성이 높음
         // (coefficient가 달라지므로)
     }
@@ -100,10 +100,13 @@
         // M8 (v36): generate_polymorphic가 서로 다른(바이트코드 상이한) 등가 변이를
         // n개 만들고, 각각이 임의 var_val에서도 원본 값과 동일함을 보장한다.
         for level in 1..=3 {
-            let variants = MbaPolynomial::generate_polymorphic(0x12345678, level, 3);
+            let variants = MbaPolynomial::generate_polymorphic(0x12345678, level, 3).unwrap();
             assert_eq!(variants.len(), 3, "level {}: expected 3 distinct variants", level);
             // 개별 variant가 서로 다른 기계어를 낸다 (폴리모픽)
-            let codes: Vec<Vec<u8>> = variants.iter().map(|p| p.to_x86_64_code()).collect();
+            let codes: Vec<Vec<u8>> = variants
+                .iter()
+                .map(|p| p.to_x86_64_code().unwrap())
+                .collect();
             assert!(codes[0] != codes[1] || codes[1] != codes[2],
                 "level {}: variants should differ in generated code", level);
             // 각 variant의 등가성 (다수 임의 var_val)

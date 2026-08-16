@@ -13,6 +13,12 @@ use crate::vm;
 use anyhow::Result;
 use rand::RngCore;
 
+mod lift;
+mod vm_build;
+
+use lift::lift_program;
+use vm_build::{build_prog_vm_mod, build_vm_mod};
+
 pub(crate) fn place_boot_stub(
     ctx: &mut PipelineContext,
     rc4: &mut Rc4,
@@ -43,37 +49,20 @@ pub(crate) fn place_boot_stub(
     rng: &mut impl RngCore,
 ) -> Result<()> {
     let boot_va = dispatcher_va + boot_off as u64;
+
+    // M8: VM module builders live in `vm_build` (MBA-variant vs plain routing).
+    // P3 (G1): 상용 프로그램 리프트의 ip_map (source-IP -> micro-op index) — the
+    // VirtualBranch native handler uses it to resolve branch targets to bytecode
+    // byte offsets. Populated in the lift below and passed to build_prog_vm_mod.
+    let (vm_prog_bytecode, vm_oep_native_entry, oep_va, vm_prog_ip_map) = lift_program(
+        ctx,
+        image_base,
+        vm_oep_effective,
+        vm_commercial,
+    )?;
+
     let btg = ctx.btg_section_data.as_mut()
         .ok_or_else(|| anyhow::anyhow!("btg_section_data not set — run Pass 4 first"))?;
-
-    // M8: MBA-obfuscated VM handler table builder — routes to the MBA variant
-    // (XOR-encrypted handler table + runtime MBA key derivation) when --m8 is on,
-    // else the plain builder. Used by both the sizing pass and the final placement.
-    let build_mod = |code_va: u64,
-                     table_va: u64,
-                     bytecode_va: u64,
-                     bc: Vec<u8>,
-                     mode: vm::handlers::EntryMode|
-     -> anyhow::Result<vm::VmModule> {
-        if m8_mod {
-            vm::build_vm_module_mba(code_va, table_va, bytecode_va, bc, mode)
-        } else {
-            vm::build_vm_module(code_va, table_va, bytecode_va, bc, mode)
-        }
-    };
-    let vm_commercial_seed = ctx.poly_vm_seed;
-    let build_prog_mod = |code_va: u64,
-                          table_va: u64,
-                          bytecode_va: u64,
-                          bc: Vec<u8>,
-                          state_va: u64|
-     -> anyhow::Result<vm::VmModule> {
-        if vm_commercial {
-            vm::build_program_vm_commercial(code_va, table_va, bytecode_va, bc, state_va, vm_commercial_seed)
-        } else {
-            vm::build_program_vm(code_va, table_va, bytecode_va, bc, state_va, m8_mod)
-        }
-    };
 
     // ── 6. 부트 스텁 배치 ────────────────────────────────────────────────────
     // v6: --iat-hide 리졸브 테이블.
@@ -98,45 +87,7 @@ pub(crate) fn place_boot_stub(
     // 여기서 확정해 부트 스텁의 clean-native-entry 분기(아래)와 프로그램 VM 모듈
     // 양쪽에 동일한 값을 준다. 1st/2nd 패스 스텁이 같은 값을 쓰므로
     // `assert_eq!(stub_code.len(), stub_code_len)` 불변식이 유지된다.
-    let (vm_prog_bytecode, vm_oep_native_entry, oep_va): (Vec<u8>, bool, u64) = if vm_oep_effective {
-        let base_va = image_base + ctx.target_info.text_rva as u64;
-        let ep_va = image_base + ctx.target_info.entry_point_rva as u64;
-        let (prog_bytecode, entry_native): (Vec<u8>, bool) = if vm_commercial {
-            let lift = vm::text_lift::lift_program_cfg_commercial(
-                &ctx.target_info.text_bytes,
-                base_va,
-                ep_va,
-                &ctx.target_info.relayed_sections,
-                image_base,
-            )?;
-            let mut enc = crate::vm::poly::PolymorphicEncoder::new(ctx.poly_vm_seed);
-            // P3 (G1): 상용 리프트 매핑 — commercial.rs가 lift 시점에 기록한 RISC
-            // 엔트리에 per-micro-op 폴리 바이트코드 오프셋을 채운다 (--map/--sym-map).
-            let (bc, offsets) = enc.encode_with_offsets(&lift.program)?;
-            if crate::vm::mapper::active() {
-                crate::vm::mapper::fill_risc_poly_offsets(&offsets);
-            }
-            (bc, lift.entry_native)
-        } else {
-            let lift = vm::text_lift::lift_program_cfg(
-                &ctx.target_info.text_bytes,
-                base_va,
-                ep_va,
-                &ctx.target_info.relayed_sections,
-                image_base,
-            )?;
-            (lift.bytecode, lift.entry_native)
-        };
-        if prog_bytecode.is_empty() {
-            return Err(anyhow::anyhow!(
-                "M6 Phase-2 --vm-oep{}: original .text lifted to empty VM program",
-                if vm_commercial { " --vm-commercial" } else { "" }
-            ));
-        }
-        (prog_bytecode, entry_native, ep_va)
-    } else {
-        (Vec::new(), false, 0)
-    };
+    // (리프트 본체는 `lift::lift_program` — 위에서 호출됨)
     if vm_oep_effective {
         println!(
             "[+] --vm-oep: program entry block {}virtualized ({} bytes bytecode)",
@@ -232,14 +183,14 @@ pub(crate) fn place_boot_stub(
     // 최종 VA로 재생성한다. 모듈 레이아웃: [code][table][bytecode][state]
     let vm_mod: Option<vm::VmModule> = if vm_effective {
         let bc = vm::lifter::lift_ksa(&vm::ksa::build_ksa_instructions(0, k1, k2, k3))?;
-        Some(build_mod(0, 0, 0, bc, vm::handlers::EntryMode::Ksa)?)
+        Some(build_vm_mod(m8_mod, 0, 0, 0, bc, vm::handlers::EntryMode::Ksa)?)
     } else {
         None
     };
     // v19: PRGA VM (RC4 키스트림 생성/복호화 루프) — vm과 함께 배치.
     // 바이트코드는 VA 독립이므로 1차 sizing(VA=0)으로 크기 확정 후 최종 VA 재생성.
     let vm_prga_mod: Option<vm::VmModule> = if vm_effective {
-        Some(build_mod(
+        Some(build_vm_mod(m8_mod, 
             0, 0, 0,
             vm::prga::build_prga_bytecode(),
             vm::handlers::EntryMode::Prga,
@@ -252,7 +203,7 @@ pub(crate) fn place_boot_stub(
     let vm_prog_mod: Option<vm::VmModule> = if vm_oep_effective {
         // use the lift computed above (before the 1st-pass stub) so the entry
         // decision and the module bytecode come from the same single lift.
-        Some(build_prog_mod(0, 0, 0, vm_prog_bytecode, 0)?)
+        Some(build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed, 0, 0, 0, vm_prog_bytecode, 0, vm_prog_ip_map.as_ref(), m8_mod)?)
     } else {
         None
     };
@@ -630,7 +581,7 @@ pub(crate) fn place_boot_stub(
     // ── VM 모듈 배치 (최종 VA로 재생성 후 복사) ───────────────────────────────
     if let Some(m) = vm_mod {
         let vm_va = dispatcher_va + vm_off as u64;
-        let module = build_mod(
+        let module = build_vm_mod(m8_mod, 
             vm_va,
             vm_va + m.code.len() as u64,
             vm_va + (m.code.len() + m.table.len()) as u64,
@@ -663,7 +614,7 @@ pub(crate) fn place_boot_stub(
     // v19: PRGA VM 모듈 배치 (최종 VA로 재생성 후 복사)
     if let Some(m) = vm_prga_mod {
         let pva = dispatcher_va + vm_prga_off as u64;
-        let pmod = build_mod(
+        let pmod = build_vm_mod(m8_mod, 
             pva,
             pva + m.code.len() as u64,
             pva + (m.code.len() + m.table.len()) as u64,
@@ -696,13 +647,15 @@ pub(crate) fn place_boot_stub(
     // ── M6 Phase-2: 프로그램 VM 모듈 배치 (최종 VA로 재생성 후 복사) ──────────
     if let Some(m) = vm_prog_mod {
         let prva = dispatcher_va + vm_prog_off as u64;
-        let prmod = build_prog_mod(
-            prva,
-            prva + m.code.len() as u64,
-            prva + (m.code.len() + m.table.len()) as u64,
-            m.bytecode.clone(),
-            vm_prog_state_va,
-        )?;
+let prmod = build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed, 
+              prva,
+              prva + m.code.len() as u64,
+              prva + (m.code.len() + m.table.len()) as u64,
+              m.bytecode.clone(),
+              vm_prog_state_va,
+              vm_prog_ip_map.as_ref(),
+              m8_mod,
+          )?;
         let prend = vm_prog_off + prmod.total_len();
         if prend > boot_off + BOOT_AREA_RESERVE {
             return Err(anyhow::anyhow!(

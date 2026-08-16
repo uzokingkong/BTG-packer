@@ -67,6 +67,65 @@ pub(super) fn emit_mov_r_r64(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     );
 }
 
+// ── v64: 0x5A MOV_R_FLAGS / 0x5B MOV_FLAGS_R ────────────────────────────────
+// flags ↔ vreg 이동 (REP 문자열 루프가 x86 RFLAGS 를 보존하기 위함).
+// 둘 다 RFLAGS 를 변경하지 않는다 (STATE_FLAGS 슬롯을 직접 읽고 쓴다).
+pub(super) fn emit_mov_r_flags(seq: &mut Vec<(Instruction, Option<Cl>)>) {
+    hdr(
+        seq,
+        OP_MOV_R_FLAGS,
+        vec![
+            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(Code::Mov_r64_rm64, Register::RAX, state_flags_mem()).unwrap(),
+            Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(),
+            Instruction::with2(Code::Add_rm64_imm32, Register::R9, 1).unwrap(),
+        ],
+    );
+}
+
+pub(super) fn emit_mov_flags_r(seq: &mut Vec<(Instruction, Option<Cl>)>) {
+    hdr(
+        seq,
+        OP_MOV_FLAGS_R,
+        vec![
+            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RCX)).unwrap(),
+            Instruction::with2(Code::Mov_rm64_r64, state_flags_mem(), Register::RAX).unwrap(),
+            Instruction::with2(Code::Add_rm64_imm32, Register::R9, 1).unwrap(),
+        ],
+    );
+}
+
+// ── v65: 0xBE CLD / 0xBF STD — direction flag (no operands) ────────────────
+// DF lives in STATE_FLAGS bit 10 AND in the real host RFLAGS. The real `cld`/
+// `std` is executed so the threaded dispatch's pushfq-based cap_flags captures
+// the guest's DF on the next arithmetic op (the entry stub issues `cld` first to
+// normalize the host DF). The STATE_FLAGS bit is also written directly so the
+// interp path and the string-op delta reader agree.
+pub(super) fn emit_cld(seq: &mut Vec<(Instruction, Option<Cl>)>) {
+    hdr(
+        seq,
+        OP_CLD,
+        vec![
+            Instruction::with(Code::Cld),
+            // Clear bit 10 (DF) in the modelled flags: and [state_flags], ~F_DF.
+            Instruction::with2(Code::And_rm64_imm32, state_flags_mem(), (!(F_DF as u32)) as i32).unwrap(),
+        ],
+    );
+}
+
+pub(super) fn emit_std(seq: &mut Vec<(Instruction, Option<Cl>)>) {
+    hdr(
+        seq,
+        OP_STD,
+        vec![
+            Instruction::with(Code::Std),
+            // Set bit 10 (DF) in the modelled flags: or [state_flags], F_DF.
+            Instruction::with2(Code::Or_rm64_imm32, state_flags_mem(), (F_DF as u32) as i32).unwrap(),
+        ],
+    );
+}
+
 // ── M2 (v22) 0x28-0x2C wider / sign-extending memory loads (dst, slot, idx) ─
 // MOVSX sign-extends to the full 64-bit vreg (matches flags/interp).
 pub(super) fn emit_mem_loads_wider(seq: &mut Vec<(Instruction, Option<Cl>)>) {

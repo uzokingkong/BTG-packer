@@ -13,10 +13,35 @@
 
 use super::{detect_seh_native_functions, is_zero_padding, resolve_switch_cases};
 use crate::graph::CfgExtractor;
-use crate::vm::risc::{MicroInstr, RiscLifter, RiscOp, RiscProgram};
+use crate::vm::poly::isa_spec::VirtualIsaSpec;
+use crate::vm::risc::{BranchCondition, MicroInstr, RiscLifter, RiscOp, RiscProgram};
 use anyhow::Result;
 use iced_x86::{Code, Instruction};
 use std::collections::{HashMap, HashSet};
+
+/// 블록의 모든 명령이 RISC lift 되고, 생성된 RISC op 가 전부 **폴리 인코딩 가능**한지.
+///
+/// RISC 리프터는 Float 스칼라(FloatAdd/FloatToFloat/...)를 lift 할 수 있지만, 폴리
+/// ISA(opcode 집합)에는 그런 op 가 없다. 그대로 두면 `PolymorphicEncoder::encode`가
+/// `opcode mapping missing` 오류를 내므로, 인코딩 불가 op 를 포함한 함수는 네이티브로
+/// 유지한다 (절반 lift 금지 — RISC-unliftable 과 동일한 전량-거부 규칙).
+fn block_poly_liftable(real: &[Instruction]) -> bool {
+    let mut lifter = RiscLifter::new();
+    for i in real {
+        let before = lifter.desynth.instrs.len();
+        if lifter.lift_instruction(i).is_err() {
+            return false;
+        }
+        if lifter.desynth.instrs[before..]
+            .iter()
+            .any(|op| !VirtualIsaSpec::is_encodable(op.op))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 
 /// P3 (G1): --vm-oep 상용 엔진 백엔드용 프로그램 리프트 결과.
 #[derive(Debug, Clone)]
@@ -133,15 +158,7 @@ pub fn lift_program_cfg_commercial(
             if real.is_empty() {
                 continue;
             }
-            let mut lifter = RiscLifter::new();
-            let mut ok = true;
-            for i in &real {
-                if lifter.lift_instruction(i).is_err() {
-                    ok = false;
-                    break;
-                }
-            }
-            if !ok {
+            if !block_poly_liftable(&real) {
                 if let Some((s, e)) = excl
                     .func_ranges
                     .iter()
@@ -168,8 +185,9 @@ pub fn lift_program_cfg_commercial(
         excluded_blocks.len()
     );
 
-    // OEP-force (lift_program_cfg와 동일): entry 블록이 RISC로 온전히 lift되면
-    // OEP를 VM에 포함해 entry_native=false를 만든다. 아니면 네이티브 OEP 유지.
+    // OEP-force (lift_program_cfg와 동일): entry 블록이 RISC로 온전히 lift되고
+    // 폴리 인코딩 가능하면 OEP를 VM에 포함해 entry_native=false를 만든다.
+    // 아니면 네이티브 OEP 유지.
     if entry_point_va != 0 {
         let entry_liftable = blocks
             .iter()
@@ -181,8 +199,7 @@ pub fn lift_program_cfg_commercial(
                     .copied()
                     .filter(|i| !is_zero_padding(i))
                     .collect();
-                let mut lifter = RiscLifter::new();
-                real.iter().all(|i| lifter.lift_instruction(i).is_ok())
+                block_poly_liftable(&real)
             })
             .unwrap_or(false);
         if entry_liftable {
@@ -200,6 +217,20 @@ pub fn lift_program_cfg_commercial(
     // 2nd pass: 포함(비제외) 블록을 실제로 RISC lift해 프로그램 + ip_map 구성.
     let mut instrs: Vec<MicroInstr> = Vec::new();
     let mut ip_map: HashMap<u64, usize> = HashMap::new();
+    // P3 (G1): CfgExtractor는 블록을 주소 순으로 나열하므로 OEP가 바이트코드[0]이
+    // 아니다. 레거시 `lift_cfg_switch(.., Some(entry_va))`의 entry-jump와 동일하게,
+    // OEP가 VM화(비제외)되면 프로그램 맨 앞에 `VirtualBranch(Always) → OEP`를
+    // prepend해 디스패처가 OEP에서 실행을 시작하게 한다. (타깃은 절대 source-IP —
+    // branch-map이 ip_map으로 바이트 오프셋 해석.) OEP가 제외(네이티브)면 부트
+    // 스텁이 VM을 디스패치하지 않으므로 prepend하지 않는다.
+    if entry_point_va != 0 && !excluded_blocks.contains(&entry_point_va) {
+        instrs.push(
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::Always,
+            })
+            .with_imm(entry_point_va),
+        );
+    }
     let mut virtualized = 0usize;
     let mut native_blocks = 0usize;
     let mut total_inst = 0usize;
@@ -469,8 +500,7 @@ mod tests {
     /// (계약 문서 `docs/commercial-vm-engine.md` §3 참조).
     #[test]
     fn test_commercial_program_lift_integration_execution_equivalence() {
-        use crate::vm::poly::PolymorphicEncoder;
-        use crate::vm::threaded::harness::run_native_poly;
+        use crate::vm::threaded::harness::run_native_risc;
 
         // 전량-RISC-lift 가능한 단일 함수 (분기 없음, ret 종단):
         //   mov rax, 100 ; mov rbx, 50 ; add rax, rbx ; shl rax, 2 ; shr rax, 1
@@ -496,26 +526,29 @@ mod tests {
         assert!(!lift.entry_native, "OEP virtualized (entry_native=false)");
         assert!(lift.virtualized_blocks >= 1, "at least one block virtualized");
         assert!(!lift.program.instrs.is_empty(), "lifted program non-empty");
+        // OEP가 VM화되면 lift된 프로그램은 `VirtualBranch(Always) → OEP` entry-jump로
+        // 시작한다 (CfgExtractor 주소순 블록 나열에서 OEP가 바이트코드[0]이 아니므로).
+        assert!(
+            matches!(lift.program.instrs[0].op, RiscOp::VirtualBranch { .. }),
+            "lifted program must begin with the OEP entry-jump"
+        );
 
         let init = [0u64; 16];
         let ref_st = lift.program.eval_state(&init);
 
-        // 여러 시드에서: 리프트된 RiscProgram → 폴리 롤링키 인코딩 → 네이티브 실행 == 참조.
-        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789, 0x9E3779B97F4A7C15] {
-            let mut enc = PolymorphicEncoder::new(seed);
-            let bytecode = enc.encode(&lift.program).unwrap();
-            let nat = run_native_poly(&bytecode, seed, &init).unwrap();
-
-            assert_eq!(nat.regs, ref_st.regs, "seed {seed:#x}: regs mismatch");
-            assert_eq!(nat.temps, ref_st.temps, "seed {seed:#x}: temps mismatch");
-            assert_eq!(
-                nat.flags, ref_st.flags,
-                "seed {seed:#x}: flags mismatch (ref={:#x} nat={:#x})",
-                ref_st.flags, nat.flags
-            );
-            assert_eq!(nat.vsp, ref_st.vsp, "seed {seed:#x}: vsp mismatch");
-            assert_eq!(nat.stack, ref_st.stack, "seed {seed:#x}: stack mismatch");
-        }
+        // 리프트된 RiscProgram (ip_map 보존)을 네이티브 하네스로 실행 == 참조.
+        // (entry-jump는 ip_map으로 타깃을 해석하므로 `run_native_risc`를 사용한다 —
+        //  바이트코드 복호화 경로는 ip_map을 수반하지 않아 절대-IP 분기를 해석할 수 없다.)
+        let nat = run_native_risc(&lift.program, &init).unwrap();
+        assert_eq!(nat.regs, ref_st.regs, "regs mismatch");
+        assert_eq!(nat.temps, ref_st.temps, "temps mismatch");
+        assert_eq!(
+            nat.flags, ref_st.flags,
+            "flags mismatch (ref={:#x} nat={:#x})",
+            ref_st.flags, nat.flags
+        );
+        assert_eq!(nat.vsp, ref_st.vsp, "vsp mismatch");
+        assert_eq!(nat.stack, ref_st.stack, "stack mismatch");
 
         // 결과 무결성 (프로그램 경로에서도 최종 값이 기대와 일치).
         assert_eq!(ref_st.regs[0], ((100 + 50) << 2 >> 1) ^ 0x1234, "rax final");

@@ -123,12 +123,17 @@ impl PolymorphicEncoder {
                     out.push(self.rolling.encrypt_byte(b, vip));
                     vip += 1;
                 }
-            } else if !matches!(ins.op, RiscOp::VirtualBranch { .. })
+            } else if ins.op == RiscOp::AddWithCarry
                 && imm1.is_none()
                 && imm2.is_none()
-                && (ins.op == RiscOp::AddWithCarry || ins.imm != 0)
             {
-                // AddWithCarry 의 cin (또는 하위 호환 즉시값) 8B
+                // AddWithCarry 의 cin 8B (등록 피연산자만). 다른 op 의 `imm` 필드
+                // (예: 스케일 쉬프트 ShiftLeft with_imm(1/2/3)) 는 참조 eval_state 가
+                // src2 로 시프트 횟수를 읽어 의미가 없고, decoder/interpreter/native
+                // 어디에도 소비되지 않으므로 스트림에 쓰지 않는다. 이전 코드가
+                // `|| ins.imm != 0` 으로 스케일 쉬프트에 8B 를 써서 디코더와
+                // desync(전체 프로그램 상용 경로 첫 스케일 쉬프트에서 바이트 오프셋
+                // 불일치 → 브랜치 맵/롤링키 재동기화 오류)를 일으켰다.
                 let enc = ins.imm ^ self.spec.operand_mask;
                 for b in enc.to_le_bytes() {
                     out.push(self.rolling.encrypt_byte(b, vip));

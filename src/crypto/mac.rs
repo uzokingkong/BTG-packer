@@ -30,6 +30,10 @@ const PHI: u64 = 0x9E37_79B9_7F4A_7C15;
 pub struct BtgKeyedMac {
     h0: u64,
     h1: u64,
+    /// 지금까지 흡수한 데이터 바이트 수. `update` 가 **진짜 인크리멘탈**이 되게
+    /// 하는 위치 카운터 — 없으면 `update(a); update(b)` 의 두 번째 호출이 인덱스를
+    /// 0 부터 다시 세어 `update(a+b)` 와 다른 결과를 낸다 (리뷰 지적 #17).
+    processed: u64,
 }
 
 impl BtgKeyedMac {
@@ -46,13 +50,14 @@ impl BtgKeyedMac {
             h1 = h1.rotate_left(23).wrapping_mul(PHI).wrapping_add(h0);
             h0 = h0.rotate_left(17) ^ h1;
         }
-        Self { h0, h1 }
+        Self { h0, h1, processed: 0 }
     }
 
-    /// 데이터를 MAC 상태에 흡수 (증분 사용 가능).
+    /// 데이터를 MAC 상태에 흡수 (증분 사용 가능 — `update(a); update(b)` 는
+    /// `update(a.concat(b))` 와 동일한 결과를 낸다).
     pub fn update(&mut self, data: &[u8]) {
         for (i, &b) in data.iter().enumerate() {
-            let i = i as u64;
+            let i = self.processed.wrapping_add(i as u64);
             self.h1 ^= (b as u64)
                 .wrapping_mul(PHI)
                 .wrapping_add(self.h0.rotate_left((i & 63) as u32))
@@ -60,6 +65,7 @@ impl BtgKeyedMac {
             self.h1 = self.h1.rotate_left(17).wrapping_mul(PHI).wrapping_add(self.h0);
             self.h0 = self.h0.rotate_left(31) ^ self.h1;
         }
+        self.processed = self.processed.wrapping_add(data.len() as u64);
     }
 
     /// 최종 64비트 MAC 값.
@@ -118,5 +124,36 @@ mod tests {
         let a = BtgKeyedMac::mac(seed, b"\x00hello");
         let b = BtgKeyedMac::mac(seed, b"hello");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn keyed_mac_incremental_update_equals_single_update() {
+        // 리뷰 지적 #17: `update(a); update(b)` == `update(a||b)` 여야 한다.
+        let seed = b"incremental-seed-9876";
+        let a = b"the quick brown fox ";
+        let b = b"jumps over the lazy dog";
+
+        // 1) 두 번 나눠 흡수
+        let mut m1 = BtgKeyedMac::new(seed);
+        m1.update(a);
+        m1.update(b);
+        let incr = m1.finish();
+
+        // 2) 한 번에 흡수
+        let mut m2 = BtgKeyedMac::new(seed);
+        let mut both = Vec::with_capacity(a.len() + b.len());
+        both.extend_from_slice(a);
+        both.extend_from_slice(b);
+        m2.update(&both);
+        let single = m2.finish();
+
+        assert_eq!(incr, single, "update(a)+update(b) must equal update(a||b)");
+
+        // 3) 바이트 단위로 조각내도 동일해야 한다
+        let mut m3 = BtgKeyedMac::new(seed);
+        for chunk in both.chunks(3) {
+            m3.update(chunk);
+        }
+        assert_eq!(m3.finish(), single, "byte-chunked update must equal single update");
     }
 }
