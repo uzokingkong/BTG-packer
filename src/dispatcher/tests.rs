@@ -4,41 +4,41 @@ use iced_x86::{Code, Decoder, DecoderOptions, Register};
 
     #[test]
     fn test_reencrypt_dispatcher_builds_and_validates() {
-        let code = build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false);
+        let code = build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false).unwrap();
         assert!(!code.is_empty());
         assert!(validate_dispatcher(&code).is_ok());
-        // 시작은 pushfq(0x9C), 마지막은 ret(0xC3)
+        // ??뽰삂?? pushfq(0x9C), 筌띾뜆?筌띾맩? ret(0xC3)
         assert_eq!(code[0], 0x9C);
         assert_eq!(*code.last().unwrap(), 0xC3);
-        // 재암호화 디스패처는 수백 바이트 — 할당된 테이블 영역 안에 들어가야 한다
+        // ??釉?紐낆넅 ?遺용뮞??μ퓗????롪컶 獄쏅뗄??????醫딅뼣?????뵠???怨몃열 ??됰퓠 ??쇰선揶쎛????뺣뼄
         assert!(code.len() < 0x600 - 0x20, "dispatcher too large: {}", code.len());
     }
 
     #[test]
     fn test_reencrypt_dispatcher_size_va_independent() {
-        let a = build_dispatcher_reencrypt(0x140001000, 0x200, 16, 0xCAFEBABE, false);
-        let b = build_dispatcher_reencrypt(0x180000000, 0x999, 64, 0x12345678, false);
-        let c = build_dispatcher_reencrypt(0x140001000, 0x200, 16, 0xCAFEBABE, false);
+        let a = build_dispatcher_reencrypt(0x140001000, 0x200, 16, 0xCAFEBABE, false).unwrap();
+        let b = build_dispatcher_reencrypt(0x180000000, 0x999, 64, 0x12345678, false).unwrap();
+        let c = build_dispatcher_reencrypt(0x140001000, 0x200, 16, 0xCAFEBABE, false).unwrap();
         assert_eq!(a.len(), b.len(), "length must be VA/table/constant independent");
         assert_eq!(a, c, "deterministic for same inputs");
     }
 
     #[test]
     fn test_reencrypt_dispatcher_rip_references_in_section() {
-        // RIP-relative 참조가 모두 .btg 섹션 내부 (섹션베이스/점프테이블/길이테이블)를
-        // 가리키는지. iced는 RIP 메모리 피연산자의 memory_displacement64()를 **절대
-        // ip-relative 주소**(ip+len+rawdisp)로 반환하므로 그 값 자체를 비교한다.
+        // RIP-relative 筌〓챷?쒎첎? 筌뤴뫀紐?.btg ?諭????? (?諭?↑린醫롮뵠???癒곕늄???뵠??疫뀀챷????뵠????
+        // 揶쎛?귐뗪텕?遺?. iced??RIP 筌롫뗀?덄뵳???깅염?怨쀬쁽??memory_displacement64()??**???
+        // ip-relative 雅뚯눘??*(ip+len+rawdisp)嚥?獄쏆꼹????嚥?域?揶??癒?퍥????쑨???뺣뼄.
         let va = 0x140001000u64;
         let table_off = 0x600usize;
         let nb = 16usize;
-        let code = build_dispatcher_reencrypt(va, table_off, nb, 0xCAFEBABE, false);
+        let code = build_dispatcher_reencrypt(va, table_off, nb, 0xCAFEBABE, false).unwrap();
         let len_table_va = va + (table_off + nb * 4) as u64;
         let table_va = va + table_off as u64;
         let mut dec = Decoder::with_ip(64, &code, va + 0x20, DecoderOptions::NONE);
         while dec.can_decode() {
             let inst = dec.decode();
             if matches!(inst.memory_base(), Register::RIP) {
-                let target = inst.memory_displacement64(); // 절대 타깃 (iced 규약)
+                let target = inst.memory_displacement64(); // ??? ??繹?(iced 域뱀뮇鍮?
                 assert!(
                     target == va || target == table_va || target == len_table_va,
                     "RIP target 0x{:X} not in .btg tables (va=0x{:X} table=0x{:X} len=0x{:X})",
@@ -51,9 +51,9 @@ use iced_x86::{Code, Decoder, DecoderOptions, Register};
         }
     }
 
-    /// 디스패처가 진입 스택에서 소비하는 슬롯 수를 역어셈블로 계산한다.
-    /// (스텁이 N개를 push → 디스패처가 정확히 N개를 소비해야 타깃 블록의 RSP가
-    /// 원본과 일치한다. 소비가 적으면 디스패치마다 스택 누수 → 8B 어긋남.)
+    /// ?遺용뮞??μ퓗揶쎛 筌욊쑴????쎄문?癒?퐣 ???돩??롫뮉 ??????? ??堉??덊닜嚥??④쑴沅??뺣뼄.
+    /// (??쎈??N揶쏆뮆? push ???遺용뮞??μ퓗揶쎛 ?類μ넇??N揶쏆뮆? ???돩??곷튊 ??繹??됰뗀以??RSP揶쎛
+    /// ?癒?궚????깊뒄??뺣뼄. ???돩揶쎛 ?怨몄몵筌??遺용뮞??ν뒄筌띾뜄????쎄문 ?袁⑸땾 ??8B ??욱닎??)
     fn net_stack_slots_consumed(code: &[u8], base_va: u64) -> i32 {
         let mut dec = Decoder::with_ip(64, code, base_va, DecoderOptions::NONE);
         let mut pushes = 0i32;
@@ -76,15 +76,15 @@ use iced_x86::{Code, Decoder, DecoderOptions, Register};
             }
         }
         assert!(ret, "dispatcher must end with ret");
-        -pushes + pops + lea_rsp_slots + 1 // +1 = ret가 1슬롯 pop
+        -pushes + pops + lea_rsp_slots + 1 // +1 = ret揶쎛 1????pop
     }
 
     #[test]
     fn test_plain_dispatcher_stack_balance_two_slots() {
-        // v10 FIX 회귀 (일반 모드 8B 스택 누수):
-        // 일반 디스패처는 2-푸시 규약 [seed][target]에 맞춰 정확히 2슬롯만
-        // 소비해야 한다. (v8~v9에는 블록 스텁이 3푸시를 했지만 디스패처가
-        // 2슬롯만 소비해 디스패치마다 8바이트가 남았음)
+        // v10 FIX ??? (??곗뺘 筌뤴뫀諭?8B ??쎄문 ?袁⑸땾):
+        // ??곗뺘 ?遺용뮞??μ퓗??2-?紐꾨뻻 域뱀뮇鍮?[seed][target]??筌띿쉸???類μ넇??2???숋쭕?
+        // ???돩??곷튊 ??뺣뼄. (v8~v9?癒?뮉 ?됰뗀以???쎈??3?紐꾨뻻?????筌??遺용뮞??μ퓗揶쎛
+        // 2???숋쭕????돩???遺용뮞??ν뒄筌띾뜄??8獄쏅뗄??硫? ??λ릭??
         let code = build_dispatcher(0x140001000, 0x80, 16, false, 0xCAFEBABE, false, 0);
         let consumed = net_stack_slots_consumed(&code, 0x140001020);
         assert_eq!(
@@ -92,29 +92,29 @@ use iced_x86::{Code, Decoder, DecoderOptions, Register};
             "plain dispatcher must consume exactly 2 stack slots (got {})",
             consumed
         );
-        // trace 모드(INT3 1B)도 같은 균형
+        // trace 筌뤴뫀諭?INT3 1B)??揶쏆늿? 域뱀쥚??
         let code_t = build_dispatcher(0x140001000, 0x80, 16, true, 0xCAFEBABE, false, 0);
         assert_eq!(net_stack_slots_consumed(&code_t, 0x140001020), 2);
     }
 
     #[test]
     fn test_dispatcher_ring_buffer_injects_and_validates() {
-        // v13.4d diag: block_ring=true 일 때 ring write 시퀀스가 들어가고
-        // 디스패처는 여전히 validate/stack-balance 를 만족해야 한다.
+        // v13.4d diag: block_ring=true ????ring write ??쀂???? ??쇰선揶쎛??
+        // ?遺용뮞??μ퓗???????validate/stack-balance ??筌띾슣???곷튊 ??뺣뼄.
         let va: u64 = 0x140001000;
         let to: usize = 0x600;
-        // ring 영역 VA = dispatcher_va + table_offset - RING_REGION
+        // ring ?怨몃열 VA = dispatcher_va + table_offset - RING_REGION
         let ring_va = va + to as u64 - RING_REGION as u64;
         let code = build_dispatcher(va, to, 16, false, 0xCAFEBABE, true, ring_va);
         assert!(!code.is_empty());
         assert!(validate_dispatcher(&code).is_ok());
-        // 디스패처가 ring 영역을 침범하면 안 됨 (disp_base + len <= ring_va)
+        // ?遺용뮞??μ퓗揶쎛 ring ?怨몃열??燁삘뫀苡??롢늺 ????(disp_base + len <= ring_va)
         assert!(
             (va + 0x20) + code.len() as u64 <= ring_va,
             "dispatcher {} bytes overflows into ring region @0x{:X}",
             code.len(), ring_va
         );
-        // disasm 후, ring base(r11 절대주소) 를 계산하는 mov r64,imm64 이 존재해야 한다.
+        // disasm ?? ring base(r11 ???雅뚯눘?? ???④쑴沅??롫뮉 mov r64,imm64 ??鈺곕똻???곷튊 ??뺣뼄.
         let mut dec = Decoder::with_ip(64, &code, va + 0x20, DecoderOptions::NONE);
         let mut found_base = false;
         let mut found_store = false;
@@ -127,7 +127,7 @@ use iced_x86::{Code, Decoder, DecoderOptions, Register};
             {
                 found_base = true;
             }
-            // [r11 + rax*4] 인덱스 스토어 (ring[index] = block_id)
+            // [r11 + rax*4] ?紐껊쑔????쎈꽅??(ring[index] = block_id)
             if inst.code() == Code::Mov_rm32_r32
                 && inst.memory_base() == Register::R11
                 && inst.memory_index() == Register::RAX
@@ -137,7 +137,7 @@ use iced_x86::{Code, Decoder, DecoderOptions, Register};
         }
         assert!(found_base, "ring base (mov r11, imm64=ring_va) not found");
         assert!(found_store, "ring indexed store not found");
-        // ring off 일 때는 base store 가 없어야 한다.
+        // ring off ?????뮉 base store 揶쎛 ??곷선????뺣뼄.
         let code_off = build_dispatcher(va, to, 16, false, 0xCAFEBABE, false, 0);
         let mut dec2 = Decoder::with_ip(64, &code_off, va + 0x20, DecoderOptions::NONE);
         let mut base_off = false;
@@ -162,7 +162,7 @@ use iced_x86::{Code, Decoder, DecoderOptions, Register};
         // with len=0 -> no block was ever decrypted -> every encrypted block
         // executed as ciphertext. The loop counter must use a scratch register
         // (R8D) so EDX keeps the length for the PRGA call.
-        let code = build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false);
+        let code = build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false).unwrap();
         let mut dec = Decoder::with_ip(64, &code, 0x140001020, DecoderOptions::NONE);
         let mut dec_edx = 0usize;
         let mut mov_edx_64 = 0usize;
@@ -196,9 +196,9 @@ use iced_x86::{Code, Decoder, DecoderOptions, Register};
 
     #[test]
     fn test_reencrypt_dispatcher_stack_balance_three_slots() {
-        // 재암호화 디스패처는 3-푸시 규약 [seed][target][current]에 맞춰
-        // 정확히 3슬롯을 소비해야 한다.
-        let code = build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false);
+        // ??釉?紐낆넅 ?遺용뮞??μ퓗??3-?紐꾨뻻 域뱀뮇鍮?[seed][target][current]??筌띿쉸??
+        // ?類μ넇??3????????돩??곷튊 ??뺣뼄.
+        let code = build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false).unwrap();
         let consumed = net_stack_slots_consumed(&code, 0x140001020);
         assert_eq!(
             consumed, 3,

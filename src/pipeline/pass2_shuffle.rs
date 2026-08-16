@@ -41,15 +41,15 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
     // per-block blob(30KB)이 append되어 더욱 크다.
     let dispatcher_size = if ctx.m7 {
         if ctx.custom_cipher {
-            crate::dispatcher::build_dispatcher_m7_c1(0, 0, num_blocks, ctx.mba_constant, true, 0, 0).len()
+            crate::dispatcher::build_dispatcher_m7_c1(0, 0, num_blocks, ctx.mba_constant, true, 0, 0)?.len()
         } else {
-            crate::dispatcher::build_dispatcher_m7(0, 0, num_blocks, ctx.mba_constant, true).len()
+            crate::dispatcher::build_dispatcher_m7(0, 0, num_blocks, ctx.mba_constant, true)?.len()
         }
     } else if ctx.reencrypt {
         if ctx.custom_cipher {
-            crate::dispatcher::build_dispatcher_reencrypt_c1(0, 0, num_blocks, ctx.mba_constant, true, 0, 0).len()
+            crate::dispatcher::build_dispatcher_reencrypt_c1(0, 0, num_blocks, ctx.mba_constant, true, 0, 0)?.len()
         } else {
-            crate::dispatcher::build_dispatcher_reencrypt(0, 0, num_blocks, ctx.mba_constant, true).len()
+            crate::dispatcher::build_dispatcher_reencrypt(0, 0, num_blocks, ctx.mba_constant, true)?.len()
         }
     } else if ctx.block_ring {
         // v13.4d diag: --block-ring 은 표준 디스패처에 ring-write ~24B 를 더한다.

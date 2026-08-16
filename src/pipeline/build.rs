@@ -10,50 +10,50 @@ use anyhow::Result;
 use std::fs;
 use std::path::Path;
 
-/// 최종 PE 이진 파일을 합성하고 (선택적으로) 디스크에 기록한다.
+/// 筌ㅼ뮇伊?PE ??곸춭 ???뵬????밴쉐??랁?(?醫뤾문?怨몄몵嚥? ?遺용뮞??肉?疫꿸퀡以??뺣뼄.
 ///
-/// 처리 순서:
-/// 1. DataDirectory 정리 (Debug, Security, Relocations 제거)
-/// 2. `.pdata` SEH 테이블 갱신 (.btg 커버리지는 디스패처 부트 영역만 타이트하게)
-/// 3. `PeMultiSectionBuilder::build()` 호출
-/// 4. `output_path`가 `Some`이면 파일 기록, `None`이면 바이트만 반환
+/// 筌ｌ꼶????뽮퐣:
+/// 1. DataDirectory ?類ｂ봺 (Debug, Security, Relocations ??볤탢)
+/// 2. `.pdata` SEH ???뵠??揶쏄퉮??(.btg ?뚣끇苡?뵳?????遺용뮞??μ퓗 ?봔???怨몃열筌?????꾨뱜??띿쓺)
+/// 3. `PeMultiSectionBuilder::build()` ?紐꾪뀱
+/// 4. `output_path`揶쎛 `Some`???????뵬 疫꿸퀡以? `None`????獄쏅뗄??紐껋춸 獄쏆꼹??
 ///
-/// 리뷰 지적 #29: library API(`pack::run_full`)가 호출자의 working directory에
-/// 부수 파일을 만들지 않도록, 파일 기록을 호출자가 명시적으로 요청할 때만
-/// 하게끔 `Option<&Path>` 로 받는다.
+/// ?귐됰윮 筌왖??#29: library API(`pack::run_full`)揶쎛 ?紐꾪뀱?癒?벥 working directory??
+/// ?봔?????뵬??筌띾슢諭억쭪? ??낅즲嚥? ???뵬 疫꿸퀡以???紐꾪뀱?癒? 筌뤿굞??怨몄몵嚥??遺욧퍕?????춸
+/// ??띿쓺??`Option<&Path>` 嚥?獄쏆룆???
 ///
-/// # 반환
-/// 빌드된 PE 바이너리 바이트열.
+/// # 獄쏆꼹??
+/// ??슢諭??PE 獄쏅뗄???댿봺 獄쏅뗄??紐꾨였.
 pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>> {
     ctx.layout()?;
     let btg_section = ctx
         .btg_section_data
         .clone()
-        .ok_or_else(|| anyhow::anyhow!("btg_section_data not set — run Pass 4 first"))?;
+        .ok_or_else(|| anyhow::anyhow!("btg_section_data not set ??run Pass 4 first"))?;
 
     let dispatcher_rva = ctx.dispatcher_rva;
-    // 디스패처/부트 스텁 영역 길이: [dispatcher .. dispatcher+first_block_offset)
-    // 까지만이 실제 연속적인 "부트 함수"(고유 prologue + UNWIND_INFO). 그 뒤의
-    // shuffled 블록 영역은 각기 다른 stack frame 의 무수한 블록이므로 단일
-    // RUNTIME_FUNCTION 으로 커버하면 안 된다 (잘못된 unwind → 잘못된 RSP →
-    // 0xC0000005). 브리지 진입 스텁(boot/dispatcher)만 최소 UNWIND_INFO 로 감싼다.
+    // ?遺용뮞??μ퓗/?봔????쎈??怨몃열 疫뀀챷?? [dispatcher .. dispatcher+first_block_offset)
+    // 繹먮슣?筌띾슣????쇱젫 ?怨쀫꺗?怨몄뵥 "?봔????λ땾"(?⑥쥙? prologue + UNWIND_INFO). 域???쇱벥
+    // shuffled ?됰뗀以??怨몃열?? 揶쏄낫由???삘뀲 stack frame ???얜똻????됰뗀以???嚥???μ뵬
+    // RUNTIME_FUNCTION ??곗쨮 ?뚣끇苡??롢늺 ????뺣뼄 (??롢걵??unwind ????롢걵??RSP ??
+    // 0xC0000005). ?됰슢?곻쭪? 筌욊쑴????쎈?boot/dispatcher)筌?筌ㅼ뮇??UNWIND_INFO 嚥?揶쏅Ŋ???
     let boot_area_len = ctx.first_block_offset as u32;
-    // ── DataDirectory 정리 ────────────────────────────────────────────────────────
+    // ???? DataDirectory ?類ｂ봺 ????????????????????????????????????????????????????????????????????????????????????????????????????????????????
     let mut clean_data_dirs = ctx.target_info.data_directories.clone();
-    // idx=4 Security, idx=5 .reloc, idx=6 Debug 제거
+    // idx=4 Security, idx=5 .reloc, idx=6 Debug ??볤탢
     for idx in &[4usize, 5, 6] {
         if clean_data_dirs.len() > *idx {
             clean_data_dirs[*idx] = DataDirectory { virtual_address: 0, size: 0 };
         }
     }
-    // v4: --rsrc-register — 리소스 디렉터리를 재구성된 트리로 교체
+    // v4: --rsrc-register ???귐딅꺖???遺얠젂?怨뺚봺??????源낅쭆 ?紐꺿봺嚥??대Ŋ猿?
     if ctx.rsrc_dir_rva > 0 && clean_data_dirs.len() > 2 {
         clean_data_dirs[2] = DataDirectory {
             virtual_address: ctx.rsrc_dir_rva,
             size: ctx.rsrc_dir_size,
         };
     }
-    // v6: --iat-hide — import 디렉터리를 더미(LoadLibraryA/GetProcAddress)로 교체
+    // v6: --iat-hide ??import ?遺얠젂?怨뺚봺???遺?(LoadLibraryA/GetProcAddress)嚥??대Ŋ猿?
     if ctx.iat_dir_rva > 0 && clean_data_dirs.len() > 1 {
         clean_data_dirs[1] = DataDirectory {
             virtual_address: ctx.iat_dir_rva,
@@ -61,27 +61,27 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
         };
     }
 
-    // ── DLL Characteristics: DYNAMIC_BASE(0x0040), HIGH_ENTROPY_VA(0x0020), GUARD_CF(0x4000) 제거 ──
+    // ???? DLL Characteristics: DYNAMIC_BASE(0x0040), HIGH_ENTROPY_VA(0x0020), GUARD_CF(0x4000) ??볤탢 ????
     let clean_dll_characteristics = ctx.target_info.dll_characteristics & !(0x0020 | 0x0040 | 0x4000);
 
-    // ── 패치된 섹션에서 .pdata SEH 테이블 재구성 ────────────────────────────────
-    // 원본 `.text`는 TLS 콜백, VM native bridge, 그리고 entry_native 경로에서 계속
-    // 실행된다. 따라서 원본 RUNTIME_FUNCTION 항목을 반드시 유지하고, 새 디스패처
-    // 브리지 영역의 leaf 항목만 추가한다. `--keep-pdata`는 진단 호환성을
-    // 위해 새 항목까지 추가하지 않는 완전 원본 유지 모드로 남긴다.
+    // ???? ??ν뒄???諭??癒?퐣 .pdata SEH ???뵠???????????????????????????????????????????????????????????????????????
+    // ?癒?궚 `.text`??TLS ?꾩뮆媛? VM native bridge, 域밸챶?곫?entry_native 野껋럥以?癒?퐣 ?④쑴??
+    // ??쎈뻬??뺣뼄. ?怨뺤뵬???癒?궚 RUNTIME_FUNCTION ?????獄쏆꼶諭???醫???랁? ???遺용뮞??μ퓗
+    // ?됰슢?곻쭪? ?怨몃열??leaf ???됵쭕??곕떽???뺣뼄. `--keep-pdata`??筌욊쑬???紐낆넎?源놁뱽
+    // ?袁る퉸 ?????됪틦?? ?곕떽???? ??낅뮉 ?袁⑹읈 ?癒?궚 ?醫? 筌뤴뫀諭뜻에???ｋ┸??
     //
-    // 브리지 leaf가 커버하는 실제 코드는 [dispatcher+0x20 .. dispatcher+boot_area_len),
-    // 즉 디스패처 본체(셔플 블록/부트 스텁은 커버하지 않는다 — 이들은 `.textb`의
-    // 나머지처럼 원칙적으로 unwind 커버리지 밖이다). UNWIND_INFO는 하드코딩하지 않고
-    // 실제 디스패처의 `pushfq`/`push r64` prologue를 역어셈블해 생성한다. (기존
-    // `PUSH RBX + ALLOC 0x20` 하드코딩은 표준 디스패처의 pushfq/rax/rcx/r10/r11
-    // prologue와 재암호화 디스패처의 16-푸시 prologue 어느 것과도 일치하지 않는 허상
-    // 이었다 — 잘못된 unwind → 잘못된 RSP → 0xC0000005 경로의 원인이 될 수 있다.)
+    // ?됰슢?곻쭪? leaf揶쎛 ?뚣끇苡??롫뮉 ??쇱젫 ?꾨뗀諭??[dispatcher+0x20 .. dispatcher+boot_area_len),
+    // 筌??遺용뮞??μ퓗 癰귣챷猿??酉逾??됰뗀以??봔????쎈?? ?뚣끇苡??? ??낅뮉??????諭?? `.textb`??
+    // ??롢돢筌왖筌ｌ꼶???癒?뒅?怨몄몵嚥?unwind ?뚣끇苡?뵳?? 獄쏅쉼???. UNWIND_INFO????롫굡?꾨뗀逾??? ??꾪?
+    // ??쇱젫 ?遺용뮞??μ퓗??`pushfq`/`push r64` prologue????堉??덊닜????밴쉐??뺣뼄. (疫꿸퀣??
+    // `PUSH RBX + ALLOC 0x20` ??롫굡?꾨뗀逾?? ??? ?遺용뮞??μ퓗??pushfq/rax/rcx/r10/r11
+    // prologue?? ??釉?紐낆넅 ?遺용뮞??μ퓗??16-?紐꾨뻻 prologue ????野껉퍒?????깊뒄??? ??낅뮉 ??됯맒
+    // ??곷???????롢걵??unwind ????롢걵??RSP ??0xC0000005 野껋럥以???癒?뵥????????덈뼄.)
     let mut relayed_sections = ctx.patched_sections.clone();
-    // 브리지 leaf 가 커버하는 디스패처 본체(.textb 섹션 오프셋 0x20)의 prologue 를
-    // 디코드해 UNWIND_INFO 를 생성한다. `.textb` 는 patched_sections 에 없고
-    // `btg_section_data` 에 있으므로 여기서 읽는다 (relayed_sections 에서 찾으면
-    // bridge_unwind 가 None → 브리지 leaf 가 누락되는 회귀).
+    // ?됰슢?곻쭪? leaf 揶쎛 ?뚣끇苡??롫뮉 ?遺용뮞??μ퓗 癰귣챷猿?.textb ?諭????쎈늄??0x20)??prologue ??
+    // ?遺욱맜??쀫퉸 UNWIND_INFO ????밴쉐??뺣뼄. `.textb` ??patched_sections ????얩?
+    // `btg_section_data` ????됱몵沃샕嚥???由????덈뮉??(relayed_sections ?癒?퐣 筌≪뼚?앾쭖?
+    // bridge_unwind 揶쎛 None ???됰슢?곻쭪? leaf 揶쎛 ?袁⑥뵭??롫뮉 ???).
     let bridge_unwind: Option<(u8, Vec<(u8, u8)>)> = ctx
         .btg_section_data
         .as_ref()
@@ -92,7 +92,7 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
             (prolog_len, codes.iter().map(|c| (c.offset, c.reg)).collect())
         });
     if ctx.keep_pdata {
-        println!("[+] .pdata: KEPT original (--keep-pdata) — build.rs SEH rebuild skipped; original RUNTIME_FUNCTION table left verbatim");
+        println!("[+] .pdata: KEPT original (--keep-pdata) ??build.rs SEH rebuild skipped; original RUNTIME_FUNCTION table left verbatim");
     } else {
         update_pdata_seh(
             &mut relayed_sections,
@@ -104,9 +104,9 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
         );
     }
 
-    // ── PE 빌드 ───────────────────────────────────────────────────────────────────
-    // v3: 암호화가 켜져 있으면 부트 스텁(boot stub)이 새 진입점이 된다.
-    // ctx.boot_entry_offset = 부트 스텁의 섹션 내 오프셋 (0이면 기존 OEP = 섹션 시작)
+    // ???? PE ??슢諭???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+    // v3: ?酉??遺? ?녹뮇議???됱몵筌??봔????쎈?boot stub)????筌욊쑴??癒?뵠 ??뺣뼄.
+    // ctx.boot_entry_offset = ?봔????쎈???諭??????쎈늄??(0????疫꿸퀣??OEP = ?諭????뽰삂)
     let entry_point_rva = dispatcher_rva + ctx.boot_entry_offset;
 
     let multi_builder = PeMultiSectionBuilder::new(
@@ -146,23 +146,23 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     Ok(output_pe_bytes)
 }
 
-// ── x64 UNWIND_INFO / UNWIND_CODE 상수 (PE/COFF §5.8, Win64 ABI) ─────────────
-/// UNWIND_INFO Version (낮은 3비트). 로더는 version==1 만 수용한다.
+// ???? x64 UNWIND_INFO / UNWIND_CODE ?怨몃땾 (PE/COFF 吏?.8, Win64 ABI) ??????????????????????????
+/// UNWIND_INFO Version (??? 3??쑵??. 嚥≪뮆???version==1 筌???륁뒠??뺣뼄.
 const UNWIND_VERSION: u8 = 1;
-/// UWOP_PUSH_NONVOL — callee-saved 정수 레지스터를 스택에 push.
+/// UWOP_PUSH_NONVOL ??callee-saved ?類ㅻ땾 ?????쎄숲????쎄문??push.
 const UWOP_PUSH_NONVOL: u8 = 0;
-/// UWOP_ALLOC_SMALL — 8..=128 바이트 소형 스택 할당 (OpInfo = (size/8)-1).
+/// UWOP_ALLOC_SMALL ??8..=128 獄쏅뗄?????곗굨 ??쎄문 ?醫딅뼣 (OpInfo = (size/8)-1).
 const UWOP_ALLOC_SMALL: u8 = 2;
 
-/// SEH 브리지 디스패처 영역용 UNWIND_INFO 바이트 열을 생성한다.
+/// SEH ?됰슢?곻쭪? ?遺용뮞??μ퓗 ?怨몃열??UNWIND_INFO 獄쏅뗄?????곸뱽 ??밴쉐??뺣뼄.
 ///
-/// UNWIND_CODE 는 하드코딩하지 않고, 디스패처의 **실제 prologue**(`pushfq`/
-/// `push r64` 시퀀스)에서 `dispatcher_unwind_codes`가 뽑아낸 사양으로부터 만든다.
-///  - 비휘발성 GPR push   → `UWOP_PUSH_NONVOL(reg)` (언와인드 시 레지스터 복원)
-///  - pushfq/휘발성 push   → `UWOP_ALLOC_SMALL(8)` (RSP 정산만 — 복원 불필요)
-/// 이렇게 하면 UNWIND_INFO 가 로더가 실제 실행하는 코드와 항상 일치한다.
+/// UNWIND_CODE ????롫굡?꾨뗀逾??? ??꾪? ?遺용뮞??μ퓗??**??쇱젫 prologue**(`pushfq`/
+/// `push r64` ??쀂????癒?퐣 `dispatcher_unwind_codes`揶쎛 筌믩쵐釉????堉??곗쨮?봔??筌띾슢諭??
+///  - ??쑵?띈쳸?뽮쉐 GPR push   ??`UWOP_PUSH_NONVOL(reg)` (?紐??紐껊굡 ???????쎄숲 癰귣벊??
+///  - pushfq/??롮뻣??push   ??`UWOP_ALLOC_SMALL(8)` (RSP ?類ㅺ텦筌???癰귣벊???븍뜇釉??
+/// ???껃칰???롢늺 UNWIND_INFO 揶쎛 嚥≪뮆?묈첎? ??쇱젫 ??쎈뻬??롫뮉 ?꾨뗀諭?? ??湲???깊뒄??뺣뼄.
 ///
-/// 반환 구조 (DWORD 정렬, 로더 수용 조건 충족):
+/// 獄쏆꼹???닌듼?(DWORD ?類ｌ졊, 嚥≪뮆????륁뒠 鈺곌퀗援??겸뫗??:
 /// ```text
 /// +0  Version(3) | Flags(5)      = 0x01 (v1, no handler)
 /// +1  SizeOfProlog
@@ -170,11 +170,11 @@ const UWOP_ALLOC_SMALL: u8 = 2;
 /// +3  FrameRegister(4)|Offset(4) = 0
 /// +4  UNWIND_CODE[0]  (CodeOffset, UnwindOp|OpInfo)
 /// ... UNWIND_CODE[n-1]
-/// +pad DWORD 경계
+/// +pad DWORD 野껋럡??
 /// ```
 fn build_bridge_unwind_info(size_of_prolog: u8, codes: &[(u8, u8)]) -> Vec<u8> {
     let mut info = Vec::with_capacity(4 + codes.len() * 2);
-    // byte0: Version | Flags(0 = exception handler 없음)
+    // byte0: Version | Flags(0 = exception handler ??곸벉)
     info.push((UNWIND_VERSION & 0x07) | 0);
     // byte1: SizeOfProlog
     info.push(size_of_prolog);
@@ -186,37 +186,37 @@ fn build_bridge_unwind_info(size_of_prolog: u8, codes: &[(u8, u8)]) -> Vec<u8> {
     for &(off, reg) in codes {
         info.push(off);
         if reg == UNWIND_ALLOC8 {
-            // 8바이트 스택 op (pushfq/휘발성 push) — UWOP_ALLOC_SMALL(8): OpInfo=0.
+            // 8獄쏅뗄?????쎄문 op (pushfq/??롮뻣??push) ??UWOP_ALLOC_SMALL(8): OpInfo=0.
             info.push((0 << 4) | UWOP_ALLOC_SMALL);
         } else {
-            // 비휘발성 GPR push — UWOP_PUSH_NONVOL(reg). reg 는 Win64 레지스터 번호.
+            // ??쑵?띈쳸?뽮쉐 GPR push ??UWOP_PUSH_NONVOL(reg). reg ??Win64 ?????쎄숲 甕곕뜇??
             info.push(((reg & 0x0F) << 4) | UWOP_PUSH_NONVOL);
         }
     }
-    // DWORD 정렬
+    // DWORD ?類ｌ졊
     while info.len() % 4 != 0 {
         info.push(0);
     }
     info
 }
 
-/// `.pdata` SEH 테이블을 재구성한다 (v13.4c → P4: 브리지 UNWIND_INFO 생성).
+/// `.pdata` SEH ???뵠?됰뗄??????源딅립??(v13.4c ??P4: ?됰슢?곻쭪? UNWIND_INFO ??밴쉐).
 ///
-/// 블록 shuffle 결과는 새 `.textb` 주소에 있으므로 원본 `.text`의 RUNTIME_FUNCTION
-/// 범위와 겹치지 않는다. 원본 `.text` 자체도 그대로 보존되며 네이티브 경로에서
-/// 실행되므로 기존 항목을 삭제하면 Rust panic/TLS teardown의 OS unwind가 깨진다.
-/// 따라서:
-///   1. 유효한 원본 항목을 주소 변경 없이 모두 보존한다.
-///   2. **브리지 디스패처** 영역 [dispatcher+0x20 .. dispatcher+boot_area_len) 을
-///      커버하는 RUNTIME_FUNCTION 하나를 추가하고, 그 UNWIND_INFO 는 실제
-///      디스패처 prologue에서 유도한 UNWIND_CODE(헤더 + PUSH_NONVOL/ALLOC_SMALL)로
-///      생성한다. 생성된 UNWIND_INFO 는 `.pdata` 섹션의 RUNTIME_FUNCTION 배열
-///      직후에 DWORD 정렬로 이어붙인다. (예전처럼 `.btg` 전체를 하나의
-///      RUNTIME_FUNCTION 로 등록하면 서로 다른 stack frame 을 가진 수천 블록을
-///      하나의 UNWIND_INFO 로 처리하려다 잘못된 unwind 가 된다.)
-///   3. 로더가 STATUS_INVALID_IMAGE_FORMAT 으로 거부하지 않도록 Exception
-///      Directory(Idx 3) 크기는 RUNTIME_FUNCTION 배열 길이(12 바이트 배수)로
-///      유지하고, UNWIND_INFO 는 배열 뒤에 두어 배열 파싱에 영향을 주지 않게 한다.
+/// ?됰뗀以?shuffle 野껉퀗?????`.textb` 雅뚯눘?????됱몵沃샕嚥??癒?궚 `.text`??RUNTIME_FUNCTION
+/// 甕곕뗄??? 野껊??귨쭪? ??낅뮉?? ?癒?궚 `.text` ?癒?퍥??域밸챶?嚥?癰귣똻???렽???쇱뵠?怨뺥닏 野껋럥以?癒?퐣
+/// ??쎈뻬???嚥?疫꿸퀣????????????롢늺 Rust panic/TLS teardown??OS unwind揶쎛 繹먥뫁彛??
+/// ?怨뺤뵬??
+///   1. ?醫륁뒞???癒?궚 ?????雅뚯눘??癰궰野???곸뵠 筌뤴뫀紐?癰귣똻???뺣뼄.
+///   2. **?됰슢?곻쭪? ?遺용뮞??μ퓗** ?怨몃열 [dispatcher+0x20 .. dispatcher+boot_area_len) ??
+///      ?뚣끇苡??롫뮉 RUNTIME_FUNCTION ??롪돌???곕떽???랁? 域?UNWIND_INFO ????쇱젫
+///      ?遺용뮞??μ퓗 prologue?癒?퐣 ?醫딅즲??UNWIND_CODE(??삳쐭 + PUSH_NONVOL/ALLOC_SMALL)嚥?
+///      ??밴쉐??뺣뼄. ??밴쉐??UNWIND_INFO ??`.pdata` ?諭???RUNTIME_FUNCTION 獄쏄퀣肉?
+///      筌욊낱???DWORD ?類ｌ졊嚥???곷선?븐늿??? (??됱읈筌ｌ꼶??`.btg` ?袁⑷퍥????롪돌??
+///      RUNTIME_FUNCTION 嚥??源낆쨯??롢늺 ??뺤쨮 ??삘뀲 stack frame ??揶쎛筌???륁퓝 ?됰뗀以??
+///      ??롪돌??UNWIND_INFO 嚥?筌ｌ꼶???롮젻????롢걵??unwind 揶쎛 ??뺣뼄.)
+///   3. 嚥≪뮆?묈첎? STATUS_INVALID_IMAGE_FORMAT ??곗쨮 椰꾧퀡???? ??낅즲嚥?Exception
+///      Directory(Idx 3) ??由??RUNTIME_FUNCTION 獄쏄퀣肉?疫뀀챷??12 獄쏅뗄???獄쏄퀣??嚥?
+///      ?醫???랁? UNWIND_INFO ??獄쏄퀣肉???쇰퓠 ?癒?선 獄쏄퀣肉????뼓???怨밸샨??雅뚯눘? ??꾩쓺 ??뺣뼄.
 fn update_pdata_seh(
     relayed_sections: &mut Vec<SectionData>,
     clean_data_dirs: &mut Vec<DataDirectory>,
@@ -226,7 +226,7 @@ fn update_pdata_seh(
     bridge_unwind: Option<&(u8, Vec<(u8, u8)>)>,
 ) {
     if let Some(pdata_sec) = relayed_sections.iter_mut().find(|s| s.name == ".pdata") {
-        // 원본 `.text`는 그대로 존재하고 네이티브 경로에서 실행되므로 전부 보존한다.
+        // ?癒?궚 `.text`??域밸챶?嚥?鈺곕똻???랁???쇱뵠?怨뺥닏 野껋럥以?癒?퐣 ??쎈뻬???嚥??袁? 癰귣똻???뺣뼄.
         let mut rf_list: Vec<RuntimeFunction> = original_pdata_entries
             .iter()
             .filter(|rf| {
@@ -236,10 +236,10 @@ fn update_pdata_seh(
             .copied()
             .collect();
 
-        // 브리지 디스패처 영역만 커버하는 타이트 leaf 추가 (.btg 전체가 아님).
-        // 기존 엔트리와 Begin 이 충돌하지 않을 때만. UNWIND_INFO RVA 는 배열을
-        // 직렬화한 뒤의 .pdata 내부 오프셋으로 아래에서 채운다. 디스패처 본체는
-        // 섹션 오프셋 0x20 에 있으므로(섹션 시작 0x0 = OEP 스텁) begin 은 0x20.
+        // ?됰슢?곻쭪? ?遺용뮞??μ퓗 ?怨몃열筌??뚣끇苡??롫뮉 ????꾨뱜 leaf ?곕떽? (.btg ?袁⑷퍥揶쎛 ?袁⑤뻷).
+        // 疫꿸퀣???酉?껆뵳?? Begin ???겸뫖猷??? ??놁뱽 ???춸. UNWIND_INFO RVA ??獄쏄퀣肉??
+        // 筌욊낮??酉釉???쇱벥 .pdata ??? ??쎈늄???몵嚥??袁⑥삋?癒?퐣 筌?쑴??? ?遺용뮞??μ퓗 癰귣챷猿??
+        // ?諭????쎈늄??0x20 ????됱몵沃샕嚥??諭????뽰삂 0x0 = OEP ??쎈? begin ?? 0x20.
         let bridge_begin = dispatcher_rva + 0x20;
         let mut added_bridge = false;
         let mut unwind_info: Vec<u8> = Vec::new();
@@ -249,7 +249,7 @@ fn update_pdata_seh(
                 rf_list.push(RuntimeFunction {
                     begin_address: bridge_begin,
                     end_address: dispatcher_rva + boot_area_len,
-                    unwind_info_address: 0, // 채워질 자리
+                    unwind_info_address: 0, // 筌?쑴?숋쭪??癒?봺
                 });
             }
             unwind_info = build_bridge_unwind_info(*prolog_len, codes);
@@ -258,13 +258,13 @@ fn update_pdata_seh(
         rf_list.sort_by_key(|rf| rf.begin_address);
         rf_list.dedup_by_key(|rf| rf.begin_address);
 
-        // RUNTIME_FUNCTION 배열 (12 바이트/엔트리). Exception Directory 크기로 쓴다.
+        // RUNTIME_FUNCTION 獄쏄퀣肉?(12 獄쏅뗄????酉?껆뵳?. Exception Directory ??由경에?????
         let array_len = rf_list.len() as u32 * 12;
 
-        // UNWIND_INFO 를 배열 직후 .pdata 내부로 이어붙인다 (DWORD 정렬: 12|4).
+        // UNWIND_INFO ??獄쏄퀣肉?筌욊낱??.pdata ???嚥???곷선?븐늿???(DWORD ?類ｌ졊: 12|4).
         let unwind_rva = pdata_sec.virtual_address + array_len;
 
-        // 브리지 엔트리의 UNWIND_INFO 주소를 채운다.
+        // ?됰슢?곻쭪? ?酉?껆뵳???UNWIND_INFO 雅뚯눘?쇘몴?筌?쑴???
         for rf in rf_list.iter_mut() {
             if rf.begin_address == bridge_begin {
                 rf.unwind_info_address = unwind_rva;
@@ -280,8 +280,8 @@ fn update_pdata_seh(
         pdata_bytes.extend_from_slice(&unwind_info);
 
         pdata_sec.bytes = pdata_bytes.clone();
-        // Exception Directory 크기 = RUNTIME_FUNCTION 배열만 (로더가 size/12 로
-        // 엔트리 수를 세므로 UNWIND_INFO 를 포함하면 오파싱 → STATUS_INVALID_IMAGE_FORMAT).
+        // Exception Directory ??由?= RUNTIME_FUNCTION 獄쏄퀣肉댐쭕?(嚥≪뮆?묈첎? size/12 嚥?
+        // ?酉?껆뵳???? ?紐?嚥?UNWIND_INFO ????釉??롢늺 ??쎈솁????STATUS_INVALID_IMAGE_FORMAT).
         pdata_sec.virtual_size = array_len;
 
         if clean_data_dirs.len() > 3 {
@@ -335,8 +335,8 @@ mod tests {
             16
         ];
 
-        // 브리지 UNWIND_CODE: PUSH_NONVOL(RBX=3) @1 + ALLOC8 @0x0C (실제 디스패처
-        // prologue를 모사하는 합성 코드).
+        // ?됰슢?곻쭪? UNWIND_CODE: PUSH_NONVOL(RBX=3) @1 + ALLOC8 @0x0C (??쇱젫 ?遺용뮞??μ퓗
+        // prologue??筌뤴뫁沅??롫뮉 ??밴쉐 ?꾨뗀諭?.
         let bridge_unwind = (0x0Eu8, vec![(0x01u8, 0x03u8), (0x0Cu8, UNWIND_ALLOC8)]);
         update_pdata_seh(
             &mut sections,
@@ -347,9 +347,9 @@ mod tests {
             Some(&bridge_unwind),
         );
 
-        // 원본 2 + 브리지 1 = 3개 RUNTIME_FUNCTION (36 바이트) + UNWIND_INFO(8) = 44.
+        // ?癒?궚 2 + ?됰슢?곻쭪? 1 = 3揶?RUNTIME_FUNCTION (36 獄쏅뗄??? + UNWIND_INFO(8) = 44.
         assert_eq!(sections[0].bytes.len(), 44);
-        // Exception Directory 크기는 배열만.
+        // Exception Directory ??由??獄쏄퀣肉댐쭕?
         assert_eq!(directories[3].virtual_address, 0x4000);
         assert_eq!(directories[3].size, 36);
         assert_eq!(sections[0].virtual_size, 36);
@@ -359,7 +359,7 @@ mod tests {
             .chunks_exact(4)
             .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
             .collect();
-        // 브리지 엔트리 begin=0x5020(디스패처 = 섹션 0x0 + 0x20), end=0x5080,
+        // ?됰슢?곻쭪? ?酉?껆뵳?begin=0x5020(?遺용뮞??μ퓗 = ?諭??0x0 + 0x20), end=0x5080,
         // unwind=0x4000+36=0x4024.
         assert_eq!(
             words,
@@ -393,8 +393,8 @@ mod tests {
             16
         ];
 
-        // 표준 디스패처 prologue (pushfq; push rax; push rcx; push r10; push r11)를
-        // 합성한 UNWIND_CODE — 전부 8바이트 스택 op (pushfq/휘발성 GPR).
+        // ??? ?遺용뮞??μ퓗 prologue (pushfq; push rax; push rcx; push r10; push r11)??
+        // ??밴쉐??UNWIND_CODE ???袁? 8獄쏅뗄?????쎄문 op (pushfq/??롮뻣??GPR).
         let bridge_unwind = (0x07u8, vec![
             (0x00u8, UNWIND_ALLOC8), // pushfq
             (0x01u8, UNWIND_ALLOC8), // push rax
@@ -411,22 +411,22 @@ mod tests {
             Some(&bridge_unwind),
         );
 
-        // 배열 24 바이트(2 엔트리) + UNWIND_INFO (4 헤더 + 5*2 코드 = 14 → 16) = 40.
+        // 獄쏄퀣肉?24 獄쏅뗄???2 ?酉?껆뵳? + UNWIND_INFO (4 ??삳쐭 + 5*2 ?꾨뗀諭?= 14 ??16) = 40.
         assert_eq!(sections[0].bytes.len(), 40);
         let unwind_off = 24usize;
         let unwind = &sections[0].bytes[unwind_off..unwind_off + 16];
 
-        // 헤더: Version=1, Flags=0.
+        // ??삳쐭: Version=1, Flags=0.
         assert_eq!(unwind[0] & 0x07, UNWIND_VERSION);
         assert_eq!(unwind[0] & 0xF8, 0);
-        // SizeOfProlog = 7 (5 push 명령의 총 길이).
+        // SizeOfProlog = 7 (5 push 筌뤿굝議????疫뀀챷??.
         assert_eq!(unwind[1], 0x07);
         // CountOfCodes = 5.
         assert_eq!(unwind[2], 5);
         // FrameRegister/Offset = 0.
         assert_eq!(unwind[3], 0);
 
-        // 모든 코드가 UWOP_ALLOC_SMALL(8) (OpInfo=0, op=ALLOC_SMALL=2) 이어야 한다.
+        // 筌뤴뫀諭??꾨뗀諭뜹첎? UWOP_ALLOC_SMALL(8) (OpInfo=0, op=ALLOC_SMALL=2) ??곷선????뺣뼄.
         for i in 0..5 {
             let off = unwind[4 + i * 2];
             let opbyte = unwind[5 + i * 2];
@@ -482,13 +482,13 @@ mod tests {
         let pdata = &sections[0].bytes;
         let dir = directories[3];
 
-        // 로더는 Exception Directory 크기가 12바이트(RUNTIME_FUNCTION)의 배수임을 요구.
+        // 嚥≪뮆???Exception Directory ??由겼첎? 12獄쏅뗄???RUNTIME_FUNCTION)??獄쏄퀣??袁⑹뱽 ?遺쎈럡.
         assert_eq!(dir.virtual_address, 0x4000);
         assert_eq!(dir.size % 12, 0);
         let num_entries = dir.size as usize / 12;
         assert_eq!(num_entries, 2);
 
-        // 각 엔트리: Begin < End, UNWIND_INFO 가 4바이트 정렬.
+        // 揶??酉?껆뵳? Begin < End, UNWIND_INFO 揶쎛 4獄쏅뗄????類ｌ졊.
         for i in 0..num_entries {
             let begin = u32::from_le_bytes(pdata[i * 12..i * 12 + 4].try_into().unwrap());
             let end = u32::from_le_bytes(pdata[i * 12 + 4..i * 12 + 8].try_into().unwrap());
@@ -497,24 +497,24 @@ mod tests {
             assert_eq!(unwind % 4, 0, "entry {}: unwind 0x{:X} not DWORD aligned", i, unwind);
         }
 
-        // 브리지(우리가 추가한) 엔트리는 UNWIND_INFO 가 .pdata 섹션 내부(배열 뒤
-        // DWORD 정렬 위치)를 가리켜야 한다. 원본 엔트리는 원본 .text/.rdata 의
-        // UNWIND_INFO 를 가리키므로 .pdata 밖일 수 있다 (정상).
+        // ?됰슢?곻쭪?(?怨뺚봺揶쎛 ?곕떽??? ?酉?껆뵳???UNWIND_INFO 揶쎛 .pdata ?諭?????(獄쏄퀣肉???
+        // DWORD ?類ｌ졊 ?袁⑺뒄)??揶쎛?귐딇룖????뺣뼄. ?癒?궚 ?酉?껆뵳????癒?궚 .text/.rdata ??
+        // UNWIND_INFO ??揶쎛?귐뗪텕沃샕嚥?.pdata 獄쏅쉼??????덈뼄 (?類ㅺ맒).
         let bridge = pdata
             .chunks_exact(12)
             .nth(num_entries - 1)
             .unwrap();
         let bridge_begin = u32::from_le_bytes(bridge[0..4].try_into().unwrap());
-        assert_eq!(bridge_begin, 0x5020); // 디스패처 = dispatcher_rva + 0x20
+        assert_eq!(bridge_begin, 0x5020); // ?遺용뮞??μ퓗 = dispatcher_rva + 0x20
         let bridge_unwind = u32::from_le_bytes(bridge[8..12].try_into().unwrap());
-        assert_eq!(bridge_unwind, 0x4000 + 24); // .pdata 시작 + 배열(24) = UNWIND_INFO
+        assert_eq!(bridge_unwind, 0x4000 + 24); // .pdata ??뽰삂 + 獄쏄퀣肉?24) = UNWIND_INFO
         assert!(
             bridge_unwind >= 0x4000 && bridge_unwind < 0x4000 + pdata.len() as u32,
             "bridge unwind 0x{:X} outside .pdata",
             bridge_unwind
         );
 
-        // 정렬: BeginAddress 오름차순이어야 로더가 이분 탐색 가능.
+        // ?類ｌ졊: BeginAddress ??살カ筌△뫁???곷선??嚥≪뮆?묈첎? ?????癒?퉳 揶쎛??
         let begins: Vec<u32> = (0..num_entries)
             .map(|i| u32::from_le_bytes(pdata[i * 12..i * 12 + 4].try_into().unwrap()))
             .collect();
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn build_bridge_unwind_info_layout() {
-        // DWORD 정렬 + 헤더/코드 구조 검증 (PUSH_NONVOL + ALLOC8 혼합).
+        // DWORD ?類ｌ졊 + ??삳쐭/?꾨뗀諭??닌듼?野꺜筌?(PUSH_NONVOL + ALLOC8 ??노?).
         let codes = vec![(0x01u8, 0x03u8), (0x0Cu8, UNWIND_ALLOC8)];
         let info = build_bridge_unwind_info(0x0E, &codes);
         assert_eq!(info.len() % 4, 0);
@@ -540,29 +540,29 @@ mod tests {
         assert_eq!(info[7], (0 << 4) | UWOP_ALLOC_SMALL); // ALLOC_SMALL(8)
     }
 
-    /// 리뷰 지적 #28 검증: 생성된 UNWIND_INFO 가 **실제 디스패처 prologue와 정확히
-    /// 일치**해야 한다 (형식 검증이 아니라 코드 대조).
+    /// ?귐됰윮 筌왖??#28 野꺜筌? ??밴쉐??UNWIND_INFO 揶쎛 **??쇱젫 ?遺용뮞??μ퓗 prologue?? ?類μ넇??
+    /// ??깊뒄**??곷튊 ??뺣뼄 (?類ㅻ뻼 野꺜筌앹빘???袁⑤빍???꾨뗀諭???鈺?.
     #[test]
     fn bridge_unwind_info_matches_real_dispatcher_prologue() {
         for (code, name) in [
             (build_dispatcher(0x140001000, 0x80, 16, false, 0xCAFEBABE, false, 0), "plain"),
             (build_dispatcher(0x140001000, 0x80, 16, true, 0xCAFEBABE, false, 0), "plain+trace"),
-            (build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false), "reencrypt"),
+            (build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false).unwrap(), "reencrypt"),
         ] {
             let (codes, prolog_len) = crate::dispatcher::dispatcher_unwind_codes(&code);
             let unwind = build_bridge_unwind_info(prolog_len, &codes.iter().map(|c| (c.offset, c.reg)).collect::<Vec<_>>());
-            // 헤더
+            // ??삳쐭
             assert_eq!(unwind[0] & 0x07, UNWIND_VERSION, "{name}");
             assert_eq!(unwind[1], prolog_len, "{name}: SizeOfProlog");
             assert_eq!(unwind[2] as usize, codes.len(), "{name}: CountOfCodes");
             assert_eq!(unwind[3], 0, "{name}: frame reg");
-            // 코드가 prologue 길이를 초과하지 않는다
+            // ?꾨뗀諭뜹첎? prologue 疫뀀챷?좂몴??λ뜃???? ??낅뮉??
             for c in &codes {
                 assert!((c.offset as u16) < prolog_len as u16, "{name}: code off {}", c.offset);
             }
-            // DWORD 정렬
+            // DWORD ?類ｌ졊
             assert_eq!(unwind.len() % 4, 0, "{name}");
-            // 실제 디스패처 첫 바이트가 pushfq(0x9C)이면 첫 코드가 ALLOC8(flags) 이어야 한다
+            // ??쇱젫 ?遺용뮞??μ퓗 筌?獄쏅뗄??硫? pushfq(0x9C)????筌??꾨뗀諭뜹첎? ALLOC8(flags) ??곷선????뺣뼄
             if code[0] == 0x9C {
                 assert_eq!(codes.first().unwrap().reg, UNWIND_ALLOC8, "{name}: pushfq");
                 assert_eq!(codes.first().unwrap().offset, 0, "{name}: pushfq offset");

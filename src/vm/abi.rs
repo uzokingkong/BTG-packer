@@ -1,24 +1,24 @@
 // ==============================================================================
-// BTG v61 - P0-2: Win64 VM ABI 명세 + 정적 검증기 (Notes #2 반영)
+// BTG v61 - P0-2: Win64 VM ABI 筌뤿굞苑?+ ?類ㅼ읅 野꺜筌앹빓由?(Notes #2 獄쏆꼷??
 // ==============================================================================
-// 상용 VM의 네이티브 핸들러/디스패처/아레나 호출이 반드시 지켜야 하는 Win64
-// ABI 계약을 코드로 명문화하고, 생성된 머신 코드를 역어셈블해 위반을 탐지한다.
+// ?怨몄뒠 VM????쇱뵠?怨뺥닏 ?紐껊굶???遺용뮞??μ퓗/?袁⑥쟿???紐꾪뀱??獄쏆꼶諭??筌왖?녹뮇鍮???롫뮉 Win64
+// ABI ?④쑴鍮???꾨뗀諭뜻에?筌뤿굝揆?酉釉?? ??밴쉐???믩챷???꾨뗀諭띄몴???堉??덊닜???袁⑥뺘???癒???뺣뼄.
 //
-// Win64 호출 규약 (AMD64 ABI):
+// Win64 ?紐꾪뀱 域뱀뮇鍮?(AMD64 ABI):
 //   volatile   (callee-clobberable): RAX, RCX, RDX, R8..R11, XMM0..XMM5, RFLAGS
 //   nonvolatile(callee-saved)      : RBX, RBP, RDI, RSI, R12..R15, XMM6..XMM15
-//   RSP 16B 정렬 (call 직전), shadow space 32B, direction flag clear.
+//   RSP 16B ?類ｌ졊 (call 筌욊낯??, shadow space 32B, direction flag clear.
 //
-// `validate_win64_abi(code)`는 코드를 디코드해 각 callee-saved GPR이 "저장 전에
-// 쓰이는지"(violation)를 선형 추적한다. push가 저장으로 간주되고, 이후의 write는
-// 허용. 핸들러/디스패처는 push/pop으로 보존해야 한다. (XMM는 별도 수동 점검 —
-//  xmm6+를 쓰는 핸들러가 save/restore하는지 문서화.)
+// `validate_win64_abi(code)`???꾨뗀諭띄몴??遺욱맜??쀫퉸 揶?callee-saved GPR??"?????袁⑸퓠
+// ?怨쀬뵠?遺?"(violation)???醫륁굨 ?곕뗄???뺣뼄. push揶쎛 ???關?앮에?揶쏄쑴竊??랁? ??꾩뜎??write??
+// ??됱뒠. ?紐껊굶???遺용뮞??μ퓗??push/pop??곗쨮 癰귣똻???곷튊 ??뺣뼄. (XMM??癰귢쑬猷???롫짗 ?癒? ??
+//  xmm6+???怨뺣뮉 ?紐껊굶??? save/restore??롫뮉筌왖 ?얜챷苑??)
 // ==============================================================================
 
 use anyhow::{anyhow, Result};
 use iced_x86::{Code, Decoder, DecoderOptions, Register};
 
-/// Win64 callee-saved GPR (함수 진입 시 보존해야 하는 레지스터).
+/// Win64 callee-saved GPR (??λ땾 筌욊쑴????癰귣똻???곷튊 ??롫뮉 ?????쎄숲).
 pub const WIN64_NONVOL_GPRS: &[Register] = &[
     Register::RBX,
     Register::RBP,
@@ -30,7 +30,7 @@ pub const WIN64_NONVOL_GPRS: &[Register] = &[
     Register::R15,
 ];
 
-/// Win64 volatile GPR (호출자가 자유롭게 클로버 가능).
+/// Win64 volatile GPR (?紐꾪뀱?癒? ?癒??嚥?苡???以덅린?揶쎛??.
 pub const WIN64_VOLATILE_GPRS: &[Register] = &[
     Register::RAX,
     Register::RCX,
@@ -41,23 +41,23 @@ pub const WIN64_VOLATILE_GPRS: &[Register] = &[
     Register::R11,
 ];
 
-/// Win64 ABI 명세 — 모든 네이티브 진입점/핸들러가 지켜야 하는 계약.
+/// Win64 ABI 筌뤿굞苑???筌뤴뫀諭???쇱뵠?怨뺥닏 筌욊쑴????紐껊굶??? 筌왖?녹뮇鍮???롫뮉 ?④쑴鍮?
 #[derive(Debug, Clone, Copy)]
 pub struct VmAbi {
-    /// 비휘발성 GPR (callee-saved) — 위반 시 정적 검증기가 탐지.
+    /// ??쑵?띈쳸?뽮쉐 GPR (callee-saved) ???袁⑥뺘 ???類ㅼ읅 野꺜筌앹빓由겼첎? ?癒?.
     pub nonvolatile_gprs: &'static [Register],
-    /// 휘발성 GPR.
+    /// ??롮뻣??GPR.
     pub volatile_gprs: &'static [Register],
-    /// 비휘발성 XMM (XMM6-15) — 저장/복원 필요 (수동 점검 + 문서화).
+    /// ??쑵?띈쳸?뽮쉐 XMM (XMM6-15) ??????癰귣벊???袁⑹뒄 (??롫짗 ?癒? + ?얜챷苑??.
     pub nonvolatile_xmm_start: u8, // XMM6
     pub nonvolatile_xmm_end: u8,   // XMM15
-    /// RSP 16B 정렬 (call 직전).
+    /// RSP 16B ?類ｌ졊 (call 筌욊낯??.
     pub stack_alignment: usize,
     /// shadow space (32B).
     pub shadow_space: usize,
-    /// 방향 플래그(DF) 정책 — 함수 진입/복귀 시 clear.
+    /// 獄쎻뫚堉????삋域?DF) ?類ㅼ퐠 ????λ땾 筌욊쑴??癰귣벀? ??clear.
     pub df_clear: bool,
-    /// 반환 정책 — RAX 반환, callee-saved는 호출자 상태 유지.
+    /// 獄쏆꼹???類ㅼ퐠 ??RAX 獄쏆꼹?? callee-saved???紐꾪뀱???怨밴묶 ?醫?.
     pub return_policy: &'static str,
 }
 
@@ -82,9 +82,9 @@ impl VmAbi {
     }
 }
 
-/// 명령이 레지스터 `r`(또는 하위 폼)을 쓰는지.
+/// 筌뤿굝議???????쎄숲 `r`(?癒?뮉 ??륁맄 ?????怨뺣뮉筌왖.
 fn writes_reg(inst: &iced_x86::Instruction, r: Register) -> bool {
-    // op0 (dst) 가 r 또는 그 하위 폼인 경우 (number() 기반으로 32/16/8비트 폼 통합)
+    // op0 (dst) 揶쎛 r ?癒?뮉 域???륁맄 ??깆뵥 野껋럩??(number() 疫꿸퀡而??곗쨮 32/16/8??쑵????????)
     if inst.op_count() >= 1 {
         if let iced_x86::OpKind::Register = inst.op0_kind() {
             let d = inst.op0_register();
@@ -96,17 +96,17 @@ fn writes_reg(inst: &iced_x86::Instruction, r: Register) -> bool {
     false
 }
 
-/// 명령이 레지스터 `r`을 스택에 저장(push)하는지.
+/// 筌뤿굝議???????쎄숲 `r`????쎄문??????push)??롫뮉筌왖.
 fn is_push_of(inst: &iced_x86::Instruction, r: Register) -> bool {
     matches!(inst.code(), Code::Push_r64) && inst.op0_register().number() == r.number()
 }
 
-/// 선형 스캔으로 callee-saved GPR의 "저장 전 쓰기" 위반을 탐지한다.
+/// ?醫륁굨 ??쇳떔??곗쨮 callee-saved GPR??"???????怨뚮┛" ?袁⑥뺘???癒???뺣뼄.
 ///
-/// 규칙: 각 nonvolatile GPR을 시작 시 unsaved로 보고, `push r`에서 saved로 전환.
-/// saved 이전에 해당 레지스터(하위 폼 포함)를 **쓰면** 위반. pop 은 분석을
-/// 단순화하기 위해 무시한다(위반 신고에만 사용). call/jmp 이후는 새 함수 경계로
-/// 취급하지 않는다(단일 루틴 전제) — 재진입 경계는 호출자에서 관리.
+/// 域뱀뮇?? 揶?nonvolatile GPR????뽰삂 ??unsaved嚥?癰귣떯?? `push r`?癒?퐣 saved嚥??袁れ넎.
+/// saved ??곸읈???????????쎄숲(??륁맄 ????釉???**?怨뺛늺** ?袁⑥뺘. pop ?? ?브쑴苑??
+/// ??λ떄?酉釉?묾??袁る퉸 ?얜똻???뺣뼄(?袁⑥뺘 ?醫됲?癒?춸 ????. call/jmp ??꾩뜎??????λ땾 野껋럡?롦에?
+/// ?띯몿???? ??낅뮉????μ뵬 ?룐뫂???袁⑹젫) ????彛??野껋럡????紐꾪뀱?癒?퓠???온??
 pub fn validate_win64_abi(code: &[u8], entry_ip: u64) -> Result<Vec<String>> {
     let abi = VmAbi::default();
     let mut violations = Vec::new();
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn detects_unsaved_callee_saved_write() {
-        // push rbx (saved) → mov rbx, 5 (OK) → mov r12, 7 (r12 unsaved → 위반)
+        // push rbx (saved) ??mov rbx, 5 (OK) ??mov r12, 7 (r12 unsaved ???袁⑥뺘)
         let code = vec![
             0x53,             // push rbx
             0xBB, 0x05, 0x00, 0x00, 0x00, // mov ebx, 5
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn abi_valid_code_passes() {
-        // 모든 callee-saved를 push 후 사용, ret
+        // 筌뤴뫀諭?callee-saved??push ?????? ret
         let code = vec![
             0x41, 0x57,             // push r15
             0x41, 0x56,             // push r14
@@ -198,16 +198,16 @@ mod tests {
         assert!(v.is_empty(), "no violations expected, got: {v:?}");
     }
 
-    /// 실제 생성된 디스패처(표준/reencrypt/m7)들이 Win64 callee-saved GPR을
-    /// 저장한 뒤만 사용하는지 검증한다. (P0-2 — 상용 네이티브 진입점 ABI 정합.)
+    /// ??쇱젫 ??밴쉐???遺용뮞??μ퓗(???/reencrypt/m7)??쇱뵠 Win64 callee-saved GPR??
+    /// ???館釉???살춸 ?????롫뮉筌왖 野꺜筌앹빜釉?? (P0-2 ???怨몄뒠 ??쇱뵠?怨뺥닏 筌욊쑴???ABI ?類λ?.)
     #[test]
     fn generated_dispatchers_preserve_win64_abi() {
         let cases: Vec<(&str, Vec<u8>)> = vec![
             ("plain", crate::dispatcher::build_dispatcher(0x140001000, 0x80, 16, false, 0xCAFEBABE, false, 0)),
-            ("reencrypt", crate::dispatcher::build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false)),
-            ("m7", crate::dispatcher::build_dispatcher_m7(0x140001000, 0x600, 16, 0xCAFEBABE, false)),
-            ("m7_c1", crate::dispatcher::build_dispatcher_m7_c1(0x140001000, 0x600, 16, 0xCAFEBABE, false, 0x140003000, 0x140003100)),
-            ("reencrypt_c1", crate::dispatcher::build_dispatcher_reencrypt_c1(0x140001000, 0x600, 16, 0xCAFEBABE, false, 0x140003000, 0x140003100)),
+            ("reencrypt", crate::dispatcher::build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false).unwrap()),
+            ("m7", crate::dispatcher::build_dispatcher_m7(0x140001000, 0x600, 16, 0xCAFEBABE, false).unwrap()),
+            ("m7_c1", crate::dispatcher::build_dispatcher_m7_c1(0x140001000, 0x600, 16, 0xCAFEBABE, false, 0x140003000, 0x140003100).unwrap()),
+            ("reencrypt_c1", crate::dispatcher::build_dispatcher_reencrypt_c1(0x140001000, 0x600, 16, 0xCAFEBABE, false, 0x140003000, 0x140003100).unwrap()),
         ];
         for (name, code) in cases {
             let v = validate_win64_abi(&code, 0x140001000 + 0x20).unwrap();
