@@ -31,6 +31,7 @@
 - **목표**: Win64 ABI 계약(volatile/nonvolatile GPR, XMM, RSP 정렬, shadow space, RFLAGS 정책)을 코드로 명문화.
 - **작업**: `VmAbi` 구조체 + `vm/abi.rs`, 모든 native handler/arena 호출(`extern "C"` transmute)을 이 명세로 검증. 특히 `vm/arena.rs`의 transmute 호출부와 `handlers/`의 레지스터 클로버 전수 점검.
 - **검증**: handler별 "클로버하는 레지스터 ⊆ volatile ∪ 자신의 인자" 자동 검증 테스트.
+- **상태**: ✅ (1898917) — `VmAbi` 명세 + `validate_win64_abi`(저장 전 callee-saved 쓰기 탐지), pass4에서 생성 디스패처 ABI 검증(위반 시 빌드 거부, 전 변형 통과). ⬜ XMM6-15 클로버 자동 검증, arena transmute 호출부 정합 테스트.
 
 ### 1-3. dispatcher CFG 검증 추가 확장 (Notes #3, 부분 완료)
 - ✅ 분기 타깃/경계/self-loop/call-ret (5e7bd40).
