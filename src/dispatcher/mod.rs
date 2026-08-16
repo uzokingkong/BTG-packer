@@ -10,12 +10,16 @@
 pub mod antidebug;
 
 mod build;
+mod m7;
+mod m7_c1;
 mod reencrypt;
 mod validate;
 
 pub use build::{
     RING_ENTRIES, RING_REGION, RING_INDEX_OFF, RING_META_OFF, build_dispatcher,
 };
+pub use m7::build_dispatcher_m7;
+pub use m7_c1::build_dispatcher_m7_c1;
 pub use reencrypt::build_dispatcher_reencrypt;
 pub use validate::validate_dispatcher;
 

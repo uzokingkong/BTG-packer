@@ -6,7 +6,7 @@ use super::bootstub::{build_anti_debug_raw_block, build_rc4_block, BootStubCtx};
 use super::cipher::Rc4;
 use super::integrity::crc32;
 use super::scan::StringRun;
-use super::IMPORT_MBA_C;
+use super::{BootStreamCipher, IMPORT_MBA_C};
 use crate::pipeline::pass4_section::BOOT_AREA_RESERVE;
 use crate::pipeline::PipelineContext;
 use crate::vm;
@@ -19,9 +19,12 @@ mod vm_build;
 use lift::lift_program;
 use vm_build::{build_prog_vm_mod, build_vm_mod};
 
+/// BTG-C1 상태 버퍼 크기 (key[32] + ctr[8] + nonce[4] + pad + ks[64] + ks_off[4] = 0x80).
+const C1_STATE_SIZE: usize = 0x80;
+
 pub(crate) fn place_boot_stub(
     ctx: &mut PipelineContext,
-    rc4: &mut Rc4,
+    stream: &mut BootStreamCipher,
     runs: &[StringRun],
     seed_masked: &[u8],
     seed_stored: &[u8],
@@ -46,6 +49,7 @@ pub(crate) fn place_boot_stub(
     k2: u32,
     k3: u32,
     m8_mod: bool,
+    c1_mode: bool,
     rng: &mut impl RngCore,
 ) -> Result<()> {
     let boot_va = dispatcher_va + boot_off as u64;
@@ -167,6 +171,14 @@ pub(crate) fn place_boot_stub(
         // Win64 entry에서 RSP는 16-byte 경계보다 8만큼 어긋나 있다. 8 mod 16인
         // 프레임을 빼야 VM/native helper CALL 직전 RSP가 16-byte 정렬된다.
         stack_frame: if ctx.iat_hide || ctx.mem_harden { 0x138 } else { 0x118 },
+        // v60 (--custom-cipher): BTG-C1 경로 (1st pass 자리표시자 — stub2/3에서 확정)
+        c1_mode,
+        // c1_blob_va는 rel32 `call` 타깃이라 패스1에서 유효한 in-range 자리표시자
+        // (dispatcher_va)를 써야 BlockEncoder가 측정/인코딩에 실패하지 않는다.
+        // (0이면 diff가 i32를 벗어나 "Branch distance is too far away" — VM 엔트리와 동일 방침)
+        c1_blob_va: if c1_mode { dispatcher_va } else { 0 },
+        c1_sbox_va: 0,
+        c1_state_va: 0,
     };
 
     // 1st pass: stub 길이 측정 (runs_va/seed_va/vm_* = 0)
@@ -214,6 +226,28 @@ pub(crate) fn place_boot_stub(
     } else {
         cursor = (cursor + 7) & !7; // align 8 (원래 레이아웃 유지)
     }
+
+    // ── v60 (--custom-cipher): BTG-C1 blob + S-box + 상태 영역 배치 ────────────
+    // BTG-C1 crypt blob(완전 전개 네이티브 라운드)을 스텁 직후에 두고, 그 뒤에
+    // 256B S-box 상수 테이블(패커가 기록)과 0x80B 상태 버퍼(스텁이 초기화)를 붙인다.
+    // blob 길이는 imm64/rel32만 써서 VA와 무관(고정) — 1차 sizing에서 확정 가능.
+    let mut c1_blob_off = 0usize;
+    let mut c1_sbox_off = 0usize;
+    let mut c1_state_off = 0usize;
+    let c1_blob_len = if c1_mode {
+        let len = crate::crypto::native::emit_btg_crypt_blob(0, 0).len();
+        c1_blob_off = cursor;
+        c1_sbox_off = c1_blob_off + len;
+        c1_state_off = c1_sbox_off + 256;
+        len
+    } else {
+        0
+    };
+    let c1_blob_va = if c1_mode { dispatcher_va + c1_blob_off as u64 } else { 0 };
+    let c1_sbox_va = if c1_mode { dispatcher_va + c1_sbox_off as u64 } else { 0 };
+    let c1_state_va = if c1_mode { dispatcher_va + c1_state_off as u64 } else { 0 };
+    let c1_end = if c1_mode { c1_state_off + C1_STATE_SIZE } else { cursor };
+    cursor = c1_end;
 
     let vm_off = cursor;
     let (vm_entry_va, vm_state_va, vm_total) = if let Some(m) = &vm_mod {
@@ -440,6 +474,10 @@ pub(crate) fn place_boot_stub(
         vm_prga_state_va,
         vm_prog_entry_va,
         vm_prog_state_va,
+        // v60: BTG-C1 blob/상태/S-box VA (imm64/rel32 — 길이 불변)
+        c1_blob_va,
+        c1_sbox_va,
+        c1_state_va,
         ..stub
     };
     let stub_code = build_rc4_block(&stub2);
@@ -477,6 +515,7 @@ pub(crate) fn place_boot_stub(
     // (pass4가 여유 있게 예약한 BOOT_AREA_RESERVE 중 사용하지 않은 영역 제거 →
     //   raw 섹션 크기가 줄어 파일 크기 감소. .vdata도 잘린 .textb 직후에 붙는다.)
     let boot_end = stub_end
+        .max(c1_end)
         .max(vm_off + vm_total)
         .max(runs_off + 8 + total_num_runs * 16)
         .max(text_runs_off + text_runs_block)
@@ -577,6 +616,23 @@ pub(crate) fn place_boot_stub(
 
     // 부트 스텁 복사
     btg.bytes[boot_off..stub_end].copy_from_slice(&full_stub_final);
+
+    // ── v60 (--custom-cipher): BTG-C1 blob + S-box + 상태 영역 기록 ───────────
+    if c1_mode {
+        // blob은 최종 VA(c1_state_va/c1_sbox_va)로 재생성 — 길이는 1차와 동일.
+        let blob = crate::crypto::native::emit_btg_crypt_blob(c1_state_va, c1_sbox_va);
+        debug_assert_eq!(blob.len(), c1_blob_len, "BTG-C1 blob length must be VA-independent");
+        btg.bytes[c1_blob_off..c1_blob_off + blob.len()].copy_from_slice(&blob);
+        // S-box 상수 테이블 (패커가 기록 — 스텁 emit_c1_init은 상태만 초기화)
+        let sbox = crate::crypto::nonlinear::sbox();
+        btg.bytes[c1_sbox_off..c1_sbox_off + 256].copy_from_slice(&sbox);
+        // 상태 버퍼는 0으로 초기화 (스텁이 런타임에 key/ctr/nonce/ks_off 기록)
+        btg.bytes[c1_state_off..c1_state_off + C1_STATE_SIZE].fill(0);
+        println!(
+            "[+] v60 BTG-C1: crypt blob @0x{:X} ({}B), sbox @0x{:X}, state @0x{:X}",
+            c1_blob_off, blob.len(), c1_sbox_off, c1_state_off
+        );
+    }
 
     // ── VM 모듈 배치 (최종 VA로 재생성 후 복사) ───────────────────────────────
     if let Some(m) = vm_mod {
@@ -759,10 +815,11 @@ let prmod = build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed,
         btg.bytes[dummy_off..dummy_off + dummy_blob.len()].copy_from_slice(&dummy_blob);
         if !iat_table_blob.is_empty() {
             btg.bytes[table_off..table_off + iat_table_blob.len()].copy_from_slice(&iat_table_blob);
-            // v9: crypto-on에서만 리졸브 테이블을 마지막 run으로 RC4 암호화한다.
+            // v9: crypto-on에서만 리졸브 테이블을 마지막 run으로 암호화한다.
             //     crypto-off에서는 평문으로 두고 스텁이 직접 읽는다.
+            // v60: BTG-C1 경로도 코드/런과 같은 연속 키스트림으로 이어 암호화.
             if table_is_run {
-                rc4.crypt(&mut btg.bytes[table_off..table_off + iat_table_blob.len()]);
+                stream.crypt(&mut btg.bytes[table_off..table_off + iat_table_blob.len()]);
             }
         }
         if ctx.mem_harden {

@@ -117,6 +117,10 @@ use crate::pipeline::PipelineContext;
             mem_code_base: 0,
             mem_code_size: 0,
             stack_frame: 0x118,
+            c1_mode: false,
+            c1_blob_va: 0,
+            c1_sbox_va: 0,
+            c1_state_va: 0,
         };
         let ad = build_anti_debug_raw_block();
         assert_eq!(ad.len(), ANTI_DEBUG_BLOCK_LEN);
@@ -234,6 +238,10 @@ use crate::pipeline::PipelineContext;
             mem_code_base: 0,
             mem_code_size: 0,
             stack_frame: 0x118,
+            c1_mode: false,
+            c1_blob_va: 0,
+            c1_sbox_va: 0,
+            c1_state_va: 0,
         };
         let code = build_rc4_block(&stub);
         assert!(!code.is_empty());
@@ -390,6 +398,10 @@ use crate::pipeline::PipelineContext;
             mem_code_base: 0,
             mem_code_size: 0,
             stack_frame: 0x138,
+            c1_mode: false,
+            c1_blob_va: 0,
+            c1_sbox_va: 0,
+            c1_state_va: 0,
         };
         let code = build_rc4_block(&stub);
         assert!(!code.is_empty());

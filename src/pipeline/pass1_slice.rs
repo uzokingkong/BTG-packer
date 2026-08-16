@@ -2,7 +2,7 @@
 // BTG Pipeline - Pass 1: CFG Extraction & Micro-Slicing
 // ==============================================================================
 
-use crate::analysis::MetricsAnalyzer;
+use crate::analysis::{CfgEdgeCounts, MetricsAnalyzer};
 use crate::graph::{CfgExtractor, MicroSlicer};
 use crate::pipeline::PipelineContext;
 use anyhow::Result;
@@ -49,6 +49,12 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         &ctx.target_info.relayed_sections,
         target_ep_va,
     );
+    // ── 실측 플래트닝 지표용: SEH 필터 이전의 원본 CFG 엣지와 시작 주소 스냅샷 ──
+    let total_cfg_edges: usize = basic_blocks.iter().map(|bb| bb.successor_vas.len()).sum();
+    let pre_filter_edges: Vec<(u64, Vec<u64>)> = basic_blocks
+        .iter()
+        .map(|bb| (bb.start_va, bb.successor_vas.clone()))
+        .collect();
     let total_before = basic_blocks.len();
     let basic_blocks: Vec<_> = basic_blocks
         .into_iter()
@@ -67,6 +73,25 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
             basic_blocks.len()
         );
     }
+    // 양 끝점이 모두 셔플(디스패처 라우팅) 집합에 속하는 엣지만 플래트닝된다.
+    // SEH/native 유지 함수와 닿는 엣지(또는 .text 밖/패딩 타깃)는 직접 분기 → 미포함.
+    let shuffled_starts: std::collections::HashSet<u64> =
+        basic_blocks.iter().map(|bb| bb.start_va).collect();
+    let flattened_cfg_edges = pre_filter_edges
+        .iter()
+        .map(|(src, succs)| {
+            succs
+                .iter()
+                .filter(|dst| {
+                    shuffled_starts.contains(src) && shuffled_starts.contains(dst)
+                })
+                .count()
+        })
+        .sum();
+    let cfg_edges = CfgEdgeCounts {
+        total: total_cfg_edges,
+        flattened: flattened_cfg_edges,
+    };
 
     // MicroSlicer: max_chunk_size = usize::MAX → 원자 기본 블록 경계 유지.
     // 블록 내부에서 자르면 SSE(movaps) 등에서 요구하는 16-byte RSP 정렬이 깨질 수 있음.
@@ -208,16 +233,21 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         trigger_blocks.len()
     );
 
-    // 난독화 지표 출력
-    let metrics = MetricsAnalyzer::analyze(&trigger_blocks);
+    // 난독화 지표 출력 (실측 기반 — flattening/MBA 엔트로피는 상수가 아님)
+    let metrics = MetricsAnalyzer::analyze(
+        &trigger_blocks,
+        ctx.mba_constant,
+        ctx.obf_complexity,
+        cfg_edges,
+    );
     println!("\n------------------------------------------------------------------");
     println!(" [METRICS] BTG Protection Intensity Evaluation ");
     println!("------------------------------------------------------------------");
     println!("  Total Trigger Blocks:        {}", metrics.total_trigger_blocks);
     println!("  Overlapped Blocks:           {}", metrics.overlapped_blocks);
     println!("  Instruction Overlap Density: {:.2}%", metrics.overlap_density);
-    println!("  Control Flow Flattening:     {:.2}% (design constant — all transitions route via dispatcher)", metrics.flattening_ratio);
-    println!("  MBA Key Entropy Score:       {:.0}-bit (theoretical upper bound = key size)", metrics.mba_entropy_score);
+    println!("  Control Flow Flattening:     {:.2}% (measured: {} / {} CFG edges routed via dispatcher)", metrics.flattening_ratio, metrics.flattened_cfg_edges, metrics.total_cfg_edges);
+    println!("  MBA Key Entropy Score:       {:.2} bits/byte (measured Shannon over {} per-block MBA keys; theoretical bound {} bits)", metrics.mba_entropy_score, metrics.total_trigger_blocks, metrics.mba_entropy_bits);
     println!("------------------------------------------------------------------\n");
 
     ctx.basic_blocks = basic_blocks;

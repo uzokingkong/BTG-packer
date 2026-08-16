@@ -36,7 +36,16 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
     // 실제 빌더로 정확한 길이를 측정한다 (모든 참조는 disp32/rel32라 길이가
     // VA·테이블 오프셋과 무관하다). trace(INT3 1B)는 항상 포함해 측정 —
     // 실제 디스패처가 더 길어지는 일이 없도록 보수적으로 잡는다.
-    let dispatcher_size = if ctx.reencrypt {
+    // v61: --m7 디스패처는 재암호화 + refcount 상태 머신 + seed_for 재계산이
+    // 더해져 더 크다 — 실제 빌더로 측정한다. --m7 + --custom-cipher면 BTG-C1
+    // per-block blob(30KB)이 append되어 더욱 크다.
+    let dispatcher_size = if ctx.m7 {
+        if ctx.custom_cipher {
+            crate::dispatcher::build_dispatcher_m7_c1(0, 0, num_blocks, ctx.mba_constant, true, 0, 0).len()
+        } else {
+            crate::dispatcher::build_dispatcher_m7(0, 0, num_blocks, ctx.mba_constant, true).len()
+        }
+    } else if ctx.reencrypt {
         crate::dispatcher::build_dispatcher_reencrypt(0, 0, num_blocks, ctx.mba_constant, true).len()
     } else if ctx.block_ring {
         // v13.4d diag: --block-ring 은 표준 디스패처에 ring-write ~24B 를 더한다.
@@ -53,9 +62,15 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
 
     // first_block_offset: 테이블 끝 이후, 256-byte 정렬
     // v8: 재암호화 시 점프 테이블 뒤에 블록 길이 테이블(num_blocks*4)이 붙는다.
+    // v61: --m7은 상태 테이블(num_blocks*4)까지 추가한다 (점프 + 길이 + 상태).
+    // v61(+custom-cipher): C1 상태 버퍼(0x80) + S-box 상수 테이블(0x100)을
+    // 테이블 직후(first_block_offset 직전)에 예약한다.
+    let c1_reserve = if ctx.m7 && ctx.custom_cipher { 0x180 } else { 0 };
     let required_table_end = table_offset
         + num_blocks * 4
-        + if ctx.reencrypt { num_blocks * 4 } else { 0 };
+        + if ctx.reencrypt { num_blocks * 4 } else { 0 }
+        + if ctx.m7 { num_blocks * 4 } else { 0 }
+        + c1_reserve;
     let first_block_offset = (required_table_end + 0xFF) & !0xFF;
 
     debug_assert!(

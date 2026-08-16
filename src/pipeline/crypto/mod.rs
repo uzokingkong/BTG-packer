@@ -44,6 +44,25 @@ mod vm_embed;
 pub use cipher::Rc4;
 pub use integrity::crc32;
 
+/// 부트 스텁/패커가 공유하는 연속 키스트림 암호 (v60 --custom-cipher).
+///
+/// `place_boot_stub`가 IAT 리졸브 테이블 run을 코드 영역 + 문자열 런 뒤에서
+/// 이어서 암호화해야 하므로, 코드/런 암호화에 사용한 인스턴스를 그대로 넘긴다.
+/// RC4와 BTG-C1 모두 `crypt`가 in-place XOR (encrypt == decrypt)이다.
+pub(crate) enum BootStreamCipher<'a> {
+    Rc4(&'a mut Rc4),
+    C1(crate::crypto::BtgCipher),
+}
+
+impl<'a> BootStreamCipher<'a> {
+    pub(crate) fn crypt(&mut self, buf: &mut [u8]) {
+        match self {
+            BootStreamCipher::Rc4(r) => r.crypt(buf),
+            BootStreamCipher::C1(c) => c.crypt(buf),
+        }
+    }
+}
+
 /// 문자열 런 최대 개수 / 총 바이트 상한 (성능 보호)
 pub(crate) const MAX_STRING_RUNS: usize = 512;
 
@@ -94,12 +113,30 @@ pub fn run(
     let m8_mod = ctx.m8 && vm_effective;
     let integrity_effective = integrity && enabled;
 
-    // ── M7: on-demand 재암호화(anti-dump) — 원본 .text/.data/.rdata 런을 파일에는
-    // 암호문으로 유지하고(이미 boot-decrypt run 등록됨), 실행 중 on-demand로만
-    // 복호화→사용→재암호화한다. 여기선 런이 파일에 암호문 상태로 남음을 보장하고,
-    // 부트 스텁이 복호화 후 재암호화하는 on-demand 경로를 로그로 확인한다.
+    // ── v60 (--custom-cipher): BTG-C1 활성 판정 ───────────────────────────────
+    // chained/VM(PRGA·KSA) 경로는 RC4 전용 부트 스텁 서브루틴/가상화를 쓰므로
+    // 이 조합에서는 --custom-cipher를 무시하고 RC4로 폴백한다.
+    // v61: 평문(벌크) 경로와 --m7(per-block C1 디스패처) 경로에서 C1 활성.
+    //     --dispatcher-reencrypt(비-m7)는 아직 RC4 reencrypt 디스패처를 쓰므로
+    //     C1을 활성화하지 않는다 (후속: reencrypt-C1 디스패처).
+    let c1_mode = ctx.custom_cipher && !chained_effective && !vm_effective && (!reencrypt || ctx.m7);
+    if ctx.custom_cipher && !c1_mode {
+        println!(
+            "[!] --custom-cipher (BTG-C1) ignored for this mode: chained/VM use the RC4 boot-stub/VM subroutines, and non-m7 reencrypt still uses the RC4 reencrypt dispatcher (falls back to RC4)"
+        );
+    }
+    if c1_mode {
+        println!("[+] v60 Custom Cipher: BTG-C1 512-bit stream cipher ENABLED (string runs via seed stream; --m7 per-block via per-block C1 keys)");
+    }
+
+    // ── M7: on-demand 재암호화(anti-dump) — refcount-safe 디스패처가 블록을
+    // 실행 후 즉시 재암호화한다 (어느 순간에도 실행 중 블록만 평문). 블록별 개별
+    // 암호화 + 부트 스텁 일괄 복호화 생략은 위 `reencrypt` 플러밍을 공유한다.
     if ctx.m7 {
-        println!("[+] M7 on-demand re-encrypt: boot-decrypt runs stay ciphertext at rest; on-demand decrypt→use→re-encrypt (anti-dump)");
+        println!(
+            "[+] M7 on-demand re-encrypt: blocks individually {}-encrypted; dispatcher decrypts on entry and re-encrypts on last-exit (refcount-safe anti-dump)",
+            if c1_mode { "BTG-C1" } else { "RC4" }
+        );
     }
 
     // ── 1. 레이아웃 정보 읽기 (아직 btg를 빌리지 않은 상태 — &ctx만 사용) ────
@@ -177,7 +214,8 @@ pub fn run(
     if boot_off == 0 || boot_off + BOOT_AREA_RESERVE > btg.bytes.len() {
         return Err(anyhow::anyhow!("Boot area not reserved by Pass 4 (boot_off=0x{:X})", boot_off));
     }
-    let mut rc4;
+    let mut rc4 = Rc4::new(&key);
+    let mut c1: Option<crate::crypto::BtgCipher> = None;
 
     // 5a. 코드 영역
     // v5(--integrity) CRC 소스:
@@ -193,24 +231,37 @@ pub fn run(
     };
     if reencrypt {
         // v8(Phase 0.3): 코드 영역을 통째로 암호화하지 않고, 블록별 MBA 키로
-        // 개별 RC4 암호화한다. 디스패처가 매 디스패치마다 해당 블록만 복호화하고
+        // 개별 암호화한다. 디스패처가 매 디스패치마다 해당 블록만 복호화하고
         // 직전 블록을 재암호화한다. 문자열 런은 아래에서 영역 없이 시작하는
-        // fresh RC4 스트림으로 암호화한다 (부트 스텁도 영역 복호화를 생략).
-        // plan.txt 3단계: 블록 메타데이터(offset/length/block_id)로 키를 유도.
-        for (off, len, key_u32) in &block_keys {
-            let meta = BlockCryptoMeta::new(*off as u32, *off as u64, *len as u32);
-            let mut rc4b = <Rc4 as CryptoProvider>::from_key(&key_u32.to_le_bytes());
-            rc4b
-                .encrypt_block(&meta, &mut btg.bytes[*off..*off + *len])
-                .map_err(|e| anyhow::anyhow!("reencrypt block {}: {}", meta.block_id, e))?;
+        // fresh 스트림으로 암호화한다 (부트 스텁도 영역 복호화를 생략).
+        // v61: --custom-cipher면 per-block 키(key4)를 BTG-C1 키(8회 반복)로
+        // 확장해 BtgCipher로 암호화한다 — M7/reencrypt C1 디스패처가 동일 재생.
+        if c1_mode {
+            for (off, len, key_u32) in &block_keys {
+                let key32 = cipher::repeat4(*key_u32);
+                let mut c1b = crate::crypto::BtgCipher::new(&key32, 0);
+                c1b.crypt(&mut btg.bytes[*off..*off + *len]);
+            }
+            // 문자열 런 키스트림: seed 유도 C1 (부트 스텁 c1 blob과 동일)
+            let (c1_key, c1_nonce) = cipher::derive_c1_key_nonce(&seed_masked);
+            c1 = Some(crate::crypto::BtgCipher::new(&c1_key, c1_nonce));
+        } else {
+            for (off, len, key_u32) in &block_keys {
+                let meta = BlockCryptoMeta::new(*off as u32, *off as u64, *len as u32);
+                let mut rc4b = <Rc4 as CryptoProvider>::from_key(&key_u32.to_le_bytes());
+                rc4b
+                    .encrypt_block(&meta, &mut btg.bytes[*off..*off + *len])
+                    .map_err(|e| anyhow::anyhow!("reencrypt block {}: {}", meta.block_id, e))?;
+            }
         }
         if integrity_effective {
             crc_source = Some(btg.bytes[code_start..code_end].to_vec());
         }
         rc4 = Rc4::new(&key);
         println!(
-            "[+] v8 Dispatcher Re-Encrypt: {} blocks individually RC4-encrypted with per-block MBA keys (boot-stub bulk decryption skipped)",
-            total_blocks
+            "[+] v8 Dispatcher Re-Encrypt: {} blocks individually {}-encrypted with per-block MBA keys (boot-stub bulk decryption skipped)",
+            total_blocks,
+            if c1_mode { "BTG-C1" } else { "RC4" }
         );
     } else if chained_effective {
         // v7: 청크 체이닝 암호화 — Key_i = 이전 청크 평문(256B), chunk0 = seed anchor.
@@ -225,11 +276,16 @@ pub fn run(
             code_len
         );
     } else if !no_crypto {
-        rc4 = Rc4::new(&key);
-        rc4.crypt(&mut btg.bytes[code_start..code_end]);
-    } else {
-        // v9: crypto-off — 코드 영역은 그대로 둔다 (payload-relocate 시 아래에서 이동)
-        rc4 = Rc4::new(&key);
+        if c1_mode {
+            // v60 (--custom-cipher): BTG-C1 — 키/논스는 seed_masked에서 유도(단일
+            // 소스), 카운터 모드 연속 키스트림은 부트 스텁 blob이 동일하게 재생한다.
+            let (c1_key, c1_nonce) = cipher::derive_c1_key_nonce(&seed_masked);
+            let mut c = crate::crypto::BtgCipher::new(&c1_key, c1_nonce);
+            c.crypt(&mut btg.bytes[code_start..code_end]);
+            c1 = Some(c);
+        } else {
+            rc4.crypt(&mut btg.bytes[code_start..code_end]);
+        }
     }
 
     // 5a-1. v4 payload-relocate: (암호화된) 코드 영역을 실행 불가 데이터 섹션으로 이동
@@ -248,12 +304,22 @@ pub fn run(
     // 5b. 문자열 런 (부트 스텁 런 테이블과 같은 순서) — CryptoProvider.apply
     for run in &runs {
         let sec = &mut ctx.patched_sections[run.sec_idx];
-        rc4.apply(&mut sec.bytes[run.offset..run.offset + run.len]);
+        if let Some(c) = c1.as_mut() {
+            c.crypt(&mut sec.bytes[run.offset..run.offset + run.len]);
+        } else {
+            rc4.apply(&mut sec.bytes[run.offset..run.offset + run.len]);
+        }
     }
+
+    // v60: place_boot_stub로 넘길 연속 키스트림 (코드 영역 + 런을 이미 소모한 인스턴스)
+    let mut stream: BootStreamCipher = match c1.take() {
+        Some(c) => BootStreamCipher::C1(c),
+        None => BootStreamCipher::Rc4(&mut rc4),
+    };
 
     place::place_boot_stub(
         ctx,
-        &mut rc4,
+        &mut stream,
         &runs,
         &seed_masked,
         &seed_stored,
@@ -278,6 +344,7 @@ pub fn run(
         k2,
         k3,
         m8_mod,
+        c1_mode,
         &mut rng,
     )?;
     Ok(())

@@ -325,13 +325,23 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
                     );
                 }
             } else {
-                let mut rc4 = crate::pipeline::crypto::Rc4::new(&key.to_le_bytes());
+                // v61: --m7 + --custom-cipher면 per-block 키를 BTG-C1(repeat4)로
+                // 복호화해 패커 암호화 ↔ C1 디스패처 복호화 동치를 검증한다.
+                let c1 = ctx.m7 && ctx.custom_cipher;
                 let mut dec = out[file_off..file_off + len].to_vec();
-                rc4.crypt(&mut dec);
+                if c1 {
+                    let key32 = crate::pipeline::crypto::cipher::repeat4(key);
+                    let mut c1b = crate::crypto::BtgCipher::new(&key32, 0);
+                    c1b.crypt(&mut dec);
+                } else {
+                    let mut rc4 = crate::pipeline::crypto::Rc4::new(&key.to_le_bytes());
+                    rc4.crypt(&mut dec);
+                }
                 if dec != block.instructions {
                     bail!(
-                        "Phase 0.3: block {} per-block decrypt roundtrip mismatch (dispatcher would execute garbage)",
-                        id
+                        "Phase 0.3: block {} per-block decrypt roundtrip mismatch ({}) (dispatcher would execute garbage)",
+                        id,
+                        if c1 { "BTG-C1" } else { "RC4" }
                     );
                 }
             }
@@ -339,6 +349,43 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
         println!(
             "[VALIDATE] OK  Phase 0.3: {} blocks individually encrypted, length table verified (per-block keys, {} call-target plaintext)",
             num_blocks, call_target_count
+        );
+    }
+
+    // 3d. v61 (--m7): on-demand 상태 테이블 — 일반 블록은 0xFFFFFFFF(암호화),
+    //     call-target 블록은 0(평문 유지)으로 초기화되어야 디스패처 상태 머신이
+    //     올바르게 시작한다. (점프 테이블 + 길이 테이블 뒤 = table_offset + 2*N*4)
+    if ctx.m7 {
+        let tb = sections
+            .iter()
+            .rev().find(|s| s.name == ".textb")
+            .ok_or_else(|| anyhow!("packed section '.textb' missing from output"))?;
+        let layout = ctx
+            .layout()
+            .map_err(|e| anyhow!("m7 validation needs layout: {e}"))?;
+        let num_blocks = layout.shuffled_blocks.len();
+        let state_table_off = tb.raw_ptr as usize + ctx.table_offset + num_blocks * 8;
+        let mut call_target_count = 0usize;
+        for block in &layout.shuffled_blocks {
+            let id = block.id as usize;
+            let entry_off = state_table_off + id * 4;
+            if entry_off + 4 > out.len() {
+                bail!("v61 m7: state table entry for block {} beyond EOF", id);
+            }
+            let st = u32::from_le_bytes(out[entry_off..entry_off + 4].try_into().unwrap());
+            let is_call_target = ctx.call_target_block_ids.contains(&block.id);
+            if is_call_target {
+                call_target_count += 1;
+                if st != 0 {
+                    bail!("v61 m7: call-target block {} state must be 0 (plaintext), got 0x{:X}", id, st);
+                }
+            } else if st != 0xFFFF_FFFF {
+                bail!("v61 m7: block {} state must be 0xFFFFFFFF (encrypted) at rest, got 0x{:X}", id, st);
+            }
+        }
+        println!(
+            "[VALIDATE] OK  v61 m7: state table verified ({} encrypted, {} call-target plaintext)",
+            num_blocks - call_target_count, call_target_count
         );
     }
 
