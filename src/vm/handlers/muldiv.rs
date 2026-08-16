@@ -183,7 +183,9 @@ pub(super) fn emit_bswap64(seq: &mut Vec<(Instruction, Option<Cl>)>) {
 }
 
 // BSR/BSF: dst = bit index (most/least significant set bit of src); ZF set if src==0.
-// Uses real x86 bsr/bsf; captures flags (cap_flags(false) keeps ZF/SF/PF).
+// Uses real x86 bsr/bsf. Intel defines ONLY ZF for these (SF/PF/AF undefined),
+// so only ZF is captured — matching the reference interpreter exactly (a prior
+// `cap_flags(false)` kept the undefined SF/PF bits and could diverge from interp).
 pub(super) fn emit_bsr_bsf(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     for (op, code32, code64, is64) in [
         (OP_BSR_R32, Code::Bsr_r32_rm32, Code::Bsr_r64_rm64, false),
@@ -204,7 +206,18 @@ pub(super) fn emit_bsr_bsf(seq: &mut Vec<(Instruction, Option<Cl>)>) {
             body.push(Instruction::with2(code32, Register::EAX, Register::EAX).unwrap());
             body.push(Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap());
         }
-        body.extend(cap_flags(false));
+        // Capture ONLY ZF (+ carry DF through) — bsr/bsf define no other status bit.
+        body.extend(vec![
+            Instruction::with(Code::Pushfq),
+            Instruction::with1(Code::Pop_r64, Register::R11).unwrap(),
+            Instruction::with2(
+                Code::And_rm64_imm32,
+                Register::R11,
+                (F_ZF | F_DF) as u32 as i32,
+            )
+            .unwrap(),
+            Instruction::with2(Code::Mov_rm64_r64, state_flags_mem(), Register::R11).unwrap(),
+        ]);
         body.push(Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap());
         hdr(seq, op, body);
     }

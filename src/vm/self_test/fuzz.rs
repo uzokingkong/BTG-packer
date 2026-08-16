@@ -225,6 +225,113 @@ pub(crate) fn run_fuzz_arith_test() -> Result<()> {
     Ok(())
 }
 
+/// Randomized differential check for the bit-scan/count family whose flag
+/// semantics are the subtlest: TZCNT / LZCNT / BSR / BSF (32/64). References
+/// are computed in Rust and locked against the real-hardware probe in
+/// `vm::semantics` (CF=1 iff src==0, ZF follows the result for TZCNT/LZCNT;
+/// ZF=1 iff src==0 for BSR/BSF). Each op's flags are compared only within its
+/// documented contract (semantics::flag_contract) — undefined bits never fail.
+pub(crate) fn run_fuzz_bitscan_test() -> Result<()> {
+    use crate::vm::bytecode::*;
+    use crate::vm::semantics;
+
+    let iters = 40;
+    let dirty = FLAG_MASK & !F_DF;
+
+    // (name, op, is64, width, dst(a), flags(a, dst), contract_mask)
+    let cases: Vec<(
+        &'static str,
+        u8,
+        bool,
+        u32,
+        fn(u64, u32) -> u64,
+        fn(u64, u64) -> u64,
+        u64,
+    )> = vec![
+        (
+            "tzcnt32", OP_TZCNT_R32, false, 32,
+            |a, w| if a == 0 { w as u64 } else { (a as u32).trailing_zeros() as u64 },
+            |a, d| (if a == 0 { F_CF } else { 0 }) | (if d == 0 { F_ZF } else { 0 }),
+            F_CF | F_ZF,
+        ),
+        (
+            "lzcnt32", OP_LZCNT_R32, false, 32,
+            |a, w| if a == 0 { w as u64 } else { (a as u32).leading_zeros() as u64 },
+            |a, d| (if a == 0 { F_CF } else { 0 }) | (if d == 0 { F_ZF } else { 0 }),
+            F_CF | F_ZF,
+        ),
+        (
+            "lzcnt64", OP_LZCNT_R64, true, 64,
+            |a, w| if a == 0 { w as u64 } else { a.leading_zeros() as u64 },
+            |a, d| (if a == 0 { F_CF } else { 0 }) | (if d == 0 { F_ZF } else { 0 }),
+            F_CF | F_ZF,
+        ),
+        (
+            "bsr32", OP_BSR_R32, false, 32,
+            |a, w| if a == 0 { 0 } else { (w - 1 - (a as u32).leading_zeros()) as u64 },
+            |a, _| if a == 0 { F_ZF } else { 0 },
+            F_ZF,
+        ),
+        (
+            "bsr64", OP_BSR_R64, true, 64,
+            |a, w| if a == 0 { 0 } else { (w - 1 - a.leading_zeros()) as u64 },
+            |a, _| if a == 0 { F_ZF } else { 0 },
+            F_ZF,
+        ),
+        (
+            "bsf32", OP_BSF_R32, false, 32,
+            |a, _| if a == 0 { 0 } else { (a as u32).trailing_zeros() as u64 },
+            |a, _| if a == 0 { F_ZF } else { 0 },
+            F_ZF,
+        ),
+        (
+            "bsf64", OP_BSF_R64, true, 64,
+            |a, _| if a == 0 { 0 } else { a.trailing_zeros() as u64 },
+            |a, _| if a == 0 { F_ZF } else { 0 },
+            F_ZF,
+        ),
+    ];
+
+    for (name, op, is64, width, dst_sem, fl_sem, contract) in cases {
+        assert_eq!(
+            semantics::flag_contract(op).0,
+            contract,
+            "{name}: flag_contract mismatch (semantics table out of sync with fuzz)"
+        );
+        let mut rng = StdRng::seed_from_u64(0xB175C3A4 ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        for _ in 0..iters {
+            let a = rng.next_u64();
+            let am = if is64 { a } else { a as u32 as u64 };
+            let want_dst = dst_sem(am, width);
+            let want_flags = fl_sem(am, want_dst) & contract;
+
+            let mut bc = BytecodeBuilder::new();
+            if is64 {
+                bc.mov_r_imm64(4, a);
+            } else {
+                bc.mov_r_imm32(4, a as u32);
+            }
+            match name {
+                n if n.starts_with("tzcnt") => bc.tzcnt_r(op, 3, 4),
+                n if n.starts_with("lzcnt") => bc.lzcnt_r(op, 3, 4),
+                n if n.starts_with("bsr") => bc.bsr_r(op, 3, 4),
+                _ => bc.bsf_r(op, 3, 4),
+            }
+            bc.halt();
+            let prog = bc.finish();
+
+            let (st_i, st_n) = run_prog_diff(&prog, |s| seed_state(s, dirty, am, 0))?;
+            let (di, fi) = (vreg(&st_i, 3), flags_of(&st_i));
+            let (dn, fn_) = (vreg(&st_n, 3), flags_of(&st_n));
+            assert_eq!(di, want_dst, "{name}(a=0x{a:X}): interp dst 0x{di:X} != expected 0x{want_dst:X}");
+            assert_eq!(dn, want_dst, "{name}(a=0x{a:X}): native dst 0x{dn:X} != expected 0x{want_dst:X}");
+            assert_eq!(fi & contract, want_flags, "{name}(a=0x{a:X}): interp flags 0x{fi:X} != expected 0x{want_flags:X}");
+            assert_eq!(fn_ & contract, want_flags, "{name}(a=0x{a:X}): native flags 0x{fn_:X} != expected 0x{want_flags:X}");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +344,10 @@ mod tests {
     #[test]
     fn fuzz_arith_differential() {
         run_fuzz_arith_test().expect("arith/popcnt randomized differential check failed");
+    }
+
+    #[test]
+    fn fuzz_bitscan_differential() {
+        run_fuzz_bitscan_test().expect("bitscan randomized differential check failed");
     }
 }

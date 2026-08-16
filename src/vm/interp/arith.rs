@@ -353,7 +353,11 @@ pub(crate) fn exec(
             let v = if is64 { vreg64(state, sr)? } else { vreg32(state, sr)? as u64 };
             let lz = if is64 { v.leading_zeros() as u64 } else { (v as u32).leading_zeros() as u64 };
             set_vreg64(state, d, lz)?;
-            if v == 0 { set_flags(state, F_CF | F_ZF); } else if lz == 0 { set_flags(state, F_ZF); } else { set_flags(state, 0); }
+            // Real x86 (probe-verified): CF=1 iff src==0; ZF follows the RESULT
+            // (lzcnt(0)=width → ZF=0; lzcnt(msb-set)=0 → ZF=1). OF/SF/AF cleared.
+            let cf = if v == 0 { F_CF } else { 0 };
+            let zf = if lz == 0 { F_ZF } else { 0 };
+            set_flags(state, cf | zf);
             Ok(ip)
         }
         OP_POPCNT_R32 | OP_POPCNT_R64 => {
@@ -422,7 +426,11 @@ pub(crate) fn exec(
             let lsb = v.wrapping_neg() & v;
             let cnt = lsb.wrapping_sub(1).count_ones() as u64; // == tzcnt, 32 when v==0
             set_vreg64(state, d, cnt)?;
-            if v == 0 { set_flags(state, F_CF | F_ZF); } else { set_flags(state, 0); }
+            // Real x86 (probe-verified): CF=1 iff src==0; ZF follows the RESULT
+            // (tzcnt(0)=width → ZF=0; tzcnt(odd)=0 → ZF=1). OF/SF/AF cleared.
+            let cf = if v == 0 { F_CF } else { 0 };
+            let zf = if cnt == 0 { F_ZF } else { 0 };
+            set_flags(state, cf | zf);
             Ok(ip)
         }
         OP_CPUID => {

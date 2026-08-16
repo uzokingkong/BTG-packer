@@ -32,6 +32,7 @@ pub mod mem_model;
 pub mod poly;
 pub mod prga;
 pub mod risc;
+pub mod semantics;
 pub mod text_lift;
 pub mod threaded;
 pub mod commercial_build;

@@ -52,7 +52,7 @@ use self::bmi::run_bmi_test;
 use self::sse_fpu::run_sse_fpu_test;
 use self::lock_incdec::run_lock_incdec_test;
 use self::ir::run_ir_test;
-use self::fuzz::{run_fuzz_arith_test, run_fuzz_bmi_test};
+use self::fuzz::{run_fuzz_arith_test, run_fuzz_bmi_test, run_fuzz_bitscan_test};
 use self::flags::run_flags_jcc_test;
 use self::abi::run_handler_abi_test;
 use self::addr::run_m2_addr_test;
@@ -724,6 +724,15 @@ pub fn run_self_test() -> Result<()> {
         Ok(_) => println!("[37b] FUZZ arith/popcnt (random operands, interp==native==ref):              PASS"),
         Err(e) => {
             println!("[37b] FUZZ arith/popcnt:                                                            FAIL ({})", e);
+            return Err(e);
+        }
+    }
+    let _ = std::io::stdout().flush();
+
+    match run_fuzz_bitscan_test() {
+        Ok(_) => println!("[37c] FUZZ bitscan tzcnt/lzcnt/bsr/bsf (real-x86-locked, interp==native==ref): PASS"),
+        Err(e) => {
+            println!("[37c] FUZZ bitscan:                                                              FAIL ({})", e);
             return Err(e);
         }
     }
