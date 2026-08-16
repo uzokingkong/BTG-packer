@@ -21,6 +21,7 @@
 
 
 pub mod bytecode;
+pub mod c1;
 pub mod flags;
 pub mod handlers;
 pub mod import_key;

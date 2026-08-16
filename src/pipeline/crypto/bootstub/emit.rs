@@ -140,6 +140,16 @@ pub(crate) fn emit_ksa_init(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &
     if stub.chained {
         // ── v7 chained-crypto: 초기 KSA 없음 — 아래 체인 루프가 청크별로 KSA 수행 ──
         // (청크 0의 키 = seed anchor, 이후 청크의 키 = 직전 청크 평문)
+    } else if stub.c1_mode && stub.vm {
+        // ── v61 (--custom-cipher + --vm): C1 상태 초기화를 VM으로 virtualize ────
+        // RC4의 KSA-virtualize에 대응: seed → key32/ctr/nonce/ks_off 유도가 VM
+        // 바이트코드(C1Init 모드) 안에서만 일어난다.
+        // 호출 규약: RCX = VM 상태 버퍼 VA, RDX = seed VA(→MEM_SEED),
+        //           R8 = C1 상태 버퍼 VA(→MEM_BUF), call vm_entry_va.
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX, stub.seed_va).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R8, stub.c1_state_va).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.vm_state_va).unwrap(), None));
+        seq.push((Instruction::with_branch(Code::Call_rel32_64, stub.vm_entry_va).unwrap(), None));
     } else if stub.vm {
         // ── v3-composite VM 경로 ──────────────────────────────────────────────
         // S-box 초기화 + KSA(키 스케줄)는 가상화된 VM 모듈이 수행한다.

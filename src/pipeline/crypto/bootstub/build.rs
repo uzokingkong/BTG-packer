@@ -85,10 +85,15 @@ pub(crate) fn build_rc4_block(stub: &BootStubCtx) -> Vec<u8> {
     }
 
     // v60 (--custom-cipher): BTG-C1 경로는 RC4 KSA 대신 C1 상태 초기화를 수행한다.
-    // (chained/reencrypt/vm/vm-oep는 RC4 전용 서브루틴 — c1_mode는 place.rs가
-    //  비활성화해 이 분기에 도달하지 않는다.)
+    // (chained/vm-oep는 RC4 전용 — c1_mode는 place.rs가 비활성화해 이 분기에
+    //  도달하지 않는다.) v61: --vm과 함께면 C1 상태 초기화를 VM으로 virtualize
+    //  (emit_ksa_init의 c1_mode && vm 분기), 아니면 네이티브 emit_c1_init.
     if stub.c1_mode {
-        emit_c1_init(&mut seq, stub);
+        if stub.vm {
+            emit_ksa_init(&mut seq, stub);
+        } else {
+            emit_c1_init(&mut seq, stub);
+        }
     } else {
         emit_ksa_init(&mut seq, stub);
     }

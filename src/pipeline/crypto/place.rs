@@ -193,15 +193,22 @@ pub(crate) fn place_boot_stub(
     // ── v3-composite VM 모듈 (부트 스텁 직후 배치) ────────────────────────────
     // 바이트코드는 VA 독립적이므로 1차 sizing(VA=0)으로 크기를 확정한 뒤,
     // 최종 VA로 재생성한다. 모듈 레이아웃: [code][table][bytecode][state]
+    // v61: --custom-cipher + --vm — RC4 KSA 대신 C1 상태 초기화 VM(C1Init 모드).
     let vm_mod: Option<vm::VmModule> = if vm_effective {
-        let bc = vm::lifter::lift_ksa(&vm::ksa::build_ksa_instructions(0, k1, k2, k3))?;
-        Some(build_vm_mod(m8_mod, 0, 0, 0, bc, vm::handlers::EntryMode::Ksa)?)
+        if c1_mode {
+            let bc = vm::c1::build_c1_init_bytecode();
+            Some(build_vm_mod(m8_mod, 0, 0, 0, bc, vm::handlers::EntryMode::C1Init)?)
+        } else {
+            let bc = vm::lifter::lift_ksa(&vm::ksa::build_ksa_instructions(0, k1, k2, k3))?;
+            Some(build_vm_mod(m8_mod, 0, 0, 0, bc, vm::handlers::EntryMode::Ksa)?)
+        }
     } else {
         None
     };
     // v19: PRGA VM (RC4 키스트림 생성/복호화 루프) — vm과 함께 배치.
     // 바이트코드는 VA 독립이므로 1차 sizing(VA=0)으로 크기 확정 후 최종 VA 재생성.
-    let vm_prga_mod: Option<vm::VmModule> = if vm_effective {
+    // v61: --custom-cipher + --vm — 키스트림은 C1 blob이 생성하므로 PRGA VM 생략.
+    let vm_prga_mod: Option<vm::VmModule> = if vm_effective && !c1_mode {
         Some(build_vm_mod(m8_mod, 
             0, 0, 0,
             vm::prga::build_prga_bytecode(),
@@ -637,12 +644,13 @@ pub(crate) fn place_boot_stub(
     // ── VM 모듈 배치 (최종 VA로 재생성 후 복사) ───────────────────────────────
     if let Some(m) = vm_mod {
         let vm_va = dispatcher_va + vm_off as u64;
+        let mode = if c1_mode { vm::handlers::EntryMode::C1Init } else { vm::handlers::EntryMode::Ksa };
         let module = build_vm_mod(m8_mod, 
             vm_va,
             vm_va + m.code.len() as u64,
             vm_va + (m.code.len() + m.table.len()) as u64,
             m.bytecode.clone(),
-            vm::handlers::EntryMode::Ksa,
+            mode,
         )?;
         let vm_end = vm_off + module.total_len();
         if vm_end > boot_off + BOOT_AREA_RESERVE {
