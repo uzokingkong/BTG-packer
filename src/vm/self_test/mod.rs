@@ -56,7 +56,7 @@ use self::ir::run_ir_test;
 use self::cross_path::run_cross_path_test;
 use self::fuzz::{
     run_fuzz_arith_test, run_fuzz_atomic_test, run_fuzz_bitscan_test, run_fuzz_bmi_test,
-    run_fuzz_fpconv_test, run_fuzz_muldiv_test, run_fuzz_shld_rol_test,
+    run_fuzz_fpconv_test, run_fuzz_muldiv_test, run_fuzz_shld_rol_test, run_mt_reentrancy_test,
 };
 use self::flags::run_flags_jcc_test;
 use self::abi::run_handler_abi_test;
@@ -774,6 +774,15 @@ pub fn run_self_test() -> Result<()> {
         Ok(_) => println!("[37g] FUZZ float->int cvt (trunc/rne + NaN/overflow indefinite, interp==native):  PASS"),
         Err(e) => {
             println!("[37g] FUZZ fp conversion:                                                           FAIL ({})", e);
+            return Err(e);
+        }
+    }
+    let _ = std::io::stdout().flush();
+
+    match run_mt_reentrancy_test() {
+        Ok(_) => println!("[37h] MT reentrancy (8 threads x per-thread state, interp deterministic):          PASS"),
+        Err(e) => {
+            println!("[37h] MT reentrancy:                                                                FAIL ({})", e);
             return Err(e);
         }
     }

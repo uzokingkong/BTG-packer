@@ -910,6 +910,81 @@ pub(crate) fn run_fuzz_fpconv_test() -> Result<()> {
     Ok(())
 }
 
+/// Read the 16 architectural vregs from a state buffer.
+fn st_vregs(st: &[u8]) -> [u64; 16] {
+    let mut out = [0u64; 16];
+    for (i, v) in out.iter_mut().enumerate() {
+        *v = vreg(st, i);
+    }
+    out
+}
+
+/// 아이템 9 — 멀티스레드 진입 안전성. Reference 인터프리터는 per-invocation
+/// state 를 받으므로 동시 호출에 재진입 안전해야 한다. N 개 스레드가 각자
+/// 독립 state 로 같은 프로그램을 입력별로 200회씩 실행하고, 그 결과가
+/// 단일스레드 참조와 완전히 일치하는지 검증한다. 만약 어떤 전역/공유 상태가
+/// 끼어 있다면 여기서 flake 로 드러난다.
+///
+/// 이 모델은 배포 런타임의 요구사항이기도 하다: 패킹된 바이너리의 프로그램 VM 은
+/// 단일 state 버퍼를 쓰므로, 멀티스레드 진입은 **스레드당 독립 state**가 필요하다
+/// (이 테스트가 그 모델의 정확성을 참조 레벨에서 고정한다).
+pub(crate) fn run_mt_reentrancy_test() -> Result<()> {
+    use crate::vm::bytecode::*;
+    use std::sync::Arc;
+
+    // 산술/논리/시프트/BMI/inc-dec 를 섞은 결정적 프로그램.
+    let mut b = BytecodeBuilder::new();
+    b.mov_r_imm64(4, 0x1122_3344_5566_7788);
+    b.mov_r_imm64(5, 0xFEDC_BA98_7654_3210);
+    b.binop_r_r64(OP_ADD_R_R64, 3, 4);
+    b.binop_r_r64(OP_SUB_R_R64, 3, 5);
+    b.binop_r_r64(OP_XOR_R_R64, 3, 4);
+    b.binop_r_r64(OP_AND_R_R64, 3, 5);
+    b.inc_r64(3);
+    b.dec_r64(3);
+    b.bsr_r(OP_BSR_R64, 6, 3);
+    b.popcnt_r(OP_POPCNT_R64, 7, 3);
+    b.lzcnt_r(OP_LZCNT_R64, 8, 3);
+    b.halt();
+    let prog = Arc::new(b.finish());
+
+    let inputs: Vec<u64> = (0..8u64).map(|i| 0x0102_0304_0506_0708u64.wrapping_mul(i.wrapping_add(1)).wrapping_add(i)).collect();
+
+    // 단일 스레드 참조 (입력별).
+    let refs: Vec<[u64; 16]> = inputs
+        .iter()
+        .map(|&v| {
+            let (mut st, mut mem) = super::util::interp_state();
+            set_vreg(&mut st, 0, v);
+            interp::interpret(&mut st, &mut mem, &prog)
+                .expect("reference interp");
+            st_vregs(&st)
+        })
+        .collect();
+
+    // 멀티스레드: 각 스레드가 독립 state 로 같은 프로그램을 반복 실행.
+    let threads: Vec<_> = inputs
+        .into_iter()
+        .zip(refs)
+        .map(|(v, r)| {
+            let prog = Arc::clone(&prog);
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let (mut st, mut mem) = super::util::interp_state();
+                    set_vreg(&mut st, 0, v);
+                    interp::interpret(&mut st, &mut mem, &prog)
+                        .expect("mt interp");
+                    assert_eq!(st_vregs(&st), r, "mt reentrancy: result diverged from single-thread reference");
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().map_err(|_| anyhow!("mt thread panicked"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -947,5 +1022,10 @@ mod tests {
     #[test]
     fn fuzz_fpconv_differential() {
         run_fuzz_fpconv_test().expect("float->int conversion randomized differential check failed");
+    }
+
+    #[test]
+    fn mt_reentrancy() {
+        run_mt_reentrancy_test().expect("multithreaded reentrancy check failed");
     }
 }
