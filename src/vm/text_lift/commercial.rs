@@ -78,6 +78,50 @@ impl ProgramLiftCommercial {
     }
 }
 
+/// P0-①: VM ↔ native 경계의 함수 원자성.
+///
+/// 포함 블록에서 제외(네이티브 유지) 블록으로 나가는 직접 분기(`VirtualBranch
+/// { cond }`의 `imm` = 원본 source-IP)는, 그 타깃이 제외 **함수 범위** 안에
+/// 있으면 **함수 진입(프롤로그) 주소**로 리다이렉트한다. 네이티브 브리지가
+/// 함수 중간(예: 에필로그 `add rsp,..; pop; ret`)이 아니라 함수 처음부터
+/// 실행되게 하여, 프롤로그 없는 프레임 실행·스택 파괴를 막는다.
+///
+/// `ip_map`에 있는 타깃(= 가상화된 블록)은 VM 내부 분기이므로 건드리지 않는다.
+/// `excluded_func_ranges`는 제외 함수의 `(start, end)` 범위 목록.
+fn bridge_to_function_entries(
+    program: &mut RiscProgram,
+    ip_map: &HashMap<u64, usize>,
+    excluded_func_ranges: &[(u64, u64)],
+) -> usize {
+    if excluded_func_ranges.is_empty() {
+        return 0;
+    }
+    let entry_for = |va: u64| -> u64 {
+        excluded_func_ranges
+            .iter()
+            .find(|&&(s, e)| s <= va && va < e)
+            .map(|&(s, _)| s)
+            .unwrap_or(va)
+    };
+    let mut redirected = 0;
+    for ins in program.instrs.iter_mut() {
+        // 직접 타깃(imm)만 — src1(런타임 값/간접)은 정적 리다이렉트 불가.
+        if matches!(ins.op, RiscOp::VirtualBranch { .. }) && ins.src1.is_none() {
+            let target = ins.imm;
+            // 가상화된 블록이면 VM 내부 분기 (ip_map 존재) → 유지.
+            if ip_map.contains_key(&target) {
+                continue;
+            }
+            let entry = entry_for(target);
+            if entry != target {
+                ins.imm = entry;
+                redirected += 1;
+            }
+        }
+    }
+    redirected
+}
+
 /// P3 (G1): 원본 `.text`의 entry로부터 도달 가능한 CFG를 **RISC lift**해
 /// 상용 엔진(risc→poly→threaded) 프로그램으로 만든다.
 ///
@@ -301,8 +345,20 @@ pub fn lift_program_cfg_commercial(
         }
     }
 
-    let program = RiscProgram::with_ip_map(instrs, ip_map);
+    // P0-①: VM↔native 경계 함수 원자성 — 제외 함수 범위로 나가는 직접 분기 타깃을
+    // 함수 진입(프롤로그)으로 리다이렉트해, 네이티브 브리지가 함수 중간(에필로그)
+    // 이 아니라 처음부터 실행하게 한다 (프롤로그 없는 프레임 실행 방지).
+    // (ip_map은 with_ip_map이 소비하므로 판정용 사본을 유지 — pack-time 1회 패스.)
+    let ip_map_snapshot = ip_map.clone();
+    let mut program = RiscProgram::with_ip_map(instrs, ip_map);
     let lifted_ops = program.instrs.len();
+    let redirected = bridge_to_function_entries(&mut program, &ip_map_snapshot, &excl.func_ranges);
+    if redirected > 0 {
+        println!(
+            "[+] P0-① boundary atomicity: redirected {} direct branch(es) to excluded function entry (prologue-preserving native bridge)",
+            redirected
+        );
+    }
 
     // 진단: env BTG_DUMP_RISC_OPS 가 설정되면 lift된 RISC op 히스토그램을 출력한다.
     // (실제 샘플이 어떤 핸들러 셋을 필요로 하는지 파악 — 상용 임베드 핸들러 커버리지 결정)
@@ -746,6 +802,34 @@ mod tests {
         // 최종 test al, cl: 0x06 & 0x80 == 0 → ZF=1
         assert_ne!(ref_st.flags & crate::vm::risc::flags::VFLAG_ZF, 0, "ZF set by final test");
         assert_eq!(ref_st.vsp, 0, "vsp balanced");
+    }
+
+    /// P0-①: VM↔native 경계 함수 원자성 — 제외 함수 범위로 나가는 직접 `VirtualBranch`
+    /// 타깃이 함수 진입(프롤로그) 주소로 리다이렉트되는지, 가상화된 블록(ip_map 존재)
+    /// 분기는 유지되는지, 범위 밖 타깃은 그대로인지 검증한다.
+    #[test]
+    fn test_bridge_to_function_entries_redirects_excluded_mid_function() {
+        use crate::vm::risc::{BranchCondition, MicroOperand, RiscOp};
+
+        // 제외 함수: [0x140002000 .. 0x140002040). 그 안의 중간 블록 0x140002028로
+        // 가는 직접 분기는 함수 진입 0x140002000으로 리다이렉트돼야 한다.
+        let func_ranges = vec![(0x140002000u64, 0x140002040u64)];
+        let mut ip_map = HashMap::new();
+        ip_map.insert(0x140001000u64, 0usize); // 가상화된 블록
+
+        let mut prog = RiscProgram::new(vec![
+            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Always }).with_imm(0x140002028), // → 함수 중간 (리다이렉트)
+            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Zero }).with_imm(0x140001000),   // → 가상화 블록 (유지)
+            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Always }).with_imm(0x140003000), // → 범위 밖 (유지)
+            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Always }).with_src1(MicroOperand::VReg(1)), // 간접 (유지)
+        ]);
+
+        let n = bridge_to_function_entries(&mut prog, &ip_map, &func_ranges);
+        assert_eq!(n, 1, "exactly the mid-function branch is redirected");
+        assert_eq!(prog.instrs[0].imm, 0x140002000, "redirected to function entry (prologue)");
+        assert_eq!(prog.instrs[1].imm, 0x140001000, "virtualized-block branch untouched");
+        assert_eq!(prog.instrs[2].imm, 0x140003000, "out-of-range branch untouched");
+        assert!(prog.instrs[3].src1.is_some(), "indirect branch untouched");
     }
 }
 
