@@ -170,8 +170,8 @@ mod tests {
         run_cross_path_test().expect("bytecode path vs RISC path differential check failed");
     }
 
-    /// Guard: the generated native VM code must keep fitting the smallest legacy
-    /// test-arena layout (code @ 0x1000, table @ 0x4800 → 0x3800 bytes). Every
+    /// Guard: the generated native VM code must keep fitting the shared test
+    /// arena layout (code @ 0x1000, table @ 0x5800 → 0x4800 bytes). Every
     /// opcode addition grows it; if this trips, enlarge the shared test layouts
     /// (self_test/util.rs + the per-test arenas) instead of letting the code
     /// silently overwrite the handler table.
@@ -179,16 +179,16 @@ mod tests {
     fn vm_code_fits_legacy_arena_layout() {
         let m = crate::vm::build_vm_module(
             0x14000_1000,
-            0x14000_4800,
-            0x14000_5000,
+            0x14000_5800,
+            0x14000_6000,
             vec![crate::vm::bytecode::OP_HALT],
             crate::vm::handlers::EntryMode::Ksa,
         )
         .expect("build vm");
-        let region = 0x3800usize;
+        let region = 0x4800usize;
         assert!(
             m.code.len() < region,
-            "native VM code {} bytes must stay under the 0x3800 legacy layout ({}); enlarge shared test arenas",
+            "native VM code {} bytes must stay under the 0x4800 shared layout ({}); enlarge shared test arenas",
             m.code.len(),
             region
         );

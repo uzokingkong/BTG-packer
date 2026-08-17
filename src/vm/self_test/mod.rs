@@ -622,7 +622,7 @@ pub fn run_self_test() -> Result<()> {
         // Native VM run.
         let mut varena = Arena::new(0x40000)?;
         let (vc, vt, vb, vs, vtr, vdata) = (
-            varena.base + 0x1000, varena.base + 0x4800, varena.base + 0x5000,
+            varena.base + 0x1000, varena.base + 0x5800, varena.base + 0x5000,
             varena.base + 0x6000, varena.base + 0x8000, varena.base + 0x9000,
         );
         let module = build_vm_module(vc as u64, vt as u64, vb as u64, prog.clone(), handlers::EntryMode::Ksa)?;
@@ -632,7 +632,7 @@ pub fn run_self_test() -> Result<()> {
         {
             let b = varena.bytes();
             b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-            b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
+            b[0x5800..0x5800 + module.table.len()].copy_from_slice(&module.table);
             b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
             b[0x5000..0x5000 + prog.len()].copy_from_slice(&prog);
             b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
@@ -744,7 +744,7 @@ pub fn run_self_test() -> Result<()> {
     let _ = std::io::stdout().flush();
 
     match run_fuzz_muldiv_test() {
-        Ok(_) => println!("[37d] FUZZ mul/div 8/16/32/64 (acc-pair + M1 flagless, interp==native==ref):   PASS"),
+        Ok(_) => println!("[37d] FUZZ mul/div 8/16/32/64 (acc-pair, P0-⑤ CF/OF=upper-overflow, div flagless): PASS"),
         Err(e) => {
             println!("[37d] FUZZ mul/div:                                                                FAIL ({})", e);
             return Err(e);

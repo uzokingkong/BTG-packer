@@ -17,8 +17,13 @@
 //   * AND/XOR/OR          : ZF/SF/PF defined; CF=OF=0; AF is undefined on x86,
 //                           so we *define* it as 0 (the native handler masks it
 //                           out too, keeping the two sides identical).
-//   * IMUL/MUL/DIV        : flags left untouched in M1 (not consumed by any
-//                           virtualized target; documented limitation).
+//   * MUL/IMUL            : CF/OF defined (upper-half overflow, see below); the
+//                           other status flags are undefined on x86 so they pass
+//                           through unchanged (P0-⑤ — matches the RISC reference
+//                           `set_cf_of` exactly, so interp == native == RISC).
+//   * DIV/IDIV            : flags are *undefined* on x86, so they pass through
+//                           unchanged (both the native handler and the RISC
+//                           reference leave them untouched).
 // ==============================================================================
 
 
@@ -303,6 +308,44 @@ pub fn logical_flags64(r: u64) -> u64 {
         f |= F_PF;
     }
     f
+}
+
+/// MUL/IMUL CF/OF: merge the *upper-half-overflow* condition into a previous
+/// flag word, preserving every other status bit. x86 defines ONLY CF/OF for
+/// MUL/IMUL (SF/ZF/AF/PF are undefined), so the other bits pass through — this
+/// matches the RISC reference (`VirtualFlags::set_cf_of`) and the native
+/// handler capture (`cap_flags_cf_of`), keeping interp == native == RISC.
+#[inline]
+pub fn muldiv_cf_of(prev: u64, ovf: bool) -> u64 {
+    let mut f = prev & !(F_CF | F_OF);
+    if ovf {
+        f |= F_CF | F_OF;
+    }
+    f
+}
+
+/// 1-op MUL/IMUL upper-half overflow: CF=OF iff the upper half of the 2w-bit
+/// product is non-zero (MUL) or not a sign-extension of the low half (IMUL).
+#[inline]
+pub fn mul_upper_ovf(low: u64, high: u64, bits: u32, signed: bool) -> bool {
+    if !signed {
+        return high != 0;
+    }
+    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let sign_ext = if low & (1u64 << (bits - 1)) != 0 { mask } else { 0 };
+    high != sign_ext
+}
+
+/// 2/3-op IMUL overflow: CF=OF iff the signed product does not fit in `bits`.
+#[inline]
+pub fn imul_fit_ovf(a: u64, b: u64, bits: u32) -> bool {
+    if bits >= 64 {
+        let p = (a as i64 as i128).wrapping_mul(b as i64 as i128);
+        p != (p as i64 as i128)
+    } else {
+        let p = (a as i32 as i64).wrapping_mul(b as i32 as i64);
+        p != (p as i32 as i64)
+    }
 }
 
 /// Flags for BMI BLSR/BLSMSK/BLSI (32/64-bit). Intel SDM Vol. 2: SF, OF and

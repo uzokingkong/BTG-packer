@@ -62,7 +62,7 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
     let mut arena = Arena::new(0x40000)?;
     let (vc, vt, vb, vs, vtr, vdata) = (
         arena.base + 0x1000,
-        arena.base + 0x4800,
+        arena.base + 0x5800,
         arena.base + 0x5000,
         arena.base + 0x6000,
         arena.base + 0x8000,
@@ -80,7 +80,7 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
+        b[0x5800..0x5800 + module.table.len()].copy_from_slice(&module.table);
         b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
     }
     let vbase = arena.base as u64;

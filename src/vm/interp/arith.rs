@@ -43,8 +43,13 @@ pub(crate) fn exec(
             let d = code[ip] as usize;
             let s = code[ip + 1] as usize;
             let ip = ip + 2;
-            set_vreg64(state, d, vreg32(state, d)?.wrapping_mul(vreg32(state, s)?) as u64)?;
-            // M1: IMUL leaves flags untouched (x86 defines only CF/OF; not consumed).
+            let a = vreg32(state, d)? as u64;
+            let b = vreg32(state, s)? as u64;
+            set_vreg64(state, d, a.wrapping_mul(b) as u64)?;
+            // P0-⑤: 2/3-op IMUL sets CF/OF iff the signed product doesn't fit
+            // the 32-bit destination (matches the native `imul eax, edx`).
+            let ovf = flags::imul_fit_ovf(a, b, 32);
+            set_flags(state, flags::muldiv_cf_of(flags_of(state), ovf));
             Ok(ip)
         }
         OP_SUB_R_R => {
@@ -176,6 +181,11 @@ pub(crate) fn exec(
                 // XOR uses the combined result
                 let fl = if op == OP_XOR_R_R64 { flags::logical_flags64(a ^ b) } else { fl };
                 set_flags(state, fl);
+            } else {
+                // P0-⑤: 2/3-op IMUL64 sets CF/OF iff the signed product doesn't
+                // fit the 64-bit destination (matches native `imul rax, rdx`).
+                let ovf = flags::imul_fit_ovf(a, b, 64);
+                set_flags(state, flags::muldiv_cf_of(flags_of(state), ovf));
             }
             Ok(ip)
         }

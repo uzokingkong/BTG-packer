@@ -134,7 +134,7 @@ pub(crate) fn run_text_lift_test() -> Result<()> {
     // 4) Native VM execution of the same lifted bytecode.
     let mut vm_arena = Arena::new(0x40000)?;
     let vm_code_va = vm_arena.base + 0x1000;
-    let vm_table_va = vm_arena.base + 0x4800;
+    let vm_table_va = vm_arena.base + 0x5800;
     let vm_bc_va = vm_arena.base + 0x5000;
     let vm_state_va = vm_arena.base + 0x6000;
     let vm_stack_va = vm_arena.base + 0x7000;
@@ -148,7 +148,7 @@ pub(crate) fn run_text_lift_test() -> Result<()> {
     {
         let b = vm_arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
+        b[0x5800..0x5800 + module.table.len()].copy_from_slice(&module.table);
         b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
         b[0x5000..0x5000 + lifted_bc.len()].copy_from_slice(&lifted_bc);
         b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
@@ -396,7 +396,7 @@ pub(crate) fn run_m6_phase2_native_program_test() -> Result<()> {
     // 4) Native VM execution of the lifted program (the M6 Phase-2 dispatch path).
     let mut varena = Arena::new(0x40000)?;
     let (vc, vt, vb, vs, vsz, vtr, vdata) = (
-        varena.base + 0x1000, varena.base + 0x4800, varena.base + 0x5000,
+        varena.base + 0x1000, varena.base + 0x5800, varena.base + 0x5000,
         varena.base + 0x6000, varena.base + 0x7000, varena.base + 0x8000, varena.base + 0x9000,
     );
     let module = build_vm_module(vc as u64, vt as u64, vb as u64, bc.clone(), handlers::EntryMode::Ksa)?;
@@ -406,7 +406,7 @@ pub(crate) fn run_m6_phase2_native_program_test() -> Result<()> {
     {
         let b = varena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
+        b[0x5800..0x5800 + module.table.len()].copy_from_slice(&module.table);
         b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
         b[0x5000..0x5000 + bc.len()].copy_from_slice(bc);
         b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);

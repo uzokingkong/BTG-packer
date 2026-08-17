@@ -23,7 +23,7 @@ pub(crate) fn run_m3_bridge_test() -> Result<()> {
 
     let mut arena = Arena::new(0x40000)?;
     let code_va = arena.base + 0x1000;
-    let table_va = arena.base + 0x4800;
+    let table_va = arena.base + 0x5800;
     let bc_va = arena.base + 0x5000;
     let state_va = arena.base + 0x6000;
     let stack_va = arena.base + 0x7000;
@@ -78,7 +78,7 @@ pub(crate) fn run_m3_bridge_test() -> Result<()> {
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
+        b[0x5800..0x5800 + module.table.len()].copy_from_slice(&module.table);
         b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
         b[0xB000..0xB000 + henc.code_buffer.len()].copy_from_slice(&henc.code_buffer);
         b[0x5000..0x5000 + prog.len()].copy_from_slice(&prog);

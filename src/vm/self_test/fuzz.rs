@@ -426,9 +426,11 @@ fn muldiv_ref(op: u8, width: u8, rax: u64, rdx: u64, src: u64) -> (bool, u64, u6
 
 /// Randomized differential check for the 1-op multiply/divide accumulator
 /// family (MUL/IMUL1/DIV/IDIV at 8/16/32/64). Compares the RAX(v0)/RDX(v2)
-/// pair across interp == native == reference, and asserts the M1 flagless
-/// contract (modelled status flags pass through unchanged). Inputs that would
-/// raise #DE on real x86 (divisor 0 / quotient overflow) are skipped.
+/// pair across interp == native == reference, and checks the flag contract:
+/// MUL/IMUL set CF/OF from the upper-half overflow (P0-⑤), preserving the
+/// other status bits; DIV/IDIV leave ALL flags undefined on x86 so they pass
+/// through unchanged. Inputs that would raise #DE on real x86 (divisor 0 /
+/// quotient overflow) are skipped.
 pub(crate) fn run_fuzz_muldiv_test() -> Result<()> {
     use crate::vm::bytecode::*;
 
@@ -443,10 +445,18 @@ pub(crate) fn run_fuzz_muldiv_test() -> Result<()> {
     ];
 
     for (op, width) in cases {
+        let (written, preserved) = crate::vm::semantics::flag_contract(op);
+        // MUL/IMUL write CF/OF (upper-half overflow); DIV/IDIV write nothing.
         assert_eq!(
-            crate::vm::semantics::flag_contract(op),
-            (0, 0),
-            "mul/div op 0x{op:02X}: must stay flagless (M1) in the contract"
+            written,
+            if op == OP_DIV_R_R8 || op == OP_DIV_R_R16 || op == OP_DIV_R_R32 || op == OP_DIV_R_R64
+                || op == OP_IDIV_R_R8 || op == OP_IDIV_R_R16 || op == OP_IDIV_R_R32 || op == OP_IDIV_R_R64
+            {
+                0
+            } else {
+                F_CF | F_OF
+            },
+            "op 0x{op:02X}: flag_contract written mask mismatch (P0-⑤)"
         );
         let mut rng = StdRng::seed_from_u64(0x01D0_0D1E ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let mut ran = 0;
@@ -487,7 +497,7 @@ pub(crate) fn run_fuzz_muldiv_test() -> Result<()> {
             let prog = bc.finish();
 
             let (st_i, st_n) = run_prog_diff(&prog, |s| {
-                // RAX=v0, RDX=v2, src=v3; dirty flags to verify flagless.
+                // RAX=v0, RDX=v2, src=v3; dirty flags to verify contract.
                 s[STATE_FLAGS..STATE_FLAGS + 8].copy_from_slice(&dirty.to_le_bytes());
                 set_vreg(s, 0, rax);
                 set_vreg(s, 2, rdx);
@@ -503,12 +513,45 @@ pub(crate) fn run_fuzz_muldiv_test() -> Result<()> {
             assert_eq!(n2, want_hi, "{name}(rax=0x{rax:X},rdx=0x{rdx:X},src=0x{src:X}): native v2 0x{n2:X} != expected 0x{want_hi:X}");
             assert_eq!(i0, n0, "{name}: interp v0 0x{i0:X} != native v0 0x{n0:X}");
             assert_eq!(i2, n2, "{name}: interp v2 0x{i2:X} != native v2 0x{n2:X}");
-            assert_eq!(fi, dirty, "{name}: interp must be flagless, flags changed to 0x{fi:X}");
-            assert_eq!(fn_, dirty, "{name}: native must be flagless, flags changed to 0x{fn_:X}");
+
+            // MUL/IMUL: CF/OF set per upper-half overflow; the other status
+            // bits pass through (dirty). DIV/IDIV: all flags pass through.
+            // 8-bit: the product's upper half is AH = bits 8..15 of AX (want_lo);
+            // for >=16-bit it's the returned want_hi (RDX upper, masked).
+            let ovf = if written != 0 {
+                if width == 8 {
+                    crate::vm::flags::mul_upper_ovf(
+                        want_lo & 0xFF,
+                        (want_lo >> 8) & 0xFF,
+                        8,
+                        is_imul(op),
+                    )
+                } else {
+                    crate::vm::flags::mul_upper_ovf(want_lo, want_hi, width as u32, is_imul(op))
+                }
+            } else {
+                false
+            };
+            let want_cf_of = if ovf { F_CF | F_OF } else { 0 };
+            // Flags = dirty, with the contract's *written* bits replaced by the
+            // op's result (DIV/IDIV write nothing → flags unchanged).
+            let expect = (dirty & !written) | want_cf_of;
+            assert_eq!(fi & written, want_cf_of, "{name}: interp CF/OF wrong, got 0x{fi:X}");
+            assert_eq!(fn_ & written, want_cf_of, "{name}: native CF/OF wrong, got 0x{fn_:X}");
+            assert_eq!(fi & preserved, dirty & preserved, "{name}: interp must preserve other flags, got 0x{fi:X}");
+            assert_eq!(fn_ & preserved, dirty & preserved, "{name}: native must preserve other flags, got 0x{fn_:X}");
+            assert_eq!(fi, expect, "{name}: interp flags 0x{fi:X} != expected 0x{expect:X}");
+            assert_eq!(fn_, expect, "{name}: native flags 0x{fn_:X} != expected 0x{expect:X}");
         }
         assert!(ran > 0, "op 0x{op:02X}: no valid inputs found (all skipped)");
     }
     Ok(())
+}
+
+/// True for the 1-op IMUL1 family (signed upper-half sign-extension overflow).
+fn is_imul(op: u8) -> bool {
+    use crate::vm::bytecode::*;
+    op == OP_IMUL1_R_R8 || op == OP_IMUL1_R_R16 || op == OP_IMUL1_R_R32 || op == OP_IMUL1_R_R64
 }
 
 /// Randomized differential check for SHLD/SHRD (32/64, imm8 & CL) and ROL/ROR

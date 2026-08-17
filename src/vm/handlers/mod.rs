@@ -248,6 +248,26 @@ fn cap_flags_shift() -> Vec<Instruction> {
     ]
 }
 
+/// Capture MUL/IMUL flags (P0-⑤): x86 defines ONLY CF/OF for these (upper-half
+/// overflow); SF/ZF/AF/PF are undefined and pass through unchanged, so only the
+/// CPU's CF/OF bits are taken from pushfq and merged into the existing
+/// STATE_FLAGS slot. Must be emitted immediately after the mul/imul (before any
+/// instruction that changes flags, e.g. `add r9, N`). Matches the interpreter's
+/// `flags::muldiv_cf_of` and the RISC reference `set_cf_of` exactly.
+fn cap_flags_cf_of() -> Vec<Instruction> {
+    vec![
+        Instruction::with(Code::Pushfq),
+        Instruction::with1(Code::Pop_r64, Register::R11).unwrap(),
+        // r11 = only CF/OF from the host flags
+        Instruction::with2(Code::And_rm64_imm32, Register::R11, (F_CF | F_OF) as u32 as i32).unwrap(),
+        // rcx = existing VM flags minus CF/OF (preserve SF/ZF/AF/PF + DF)
+        Instruction::with2(Code::Mov_r64_rm64, Register::RCX, state_flags_mem()).unwrap(),
+        Instruction::with2(Code::And_rm64_imm32, Register::RCX, !((F_CF | F_OF) as u32) as i32).unwrap(),
+        Instruction::with2(Code::Or_rm64_r64, Register::RCX, Register::R11).unwrap(),
+        Instruction::with2(Code::Mov_rm64_r64, state_flags_mem(), Register::RCX).unwrap(),
+    ]
+}
+
 /// Generate the VM machine code.
 /// - `code_va`: VA where `code` will be loaded
 /// - `bytecode_va`: VA of the bytecode array (embedded in the entry stub)

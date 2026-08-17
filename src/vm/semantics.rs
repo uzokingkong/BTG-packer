@@ -181,14 +181,17 @@ pub fn flag_contract(op: u8) -> (u64, u64) {
         | OP_XADD_MEM8_A | OP_XADD_MEM16_A | OP_XADD_MEM32_A | OP_XADD_MEM64_A => {
             (F_CF | F_PF | F_AF | F_ZF | F_SF | F_OF, 0) // full arithmetic set
         }
-        // M1 documented limitation: MUL/IMUL/DIV leave the modelled status flags
-        // untouched on BOTH sides (real x86 defines only CF/OF for these, and no
-        // virtualized target consumes them yet). Contract = flagless.
+        // P0-⑤: MUL/IMUL define CF/OF (upper-half overflow) — written here;
+        // SF/ZF/AF/PF are undefined on x86 so they pass through (preserved).
+        // DIV/IDIV leave ALL status flags undefined on x86 → pass through
+        // (no written bits). Matches the RISC reference (mul_wide/mul_low set
+        // CF/OF via set_cf_of; div_wide leaves flags untouched) and the native
+        // handler capture (cap_flags_cf_of), so every path agrees.
         OP_MUL_R_R32 | OP_MUL_R_R64 | OP_MUL_R_R8 | OP_MUL_R_R16
         | OP_IMUL1_R_R32 | OP_IMUL1_R_R64 | OP_IMUL1_R_R8 | OP_IMUL1_R_R16
-        | OP_DIV_R_R32 | OP_DIV_R_R64 | OP_DIV_R_R8 | OP_DIV_R_R16
-        | OP_IDIV_R_R32 | OP_IDIV_R_R64 | OP_IDIV_R_R8 | OP_IDIV_R_R16
-        | OP_IMUL_R_R | OP_IMUL_R_R64 => (0, 0),
+        | OP_IMUL_R_R | OP_IMUL_R_R64 => (F_CF | F_OF, FLAG_MASK & !(F_CF | F_OF)),
+        OP_DIV_R_R32 | OP_DIV_R_R64 | OP_DIV_R_R8 | OP_DIV_R_R16
+        | OP_IDIV_R_R32 | OP_IDIV_R_R64 | OP_IDIV_R_R8 | OP_IDIV_R_R16 => (0, 0),
         OP_AND_R_R | OP_AND_R_IMM32 | OP_AND_R_R64 | OP_AND_R_IMM64
         | OP_XOR_R_R | OP_XOR_R_IMM32 | OP_XOR_R_R64 | OP_XOR_R_IMM64
         | OP_OR_R_R | OP_OR_R_R64 | OP_OR_R_IMM32 | OP_OR_R_IMM64
@@ -331,7 +334,10 @@ mod tests {
         assert_eq!(flag_contract(OP_ADD_R_R).0, FLAG_MASK);
         assert_eq!(flag_contract(OP_TZCNT_R32).0, F_CF | F_ZF);
         assert_eq!(flag_contract(OP_BSR_R32).0, F_ZF);
-        assert_eq!(flag_contract(OP_MUL_R_R32), (0, 0), "M1 mul is flagless in the VM");
+        assert_eq!(flag_contract(OP_MUL_R_R32), (F_CF | F_OF, FLAG_MASK & !(F_CF | F_OF)));
+        assert_eq!(flag_contract(OP_IMUL_R_R), (F_CF | F_OF, FLAG_MASK & !(F_CF | F_OF)));
+        // DIV/IDIV leave ALL flags undefined on x86 → pass through (flagless).
+        assert_eq!(flag_contract(OP_DIV_R_R64), (0, 0));
         assert_eq!(flag_contract(OP_CMPXCHG_MEM32_A), (F_ZF, FLAG_MASK & !F_ZF));
         assert_eq!(flag_contract(OP_INC_R).1, F_CF, "INC preserves CF");
         // Flagless ops (mov/jmp/lea/bswap/not) must not claim any writes.

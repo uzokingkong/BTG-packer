@@ -10,12 +10,13 @@ use super::super::*;
 use iced_x86::{Code, Instruction, MemoryOperand, Register};
 
 // ?? 0x04-0x07 + 0x15 XOR/ADD/IMUL/SUB/AND r,r  (op, dst, src) ?????????????
-// fmod: 0 = no flags (IMUL), 1 = full flags (ADD/SUB), 2 = logical (XOR/AND)
+// fmod: 0 = no flags (reserved), 1 = full flags (ADD/SUB), 2 = logical (XOR/AND),
+//       3 = MUL/IMUL CF/OF only (P0-⑤)
 pub(crate) fn emit_alu_rr(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     for (op, code, fmod) in [
         (OP_XOR_R_R, Code::Xor_rm32_r32, 2),
         (OP_ADD_R_R, Code::Add_rm32_r32, 1),
-        (OP_IMUL_R_R, Code::Imul_r32_rm32, 0),
+        (OP_IMUL_R_R, Code::Imul_r32_rm32, 3),
         (OP_SUB_R_R, Code::Sub_rm32_r32, 1),
         (OP_AND_R_R, Code::And_rm32_r32, 2),
     ] {
@@ -30,6 +31,7 @@ pub(crate) fn emit_alu_rr(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         match fmod {
             1 => body.extend(cap_flags(true)),
             2 => body.extend(cap_flags(false)),
+            3 => body.extend(cap_flags_cf_of()),
             _ => {}
         }
         body.push(Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap());
@@ -135,7 +137,7 @@ pub(crate) fn emit_alu_rr64(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         (OP_SUB_R_R64, Code::Sub_rm64_r64, 1),
         (OP_XOR_R_R64, Code::Xor_rm64_r64, 2),
         (OP_AND_R_R64, Code::And_rm64_r64, 2),
-        (OP_IMUL_R_R64, Code::Imul_r64_rm64, 0),
+        (OP_IMUL_R_R64, Code::Imul_r64_rm64, 3),
     ] {
         let mut body = vec![
             Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
@@ -148,6 +150,7 @@ pub(crate) fn emit_alu_rr64(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         match fmod {
             1 => body.extend(cap_flags(true)),
             2 => body.extend(cap_flags(false)),
+            3 => body.extend(cap_flags_cf_of()),
             _ => {}
         }
         body.push(Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap());

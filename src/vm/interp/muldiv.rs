@@ -4,9 +4,21 @@
 //
 // Covers MUL/IMUL1/DIV/IDIV with the RAX=v0 / RDX=v2 accumulator pair at
 // 8/16/32/64-bit widths (v31 + v33).
+//
+// P0-⑤: MUL/IMUL set CF/OF = upper-half overflow (x86-defined); SF/ZF/AF/PF
+// pass through unchanged (undefined on x86) — matching the RISC reference and
+// the native handlers. DIV/IDIV leave ALL flags unchanged (undefined on x86).
 
-use super::state::{VmError, set_vreg64, vreg32, vreg64};
+use super::state::{VmError, flags_of, set_flags, set_vreg64, vreg32, vreg64};
 use crate::vm::bytecode::*;
+use crate::vm::flags;
+
+/// Write CF/OF per the 1-op MUL/IMUL overflow rule, preserving the other bits.
+#[inline]
+fn set_mul_cf_of(state: &mut [u8], low: u64, high: u64, bits: u32, signed: bool) {
+    let ovf = flags::mul_upper_ovf(low, high, bits, signed);
+    set_flags(state, flags::muldiv_cf_of(flags_of(state), ovf));
+}
 
 /// Execute one multiply/divide opcode. `ip` points at the first operand byte
 /// (opcode already consumed). Returns the updated ip.
@@ -26,6 +38,7 @@ pub(crate) fn exec(
             let p = a * b; // 64-bit product
             set_vreg64(state, 0, (p as u32) as u64)?; // EAX = low32
             set_vreg64(state, 2, ((p >> 32) as u32) as u64)?; // EDX = high32
+            set_mul_cf_of(state, p as u32 as u64, p >> 32, 32, false);
             Ok(ip)
         }
         OP_MUL_R_R64 => {
@@ -36,6 +49,7 @@ pub(crate) fn exec(
             let p = (a as u128) * (b as u128);
             set_vreg64(state, 0, p as u64)?;
             set_vreg64(state, 2, (p >> 64) as u64)?;
+            set_mul_cf_of(state, p as u64, (p >> 64) as u64, 64, false);
             Ok(ip)
         }
         OP_IMUL1_R_R32 => {
@@ -46,6 +60,7 @@ pub(crate) fn exec(
             let p = a * b; // signed 64-bit product
             set_vreg64(state, 0, (p as u32) as u64)?;
             set_vreg64(state, 2, ((p >> 32) as u32) as u64)?;
+            set_mul_cf_of(state, p as u64, (p >> 32) as u64, 32, true);
             Ok(ip)
         }
         OP_IMUL1_R_R64 => {
@@ -56,6 +71,7 @@ pub(crate) fn exec(
             let p = a * b;
             set_vreg64(state, 0, p as u64)?;
             set_vreg64(state, 2, (p >> 64) as u64)?;
+            set_mul_cf_of(state, p as u64, (p >> 64) as u64, 64, true);
             Ok(ip)
         }
         OP_DIV_R_R32 => {
@@ -128,6 +144,7 @@ pub(crate) fn exec(
             let b = (vreg64(state, src)? & 0xFF) as u16;
             let p = a * b; // 16-bit product ??AX
             set_vreg64(state, 0, p as u64)?; // zero-extend into v0
+            set_mul_cf_of(state, p as u64, (p >> 8) as u64, 8, false);
             Ok(ip)
         }
         OP_MUL_R_R16 => {
@@ -138,6 +155,7 @@ pub(crate) fn exec(
             let p = a * b; // 32-bit product ??DX:AX
             set_vreg64(state, 0, (p & 0xFFFF) as u64)?;
             set_vreg64(state, 2, ((p >> 16) & 0xFFFF) as u64)?;
+            set_mul_cf_of(state, p as u64, (p >> 16) as u64, 16, false);
             Ok(ip)
         }
         OP_IMUL1_R_R8 => {
@@ -147,6 +165,7 @@ pub(crate) fn exec(
             let b = (vreg64(state, src)? & 0xFF) as u8 as i8 as i16;
             let p = a * b; // signed 16-bit product
             set_vreg64(state, 0, (p as u16) as u64)?;
+            set_mul_cf_of(state, p as u64, (p >> 8) as u64, 8, true);
             Ok(ip)
         }
         OP_IMUL1_R_R16 => {
@@ -157,6 +176,7 @@ pub(crate) fn exec(
             let p = a * b; // signed 32-bit product ??DX:AX
             set_vreg64(state, 0, ((p as u32) & 0xFFFF) as u64)?;
             set_vreg64(state, 2, (((p as u32) >> 16) & 0xFFFF) as u64)?;
+            set_mul_cf_of(state, p as u64, ((p >> 16) & 0xFFFF) as u64, 16, true);
             Ok(ip)
         }
         OP_DIV_R_R8 => {

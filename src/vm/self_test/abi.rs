@@ -218,7 +218,7 @@ pub(crate) unsafe fn abi_runtime_probe(_vmc: crate::vm::handlers::VmCode, _code_
     let mut arena = Arena::new(0x40000)?;
     let va_base = arena.base as u64;
     let (vc, vt, vb, vs, vtr, vdata) = (
-        va_base + 0x1000, va_base + 0x4800, va_base + 0x5000,
+        va_base + 0x1000, va_base + 0x5800, va_base + 0x5000,
         va_base + 0x6000, va_base + 0x8000, va_base + 0x9000,
     );
     // 테스트 바이트코드: 간단한 산술 + 메모리 RMW + 스택 push/pop 까지 섞어
@@ -244,7 +244,7 @@ pub(crate) unsafe fn abi_runtime_probe(_vmc: crate::vm::handlers::VmCode, _code_
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
+        b[0x5800..0x5800 + module.table.len()].copy_from_slice(&module.table);
         b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
         b[0x5000..0x5000 + prog.len()].copy_from_slice(&prog);
         b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
@@ -334,7 +334,7 @@ pub(crate) fn run_bridge_abi_check() -> anyhow::Result<()> {
     let mut arena = Arena::new(0x40000)?;
     let va = arena.base as u64;
     let (vc, vt, vb, vs, vtr, vdata, vstack, vnative) = (
-        va + 0x1000, va + 0x4800, va + 0x5000, va + 0x6000,
+        va + 0x1000, va + 0x5800, va + 0x5000, va + 0x6000,
         va + 0x8000, va + 0x9000, va + 0x7000, va + 0xB000,
     );
     // 네이티브 5-인자 헬퍼: return rcx + 2*rdx + 4*r8 + 8*r9 + 16*d5(stack@[rsp+0x28])
@@ -372,7 +372,7 @@ pub(crate) fn run_bridge_abi_check() -> anyhow::Result<()> {
     {
         let b = arena.bytes();
         b[0x1000..0x1000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x4800..0x4800 + module.table.len()].copy_from_slice(&module.table);
+        b[0x5800..0x5800 + module.table.len()].copy_from_slice(&module.table);
         b[0x8000..0x8000 + tramp.len()].copy_from_slice(&tramp);
         b[0xB000..0xB000 + henc.code_buffer.len()].copy_from_slice(&henc.code_buffer);
         b[0x5000..0x5000 + prog.len()].copy_from_slice(&prog);
