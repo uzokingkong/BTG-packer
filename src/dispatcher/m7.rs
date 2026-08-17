@@ -373,22 +373,23 @@ pub fn build_dispatcher_m7(
     for (inst, lbl) in seq.iter_mut() {
         if let Some(l) = lbl {
             if is_branch(inst.code()) {
-                let target = label_ips[&l];
+                let target = *label_ips
+                    .get(&l)
+                    .ok_or_else(|| anyhow::anyhow!("m7 dispatcher: unresolved label {l:?}"))?;
                 *inst = Instruction::with_branch(inst.code(), target)?;
             }
         }
     }
     let insts: Vec<Instruction> = seq.into_iter().map(|(i, _)| i).collect();
     let block = InstructionBlock::new(&insts, disp_base_va);
-    let enc = BlockEncoder::encode(64, block, enc_opts).expect("m7 dispatcher BlockEncoder failed");
+    let enc = BlockEncoder::encode(64, block, enc_opts).map_err(|e| anyhow::anyhow!("m7 dispatcher BlockEncoder failed: {e}"))?;
     let code = enc.code_buffer;
     let expected = (ip - disp_base_va) as usize;
-    assert_eq!(
-        code.len(),
-        expected,
-        "m7 dispatcher length mismatch: measured {} vs encoded {}",
-        expected,
-        code.len()
-    );
+    if code.len() != expected {
+        return Err(anyhow::anyhow!(
+            "m7 dispatcher length mismatch: measured {expected} vs encoded {}",
+            code.len()
+        ));
+    }
     Ok(code)
 }

@@ -679,22 +679,23 @@ pub fn build_dispatcher_reencrypt(
     for (inst, lbl) in seq.iter_mut() {
         if let Some(l) = lbl {
             if is_branch(inst.code()) {
-                let target = label_ips[&l];
+                let target = *label_ips
+                    .get(&l)
+                    .ok_or_else(|| anyhow::anyhow!("reencrypt dispatcher: unresolved label {l:?}"))?;
                 *inst = Instruction::with_branch(inst.code(), target)?;
             }
         }
     }
     let insts: Vec<Instruction> = seq.into_iter().map(|(i, _)| i).collect();
     let block = InstructionBlock::new(&insts, disp_base_va);
-    let enc = BlockEncoder::encode(64, block, enc_opts).expect("reencrypt dispatcher BlockEncoder failed");
+    let enc = BlockEncoder::encode(64, block, enc_opts).map_err(|e| anyhow::anyhow!("reencrypt dispatcher BlockEncoder failed: {e}"))?;
     let code = enc.code_buffer;
     let expected = (ip - disp_base_va) as usize;
-    assert_eq!(
-        code.len(),
-        expected,
-        "reencrypt dispatcher length mismatch: measured {} vs encoded {}",
-        expected,
-        code.len()
-    );
+    if code.len() != expected {
+        return Err(anyhow::anyhow!(
+            "reencrypt dispatcher length mismatch: measured {expected} vs encoded {}",
+            code.len()
+        ));
+    }
     Ok(code)
 }

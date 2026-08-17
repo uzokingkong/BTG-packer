@@ -517,8 +517,8 @@ fn main() -> error::Result<()> {
                 if let Some(pd) = ctx.target_info.relayed_sections.iter().find(|s| s.name == ".pdata") {
                     for chunk in pd.bytes.chunks_exact(12) {
                         if chunk.len() < 12 { break; }
-                        let s0 = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
-                        let e0 = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+                        let s0 = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                        let e0 = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
                         if s0 > 0 && e0 > s0 {
                             funcs.push((ctx.target_info.image_base + s0 as u64,
                                         ctx.target_info.image_base + e0 as u64));

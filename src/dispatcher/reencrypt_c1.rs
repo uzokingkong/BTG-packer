@@ -227,23 +227,24 @@ pub fn build_dispatcher_reencrypt_c1(
     for (inst, lbl) in seq.iter_mut() {
         if let Some(l) = lbl {
             if is_branch(inst.code()) {
-                let target = label_ips[&l];
+                let target = *label_ips
+                    .get(&l)
+                    .ok_or_else(|| anyhow::anyhow!("reencrypt-c1 dispatcher: unresolved label {l:?}"))?;
                 *inst = Instruction::with_branch(inst.code(), target)?;
             }
         }
     }
     let insts: Vec<Instruction> = seq.into_iter().map(|(i, _)| i).collect();
     let block = InstructionBlock::new(&insts, disp_base_va);
-    let enc = BlockEncoder::encode(64, block, enc_opts).expect("reencrypt-c1 dispatcher BlockEncoder failed");
+    let enc = BlockEncoder::encode(64, block, enc_opts).map_err(|e| anyhow::anyhow!("reencrypt-c1 dispatcher BlockEncoder failed: {e}"))?;
     let mut code = enc.code_buffer;
     let expected = (ip - disp_base_va) as usize;
-    assert_eq!(
-        code.len(),
-        expected,
-        "reencrypt-c1 dispatcher length mismatch: measured {} vs encoded {}",
-        expected,
-        code.len()
-    );
+    if code.len() != expected {
+        return Err(anyhow::anyhow!(
+            "reencrypt-c1 dispatcher length mismatch: measured {expected} vs encoded {}",
+            code.len()
+        ));
+    }
     let blob = crate::crypto::native::emit_btg_crypt_blob(c1_state_va, c1_sbox_va);
     code.extend_from_slice(&blob);
     Ok(code)

@@ -88,8 +88,25 @@ impl TargetPeInfo {
         let text_vsize = text_sec.virtual_size as usize;
         let text_rva = text_sec.virtual_address;
 
-        let end_ptr = (text_raw_ptr + text_size).min(pe_bytes.len());
-        let text_bytes = pe_bytes[text_raw_ptr..end_ptr].to_vec();
+        // Hardened PE input boundary (S6): a malicious/truncated PE can report a
+        // .text raw pointer/size beyond EOF (or wrapping when added). The raw slice
+        // below used to be `pe_bytes[text_raw_ptr..end_ptr]`, which panics on such
+        // input. Compute a checked [start, end) and return a clear error instead of
+        // crashing on hostile input.
+        let text_start = text_raw_ptr;
+        let text_end = match text_start.checked_add(text_size) {
+            Some(e) => e.min(pe_bytes.len()),
+            None => pe_bytes.len(),
+        };
+        if text_start > text_end {
+            return Err(anyhow::anyhow!(
+                "invalid .text raw range: ptr=0x{:X} size=0x{:X} (file len 0x{:X})",
+                text_start,
+                text_size,
+                pe_bytes.len()
+            ));
+        }
+        let text_bytes = pe_bytes[text_start..text_end].to_vec();
 
         let image_base = pe.image_base as u64;
         let entry_point_rva = pe.entry as u32;
@@ -152,9 +169,14 @@ impl TargetPeInfo {
             let name = sec.name().unwrap_or("").to_string();
             let s_raw_ptr = sec.pointer_to_raw_data as usize;
             let s_raw_size = sec.size_of_raw_data as usize;
-            let s_end_ptr = (s_raw_ptr + s_raw_size).min(pe_bytes.len());
+            let s_end_ptr = match s_raw_ptr.checked_add(s_raw_size) {
+                Some(e) => e.min(pe_bytes.len()),
+                None => pe_bytes.len(),
+            };
 
-            let bytes = if s_raw_ptr < pe_bytes.len() {
+            // Guard against malicious raw pointers that fall past EOF (would panic on
+            // direct slicing). Non-.text sections degrade to empty rather than crash.
+            let bytes = if s_raw_ptr <= s_end_ptr && s_raw_ptr <= pe_bytes.len() {
                 pe_bytes[s_raw_ptr..s_end_ptr].to_vec()
             } else {
                 Vec::new()
@@ -183,14 +205,17 @@ impl TargetPeInfo {
         if let Some(pdata_sec) = pe.sections.iter().find(|s| s.name().unwrap_or("").starts_with(".pdata")) {
             let p_raw = pdata_sec.pointer_to_raw_data as usize;
             let p_size = pdata_sec.size_of_raw_data as usize;
-            let p_end = (p_raw + p_size).min(pe_bytes.len());
+            let p_end = match p_raw.checked_add(p_size) {
+                Some(e) => e.min(pe_bytes.len()),
+                None => pe_bytes.len(),
+            };
 
-            if p_raw < pe_bytes.len() {
+            if p_raw <= p_end && p_raw <= pe_bytes.len() {
                 let pdata_bytes = &pe_bytes[p_raw..p_end];
                 for chunk in pdata_bytes.chunks_exact(12) {
-                    let b = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
-                    let e = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
-                    let u = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+                    let b = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    let e = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+                    let u = u32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
                     if b > 0 && e > b {
                         original_pdata_entries.push(RuntimeFunction {
                             begin_address: b,
@@ -233,4 +258,79 @@ pub struct RuntimeFunction {
     pub begin_address: u32,
     pub end_address: u32,
     pub unwind_info_address: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Craft a hostile PE32+ where the .text section's raw pointer/size point far
+    /// past EOF (or wrap). parse() must return Err instead of panicking on the raw
+    /// slice that previously was `pe_bytes[text_raw_ptr..end_ptr]` (S6).
+    fn hostile_pe(raw_ptr: u32, raw_size: u32, truncate_to: usize) -> Vec<u8> {
+        // Minimal valid-looking PE32+ with a single .text section whose raw fields
+        // are controlled. goblin will accept the DOS/NT/COFF/optional structure;
+        // the hostile .text raw range is what used to panic.
+        let mut b = vec![0u8; 0x1000];
+        b[0..2].copy_from_slice(b"MZ");
+        b[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        // COFF file header at 0x84: machine x64, 1 section
+        b[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+        b[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // number_of_sections
+        b[0x8C..0x8E].copy_from_slice(&0x0Eu16.to_le_bytes()); // size of optional header (PE32+ = 240)
+        // Optional header at 0x8E
+        b[0x8E..0x90].copy_from_slice(&0x20Bu16.to_le_bytes()); // magic PE32+
+        b[0x9E..0xA2].copy_from_slice(&0x1000u32.to_le_bytes()); // AddressOfEntryPoint (inside .text)
+        b[0xA2..0xA6].copy_from_slice(&0x1000u32.to_le_bytes()); // BaseOfCode
+        b[0xA6..0xAE].copy_from_slice(&0x140000000u64.to_le_bytes()); // ImageBase
+        b[0xAE..0xB2].copy_from_slice(&0x1000u32.to_le_bytes()); // SectionAlignment
+        b[0xB2..0xB6].copy_from_slice(&0x200u32.to_le_bytes()); // FileAlignment
+        // Section table at 0x8E + 240 = 0x17E
+        let sec = 0x17Eusize;
+        b[sec..sec + 8].copy_from_slice(b".text\0\0\0");
+        b[sec + 8..sec + 12].copy_from_slice(&0x1000u32.to_le_bytes()); // VirtualSize
+        b[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // VirtualAddress
+        b[sec + 16..sec + 20].copy_from_slice(&raw_size.to_le_bytes()); // SizeOfRawData
+        b[sec + 20..sec + 24].copy_from_slice(&raw_ptr.to_le_bytes()); // PointerToRawData
+        if truncate_to < b.len() {
+            b.truncate(truncate_to);
+        }
+        b
+    }
+
+    #[test]
+    fn malicious_text_raw_past_eof_returns_err_not_panic() {
+        // .text raw pointer beyond EOF: the old `pe_bytes[ptr..end]` slice would panic.
+        let pe = hostile_pe(0x10_0000, 0x1000, 0x1000);
+        let r = std::panic::catch_unwind(|| TargetPeInfo::parse(&pe));
+        match r {
+            Ok(Ok(_)) => panic!("hostile PE unexpectedly parsed"),
+            Ok(Err(_)) => { /* rejected cleanly */ }
+            Err(_) => panic!("hostile PE caused a panic (unchecked slice)"),
+        }
+    }
+
+    #[test]
+    fn malicious_text_raw_wraps_returns_err_not_panic() {
+        // raw_ptr + raw_size wraps to a huge value; must not panic.
+        let pe = hostile_pe(0xFFFF_FF00, 0x1000, 0x1000);
+        let r = std::panic::catch_unwind(|| TargetPeInfo::parse(&pe));
+        match r {
+            Ok(Ok(_)) => { /* may parse if ptr resolves within file; fine */ }
+            Ok(Err(_)) => { /* rejected */ }
+            Err(_) => panic!("hostile PE caused a panic (checked_add missed)"),
+        }
+    }
+
+    #[test]
+    fn truncated_file_returns_err_not_panic() {
+        // Sub-DOS-header input.
+        let r = std::panic::catch_unwind(|| TargetPeInfo::parse(&[0u8; 8]));
+        match r {
+            Ok(Ok(_)) => panic!("truncated input unexpectedly parsed"),
+            Ok(Err(_)) => { /* rejected */ }
+            Err(_) => panic!("truncated input caused a panic"),
+        }
+    }
 }

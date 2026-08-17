@@ -71,7 +71,7 @@ pub fn build_reloc_directory(
             if in_encrypted(slot_rva) {
                 continue;
             }
-            let v = u64::from_le_bytes(sec.bytes[i * 8..i * 8 + 8].try_into().unwrap());
+            let v = u64::from_le_bytes([sec.bytes[i * 8], sec.bytes[i * 8 + 1], sec.bytes[i * 8 + 2], sec.bytes[i * 8 + 3], sec.bytes[i * 8 + 4], sec.bytes[i * 8 + 5], sec.bytes[i * 8 + 6], sec.bytes[i * 8 + 7]]);
             if v < va_lo || v >= va_hi {
                 continue;
             }
