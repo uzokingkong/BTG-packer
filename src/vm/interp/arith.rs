@@ -62,6 +62,18 @@ pub(crate) fn exec(
             set_flags(state, flags::sub_flags(a, b));
             Ok(ip)
         }
+        OP_SUB_R_R8 | OP_SUB_R_R16 => {
+            let d = code[ip] as usize;
+            let s = code[ip + 1] as usize;
+            let ip = ip + 2;
+            let bits = if op == OP_SUB_R_R8 { 8u32 } else { 16u32 };
+            let mask = if bits == 8 { 0xFFu64 } else { 0xFFFFu64 };
+            let a = vreg64(state, d)?;
+            let b = vreg64(state, s)?;
+            set_vreg64(state, d, a.wrapping_sub(b) & mask)?;
+            set_flags(state, flags::sub_flags_width(a, b, bits));
+            Ok(ip)
+        }
         OP_AND_R_R => {
             let d = code[ip] as usize;
             let s = code[ip + 1] as usize;

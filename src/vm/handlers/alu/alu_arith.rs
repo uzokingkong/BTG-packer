@@ -306,3 +306,28 @@ pub(crate) fn emit_not(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         hdr(seq, op, body);
     }
 }
+// v66: 8/16-bit narrow reg-reg SUB with exact operand-width flags.
+pub(crate) fn emit_alu_sub8_sub16(seq: &mut Vec<(Instruction, Option<Cl>)>) {
+    for (op, code, w) in [
+        (OP_SUB_R_R8, Code::Sub_rm8_r8, 8),
+        (OP_SUB_R_R16, Code::Sub_rm16_r16, 16),
+    ] {
+        let (dst_reg, src_reg, zmn, zsrc) = if w == 8 {
+            (Register::AL, Register::DL, Code::Movzx_r32_rm8, Register::AL)
+        } else {
+            (Register::AX, Register::DX, Code::Movzx_r32_rm16, Register::AX)
+        };
+        let mut body = vec![
+            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
+            Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RCX)).unwrap(),
+            Instruction::with2(Code::Mov_r32_rm32, Register::EDX, vreg(Register::RDX)).unwrap(),
+            Instruction::with2(code, dst_reg, src_reg).unwrap(),
+            Instruction::with2(zmn, Register::EAX, zsrc).unwrap(),
+            Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(),
+        ];
+        body.extend(cap_flags(true));
+        body.push(Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap());
+        hdr(seq, op, body);
+    }
+}

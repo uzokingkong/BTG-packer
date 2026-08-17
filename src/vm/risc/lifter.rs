@@ -2050,11 +2050,13 @@ mod tests {
     fn test_lift_lodsw_single() {
         let raw = [0x66, 0xAD, 0xC3];
         let mut init = [0u64; 16];
+        init[0] = 0x1122_3344_5566_7788; // RAX upper bits must be PRESERVED
         init[6] = 0x1000;
         let mut mem = HashMap::new();
         seed_mem(&mut mem, 0x1000, 2, 0x7AB9);
         let st = run_mem(&raw, 0x140001000, init, mem);
-        assert_eq!(st.regs[0], 0x7AB9, "AX = [rsi] zero-extended");
+        // LODSW writes only AX: upper 48 bits of RAX stay intact.
+        assert_eq!(st.regs[0], 0x1122_3344_5566_7AB9, "AX written, upper bits preserved");
         assert_eq!(st.regs[6], 0x1002, "rsi advanced by 2");
     }
 

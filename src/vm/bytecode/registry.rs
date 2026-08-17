@@ -41,7 +41,7 @@ macro_rules! opcodes {
         )*
 
         /// Handler-table slot count (opcodes 0x00..=0xC1). 0x00 = invalid-opcode handler.
-        pub const NUM_OPS: usize = 0xC2;
+        pub const NUM_OPS: usize = 0xC4;
 
         /// Opcode -> (mnemonic, operand byte length after the opcode byte).
         pub const OPCODE_INFO: &[(u8, &'static str, usize)] = &[
@@ -327,6 +327,13 @@ opcodes! {
     // bump direction (+n when clear, -n when set). Encoding: no operands.
     OP_CLD = 0xBE : "cld", 0 ;
     OP_STD = 0xBF : "std", 0 ;
+    // v66: 8/16-bit narrow reg-reg SUB with exact operand-width flags.
+    // SCAS/CMPS 8/16-bit compare must produce the *exact* x86 CF/SF/OF at the
+    // operand width (bit 7 / bit 15), not the 32-bit SUB approximation. Mirrors
+    // OP_SUB_R_R but subtracts at 8/16 bits: vreg[dst] = (vreg[dst] - vreg[src])
+    // & mask; flags = sub_flags_width(..., 8/16). Encoding [op, dst, src].
+    OP_SUB_R_R8  = 0xC2 : "sub8", 2 ;
+    OP_SUB_R_R16 = 0xC3 : "sub16", 2 ;
 }
 
 /// Index-slot sentinel for LEA: no index term (see opcodes! / OP_LEA).

@@ -118,21 +118,33 @@ pub(super) fn lift_stos(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
 }
 
 /// LODS: AL/AX/EAX/RAX (vreg0) = [rsi]; rsi += DF ? -n : n. REP → count-down loop.
-/// Note: x86 LODSB only writes AL; we zero-extend into vreg0 for simplicity.
+/// Note: x86 LODSB/LODSW write only AL/AX (the upper bits of RAX are preserved).
 /// REP LODS leaves RFLAGS unchanged — saved/restored around the loop (v64).
 pub(super) fn lift_lods(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     let n = stos_lods_width(inst.code());
-    let (load, _, _) = width_ops(n);
+    let (load, _, mask) = width_ops(n);
     let rsi = 6u8; let rcx = 1u8;
-    let single = |b: &mut BytecodeBuilder, delta: u8| {
-        b.mem_load_a(load, 0, rsi);
-        b.lea(rsi, rsi, delta, 0, 0);
+    // x86: LODSB writes only AL, LODSW only AX â the upper bits of RAX are
+    // PRESERVED (only LODSD zeroes RAX[63:32] via the EAX write, and LODSQ
+    // writes all of RAX). Load into SCRATCH (zero-extended) then merge into
+    // vreg0 keeping its upper bits. The AND/OR clobber the modelled flags, but
+    // the caller restores STATE_FLAGS around the op.
+    let load_acc = |b: &mut BytecodeBuilder| {
+        if n == 1 || n == 2 {
+            b.mem_load_a(load, SCRATCH, rsi);
+            // v0 = (v0 & ~mask) | (SCRATCH & mask)
+            b.binop_r_imm64(OP_AND_R_IMM64, 0, (!mask & 0xFFFF_FFFF) as u32);
+            b.binop_r_r64(OP_OR_R_R64, 0, SCRATCH);
+        } else {
+            b.mem_load_a(load, 0, rsi);
+        }
     };
     if !has_any_rep(inst) {
         b.get_flags(TMP3);
         emit_dir_delta(b, SCRATCH2, TMP4, n);
+        load_acc(b);
+        b.lea(rsi, rsi, TMP4, 0, 0);
         b.set_flags(TMP3);
-        single(b, TMP4);
         return Ok(());
     }
     let loop_lbl = b.new_label();
@@ -142,7 +154,8 @@ pub(super) fn lift_lods(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
     b.mark_label(loop_lbl);
     b.test_r_r32(rcx, rcx);
     b.jcc8(COND_JE, done);
-    single(b, TMP4);
+    load_acc(b);
+    b.lea(rsi, rsi, TMP4, 0, 0);
     b.dec_r(rcx);
     b.jmp8(loop_lbl);
     b.mark_label(done);
@@ -195,10 +208,11 @@ pub(super) fn lift_movs(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
 /// pre-masked operands: ZF is exact, CF/SF/OF are the 32-bit approximations
 /// (the pre-existing model).
 fn cmp_sub(b: &mut BytecodeBuilder, n: u64, lhs: u8, rhs: u8) {
-    if is64(n) {
-        b.binop_r_r64(OP_SUB_R_R64, lhs, rhs);
-    } else {
-        b.binop_r_r(OP_SUB_R_R, lhs, rhs);
+    match n {
+        1 => b.binop_r_r(OP_SUB_R_R8, lhs, rhs),
+        2 => b.binop_r_r(OP_SUB_R_R16, lhs, rhs),
+        4 => b.binop_r_r(OP_SUB_R_R, lhs, rhs),
+        _ => b.binop_r_r64(OP_SUB_R_R64, lhs, rhs),
     }
 }
 

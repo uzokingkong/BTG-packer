@@ -41,6 +41,11 @@ pub fn disassemble(code: &[u8]) -> String {
                 line += &format!("sub v{}, v{}", code[ip], code[ip + 1]);
                 ip += 2;
             }
+            OP_SUB_R_R8 | OP_SUB_R_R16 => {
+                let m = if op == OP_SUB_R_R8 { "sub8" } else { "sub16" };
+                line += &format!("{} v{}, v{}", m, code[ip], code[ip + 1]);
+                ip += 2;
+            }
             OP_AND_R_R => {
                 line += &format!("and v{}, v{}", code[ip], code[ip + 1]);
                 ip += 2;

@@ -469,6 +469,7 @@ pub fn generate_vm_code(
     mov::emit_cld(&mut seq);
     mov::emit_std(&mut seq);
     alu::emit_alu_rr(&mut seq);
+    alu::emit_alu_sub8_sub16(&mut seq);
     alu::emit_alu_imm32(&mut seq);
     alu::emit_rol_r_imm8(&mut seq);
     alu::emit_ror_r_imm8(&mut seq);
