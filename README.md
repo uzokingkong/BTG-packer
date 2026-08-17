@@ -1,4 +1,4 @@
-# BTG Packer (vm-obf)
+# BTG Packer
 
 **Bidirectional Trigger Graph (BTG) — x86-64 이진 가상화 / 보호 / 난독화 패커 (연구용 프로토타입)**
 
