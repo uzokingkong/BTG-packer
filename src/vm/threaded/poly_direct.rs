@@ -53,6 +53,14 @@ enum WidthAluOp {
     Not,
 }
 
+/// R4: SSE/FPU 스칼라 unary 변환 핸들러 종류 (IntToFloat/FloatToInt/FloatToFloat).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FloatCvtMode {
+    IntToFloat,
+    FloatToInt,
+    FloatToFloat,
+}
+
 /// P3 (G1): assembled self-decoding dispatcher pieces (machine code + tables).
 pub struct SelfDecodingParts {
     pub code: Vec<u8>,
@@ -1540,6 +1548,131 @@ pub fn build_self_decoding_parts_with(
         b.jmp(dispatch);
     }
 
+    // ── R4: SSE/FPU 스칼라 네이티브 핸들러 ─────────────────────────────────────
+    // eval_state(참조)와 동치: 피연산자는 폭(4/8) f32/f64 **비트 패턴** u64 값이고,
+    // 결과도 비트 패턴으로 저장한다. XMM0/XMM1 만 스크래치로 쓰고 플래그를
+    // 변경하지 않는다 (SSE 스칼라 산술은 RFLAGS 불변 — 참조도 플래그 무변경).
+    // (호스트 XMM 레지스터는 게스트 XMM 상태와 무관 — 게스트는 XMM_SLOT_BASE
+    // 가상 메모리에 저장되므로 네이티브 XMM 클로버는 안전.)
+    fn emit_float_bin_handler(
+        b: &mut CodeBuilder,
+        sub_dec_ops: usize,
+        sub_resolve: usize,
+        sub_store: usize,
+        dispatch: usize,
+        width: u8,
+        op32: Code, // f32: Addss/Subss/Mulss/Divss
+        op64: Code, // f64: Addsd/Subsd/Mulsd/Divsd
+    ) {
+        b.call(sub_dec_ops);
+        // src1 -> R10
+        movzx8_m(b, Register::EAX, DEC_SRC1);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        // src2 -> R11
+        movzx8_m(b, Register::EAX, DEC_SRC2);
+        mov_m(b, Register::R11, DEC_IMM2);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
+        // XMM0 = src1 bits, XMM1 = src2 bits, op, result bits -> R10.
+        if width == 4 {
+            b.push(Instruction::with2(Code::Movd_xmm_rm32, Register::XMM0, Register::R10D).unwrap());
+            b.push(Instruction::with2(Code::Movd_xmm_rm32, Register::XMM1, Register::R11D).unwrap());
+            b.push(Instruction::with2(op32, Register::XMM0, Register::XMM1).unwrap());
+            b.push(Instruction::with2(Code::Movd_rm32_xmm, Register::R10D, Register::XMM0).unwrap());
+        } else {
+            b.push(Instruction::with2(Code::Movq_xmm_rm64, Register::XMM0, Register::R10).unwrap());
+            b.push(Instruction::with2(Code::Movq_xmm_rm64, Register::XMM1, Register::R11).unwrap());
+            b.push(Instruction::with2(op64, Register::XMM0, Register::XMM1).unwrap());
+            b.push(Instruction::with2(Code::Movq_rm64_xmm, Register::R10, Register::XMM0).unwrap());
+        }
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
+        b.call(sub_store);
+        b.jmp(dispatch);
+    }
+
+    /// R4: unary float 변환 — IntToFloat / FloatToInt / FloatToFloat.
+    /// IntToFloat:  (int)src → f32/f64 bits. src_bits=4: 부호-확장(i32→i64).
+    /// FloatToInt:  f32/f64 → int, truncate=false 는 round-half-even (MXCSR 기본
+    ///              RC=RN-even 과 동일), NaN/overflow 는 hardware가 indefinite
+    ///              (0x8000_0000 / 0x8000_0000_0000_0000) 생성 = 참조와 동일.
+    /// FloatToFloat: f32↔f64 변환.
+    fn emit_float_cvt_handler(
+        b: &mut CodeBuilder,
+        sub_dec_ops: usize,
+        sub_resolve: usize,
+        sub_store: usize,
+        dispatch: usize,
+        src_bits: u8,
+        dst_bits: u8,
+        truncate: bool,
+        mode: FloatCvtMode,
+    ) {
+        b.call(sub_dec_ops);
+        // src1 -> R10
+        movzx8_m(b, Register::EAX, DEC_SRC1);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        match mode {
+            // IntToFloat: src 는 정수, dst 는 float bits.
+            FloatCvtMode::IntToFloat => {
+                let (load_code, use_32) = if src_bits == 4 {
+                    (Code::Cvtsi2ss_xmm_rm32, true)
+                } else {
+                    (Code::Cvtsi2ss_xmm_rm64, false)
+                };
+                let load_code = if dst_bits == 8 {
+                    if use_32 { Code::Cvtsi2sd_xmm_rm32 } else { Code::Cvtsi2sd_xmm_rm64 }
+                } else {
+                    load_code
+                };
+                let src_reg = if use_32 { Register::R10D } else { Register::R10 };
+                b.push(Instruction::with2(load_code, Register::XMM0, src_reg).unwrap());
+                if dst_bits == 4 {
+                    b.push(Instruction::with2(Code::Movd_rm32_xmm, Register::R10D, Register::XMM0).unwrap());
+                } else {
+                    b.push(Instruction::with2(Code::Movq_rm64_xmm, Register::R10, Register::XMM0).unwrap());
+                }
+            }
+            // FloatToInt: src 는 float bits, dst 는 정수 (indefinite 포함).
+            FloatCvtMode::FloatToInt => {
+                if src_bits == 4 {
+                    b.push(Instruction::with2(Code::Movd_xmm_rm32, Register::XMM0, Register::R10D).unwrap());
+                } else {
+                    b.push(Instruction::with2(Code::Movq_xmm_rm64, Register::XMM0, Register::R10).unwrap());
+                }
+                let (cvt_code, dst_reg) = match (src_bits, dst_bits, truncate) {
+                    (4, 4, true) => (Code::Cvttss2si_r32_xmmm32, Register::R10D),
+                    (4, 4, false) => (Code::Cvtss2si_r32_xmmm32, Register::R10D),
+                    (4, 8, true) => (Code::Cvttss2si_r64_xmmm32, Register::R10),
+                    (4, 8, false) => (Code::Cvtss2si_r64_xmmm32, Register::R10),
+                    (8, 4, true) => (Code::Cvttsd2si_r32_xmmm64, Register::R10D),
+                    (8, 4, false) => (Code::Cvtsd2si_r32_xmmm64, Register::R10D),
+                    (8, 8, true) => (Code::Cvttsd2si_r64_xmmm64, Register::R10),
+                    _ => (Code::Cvtsd2si_r64_xmmm64, Register::R10),
+                };
+                b.push(Instruction::with2(cvt_code, dst_reg, Register::XMM0).unwrap());
+            }
+            // FloatToFloat: f32↔f64 변환.
+            FloatCvtMode::FloatToFloat => {
+                if src_bits == 4 {
+                    b.push(Instruction::with2(Code::Movd_xmm_rm32, Register::XMM0, Register::R10D).unwrap());
+                    b.push(Instruction::with2(Code::Cvtss2sd_xmm_xmmm32, Register::XMM0, Register::XMM0).unwrap());
+                    b.push(Instruction::with2(Code::Movq_rm64_xmm, Register::R10, Register::XMM0).unwrap());
+                } else {
+                    b.push(Instruction::with2(Code::Movq_xmm_rm64, Register::XMM0, Register::R10).unwrap());
+                    b.push(Instruction::with2(Code::Cvtsd2ss_xmm_xmmm64, Register::XMM0, Register::XMM0).unwrap());
+                    b.push(Instruction::with2(Code::Movd_rm32_xmm, Register::R10D, Register::XMM0).unwrap());
+                }
+            }
+        }
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
+        b.call(sub_store);
+        b.jmp(dispatch);
+    }
+
     // ── P3: SETCC / CONDITIONAL_MOVE — cond-byte native handlers. ──────────────
     // Both decode a single cond byte (right after the opcode) via `sub_dec_ops_cond`,
     // which maps it through the OFF_COND_CODES table into the DEC_COND state slot
@@ -1809,6 +1942,41 @@ pub fn build_self_decoding_parts_with(
         emit_width_alu_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, WidthAluOp::Dec, *w);
         notw_h[wi] = b.len();
         emit_width_alu_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, WidthAluOp::Not, *w);
+    }
+
+    // ── R4: SSE/FPU 스칼라 핸들러 세트 — FloatAdd/Sub/Mul/Div{4,8} +
+    // IntToFloat/FloatToInt/FloatToFloat (모든 reachable src/dst_bits·truncate).
+    // 이전에는 isa_spec 미포함 → `--vm-commercial`이 FP 함수를 통째로 네이티브
+    // 유지했다. 여기서 폴리 인코딩 + 네이티브 self-decoding 실행이 eval_state와
+    // 동치가 되도록 등록한다. (플래그 불변 — SSE 스칼라 산술은 RFLAGS 미변경.)
+    let mut fadd_h = [0usize; 2];
+    let mut fsub_h = [0usize; 2];
+    let mut fmul_h = [0usize; 2];
+    let mut fdiv_h = [0usize; 2];
+    for (wi, w) in [4u8, 8].iter().enumerate() {
+        fadd_h[wi] = b.len();
+        emit_float_bin_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, *w, Code::Addss_xmm_xmmm32, Code::Addsd_xmm_xmmm64);
+        fsub_h[wi] = b.len();
+        emit_float_bin_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, *w, Code::Subss_xmm_xmmm32, Code::Subsd_xmm_xmmm64);
+        fmul_h[wi] = b.len();
+        emit_float_bin_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, *w, Code::Mulss_xmm_xmmm32, Code::Mulsd_xmm_xmmm64);
+        fdiv_h[wi] = b.len();
+        emit_float_bin_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, *w, Code::Divss_xmm_xmmm32, Code::Divsd_xmm_xmmm64);
+    }
+    let mut fi2f_h = [[0usize; 2]; 2]; // [src_bits_idx][dst_bits_idx]
+    let mut ff2i_h = [[[0usize; 2]; 2]; 2]; // [src][dst][truncate]
+    let mut ff2f_h = [[0usize; 2]; 2];
+    for (si, sb) in [4u8, 8].iter().enumerate() {
+        for (di, db) in [4u8, 8].iter().enumerate() {
+            fi2f_h[si][di] = b.len();
+            emit_float_cvt_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, *sb, *db, false, FloatCvtMode::IntToFloat);
+            ff2f_h[si][di] = b.len();
+            emit_float_cvt_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, *sb, *db, false, FloatCvtMode::FloatToFloat);
+            for (ti, tr) in [false, true].iter().enumerate() {
+                ff2i_h[si][di][ti] = b.len();
+                emit_float_cvt_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, *sb, *db, *tr, FloatCvtMode::FloatToInt);
+            }
+        }
     }
 
     // ── P3: COMPARE_EXCHANGE{width} — atomic lock cmpxchg (Once/futex CAS). ──
@@ -2111,6 +2279,26 @@ pub fn build_self_decoding_parts_with(
             h.insert(RiscOp::Inc { width: *w }, incw_h[wi]);
             h.insert(RiscOp::Dec { width: *w }, decw_h[wi]);
             h.insert(RiscOp::Not { width: *w }, notw_h[wi]);
+        }
+        // R4: SSE/FPU 스칼라 — FloatAdd/Sub/Mul/Div{4,8} + IntToFloat/FloatToInt/
+        // FloatToFloat 네이티브 핸들러 등록 (플래그 불변, eval_state와 동치).
+        for (wi, w) in [4u8, 8].iter().enumerate() {
+            h.insert(RiscOp::FloatAdd { width: *w }, fadd_h[wi]);
+            h.insert(RiscOp::FloatSub { width: *w }, fsub_h[wi]);
+            h.insert(RiscOp::FloatMul { width: *w }, fmul_h[wi]);
+            h.insert(RiscOp::FloatDiv { width: *w }, fdiv_h[wi]);
+        }
+        for (si, sb) in [4u8, 8].iter().enumerate() {
+            for (di, db) in [4u8, 8].iter().enumerate() {
+                h.insert(RiscOp::IntToFloat { src_bits: *sb, dst_bits: *db }, fi2f_h[si][di]);
+                h.insert(RiscOp::FloatToFloat { src_bits: *sb, dst_bits: *db }, ff2f_h[si][di]);
+                for (ti, tr) in [false, true].iter().enumerate() {
+                    h.insert(
+                        RiscOp::FloatToInt { src_bits: *sb, dst_bits: *db, truncate: *tr },
+                        ff2i_h[si][di][ti],
+                    );
+                }
+            }
         }
         h.insert(RiscOp::Halt, h_halt);
         // NativeCallBridge — reference/interpreter는 no-op(스트림 소비, 상태 불변).

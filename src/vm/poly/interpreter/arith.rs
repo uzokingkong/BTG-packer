@@ -14,6 +14,45 @@ pub(crate) fn width_mask_interp(bits: u32) -> u64 {
     }
 }
 
+/// R4: x86 CVT(T)Sx2SI — eval_state `cvt_f64_int`(참조)와 동일.
+/// NaN / 무한 / out-of-range 는 "integer indefinite" (32비트 dst: 0x8000_0000,
+/// 64비트 dst: 0x8000_0000_0000_0000). Rust `as i64` 는 포화시켜 사용 불가.
+pub(crate) fn cvt_f64_int_interp(f: f64, dst_bits: u8, truncate: bool) -> u64 {
+    let r = if truncate {
+        f.trunc()
+    } else {
+        round_ties_even_interp(f) as f64
+    };
+    match dst_bits {
+        4 => {
+            if !r.is_finite() || r < -2147483648.0 || r >= 2147483648.0 {
+                0x8000_0000
+            } else {
+                r as i32 as u32 as u64
+            }
+        }
+        _ => {
+            if !r.is_finite() || r < -9_223_372_036_854_775_808.0 || r >= 9_223_372_036_854_775_808.0 {
+                0x8000_0000_0000_0000
+            } else {
+                r as i64 as u64
+            }
+        }
+    }
+}
+
+/// R4: round-half-to-even (banker's rounding) — eval_state `round_ties_even`와 동일.
+fn round_ties_even_interp(x: f64) -> i64 {
+    let fl = x.floor();
+    let diff = x - fl;
+    if diff == 0.5 {
+        let f = fl as i64;
+        if f % 2 == 0 { f } else { f + 1 }
+    } else {
+        x.round() as i64
+    }
+}
+
 /// `bits` 비트 값 `v`를 i128 로 부호 확장 (bits < 128).
 pub(crate) fn sign_extend_i128_interp(v: u128, bits: u32) -> i128 {
     let shift = 128 - bits;

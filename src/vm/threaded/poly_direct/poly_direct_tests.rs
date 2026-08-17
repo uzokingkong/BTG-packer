@@ -1491,3 +1491,161 @@
         }
 
     }
+
+    /// R4: SSE/FPU 스칼라 — FloatAdd/Sub/Mul/Div{4,8} + IntToFloat/FloatToInt/
+    /// FloatToFloat 네이티브 self-decoding 핸들러 == 폴리 인터프리터 == eval_state
+    /// (참조). 모든 reachable src/dst_bits·truncate 조합을 3 seeds 로 차등 검증한다.
+    #[test]
+    fn test_poly_direct_float_matches_reference() {
+        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
+            let mut d = RiscDesynthesizer::new();
+            let f32bits = |x: f32| (x.to_bits() as u64);
+            let f64bits = |x: f64| x.to_bits();
+            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(f32bits(2.5)), MicroOperand::Imm64(0));
+            d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(f32bits(1.5)), MicroOperand::Imm64(0));
+            d.emit_add(MicroOperand::VReg(2), MicroOperand::Imm64(f64bits(3.0)), MicroOperand::Imm64(0));
+            d.emit_add(MicroOperand::VReg(3), MicroOperand::Imm64(f64bits(1.25)), MicroOperand::Imm64(0));
+            d.emit_add(MicroOperand::VReg(4), MicroOperand::Imm64((-7i64) as u64), MicroOperand::Imm64(0));
+            d.instrs.push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Imm64(0x200)));
+            d.instrs.push(
+                MicroInstr::new(RiscOp::FloatAdd { width: 4 })
+                    .with_dst(MicroOperand::VReg(5))
+                    .with_src1(MicroOperand::VReg(0))
+                    .with_src2(MicroOperand::VReg(1)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::FloatMul { width: 8 })
+                    .with_dst(MicroOperand::VReg(6))
+                    .with_src1(MicroOperand::VReg(2))
+                    .with_src2(MicroOperand::VReg(3)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::FloatDiv { width: 8 })
+                    .with_dst(MicroOperand::VReg(7))
+                    .with_src1(MicroOperand::VReg(2))
+                    .with_src2(MicroOperand::VReg(3)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::FloatSub { width: 4 })
+                    .with_dst(MicroOperand::VReg(8))
+                    .with_src1(MicroOperand::VReg(1))
+                    .with_src2(MicroOperand::VReg(0)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::IntToFloat { src_bits: 8, dst_bits: 8 })
+                    .with_dst(MicroOperand::VReg(9))
+                    .with_src1(MicroOperand::VReg(4)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::IntToFloat { src_bits: 4, dst_bits: 4 })
+                    .with_dst(MicroOperand::VReg(10))
+                    .with_src1(MicroOperand::VReg(4)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::FloatToFloat { src_bits: 4, dst_bits: 8 })
+                    .with_dst(MicroOperand::VReg(11))
+                    .with_src1(MicroOperand::VReg(0)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::FloatToFloat { src_bits: 8, dst_bits: 4 })
+                    .with_dst(MicroOperand::VReg(12))
+                    .with_src1(MicroOperand::VReg(2)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::FloatToInt { src_bits: 4, dst_bits: 4, truncate: false })
+                    .with_dst(MicroOperand::VReg(13))
+                    .with_src1(MicroOperand::VReg(0)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::FloatToInt { src_bits: 4, dst_bits: 4, truncate: true })
+                    .with_dst(MicroOperand::VReg(14))
+                    .with_src1(MicroOperand::VReg(0)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::FloatToInt { src_bits: 8, dst_bits: 4, truncate: true })
+                    .with_dst(MicroOperand::VReg(15))
+                    .with_src1(MicroOperand::VReg(6)),
+            );
+            d.instrs.push(MicroInstr::new(RiscOp::Halt));
+            let prog = RiscProgram::new(d.instrs);
+            let init = [0u64; 16];
+
+            let mut enc = PolymorphicEncoder::new(seed);
+            let bytecode = enc.encode(&prog).unwrap();
+            let native = run_native_poly_direct(&bytecode, seed, &init).unwrap();
+            let mut interp = PolymorphicInterpreter::new(seed);
+            interp.run(&bytecode).unwrap();
+            let ref_st = prog.eval_state(&init);
+
+            assert_eq!(native.regs, ref_st.regs, "seed {seed:#x}: float native regs != ref");
+            assert_eq!(interp.regs, ref_st.regs, "seed {seed:#x}: float interp regs != ref");
+            assert_eq!(native.temps, ref_st.temps, "seed {seed:#x}: float native temps != ref");
+            assert_eq!(native.flags, ref_st.flags, "seed {seed:#x}: float native flags != ref");
+            assert_eq!(interp.flags.raw, ref_st.flags, "seed {seed:#x}: float interp flags != ref");
+
+            assert_eq!(ref_st.regs[5], f32bits(4.0), "seed {seed:#x}: FloatAdd32");
+            assert_eq!(ref_st.regs[6], f64bits(3.75), "seed {seed:#x}: FloatMul64");
+            assert_eq!(ref_st.regs[7], f64bits(2.4), "seed {seed:#x}: FloatDiv64");
+            assert_eq!(ref_st.regs[8], f32bits(-1.0), "seed {seed:#x}: FloatSub32");
+            assert_eq!(ref_st.regs[9], f64bits(-7.0), "seed {seed:#x}: IntToFloat64");
+            assert_eq!(ref_st.regs[10], f32bits(-7.0), "seed {seed:#x}: IntToFloat32");
+            assert_eq!(ref_st.regs[11], f64bits(2.5), "seed {seed:#x}: FloatToFloat 4->8");
+            assert_eq!(ref_st.regs[12], f32bits(3.0), "seed {seed:#x}: FloatToFloat 8->4");
+            assert_eq!(ref_st.regs[13], 2, "seed {seed:#x}: FloatToInt32 round-half-even 2.5");
+            assert_eq!(ref_st.regs[14], 2, "seed {seed:#x}: FloatToInt32 trunc 2.5");
+            assert_eq!(ref_st.regs[15], 3, "seed {seed:#x}: FloatToInt32 trunc 3.75");
+        }
+    }
+
+    /// R4: FloatToInt 부동-정수 변환의 특수값 — NaN / ±Inf / out-of-range 가
+    /// "integer indefinite" (0x8000_0000 / 0x8000_0000_0000_0000) 을 생성하는지
+    /// eval_state(참조)와 네이티브가 동치인지 차등 검증한다.
+    #[test]
+    fn test_poly_direct_float_to_int_special_values_matches_reference() {
+        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
+            let mut d = RiscDesynthesizer::new();
+            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x7FC0_0000), MicroOperand::Imm64(0));
+            d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(0x7F80_0000), MicroOperand::Imm64(0));
+            d.emit_add(MicroOperand::VReg(2), MicroOperand::Imm64(f64::INFINITY.to_bits()), MicroOperand::Imm64(0));
+            d.emit_add(MicroOperand::VReg(3), MicroOperand::Imm64(f64::NAN.to_bits()), MicroOperand::Imm64(0));
+            d.instrs.push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Imm64(0)));
+            d.instrs.push(
+                MicroInstr::new(RiscOp::FloatToInt { src_bits: 4, dst_bits: 4, truncate: true })
+                    .with_dst(MicroOperand::VReg(4))
+                    .with_src1(MicroOperand::VReg(0)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::FloatToInt { src_bits: 4, dst_bits: 4, truncate: true })
+                    .with_dst(MicroOperand::VReg(5))
+                    .with_src1(MicroOperand::VReg(1)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::FloatToInt { src_bits: 8, dst_bits: 8, truncate: true })
+                    .with_dst(MicroOperand::VReg(6))
+                    .with_src1(MicroOperand::VReg(2)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::FloatToInt { src_bits: 8, dst_bits: 8, truncate: true })
+                    .with_dst(MicroOperand::VReg(7))
+                    .with_src1(MicroOperand::VReg(3)),
+            );
+            d.instrs.push(MicroInstr::new(RiscOp::Halt));
+            let prog = RiscProgram::new(d.instrs);
+            let init = [0u64; 16];
+
+            let mut enc = PolymorphicEncoder::new(seed);
+            let bytecode = enc.encode(&prog).unwrap();
+            let native = run_native_poly_direct(&bytecode, seed, &init).unwrap();
+            let mut interp = PolymorphicInterpreter::new(seed);
+            interp.run(&bytecode).unwrap();
+            let ref_st = prog.eval_state(&init);
+
+            assert_eq!(native.regs, ref_st.regs, "seed {seed:#x}: special native regs != ref");
+            assert_eq!(interp.regs, ref_st.regs, "seed {seed:#x}: special interp regs != ref");
+            assert_eq!(native.flags, ref_st.flags, "seed {seed:#x}: special native flags != ref");
+            assert_eq!(ref_st.regs[4], 0x8000_0000, "seed {seed:#x}: f32 NaN -> i32 indefinite");
+            assert_eq!(ref_st.regs[5], 0x8000_0000, "seed {seed:#x}: f32 +Inf -> i32 indefinite");
+            assert_eq!(ref_st.regs[6], 0x8000_0000_0000_0000, "seed {seed:#x}: f64 +Inf -> i64 indefinite");
+            assert_eq!(ref_st.regs[7], 0x8000_0000_0000_0000, "seed {seed:#x}: f64 NaN -> i64 indefinite");
+        }
+    }

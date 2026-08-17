@@ -454,15 +454,78 @@ impl PolymorphicInterpreter {
                 RiscOp::Halt => {
                     break;
                 }
-                // P2 SSE/FPU 스칼라 — 아직 폴리모픽 인코딩 대상이 아님 (isa_spec 미포함).
-                // 리프터 레벨 차등 검증은 `eval_state`(참조)를 기준으로 하므로 여기선 no-op.
-                RiscOp::FloatAdd { .. }
-                | RiscOp::FloatSub { .. }
-                | RiscOp::FloatMul { .. }
-                | RiscOp::FloatDiv { .. }
-                | RiscOp::IntToFloat { .. }
-                | RiscOp::FloatToInt { .. }
-                | RiscOp::FloatToFloat { .. } => {}
+                // R4: SSE/FPU 스칼라 — eval_state(참조)와 동치. FloatAdd/Sub/Mul/Div
+                // 는 폭별(4/8) f32/f64 비트 해석 후 산술, 결과는 다시 비트로 저장.
+                // IntToFloat/FloatToInt/FloatToFloat 는 변환. 플래그 변경 없음.
+                RiscOp::FloatAdd { width } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    let res = if width == 4 {
+                        (f32::from_bits(a as u32) + f32::from_bits(b as u32)).to_bits() as u64
+                    } else {
+                        (f64::from_bits(a) + f64::from_bits(b)).to_bits()
+                    };
+                    self.store_operand(op_dst_raw, res);
+                }
+                RiscOp::FloatSub { width } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    let res = if width == 4 {
+                        (f32::from_bits(a as u32) - f32::from_bits(b as u32)).to_bits() as u64
+                    } else {
+                        (f64::from_bits(a) - f64::from_bits(b)).to_bits()
+                    };
+                    self.store_operand(op_dst_raw, res);
+                }
+                RiscOp::FloatMul { width } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    let res = if width == 4 {
+                        (f32::from_bits(a as u32) * f32::from_bits(b as u32)).to_bits() as u64
+                    } else {
+                        (f64::from_bits(a) * f64::from_bits(b)).to_bits()
+                    };
+                    self.store_operand(op_dst_raw, res);
+                }
+                RiscOp::FloatDiv { width } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    let res = if width == 4 {
+                        (f32::from_bits(a as u32) / f32::from_bits(b as u32)).to_bits() as u64
+                    } else {
+                        (f64::from_bits(a) / f64::from_bits(b)).to_bits()
+                    };
+                    self.store_operand(op_dst_raw, res);
+                }
+                RiscOp::IntToFloat { src_bits, dst_bits } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let iv = if src_bits == 4 { (a as i32) as i64 } else { a as i64 };
+                    let res = if dst_bits == 4 {
+                        (iv as f32).to_bits() as u64
+                    } else {
+                        (iv as f64).to_bits()
+                    };
+                    self.store_operand(op_dst_raw, res);
+                }
+                RiscOp::FloatToInt { src_bits, dst_bits, truncate } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let f = if src_bits == 4 {
+                        f32::from_bits(a as u32) as f64
+                    } else {
+                        f64::from_bits(a)
+                    };
+                    let res = cvt_f64_int_interp(f, dst_bits, truncate);
+                    self.store_operand(op_dst_raw, res);
+                }
+                RiscOp::FloatToFloat { src_bits, dst_bits } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let res = if src_bits == 4 {
+                        (f32::from_bits(a as u32) as f64).to_bits()
+                    } else {
+                        (f64::from_bits(a) as f32).to_bits() as u64
+                    };
+                    self.store_operand(op_dst_raw, res);
+                }
             }
         }
 
@@ -562,7 +625,7 @@ mod arith;
 mod branch;
 mod mem;
 
-pub(crate) use arith::{div_wide_interp, interp_store, mul_low_interp, mul_wide_interp, sign_extend_i128_interp, width_mask_interp};
+pub(crate) use arith::{cvt_f64_int_interp, div_wide_interp, interp_store, mul_low_interp, mul_wide_interp, sign_extend_i128_interp, width_mask_interp};
 pub(crate) use branch::{branch_taken, branch_taken_with_state};
 pub(crate) use mem::{mem_read, mem_write};
 

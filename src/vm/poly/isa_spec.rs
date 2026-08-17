@@ -112,6 +112,26 @@ impl VirtualIsaSpec {
             ops.push(RiscOp::Dec { width: w });
             ops.push(RiscOp::Not { width: w });
         }
+        // R4: SSE/FPU 스칼라 — FloatAdd/Sub/Mul/Div{4,8} + IntToFloat/FloatToInt/
+        // FloatToFloat (모든 reachable src/dst_bits·truncate 조합). 이전에는 isa_spec
+        // 미포함 → `is_encodable`=false → `--vm-commercial`이 FP 포함 함수를 통째로
+        // 네이티브 유지했다. 여기서 폴리 인코딩 가능하게 만들어 `eval_state`(참조)와
+        // 폴리 인터프리터·네이티브 self-decoding 러너가 동치 실행하도록 한다.
+        for w in [4u8, 8] {
+            ops.push(RiscOp::FloatAdd { width: w });
+            ops.push(RiscOp::FloatSub { width: w });
+            ops.push(RiscOp::FloatMul { width: w });
+            ops.push(RiscOp::FloatDiv { width: w });
+        }
+        for sb in [4u8, 8] {
+            for db in [4u8, 8] {
+                ops.push(RiscOp::IntToFloat { src_bits: sb, dst_bits: db });
+                ops.push(RiscOp::FloatToFloat { src_bits: sb, dst_bits: db });
+                for t in [false, true] {
+                    ops.push(RiscOp::FloatToInt { src_bits: sb, dst_bits: db, truncate: t });
+                }
+            }
+        }
 
         let mut used_bytes = std::collections::HashSet::new();
         let mut opcode_map = HashMap::new();
