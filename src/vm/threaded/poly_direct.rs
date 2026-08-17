@@ -66,6 +66,10 @@ pub struct SelfDecodingParts {
     pub code: Vec<u8>,
     /// 256 x u64 handler table (decrypted opcode byte -> handler VA).
     pub table: Vec<u64>,
+    /// P6-1: handler 테이블 암호화 키 (시드 유래). dispatch 시 `table[op] ^ key` 로
+    /// handler VA 를 복호화한다 — 평문 테이블에는 암호화된 값만 있어 opcode↔handler
+    /// 1:1 매핑이 노출되지 않는다. build/run 시점에 dispatch 코드가 이 키를 임베드.
+    pub table_key: u64,
     /// 256 x u8 operand-offset table (operand-encoding -> state offset).
     pub offs_tab: Vec<u8>,
     /// 256 x u8 operand-kind table (0=reg/temp/vsp/flags, 1=imm, 2=none).
@@ -118,6 +122,12 @@ pub fn build_self_decoding_parts_with(
 ) -> Result<SelfDecodingParts> {
     let spec = VirtualIsaSpec::from_seed(seed);
     let init_key = seed.wrapping_mul(C1) ^ 0x517CC1B727220A95;
+    // P6-1: handler 테이블 암호화 키 — dispatch loop 코드에 임베드하고, 테이블
+    // build 시에도 동일 파생식으로 사용한다 (seed→init_key→table_key 결정적).
+    let table_key = init_key
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .rotate_right(17)
+        .wrapping_add(0xBF58476D1CE4E5B9);
 
     // operand offset / flag tables
     let mut offs_tab = vec![0u8; 256];
@@ -656,6 +666,10 @@ pub fn build_self_decoding_parts_with(
         b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::AL).unwrap());
         let tbl = MemoryOperand::with_base_index_scale_displ_size(Register::R15, Register::RAX, 8, 0, 8);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, tbl).unwrap());
+        // P6-1: handler 테이블 XOR 복호화 — 평문 테이블에는 `handler_va ^ table_key`
+        // 만 있어 정적 분석으로 handler 위치를 읽을 수 없다.
+        movi(&mut b, Register::RCX, table_key);
+        b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RCX).unwrap());
         b.push(Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap());
     }
 
@@ -2352,14 +2366,17 @@ pub fn build_self_decoding_parts_with(
     }
 
     // Handler table: decrypted opcode byte -> handler VA.
+    // P6-1: 시드 유래 테이블 키로 handler VA 를 XOR 암호화한다. dispatch loop 의
+    // `table[op] ^ key` 복호화와 짝을 이룬다. 평문 테이블에는 암호화된 값만 있어
+    // 정적 분석으로 opcode↔handler 매핑을 직접 읽을 수 없다.
     let mut table = vec![va_of(h_nop) as u64; 256];
     for (op, byte) in &spec.opcode_map {
         if let Some(&hidx) = handlers.get(op) {
-            table[*byte as usize] = va_of(hidx);
+            table[*byte as usize] = va_of(hidx) ^ table_key;
         }
     }
 
-    Ok(SelfDecodingParts { code, table, offs_tab, flags_tab, cond_codes, branch_map })
+    Ok(SelfDecodingParts { code, table, table_key, offs_tab, flags_tab, cond_codes, branch_map })
 }
 
 /// Run the self-decoding dispatcher in an RWX arena (host-side test/bench path):
