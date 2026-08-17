@@ -156,11 +156,40 @@ pub fn run_self_test() -> Result<()> {
     }
 
     // ── VM module: build, place, execute natively ──────────────────────────────
+    // FIX(--vm-test [6] crash): the arena offsets were hard-coded with only 0x3800
+    // bytes between code_va (0x5000) and table_va (0x8800). As handlers were added,
+    // the module code grew past 0x3800 bytes (14666B = 0x394A), so the code region
+    // overflowed into the handler-table region and corrupted it — the dispatcher
+    // then jumped into table bytes (data executed as code) -> 0xC0000005. Do a
+    // sizing pass with placeholder VAs, compute non-overlapping offsets from the
+    // real module sizes, then rebuild with the real VAs. (VA values only affect
+    // fixed-size imm64 immediates, so code/table/bytecode lengths are identical
+    // between the sizing and real builds.)
     {
+        let align_up = |v: usize, a: usize| (v + a - 1) & !(a - 1);
+        let sizing = build_vm_module(0, 0, 0, bc.clone(), handlers::EntryMode::Ksa)?;
+        let code_len = sizing.code.len();
+        let table_len = sizing.table.len();
+        let bc_len = sizing.bytecode.len();
+
+        let code_off = 0x5000usize;
+        let table_off = align_up(code_off + code_len, 0x100);
+        let bc_off = align_up(table_off + table_len, 0x100);
+        let state_off = align_up(bc_off + bc_len, 0x100);
+        let vsbox_off = align_up(state_off + VM_STATE_SIZE, 0x100);
+        let tramp_off = align_up(vsbox_off + 0x100, 0x100);
+
+        let code_va = (arena.base + code_off) as u64;
+        let table_va = (arena.base + table_off) as u64;
+        let bc_va = (arena.base + bc_off) as u64;
+        let state_va = (arena.base + state_off) as u64;
+        let vsbox_va = (arena.base + vsbox_off) as u64;
+        let tramp_va = (arena.base + tramp_off) as u64;
+
         let module = build_vm_module(
-            code_va as u64,
-            table_va as u64,
-            bc_va as u64,
+            code_va,
+            table_va,
+            bc_va,
             bc.clone(),
             handlers::EntryMode::Ksa,
         )?;
@@ -172,16 +201,16 @@ pub fn run_self_test() -> Result<()> {
             module.bytecode.len(),
             VM_STATE_SIZE
         );
-        let tramp = encode_trampoline(state_va as u64, vsbox_va as u64, seed_va as u64, code_va as u64, tramp_va as u64)?;
+        let tramp = encode_trampoline(state_va, vsbox_va, seed_va as u64, code_va, tramp_va)?;
         let b = arena.bytes();
-        b[0x5000..0x5000 + module.code.len()].copy_from_slice(&module.code);
-        b[0x8800..0x8800 + module.table.len()].copy_from_slice(&module.table);
-        b[0x9000..0x9000 + module.bytecode.len()].copy_from_slice(&module.bytecode);
-        b[0xA000..0xA000 + VM_STATE_SIZE].fill(0);
-        b[0xB000..0xB000 + 256].fill(0);
-        b[0xC000..0xC000 + tramp.len()].copy_from_slice(&tramp);
-        arena.call(0xC000);
-        let ok = arena.bytes()[0xB000..0xB000 + 256] == expected[..];
+        b[code_off..code_off + module.code.len()].copy_from_slice(&module.code);
+        b[table_off..table_off + module.table.len()].copy_from_slice(&module.table);
+        b[bc_off..bc_off + module.bytecode.len()].copy_from_slice(&module.bytecode);
+        b[state_off..state_off + VM_STATE_SIZE].fill(0);
+        b[vsbox_off..vsbox_off + 256].fill(0);
+        b[tramp_off..tramp_off + tramp.len()].copy_from_slice(&tramp);
+        arena.call(tramp_off);
+        let ok = arena.bytes()[vsbox_off..vsbox_off + 256] == expected[..];
         println!("[6] VM module native execution:   {}", pass_fail(ok));
         if !ok {
             return Err(anyhow!("VM module native execution mismatch"));

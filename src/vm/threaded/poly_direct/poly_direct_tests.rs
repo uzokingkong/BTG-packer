@@ -1649,3 +1649,165 @@
             assert_eq!(ref_st.regs[7], 0x8000_0000_0000_0000, "seed {seed:#x}: f64 NaN -> i64 indefinite");
         }
     }
+
+    /// P6-3: handler-restore prevention — the dispatch table must NOT be
+    /// decryptable with a single XOR constant. For every registered opcode byte,
+    /// `table[byte] ^ per_op_key(master, byte)` recovers the handler VA inside the
+    /// code region, while `table[byte] ^ master` (the old P6-1 single-key restore)
+    /// must NOT land inside the code region — each entry uses a distinct key derived
+    /// from the opcode byte itself, so a dumped/restored table cannot be un-XORed
+    /// wholesale.
+    #[test]
+    fn test_table_not_restorable_by_single_xor() {
+        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
+            // Build a small program so the table has real registered handlers.
+            let mut d = RiscDesynthesizer::new();
+            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x200), MicroOperand::Imm64(0));
+            d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(5), MicroOperand::Imm64(0));
+            d.instrs.push(
+                MicroInstr::new(RiscOp::Nor)
+                    .with_dst(MicroOperand::VReg(5))
+                    .with_src1(MicroOperand::VReg(0))
+                    .with_src2(MicroOperand::VReg(1)),
+            );
+            d.instrs.push(MicroInstr::new(RiscOp::Halt));
+            let prog = RiscProgram::new(d.instrs);
+            let mut enc = PolymorphicEncoder::new(seed);
+            let bytecode = enc.encode(&prog).unwrap();
+
+            let code_base = 0x100000u64;
+            let parts = build_self_decoding_parts(
+                &bytecode, seed, code_base, 0x200000, 0x300000, 0x400000, 0x500000,
+            )
+            .unwrap();
+            let code_lo = code_base;
+            let code_hi = code_base + parts.code.len() as u64;
+            let master = parts.table_key;
+
+            let spec = VirtualIsaSpec::from_seed(seed);
+            let mut checked = 0usize;
+            for (op, &byte) in &spec.opcode_map {
+                let v = parts.table[byte as usize];
+                // per-opcode key decrypts into the code region (real handler VA).
+                let dec = v ^ per_op_key(master, byte);
+                assert!(
+                    (code_lo..code_hi).contains(&dec),
+                    "seed {seed:#x}: op {op:?} per-opkey decode {dec:#x} outside [{code_lo:#x},{code_hi:#x})"
+                );
+                // single master XOR must NOT land in the code region (P6-1 restore fails).
+                let naive = v ^ master;
+                assert!(
+                    !(code_lo..code_hi).contains(&naive),
+                    "seed {seed:#x}: op {op:?} single-XOR restore leaked handler VA {naive:#x}"
+                );
+                checked += 1;
+            }
+            assert!(checked > 0, "seed {seed:#x}: no registered ops to check");
+            // The master key itself never appears as a table value.
+            for &v in parts.table.iter() {
+                assert_ne!(v, master, "seed {seed:#x}: master key leaked in table");
+            }
+        }
+    }
+
+    /// P6-3: unused opcode bytes must decode to a shared trap handler (ud2) — not the
+    /// old h_nop no-op fallback — so probing an unmapped byte faults instead of
+    /// silently continuing. All unused slots decode to the same VA, and that VA is
+    /// inside the code region but distinct from every registered handler VA.
+    #[test]
+    fn test_unused_opcode_slots_decode_to_trap() {
+        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
+            let mut d = RiscDesynthesizer::new();
+            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x200), MicroOperand::Imm64(0));
+            d.instrs.push(MicroInstr::new(RiscOp::Halt));
+            let prog = RiscProgram::new(d.instrs);
+            let mut enc = PolymorphicEncoder::new(seed);
+            let bytecode = enc.encode(&prog).unwrap();
+
+            let code_base = 0x100000u64;
+            let parts = build_self_decoding_parts(
+                &bytecode, seed, code_base, 0x200000, 0x300000, 0x400000, 0x500000,
+            )
+            .unwrap();
+            let code_hi = code_base + parts.code.len() as u64;
+            let master = parts.table_key;
+
+            let spec = VirtualIsaSpec::from_seed(seed);
+            let mut used: Vec<u8> = Vec::new();
+            for &byte in spec.opcode_map.values() {
+                used.push(byte);
+            }
+            let mut trap_va: Option<u64> = None;
+            let mut count = 0usize;
+            for byte in 0u16..256 {
+                let byte = byte as u8;
+                if used.contains(&byte) {
+                    continue;
+                }
+                let dec = parts.table[byte as usize] ^ per_op_key(master, byte);
+                match trap_va {
+                    None => trap_va = Some(dec),
+                    Some(t) => assert_eq!(t, dec, "seed {seed:#x}: unused slot {byte:#04x} not the shared trap VA"),
+                }
+                assert!(
+                    (code_base..code_hi).contains(&dec),
+                    "seed {seed:#x}: unused slot {byte:#04x} trap VA {dec:#x} outside code region"
+                );
+                count += 1;
+            }
+            assert!(count > 100, "seed {seed:#x}: expected >100 unused slots, got {count}");
+            // The trap VA must differ from every registered handler VA.
+            let trap = trap_va.unwrap();
+            for (op, &byte) in &spec.opcode_map {
+                let dec = parts.table[byte as usize] ^ per_op_key(master, byte);
+                assert_ne!(trap, dec, "seed {seed:#x}: op {op:?} decodes to the trap VA");
+            }
+        }
+    }
+
+    /// P6-3: the table integrity self-check embedded in the entry stub must be
+    /// patched with exactly `table_checksum(table)`. This is what lets the runtime
+    /// detect a patched/restored table (mismatch -> ud2 at VM entry).
+    #[test]
+    fn test_table_checksum_matches_builtin() {
+        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
+            let mut d = RiscDesynthesizer::new();
+            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x200), MicroOperand::Imm64(0));
+            d.instrs.push(MicroInstr::new(RiscOp::Halt));
+            let prog = RiscProgram::new(d.instrs);
+            let mut enc = PolymorphicEncoder::new(seed);
+            let bytecode = enc.encode(&prog).unwrap();
+            let parts = build_self_decoding_parts(
+                &bytecode, seed, 0x100000, 0x200000, 0x300000, 0x400000, 0x500000,
+            )
+            .unwrap();
+            let expect = table_checksum(&parts.table);
+            assert_eq!(parts.table_checksum, expect, "seed {seed:#x}: checksum mismatch");
+            assert_ne!(parts.table_checksum, 0x1234_5678, "seed {seed:#x}: placeholder not patched");
+        }
+    }
+
+    /// P6-3: per-opcode keys must be injective over the 256 possible opcode bytes so
+    /// no two entries share a key (a collision would let a single-XOR attack recover
+    /// that pair). The dispatch loop recomputes the same key from the opcode byte.
+    #[test]
+    fn test_per_opcode_keys_injective() {
+        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
+            let mut d = RiscDesynthesizer::new();
+            d.instrs.push(MicroInstr::new(RiscOp::Halt));
+            let prog = RiscProgram::new(d.instrs);
+            let mut enc = PolymorphicEncoder::new(seed);
+            let bytecode = enc.encode(&prog).unwrap();
+            let parts = build_self_decoding_parts(
+                &bytecode, seed, 0x100000, 0x200000, 0x300000, 0x400000, 0x500000,
+            )
+            .unwrap();
+            let master = parts.table_key;
+            let mut seen = std::collections::HashSet::new();
+            for op in 0u16..256 {
+                let k = per_op_key(master, op as u8);
+                assert!(seen.insert(k), "seed {seed:#x}: key collision at opcode {op:#04x} ({k:#x})");
+            }
+        }
+    }
+

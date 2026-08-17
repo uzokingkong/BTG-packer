@@ -103,7 +103,16 @@ Rust로 작성된 x86-64 PE 패커 겸 코드 가상화(VM) 엔진입니다. 원
   (v56부터 LOCK 메모리 RMW는 별도 격리하지 않고 VM opcode로 처리)
 - **결정적 빌드** (`--seed`): 같은 input+seed+config → 같은 출력 (SHA256 동일,
   2026-08-17 실측)
-
+- **핸들러 복원 방지 (P6-3, 상용 엔진)**: `--vm-commercial`(poly_direct self-decoding
+  dispatcher)의 handler 테이블을 Themida식으로 하드닝 —
+  (a) **per-opcode 파생 키** `K(op) = (op*C1) ^ (op<<17) ^ C4 ^ master` 로 항목별
+  XOR (단일 상수로는 테이블을 일괄 복원 불가), (b) 마스터 키 `K` 는 **MBA 항등식
+  `a+b == (a^b)+2*(a&b)` 로 런타임 유도** (평문 상수로 코드에 없음), (c) **미등록
+  opcode byte 는 트랩(ud2)** (프로브/조작 즉시 fault), (d) **엔트리 무결성
+  셀프체크** (암호화 테이블 checksum — 덤프·패치·복원된 테이블이면 VM 진입 시 ud2).
+  차등 테스트 + `--vm-commercial` pack→run 16테스트 + FINAL CHECKSUM
+  `0x2cdc0e4511d84a64` 무회귀, exit 0. (P6-1: 테이블 XOR → P6-3: per-op MBA 키 +
+  트랩 + 무결성)
 ---
 
 ## 아키텍처

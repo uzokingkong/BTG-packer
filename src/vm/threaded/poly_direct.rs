@@ -66,10 +66,15 @@ pub struct SelfDecodingParts {
     pub code: Vec<u8>,
     /// 256 x u64 handler table (decrypted opcode byte -> handler VA).
     pub table: Vec<u64>,
-    /// P6-1: handler 테이블 암호화 키 (시드 유래). dispatch 시 `table[op] ^ key` 로
-    /// handler VA 를 복호화한다 — 평문 테이블에는 암호화된 값만 있어 opcode↔handler
-    /// 1:1 매핑이 노출되지 않는다. build/run 시점에 dispatch 코드가 이 키를 임베드.
+    /// P6-1: handler 테이블 마스터 키 (시드 유래). P6-3 부터 단일 XOR 상수가 아니라
+    /// per-opcode 파생 키 `key(op) = (op*C1) ^ (op<<17) ^ master` 의 마스터로 쓰인다
+    /// (dispatch 가 opcode byte 로 파생 키를 다시 계산해 `table[op] ^ key(op)` 로
+    /// 복호화). 마스터 K 자체는 평문 상수로 코드에 없고 MBA(a,b)로 런타임 유도된다 —
+    /// 평문 테이블/덤프로부터 opcode↔handler 매핑 복원을 막는다.
     pub table_key: u64,
+    /// P6-3: 테이블 무결성 셀프체크 값 (빌드 시 암호화된 256 항목 checksum). 엔트리
+    /// 스텁이 매 VM 진입마다 재계산해 비교하며, 변조/복원된 테이블은 ud2로 실패한다.
+    pub table_checksum: u64,
     /// 256 x u8 operand-offset table (operand-encoding -> state offset).
     pub offs_tab: Vec<u8>,
     /// 256 x u8 operand-kind table (0=reg/temp/vsp/flags, 1=imm, 2=none).
@@ -81,6 +86,30 @@ pub struct SelfDecodingParts {
     /// to map a target (source-IP via ip_map, or direct micro-op index) to a bytecode
     /// byte offset for the rolling-key re-sync.
     pub branch_map: Vec<u8>,
+}
+
+/// P6-3: opcode byte 별 파생 테이블 키 — `key(op) = (op*C1) ^ (op<<17) ^ C4 ^ master`.
+/// dispatch loop 가 이 파생식을 재현해 `table[op] ^ key(op)` 로 handler VA 를
+/// 복호화한다. 단일 XOR 상수(master)로는 256개 항목을 일괄 복호화할 수 없다 —
+/// 항목마다 opcode byte 에 의존하는 서로 다른 키를 쓴다 (Themida식 테이블
+/// 재구성 방지). C4 상수를 섞어 opcode 0 의 키도 master 와 같아지지 않게 한다
+/// (master 단독 XOR 로 특정 항목이 복호화되는 것을 방지). master 는 MBA(a,b)로
+/// 런타임 유도되므로 평문 상수로 노출되지 않는다.
+fn per_op_key(master: u64, op: u8) -> u64 {
+    (op as u64).wrapping_mul(C1) ^ ((op as u64) << 17) ^ C4 ^ master
+}
+
+/// P6-3: 암호화된 256개 handler 테이블 항목의 무결성 checksum.
+/// 엔트리 스텁이 매 VM 진입마다 재계산해 빌드 시 값(`parts.table_checksum`)과
+/// 비교한다 — 테이블이 패치/복원되면 ud2로 즉시 실패 (anti-tamper / 복원 감지).
+fn table_checksum(table: &[u64]) -> u64 {
+    let mut h: u64 = 0x811C9DC5;
+    for &v in table {
+        h = h.wrapping_add(v).wrapping_mul(0x0100_0000_01B3);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    }
+    h
 }
 
 /// P3 (G1): build the self-decoding rolling-key dispatcher machine code and its
@@ -122,12 +151,18 @@ pub fn build_self_decoding_parts_with(
 ) -> Result<SelfDecodingParts> {
     let spec = VirtualIsaSpec::from_seed(seed);
     let init_key = seed.wrapping_mul(C1) ^ 0x517CC1B727220A95;
-    // P6-1: handler 테이블 암호화 키 — dispatch loop 코드에 임베드하고, 테이블
-    // build 시에도 동일 파생식으로 사용한다 (seed→init_key→table_key 결정적).
+    // P6-1: handler 테이블 마스터 키 — dispatch loop 코드와 테이블 build 시 동일
+    // 파생식을 사용한다 (seed→init_key→master 결정적). P6-3 부터 이 값은
+    // `per_op_key(op)` 를 거쳐 **opcode별 파생 키**로 사용된다.
     let table_key = init_key
         .wrapping_mul(0x9E3779B97F4A7C15)
         .rotate_right(17)
         .wrapping_add(0xBF58476D1CE4E5B9);
+    // P6-3: 마스터 K 를 a+b 로 분할 — dispatch loop 는 `(a^b) + 2*(a&b)` MBA 항등식으로
+    // 런타임에 K 를 복원한다. **K 자체는 어떤 단일 상수로도 코드에 존재하지 않는다**
+    // (P6-1의 `movi rcx, table_key` 평문 임베드 제거). a/b 만 임베드.
+    let mba_a = table_key.wrapping_mul(C3).rotate_left(23) | 1;
+    let mba_b = table_key.wrapping_sub(mba_a);
 
     // operand offset / flag tables
     let mut offs_tab = vec![0u8; 256];
@@ -636,6 +671,9 @@ pub fn build_self_decoding_parts_with(
             *ti = entry;
         }
     }
+    // P6-3: index of the entry's checksum placeholder (`mov r11, imm64`) — patched
+    // with the real table checksum after assembly (table VAs are only known then).
+    let csum_placeholder_idx;
     {
         b.push(Instruction::with1(Code::Push_r64, Register::R12).unwrap());
         b.push(Instruction::with1(Code::Push_r64, Register::R13).unwrap());
@@ -657,6 +695,39 @@ pub fn build_self_decoding_parts_with(
         movi(&mut b, Register::R14, init_key);
         movi(&mut b, Register::R15, table_base);
         movi(&mut b, Register::RDX, state_base);
+        // P6-3: handler-table integrity self-check — recompute the checksum over the
+        // 256 encrypted entries and compare with the build-time value. A patched /
+        // restored table (e.g. a dumped-and-rewritten handler table) trips `ud2`.
+        // R15 must be table_base (set above); clobbers RCX/R9/R10/R11/RAX only.
+        b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R9, Register::R9).unwrap());
+        movi(&mut b, Register::R10, 0x811C9DC5);
+        let csum_loop = b.len();
+        {
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, MemoryOperand::with_base_index_scale_displ_size(Register::R15, Register::R9, 8, 0, 8)).unwrap());
+            b.push(Instruction::with2(Code::Add_rm64_r64, Register::R10, Register::R11).unwrap());
+            movi(&mut b, Register::RCX, 0x0100_0000_01B3);
+            b.push(Instruction::with2(Code::Imul_r64_rm64, Register::R10, Register::RCX).unwrap());
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::R10).unwrap());
+            b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::R11, 33).unwrap());
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R10, Register::R11).unwrap());
+            movi(&mut b, Register::RCX, 0xFF51_AFD7_ED55_8CCD);
+            b.push(Instruction::with2(Code::Imul_r64_rm64, Register::R10, Register::RCX).unwrap());
+            b.push(Instruction::with1(Code::Inc_rm64, Register::R9).unwrap());
+            b.push(Instruction::with2(Code::Cmp_rm64_imm32, Register::R9, 256).unwrap());
+            b.jne(csum_loop);
+        }
+        // placeholder expected checksum — patched below with the real value once the
+        // (VA-dependent) encrypted table is built. mov r64, imm64 is fixed 10 bytes.
+        csum_placeholder_idx = b.push(Instruction::with2(Code::Mov_r64_imm64, Register::R11, 0x1234_5678).unwrap());
+        b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::R10, Register::R11).unwrap());
+        let csum_je = b.br(Code::Je_rel32_64, 0);
+        b.push(Instruction::with(Code::Ud2));
+        let csum_ok = b.len();
+        for &mut (bi, ref mut ti) in b.branches.iter_mut() {
+            if bi == csum_je {
+                *ti = csum_ok;
+            }
+        }
     }
 
     // dispatch loop
@@ -664,11 +735,35 @@ pub fn build_self_decoding_parts_with(
     {
         b.call(sub_decrypt);
         b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::AL).unwrap());
+        // P6-3: keep the decrypted opcode byte in R9 — it drives the per-opcode
+        // table key below. (R9 is scratch here; no handler relies on it at entry.)
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::RAX).unwrap());
         let tbl = MemoryOperand::with_base_index_scale_displ_size(Register::R15, Register::RAX, 8, 0, 8);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, tbl).unwrap());
-        // P6-1: handler 테이블 XOR 복호화 — 평문 테이블에는 `handler_va ^ table_key`
-        // 만 있어 정적 분석으로 handler 위치를 읽을 수 없다.
-        movi(&mut b, Register::RCX, table_key);
+        // P6-3: derive the master key K = a + b via the MBA identity
+        // `a + b == (a ^ b) + 2 * (a & b)`. K is never a plaintext constant in the
+        // code — only mba_a / mba_b are embedded (and each alone reveals nothing).
+        movi(&mut b, Register::RCX, mba_a);
+        movi(&mut b, Register::R10, mba_b);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RCX).unwrap());
+        b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R11, Register::R10).unwrap());
+        b.push(Instruction::with2(Code::And_rm64_r64, Register::RCX, Register::R10).unwrap());
+        b.push(Instruction::with2(Code::Add_rm64_r64, Register::RCX, Register::RCX).unwrap());
+        b.push(Instruction::with2(Code::Add_rm64_r64, Register::R11, Register::RCX).unwrap());
+        // P6-3: per-opcode key K(op) = (op*C1) ^ (op<<17) ^ C4 ^ master. The table
+        // entry was XORed with K(op) at build time, so this exactly recovers the
+        // handler VA. A single-XOR restore attack (XOR the whole table with one
+        // constant) cannot reproduce K(op) — each entry uses a different key, and
+        // even opcode 0 differs from master (C4 mixed in).
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::R9).unwrap());
+        movi(&mut b, Register::R10, C1);
+        b.push(Instruction::with2(Code::Imul_r64_rm64, Register::RCX, Register::R10).unwrap());
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::R9).unwrap());
+        b.push(Instruction::with2(Code::Shl_rm64_imm8, Register::R10, 17).unwrap());
+        b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RCX, Register::R10).unwrap());
+        movi(&mut b, Register::R10, C4);
+        b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RCX, Register::R10).unwrap());
+        b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RCX, Register::R11).unwrap());
         b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RCX).unwrap());
         b.push(Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap());
     }
@@ -680,6 +775,16 @@ pub fn build_self_decoding_parts_with(
     {
         b.call(sub_dec_ops);
         b.jmp(dispatch);
+    }
+
+    // P6-3: trap handler for UNUSED opcode bytes. Every table slot that has no
+    // registered opcode points here, so probing an unmapped byte (a restore /
+    // reconstruction attempt that feeds a crafted byte) hits `ud2` and faults
+    // instead of silently no-op'ing. This is the anti-table-probing counterpart
+    // to the per-opcode keys above.
+    let h_trap = b.len();
+    {
+        b.push(Instruction::with(Code::Ud2));
     }
 
     let h_nor = b.len();
@@ -2350,7 +2455,7 @@ pub fn build_self_decoding_parts_with(
     }
 
     // Assemble; use the true per-instruction IPs for handler VAs.
-    let (code, ips) = b.assemble(code_base)?;
+    let (mut code, ips) = b.assemble(code_base)?;
     let va_of = |idx: usize| -> u64 { ips[idx] };
 
     if std::env::var("BTG_DUMP_POLY").is_ok() {
@@ -2370,17 +2475,43 @@ pub fn build_self_decoding_parts_with(
     }
 
     // Handler table: decrypted opcode byte -> handler VA.
-    // P6-1: 시드 유래 테이블 키로 handler VA 를 XOR 암호화한다. dispatch loop 의
-    // `table[op] ^ key` 복호화와 짝을 이룬다. 평문 테이블에는 암호화된 값만 있어
-    // 정적 분석으로 opcode↔handler 매핑을 직접 읽을 수 없다.
-    let mut table = vec![va_of(h_nop) as u64; 256];
+    // P6-1/P6-3: 시드 유래 마스터 키에서 per-opcode 파생 키 `K(op)` 로 handler VA 를
+    // XOR 암호화한다. dispatch loop 의 `table[op] ^ K(op)` 복호화와 짝을 이룬다.
+    //   * 미등록 opcode byte 는 트랩 핸들러(h_trap, ud2)를 가리킨다 — 테이블 프로브가
+    //     조용히 통과하지 못하고 즉시 fault (P6-3, P6-1의 h_nop 폴백 대체).
+    //   * 항목마다 서로 다른 K(op) 를 쓰므로, 덤프/단일-XOR 로는 opcode↔handler
+    //     매핑을 일괄 복원할 수 없다.
+    let mut table = vec![0u64; 256];
+    for byte in 0u16..256 {
+        table[byte as usize] = va_of(h_trap) ^ per_op_key(table_key, byte as u8);
+    }
     for (op, byte) in &spec.opcode_map {
         if let Some(&hidx) = handlers.get(op) {
-            table[*byte as usize] = va_of(hidx) ^ table_key;
+            table[*byte as usize] = va_of(hidx) ^ per_op_key(table_key, *byte as u8);
+        }
+    }
+    // P6-3: 엔트리 스텁의 무결성 셀프체크를 위한 테이블 checksum.
+    let table_checksum = table_checksum(&table);
+
+    // P6-3: 위에서 임베드한 placeholder(`mov r11, imm64`, 10 bytes)의 imm64 를 실제
+    // checksum 으로 패치. `ips[csum_placeholder_idx]` = 해당 명령의 IP. mov r64, imm64
+    // 는 REX.W + B8+rd + imm64 로 imm64 가 offset+2 에 온다.
+    {
+        let ip = ips[csum_placeholder_idx];
+        let off = (ip - code_base) as usize;
+        if off + 2 + 8 <= code.len() {
+            code[off + 2..off + 10].copy_from_slice(&table_checksum.to_le_bytes());
+        } else {
+            return Err(anyhow!(
+                "P6-3 checksum placeholder OOB: ip 0x{:X} off {} code_len {}",
+                ip,
+                off,
+                code.len()
+            ));
         }
     }
 
-    Ok(SelfDecodingParts { code, table, table_key, offs_tab, flags_tab, cond_codes, branch_map })
+    Ok(SelfDecodingParts { code, table, table_key, table_checksum, offs_tab, flags_tab, cond_codes, branch_map })
 }
 
 /// Run the self-decoding dispatcher in an RWX arena (host-side test/bench path):
