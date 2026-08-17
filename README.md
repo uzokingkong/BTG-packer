@@ -111,6 +111,11 @@ Rust로 작성된 x86-64 PE 패커 겸 코드 가상화(VM) 엔진입니다. 원
   `--integrity`(CRC32, keyed-MAC은 **패킹 시 계산만 하고 런타임 미검증**),
   `--payload-relocate`, 리소스 등록(`--rsrc-register`), 안티디버그 부트 스텁
 - `.pdata` SEH 재생성(브리지 UNWIND_INFO), `--keep-pdata` 원본 유지 옵션
+- 프로그램 VM(`--vm-oep`)의 네이티브 제외 집합(`src/vm/text_lift/exclusions.rs`):
+  Rust panic/unwind/Once 런타임, setjmp/longjmp 함수, SEH(catch/unwind) 함수를
+  `.pdata` 함수 단위로 네이티브 유지. SEH 전체 가상화는 `BTG_SEH_NONE=1`
+  (기본: `BTG_SEH_MINIMAL=1` — 최소 catch/cleanup 집합만 네이티브).
+  (v56부터 LOCK 메모리 RMW는 별도 격리하지 않고 VM opcode로 처리)
 - **결정적 빌드** (`--seed`): 같은 input+seed+config → 같은 출력 (SHA256 동일,
   2026-08-17 실측)
 
@@ -248,7 +253,9 @@ btg-packer.exe -i test.exe -o packed.exe --no-crypto
    **미달성** 목표입니다.
 2. **VM↔네이티브 경계가 함수 단위로 원자적이지 않다.** lift 불가 블록은
    네이티브로 남는데, 함수 중간에서 VM/native 경계가 생겨 스택 프레임이 깨질 수
-   있음 (P2 후속 과제 — `text_lift/commercial.rs:181-196`).
+   있음 (P2 후속 과제 — `text_lift/commercial.rs:181-196`). panic/unwind/Once·
+   setjmp/longjmp·SEH 함수는 함수 단위로 네이티브 유지해 이 경계를 완화하지만,
+   그 외 unliftable 명령이 섞인 함수는 여전히 경계가 존재한다.
 3. **RIP-relative 리프트는 크래시(0xC0000005, keystream desync)로 비활성(gate).**
    → "6040 블록 가상화"는 RIP-relative 포함 진단값으로, **실제 활성 경로에서는
    그보다 적음** (`docs/journal/2026-08-17-commercial-p2-risc-lift.md`).

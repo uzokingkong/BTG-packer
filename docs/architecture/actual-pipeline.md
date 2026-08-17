@@ -50,6 +50,8 @@
 - `--dispatcher-reencrypt`는 블록별 개별 암호화. **주의**: 실제로는 첫 디스패치
   시 복호화 후 평문 유지(decrypt-once) — `reencrypt.rs:193-195`.
 - `--m7`만 실행 후 재암호화(anti-dump)를 수행 (refcount-safe state machine).
+- at-rest 암호화 적용 시(`ctx.at_rest_encrypted`) build.rs는 relocation-aware/
+  ASLR 보존 출력을 **비활성화**한다 (로더가 암호문에 .reloc을 적용하면 깨짐).
 
 ### 2.3 부트 스텁 / 디스패처
 - `dispatcher/build.rs` (일반 MBA 점프 테이블), `reencrypt.rs`, `m7.rs`.
@@ -63,6 +65,19 @@
   `PolymorphicEncoder` → `build_program_vm_commercial` → `poly_direct` 네이티브
   self-decoding 디스패처.
 - 차등 검증은 **선형 블록 단위 동치**로 한정 (taken-분기 제어흐름은 계약 밖).
+
+#### 2.4.1 프로그램 VM의 네이티브 유지(제외) 집합 (`src/vm/text_lift/exclusions.rs`)
+프로그램(전체 OEP) 가상화는 `.pdata` 함수 단위로 아래를 네이티브로 남긴 뒤
+native-call 브리지로 실행한다:
+- **Rust panic/unwind/Once 런타임** (`detect_panic_unwind_ranges`) — panic 문자열
+  참조·`_CxxThrowException`/`__CxxFrameHandler3` 임포트·양방향 호출+전역상태 폐포.
+  (이를 VM으로 옮기면 `once.rs:166 f.take().unwrap()` teardown 크래시.)
+- **setjmp/longjmp** (`detect_setjmp_longjmp_functions`) — setjmp/longjmp IAT 슬롯
+  사용 함수 + 폐포. (비지역 점프가 VM 가상 레지스터를 우회.)
+- **SEH 함수** (`detect_seh_native_functions`) — panic·catch/unwind 프레임.
+  `BTG_SEH_MINIMAL=1`(기본)은 최소 집합만, `BTG_SEH_NONE=1`은 SEH 전체를 VM화
+  (teardown-guard만 네이티브).
+- v56: LOCK 메모리 RMW 격리 망은 제거됨 — LOCK 원자 RMW는 VM opcode로 처리.
 
 ### 2.5 출력 합성 / 검증
 - `build.rs`: PE32+ 다중 섹션 합성, `.pdata` SEH 재생성(브리지 UNWIND_INFO),
@@ -85,6 +100,7 @@
 | 멀티스레드 VM 재진입 | **미지원** — 단일 정적 state | `vm/interp/state.rs` |
 | `--mem-harden` | **fail-open** + `--dispatcher-reencrypt`와 배타 | `crypto/memharden.rs` |
 | `--integrity` | CRC32 강제, **keyed-MAC은 미강제** | `crypto/integrity.rs` |
+| SEH 함수 네이티브 유지 | 기본 모드에서 **최소 집합만** 유지; 전체 VM화는 `BTG_SEH_NONE=1`(미기본) | `text_lift/exclusions.rs` |
 
 ---
 
@@ -92,7 +108,7 @@
 
 - `cargo build --release` → 성공.
 - `cargo test --release --lib` → **285 passed / 0 failed**.
-- 레거시 VM opcode **193개** (`src/vm/bytecode/registry.rs`, `NUM_OPS=194` 슬롯).
+- 레거시 VM opcode **193개** (`src/vm/bytecode/registry.rs`, `NUM_OPS=0xC2` 슬롯).
 - RISC 마이크로-op **38개** (`src/vm/risc/opcodes.rs`).
 - `--seed` 결정적 빌드 → 동일 시드 2회 패킹 SHA256 동일.
 - "26,956/26,956 (100%)"·"6040 블록"은 **특정 테스트 바이너리 1개**에 대한
