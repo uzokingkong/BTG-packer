@@ -26,24 +26,6 @@ Rust로 작성된 x86-64 PE 패커 겸 코드 가상화(VM) 엔진입니다. 원
 - [검증 상태](#검증-상태)
 - [문서](#문서)
 - [라이선스](#라이선스)
-
----
-
-## 실제 상태 요약
-
-| 영역 | 상태 | 근거 |
-|---|---|---|
-| 빌드 (`cargo build --release`) | ✅ 성공 | 2026-08-17 실제 실행 확인 |
-| 단위/차등 테스트 (`cargo test --release --lib`) | ✅ **285 passed / 0 failed** | 2026-08-17 실제 실행 확인 |
-| 레거시 VM opcode 수 | ✅ **193개** (0x01..0xC1) | `src/vm/bytecode/registry.rs` `opcodes!` 매크로 |
-| 상용 RISC 마이크로 연산 수 | ✅ **38개** | `src/vm/risc/opcodes.rs` `RiscOp` enum |
-| 결정적 빌드 (`--seed`) | ✅ 동작 확인 | 동일 seed 2회 패킹 → **SHA256 동일** (2026-08-17 실측) |
-| 상용(risc→poly→threaded) 경로 | 🔶 구현·배선됨, **선형 블록 단위 동치**로만 검증 | `build_program_vm_commercial` + 차등 테스트 |
-| 원본 `.text` 전체 가상화 | ❌ **대부분의 모드에서 미달성** — 원본 `.text`는 평문으로 유지됨 | `patch_data.rs` / `crypto/mod.rs` |
-| "명령 커버리지 100% (26,956/26,956)" | ⚠️ **특정 테스트 바이너리 1개의 진단 수치**일 뿐, 일반 보장 아님 | `--text-vm` 진단 (2026-08-13) |
-| "6040 블록 가상화" | ⚠️ **진단(P2-RISC-GAP) 산출값** — RIP-relative lift는 크래시로 **비활성(gate) 상태** | `docs/journal/2026-08-17-*` |
-| FINAL CHECKSUM `0x2cdc...` | ⚠️ **자체 개발 기록/테스트 하네스에만 존재** — 커밋된 로그 산출물에 없음 | `test/src/main.rs:269`, docs |
-
 ---
 
 ## 구현된 것 (코드 기준)
