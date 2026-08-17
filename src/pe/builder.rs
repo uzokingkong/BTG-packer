@@ -67,6 +67,15 @@ pub struct PeMultiSectionBuilder {
     pub btg_section: SectionData,
     pub payload_section: Option<SectionData>,
     pub original_headers_bytes: Vec<u8>,
+    /// P0-⑦: relocation-aware 출력 — `.reloc` data directory(idx 5)가 제공되면
+    /// ASLR(DYNAMIC_BASE 0x0040)/HIGH_ENTROPY_VA(0x0020) 비트를 보존한다.
+    /// (오프셋: [dispatcher .. dispatcher+first_block_offset) 부트 영역의 절대
+    /// VA 슬롯이 .reloc으로 커버되므로 로더가 리베이스해도 안전.)
+    pub preserve_aslr_bits: bool,
+    /// P0-⑦: 별도로 생성된 `.reloc` 섹션 — relayed 섹션에 추가하면 `.textb`(부트
+    /// 영역, entry point/절대 VA의 기준)의 위치가 밀려 깨지므로, payload 뒤에
+    /// 별도로 배치한다.
+    pub reloc_section: Option<SectionData>,
 }
 
 impl PeMultiSectionBuilder {
@@ -104,6 +113,10 @@ impl PeMultiSectionBuilder {
             btg_section,
             payload_section,
             original_headers_bytes,
+            // P0-⑦: 기본값은 기존 동작(ASLR 스트립) 유지. relocation-aware 경로가
+            // .reloc data directory를 채우고 이 플래그를 켠다.
+            preserve_aslr_bits: false,
+            reloc_section: None,
         }
     }
 
@@ -113,7 +126,10 @@ impl PeMultiSectionBuilder {
             section_alignment: if self.section_alignment == 0 { 0x1000 } else { self.section_alignment },
         };
 
-        let num_sections = (self.relayed_sections.len() + 1 + usize::from(self.payload_section.is_some())) as u16;
+        let num_sections = (self.relayed_sections.len()
+            + 1
+            + usize::from(self.payload_section.is_some())
+            + usize::from(self.reloc_section.is_some())) as u16;
         let header_size = self.original_headers_bytes.len().max(0x400);
         let size_of_headers = align_config.align_size(header_size as u32, AlignmentType::File);
 
@@ -139,7 +155,13 @@ impl PeMultiSectionBuilder {
         header.coff_header.machine = 0x8664; // x64
         header.coff_header.number_of_sections = num_sections;
         header.coff_header.size_of_optional_header = 240;
-        header.coff_header.characteristics = 0x0023; // RELOCS_STRIPPED | EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+        // P0-⑦: relocation-aware 경로는 RELOCS_STRIPPED(0x0001)를 끈다 — 정식 .reloc
+        // data directory가 존재하므로 이미지에 재배치 정보가 있다는 뜻이다.
+        header.coff_header.characteristics = if self.preserve_aslr_bits {
+            0x0022 // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE (no RELOCS_STRIPPED)
+        } else {
+            0x0023 // RELOCS_STRIPPED | EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+        };
 
         // Calculate max Virtual Address for btg_section placement
         // v9 FIX: relayed 섹션이 하나도 없는 경우(자체 생성 dummy 타깃) 기본값을
@@ -159,13 +181,31 @@ impl PeMultiSectionBuilder {
 
         // v4: --payload-relocate — 암호화된 코드 페이로드 섹션(.vdata)을 .textb 직후에 배치
         let mut adjusted_payload_section = self.payload_section;
-        if let Some(ref mut psec) = adjusted_payload_section {
+        let payload_end_va = if let Some(ref mut psec) = adjusted_payload_section {
             let btg_end = adjusted_btg_section.virtual_address
                 + align_config.align_size(
                     adjusted_btg_section.virtual_size.max(adjusted_btg_section.bytes.len() as u32),
                     AlignmentType::Section,
                 );
-            psec.virtual_address = align_config.align_size(btg_end, AlignmentType::Section);
+            let p_va = align_config.align_size(btg_end, AlignmentType::Section);
+            psec.virtual_address = p_va;
+            p_va + align_config.align_size(
+                psec.virtual_size.max(psec.bytes.len() as u32),
+                AlignmentType::Section,
+            )
+        } else {
+            adjusted_btg_section.virtual_address
+                + align_config.align_size(
+                    adjusted_btg_section.virtual_size.max(adjusted_btg_section.bytes.len() as u32),
+                    AlignmentType::Section,
+                )
+        };
+
+        // P0-⑦: 별도 .reloc 섹션을 payload/btg 뒤에 배치 (relayed에 넣으면 .textb가
+        // 밀려 entry point/절대 VA 기준이 깨지므로 여기서 붙인다).
+        let mut adjusted_reloc_section = self.reloc_section;
+        if let Some(ref mut rsec) = adjusted_reloc_section {
+            rsec.virtual_address = align_config.align_size(payload_end_va, AlignmentType::Section);
         }
 
         // Write Section Headers
@@ -177,6 +217,9 @@ impl PeMultiSectionBuilder {
         all_sections.push(adjusted_btg_section);
         if let Some(ps) = adjusted_payload_section {
             all_sections.push(ps);
+        }
+        if let Some(rs) = adjusted_reloc_section {
+            all_sections.push(rs);
         }
         all_sections.sort_by_key(|s| s.virtual_address);
 
@@ -271,7 +314,15 @@ impl PeMultiSectionBuilder {
         // CRITICAL FIX: Strip DYNAMIC_BASE (0x0040), HIGH_ENTROPY_VA (0x0020), and GUARD_CF (0x4000).
         // Since .reloc is stripped for shuffled .btg code, disabling ASLR forces the OS loader to
         // always load the executable at fixed preferred ImageBase (0x140000000), preventing random VA offset crashes.
-        let sanitized_dll_characteristics = self.dll_characteristics & !(0x0020 | 0x0040 | 0x4000);
+        // P0-⑦: relocation-aware 경로(preserve_aslr_bits)는 .reloc data directory가 채워진
+        // 상태에서 DYNAMIC_BASE/HIGH_ENTROPY_VA를 보존한다 (로더가 리베이스 시 .reloc으로
+        // 부트 영역 절대 VA 슬롯을 패치 → 안전). GUARD_CF는 여전히 스트립 — CFG 함수
+        // 테이블/비트맵이 패커 변환과 무결하지 않아 켜면 로더 거부/크래시 위험이 있다.
+        let sanitized_dll_characteristics = if self.preserve_aslr_bits {
+            self.dll_characteristics & !0x4000
+        } else {
+            self.dll_characteristics & !(0x0020 | 0x0040 | 0x4000)
+        };
         pe_bytes[opt_pos + 68..opt_pos + 70].copy_from_slice(&self.subsystem.to_le_bytes());
         pe_bytes[opt_pos + 70..opt_pos + 72].copy_from_slice(&sanitized_dll_characteristics.to_le_bytes());
 

@@ -304,6 +304,18 @@ pub fn run(
         );
     }
 
+    // P0-⑦: at-rest 암호화 여부를 기록 — 로더가 부트 스텁 복호화 전에 .reloc을
+    // 적용하면 암호문이 깨지므로, 이 플래그가 켜지면 build.rs가 relocation-aware
+    // 출력(ASLR 보존)을 비활성화한다.
+    ctx.at_rest_encrypted = code_len > 0 || !runs.is_empty();
+    println!(
+        "[+] P0-⑦ at-rest-encryption: {} (code {}B, {} data run(s)) → relocation-aware/ASLR {}",
+        if ctx.at_rest_encrypted { "ON" } else { "OFF" },
+        code_len,
+        runs.len(),
+        if ctx.at_rest_encrypted { "DISABLED (loader relocation would corrupt ciphertext)" } else { "ENABLED" }
+    );
+
     // 5b. 문자열 런 (부트 스텁 런 테이블과 같은 순서) — CryptoProvider.apply
     for run in &runs {
         let sec = &mut ctx.patched_sections[run.sec_idx];

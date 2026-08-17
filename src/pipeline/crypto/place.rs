@@ -771,6 +771,9 @@ let prmod = build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed,
             "[+] --vm-oep at-rest: fresh-RC4(seed) encryption applied (preserved .text {} run(s)/{}B + Program VM bytecode {}B)",
             text_enc_runs.len(), text_enc_total, vm_prog_bc_len
         );
+        // P0-⑦: .text 보존 런(원본 절대 VA 포함)이 at-rest 암호화됨 → 로더 .reloc
+        // 적용 시 암호문 파괴 → relocation-aware(ASLR) 비활성화.
+        ctx.at_rest_encrypted = true;
     }
 
     // 런 테이블 헤더 + 엔트리 (절대 VA) — 문자열 런 + v6 리졸브 테이블 run

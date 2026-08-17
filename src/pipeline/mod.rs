@@ -68,6 +68,8 @@ pub struct PipelineContext {
     pub boot_entry_offset: u32,
     /// 암호화 적용 여부
     pub crypto_enabled: bool,
+    /// P0-⑦: at-rest 암호화가 실제로 적용됐는지 (코드 블록/데이터 런 암호화).
+    pub at_rest_encrypted: bool,
     /// v4: --payload-relocate 시 암호화된 코드 페이로드를 담는 데이터 섹션
     pub payload_section_data: Option<SectionData>,
     /// 페이로드 섹션 RVA (rsrc_register가 리소스 데이터 엔트리로 사용)
@@ -167,6 +169,7 @@ impl PipelineContext {
             patched_sections: Vec::new(),
             boot_entry_offset: 0,
             crypto_enabled: false,
+            at_rest_encrypted: false,
             payload_section_data: None,
             payload_rva: 0,
             payload_len: 0,

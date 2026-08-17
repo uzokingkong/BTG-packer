@@ -23,6 +23,10 @@ pub struct TargetPeInfo {
     pub text_bytes: Vec<u8>,
     pub entry_point_rva: u32,
     pub subsystem: u16,
+    /// P0-⑦: 원본 DLL characteristics (ASLR/CFG 비트 포함) — 출력에서 보존할 수 있도록
+    /// 스트리핑 전 원본을 그대로 보존한다. `dll_characteristics`는 필요 시 스트리핑된
+    /// 값을 담을 수 있지만, 이 필드는 항상 원본을 유지한다.
+    pub original_dll_characteristics: u16,
     pub dll_characteristics: u16,
     pub stack_reserve: u64,
     pub stack_commit: u64,
@@ -93,6 +97,7 @@ impl TargetPeInfo {
         // Extract Subsystem, DllCharacteristics, Alignments, Stack/Heap & Data Directories from optional_header
         let (
             subsystem,
+            dll_characteristics_raw,
             dll_characteristics,
             stack_reserve,
             stack_commit,
@@ -103,7 +108,12 @@ impl TargetPeInfo {
             data_directories,
         ) = if let Some(opt) = pe.header.optional_header {
             let sub = opt.windows_fields.subsystem;
-            let dll_char = opt.windows_fields.dll_characteristics & !(0x0020 | 0x0040 | 0x4000); // Disable ASLR & CFG for fixed BaseVA stability
+            let orig_dll_char = opt.windows_fields.dll_characteristics;
+            // P0-⑦: 원본 ASLR/CFG 비트를 보존하되, `dll_characteristics`는 기존
+            // 소비처(build.rs 등)가 여전히 안전한 기본값을 쓰도록 스트리핑된 값을
+            // 담는다. relocation-aware 경로(build.rs)는 `original_dll_characteristics`
+            // 를 기준으로 ASLR 비트를 복원한다.
+            let dll_char = orig_dll_char & !(0x0020 | 0x0040 | 0x4000); // Disable ASLR & CFG for fixed BaseVA stability
             let s_res = opt.windows_fields.size_of_stack_reserve;
             let s_com = opt.windows_fields.size_of_stack_commit;
             let h_res = opt.windows_fields.size_of_heap_reserve;
@@ -119,6 +129,7 @@ impl TargetPeInfo {
                     // idx=4: Security / Digital Signature — invalid after binary modification.
                     // idx=5: Base Relocations (.reloc) — cleared to prevent OS loader from patching
                     //        shuffled .btg code bytes when DYNAMIC_BASE is stripped.
+                    //        (P0-⑦: relocation-aware 경로는 build.rs가 재생성한 .reloc 으로 채운다.)
                     // Note: idx=10 (LoadConfig) MUST BE PRESERVED so OS loader populates __security_cookie
                     //       and Control Flow Guard (CFG) function pointers like __guard_check_icall_fptr.
                     if idx == 4 || idx == 5 {
@@ -131,9 +142,9 @@ impl TargetPeInfo {
                     }
                 }
             }
-            (sub, dll_char, s_res, s_com, h_res, h_com, f_align, sec_align, dirs)
+            (sub, orig_dll_char, dll_char, s_res, s_com, h_res, h_com, f_align, sec_align, dirs)
         } else {
-            (3, 0x8120, 0x100000, 0x1000, 0x100000, 0x1000, 0x200, 0x1000, vec![DataDirectory { virtual_address: 0, size: 0 }; 16])
+            (3, 0x8120, 0x8120, 0x100000, 0x1000, 0x100000, 0x1000, 0x200, 0x1000, vec![DataDirectory { virtual_address: 0, size: 0 }; 16])
         };
 
         let mut relayed_sections = Vec::new();
@@ -200,6 +211,7 @@ impl TargetPeInfo {
             text_bytes,
             entry_point_rva,
             subsystem,
+            original_dll_characteristics: dll_characteristics_raw,
             dll_characteristics,
             stack_reserve,
             stack_commit,

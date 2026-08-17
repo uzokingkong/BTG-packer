@@ -5,6 +5,7 @@
 use crate::dispatcher::{UNWIND_ALLOC8, dispatcher_unwind_codes};
 use crate::pe::builder::{DataDirectory, PeMultiSectionBuilder, SectionData};
 use crate::pe::parser::RuntimeFunction;
+use crate::pe::reloc::build_reloc_directory;
 use crate::pipeline::PipelineContext;
 use anyhow::Result;
 use std::fs;
@@ -62,6 +63,8 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     }
 
     // ???? DLL Characteristics: DYNAMIC_BASE(0x0040), HIGH_ENTROPY_VA(0x0020), GUARD_CF(0x4000) ??볤탢 ????
+    // P0-⑦: relocation-aware 경로가 확정되기 전까지는 기존대로 ASLR/CFG 비트를 스트립한
+    // 값을 쓰고, 아래에서 preserve_aslr_bits가 켜지면 원본 ASLR 비트를 복원한다.
     let clean_dll_characteristics = ctx.target_info.dll_characteristics & !(0x0020 | 0x0040 | 0x4000);
 
     // ???? ??ν뒄???諭??癒?퐣 .pdata SEH ???뵠???????????????????????????????????????????????????????????????????????
@@ -109,11 +112,111 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     // ctx.boot_entry_offset = ?봔????쎈???諭??????쎈늄??(0????疫꿸퀣??OEP = ?諭????뽰삂)
     let entry_point_rva = dispatcher_rva + ctx.boot_entry_offset;
 
+    // ── P0-⑦: relocation-aware 출력 ────────────────────────────────────────────
+    // ASLR(DYNAMIC_BASE)/HIGH_ENTROPY_VA 보존을 위해, 최종 이미지의 절대 VA 슬롯을
+    // 커버하는 정식 `.reloc` data directory를 생성한다. 로더가 리베이스 시 이
+    // 테이블로 부트 영역(dispatcher/부트 스텁/VM 엔트리 스텁/핸들러 테이블)의 절대
+    // VA를 패치하므로 선호 base ≠ 실제 base 여도 정상 동작한다.
+    //
+    // 안전 게이트: at-rest 암호화된 영역에 절대 VA가 있는 경로는 제외한다 —
+    // 로더는 부트 스텁 복호화 **전**에 .reloc을 적용하므로, 암호문에 relocation을
+    // 적용하면 복호화가 깨진다. `at_rest_encrypted`(crypto::run이 실제 암호화
+    // 적용 여부 기록)가 false인 경로만 커버한다:
+    //   * --no-crypto (아무것도 암호화 안 함) → 커버 가능 (절대 VA 전부 평문)
+    //   * --dispatcher-reencrypt / --m7 / 일반 crypto / --vm-oep(보존 .text 런
+    //     at-rest 암호화) → 로더 relocation이 암호문을 파괴 → 제외
+    //     (런타임 post-decrypt relocation은 후속 P0-⑦ 확장 항목).
+    let reloc_aware = !ctx.at_rest_encrypted;
+
+    let mut preserve_aslr_bits = false;
+    let mut reloc_section: Option<SectionData> = None;
+    if reloc_aware {
+        // 최종 섹션 배치를 builder 로직과 동일하게 계산한다.
+        let sec_align = ctx.target_info.section_alignment;
+        let align_sec = |v: u32| -> u32 {
+            if sec_align == 0 { 0x1000 } else { (v + sec_align - 1) & !(sec_align - 1) }
+        };
+        let max_existing_va = relayed_sections
+            .iter()
+            .map(|s| {
+                let sz = s.virtual_size.max(s.bytes.len() as u32);
+                s.virtual_address + align_sec(sz)
+            })
+            .max()
+            .unwrap_or(0x1000);
+        let btg_va = if btg_section.virtual_address < max_existing_va {
+            align_sec(max_existing_va)
+        } else {
+            btg_section.virtual_address
+        };
+        let btg_end = btg_va + align_sec(btg_section.virtual_size.max(btg_section.bytes.len() as u32));
+        let payload_end = match &ctx.payload_section_data {
+            Some(p) => {
+                let p_va = align_sec(btg_end);
+                p_va + align_sec(p.virtual_size.max(p.bytes.len() as u32))
+            }
+            None => btg_end,
+        };
+
+        // at-rest 암호화 영역 없음 (--no-crypto) → 빈 목록.
+        let encrypted_rva_ranges: Vec<(u32, u32)> = Vec::new();
+
+        let image_base = ctx.target_info.image_base;
+        let size_of_image = payload_end;
+
+        // 모든 최종 섹션 목록 (VA 확정본) — .reloc 자체는 제외하고 스캔.
+        let mut final_sections: Vec<SectionData> = relayed_sections.clone();
+        {
+            let mut btg_final = btg_section.clone();
+            btg_final.virtual_address = btg_va;
+            final_sections.push(btg_final);
+        }
+        if let Some(p) = &ctx.payload_section_data {
+            let mut pf = p.clone();
+            pf.virtual_address = align_sec(btg_end);
+            final_sections.push(pf);
+        }
+
+        let reloc = build_reloc_directory(
+            &final_sections,
+            image_base,
+            size_of_image,
+            &encrypted_rva_ranges,
+        );
+
+        if let Some(mut ro) = reloc {
+                let reloc_va = align_sec(payload_end);
+                ro.section.virtual_address = reloc_va;
+                if clean_data_dirs.len() > 5 {
+                    clean_data_dirs[5] = DataDirectory {
+                        virtual_address: reloc_va,
+                        size: ro.directory.size,
+                    };
+                }
+                preserve_aslr_bits = true;
+                // builder가 .reloc 섹션을 btg/payload 뒤에 배치하도록 전달한다
+                // (relayed_sections에 추가하지 않음 — .textb 위치가 밀리면 안 됨).
+                reloc_section = Some(ro.section);
+                println!(
+                    "[+] P0-⑦ relocation-aware: .reloc dir @0x{:X} ({}B, {} slot(s)) — DYNAMIC_BASE/HIGH_ENTROPY_VA preserved",
+                    reloc_va, ro.directory.size, ro.directory.size / 2
+                );
+            } else {
+                println!("[!] P0-⑦ relocation-aware: no image-relative pointers found in injected sections; ASLR bits kept stripped");
+            }
+    }
+
     let multi_builder = PeMultiSectionBuilder::new(
         ctx.target_info.image_base,
         entry_point_rva,
         ctx.target_info.subsystem,
-        clean_dll_characteristics,
+        // P0-⑦: relocation-aware 경로는 원본 DLL characteristics(DYNAMIC_BASE/
+        // HIGH_ENTROPY_VA 포함)를 그대로 넘겨 builder가 .reloc과 함께 보존한다.
+        if preserve_aslr_bits {
+            ctx.target_info.original_dll_characteristics
+        } else {
+            clean_dll_characteristics
+        },
         ctx.target_info.stack_reserve,
         ctx.target_info.stack_commit,
         ctx.target_info.heap_reserve,
@@ -126,6 +229,10 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
         ctx.payload_section_data.clone(),
         ctx.target_info.original_headers_bytes.clone(),
     );
+    // P0-⑦: relocation-aware 경로만 ASLR 비트 보존 (다른 경로는 기존 스트립 유지).
+    let mut multi_builder = multi_builder;
+    multi_builder.preserve_aslr_bits = preserve_aslr_bits;
+    multi_builder.reloc_section = reloc_section;
 
     let output_pe_bytes = multi_builder.build()?;
 
