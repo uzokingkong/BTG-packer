@@ -125,6 +125,17 @@ CVTTSS2SI/CVTSS2SI/CVTTSD2SI/CVTSD2SI trunc/nearest-even), **BMI**(ANDN/BLSR/BLS
 `eval_state`(참조)에 추가(FP 는 정수 원자로 분해 불가 — "strictly required"). 리프터 레벨
 선형 블록 단위 차등 테스트 22개 신설. `cargo test --release --lib` → **220 passed; 0 failed**
 (기준 198). 폴리/네이티브 해석·컴파일은 아직 이 FP op 미지원(isa_spec 미포함, no-op arm).
+
+**상태 (2026-08-17 후속)**: P2-RISC-GAP 진단 + 리프터 확장으로 **상용 경로 가상화 블록
+4513→6040(+34%), RISC-unliftable 3210→1683(-48%)** (rust_packer_test 실측).
+- 신규 리프트: **8/16-bit CMP/TEST**(레지스터 피연산자 폭 마스킹), **8-bit ADD/SUB**
+  (부분-쓰기 상위 비트 보존 `preserve_upper`), **NOP/Pause no-op**, **간접 JMP
+  (`Jmp_rm64`)**. 기존 TEST의 Temp(3) clobber 잠재 버그 수정.
+- **RIP-relative addressing** 리프트는 현재 타깃에서 디스패처 keystream desync
+  (0xC0000005)를 일으켜 **비활성 게이트**로 둠 (후속 P2 — 패치 데이터 재배치 연동 추적).
+- `cargo test --release --lib` → **279 passed; 0 failed**. 3경로(`--vm`/`--vm-oep`/
+  `--vm-commercial`) 16테스트 + FINAL CHECKSUM `0x2cdc0e4511d84a64` 무회귀.
+  상세: `docs/journal/2026-08-17-commercial-p2-risc-lift.md`.
 **목표**: G3 해소 — `vm/risc/lifter.rs`가 레거시 171-opcode 커버리지와 동등해지도록 확장.
 
 **작업 항목** (레거시 `vm/lifter/` + `vm/text_lift/` 커버리지와 대조하며):

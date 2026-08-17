@@ -12,6 +12,7 @@ use crate::pe::TargetPeInfo;
 use crate::pipeline::PipelineContext;
 use crate::pipeline::{pass1_slice, pass2_shuffle, pass3_encode, pass4_section, patch_data, build, crypto};
 use anyhow::Result;
+use rand::RngCore;
 use std::path::Path;
 
 /// Run the full protection pipeline over an input PE and return the protected
@@ -43,8 +44,8 @@ pub fn run_full(
 
     let obf = obf_level.clamp(1, 3) as usize;
     let mut ctx = PipelineContext::new(info, dispatcher_va, dispatcher_rva, obf);
-    // v6: MBA key schedule constant (once per pack).
-    ctx.mba_constant = { use rand::RngCore; rand::thread_rng().next_u32() };
+    // v6: MBA key schedule constant (once per pack) — P3-1: from the ctx RNG.
+    ctx.mba_constant = ctx.rng.next_u32();
 
     pass1_slice::run(&mut ctx)?;
     pass2_shuffle::run(&mut ctx)?;

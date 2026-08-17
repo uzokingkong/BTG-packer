@@ -13,6 +13,15 @@ impl RiscLifter {
             OpKind::Register => {
                 let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
                 let right = self.operand_value(inst, 1)?;
+                // P2 (G3): 8/16비트 레지스터 Add/Sub는 상위 비트 보존이 필요하다.
+                // Add/Sub{width}가 dst를 마스크로 덮어쓰므로, **먼저** 원본을 Temp(0)에
+                // 저장한 뒤 결과를 합성한다: dst = (orig & ~mask) | masked.
+                let preserve = (alu == Alu::Add || alu == Alu::Sub) && (width == 1 || width == 2);
+                if preserve {
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::Temp(0)).with_src1(dst),
+                    );
+                }
                 if alu == Alu::Sub {
                     self.desynth.instrs.push(
                         MicroInstr::new(RiscOp::SubWithBorrow { width })
@@ -35,6 +44,9 @@ impl RiscLifter {
                 // zero-extend(AND)로 플래그를 클로버하지 않는다. (다른 ALU만 제로확장)
                 if alu != Alu::Add && alu != Alu::Sub {
                     self.zero_extend_dst_if32(inst, dst);
+                }
+                if preserve {
+                    self.preserve_upper(dst, width);
                 }
             }
             OpKind::Memory => {
@@ -79,10 +91,15 @@ impl RiscLifter {
     /// CMP: 플래그만 갱신(CF/ZF/SF/OF)하고 결과를 버리는 SUB. 스크래치로 Temp(7) 사용.
     /// P0-1: borrow-CF 정확 — 전용 SubWithBorrow(width).
     pub(super) fn lift_cmp(&mut self, inst: &Instruction) -> Result<()> {
+        let width = Self::operand_width(inst);
         let left = self.operand_value(inst, 0)?;
         let right = self.operand_value(inst, 1)?;
         let scratch = MicroOperand::Temp(7);
-        let width = Self::operand_width(inst);
+        // P2 (G3): 8/16비트 CMP는 low-byte/word만 비교한다. 레지스터 피연산자는
+        // 상위 비트(0-확장되지 않음)가 결과/플래그를 오염시키므로 폭으로 마스크한다.
+        // (메모리는 MemoryRead{width}가 이미 0-확장, imm은 이미 폭 안.)
+        let left = self.mask_reg_operand(left, width, MicroOperand::Temp(3))?;
+        let right = self.mask_reg_operand(right, width, MicroOperand::Temp(2))?;
         self.desynth.instrs.push(
             MicroInstr::new(RiscOp::SubWithBorrow { width })
                 .with_dst(scratch)
@@ -90,6 +107,40 @@ impl RiscLifter {
                 .with_src2(right),
         );
         Ok(())
+    }
+
+    /// P2 (G3): 8/16비트 연산에서 **레지스터** 피연산자만 폭으로 마스크해 지정
+    /// temp에 저장한다 (x86은 low-byte/word만 사용). 메모리/즉시 피연산자는 그대로.
+    fn mask_reg_operand(&mut self, op: MicroOperand, width: u8, temp: MicroOperand) -> Result<MicroOperand> {
+        if width >= 8 {
+            return Ok(op);
+        }
+        let mask = if width == 1 { 0xFF } else { 0xFFFF };
+        if matches!(op, MicroOperand::VReg(_)) {
+            self.desynth.emit_and(temp, op, MicroOperand::Imm64(mask));
+            Ok(temp)
+        } else {
+            Ok(op)
+        }
+    }
+
+    /// P2 (G3): op를 `width`로 마스크해 **지정 temp**에 저장한다.
+    /// (`mask_operand`의 공용 Temp(3) clobber를 피해 TEST처럼 두 피연산자를 동시에
+    /// 마스크할 때 서로 다른 temp를 쓴다.)
+    pub(super) fn mask_operand_into(
+        &mut self,
+        op: MicroOperand,
+        width: u8,
+        temp: MicroOperand,
+    ) -> Result<MicroOperand> {
+        let mask = match width {
+            1 => 0xFF,
+            2 => 0xFFFF,
+            4 => 0xFFFF_FFFF,
+            _ => return Ok(op),
+        };
+        self.desynth.emit_and(temp, op, MicroOperand::Imm64(mask));
+        Ok(temp)
     }
 
     /// SHL/SHR/SAR (32/64-bit, count: imm8 / 1 / CL).
@@ -249,6 +300,25 @@ impl RiscLifter {
         Ok(t)
     }
 
+    /// P2 (G3): 8/16비트 **레지스터** ALU 결과의 상위 비트 보존.
+    ///
+    /// x86은 8/16비트 쓰기가 상위 비트를 그대로 둔다 (0-확장은 32/64비트에만 적용).
+    /// 그런데 `Add { width }`/`SubWithBorrow { width }`류 op는 결과를 `width`로
+    /// 마스크하므로 상위가 0으로 밀린다. 호출자는 Add/Sub op가 dst를 덮어쓰기
+    /// **전에** 원본을 Temp(0)에 저장해 두어야 한다. 여기서는 그 원본을 이용해
+    /// `dst = (orig & ~mask) | masked`를 합성해 정확한 x86 부분-쓰기 의미론을 복원한다.
+    pub(super) fn preserve_upper(&mut self, dst: MicroOperand, width: u8) {
+        let mask = match width {
+            1 => 0xFFu64,
+            2 => 0xFFFFu64,
+            _ => return,
+        };
+        let orig = MicroOperand::Temp(0);
+        let keep = MicroOperand::Temp(1);
+        self.desynth.emit_and(keep, orig, MicroOperand::Imm64(!mask));
+        self.desynth.emit_or(dst, dst, keep);
+    }
+
     /// 산술/논리 명령의 피연산자 폭(바이트) — 플래그 경계(bit 7/15/31/63) 결정.
     /// op0이 레지스터면 그 폭, 메모리면 memory_size, 즉시면 op1에서 유추.
     pub(super) fn operand_width(inst: &Instruction) -> u8 {
@@ -298,9 +368,12 @@ impl RiscLifter {
             _ => 1,
         };
         let v0 = self.operand_value(inst, 0)?;
-        let a = self.mask_operand(v0, w)?;
         let v1 = self.operand_value(inst, 1)?;
-        let b = self.mask_operand(v1, w)?;
+        // P2 (G3): 두 피연산자를 폭별로 마스크 — **서로 다른 temp**(Temp(3)/Temp(2))를
+        // 써서 기존 `mask_operand`의 공용 Temp(3) clobber 버그를 수정한다.
+        // (기존 16/32비트 TEST가 `v0&v1` 대신 `v1&v1`을 계산하던 잠재 버그.)
+        let a = self.mask_operand_into(v0, w, MicroOperand::Temp(3))?;
+        let b = self.mask_operand_into(v1, w, MicroOperand::Temp(2))?;
         let scratch = MicroOperand::Temp(7);
         self.desynth.emit_and(scratch, a, b);
         Ok(())

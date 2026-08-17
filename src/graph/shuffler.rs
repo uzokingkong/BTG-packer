@@ -8,8 +8,8 @@
 
 use crate::core::trigger_block::TriggerBlock;
 use iced_x86::{BlockEncoder, BlockEncoderOptions, InstructionBlock};
+use rand::Rng;
 use rand::seq::SliceRandom;
-use rand::thread_rng;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -40,13 +40,14 @@ impl LayoutShuffler {
     /// Shuffles physical block placement and computes encrypted jump table entries.
     /// Uses Dummy BlockEncoder Pass to determine exact machine byte length,
     /// accounting for potential branch instruction expansion (rel8 -> rel32 promotion).
-    pub fn shuffle(
+    /// P3-1: `rng`를 외부에서 받아 결정적 빌드(--seed)와 호환된다.
+    pub fn shuffle<R: Rng + ?Sized>(
         trigger_blocks: Vec<TriggerBlock>,
         first_block_physical_offset: usize,
+        rng: &mut R,
     ) -> ShuffledLayout {
         let mut physical_order: Vec<usize> = (0..trigger_blocks.len()).collect();
-        let mut rng = thread_rng();
-        physical_order.shuffle(&mut rng);
+        physical_order.shuffle(rng);
 
         let mut shuffled_blocks = Vec::with_capacity(trigger_blocks.len());
         let mut table_offsets = vec![0u32; trigger_blocks.len()];

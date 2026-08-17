@@ -27,7 +27,8 @@ use crate::crypto::{chain_encrypt, BlockCryptoMeta, CryptoProvider};
 use crate::pipeline::pass4_section::BOOT_AREA_RESERVE;
 use crate::pipeline::PipelineContext;
 use anyhow::Result;
-use rand::RngCore;
+use rand::rngs::StdRng;
+use rand::{RngCore, SeedableRng};
 
 mod bootstub;
 pub(crate) mod cipher;
@@ -189,7 +190,10 @@ pub fn run(
     let (block_keys, total_blocks) = perblock::collect_block_keys(ctx, &layout, reencrypt);
 
     // ── 2. 키 상수 생성 ──────────────────────────────────────────────────────
-    let mut rng = rand::thread_rng();
+    // P3-1: 단일 시드 RNG(--seed)에서 키 상수/시드/레이아웃 패드를 파생한다.
+    // ctx.rng을 로컬로 빼내 소유하면 이후 ctx(&mut)를 받는 호출들과 빌림이
+    // 겹치지 않는다. 완료 후 다시 기록해 단일 시드 소스를 유지한다.
+    let mut rng = std::mem::replace(&mut ctx.rng, StdRng::from_entropy());
     let salt1: u32 = rng.next_u32();
     let salt2: u32 = rng.next_u32();
     let salt3: u32 = rng.next_u32();
@@ -346,5 +350,7 @@ pub fn run(
         c1_mode,
         &mut rng,
     )?;
+    // P3-1: 시드 RNG를 ctx에 다시 기록 (단일 소스 유지).
+    ctx.rng = rng;
     Ok(())
 }

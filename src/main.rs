@@ -11,7 +11,8 @@ use btg_packer::qa::{self, QaBenchmarkRunner};
 use btg_packer::vm;
 use btg_packer::debug;
 use clap::Parser;
-use rand::RngCore;
+use rand::rngs::StdRng;
+use rand::{RngCore, SeedableRng};
 use std::env;
 use std::fs;
 
@@ -338,10 +339,19 @@ fn main() -> error::Result<()> {
 
     // ── PipelineContext 생성 ───────────────────────────────────────────────────────
     let mut ctx = PipelineContext::new(target_info, dispatcher_va, dispatcher_rva, obf_complexity);
+    // ── P3-1: 결정적 빌드 (--seed) — 단일 시드 RNG 고정 ──────────────────────────
+    // `--seed <u64>`가 주어지면 ctx.rng를 고정한다. 셔플/mba_constant/crypto 시드/
+    // 폴리 시드/레이아웃 패드가 모두 이 RNG에서 파생되므로, 같은 input + seed +
+    // config → 같은 output (재현·디버깅·상용 배포용).
+    if let Some(seed) = args.seed {
+        ctx.rng = StdRng::seed_from_u64(seed);
+        println!("[+] P3-1 Deterministic build: RNG seeded 0x{:016X} (--seed)", seed);
+    }
     // v5: 안티디버그 여부 기록 (validate의 부트 스텁 프롤로그 검사가 사용)
     ctx.anti_debug = anti_debug || args.trace_blocks;
-    // v6: MBA 키 스케줄 상수 (패킹당 1회 랜덤 — 슬라이서/패스3/패스4/디스패처 공유)
-    ctx.mba_constant = { use rand::RngCore; rand::thread_rng().next_u32() };
+    // v6: MBA 키 스케줄 상수 (패킹당 1회 — 슬라이서/패스3/패스4/디스패처 공유)
+    // P3-1: --seed 시 단일 시드 RNG에서 파생 (thread_rng 대신 ctx.rng 배선)
+    ctx.mba_constant = ctx.rng.next_u32();
     // ── v61: M7 (on-demand 재암호화) 판정 — per-block reencrypt 계열 디스패처를
     // 쓰므로 --dispatcher-reencrypt와 상호 배타, --vm/--vm-oep(일괄 복호화 부트
     // 흐름)와도 배타. crypto 필수. (ctx.reencrypt가 아래에서 이를 반영)
@@ -387,8 +397,9 @@ fn main() -> error::Result<()> {
 
     // ── Phase 6: SDK Marker Selective VM Pass (if markers present) ───────────────
     if vm_enabled {
-        // T1-1: 폴리모픽 VM 시드를 빌드마다 OS 엔트로피(OsRng)로 생성.
-        let poly_seed: u64 = rand::rngs::OsRng.next_u64();
+        // T1-1: 폴리모픽 VM 시드 — --seed 주어지면 단일 시드 RNG에서 파생(결정적),
+        // 아니면 OsRng 엔트로피와 동등한 랜덤 값.
+        let poly_seed: u64 = ctx.rng.next_u64();
         ctx.poly_vm_seed = poly_seed;
         ctx.poly_vm_seed_masked =
             poly_seed ^ 0xA7B3C5D1E9F20486u64.wrapping_mul(ctx.mba_constant as u64);

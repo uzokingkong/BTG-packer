@@ -20,6 +20,8 @@ pub mod validate;
 use crate::graph::{BasicBlock, ShuffledLayout};
 use crate::core::trigger_block::TriggerBlock;
 use crate::pe::{parser::TargetPeInfo, builder::SectionData};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 use std::collections::BTreeMap;
 
 /// 각 Pass 사이에 공유되는 파이프라인 상태.
@@ -27,6 +29,10 @@ use std::collections::BTreeMap;
 /// `main`에서 `PipelineContext`를 생성하고 각 Pass 함수에 `&mut self`로 전달한다.
 /// 각 Pass는 이전 Pass의 결과를 소비하거나 참조하여 다음 단계 출력을 채운다.
 pub struct PipelineContext {
+    /// P3-1 (결정적 빌드): 패킹의 모든 랜덤성(셔플/mba_constant/crypto 시드/폴리
+    /// 시드/레이아웃 패드)을 파생하는 단일 시드 RNG. `--seed <u64>`로 고정하면
+    /// 같은 input+seed+config → 같은 output (재현·디버깅·상용 배포용).
+    pub rng: StdRng,
     // ── 입력 (파이프라인 시작 전 설정) ──────────────────────────────────────────
     pub target_info: TargetPeInfo,
     pub dispatcher_va: u64,
@@ -150,6 +156,7 @@ impl PipelineContext {
             dispatcher_va,
             dispatcher_rva,
             obf_complexity,
+            rng: StdRng::from_entropy(),
             basic_blocks: Vec::new(),
             trigger_blocks: Vec::new(),
             va_to_trigger_id: BTreeMap::new(),

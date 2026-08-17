@@ -88,7 +88,7 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         table_offset
     );
 
-    let shuffled_layout = LayoutShuffler::shuffle(ctx.trigger_blocks.clone(), first_block_offset);
+    let shuffled_layout = LayoutShuffler::shuffle(ctx.trigger_blocks.clone(), first_block_offset, &mut ctx.rng);
 
     println!(
         "[+] Pass 2 Complete: table_offset=0x{:X}, first_block_offset=0x{:X}, {} blocks shuffled.",

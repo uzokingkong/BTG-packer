@@ -43,6 +43,16 @@ pub(crate) use codegen_util::{
 #[cfg(test)]
 mod poly_direct_tests;
 
+/// P2 (G3): 폭별 ALU 네이티브 핸들러 종류 (Add/SubWithBorrow/Inc/Dec/Not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WidthAluOp {
+    Add,
+    Sub,
+    Inc,
+    Dec,
+    Not,
+}
+
 /// P3 (G1): assembled self-decoding dispatcher pieces (machine code + tables).
 pub struct SelfDecodingParts {
     pub code: Vec<u8>,
@@ -538,6 +548,22 @@ pub fn build_self_decoding_parts_with(
         b.push(Instruction::with(Code::Pushfq));
         b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
         b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, FLAG_MASK as u32).unwrap());
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(FLAGS_OFF)).unwrap());
+        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!FLAG_MASK) as i32).unwrap());
+        b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap());
+        store_m(b, FLAGS_OFF, Register::RAX);
+    }
+
+    // P2 (G3): INC/DEC 플래그 저장 — x86 INC/DEC는 **CF를 보존**한다 (eval_state의
+    // update_inc/update_dec와 동일). 하드웨어 `inc/dec`는 CF를 변경하지 않으므로
+    // FLAG_MASK에서 CF 비트를 제외하고, FLAGS_OFF 슬롯의 기존 CF를 그대로 합병한다.
+    fn emit_store_flags_incdec(b: &mut CodeBuilder) {
+        b.push(Instruction::with(Code::Pushfq));
+        b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
+        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, (FLAG_MASK & !1) as u32).unwrap()); // CF 제외
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(FLAGS_OFF)).unwrap());
+        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, 1).unwrap()); // 기존 CF
+        b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap());
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(FLAGS_OFF)).unwrap());
         b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!FLAG_MASK) as i32).unwrap());
         b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap());
@@ -1453,6 +1479,67 @@ pub fn build_self_decoding_parts_with(
         b.jmp(dispatch);
     }
 
+    // ── P2 (G3): 폭별 ALU 핸들러 — Add/SubWithBorrow/Inc/Dec/Not {width}. ──────
+    // eval_state와 동치: 폭별 하드웨어 플래그(Add/Sub), CF 보존(Inc/Dec), 플래그
+    // 불변(Not), 부분-쓰기 상위 비트 보존(8/16비트는 하드웨어가 이미 보존).
+    fn emit_width_alu_handler(
+        b: &mut CodeBuilder,
+        sub_dec_ops: usize,
+        sub_resolve: usize,
+        sub_store: usize,
+        dispatch: usize,
+        op: WidthAluOp,
+        width: u8,
+    ) {
+        b.call(sub_dec_ops);
+        // src1 -> R10
+        movzx8_m(b, Register::EAX, DEC_SRC1);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        // src2 -> R11 (Add/Sub만; Inc/Dec/Not는 src1 단일)
+        if op == WidthAluOp::Add || op == WidthAluOp::Sub {
+            movzx8_m(b, Register::EAX, DEC_SRC2);
+            mov_m(b, Register::R11, DEC_IMM2);
+            b.call(sub_resolve);
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
+        }
+        // 폭별 연산 (x86 부분-쓰기: 8/16비트는 상위 비트 보존 — eval_state의
+        // preserve_upper와 동치).
+        match (op, width) {
+            (WidthAluOp::Add, 1) => b.push(Instruction::with2(Code::Add_rm8_r8, Register::R10L, Register::R11L).unwrap()),
+            (WidthAluOp::Add, 2) => b.push(Instruction::with2(Code::Add_rm16_r16, Register::R10W, Register::R11W).unwrap()),
+            (WidthAluOp::Add, 4) => b.push(Instruction::with2(Code::Add_rm32_r32, Register::R10D, Register::R11D).unwrap()),
+            (WidthAluOp::Add, _) => b.push(Instruction::with2(Code::Add_rm64_r64, Register::R10, Register::R11).unwrap()),
+            (WidthAluOp::Sub, 1) => b.push(Instruction::with2(Code::Sub_rm8_r8, Register::R10L, Register::R11L).unwrap()),
+            (WidthAluOp::Sub, 2) => b.push(Instruction::with2(Code::Sub_rm16_r16, Register::R10W, Register::R11W).unwrap()),
+            (WidthAluOp::Sub, 4) => b.push(Instruction::with2(Code::Sub_rm32_r32, Register::R10D, Register::R11D).unwrap()),
+            (WidthAluOp::Sub, _) => b.push(Instruction::with2(Code::Sub_rm64_r64, Register::R10, Register::R11).unwrap()),
+            (WidthAluOp::Inc, 1) => b.push(Instruction::with1(Code::Inc_rm8, Register::R10L).unwrap()),
+            (WidthAluOp::Inc, 2) => b.push(Instruction::with1(Code::Inc_rm16, Register::R10W).unwrap()),
+            (WidthAluOp::Inc, 4) => b.push(Instruction::with1(Code::Inc_rm32, Register::R10D).unwrap()),
+            (WidthAluOp::Inc, _) => b.push(Instruction::with1(Code::Inc_rm64, Register::R10).unwrap()),
+            (WidthAluOp::Dec, 1) => b.push(Instruction::with1(Code::Dec_rm8, Register::R10L).unwrap()),
+            (WidthAluOp::Dec, 2) => b.push(Instruction::with1(Code::Dec_rm16, Register::R10W).unwrap()),
+            (WidthAluOp::Dec, 4) => b.push(Instruction::with1(Code::Dec_rm32, Register::R10D).unwrap()),
+            (WidthAluOp::Dec, _) => b.push(Instruction::with1(Code::Dec_rm64, Register::R10).unwrap()),
+            (WidthAluOp::Not, 1) => b.push(Instruction::with1(Code::Not_rm8, Register::R10L).unwrap()),
+            (WidthAluOp::Not, 2) => b.push(Instruction::with1(Code::Not_rm16, Register::R10W).unwrap()),
+            (WidthAluOp::Not, 4) => b.push(Instruction::with1(Code::Not_rm32, Register::R10D).unwrap()),
+            (WidthAluOp::Not, _) => b.push(Instruction::with1(Code::Not_rm64, Register::R10).unwrap()),
+        };
+        // 플래그: Add/Sub → 폭별 하드웨어 플래그(CF|PF|ZF|SF|OF). Inc/Dec → CF
+        // 보존(emit_store_flags_incdec). Not → 플래그 불변 (x86 NOT).
+        match op {
+            WidthAluOp::Add | WidthAluOp::Sub => emit_store_flags(b),
+            WidthAluOp::Inc | WidthAluOp::Dec => emit_store_flags_incdec(b),
+            WidthAluOp::Not => {}
+        }
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
+        b.call(sub_store);
+        b.jmp(dispatch);
+    }
+
     // ── P3: SETCC / CONDITIONAL_MOVE — cond-byte native handlers. ──────────────
     // Both decode a single cond byte (right after the opcode) via `sub_dec_ops_cond`,
     // which maps it through the OFF_COND_CODES table into the DEC_COND state slot
@@ -1696,6 +1783,32 @@ pub fn build_self_decoding_parts_with(
             div_h[si][wi] = b.len();
             emit_div_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, *signed, *w, dispatch);
         }
+    }
+
+    // ── P2 (G3): width-aware ALU 핸들러 (Add/SubWithBorrow/Inc/Dec/Not {width}) ──
+    // 전체 프로그램 리프트가 내는 `Add {width}`/`SubWithBorrow {width}`/`Inc`/`Dec`/
+    // `Not {width}` op는 지금까지 **핸들러 미등록 → h_nop(no-op)**이었다. h_nop는
+    // 바이트만 소비하고 의미를 실행하지 않으므로, `sub rsp`/`cmp`/`test`가 무시되어
+    // 새로 가상화된 블록(예: RIP-relative 블록)에서 가상 스택/플래그가 틀어져
+    // keystream desync → 0xC0000005를 일으킨다. 여기서 폭별 네이티브 핸들러를
+    // 등록해 eval_state와 동치(폭별 하드웨어 플래그 + 부분-쓰기 상위 비트 보존)로
+    // 실행한다.
+    let mut addw_h = [0usize; 4];
+    let mut subw_h = [0usize; 4];
+    let mut incw_h = [0usize; 4];
+    let mut decw_h = [0usize; 4];
+    let mut notw_h = [0usize; 4];
+    for (wi, w) in [1u8, 2, 4, 8].iter().enumerate() {
+        addw_h[wi] = b.len();
+        emit_width_alu_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, WidthAluOp::Add, *w);
+        subw_h[wi] = b.len();
+        emit_width_alu_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, WidthAluOp::Sub, *w);
+        incw_h[wi] = b.len();
+        emit_width_alu_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, WidthAluOp::Inc, *w);
+        decw_h[wi] = b.len();
+        emit_width_alu_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, WidthAluOp::Dec, *w);
+        notw_h[wi] = b.len();
+        emit_width_alu_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, WidthAluOp::Not, *w);
     }
 
     // ── P3: COMPARE_EXCHANGE{width} — atomic lock cmpxchg (Once/futex CAS). ──
@@ -1991,9 +2104,44 @@ pub fn build_self_decoding_parts_with(
                 h.insert(RiscOp::Divide { signed: *signed, width: *w }, div_h[si][wi]);
             }
         }
+        // P2 (G3): width-aware ALU — Add/SubWithBorrow/Inc/Dec/Not {width} 핸들러.
+        for (wi, w) in [1u8, 2, 4, 8].iter().enumerate() {
+            h.insert(RiscOp::Add { width: *w }, addw_h[wi]);
+            h.insert(RiscOp::SubWithBorrow { width: *w }, subw_h[wi]);
+            h.insert(RiscOp::Inc { width: *w }, incw_h[wi]);
+            h.insert(RiscOp::Dec { width: *w }, decw_h[wi]);
+            h.insert(RiscOp::Not { width: *w }, notw_h[wi]);
+        }
         h.insert(RiscOp::Halt, h_halt);
+        // NativeCallBridge — reference/interpreter는 no-op(스트림 소비, 상태 불변).
+        // h_nop과 동일 의미이므로 명시 등록해 [P2-HANDLER-GAP] 감사를 깨끗하게 한다.
+        h.insert(RiscOp::NativeCallBridge, h_nop);
         h
     };
+
+    // P2 (G3): **h_nop fallback 전수 감사** — 인코딩 가능한 op 중 네이티브 핸들러가
+    // 없는 op는 h_nop(바이트 소비만, 의미 no-op)으로 떨어진다. 이전에 Add/Sub/
+    // Inc/Dec/Not {width}가 여기 빠져 전체 프로그램에서 조용히 무시되던 버그가
+    // 있었다. 여기서 남은 미등록 op를 즉시 노출해 재발을 막는다.
+    {
+        let mut unhandled: Vec<String> = Vec::new();
+        for (op, _byte) in &spec.opcode_map {
+            if !handlers.contains_key(op) {
+                unhandled.push(format!("{:?}", op));
+            }
+        }
+        if !unhandled.is_empty() {
+            println!(
+                "[P2-HANDLER-GAP] {} encodable op(s) have NO native handler (h_nop no-op fallback):",
+                unhandled.len()
+            );
+            for u in unhandled {
+                println!("    - {}", u);
+            }
+        } else {
+            println!("[P2-HANDLER-GAP] all encodable ops have native handlers");
+        }
+    }
 
     // Assemble; use the true per-instruction IPs for handler VAs.
     let (code, ips) = b.assemble(code_base)?;

@@ -8,6 +8,48 @@
 
     use crate::vm::risc::RiscDesynthesizer;
 
+    /// P2 (G3): 양-즉시 `AddWithCarry(Imm64, Imm64, cin=0)` — RIP-relative 주소
+    /// 계산(`lower_effective_address`의 `emit_add(temp, Imm64(abs), Imm64(0))`)이
+    /// 만드는 정확한 인코딩 패턴. 네이티브 self-decoding 런타임이 이 op의 바이트를
+    /// 인코더와 동일하게 소비하는지 차등 검증한다. (인터프리터/참조와 동치여야 함.)
+    #[test]
+    fn test_native_poly_direct_both_imm_addwithcarry_matches_reference() {
+        let mut d = RiscDesynthesizer::new();
+        // RIP-relative 주소 계산: AddWithCarry(Temp(4), Imm64(abs), Imm64(0), cin=0).
+        d.instrs.push(
+            MicroInstr::new(RiscOp::AddWithCarry)
+                .with_dst(MicroOperand::Temp(4))
+                .with_src1(MicroOperand::Imm64(0x14003F140))
+                .with_src2(MicroOperand::Imm64(0))
+                .with_imm(0),
+        );
+        // 결과를 레지스터로 (계산된 절대 주소가 보존되는지).
+        d.instrs.push(
+            MicroInstr::new(RiscOp::Mov)
+                .with_dst(MicroOperand::VReg(0))
+                .with_src1(MicroOperand::Temp(4)),
+        );
+        d.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::VReg(1)).with_src1(MicroOperand::Imm64(0x2B992DDFA232)));
+        d.instrs.push(MicroInstr::new(RiscOp::Halt));
+        let prog = RiscProgram::new(d.instrs);
+        let init = [0u64; 16];
+
+        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789, 0xBADF00D] {
+            let mut enc = PolymorphicEncoder::new(seed);
+            let bytecode = enc.encode(&prog).unwrap();
+
+            let native = run_native_poly_direct(&bytecode, seed, &init).unwrap();
+            let mut interp = PolymorphicInterpreter::new(seed);
+            interp.run(&bytecode).unwrap();
+            let ref_st = prog.eval_state(&init);
+
+            assert_eq!(native.regs[0], 0x14003F140, "seed {seed:#x}: AddWithCarry(imm,imm) address");
+            assert_eq!(native.regs[1], 0x2B992DDFA232, "seed {seed:#x}: Mov(imm64) after two-imm op");
+            assert_eq!(native.regs, ref_st.regs, "seed {seed:#x}: native vs reference regs");
+            assert_eq!(interp.regs, ref_st.regs, "seed {seed:#x}: interpreter vs reference regs");
+        }
+    }
+
 
 
     /// Differential: native self-decoding == interpreter == reference.

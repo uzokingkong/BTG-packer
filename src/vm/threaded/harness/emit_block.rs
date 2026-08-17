@@ -211,12 +211,15 @@ impl NativeVmHarness {
                 load(instrs, ins.src2, Register::R11)?;
                 match width {
                     1 => {
+                        // P2 (G3): x86 8비트 ADD는 low-byte만 갱신하고 상위 비트를
+                        // 유지한다. `add r10l, r11l`이 정확히 그 의미론을 준다
+                        // (r10 상위 비트 보존 + 8비트 폭 하드웨어 플래그).
+                        // 기존 `movzx r10d, r10l`는 상위를 0으로 밀어 잘못된 결과였다
+                        // (거기에 dst를 64비트 R10으로 줘 어셈블 실패 — Register 63).
                         instrs.push(Instruction::with2(Code::Add_rm8_r8, Register::R10L, Register::R11L).map_err(|e| anyhow!("{e}"))?);
-                        instrs.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R10, Register::R10L).map_err(|e| anyhow!("{e}"))?);
                     }
                     2 => {
                         instrs.push(Instruction::with2(Code::Add_rm16_r16, Register::R10W, Register::R11W).map_err(|e| anyhow!("{e}"))?);
-                        instrs.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R10, Register::R10W).map_err(|e| anyhow!("{e}"))?);
                     }
                     4 => {
                         instrs.push(Instruction::with2(Code::Add_rm32_r32, Register::R10D, Register::R11D).map_err(|e| anyhow!("{e}"))?);
@@ -234,11 +237,9 @@ impl NativeVmHarness {
                 match width {
                     1 => {
                         instrs.push(Instruction::with2(Code::Sub_rm8_r8, Register::R10L, Register::R11L).map_err(|e| anyhow!("{e}"))?);
-                        instrs.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R10, Register::R10L).map_err(|e| anyhow!("{e}"))?);
                     }
                     2 => {
                         instrs.push(Instruction::with2(Code::Sub_rm16_r16, Register::R10W, Register::R11W).map_err(|e| anyhow!("{e}"))?);
-                        instrs.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R10, Register::R10W).map_err(|e| anyhow!("{e}"))?);
                     }
                     4 => {
                         instrs.push(Instruction::with2(Code::Sub_rm32_r32, Register::R10D, Register::R11D).map_err(|e| anyhow!("{e}"))?);

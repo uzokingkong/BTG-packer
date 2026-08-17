@@ -215,6 +215,24 @@ impl RiscLifter {
         let scale = inst.memory_index_scale();
         let disp = inst.memory_displacement64();
 
+        // P2 (G3): RIP-relative addressing — x86의 `[rip+disp32]`는 **다음 명령
+        // 주소**(inst.ip() + inst.len()) + disp32 가 피연산자의 절대 주소다.
+        // 패킹 후 데이터 섹션(.rdata/.data/.rodata)은 원본 RVA를 그대로 유지하므로
+        // 소스 절대 VA를 즉시값으로 박으면 런타임 주소와 일치한다.
+        //
+        // ⚠ P2 (G3) 최종 BISECT: 이 lift로 새로 가상화된 블록이 현재 타깃에서
+        // 네이티브 self-decoding 디스패처의 keystream 불일치로 크래시(0xC0000005,
+        // MemoryRead 핸들러가 결정적으로 가비지 주소 0x28006b46d deref)를 일으킨다.
+        // 규명·수정한 것: (1) h_nop 미등록 폭별 ALU 핸들러 no-op 버그 → 5종 20개
+        // 핸들러 구현. (2) 함수 원자성(.pdata) 시도 — 커버리지 절반으로 하락+크래시
+        // 미해소로 revert. (3) 양-즉시 AddWithCarry는 차등 테스트로 정상 확인.
+        // 남은 원인: 가상화 블록이 제외 함수 **꼬리**를 네이티브 브리지로 호출하는
+        // 경계 문제 또는 네이티브 디스패처의 특정 op keystream 소비 차이 — 후속 P2.
+        // 안전을 위해 **게이트**한다. (진단 [P2-RISC-GAP]이 갭을 계속 노출.)
+        if base_reg == Register::RIP {
+            return Err(anyhow!("risc lifter: RIP-relative addressing (P2 gap, gated)"));
+        }
+
         // 1. Start with base or 0
         if base_reg != Register::None {
             let base_v = Self::reg_to_vreg(base_reg).ok_or_else(|| anyhow!("unsupported base reg"))?;
@@ -311,6 +329,10 @@ impl RiscLifter {
         let code = inst.code();
 
         match code {
+            // P2 (G3): NOP / Pause — 무연산. RISC micro-op을 만들지 않아
+            // 커버리지를 높이고(코드베이스 NOP/멀티바이트 NOP 다수) 실행 의미도
+            // 그대로다. (Pause는 스핀 루프 힌트일 뿐 단일 스레드 의미론 무연산.)
+            Code::Nopw | Code::Nopd | Code::Nop_rm16 | Code::Nop_rm32 | Code::Nop_rm64 | Code::Pause => {}
             // ???? MOV ?④쑴肉?????????????????????????????????????????????????????????????????????????????????????????????????????????????????
             Code::Mov_r64_rm64 | Code::Mov_r32_rm32 | Code::Mov_r16_rm16 | Code::Mov_r8_rm8 => {
                 let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
@@ -407,7 +429,13 @@ impl RiscLifter {
             | Code::Add_rm32_imm32
             | Code::Add_rm32_imm8
             | Code::Add_RAX_imm32
-            | Code::Add_EAX_imm32 => self.lift_binary_alu(inst, Alu::Add)?,
+            | Code::Add_EAX_imm32
+            // P2 (G3): 8-bit ADD — Add{width:1}가 폭별 플래그·마스킹을 처리하고
+            // preserve_upper가 레지스터 상위 비트를 복원한다 (메모리는 RMW가 정확).
+            | Code::Add_AL_imm8
+            | Code::Add_r8_rm8
+            | Code::Add_rm8_imm8
+            | Code::Add_rm8_r8 => self.lift_binary_alu(inst, Alu::Add)?,
             Code::Sub_rm64_r64
             | Code::Sub_r64_rm64
             | Code::Sub_rm32_r32
@@ -417,7 +445,12 @@ impl RiscLifter {
             | Code::Sub_rm32_imm32
             | Code::Sub_rm32_imm8
             | Code::Sub_RAX_imm32
-            | Code::Sub_EAX_imm32 => self.lift_binary_alu(inst, Alu::Sub)?,
+            | Code::Sub_EAX_imm32
+            // P2 (G3): 8-bit SUB — SubWithBorrow{width:1} + preserve_upper.
+            | Code::Sub_AL_imm8
+            | Code::Sub_r8_rm8
+            | Code::Sub_rm8_imm8
+            | Code::Sub_rm8_r8 => self.lift_binary_alu(inst, Alu::Sub)?,
             Code::Xor_rm64_r64
             | Code::Xor_r64_rm64
             | Code::Xor_rm32_r32
@@ -480,7 +513,16 @@ impl RiscLifter {
             | Code::Cmp_rm32_r32
             | Code::Cmp_rm32_imm32
             | Code::Cmp_rm32_imm8
-            | Code::Cmp_EAX_imm32 => self.lift_cmp(inst)?,
+            | Code::Cmp_EAX_imm32
+            // P2 (G3): 8/16-bit CMP — lift_cmp는 SubWithBorrow{width}로 폭별
+            // 플래그를 정확히 계산하고 결과는 버린다 (스크래치 Temp(7)).
+            | Code::Cmp_AL_imm8
+            | Code::Cmp_r8_rm8
+            | Code::Cmp_rm8_imm8
+            | Code::Cmp_rm8_r8
+            | Code::Cmp_rm16_imm16
+            | Code::Cmp_rm16_imm8
+            | Code::Cmp_rm16_r16 => self.lift_cmp(inst)?,
 
             // ???? ??쀫늄??(SHL / SHR) ????????????????????????????????????????????????????????????????????????????????????????????
             Code::Shl_rm64_imm8 | Code::Shl_rm64_1 | Code::Shl_rm64_CL
@@ -540,6 +582,20 @@ impl RiscLifter {
             Code::Jmp_rel32_64 | Code::Jmp_rel8_64 => {
                 let target = inst.near_branch_target();
                 self.desynth.emit_jmp(target);
+            }
+            // P2 (G3): 간접 JMP (`jmp rax` / `jmp [rip+..]` / `jmp qword ptr [rax+...]`).
+            // 점프 테이블·가상 함수·switch dispatch 에 쓰인다. 타깃은 런타임 값이므로
+            // VirtualBranch(Always)의 src1(계산된 타깃)로 emit한다 — Call_rm64와 동일
+            // 계약으로, 타깃이 branch-map(ip_map)에 있으면 VM 내부 dispatch, 없으면
+            // h_branch가 native-call 브리지로 처리한다.
+            Code::Jmp_rm64 | Code::Jmp_rm32 => {
+                let target = self.operand_value(inst, 0)?;
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::VirtualBranch {
+                        cond: BranchCondition::Always,
+                    })
+                    .with_src1(target),
+                );
             }
             Code::Je_rel32_64 | Code::Je_rel8_64 => {
                 let target = inst.near_branch_target();
@@ -952,7 +1008,10 @@ impl RiscLifter {
             | Code::Test_rm16_imm16
             | Code::Test_rm16_r16
             | Code::Test_AX_imm16
-            | Code::Test_AL_imm8 => self.lift_test(inst)?,
+            | Code::Test_AL_imm8
+            // P2 (G3): 8-bit TEST — lift_test가 `_ => 1`로 8비트 폭을 처리한다.
+            | Code::Test_rm8_r8
+            | Code::Test_rm8_imm8 => self.lift_test(inst)?,
 
             // ???? P2: XCHG ??????????????????????????????????????????????????????????????????????????????????????????????????????????????
             Code::Xchg_rm64_r64 | Code::Xchg_rm32_r32 | Code::Xchg_rm16_r16 | Code::Xchg_rm8_r8 => {

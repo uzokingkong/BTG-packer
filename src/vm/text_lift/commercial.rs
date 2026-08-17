@@ -143,6 +143,13 @@ pub fn lift_program_cfg_commercial(
 
     // RISC-unliftable 제외 넷 (전량-거부): RISC 리프터가 못 다루는 명령이 있는
     // 블록은 (그 함수 전체를) 네이티브로 유지 — 절대 절반 lift 금지.
+    //
+    // ⚠ 알려진 잠재 리스크 (P2 후속): SEH func_ranges 밖의 함수는 unliftable 블록
+    // 하나만 제외되어 가상화↔네이티브 경계가 함수 중간에 생길 수 있다. 그 경계를
+    // 건너는 가상화된 `jmp/call`이 네이티브 브리지로 함수 **꼬리**(add rsp; pop; ret)
+    // 를 호출하면 스택 프레임이 파괴된다(이번 타깃에선 RIP-relative 크래시로 발현).
+    // `.pdata` 함수 원자성으로 막을 수 있지만 커버리지가 절반으로 하락해(4513→2317)
+    // 채택하지 않음. 함수 원자성 + 경계-브리지 재설계는 후속 P2 항목.
     loop {
         let mut added = 0;
         for bb in blocks.iter() {
@@ -324,8 +331,23 @@ pub fn lift_program_cfg_commercial(
         .unwrap_or(entry_point_va);
 
     // RISC-lift 불가 명령 진단 (실패 지점 노출 — 전체 프로그램 lift 정확도).
+    //
+    // P2 (G3) 정제: SEH/panic-unwind 로 네이티브 유지되는 블록(구조적으로 VM 대상이
+    // 아님)은 제외하고, **RISC-unliftable 만으로** 네이티브로 밀려난 블록의 실패
+    // 명령만 집계한다. 그래야 남은 RISC 리프터 확장 항목(= P2 게이트)이 정확히 보인다.
+    let seh_block: HashSet<u64> = blocks
+        .iter()
+        .filter(|bb| {
+            excl.func_ranges.iter().any(|(s, e)| *s <= bb.start_va && bb.start_va < *e)
+        })
+        .map(|bb| bb.start_va)
+        .collect();
+    let mut risc_unliftable_blocks = 0usize;
     let mut unsupported = Vec::new();
     for bb in &blocks {
+        if seh_block.contains(&bb.start_va) {
+            continue;
+        }
         let real: Vec<Instruction> = bb
             .instructions
             .iter()
@@ -333,11 +355,36 @@ pub fn lift_program_cfg_commercial(
             .filter(|i| !is_zero_padding(i))
             .collect();
         let mut lifter = RiscLifter::new();
+        let mut failed = false;
         for i in &real {
-            if let Err(_) = lifter.lift_instruction(i) {
+            if lifter.lift_instruction(i).is_err() {
+                failed = true;
                 unsupported.push((format!("0x{:X}", i.ip()), i.code()));
             }
         }
+        if failed {
+            risc_unliftable_blocks += 1;
+        }
+    }
+    println!(
+        "[P2-RISC-GAP] blocks: {} virtualized, {} native (SEH {}+RISC-unliftable {}), {} RISC-lift unsupported instruction(s) in RISC-unliftable blocks:",
+        virtualized,
+        native_blocks,
+        excluded_blocks.len().saturating_sub(risc_unliftable_blocks),
+        risc_unliftable_blocks,
+        unsupported.len()
+    );
+    if !unsupported.is_empty() {
+        use std::collections::BTreeMap;
+        let mut by_code: BTreeMap<String, usize> = BTreeMap::new();
+        for (s, c) in &unsupported {
+            *by_code.entry(format!("{:?}", c)).or_insert(0) += 1;
+        }
+        for (k, v) in &by_code {
+            println!("    - {}  (x{})", k, v);
+        }
+    } else {
+        println!("[P2-RISC-GAP] all non-SEH blocks RISC-liftable (no unsupported)");
     }
 
     Ok(ProgramLiftCommercial {
@@ -628,6 +675,76 @@ mod tests {
         assert_eq!(ref_st.regs[3], 5, "rbx still 5");                    // reg[3] = rbx
         assert_eq!(ref_st.regs[6], exp_rax, "rsi = rax");                // reg[6] = rsi
         assert_eq!(ref_st.stack.len(), 0, "push+pop balanced");
+        assert_eq!(ref_st.vsp, 0, "vsp balanced");
+    }
+
+    /// P2 (G3): 8-bit ALU/CMP/TEST/NOP lift 정확성 — **값 단언**(x86 실제 의미론).
+    ///
+    /// 선형 블록 단위 동치(레퍼런스==네이티브)는 lift 자체의 버그(예: 8/16비트 상위
+    /// 비트 미보존, 8비트 CMP가 전체 64비트 레지스터를 비교)를 잡지 못한다 — 양쪽이
+    /// 같은 (잘못된) lift를 쓰기 때문. 그래서 여기서는 **x86 기대 값**을 직접 단언해
+    /// 8비트 부분-쓰기 상위 비트 보존과 8비트 CMP/TEST의 low-byte 비교를 고정한다.
+    ///
+    ///   mov rax, 0x1122334455667788 ; add al, 1 ; add al, 0x7F ; sub al, 2
+    ///   cmp al, 6 ; test al, 1 ; nop ; xor ecx, ecx ; mov cl, 0x80 ; test al, cl ; ret
+    ///
+    /// 최종 rax = 0x1122334455667706 (상위 비트 보존 + low-byte 0x06),
+    /// rcx = 0x80. CF는 add 0x7F에서 세트(0x89+0x7F=0x108), 최종 test al,cl → ZF=1.
+    #[test]
+    fn test_commercial_8bit_partial_write_and_cmp_test_matches_reference() {
+        use crate::vm::poly::PolymorphicEncoder;
+        use crate::vm::risc::RiscProgram;
+        use crate::vm::threaded::harness::run_native_poly;
+        use iced_x86::{Decoder, DecoderOptions};
+
+        let raw = [
+            0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, 0x1122334455667788
+            0x04, 0x01, // add al, 1
+            0x04, 0x7F, // add al, 0x7F  (low 0x89+0x7F=0x108 → 0x08, CF=1)
+            0x2C, 0x02, // sub al, 2    (0x08-2 = 0x06)
+            0x3C, 0x06, // cmp al, 6    (ZF=1)
+            0xA8, 0x01, // test al, 1   (0x06&1=0 → ZF=0)
+            0x90,       // nop
+            0x31, 0xC9, // xor ecx, ecx
+            0xB1, 0x80, // mov cl, 0x80
+            0x84, 0xC8, // test al, cl  (0x06&0x80=0 → ZF=1)
+            0xC3,       // ret
+        ];
+        let base = 0x140001000u64;
+
+        let mut decoder = Decoder::with_ip(64, &raw, base, DecoderOptions::NONE);
+        let mut lifter = RiscLifter::new();
+        while decoder.can_decode() {
+            let inst = decoder.decode();
+            lifter.lift_instruction(&inst).expect("all instructions RISC-liftable");
+        }
+        let prog = RiscProgram::new(lifter.desynth.instrs);
+        assert!(!prog.instrs.is_empty(), "lifted program must be non-empty");
+
+        let init = [0u64; 16];
+        let ref_st = prog.eval_state(&init);
+
+        // P2 (G3): 하네스 8/16비트 Add/Sub 어셈블 버그(Register 63 + 상위 비트 0-확장)
+        // 를 고친 뒤 `run_native_poly` 차등 실행 == `eval_state` 참조 (regs/temps/vsp).
+        // flags는 store_flags의 FLAG_MASK가 PF/AF를 제외하므로 전부 동치를 단언하지
+        // 않고, 아래에서 ZF 값 단언으로 8비트 CMP/TEST 플래그를 고정한다.
+        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
+            let mut enc = PolymorphicEncoder::new(seed);
+            let bytecode = enc.encode(&prog).unwrap();
+            let nat = run_native_poly(&bytecode, seed, &init)
+                .map_err(|e| format!("seed {seed:#x}: native run failed: {e}"))
+                .unwrap();
+            assert_eq!(nat.regs, ref_st.regs, "seed {seed:#x}: regs mismatch");
+            assert_eq!(nat.temps, ref_st.temps, "seed {seed:#x}: temps mismatch");
+            assert_eq!(nat.vsp, ref_st.vsp, "seed {seed:#x}: vsp mismatch");
+        }
+
+        // x86 실제 의미론 값 단언 (lift 버그 회귀 고정):
+        assert_eq!(ref_st.regs[0], 0x1122334455667706, "rax: upper preserved + low byte 0x06");
+        // mov cl, 0x80 → rcx low byte 0x80 (rcx는 xor로 0 확장됨)
+        assert_eq!(ref_st.regs[1], 0x80, "rcx low byte 0x80");
+        // 최종 test al, cl: 0x06 & 0x80 == 0 → ZF=1
+        assert_ne!(ref_st.flags & crate::vm::risc::flags::VFLAG_ZF, 0, "ZF set by final test");
         assert_eq!(ref_st.vsp, 0, "vsp balanced");
     }
 }

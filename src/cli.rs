@@ -21,6 +21,12 @@ pub struct CliArgs {
     #[arg(short, long, default_value = "protected_btg.exe")]
     pub output: PathBuf,
 
+    /// P3-1: 결정적 빌드용 시드. `--seed <u64>`로 패킹의 모든 RNG
+    /// (셔플/mba_constant/crypto 시드/폴리 시드/레이아웃 패드)를 고정한다.
+    /// 같은 input + seed + config → 같은 output (재현·디버깅·상용 배포용).
+    #[arg(long)]
+    pub seed: Option<u64>,
+
     /// Obfuscation intensity level (1: Basic, 2: MBA, 3: Overlapping + MBA)
     #[arg(short = 'l', long, default_value_t = 3)]
     pub obf_level: u32,
