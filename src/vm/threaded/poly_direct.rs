@@ -693,8 +693,12 @@ pub fn build_self_decoding_parts_with(
         mov_m(&mut b, Register::R11, DEC_IMM2);
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
-        b.push(Instruction::with2(Code::Or_rm64_r64, Register::R10, Register::R11).unwrap());
+        // P6-2: NOR 시그니처 제거 — `~(a|b)` 를 `(~a) & (~b)` 로 재표현해
+        // 원시 NOR(OR+NOT) 패턴을 노출하지 않는다. De Morgan 등가이며 플래그
+        // 의미(NOR 결과 기준 ZF/SF/PF)는 동일하다.
         b.push(Instruction::with1(Code::Not_rm64, Register::R10).unwrap());
+        b.push(Instruction::with1(Code::Not_rm64, Register::R11).unwrap());
+        b.push(Instruction::with2(Code::And_rm64_r64, Register::R10, Register::R11).unwrap());
         b.push(Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).unwrap());
         emit_store_flags(&mut b);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
