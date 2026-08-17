@@ -64,7 +64,7 @@ RUN_EXIT=0
 
 ## 3. VMR 가상화의 현재 커버리지 (문서와 코드 기준)
 
-- **Program VM (OEP 가상화)**: OEP→VM 진입 고정, `entry_native=false`. VM 바이트코드 312,035B가 at-rest RC4 암호화. (docs/milestones.md §2.4, docs/vm-compiler-architecture.md §5)
+- **Program VM (OEP 가상화)**: OEP→VM 진입 고정, `entry_native=false`. VM 바이트코드 312,035B가 at-rest RC4 암호화. (docs/roadmap/milestones.md §2.4, docs/architecture/vm-compiler-architecture.md §5)
 - **.textb 셔플**: 6,973/12,170 블록이 셔플+암호화되어 `.textb`로 이동. (pack_vmoep.log)
 - **SEH 네이티브 유지**: panic/catch unwind 경로 함수 175개(0x127B0 bytes)는 원본 `.text`에 네이티브로 유지 (SEH unwind가 .pdata 커버리지를 요구하므로). 이들도 평문으로 남는다.
 - **VM→네이티브 브리지**: 제외(SEH) 블록과 CRT/런타임 경로는 native-call 브리지로 실행. 이 브리지가 원본 `.text`의 네이티브 함수를 호출하므로, 실행 도중에는 원본 `.text` 코드가 실제로 실행된다.

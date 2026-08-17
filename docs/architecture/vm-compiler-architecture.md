@@ -52,7 +52,7 @@ RISC De-synthesis, 빌드별 시드 기반 다형성(Polymorphic ISA), 롤링 �
 
 ## 3. Phase 1 분해 — 완료 ✅
 
-모든 긴 단일 파일이 디렉터리 모듈로 분해됨 (`milestones.md`의 표 참조).
+모든 긴 단일 파일이 디렉터리 모듈로 분해됨 (`../roadmap/milestones.md`의 표 참조).
 순수 코드 이동 원칙: 공개 API 불변, `cargo build --release` green +
 `cargo test`(68) + `--vm-test` ALL PASS + 문자열/hex 리터럴 회귀 0.
 
@@ -111,4 +111,4 @@ BTG 패커는 실제 실행 코드를 `.textb` 블록(셔플+RC4)으로 옮기�
   `slicer.rs`의 jcc는 네이티브 타깃에 원본 분기를 유지한다. 이 타깃에서 .text의
   ~28%(175 함수)가 네이티브 유지되며 --vm/--chained/plain 패킹 [1..16] 전체 통과.
 
-세부 우선순위/검증 기준은 `milestones.md` 참조.
+세부 우선순위/검증 기준은 `../roadmap/milestones.md` 참조.

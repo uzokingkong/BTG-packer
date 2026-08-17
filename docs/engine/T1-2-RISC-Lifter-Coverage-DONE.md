@@ -45,7 +45,7 @@
   → **P1(2026-08-15)에서 해소**: 폴리 인코더/인터프리터가 `ArithmeticShiftRight`, `VirtualBranch`,
   `MemoryRead/Write{1,2,4,8}`, `NativeCallBridge`를 인코딩·실행하며 `PolymorphicInterpreter` ==
   `eval_state` **완전 상태 동치**(regs/temps/flags/vsp/stack/mem) 차등 테스트(≥3 seeds)가 green.
-  상세: `docs/COMMERCIAL-VM-UPGRADE-PLAN.md` §P1, `docs/milestones.md` Phase 5, `docs/journal/2026-08-15.md`.
+  상세: `docs/roadmap/COMMERCIAL-VM-UPGRADE-PLAN.md` §P1, `docs/roadmap/milestones.md` Phase 5, `docs/journal/2026-08-15.md`.
 
 ## 4. 검증
 
@@ -103,7 +103,7 @@
 <COMMIT_HASH_PLACEHOLDER> feat(vm/risc): T1-2 remainder — SAR, MOVSX, JP/JNP, Jcxz/Jecxz, precise unsigned Jcc
 ```
 - 변경 파일: `src/vm/risc/opcodes.rs`, `src/vm/risc/flags.rs`, `src/vm/risc/mod.rs`,
-  `src/vm/risc/lifter.rs`, `src/vm/threaded/harness.rs`(PF 동기화), `docs/T1-2-RISC-Lifter-Coverage-DONE.md`.
+  `src/vm/risc/lifter.rs`, `src/vm/threaded/harness.rs`(PF 동기화), `docs/engine/T1-2-RISC-Lifter-Coverage-DONE.md`.
 
 ### 후속 — P1 폴리 계층 완성 (2026-08-15, §3 과제 해소)
 - `vm/poly/isa_spec.rs`·`encoder.rs`·`interpreter.rs`가 메모리/분기/SAR/NativeCallBridge op를

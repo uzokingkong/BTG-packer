@@ -116,4 +116,4 @@
 - **검증**: `--vm --vm-oep --vm-commercial` pack→run → **16개 테스트 전체 통과 +
   FINAL CHECKSUM `0x2cdc0e4511d84a64`** (= baseline, 3회 반복 안정). `cargo test
   --release --lib` → 236 passed; 0 failed. `--vm`/`--vm-oep` 무회귀.
-- 기록: `docs/P3-handlers-wired-and-verified.md` §5, `docs/P3-commercial-selfdecoding-fix.md`.
+- 기록: `docs/engine/P3-handlers-wired-and-verified.md` §5, `docs/engine/P3-commercial-selfdecoding-fix.md`.

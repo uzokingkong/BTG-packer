@@ -68,7 +68,7 @@
 
 ## 4. 아티팩트
 
-- `docs/VirtualBranch-Native-Handler-DONE.md` (세션 2 갱신)
+- `docs/engine/VirtualBranch-Native-Handler-DONE.md` (세션 2 갱신)
 - `docs/journal/2026-08-15.md` (본 세션 저널)
 - 본 보고서 (P3 핸들러 구현·와이어·검증)
 
@@ -78,8 +78,8 @@
 
 > **해소 (후속 세션)**: self-decoding 디스패처에 레거시 `OP_NATIVE_CALL`급 **네이티브
 > 콜 브리지**를 구현하고, 상용 리프트에 OEP **entry-jump**를 추가해 `--vm-commercial`
-> run을 green으로 돌렸다. 상세: `docs/VirtualBranch-Native-Handler-DONE.md` §"남은 것 →
-> 해소", `docs/P3-commercial-selfdecoding-fix.md`.
+> run을 green으로 돌렸다. 상세: `docs/engine/VirtualBranch-Native-Handler-DONE.md` §"남은 것 →
+> 해소", `docs/engine/P3-commercial-selfdecoding-fix.md`.
 
 ### 5.1 문제 (이전)
 
@@ -112,4 +112,4 @@ branch-map에 없어 바이트 오프셋 폴백으로 잘못 점프 → 바이�
 - `--vm --vm-oep` pack→run → **16개 테스트 전체 통과**, FINAL CHECKSUM `0x2cdc0e4511d84a64`.
 - **`--vm --vm-oep --vm-commercial` pack→run → 16개 테스트 전체 통과 + FINAL CHECKSUM
   `0x2cdc0e4511d84a64`** (= baseline, 3회 반복 안정). **0xC0000005 해소.**
-- 기록: `docs/P3-commercial-selfdecoding-fix.md` · milestones "pre-existing P3 gap → 해소".
+- 기록: `docs/engine/P3-commercial-selfdecoding-fix.md` · milestones "pre-existing P3 gap → 해소".

@@ -2,8 +2,8 @@
 
 > 작성일: 2026-08-15 · 대상 repo: `asdfsadfecwecc` (BTG Packer) · node `ujiwo-zyris-code`
 > 기준 HEAD: `cc6b973` (RISC 32-bit zero-extension / shift-count masking, 2026-08-15)
-> 근거: `problem.txt`, `docs/milestones.md`, `docs/vm-compiler-architecture.md`,
-> `docs/commercial-vm-engine.md`, `docs/coverage.md`, `docs/T1-2-*/`, `docs/T1-4-*/`,
+> 근거: `problem.txt`, `docs/roadmap/milestones.md`, `docs/architecture/vm-compiler-architecture.md`,
+> `docs/architecture/commercial-vm-engine.md`, `docs/architecture/coverage.md`, `docs/T1-2-*/`, `docs/T1-4-*/`,
 > 소스 실측(`src/vm/risc|poly|threaded`, `src/pipeline/selective_vm|poly_embed`, `src/main.rs`),
 > 이전 실행의 패킹 실측(packed_vmoep.exe, .text 평문 확인).
 
@@ -19,7 +19,7 @@
 | 방식 | 1:1 CISC→VM 바이트코드 (171–187 opcode) | RISC De-synthesis(12 micro-op) → 폴리모픽 ISA → 다이렉트 스레딩 |
 | 명령 커버리지 | **100%** (실측 26,956/26,956) | **부분** (mov/lea/shift/arith/cmp/call/jcc/mem-operand + 32비트 정밀화) |
 | **실제 역할** | **`--vm-oep` 프로그램 전체 가상화를 실제 담당** | **SDK 마커(`BTG_VM_START/END`) 선택 가상화 + T1-3 폴리 스텁 임베드만 담당** |
-| 탈가상화 저항 | 약함 (1:1 매핑 — `commercial-vm-engine.md §1`이 스스로 "정적 패턴/심볼릭 탈가상화에 취약" 명시) | 강함(목표) |
+| 탈가상화 저항 | 약함 (1:1 매핑 — `../architecture/commercial-vm-engine.md §1`이 스스로 "정적 패턴/심볼릭 탈가상화에 취약" 명시) | 강함(목표) |
 
 **⇒ 가장 중요한 갭: 상용 엔진이 아직 "전체 프로그램 가상화"의 백엔드가 아니다.** `--vm-oep`는 여전히 레거시 1:1 VM으로 프로그램을 돌린다. 이는 문서상 "상용급 완료"라는 표기와 실제 코드가 어긋나는 지점이다.
 
@@ -224,7 +224,7 @@ teardown으로 배제(132가 채택 최소치). `.pdata` 재생성(브리지 UNW
 1. **샘플 타깃 확보**: `real_win_calc.exe`(메모장/계산기 등 Win32 GUI) 1~3개 추가, `--vm-commercial` 회귀.
 2. **자동 회귀 스크립트**: `cargo test` + `--vm-test` + 5개 CLI 조합(`plain / --vm / --vm-oep / --full / --chained`) pack→run→checksum 비교를 한 번에.
 3. **크래시/Event Log 모니터링**: packed 실행 후 Windows Event Log 0 Crash 검증.
-4. **문서 동기화**: `commercial-vm-engine.md`·`milestones.md`가 "실제 통합 여부"를 솔직히 반영(현재 "완료" 표기는 G1 때문에 과장).
+4. **문서 동기화**: `../architecture/commercial-vm-engine.md`·`milestones.md`가 "실제 통합 여부"를 솔직히 반영(현재 "완료" 표기는 G1 때문에 과장).
 5. **성능 벤치**: `--vm-bench`로 상용 경로 오버헤드 측정, P6 후 목표치 설정.
 
 **검증**: 전 샘플 타깃 × 전 조합 green. 문서가 코드와 일치.

@@ -127,8 +127,9 @@ x86-64 PE
   └── qa/             멀티 컴파일러 QA 벤치마크
 ```
 
-핵심 설계 문서: [`docs/vm-compiler-architecture.md`](docs/vm-compiler-architecture.md) ·
-[`docs/commercial-vm-engine.md`](docs/commercial-vm-engine.md)
+핵심 설계 문서: [`docs/architecture/vm-compiler-architecture.md`](docs/architecture/vm-compiler-architecture.md) ·
+[`docs/architecture/commercial-vm-engine.md`](docs/architecture/commercial-vm-engine.md) ·
+[`docs/README.md`](docs/README.md) (전체 문서 인덱스)
 
 ---
 
@@ -223,9 +224,9 @@ btg-packer.exe -i test.exe -o packed.exe --no-crypto
 
 ## 상용화 진행 (P0~P3)
 
-상세 로드맵: [`docs/commercial-readiness-plan.md`](docs/commercial-readiness-plan.md) ·
-[`docs/COMMERCIAL-VM-UPGRADE-PLAN.md`](docs/COMMERCIAL-VM-UPGRADE-PLAN.md) ·
-[`docs/milestones.md`](docs/milestones.md)
+상세 로드맵: [`docs/roadmap/commercial-readiness-plan.md`](docs/roadmap/commercial-readiness-plan.md) ·
+[`docs/roadmap/COMMERCIAL-VM-UPGRADE-PLAN.md`](docs/roadmap/COMMERCIAL-VM-UPGRADE-PLAN.md) ·
+[`docs/roadmap/milestones.md`](docs/roadmap/milestones.md)
 
 - **P0-1** canonical semantics 단일화 · **P0-2** Win64 ABI 검증기 · **P0-4** PE 구조
   전수 검증 · **P0-5** MUL/IMUL CF/OF · **P0-7** ASLR 보존 → 완료
@@ -240,15 +241,16 @@ btg-packer.exe -i test.exe -o packed.exe --no-crypto
 
 | 문서 | 내용 |
 |---|---|
-| [`docs/vm-compiler-architecture.md`](docs/vm-compiler-architecture.md) | 모듈 지도, 컴파일러 프론트엔드/부트 정합 |
-| [`docs/commercial-vm-engine.md`](docs/commercial-vm-engine.md) | Phase 1~4 상용 가상화 엔진 심층 설계 |
-| [`docs/COMMERCIAL-VM-UPGRADE-PLAN.md`](docs/COMMERCIAL-VM-UPGRADE-PLAN.md) | 상용화 마스터플랜 (갭 분석) |
-| [`docs/commercial-readiness-plan.md`](docs/commercial-readiness-plan.md) | P0~P3 실행 로드맵 (상태 마커) |
-| [`docs/coverage.md`](docs/coverage.md) | 명령 커버리지 베이스라인 |
-| [`docs/milestones.md`](docs/milestones.md) | 마일스톤 체크리스트 |
-| [`docs/P3-handlers-wired-and-verified.md`](docs/P3-handlers-wired-and-verified.md) | 상용 self-decoding 핸들러 검증 |
-| [`docs/T1-2-RISC-Lifter-Coverage-DONE.md`](docs/T1-2-RISC-Lifter-Coverage-DONE.md) | RISC 리프터 커버리지 |
-| [`docs/T1-4-Native-SelfDecoding-Dispatcher-DONE.md`](docs/T1-4-Native-SelfDecoding-Dispatcher-DONE.md) | 네이티브 self-decoding 디스패처 |
+| [`docs/README.md`](docs/README.md) | 전체 문서 인덱스 (카테고리별) |
+| [`docs/architecture/vm-compiler-architecture.md`](docs/architecture/vm-compiler-architecture.md) | 모듈 지도, 컴파일러 프론트엔드/부트 정합 |
+| [`docs/architecture/commercial-vm-engine.md`](docs/architecture/commercial-vm-engine.md) | Phase 1~4 상용 가상화 엔진 심층 설계 |
+| [`docs/architecture/coverage.md`](docs/architecture/coverage.md) | 명령 커버리지 베이스라인 |
+| [`docs/roadmap/COMMERCIAL-VM-UPGRADE-PLAN.md`](docs/roadmap/COMMERCIAL-VM-UPGRADE-PLAN.md) | 상용화 마스터플랜 (갭 분석) |
+| [`docs/roadmap/commercial-readiness-plan.md`](docs/roadmap/commercial-readiness-plan.md) | P0~P3 실행 로드맵 (상태 마커) |
+| [`docs/roadmap/milestones.md`](docs/roadmap/milestones.md) | 마일스톤 체크리스트 |
+| [`docs/engine/P3-handlers-wired-and-verified.md`](docs/engine/P3-handlers-wired-and-verified.md) | 상용 self-decoding 핸들러 검증 |
+| [`docs/engine/T1-2-RISC-Lifter-Coverage-DONE.md`](docs/engine/T1-2-RISC-Lifter-Coverage-DONE.md) | RISC 리프터 커버리지 |
+| [`docs/engine/T1-4-Native-SelfDecoding-Dispatcher-DONE.md`](docs/engine/T1-4-Native-SelfDecoding-Dispatcher-DONE.md) | 네이티브 self-decoding 디스패처 |
 | [`docs/journal/`](docs/journal/) | 일일 작업 기록 |
 
 ---

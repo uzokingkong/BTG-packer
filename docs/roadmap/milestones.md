@@ -36,7 +36,7 @@
 ## Phase 2 — 레거시 컴파일러 프론트엔드 (IR + 커버리지 + 전체 가상화) ✅
 
 ### 2.1 명령 커버리지 완결 ✅
-- [x] `--text-vm` 진단 커버리지 100.00% 달성 (`coverage.md`).
+- [x] `--text-vm` 진단 커버리지 100.00% 달성 (`../architecture/coverage.md`).
 - [x] SSE/FPU, BMI1/2, 문자열 ops, CMOVcc, LOCK inc/dec 지원.
 
 ### 2.2 제외 블록 최소화 및 SEH 안정성 ✅
@@ -66,16 +66,16 @@
 ---
 
 ## Phase 4 — 문서화 및 유지보수 ✅
-- [x] `docs/vm-compiler-architecture.md` — 모듈 지도 및 엔진 아키텍처 개요.
-- [x] `docs/commercial-vm-engine.md` — Themida/VMProtect급 4단계 상용 가상화 엔진 심층 설계서.
-- [x] `docs/coverage.md` — 명령어 커버리지 베이스라인.
-- [x] `docs/milestones.md` — 전체 마일스톤 체크리스트.
+- [x] `docs/architecture/vm-compiler-architecture.md` — 모듈 지도 및 엔진 아키텍처 개요.
+- [x] `docs/architecture/commercial-vm-engine.md` — Themida/VMProtect급 4단계 상용 가상화 엔진 심층 설계서.
+- [x] `docs/architecture/coverage.md` — 명령어 커버리지 베이스라인.
+- [x] `docs/roadmap/milestones.md` — 전체 마일스톤 체크리스트.
 
 ---
 
 ## Phase 5 — 상용 VM 컴파일러 업그레이드 플랜 (P0 / P1) 🔶
 
-> 상세: `docs/COMMERCIAL-VM-UPGRADE-PLAN.md` · 대상 브랜치: `commercial/p1-poly-complete`
+> 상세: `docs/roadmap/COMMERCIAL-VM-UPGRADE-PLAN.md` · 대상 브랜치: `commercial/p1-poly-complete`
 > (기준 `cc6b973` = `origin/main`).
 
 ### P0 — 저장소 정리 (Repo Consolidation) ✅
@@ -143,7 +143,7 @@
       ret_ip pop → GPR 실장 → Win64 콜 → 동기화 → ret_ip 재개) + 상용 리프트 **OEP
       entry-jump** 추가로 0xC0000005 해소. **16개 테스트 전체 통과 + FINAL CHECKSUM
       `0x2cdc0e4511d84a64`** (= baseline, 3회 반복 안정). (기록:
-      `docs/P3-handlers-wired-and-verified.md` §5, `docs/VirtualBranch-Native-Handler-DONE.md`.)
+      `docs/engine/P3-handlers-wired-and-verified.md` §5, `docs/engine/VirtualBranch-Native-Handler-DONE.md`.)
 
 ### P3 — 상용 self-decoding 핸들러 전수 구현·와이어·검증 ✅ (2026-08-15)
 - [x] VirtualBranch (taken/not-taken, ip_map 분기 해석, rolling-key 재동기화) — 차등 2개 green.

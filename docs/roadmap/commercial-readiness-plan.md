@@ -23,7 +23,7 @@
 
 ### 1-1. Canonical VM semantics 단일화 (Notes #1)
 - **목표**: 하나의 x86 명령이 모든 백엔드(lifter→IR→RISC→poly→threaded→handlers→interp)에서 동일 의미론.
-- **작업**: `docs/vm-compiler-architecture.md`에 semantic contract 명문화 → 각 백엔드가 참조하는 단일 `vm/semantics.rs`(상수/함수)로 통합. BSR/BSF/TZCNT/LZCNT, ADC/SBB, shift count, partial register, RFLAGS 규칙을 전수 대조.
+- **작업**: `docs/architecture/vm-compiler-architecture.md`에 semantic contract 명문화 → 각 백엔드가 참조하는 단일 `vm/semantics.rs`(상수/함수)로 통합. BSR/BSF/TZCNT/LZCNT, ADC/SBB, shift count, partial register, RFLAGS 규칙을 전수 대조.
 - **검증**: 명령 × 백엔드 차등 테스트 행렬 자동 생성.
 - **상태**: 🔶 진행 중 — ✅ (f7578b5) ADD/SUB/CMP/INC/DEC/NEG/NOT/SHIFT의 x86 정확 플래그를 전용 micro-op으로 canonical화, RISC 참조·poly 인터프리터·harness 동기화, cross-path 플래그 drift **0**(하드 게이트). ⬜ BSR/BSF/TZCNT/LZCNT 폭·ZF 정책 전수 대조, ADC/SBB 전용 op, partial register(AH/BH) 정책, poly_direct 네이티브 핸들러의 AF 캡처 정합.
 

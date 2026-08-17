@@ -9,7 +9,7 @@
 모듈**이 `--vm-commercial` 부트 크래시(`0xC0000005`)의 근본 원인이었음을 진단·해소했다.
 그 모듈의 tail-dispatch는 rolling-key 폴리 바이트코드를 **full-64-bit seed**로 XOR하고
 **operand 디코딩이 전혀 없어** `mov rax,[r15+rax*8]`가 가비지 인덱스로 폭발했다.
-(`docs/P4-P5-gates-progress.md` §8의 기존 진단과 일치.)
+(`docs/engine/P4-P5-gates-progress.md` §8의 기존 진단과 일치.)
 
 ## 변경 내용
 

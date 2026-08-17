@@ -145,7 +145,7 @@ TLS RVA 0x36e80 size 40  (IMAGE_TLS_DIRECTORY64)
       16테스트 + cdb).
 - [ ] P4: 브리지 진입 스텁 .pdata/UNWIND_INFO 생성기 (3.3).
 - [ ] P4: SEH 네이티브 175→최소, [10] 가상화 통과.
-- [ ] 문저: milestones.md / COMMERCIAL-VM-UPGRADE-PLAN.md 현재 상태 반영.
+- [ ] 문저: ../roadmap/milestones.md / ../roadmap/COMMERCIAL-VM-UPGRADE-PLAN.md 현재 상태 반영.
 
 ---
 
@@ -260,7 +260,7 @@ CHECKSUM `0x2cdc0e4511d84a64`(baseline 동일)를 만족하며, 132가 더 공�
   test[10] catch_unwind의 정상 unwinding (first chance).
 
 ### 문서 반영
-- `docs/milestones.md` — P5 완료 체크리스트 + 최종 회귀 섹션 추가.
+- `docs/roadmap/milestones.md` — P5 완료 체크리스트 + 최종 회귀 섹션 추가.
 - `docs/journal/2026-08-15.md` — 본 회귀 세션 저널.
 - 커밋: `Co-authored-by: Attacca <attacca@walruslab.org>` + origin push.
 
