@@ -460,7 +460,11 @@ impl RiscLifter {
             | Code::Xor_rm32_imm32
             | Code::Xor_rm32_imm8
             | Code::Xor_RAX_imm32
-            | Code::Xor_EAX_imm32 => self.lift_binary_alu(inst, Alu::Xor)?,
+            | Code::Xor_EAX_imm32
+            // R7: 8/16-bit XOR — lift_binary_alu가 폭별 마스킹 + preserve_upper.
+            | Code::Xor_rm8_r8 | Code::Xor_r8_rm8 | Code::Xor_AL_imm8 | Code::Xor_rm8_imm8
+            | Code::Xor_rm16_r16 | Code::Xor_r16_rm16 | Code::Xor_AX_imm16
+            | Code::Xor_rm16_imm8 | Code::Xor_rm16_imm16 => self.lift_binary_alu(inst, Alu::Xor)?,
             Code::And_rm64_r64
             | Code::And_r64_rm64
             | Code::And_rm32_r32
@@ -470,7 +474,11 @@ impl RiscLifter {
             | Code::And_rm32_imm32
             | Code::And_rm32_imm8
             | Code::And_RAX_imm32
-            | Code::And_EAX_imm32 => self.lift_binary_alu(inst, Alu::And)?,
+            | Code::And_EAX_imm32
+            // R7: 8/16-bit AND — 폭별 마스킹 + preserve_upper.
+            | Code::And_rm8_r8 | Code::And_r8_rm8 | Code::And_AL_imm8 | Code::And_rm8_imm8
+            | Code::And_rm16_r16 | Code::And_r16_rm16 | Code::And_AX_imm16
+            | Code::And_rm16_imm8 | Code::And_rm16_imm16 => self.lift_binary_alu(inst, Alu::And)?,
             Code::Or_rm64_r64
             | Code::Or_r64_rm64
             | Code::Or_rm32_r32
@@ -480,27 +488,17 @@ impl RiscLifter {
             | Code::Or_rm32_imm32
             | Code::Or_rm32_imm8
             | Code::Or_RAX_imm32
-            | Code::Or_EAX_imm32 => self.lift_binary_alu(inst, Alu::Or)?,
-            Code::Neg_rm64 | Code::Neg_rm32 => {
-                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
-                // P0-1: NEG = 0 - a ??borrow-CF ?類μ넇(SubWithBorrow)??곗쨮 lift.
-                let width = Self::operand_width(inst);
-                self.desynth.instrs.push(
-                    MicroInstr::new(RiscOp::SubWithBorrow { width })
-                        .with_dst(dst)
-                        .with_src1(MicroOperand::Imm64(0))
-                        .with_src2(dst),
-                );
+            | Code::Or_EAX_imm32
+            // R7: 8/16-bit OR — 폭별 마스킹 + preserve_upper.
+            | Code::Or_rm8_r8 | Code::Or_r8_rm8 | Code::Or_AL_imm8 | Code::Or_rm8_imm8
+            | Code::Or_rm16_r16 | Code::Or_r16_rm16 | Code::Or_AX_imm16
+            | Code::Or_rm16_imm8 | Code::Or_rm16_imm16 => self.lift_binary_alu(inst, Alu::Or)?,
+            // R7: 8/16-bit NEG/NOT — SubWithBorrow/Not{width} + preserve_upper.
+            Code::Neg_rm8 | Code::Neg_rm16 | Code::Neg_rm64 | Code::Neg_rm32 => {
+                self.lift_neg_not(inst, false)?
             }
-            Code::Not_rm64 | Code::Not_rm32 => {
-                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
-                // P0-1: NOT?? x86?癒?퐣 RFLAGS ?븍뜄? ???袁⑹뒠 Not(width) op (???삋域??얜??野?.
-                let width = Self::operand_width(inst);
-                self.desynth.instrs.push(
-                    MicroInstr::new(RiscOp::Not { width })
-                        .with_dst(dst)
-                        .with_src1(dst),
-                );
+            Code::Not_rm8 | Code::Not_rm16 | Code::Not_rm64 | Code::Not_rm32 => {
+                self.lift_neg_not(inst, true)?
             }
 
             // ???? CMP (???삋域밸챶彛?揶쏄퉮?? ??????????????????????????????????????????????????????????????????????????????????????????
@@ -526,9 +524,15 @@ impl RiscLifter {
 
             // ???? ??쀫늄??(SHL / SHR) ????????????????????????????????????????????????????????????????????????????????????????????
             Code::Shl_rm64_imm8 | Code::Shl_rm64_1 | Code::Shl_rm64_CL
-            | Code::Shl_rm32_imm8 | Code::Shl_rm32_1 | Code::Shl_rm32_CL => self.lift_shift(inst, RiscOp::ShiftLeft)?,
+            | Code::Shl_rm32_imm8 | Code::Shl_rm32_1 | Code::Shl_rm32_CL
+            // R7: 8/16-bit SHL — lift_shift가 폭별 마스킹 + preserve_upper.
+            | Code::Shl_rm16_imm8 | Code::Shl_rm16_1 | Code::Shl_rm16_CL
+            | Code::Shl_rm8_imm8 | Code::Shl_rm8_1 | Code::Shl_rm8_CL => self.lift_shift(inst, RiscOp::ShiftLeft)?,
             Code::Shr_rm64_imm8 | Code::Shr_rm64_1 | Code::Shr_rm64_CL
-            | Code::Shr_rm32_imm8 | Code::Shr_rm32_1 | Code::Shr_rm32_CL => self.lift_shift(inst, RiscOp::ShiftRight)?,
+            | Code::Shr_rm32_imm8 | Code::Shr_rm32_1 | Code::Shr_rm32_CL
+            // R7: 8/16-bit SHR — lift_shift가 폭별 마스킹 + preserve_upper.
+            | Code::Shr_rm16_imm8 | Code::Shr_rm16_1 | Code::Shr_rm16_CL
+            | Code::Shr_rm8_imm8 | Code::Shr_rm8_1 | Code::Shr_rm8_CL => self.lift_shift(inst, RiscOp::ShiftRight)?,
             // SAR (?怨쀫떊 ?怨쀫? ??쀫늄?????봔????쑵???醫?)
             Code::Sar_rm64_imm8 | Code::Sar_rm64_1 | Code::Sar_rm64_CL
             | Code::Sar_rm32_imm8 | Code::Sar_rm32_1 | Code::Sar_rm32_CL
@@ -2385,5 +2389,110 @@ mod tests {
         init[1] = 4;
         let st = run_mem(&raw, 0x140001000, init, HashMap::new());
         assert_eq!(st.regs[0], 0x0F, "BZHI(0xFF, 4) = 0x0F");
+    }
+
+    // ── R7: 8/16-bit 논리(XOR/AND/OR)·시프트(SHL/SHR)·NEG/NOT ────────────────
+    // 참조: 레거시 `vm/lifter/arith.rs::lift_narrow_arith`, `vm/lifter/mod.rs`
+    // (Xor_rm8/16, And_rm8/16, Or_rm8/16, Shl_rm8/16, Shr_rm8/16, Neg/Not_rm8/16).
+    // 검증 포인트: (a) 8/16비트 결과의 상위 비트 보존(레지스터), (b) 플래그 폭.
+
+    /// R7: 8-bit XOR register (상위 비트 보존).
+    #[test]
+    fn test_lift_8bit_xor_reg_preserve_upper() {
+        // xor al, bl   (0x30 0xD8) — AL=0x5A ^ BL=0x0F = 0x55, 상위 56비트 보존.
+        let raw = [0x30, 0xD8, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 0x1122_3344_5566_775A; // RAX 상위 비트 + AL=0x5A
+        init[3] = 0x0000_0000_0000_000F; // BL = 0x0F
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 0x1122_3344_5566_7755, "XOR AL low byte, upper preserved");
+    }
+
+    /// R7: 16-bit AND register (상위 비트 보존).
+    #[test]
+    fn test_lift_16bit_and_reg_preserve_upper() {
+        // and ax, bx  (0x66 0x21 0xD8) — AX = 0x7FFF & 0x0F0F = 0x0F0F.
+        let raw = [0x66, 0x21, 0xD8, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 0x1122_3344_5566_7FFF;
+        init[3] = 0x0000_0000_0000_0F0F;
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 0x1122_3344_5566_0F0F, "AND AX low word, upper preserved");
+    }
+
+    /// R7: 8-bit OR immediate (AL = AL | 0x0F).
+    #[test]
+    fn test_lift_8bit_or_imm() {
+        // or al, 0x0F  (0x0C 0x0F) — AL = 0x10 | 0x0F = 0x1F.
+        let raw = [0x0C, 0x0F, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 0x1122_3344_5566_7710;
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 0x1122_3344_5566_771F, "OR AL imm");
+    }
+
+    /// R7: 8/16-bit XOR memory RMW (레지스터 피연산자 마스킹).
+    #[test]
+    fn test_lift_8bit_xor_mem_rmw() {
+        // xor byte ptr [rbx], al  (0x30 0x03) — [0x1000] ^= AL.
+        let raw = [0x30, 0x03, 0xC3];
+        let mut init = [0u64; 16];
+        init[3] = 0x1000;
+        init[0] = 0x0000_0000_0000_000F; // AL = 0x0F
+        let mut mem = HashMap::new();
+        mem.insert(0x1000, 0x51);
+        let st = run_mem(&raw, 0x140001000, init, mem);
+        assert_eq!(st.mem.get(&0x1000), Some(&0x5E), "mem byte ^= AL");
+    }
+
+    /// R7: 8-bit SHL register (카운트 mod 8 경계 + 상위 보존).
+    #[test]
+    fn test_lift_8bit_shl_reg() {
+        // shl al, 2  (0xC0 0xE0 0x02) — AL = 0x40 << 2 = 0x00 (8-bit wrap).
+        let raw = [0xC0, 0xE0, 0x02, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 0x1122_3344_5566_7740;
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 0x1122_3344_5566_7700, "SHL AL,2 = 0x00, upper preserved");
+    }
+
+    /// R7: 16-bit SHR register (상위 워드 0, 상위 비트 보존).
+    #[test]
+    fn test_lift_16bit_shr_reg() {
+        // shr ax, 4  (0x66 0xC1 0xE8 0x04) — AX = 0x8000 >> 4 = 0x0800.
+        let raw = [0x66, 0xC1, 0xE8, 0x04, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 0x1122_3344_5566_8000;
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 0x1122_3344_5566_0800, "SHR AX,4");
+    }
+
+    /// R7: 8/16-bit NEG/NOT (플래그 + 상위 보존).
+    #[test]
+    fn test_lift_8bit_neg_not() {
+        // neg al (0xF6 0xD8); not al (0xF6 0xD0)
+        let raw = [0xF6, 0xD8, 0xF6, 0xD0, 0xC3];
+        let mut init = [0u64; 16];
+        init[0] = 0x1122_3344_5566_7701; // AL = 1 → NEG = 0xFF → NOT = 0x00
+        let st = run(&raw, 0x140001000, init);
+        assert_eq!(regs(&st)[0], 0x1122_3344_5566_7700, "NEG then NOT AL");
+    }
+
+    /// R7: 16-bit NEG memory (부호 반전 + 메모리 폭 쓰기).
+    #[test]
+    fn test_lift_16bit_neg_mem() {
+        // neg word ptr [rbx]  (0x66 0xF7 0x1B) — [0x1000] = -0x0010 = 0xFFF0.
+        let raw = [0x66, 0xF7, 0x1B, 0xC3];
+        let mut init = [0u64; 16];
+        init[3] = 0x1000;
+        let mut mem = HashMap::new();
+        mem.insert(0x1000, 0x10);
+        mem.insert(0x1001, 0x00);
+        let st = run_mem(&raw, 0x140001000, init, mem);
+        let mut v = 0u64;
+        for i in 0..2 {
+            v |= (*st.mem.get(&(0x1000 + i)).unwrap_or(&0) as u64) << (i * 8);
+        }
+        assert_eq!(v, 0xFFF0, "NEG word [mem] = 0xFFF0");
     }
 }

@@ -17,9 +17,16 @@ impl RiscLifter {
                 // Add/Sub{width}가 dst를 마스크로 덮어쓰므로, **먼저** 원본을 Temp(0)에
                 // 저장한 뒤 결과를 합성한다: dst = (orig & ~mask) | masked.
                 let preserve = (alu == Alu::Add || alu == Alu::Sub) && (width == 1 || width == 2);
+                // R7: 8/16-bit XOR/AND/OR — desynth(NOR 시퀀스)는 Temp(0..2)를
+                // 내부 소모하므로 원본을 Temp(5)에 보존한다.
+                let narrow_logic = matches!(alu, Alu::Xor | Alu::And | Alu::Or) && (width == 1 || width == 2);
                 if preserve {
                     self.desynth.instrs.push(
                         MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::Temp(0)).with_src1(dst),
+                    );
+                } else if narrow_logic {
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::Temp(5)).with_src1(dst),
                     );
                 }
                 if alu == Alu::Sub {
@@ -37,6 +44,12 @@ impl RiscLifter {
                             .with_src1(dst)
                             .with_src2(right),
                     );
+                } else if narrow_logic {
+                    // R7: 8/16-bit 논리 — 피연산자를 폭으로 마스크한 뒤 desynth.
+                    // (레지스터 상위 비트가 결과/플래그를 오염시키지 않도록 — CMP와 동일 패턴)
+                    let left = self.mask_operand_into(dst, width, MicroOperand::Temp(3))?;
+                    let right_m = self.mask_operand_into(right, width, MicroOperand::Temp(2))?;
+                    alu.emit(&mut self.desynth, dst, left, right_m);
                 } else {
                     alu.emit(&mut self.desynth, dst, dst, right);
                 }
@@ -47,6 +60,8 @@ impl RiscLifter {
                 }
                 if preserve {
                     self.preserve_upper(dst, width);
+                } else if narrow_logic {
+                    self.preserve_upper_from(dst, width, MicroOperand::Temp(5));
                 }
             }
             OpKind::Memory => {
@@ -75,6 +90,13 @@ impl RiscLifter {
                             .with_src2(right),
                     );
                 } else {
+                    // R7: 8/16-bit 논리 메모리 RMW — left는 MemoryRead{width}로 이미
+                    // 0-확장, 레지스터 피연산자만 폭으로 마스크해 결과/플래그를 정화.
+                    let right = if width <= 2 {
+                        self.mask_operand_into(right, width, MicroOperand::Temp(2))?
+                    } else {
+                        right
+                    };
                     alu.emit(&mut self.desynth, left, left, right);
                 }
                 self.desynth.instrs.push(
@@ -143,18 +165,26 @@ impl RiscLifter {
         Ok(temp)
     }
 
-    /// SHL/SHR/SAR (32/64-bit, count: imm8 / 1 / CL).
-    /// x86 시프트 횟수 마스크: 32비트 피연산자는 mod 32(31), 64비트는 mod 64(63).
-    /// 32비트 레지스터 시프트 결과는 상위 32비트를 0으로 정리한다.
+    /// SHL/SHR/SAR (8/16/32/64-bit, count: imm8 / 1 / CL).
+    /// x86 시프트 횟수 마스크: 8/16/32비트 피연산자는 mod 32(31), 64비트는 mod 64(63).
+    /// 32비트 레지스터 시프트 결과는 상위 32비트를 0으로, 8/16비트 레지스터는
+    /// 상위 비트 보존(preserve_upper)을 복원한다.
+    ///
+    /// R7: 8/16비트 SHR/SHL은 피연산자를 폭으로 마스크한 뒤 시프트한다
+    /// (SHR는 상위 비트가 결과 하위 폭으로 내려오는 것을 방지). 8/16비트 SAR은
+    /// 피연산자를 **폭만큼 sign-extend**(`movsx`와 동일: `(src<<s)>>s` 산술)한 뒤
+    /// 산술 시프트해야 64비트 부호 비트(bit 63)가 아닌 폭 부호 비트가 복제된다.
 
     pub(super) fn lift_shift(&mut self, inst: &Instruction, op: RiscOp) -> Result<()> {
-        // 32비트(rm32) 시프트 여부 — `_rm32_` 계열 코드.
-        let is32 = matches!(
-            inst.code(),
-            Code::Shl_rm32_imm8 | Code::Shl_rm32_1 | Code::Shl_rm32_CL
-            | Code::Shr_rm32_imm8 | Code::Shr_rm32_1 | Code::Shr_rm32_CL
-            | Code::Sar_rm32_imm8 | Code::Sar_rm32_1 | Code::Sar_rm32_CL
-        );
+        let is_sar = op == RiscOp::ArithmeticShiftRight;
+        // 피연산자 폭(바이트) — 레지스터면 op0 폭, 메모리면 memory_size.
+        let width = match inst.op0_kind() {
+            OpKind::Register => inst.op0_register().size() as u8,
+            OpKind::Memory => inst.memory_size().size() as u8,
+            _ => return Err(anyhow!("risc lifter: invalid shift op0")),
+        };
+        let narrow = width == 1 || width == 2;
+        // x86: 8/16/32비트는 mod 32, 64비트는 mod 64.
         let count = match inst.op1_kind() {
             OpKind::Immediate8
             | OpKind::Immediate8to64
@@ -163,47 +193,92 @@ impl RiscLifter {
             | OpKind::Immediate32to64
             | OpKind::Immediate64 => {
                 let v = inst.immediate64();
-                // 즉시 시프트 횟수는 리프트 시점에 마스크 (mod 32).
-                if is32 { MicroOperand::Imm64(v & 31) } else { MicroOperand::Imm64(v) }
+                if width == 8 { MicroOperand::Imm64(v) } else { MicroOperand::Imm64(v & 31) }
             }
             OpKind::Register => {
                 let c = Self::reg_to_vreg(inst.op1_register())
                     .ok_or_else(|| anyhow!("invalid shift count register"))?;
-                if is32 {
+                if width == 8 {
+                    c
+                } else {
                     // CL 등 레지스터 시프트 횟수를 31로 마스크해 Temp(2)에 저장.
                     let masked = MicroOperand::Temp(2);
                     self.desynth.emit_and(masked, c, MicroOperand::Imm64(31));
                     masked
-                } else {
-                    c
                 }
             }
             _ => return Err(anyhow!("risc lifter: unsupported shift count")),
         };
+        // R7: 8/16비트 피연산자를 폭으로 **sign-extend**해 Temp(6)에 저장.
+        // (movsx와 동일 — 산술 시프트로 부호 비트를 64비트 폭으로 복제.)
+        let sign_extend_into = |d: &mut Self, dst: MicroOperand, src: MicroOperand, w: u8| {
+            let shift = 64 - w * 8;
+            let t = MicroOperand::Temp(3);
+            d.desynth.instrs.push(
+                MicroInstr::new(RiscOp::ShiftLeft)
+                    .with_dst(t)
+                    .with_src1(src)
+                    .with_src2(MicroOperand::Imm64(shift as u64)),
+            );
+            d.desynth.instrs.push(
+                MicroInstr::new(RiscOp::ArithmeticShiftRight)
+                    .with_dst(dst)
+                    .with_src1(t)
+                    .with_src2(MicroOperand::Imm64(shift as u64)),
+            );
+        };
         match inst.op0_kind() {
             OpKind::Register => {
                 let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid shift dst"))?;
-                self.desynth
-                    .instrs
-                    .push(MicroInstr::new(op).with_dst(dst).with_src1(dst).with_src2(count));
-                // 32비트 레지스터 시프트 결과는 상위 32비트를 0으로.
-                if is32 {
+                if narrow {
+                    // 상위 비트 보존용 원본은 desynth(emit_and)가 내부 소모하는
+                    // Temp(0)/Temp(1)을 피해 Temp(5)에 저장한다.
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::Temp(5)).with_src1(dst),
+                    );
+                    let src = if is_sar {
+                        sign_extend_into(self, MicroOperand::Temp(6), dst, width);
+                        MicroOperand::Temp(6)
+                    } else {
+                        // SHR: 상위 비트가 결과 하위 폭으로 내려오는 것 방지. SHL은
+                        // 하위 폭 결과가 상위 비트와 무관하지만 동일 패턴으로 마스크.
+                        self.mask_operand_into(dst, width, MicroOperand::Temp(3))?
+                    };
+                    self.desynth
+                        .instrs
+                        .push(MicroInstr::new(op).with_dst(dst).with_src1(src).with_src2(count));
+                    self.mask_result(width, inst, dst)?;
+                    self.preserve_upper_from(dst, width, MicroOperand::Temp(5));
+                } else if width == 4 {
+                    self.desynth
+                        .instrs
+                        .push(MicroInstr::new(op).with_dst(dst).with_src1(dst).with_src2(count));
+                    // 32비트 레지스터 시프트 결과는 상위 32비트를 0으로.
                     self.zero_extend_dst_if32(inst, dst);
+                } else {
+                    self.desynth
+                        .instrs
+                        .push(MicroInstr::new(op).with_dst(dst).with_src1(dst).with_src2(count));
                 }
             }
             OpKind::Memory => {
                 let addr = MicroOperand::Temp(4);
                 self.lower_effective_address(inst, addr)?;
-                let width = inst.memory_size().size() as u8;
                 let left = MicroOperand::Temp(5);
                 self.desynth.instrs.push(
                     MicroInstr::new(RiscOp::MemoryRead { width })
                         .with_dst(left)
                         .with_src1(addr),
                 );
+                let src = if is_sar && (width == 1 || width == 2) {
+                    sign_extend_into(self, MicroOperand::Temp(6), left, width);
+                    MicroOperand::Temp(6)
+                } else {
+                    left
+                };
                 self.desynth
                     .instrs
-                    .push(MicroInstr::new(op).with_dst(left).with_src1(left).with_src2(count));
+                    .push(MicroInstr::new(op).with_dst(left).with_src1(src).with_src2(count));
                 self.desynth.instrs.push(
                     MicroInstr::new(RiscOp::MemoryWrite { width })
                         .with_src1(addr)
@@ -308,15 +383,86 @@ impl RiscLifter {
     /// **전에** 원본을 Temp(0)에 저장해 두어야 한다. 여기서는 그 원본을 이용해
     /// `dst = (orig & ~mask) | masked`를 합성해 정확한 x86 부분-쓰기 의미론을 복원한다.
     pub(super) fn preserve_upper(&mut self, dst: MicroOperand, width: u8) {
+        self.preserve_upper_from(dst, width, MicroOperand::Temp(0));
+    }
+
+    /// R7: `preserve_upper`의 일반화 — 원본 레지스터가 **지정 temp**에 저장돼 있다.
+    /// (8/16-bit XOR/AND/OR는 desynth NOR 시퀀스가 Temp(0..2)를 내부 소모하므로
+    /// 원본을 Temp(5)에 보존한 뒤 이 헬퍼로 합성한다.)
+    pub(super) fn preserve_upper_from(&mut self, dst: MicroOperand, width: u8, orig: MicroOperand) {
         let mask = match width {
             1 => 0xFFu64,
             2 => 0xFFFFu64,
             _ => return,
         };
-        let orig = MicroOperand::Temp(0);
         let keep = MicroOperand::Temp(1);
         self.desynth.emit_and(keep, orig, MicroOperand::Imm64(!mask));
         self.desynth.emit_or(dst, dst, keep);
+    }
+
+    /// R7: 8/16/32/64-bit NEG / NOT (register + memory).
+    /// NEG = 0 - dst (borrow-CF, SubWithBorrow), NOT = ~dst (RFLAGS 불변, Not{width}).
+    /// 8/16비트 레지스터 대상은 x86 부분-쓰기(상위 비트 보존)를 복원한다.
+    pub(super) fn lift_neg_not(&mut self, inst: &Instruction, is_not: bool) -> Result<()> {
+        let width = Self::operand_width(inst);
+        let narrow = width == 1 || width == 2;
+        match inst.op0_kind() {
+            OpKind::Register => {
+                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
+                if narrow {
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::Temp(0)).with_src1(dst),
+                    );
+                }
+                if is_not {
+                    // NOT{width}: 플래그 불변, 폭별 마스크.
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Not { width }).with_dst(dst).with_src1(dst),
+                    );
+                } else {
+                    // NEG: 0 - dst — borrow-CF를 위해 SubWithBorrow{width}.
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::SubWithBorrow { width })
+                            .with_dst(dst)
+                            .with_src1(MicroOperand::Imm64(0))
+                            .with_src2(dst),
+                    );
+                }
+                if narrow {
+                    self.preserve_upper(dst, width);
+                }
+            }
+            OpKind::Memory => {
+                let addr = MicroOperand::Temp(4);
+                self.lower_effective_address(inst, addr)?;
+                let w = inst.memory_size().size() as u8;
+                let left = MicroOperand::Temp(5);
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::MemoryRead { width: w })
+                        .with_dst(left)
+                        .with_src1(addr),
+                );
+                if is_not {
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Not { width: w }).with_dst(left).with_src1(left),
+                    );
+                } else {
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::SubWithBorrow { width: w })
+                            .with_dst(left)
+                            .with_src1(MicroOperand::Imm64(0))
+                            .with_src2(left),
+                    );
+                }
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::MemoryWrite { width: w })
+                        .with_src1(addr)
+                        .with_src2(left),
+                );
+            }
+            _ => return Err(anyhow!("risc lifter: invalid neg/not op0")),
+        }
+        Ok(())
     }
 
     /// 산술/논리 명령의 피연산자 폭(바이트) — 플래그 경계(bit 7/15/31/63) 결정.
