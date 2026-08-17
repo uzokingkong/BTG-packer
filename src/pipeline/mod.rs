@@ -127,6 +127,12 @@ pub struct PipelineContext {
     /// --keep-pdata — 원본 .pdata를 바이트 단위로 유지한다. 기본 모드도 모든 원본
     /// 항목을 보존하지만 디스패처 부트 leaf를 하나 추가한다.
     pub keep_pdata: bool,
+    /// P4 (전체 SEH 가상화): whole-program VM(--vm-oep) 모듈 코드 시작 RVA
+    /// (.textb 내). build.rs가 이 영역을 브리지 UNWIND_INFO로 커버해 OS
+    /// unwinder가 VM 내부 프레임을 걸 수 있게 한다. 0 = 프로그램 VM 미사용.
+    pub vm_prog_rva: u32,
+    /// P4: whole-program VM 모듈 총 길이 (code+table+bytecode+state).
+    pub vm_prog_total: u32,
     /// v13.4d diag: --block-ring — 표준 디스패처에 마지막 32개 logical block id
     /// ring-buffer 를 주입한다 (재암호화 디스패처는 미지원).
     pub block_ring: bool,
@@ -197,6 +203,8 @@ impl PipelineContext {
             mem_ntdll_name_va: 0,
             mem_ntprot_name_va: 0,
             keep_pdata: false,
+            vm_prog_rva: 0,
+            vm_prog_total: 0,
             block_ring: false,
             custom_cipher: false,
             poly_vm_seed: 0,

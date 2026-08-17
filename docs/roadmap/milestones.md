@@ -101,16 +101,32 @@
 
 > 진행: **P2 — RISC 리프터 커버리지 100%** (미착수, 다음 게이트).
 
-### P4 — SEH 네이티브 집합 175→132 최소화 ✅ (2026-08-15)
+### P4 — SEH 네이티브 집합 175→132→49 최소화 ✅ (2026-08-15 / 2026-08-17)
 - [x] `detect_seh_native_functions`가 `BTG_SEH_MINIMAL`(기본 1) 환경변수로 최소 세트
       `ehandler ∩ can_reach_panic = 132`만 네이티브 유지 (175→132).
 - [x] 진단: panic_seed=38, ehandler=162, `{can_reach_panic − can_reach_ehandler}` 역방향
       항 0개 추가, 30개 ehandler panic 도달 불가 → 무해 가상화.
 - [x] 계측 출력(`[SEH-DEBUG]`/`[SEH-DEBUG2]`/`[SEH-LEVEL]`) 제거.
-- [x] `--vm`/`--vm-oep` 16테스트 전체 통과 + FINAL CHECKSUM `0x2cdc0e4511d84a64`
-      (baseline 동일).
-- [ ] 0 목표는 exit-time 0xC0000005 teardown으로 배제(132가 채택 최소치).
-- [ ] `.pdata` 재생성(브리지 UNWIND_INFO) 통한 전체 SEH 가상화 — 후속.
+- [x] **전체 SEH 가상화 + 브리지 UNWIND_INFO (2026-08-17, P4 최종)**: `BTG_SEH_NONE=1`
+      환경변수로 SEH 네이티브 집합을 **132 → 49** 로 최소화 (legacy whole-program VM
+      `--vm --vm-oep` 경로). 49 = 전부 가상화하되 (a) computed-jump(switch-dispatch)
+      EHANDLER 함수 — 블록 단위 VM 디스패치가 switch 타깃을 프로로그 없이 진입해
+      프레임 로컬이 낡은 값(-2)을 읽는 것을 방지, (b) Once/panic 공유-state(.data/.bss)
+      함수 — teardown 원자 완료 경로 보존. 두 가드는 SEH가 아니라 teardown 안전망.
+- [x] **`.pdata` 재생성(브리지 UNWIND_INFO)**: Program-VM 모듈 영역 전체
+      `[vm_prog_rva .. vm_prog_rva+vm_prog_total)`을 RUNTIME_FUNCTION으로 커버하고,
+      실제 Program-VM 엔트리 프로로그(sub rsp,0xA0 + 15 push)에서 유도한 UNWIND_INFO
+      (UWOP_ALLOC_LARGE 160 + PUSH_NONVOL, **CodeOffset 내림차순** = PE/COFF 스펙)를
+      `.pdata` 뒤에 배치. VM 내부 예외 시 OS unwinder가 더미 핸들러 없이 결정적으로
+      VM 프레임 밖으로 unwind.
+- [x] 검증: `BTG_SEH_NONE=1` + `--vm --vm-oep` → 16테스트 전체 통과 + FINAL CHECKSUM
+      `0x2cdc0e4511d84a64`(baseline 동일), **exit 0** (exit-time teardown 0xC0000005
+      해소), 5회 연속 안정, cdb clean exit. `--vm`/`--vm-commercial`은 132 유지(게이트).
+- [x] 0 목표는 (a) switch-dispatch EHANDLER, (b) Once/panic shared-state 두 안전망까지
+      포함한 49가 채택 최소치 — 0으로 하면 exit-time teardown 0xC0000005 (VM이
+      Once 완료 경로의 낡은 프레임 로컬 -2를 xchg 주소로 씀).
+- [x] `.pdata` 재생성(브리지 UNWIND_INFO) 통한 전체 SEH 가상화 — 달성 (legacy VM 경로).
+- [x] `--vm-commercial`(RISC 엔진)은 전체 SEH 가상화 미검증 → 게이트로 132 유지.
 
 ### P5 — .text 온디스크 평문 0 (TLS-first-callback Decryptor) ✅ (2026-08-15)
 - [x] **블로커 실측**: 타깃은 TLS 콜백 1개(RVA `0x1C1A0`, CRT TLS-init) 보유 — 로더가

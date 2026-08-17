@@ -165,25 +165,43 @@ CVTTSS2SI/CVTSS2SI/CVTTSD2SI/CVTSD2SI trunc/nearest-even), **BMI**(ANDN/BLSR/BLS
 **검증**: `btg-packer -i rust_packer_test.exe -o packed_commercial.exe --vm --vm-oep --vm-commercial`
 → 실행 시 **16개 테스트 전체 통과 + checksum baseline 동일**. `.map/.sym`이 RISC 바이트코드↔원본 VA 매핑을 기록. 기존 레거시 경로는 무회귀.
 
-### P4 — SEH 함수 가상화 (.pdata 재생성)  [5–7일]  ✅ 부분 완료 (2026-08-15)
+### P4 — SEH 함수 가상화 (.pdata 재생성)  [5–7일]  ✅ 완료 (2026-08-15 / 2026-08-17)
 **상태 (2026-08-15)**: `detect_seh_native_functions`(exclusions.rs)가 `BTG_SEH_MINIMAL`
 (기본 1) 환경변수로 **SEH 네이티브 175→132 최소화**(`ehandler ∩ can_reach_panic`).
 진단: panic_seed=38, ehandler=162, `{can_reach_panic − can_reach_ehandler}` 역방향 항
 0개 추가, 30개 ehandler panic 도달 불가 → 무해 가상화. 계측 출력 제거. `--vm`/`--vm-oep`
 16테스트 + checksum baseline 동일(`0x2cdc0e4511d84a64`). 0 목표는 exit-time 0xC0000005
-teardown으로 배제(132가 채택 최소치). `.pdata` 재생성(브리지 UNWIND_INFO)은 P3 `build.rs`
-에서 부분 구현 — 전체 SEH 가상화는 후속.
+teardown으로 배제(132가 채택 최소치).
+
+**상태 (2026-08-17, P4 최종)**: **전체 SEH 가상화 달성** (legacy whole-program VM 경로).
+`BTG_SEH_NONE=1`로 **SEH 네이티브 132 → 49**:
+- SEH/panic/catch 함수 전부 가상화. 49 = 두 teardown 안전망만 네이티브 —
+  (a) computed-jump(switch-dispatch) EHANDLER 함수(블록 단위 VM 디스패치가 switch
+  타깃을 프로로그 없이 진입해 `[rbp-0x18]` 프레임 로컬이 낡은 -2를 읽는 것을 방지),
+  (b) Once/panic 공유-state(`.data/.bss`) 함수.
+- `.pdata` 재생성(브리지 UNWIND_INFO): Program-VM 모듈 영역 전체
+  `[vm_prog_rva .. vm_prog_rva+vm_prog_total)`을 RUNTIME_FUNCTION으로 커버,
+  실제 엔트리 프로로그(sub rsp,0xA0 + 15 push)에서 유도한 UNWIND_INFO
+  (UWOP_ALLOC_LARGE 160 + PUSH_NONVOL, **CodeOffset 내림차순** = PE/COFF 스펙)를
+  `.pdata` 뒤에 배치 — VM 내부 예외 시 OS unwinder가 더미 핸들러 없이 결정적으로
+  VM 프레임 밖으로 unwind.
+- 검증: `BTG_SEH_NONE=1` + `--vm --vm-oep` → 16테스트 전체 + FINAL CHECKSUM
+  `0x2cdc0e4511d84a64`(baseline 동일), **exit 0**(exit-time teardown 0xC0000005 해소),
+  5회 연속 안정, cdb clean exit. `--vm`/`--vm-commercial`은 게이트로 132 유지.
 **목표**: G5 해소 — panic/catch unwind 경로를 셔플/가상화하면서 OS unwind가 동작하게.
 
 **작업 항목**:
 1. 셔플 블록(.textb) 또는 RISC VM 블록용 **`.pdata` RUNTIME_FUNCTION/UNWIND_INFO 재생성**.
-   - 문제.txt [10]에서 시도했던 "함수 연속 레이아웃 + per-function .pdata"와
-     "블록 셔플 × SEH"의 근본 충돌을 **RISC VM 경로에서는 회피**할 방법 검토
-     (예: VM 내부가 아닌 **브리지 진입점만 원본 .pdata로 감싸고**, unwind는
-     VM 상태 복원 지점까지 native-call로 승격).
+   - **달성**: legacy Program-VM 모듈 영역 전체를 단일 RUNTIME_FUNCTION + 엔트리
+     프로로그 UNWIND_INFO로 커버 (VM 안의 모든 코드는 하나의 엔트리 프레임에서 실행되므로
+     단일 UNWIND_INFO가 정확). block-shuffle 경로는 블록 프레임이 이질적이라 계속
+     미커버(단일 UNWIND_INFO 불가 — 132 집합 유지).
 2. SEH 네이티브 보존 함수 수를 **175→최소(0 목표)** 로 줄여 `.text` 평문 영역 축소.
+   - **달성(49)**: 0은 switch-dispatch EHANDLER + Once/panic shared-state 두 안전망까지
+     포함한 49가 채택 최소치(0은 exit teardown 0xC0000005). RISC 상용 엔진(`--vm-commercial`)
+     은 전체 SEH 가상화 미검증 → 게이트로 132 유지.
 
-**검증**: `test [10] SEH unwinding & catch_unwind`가 **가상화 상태에서도** 통과(현재는 네이티브 유지로만 통과). unpack된 `.pdata`가 로더에 의해 수용(STATUS_INVALID_IMAGE_FORMAT 없음).
+**검증**: `test [10] SEH unwinding & catch_unwind`가 **가상화 상태에서도** 통과(네이티브 유지 없이 49 안전망만으로). unpack된 `.pdata`가 로더에 의해 수용(STATUS_INVALID_IMAGE_FORMAT 없음).
 
 ### P5 — .text 온디스크 평문 0 (TLS-first-callback Decryptor)  [4–6일]
 **목표**: G4 해소 — `.text`를 at-rest 암호화하고, TLS 콜백이 평문이어야 하는 문제를 해소.

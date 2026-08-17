@@ -1,4 +1,4 @@
-// ==============================================================================
+﻿// ==============================================================================
 // BTG Pipeline - Build: PE Synthesis & Output
 // ==============================================================================
 
@@ -94,6 +94,38 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
             let (codes, prolog_len) = dispatcher_unwind_codes(disp);
             (prolog_len, codes.iter().map(|c| (c.offset, c.reg)).collect())
         });
+    // P4 (전체 SEH 가상화): whole-program VM 모듈 영역의 브리지 UNWIND_INFO.
+    // Program VM은 부트 스텁이 tail-jmp로 진입하므로, VM 내부에서 예외가 나면
+    // OS unwinder가 걷는 유일한 .textb 프레임이 **Program VM 엔트리 프레임**이다.
+    // 여기에 정확한 엔트리 프로로그(sub rsp,0xA0 + 15 push) UNWIND_INFO를 등록해
+    // 더미 핸들러(리프 프레임 가정)에 의존하지 않고 결정적으로 VM 밖으로 unwind
+    // 하게 한다. 커버 범위 = [vm_prog_rva .. vm_prog_rva+vm_prog_total).
+    let vm_prog_unwind: Option<Vec<u8>> = if ctx.vm_prog_rva > 0 && ctx.vm_prog_total > 0 {
+        ctx.btg_section_data.as_ref().and_then(|sec| {
+            let off = (ctx.vm_prog_rva as u64).saturating_sub(dispatcher_rva as u64) as usize;
+            let end = (off + ctx.vm_prog_total as usize).min(sec.bytes.len());
+            if end > off && off < sec.bytes.len() {
+                let (ops, prolog_len) = vm_entry_unwind_ops(&sec.bytes[off..end]);
+                if !ops.is_empty() {
+                    println!(
+                        "[+] P4 .pdata: Program-VM bridge UNWIND_INFO — covering 0x{:X}..0x{:X} ({}B), prolog_len=0x{:X}, {} code(s)",
+                        ctx.vm_prog_rva,
+                        ctx.vm_prog_rva + ctx.vm_prog_total,
+                        ctx.vm_prog_total,
+                        prolog_len,
+                        ops.len()
+                    );
+                    Some(build_vm_entry_unwind_info(prolog_len, &ops))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
     if ctx.keep_pdata {
         println!("[+] .pdata: KEPT original (--keep-pdata) ??build.rs SEH rebuild skipped; original RUNTIME_FUNCTION table left verbatim");
     } else {
@@ -104,6 +136,9 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
             dispatcher_rva,
             boot_area_len,
             bridge_unwind.as_ref(),
+            ctx.vm_prog_rva,
+            ctx.vm_prog_total,
+            vm_prog_unwind.as_ref().map(|v| v.as_slice()),
         );
     }
 
@@ -260,6 +295,132 @@ const UNWIND_VERSION: u8 = 1;
 const UWOP_PUSH_NONVOL: u8 = 0;
 /// UWOP_ALLOC_SMALL ??8..=128 獄쏅뗄?????곗굨 ??쎄문 ?醫딅뼣 (OpInfo = (size/8)-1).
 const UWOP_ALLOC_SMALL: u8 = 2;
+/// UWOP_ALLOC_LARGE ??allocs > 128 獄쏅뗄?? 2-byte (OpInfo=0) 遺좊┰ 4-byte
+/// (OpInfo=1) frame size ??移댄??댁빞?.
+const UWOP_ALLOC_LARGE: u8 = 1;
+
+/// One stack-modifying op in the Program-VM entry prologue, in execution order.
+enum VmEntryOp {
+    /// `sub rsp, size` (0xA0 = XMM save area).
+    Alloc(u32),
+    /// `push r64` of a callee-saved GPR (UWOP_PUSH_NONVOL reg).
+    PushNonVol(u8),
+    /// `push r64` volatile / `pushfq` — only RSP accounting needed (8 bytes).
+    PushAny,
+}
+
+/// Decode the leading prologue of the Program-VM module entry code (`sub rsp,
+/// 0xA0; cld; movdqu [rsp+disp], xmm6..xmm15; push rax..r11, r15..r12`) and
+/// return the stack-modifying ops in execution order (with byte offset) plus
+/// the total prologue length in bytes. `movdqu`/`cld`/`nop`/`int3` are skipped
+/// (no RSP change).
+fn vm_entry_unwind_ops(code: &[u8]) -> (Vec<(u8, VmEntryOp)>, u8) {
+    use iced_x86::{Code, Decoder, DecoderOptions, Register};
+    let mut ops: Vec<(u8, VmEntryOp)> = Vec::new();
+    let mut off = 0usize;
+    let mut decoder = Decoder::with_ip(64, code, 0, DecoderOptions::NONE);
+    loop {
+        if off >= code.len() {
+            break;
+        }
+        let inst = decoder.decode();
+        if inst.is_invalid() {
+            break;
+        }
+        let len = inst.len() as usize;
+        if len == 0 || off + len > code.len() {
+            break;
+        }
+        match inst.code() {
+            Code::Sub_rm64_imm8 | Code::Sub_rm64_imm32
+                if inst.op0_kind() == iced_x86::OpKind::Register
+                    && inst.op0_register() == Register::RSP =>
+            {
+                let size = inst.immediate32() as i64;
+                ops.push((off as u8, VmEntryOp::Alloc(size as u32)));
+            }
+            Code::Cld | Code::Int3 | Code::Nopd | Code::Nopw | Code::Nopq => {}
+            // XMM save area stores (movdqu [rsp+disp], xmm) — no RSP change.
+            Code::Movdqu_xmmm128_xmm
+            | Code::Movdqu_xmm_xmmm128
+            | Code::Movaps_xmmm128_xmm
+            | Code::Movaps_xmm_xmmm128
+            | Code::Movups_xmmm128_xmm
+            | Code::Movups_xmm_xmmm128 => {}
+            Code::Pushfq => {
+                ops.push((off as u8, VmEntryOp::PushAny));
+            }
+            Code::Push_r64 => {
+                let reg = inst.op0_register();
+                let nonvol = matches!(
+                    reg,
+                    Register::RBX
+                        | Register::RBP
+                        | Register::RSI
+                        | Register::RDI
+                        | Register::R12
+                        | Register::R13
+                        | Register::R14
+                        | Register::R15
+                );
+                ops.push((
+                    off as u8,
+                    if nonvol {
+                        VmEntryOp::PushNonVol(reg.number() as u8)
+                    } else {
+                        VmEntryOp::PushAny
+                    },
+                ));
+            }
+            _ => break,
+        }
+        off += len;
+    }
+    (ops, off as u8)
+}
+
+/// Build a UNWIND_INFO (version 1, no handler, frame register 0) from
+/// stack-modifying prologue ops. UNWIND_CODE entries are emitted in DESCENDING
+/// CodeOffset order per the PE/COFF spec, so the OS unwinder's "apply codes with
+/// offset <= current prologue offset" scan stays correct. ALLOC sizes > 0x80 use
+/// UWOP_ALLOC_LARGE(0) + 2-byte frame size.
+fn build_vm_entry_unwind_info(size_of_prolog: u8, ops: &[(u8, VmEntryOp)]) -> Vec<u8> {
+    // Build UNWIND_CODE entries (CodeOffset, op byte, optional 2-byte frame size)
+    // in execution order.
+    let mut entries: Vec<(u8, Vec<u8>)> = Vec::new();
+    for (off, op) in ops {
+        let mut body = match op {
+            VmEntryOp::Alloc(size) if *size > 0x80 => {
+                let frame = (*size / 8) as u16;
+                vec![(0 << 4) | UWOP_ALLOC_LARGE, (frame & 0xFF) as u8, (frame >> 8) as u8]
+            }
+            VmEntryOp::Alloc(size) => {
+                let sm = ((*size / 8).saturating_sub(1)) as u8;
+                vec![(sm << 4) | UWOP_ALLOC_SMALL]
+            }
+            VmEntryOp::PushNonVol(reg) => vec![((*reg & 0x0F) << 4) | UWOP_PUSH_NONVOL],
+            VmEntryOp::PushAny => vec![(0 << 4) | UWOP_ALLOC_SMALL],
+        };
+        let mut code = vec![*off];
+        code.append(&mut body);
+        entries.push((*off, code));
+    }
+    // Sort by CodeOffset DESCENDING per spec.
+    entries.sort_by_key(|(off, _)| std::cmp::Reverse(*off));
+
+    let mut info = Vec::with_capacity(4 + entries.len() * 4);
+    info.push((UNWIND_VERSION & 0x07) | 0); // v1, no handler
+    info.push(size_of_prolog);
+    info.push(entries.len() as u8);
+    info.push(0); // FrameRegister=0, FrameRegisterOffset=0
+    for (_, code) in &entries {
+        info.extend_from_slice(code);
+    }
+    while info.len() % 4 != 0 {
+        info.push(0);
+    }
+    info
+}
 
 /// SEH ?됰슢?곻쭪? ?遺용뮞??μ퓗 ?怨몃열??UNWIND_INFO 獄쏅뗄?????곸뱽 ??밴쉐??뺣뼄.
 ///
@@ -331,6 +492,9 @@ fn update_pdata_seh(
     dispatcher_rva: u32,
     boot_area_len: u32,
     bridge_unwind: Option<&(u8, Vec<(u8, u8)>)>,
+    vm_prog_rva: u32,
+    vm_prog_total: u32,
+    vm_prog_unwind: Option<&[u8]>,
 ) {
     if let Some(pdata_sec) = relayed_sections.iter_mut().find(|s| s.name == ".pdata") {
         // ?癒?궚 `.text`??域밸챶?嚥?鈺곕똻???랁???쇱뵠?怨뺥닏 野껋럥以?癒?퐣 ??쎈뻬???嚥??袁? 癰귣똻???뺣뼄.
@@ -362,6 +526,28 @@ fn update_pdata_seh(
             unwind_info = build_bridge_unwind_info(*prolog_len, codes);
         }
 
+        // P4 (전체 SEH 가상화): whole-program VM 모듈 전체를 한 RUNTIME_FUNCTION으로
+        // 커버해, VM 내부에서 예외가 나면 OS unwinder가 더미 핸들러 대신 Program VM
+        // 엔트리 UNWIND_INFO로 결정적으로 프레임을 걷게 한다. (VM 안의 모든 코드는
+        // 하나의 엔트리 프레임 안에서 실행되므로 단일 UNWIND_INFO가 정확하다.)
+        let mut vm_unwind: Vec<u8> = Vec::new();
+        let mut vm_begin = 0u32;
+        let mut vm_end = 0u32;
+        if vm_prog_rva > 0 && vm_prog_total > 0 {
+            vm_begin = vm_prog_rva;
+            vm_end = vm_prog_rva.saturating_add(vm_prog_total);
+            if let Some(uwi) = vm_prog_unwind {
+                vm_unwind = uwi.to_vec();
+                if !rf_list.iter().any(|rf| rf.begin_address == vm_begin) {
+                    rf_list.push(RuntimeFunction {
+                        begin_address: vm_begin,
+                        end_address: vm_end,
+                        unwind_info_address: 0, // ????筌뤴뫀???뷀뒗??
+                    });
+                }
+            }
+        }
+
         rf_list.sort_by_key(|rf| rf.begin_address);
         rf_list.dedup_by_key(|rf| rf.begin_address);
 
@@ -369,22 +555,34 @@ fn update_pdata_seh(
         let array_len = rf_list.len() as u32 * 12;
 
         // UNWIND_INFO ??獄쏄퀣肉?筌욊낱??.pdata ???嚥???곷선?븐늿???(DWORD ?類ｌ졊: 12|4).
-        let unwind_rva = pdata_sec.virtual_address + array_len;
+        let mut unwind_rva = pdata_sec.virtual_address + array_len;
+        let bridge_unwind_rva = unwind_rva;
 
         // ?됰슢?곻쭪? ?酉?껆뵳???UNWIND_INFO 雅뚯눘?쇘몴?筌?쑴???
         for rf in rf_list.iter_mut() {
             if rf.begin_address == bridge_begin {
-                rf.unwind_info_address = unwind_rva;
+                rf.unwind_info_address = bridge_unwind_rva;
+            }
+        }
+        if vm_begin > 0 && !vm_unwind.is_empty() {
+            let vm_unwind_rva = unwind_rva + unwind_info.len() as u32;
+            for rf in rf_list.iter_mut() {
+                if rf.begin_address == vm_begin {
+                    rf.unwind_info_address = vm_unwind_rva;
+                }
             }
         }
 
-        let mut pdata_bytes = Vec::with_capacity(array_len as usize + unwind_info.len());
+        let mut pdata_bytes = Vec::with_capacity(
+            array_len as usize + unwind_info.len() + vm_unwind.len(),
+        );
         for rf in &rf_list {
             pdata_bytes.extend_from_slice(&rf.begin_address.to_le_bytes());
             pdata_bytes.extend_from_slice(&rf.end_address.to_le_bytes());
             pdata_bytes.extend_from_slice(&rf.unwind_info_address.to_le_bytes());
         }
         pdata_bytes.extend_from_slice(&unwind_info);
+        pdata_bytes.extend_from_slice(&vm_unwind);
 
         pdata_sec.bytes = pdata_bytes.clone();
         // Exception Directory ??由?= RUNTIME_FUNCTION 獄쏄퀣肉댐쭕?(嚥≪뮆?묈첎? size/12 嚥?
@@ -396,13 +594,23 @@ fn update_pdata_seh(
                 virtual_address: pdata_sec.virtual_address,
                 size: array_len,
             };
-            println!(
+            let mut msg = format!(
                 "[+] Rebuilt SEH Table (.pdata): RVA 0x{:X}, {} entries (Size 0x{:X}) + bridge UNWIND_INFO @0x{:X} [original native entries preserved; bridge leaf 0x{:X}..0x{:X} added, prolog_len=0x{:X}, {} codes]",
                 pdata_sec.virtual_address, rf_list.len(), array_len,
-                unwind_rva, bridge_begin, dispatcher_rva + boot_area_len,
+                bridge_unwind_rva, bridge_begin, dispatcher_rva + boot_area_len,
                 bridge_unwind.map(|(l, _)| *l).unwrap_or(0),
                 bridge_unwind.map(|(_, c)| c.len()).unwrap_or(0)
             );
+            if vm_begin > 0 && !vm_unwind.is_empty() {
+                msg.push_str(&format!(
+                    " + Program-VM bridge @0x{:X}..0x{:X} (unwind @0x{:X}, {}B)",
+                    vm_begin,
+                    vm_end,
+                    bridge_unwind_rva + unwind_info.len() as u32,
+                    vm_unwind.len()
+                ));
+            }
+            println!("{}", msg);
             let _ = added_bridge;
         }
     }
@@ -452,6 +660,9 @@ mod tests {
             0x5000,
             0x80,
             Some(&bridge_unwind),
+            0,
+            0,
+            None,
         );
 
         // ?癒?궚 2 + ?됰슢?곻쭪? 1 = 3揶?RUNTIME_FUNCTION (36 獄쏅뗄??? + UNWIND_INFO(8) = 44.
@@ -516,6 +727,9 @@ mod tests {
             0x5000,
             0x40,
             Some(&bridge_unwind),
+            0,
+            0,
+            None,
         );
 
         // 獄쏄퀣肉?24 獄쏅뗄???2 ?酉?껆뵳? + UNWIND_INFO (4 ??삳쐭 + 5*2 ?꾨뗀諭?= 14 ??16) = 40.
@@ -584,6 +798,9 @@ mod tests {
             0x5000,
             0x40,
             Some(&bridge_unwind),
+            0,
+            0,
+            None,
         );
 
         let pdata = &sections[0].bytes;
@@ -675,5 +892,71 @@ mod tests {
                 assert_eq!(codes.first().unwrap().offset, 0, "{name}: pushfq offset");
             }
         }
+    }
+
+    /// P4 (전체 SEH 가상화): Program-VM 엔트리 프로로그를 실제 코드에서 디코드해
+    /// 브리지 UNWIND_INFO를 만든다 — UWOP_ALLOC_LARGE(160) + 15 push,
+    /// UNWIND_CODE는 **CodeOffset 내림차순**(PE/COFF 스펙).
+    #[test]
+    fn vm_entry_unwind_info_matches_real_program_vm_prologue() {
+        let vmc = crate::vm::handlers::generate_vm_code(
+            0x140001000,
+            0x140002000,
+            0x140001800,
+            crate::vm::handlers::EntryMode::Program,
+            None,
+        )
+        .unwrap();
+        let code = &vmc.code;
+        // Program-VM 엔트리 프로로그: sub rsp,0xA0; cld; movdqu xmm6..15; 15 push.
+        assert_eq!(code[0], 0x48, "prologue starts with a REX.W prefix (48 ...)");
+        assert_eq!(code[1], 0x81, "sub rsp, imm32 (81 /5)");
+        let (ops, prolog_len) = vm_entry_unwind_ops(code);
+        assert!(prolog_len > 0, "decoder found a prologue");
+        assert_eq!(ops.len(), 16, "1 alloc + 15 pushes");
+        // 첫 op는 0xA0(=160B) ALLOC, 마지막 4 op는 callee-saved r12..r15 push.
+        assert!(matches!(ops[0].1, VmEntryOp::Alloc(0xA0)), "first op is sub rsp,0xA0");
+        let nonvol: Vec<u8> = ops
+            .iter()
+            .filter_map(|(_, o)| match o {
+                VmEntryOp::PushNonVol(r) => Some(*r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nonvol, vec![3, 5, 6, 7, 15, 14, 13, 12], "nonvolatile pushes in order");
+        for (off, _) in &ops {
+            assert!(*off < prolog_len, "code offset {off} within prologue");
+        }
+
+        let info = build_vm_entry_unwind_info(prolog_len, &ops);
+        assert_eq!(info[0] & 0x07, UNWIND_VERSION);
+        assert_eq!(info[1], prolog_len, "SizeOfProlog");
+        assert_eq!(info[2] as usize, ops.len(), "CountOfCodes");
+        assert_eq!(info[3], 0, "no frame register");
+        assert_eq!(info.len() % 4, 0, "DWORD aligned");
+
+        // UNWIND_CODE CodeOffset가 내림차순(PE/COFF 스펙)인지 검증하고,
+        // ALLOC_LARGE(160/8=20) 코드를 찾아 2-byte frame size를 확인한다.
+        let mut offsets = Vec::new();
+        let mut alloc_large_ok = false;
+        let mut i = 4usize;
+        let n = info[2] as usize;
+        for _ in 0..n {
+            offsets.push(info[i]);
+            let op = info[i + 1] & 0x0F;
+            if op == UWOP_ALLOC_LARGE && info[i] == 0 {
+                let frame = (info[i + 2] as u16) | ((info[i + 3] as u16) << 8);
+                alloc_large_ok = frame == 20; // 160/8
+            }
+            i += if op == UWOP_ALLOC_LARGE { 4 } else { 2 };
+        }
+        assert_eq!(offsets.len(), n);
+        let mut sorted_desc = offsets.clone();
+        sorted_desc.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(offsets, sorted_desc, "UNWIND_CODE offsets descending (PE/COFF spec)");
+        assert!(alloc_large_ok, "ALLOC_LARGE frame size 160/8=20 found");
+        // 첫(가장 큰 offset) 코드 = PUSH_NONVOL r12 (마지막 실행된 push).
+        assert_eq!(info[4], offsets[0], "first code = max offset");
+        assert_eq!(info[5], (12 << 4) | UWOP_PUSH_NONVOL, "PUSH_NONVOL r12");
     }
 }

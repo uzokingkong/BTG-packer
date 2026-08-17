@@ -443,6 +443,237 @@ pub struct SehNativeExclusion {
     pub func_ranges: Vec<(u64, u64)>,
 }
 
+/// Does a `.pdata` function range contain a computed/indirect jump (`jmp r/m64`
+/// with a register or memory-table operand)? These are the **switch-dispatch**
+/// functions. Under block-level VM lifting the CFG is dispatched basic-block by
+/// basic-block, so a switch target block can be entered directly WITHOUT its
+/// enclosing frame's prologue/saved-state instructions having run first; the
+/// block then reads a stale frame local and computes a garbage absolute address
+/// (the observed `xchg eax,[r11]` with `r11=0xFFFFFFFFFFFFFFFE` at exit-time
+/// Once completion). Keeping exactly this class native is the minimal structural
+/// guard that still virtualizes every ordinary (straight-line/branch-only) SEH
+/// function. Import thunks (`jmp [rip+disp]`, FF /4 mod=0 rm=5) are excluded —
+/// they are plain tail-call thunks, not switch dispatch.
+pub fn fn_has_computed_jump(
+    fs: u64,
+    fe: u64,
+    text_bytes: &[u8],
+    base_va: u64,
+) -> bool {
+    use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
+    let off = (fs.saturating_sub(base_va)) as usize;
+    if off >= text_bytes.len() {
+        return false;
+    }
+    let mut d = Decoder::with_ip(64, &text_bytes[off..], fs, DecoderOptions::NONE);
+    let mut guard = 0usize;
+    for inst in d {
+        if guard > 1_000_000 {
+            break;
+        }
+        guard += 1;
+        if inst.ip() >= fe {
+            break;
+        }
+        if inst.is_invalid() {
+            continue;
+        }
+        if inst.flow_control() == FlowControl::IndirectBranch {
+            // Skip `jmp [rip+disp32]` import-thunk tail calls (plain thunk).
+            if inst.op0_kind() == OpKind::Memory && inst.is_ip_rel_memory_operand() {
+                continue;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Detect the `.pdata` functions that reference the Rust Once/panic runtime's
+/// shared-state globals (first-order, `.data`/`.bss` only).
+///
+/// This is the teardown-safety net used when the SEH set is FULLY virtualized
+/// (`BTG_SEH_NONE=1`). The Once/panic runtime's completion frames (e.g. the
+/// `Once::call_once` completion path with `xchg [state], COMPLETE`) read and
+/// write **frame locals** (`[rbp-0x18]` saved-state slots) that are set up by
+/// the function's native prologue. When such a frame is block-lifted and the VM
+/// dispatches into the middle of it (no prologue), the frame slot holds stale
+/// stack data and the completion computes a garbage absolute address for the
+/// atomic xchg (observed as `xchg eax,[r11]` with `r11=0xFFFFFFFFFFFFFFFE` →
+/// exit-time 0xC0000005 teardown).
+///
+/// Every function that pokes one of those shared slots must stay native (it is
+/// then reached through the native-call bridge, which runs its real prologue).
+/// Restricting the shared-set to `.data`/`.bss` excludes the read-only
+/// panic-message strings in `.rdata` (which otherwise pull in every function
+/// that merely formats a panic) while keeping the mutable Once/hook/stdio state.
+pub fn detect_runtime_shared_global_functions(
+    text_bytes: &[u8],
+    base_va: u64,
+    image_base: u64,
+    relayed_sections: &[crate::pe::builder::SectionData],
+) -> Vec<(u64, u64)> {
+    use iced_x86::{Decoder, DecoderOptions, OpKind};
+
+    const SIGS: &[&[u8]] = &[
+        b"panicked at ",
+        b"called `Option::unwrap()`",
+        b"called `Result::unwrap()`",
+        b"fatal runtime error",
+        b"Rust panics must be rethrown",
+        b"failed to initiate panic",
+        b"Once instance has previously been poisoned",
+        b"thread panicked while processing panic",
+        b"drop of the panic payload panicked",
+        b"attempt to divide by zero",
+        b"index out of bounds",
+        b"Rust cannot catch foreign exceptions",
+    ];
+
+    // 1) panic-message string VAs in .rdata
+    let mut panic_string_vas: Vec<u64> = Vec::new();
+    for sec in relayed_sections {
+        if sec.name != ".rdata" {
+            continue;
+        }
+        let sec_va = image_base + sec.virtual_address as u64;
+        for sig in SIGS {
+            let mut pos = 0usize;
+            while let Some(i) = find_subslice(&sec.bytes, sig, pos) {
+                panic_string_vas.push(sec_va + i as u64);
+                pos = i + sig.len();
+            }
+        }
+    }
+
+    // 2) .pdata function ranges
+    let funcs = parse_pdata_functions(relayed_sections, image_base);
+    let func_of = |va: u64| -> Option<(u64, u64)> {
+        funcs
+            .iter()
+            .copied()
+            .find(|&(s, e, _)| s <= va && va < e)
+            .map(|(s, e, _)| (s, e))
+    };
+
+    // 3) decode .text: panic-string reference sites -> seed function starts.
+    let mut refs: Vec<u64> = Vec::new();
+    let mut dec = Decoder::with_ip(64, text_bytes, base_va, DecoderOptions::NONE);
+    while dec.can_decode() {
+        let inst = dec.decode();
+        if inst.is_invalid() {
+            continue;
+        }
+        for oi in 0..inst.op_count() {
+            if inst.op_kind(oi) == OpKind::Memory && inst.is_ip_rel_memory_operand() {
+                let tgt = inst.memory_displacement64();
+                if panic_string_vas.contains(&tgt) {
+                    refs.push(inst.ip());
+                }
+            }
+        }
+    }
+    let mut seed_starts: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for &r in &refs {
+        if let Some((s, _)) = func_of(r) {
+            seed_starts.insert(s);
+        }
+    }
+    if seed_starts.is_empty() {
+        return Vec::new();
+    }
+
+    // 4) shared mutable-state ranges: .data / .bss / .data$* (NOT .rdata — the
+    //    read-only panic-message strings must not seed the shared set).
+    let state_ranges: Vec<(u64, u64)> = relayed_sections
+        .iter()
+        .filter(|s| s.name.starts_with(".data") || s.name.starts_with(".bss"))
+        .map(|s| {
+            let start = image_base + s.virtual_address as u64;
+            let len = (s.virtual_size.max(s.bytes.len() as u32)) as u64;
+            (start, start + len)
+        })
+        .collect();
+    if state_ranges.is_empty() {
+        return Vec::new();
+    }
+
+    // 5) decode a function range and return the .data/.bss addresses it references.
+    let fn_state_refs = |fs: u64, fe: u64| -> Vec<u64> {
+        let mut out = Vec::new();
+        let off = (fs.saturating_sub(base_va)) as usize;
+        if off >= text_bytes.len() {
+            return out;
+        }
+        let mut d = Decoder::with_ip(64, &text_bytes[off..], fs, DecoderOptions::NONE);
+        let mut guard = 0usize;
+        for inst in d {
+            if guard > 1_000_000 {
+                break;
+            }
+            guard += 1;
+            if inst.ip() >= fe {
+                break;
+            }
+            if inst.is_invalid() {
+                continue;
+            }
+            for oi in 0..inst.op_count() {
+                if inst.op_kind(oi) != OpKind::Memory {
+                    continue;
+                }
+                let addr = if inst.is_ip_rel_memory_operand() {
+                    inst.memory_displacement64()
+                } else if inst.memory_base() == iced_x86::Register::None
+                    && inst.memory_index() == iced_x86::Register::None
+                {
+                    inst.memory_displacement64()
+                } else {
+                    continue;
+                };
+                if state_ranges.iter().any(|&(gs, ge)| gs <= addr && addr < ge) {
+                    out.push(addr);
+                }
+            }
+        }
+        out
+    };
+
+    // 6) the shared-state slots the Once/panic runtime touches.
+    let mut shared: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for &s in &seed_starts {
+        if let Some(&(_, e, _)) = funcs.iter().find(|&&(ss, _, _)| ss == s) {
+            for g in fn_state_refs(s, e) {
+                shared.insert(g);
+            }
+        }
+    }
+    if shared.is_empty() {
+        return Vec::new();
+    }
+
+    // 7) keep native every .pdata function that references one of those slots.
+    let mut native: Vec<(u64, u64)> = funcs
+        .iter()
+        .filter(|&&(s, e, _)| {
+            fn_state_refs(s, e).iter().any(|g| shared.contains(g))
+        })
+        .map(|&(s, e, _)| (s, e))
+        .collect();
+    native.sort_by_key(|r| r.0);
+    native.dedup();
+
+    if !native.is_empty() {
+        let bytes: u64 = native.iter().map(|(s, e)| e - s).sum();
+        println!(
+            "[+] SEH teardown-guard: keeping {} function(s) native (Once/panic shared-state, 0x{:X} bytes)",
+            native.len(),
+            bytes
+        );
+    }
+    native
+}
+
 /// Parse `.pdata` RUNTIME_FUNCTION entries into absolute function ranges plus
 /// each entry's UNWIND_INFO RVA.
 fn parse_pdata_functions(
@@ -520,6 +751,7 @@ pub fn detect_seh_native_functions(
     image_base: u64,
     relayed_sections: &[crate::pe::builder::SectionData],
     entry_point_va: u64,
+    full_seh_virtualize: bool,
 ) -> SehNativeExclusion {
     use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
     use std::collections::{HashMap, HashSet, VecDeque};
@@ -659,9 +891,54 @@ pub fn detect_seh_native_functions(
     //   Env BTG_SEH_MINIMAL (default 1) -- set to 0 to restore the old full set
     //   (panic_seed | ehandler | {can_reach_panic - can_reach_ehandler} = 175) for
     //   A/B regression.
+    //
+    //   Env BTG_SEH_NONE (default 0) -- set to 1 to virtualize the ENTIRE SEH set
+    //   (native set = empty). This is the P4 "전체 SEH 가상화" path: the .pdata
+    //   regeneration (bridge UNWIND_INFO, build.rs update_pdata_seh full-coverage
+    //   mode) must cover the whole-program VM region so the OS unwinder can walk
+    //   virtualized frames. Only honored when `full_seh_virtualize` is set (the
+    //   whole-program VM path --vm --vm-oep, where ALL virtualized code runs in a
+    //   single Program-VM frame and one bridge UNWIND_INFO is correct). The
+    //   block-shuffle path (--vm only) keeps the 132 minimal set because shuffled
+    //   blocks execute natively with heterogeneous frames that no single
+    //   UNWIND_INFO can cover.
+    let seh_none = full_seh_virtualize
+        && std::env::var("BTG_SEH_NONE").map_or(false, |v| v != "0");
     let seh_minimal = std::env::var("BTG_SEH_MINIMAL").map_or(true, |v| v != "0");
     let mut native: HashSet<u64> = HashSet::new();
-    if seh_minimal {
+    if seh_none {
+        // full SEH virtualization: every ordinary (straight-line / branch-only)
+        // SEH/panic/catch function is lifted into the VM. The ONLY functions kept
+        // native are the two orthogonal guards:
+        //   1. switch-dispatch (computed-jump) EHANDLER functions on the
+        //      raise..catch path — block-level VM dispatch enters switch targets
+        //      without the frame prologue, so their frame-locals read stale data
+        //      (Once completion `xchg eax,[r11]` with r11=-2 -> exit-time AV);
+        //   2. Once/panic shared-state teardown frames (data-global pokes).
+        for &s in ehandler_starts.iter() {
+            if !can_reach_panic.contains(&s) {
+                continue;
+            }
+            if let Some(&(ss, ee, _)) = funcs.iter().find(|&&(ss, _, _)| ss == s) {
+                if fn_has_computed_jump(ss, ee, text_bytes, base_va) {
+                    native.insert(s);
+                }
+            }
+        }
+        for (s, e) in detect_runtime_shared_global_functions(
+            text_bytes, base_va, image_base, relayed_sections,
+        ) {
+            native.insert(s);
+            let _ = e;
+        }
+        println!(
+            "[+] SEH native-preservation: FULL SEH VIRTUALIZATION (BTG_SEH_NONE=1) -- keeping {} function(s) native (panic_seed={}, ehandler={}, computed-jump={})",
+            native.len(),
+            panic_seed_starts.len(),
+            ehandler_starts.len(),
+            native.len()
+        );
+    } else if seh_minimal {
         // P4 minimal: keep only the catch/cleanup frames on the raise..catch path
         // (EHANDLER/UHANDLER functions reachable from a panic seed).
         for &s in ehandler_starts.iter() {

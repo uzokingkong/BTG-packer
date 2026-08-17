@@ -293,6 +293,16 @@ pub(crate) fn place_boot_stub(
         + if vm_prog_mod.is_some() { crate::vm::interp::CALL_STACK_SIZE } else { 0 };
     cursor = (cursor + 7) & !7; // align 8
 
+    // ── P4 (전체 SEH 가상화): Program VM 모듈 위치를 ctx에 기록 — build.rs가
+    // .pdata 브리지 UNWIND_INFO로 이 영역을 커버해 OS unwinder가 VM 내부 프레임을
+    // (더미 핸들러 대신) 결정적으로 걷게 한다. ---------------------------------
+    ctx.vm_prog_rva = if vm_prog_mod.is_some() {
+        dispatcher_rva.saturating_add(vm_prog_off as u32)
+    } else {
+        0
+    };
+    ctx.vm_prog_total = vm_prog_total as u32;
+
     // ── M6 Phase-2.3: at-rest 암호화 대상 확정 ──────────────────────────────
     // Program VM bytecode offset/len (boot area — .textb는 이미 RWX라 in-place 복호화 가능)
     let vm_prog_bc_len = if vm_oep_effective {

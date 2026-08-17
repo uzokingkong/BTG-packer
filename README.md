@@ -108,11 +108,16 @@ Rust로 작성된 x86-64 PE 패커 겸 코드 가상화(VM) 엔진입니다. 원
 - IAT 은닉/재구성(`--iat-hide`), 메모리 하드닝 W^X(`--mem-harden`),
   `--integrity`(CRC32, keyed-MAC은 **패킹 시 계산만 하고 런타임 미검증**),
   `--payload-relocate`, 리소스 등록(`--rsrc-register`), 안티디버그 부트 스텁
-- `.pdata` SEH 재생성(브리지 UNWIND_INFO), `--keep-pdata` 원본 유지 옵션
+- `.pdata` SEH 재생성(브리지 UNWIND_INFO): 디스패처 부트 영역 + **whole-program VM
+  모듈 영역 전체**를 RUNTIME_FUNCTION으로 커버(엔트리 프로로그에서 유도한
+  UNWIND_INFO — UWOP_ALLOC_LARGE + PUSH_NONVOL, CodeOffset 내림차순), `--keep-pdata`
+  원본 유지 옵션
 - 프로그램 VM(`--vm-oep`)의 네이티브 제외 집합(`src/vm/text_lift/exclusions.rs`):
   Rust panic/unwind/Once 런타임, setjmp/longjmp 함수, SEH(catch/unwind) 함수를
-  `.pdata` 함수 단위로 네이티브 유지. SEH 전체 가상화는 `BTG_SEH_NONE=1`
-  (기본: `BTG_SEH_MINIMAL=1` — 최소 catch/cleanup 집합만 네이티브).
+  `.pdata` 함수 단위로 네이티브 유지. **전체 SEH 가상화**는 `BTG_SEH_NONE=1`
+  (legacy `--vm --vm-oep` 경로) — SEH 네이티브 **132 → 49**, 16테스트+체크섬 유지,
+  exit teardown 안전망(computed-jump EHANDLER + Once/panic shared-state) 포함.
+  기본: `BTG_SEH_MINIMAL=1` — 최소 catch/cleanup 집합만 네이티브.
   (v56부터 LOCK 메모리 RMW는 별도 격리하지 않고 VM opcode로 처리)
 - **결정적 빌드** (`--seed`): 같은 input+seed+config → 같은 출력 (SHA256 동일,
   2026-08-17 실측)

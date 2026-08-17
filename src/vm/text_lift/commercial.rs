@@ -170,12 +170,17 @@ pub fn lift_program_cfg_commercial(
     }
 
     // SEH/panic-unwind 제외 넷 (lift_program_cfg와 동일한 구조적 규칙).
+    // NOTE: full-SEH virtualization (BTG_SEH_NONE) is only verified on the legacy
+    // 1:1 Program VM (--vm --vm-oep). The commercial RISC engine keeps the 132
+    // minimal SEH set — reducing it to the teardown-guard (49) leaves a RISC-lift
+    // fidelity gap on the virtualized Once/panic path.
     let excl = detect_seh_native_functions(
         text_bytes,
         base_va,
         image_base,
         relayed_sections,
         entry_point_va,
+        false,
     );
     let mut excluded_blocks: HashSet<u64> = blocks
         .iter()

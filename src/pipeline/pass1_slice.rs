@@ -48,6 +48,10 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         ctx.target_info.image_base,
         &ctx.target_info.relayed_sections,
         target_ep_va,
+        // full-SEH virtualization (BTG_SEH_NONE) is only verified on the legacy
+        // whole-program VM (--vm --vm-oep). The commercial RISC engine keeps the
+        // 132 minimal SEH set.
+        ctx.vm_oep && !ctx.vm_commercial,
     );
     // ── 실측 플래트닝 지표용: SEH 필터 이전의 원본 CFG 엣지와 시작 주소 스냅샷 ──
     let total_cfg_edges: usize = basic_blocks.iter().map(|bb| bb.successor_vas.len()).sum();

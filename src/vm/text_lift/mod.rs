@@ -324,7 +324,7 @@ pub fn lift_program_cfg(
     // concern is handled by the real lock VM opcodes (v46-v49/v55), so the old
     // shared-global block net is dropped here too.
     let excl = detect_seh_native_functions(
-        text_bytes, base_va, image_base, relayed_sections, entry_point_va,
+        text_bytes, base_va, image_base, relayed_sections, entry_point_va, true,
     );
     let mut excl = excl;
     // setjmp/longjmp boundary: keep every non-local-jump user (and its call
