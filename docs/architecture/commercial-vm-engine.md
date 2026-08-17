@@ -1,6 +1,9 @@
 # Commercial-Grade Polymorphic VM Architecture (Phase 1 ~ 4)
 
-> 문서 상태: v60 — **Themida / VMProtect 급 상용 가상화 엔진 구현 완료**. 갱신: 2026-08-14.  
+> 문서 상태: v60 — 상용(risc→poly→threaded) 가상화 엔진 설계 및 구현 기록. "Themida/VMProtect
+> 급 저항력"은 **지향 목표**이며, 실측 저항도(탈가상화 저항, 성능 등)는 이 문서에서 단언하지
+> 않습니다. 현재 구현·검증 현황은 루트 [`README.md`](../../README.md)의 "솔직한 현황 요약"을
+> 참조하세요. 갱신: 2026-08-14.
 > 모듈 위치: `src/vm/risc/`, `src/vm/poly/`, `src/vm/threaded/`, `src/sdk/`, `src/pipeline/selective_vm.rs`
 
 ---
@@ -15,7 +18,7 @@
 [Source x86 Machine Code]
           │
           ▼
-[Phase 1] Micro-IR & RISCification (12 Primitive Micro-Ops, De-synthesis via pure NOR & ADC)
+[Phase 1] Micro-IR & RISCification (38 Primitive Micro-Ops, NOR/ADC de-synthesis 포함)
           │
           ▼
 [Phase 2] Build-Seed Polymorphic ISA (Randomized Opcode Map, Register Permutation, Non-linear Rolling Key)
@@ -33,7 +36,8 @@
 
 ### [Phase 1] Micro-IR & RISCification (`src/vm/risc/`)
 
-1. **12개 원시 마이크로 연산자 (`opcodes.rs`)**:
+1. **원시 마이크로 연산자 — 현재 총 38개 (`src/vm/risc/opcodes.rs`의 `RiscOp` enum)**.
+   초기 12개(NOR/ADC 계열 `Nor`/`AddWithCarry`/`ShiftRight`/`ShiftLeft`/`VirtualPush`/`VirtualPop`/`MemoryRead`/`MemoryWrite`/`VirtualBranch`/`NativeCallBridge`/`SetFlag`/`Halt`)에서 확장됨 — 추가된 항목: `Mov`, x86 정확 플래그 `SubWithBorrow`/`Add`/`Inc`/`Dec`/`Not`(폭별), `Multiply`/`MultiplyLow`/`Divide`, `BSwap`, `BitScanForward/Reverse`, `CountTrailingZeros`/`CountLeadingZeros`/`PopCount`, `Setcc`, `ConditionalMove`, `CompareExchange`, `FloatAdd/Sub/Mul/Div`, `IntToFloat`/`FloatToInt`/`FloatToFloat`.
    - 산술/논리: `Nor`, `AddWithCarry`, `ShiftRight`, `ShiftLeft`
    - 메모리/스택: `VirtualPush`, `VirtualPop`, `MemoryRead`, `MemoryWrite`
    - 제어/기타: `VirtualBranch`, `NativeCallBridge`, `SetFlag`, `Halt`
@@ -111,8 +115,8 @@
 
 ## 3. 검증 결과
 
-- **단위 테스트**: `cargo test --lib` $\rightarrow$ **105/105 Passed (100%)**
-- **실행 안정성**: CLI 10개 조합 및 7개 VM/VM-OEP 조합 실환경 실행 $\rightarrow$ **Windows Event Log 0 Crash / Faults**
+- **단위 테스트**: `cargo test --release --lib` $\rightarrow$ **285 passed; 0 failed** (2026-08-17 실측)
+- **실행 안정성**: CLI 10개 조합 및 7개 VM/VM-OEP 조합 실환경 실행 $\rightarrow$ **Windows Event Log 0 Crash / Faults** (※ 이 수치는 이 저장소의 로그/자동화에서 재현하지 않았으며, 기록에 근거한 주장임)
 
 ### 3.1 차등(Differential) 검증 계약 — 선형 블록 단위 동치로 한정
 

@@ -1,11 +1,17 @@
 # BTG Packer (vm-obf)
 
-**Bidirectional Trigger Graph (BTG) — x86-64 Binary Virtualization / Protection / Obfuscation Packer**
+**Bidirectional Trigger Graph (BTG) — x86-64 이진 가상화 / 보호 / 난독화 패커 (연구용 프로토타입)**
 
-Rust로 구현된 상용급(VMProtect/Themida급 지향) VM 컴파일러 겸 PE 패커입니다.
-원본 `.text`를 평문으로 존재시키지 않고, CISC x86을 RISC 마이크로 연산자로 분해한 뒤
-빌드별 다형성 ISA(Polymorphic ISA) + 롤링 키 스트림 암호로 **전체 프로그램을
-가상화**합니다.
+Rust로 작성된 x86-64 PE 패커 겸 코드 가상화(VM) 엔진입니다. 원본 `.text`의
+일부 또는 전체를 VM 바이트코드로 lift 하고, 선택적으로 코드/데이터 암호화,
+임포트 은닉, 안티디버그, 실행 후 재암호화 등을 조합해 출력 PE를 만들어냅니다.
+
+> **냉정한 현황**: 이 프로젝트는 **연구·개발용 프로토타입**입니다. "상용급
+> (VMProtect/Themida 급) 상용 제품"은 **아직 아닙니다** — 그 방향을 지향하며
+> 진행 중이지만, 아래 "알려진 한계"에 있는 구조적 제약(특히 원본 `.text`의
+> 평문 유지, VM/native 경계, 예외/멀티스레드)이 해소되지 않았습니다. 이
+> README는 광고 문구를 걷어내고 **코드와 실제 실행 결과 기준으로** 현재 상태를
+> 기술합니다.
 
 > 크레이트: `btg-packer` v1.0.0 · Rust edition 2021 · Windows x64 대상
 
@@ -13,89 +19,100 @@ Rust로 구현된 상용급(VMProtect/Themida급 지향) VM 컴파일러 겸 PE 
 
 ## 목차
 
-- [구현된 것](#구현된-것)
+- [실제 상태 요약](#실제-상태-요약)
+- [구현된 것 (코드 기준)](#구현된-것-코드-기준)
 - [아키텍처](#아키텍처)
 - [빌드 / 테스트](#빌드--테스트)
 - [사용법 (CLI)](#사용법-cli)
-- [검증 게이트](#검증-게이트)
-- [상용화 진행 (P0~P3)](#상용화-진행-p0p3)
+- [알려진 한계 (구조적)](#알려진-한계-구조적)
+- [검증 상태](#검증-상태)
 - [문서](#문서)
+- [라이선스](#라이선스)
 
 ---
 
-## 구현된 것
+## 실제 상태 요약
 
-### 두 개의 병렬 VM 엔진
+| 영역 | 상태 | 근거 |
+|---|---|---|
+| 빌드 (`cargo build --release`) | ✅ 성공 | 2026-08-17 실제 실행 확인 |
+| 단위/차등 테스트 (`cargo test --release --lib`) | ✅ **285 passed / 0 failed** | 2026-08-17 실제 실행 확인 |
+| 레거시 VM opcode 수 | ✅ **193개** (0x01..0xC1) | `src/vm/bytecode/registry.rs` `opcodes!` 매크로 |
+| 상용 RISC 마이크로 연산 수 | ✅ **38개** | `src/vm/risc/opcodes.rs` `RiscOp` enum |
+| 결정적 빌드 (`--seed`) | ✅ 동작 확인 | 동일 seed 2회 패킹 → **SHA256 동일** (2026-08-17 실측) |
+| 상용(risc→poly→threaded) 경로 | 🔶 구현·배선됨, **선형 블록 단위 동치**로만 검증 | `build_program_vm_commercial` + 차등 테스트 |
+| 원본 `.text` 전체 가상화 | ❌ **대부분의 모드에서 미달성** — 원본 `.text`는 평문으로 유지됨 | `patch_data.rs` / `crypto/mod.rs` |
+| "명령 커버리지 100% (26,956/26,956)" | ⚠️ **특정 테스트 바이너리 1개의 진단 수치**일 뿐, 일반 보장 아님 | `--text-vm` 진단 (2026-08-13) |
+| "6040 블록 가상화" | ⚠️ **진단(P2-RISC-GAP) 산출값** — RIP-relative lift는 크래시로 **비활성(gate) 상태** | `docs/journal/2026-08-17-*` |
+| FINAL CHECKSUM `0x2cdc...` | ⚠️ **자체 개발 기록/테스트 하네스에만 존재** — 커밋된 로그 산출물에 없음 | `test/src/main.rs:269`, docs |
+
+---
+
+## 구현된 것 (코드 기준)
+
+### 두 개의 VM 엔진
 
 | | 레거시 VM 코어 | 상용 엔진 (Commercial-grade) |
 |---|---|---|
 | 모듈 | `vm/bytecode`, `vm/handlers`, `vm/lifter`, `vm/interp`, `vm/text_lift` | `vm/risc/`, `vm/poly/`, `vm/threaded/`, `sdk/`, `pipeline/selective_vm.rs`, `pipeline/poly_embed.rs` |
-| 방식 | 1:1 CISC → VM 바이트코드 | RISC De-synthesis(12 micro-op) → 폴리모픽 ISA → 다이렉트 스레딩 |
-| 명령 커버리지 | **100%** (실측 26,956/26,956) | mov/lea/shift/arith/cmp/call/jcc/mem + 8/16-bit 정밀화 (6040블록 가상화) |
-| 역할 | `--vm-oep` 프로그램 전체 가상화 | `--vm-commercial` 전체 프로그램 가상화 (risc→poly→threaded) |
+| 방식 | x86 → 1:1 VM 바이트코드 | x86 → RISC(마이크로-op) → 폴리모픽 ISA → 다이렉트 스레딩 |
+| opcode 수 | **193개** | **38개 RISC 마이크로-op** |
+| 커버리지 | 리프터가 지원하는 명령 범위는 넓음 (진단 수치 아래 참고) | RISC로 lift 불가 명령은 **함수 단위로 네이티브 유지(fallback)** |
+| 역할 | `--vm-oep` (레거시 프로그램 가상화) | `--vm-oep --vm-commercial` (risc→poly→threaded) |
 
-### 상용 가상화 파이프라인 (Phase 1~4)
+### 레거시 VM (193 opcode)
+
+- opcode 단일 진실 공급원: `vm/bytecode/registry.rs`의 `opcodes!` 매크로
+- 16 GPR + XMM + 6비트 RFLAGS + DF(방향) 모델, 두-스택(CALL/RET) 모델
+- 그룹: MOV/MOVZX/MOVSX, ADD/SUB/IMUL/AND/OR/XOR/INC/DEC/NEG/NOT/CMP/TEST,
+  SHL/SHR/SAR/ROL/ROR, MUL/IMUL/DIV/IDIV(8/16/32/64)·BSWAP, BSR/BSF/TZCNT/LZCNT/
+  POPCNT, BMI1/2(BLSR/BLSMSK/BLSI/ANDN), SETcc, CMOVcc, 문자열 ops(MOVS/STOS/
+  LODS/SCAS/CMPS + REP/REPE/REPNE + DF), PUSH/POP/CALL/RET, LEA/LEA_RIP/LEA_GS,
+  절대주소 mem, 원자적(CMPXCHG/XCHG/XADD/LOCK INC-DEC), SSE/FPU 스칼라·변환,
+  CPUID/XGETBV, native_call 브리지.
+- 인터프리터(`vm/interp/`)와 네이티브 핸들러(`vm/handlers/`)가 거의 전부 동형.
+  **예외: `OP_NATIVE_CALL`은 인터프리터에서 no-op** (실제 네이티브 브리지는
+  생성된 핸들러가 담당 — `interp/mod.rs:157`).
+
+### 상용 가상화 파이프라인 (risc→poly→threaded)
 
 ```text
 [Source x86 Machine Code]
-          │
-          ▼
-[Phase 1] Micro-IR & RISCification — 12 primitive micro-ops (NOR/ADC de-synthesis)
-          │
-          ▼
-[Phase 2] Build-Seed Polymorphic ISA — randomized opcode map, register permutation,
-          non-linear rolling-key stream cipher
-          │
-          ▼
-[Phase 3] Direct Threading & Super-Operators — tail-call direct jump, handler MBA,
-          super-op fusion
-          │
-          ▼
-[Phase 4] Selective SDK Markers — BTG_VM_START / BTG_VM_END (C/C++/Rust), native
-          dispatch trampoline, .btgvm embedding
+        ▼
+[Phase 1] RISCification — 38개 마이크로-op (NOR/ADC de-synthesis 포함)
+        ▼
+[Phase 2] Build-Seed Polymorphic ISA — randomized opcode map, rolling-key stream
+        ▼
+[Phase 3] Direct Threading — tail-call direct jump, handler MBA, super-op fusion
+        ▼
+[Phase 4] Selective SDK Markers — BTG_VM_START / BTG_VM_END
 ```
 
-- **RISC 리프터** (`vm/risc/`) — CISC → NOR/ADC 분해, 가상 플래그 모델, peephole 최적화.
-  최근(2026-08-17) 8/16-bit CMP/TEST/ADD/SUB(부분-쓰기 상위 비트 보존), NOP/Pause,
-  간접 JMP, 폭별 ALU 네이티브 핸들러 추가로 **가상화 4513→6040 블록(+34%),
-  RISC-unliftable 3210→1683(-48%)**.
+- **RISC 리프터** (`vm/risc/`) — CISC → 마이크로-op 분해, 가상 플래그 모델,
+  peephole 최적화(`vm/risc/opt.rs`, 현재는 주로 peephole 수준).
 - **폴리모픽 ISA** (`vm/poly/`) — 빌드 시드 기반 opcode/레지스터 셔플, VIP 연동
-  롤링 키. `RiscProgram::eval_state` 참조와 인터프리터/네이티브가 **완전 상태 동치**.
-- **직접 스레딩** (`vm/threaded/`) — 중앙 디스패처 루프 없이 각 핸들러가 다음
-  핸들러로 직접 점프, super-op 합성, self-decoding 네이티브 핸들러.
-- **SDK** (`sdk/`) — `BTG_VM_START/END` 마커 선택 가상화, LLVM IR 인터페이스.
-
-### 레거시 VM (171+ opcode, 명령 커버리지 100%)
-
-- opcode 단일 진실 공급원: `vm/bytecode/registry.rs`의 `opcodes!` 매크로
-- 16 GPR + XMM + 6비트 RFLAGS + DF(방향 플래그) 모델, 두-스택(CALL/RET) 모델
-- 그룹별 지원: MOV/MOVZX/MOVSX, ADD/SUB/IMUL/AND/OR/XOR/INC/DEC/NEG/NOT/CMP/TEST,
-  SHL/SHR/SAR/ROL/ROR, **MUL/IMUL/DIV/IDIV(8/16/32/64)**·BSWAP, BSR/BSF/TZCNT/LZCNT/
-  POPCNT, **BMI1/2**(BLSR/BLSMSK/BLSI/ANDN), SETcc, CMOVcc, **문자열 ops**
-  (MOVS/STOS/LODS/SCAS/CMPS + REP/REPE/REPNE + DF), PUSH/POP/CALL/RET, LEA/LEA_RIP/
-  LEA_GS, 절대주소 mem, **원자적**(CMPXCHG/XCHG/XADD/LOCK INC-DEC), SSE/FPU 스칼라·
-  변환, CPUID/XGETBV, native_call 브리지.
+  롤링 키. `RiscProgram::eval_state`(참조) == 폴리 인터프리터 == 네이티브
+  하네스가 **선형 블록 단위로 동치** 검증됨.
+- **직접 스레딩** (`vm/threaded/`) — 중앙 디스패처 루프 없이 핸들러가 다음
+  핸들러로 직접 점프, self-decoding 네이티브 핸들러(`poly_direct.rs`).
+  `run_native_poly_direct`가 실제 x86-64 기계어를 생성·실행 (순수 인터프리터 아님).
+- **SDK** (`sdk/`) — `BTG_VM_START/END` 마커 선택 가상화.
 
 ### PE 패커 / 프로텍터
 
-- CFG 추출 → 마이크로 슬라이싱 → 블록 셔플 → 재배치 픽스업 → 밀집 패킹 → 섹션
-  합성 → 부트 스텁 설치
-- 코드/데이터/문자열 런 암호화: **BTG-C1 512-bit 스트림 사이퍼**(기본, RC4는
-  `--rc4`로만), chained-crypto, dispatcher per-block 재암호화(`--dispatcher-reencrypt`),
-  M7 refcount-safe on-demand 재암호화
-- IAT 은닉/재구성, 메모리 하드닝(W^X, `--mem-harden`), `--integrity` CRC + keyed-MAC,
-  `--payload-relocate`, 리소스 등록, 안티디버그 부트 스텁
-- `.pdata` SEH 재생성(브리지 UNWIND_INFO), TLS-first-callback at-rest 복호화,
-  `--keep-pdata` 원본 유지 옵션
-- **결정적 빌드** (`--seed`): 같은 input+seed+config → 같은 출력 (SHA256 동일)
-
-### P0 상용화 수정 (2026-08-17, 리뷰 반영)
-
-| 항목 | 내용 |
-|---|---|
-| **P0-1 VM/native 경계 원자성** | 상용 리프트의 직접 분기가 제외 함수 범위 안에 있으면 **함수 진입(프롤로그) 주소로 리다이렉트** — 네이티브 브리지가 함수 중간(에필로그)이 아니라 처음부터 실행 |
-| **P0-5 MUL/IMUL CF/OF** | legacy VM이 flagless로 취급하던 MUL/IMUL이 x86 upper-half overflow CF/OF를 interp/native/RISC 전 경로에서 정확히 설정 (`semantics.rs` flag_contract + 차등 fuzz) |
-| **P0-7 ASLR 보존** | relocation-aware 출력 — 정식 `.reloc` DIR64 디렉터리를 생성해 DYNAMIC_BASE / HIGH_ENTROPY_VA 보존. `--no-crypto` 경로는 **cdb로 실제 리베이스(0x140000000→0x7ff6...) 확인**. at-rest 암호화 경로는 게이트로 비활성화 |
+- CFG 추출 → 마이크로 슬라이싱 → 블록 셔플 → 재배치 픽스업 → 밀집 패킹 →
+  섹션 합성 → 부트 스텁 설치 (`pipeline/pass1~4`, `patch_data`, `build`)
+- 코드/데이터/문자열 암호화: **BTG-C1 512-bit 스트림 사이퍼**(기본, `crypto/`
+  의 독자 ARX/S-box 구성 — RC4가 아니라 별도 구현. 다만 **암호학적 안전성은
+  감사되지 않은 홈메이드 암호**), RC4는 `--rc4`로 복귀 가능
+- chained-crypto, dispatcher per-block 재암호화(`--dispatcher-reencrypt`),
+  M7 refcount-safe on-demand 재암호화(`--m7`)
+- IAT 은닉/재구성(`--iat-hide`), 메모리 하드닝 W^X(`--mem-harden`),
+  `--integrity`(CRC32, keyed-MAC은 **패킹 시 계산만 하고 런타임 미검증**),
+  `--payload-relocate`, 리소스 등록(`--rsrc-register`), 안티디버그 부트 스텁
+- `.pdata` SEH 재생성(브리지 UNWIND_INFO), `--keep-pdata` 원본 유지 옵션
+- **결정적 빌드** (`--seed`): 같은 input+seed+config → 같은 출력 (SHA256 동일,
+  2026-08-17 실측)
 
 ---
 
@@ -108,28 +125,26 @@ x86-64 PE
   ├── pipeline/       Pass1→Pass2→Pass3→Pass4 → patch_data → crypto → build
   │                    ├── dispatcher/      static + reencrypt + m7 디스패처
   │                    ├── crypto/          BTG-C1 / RC4 / chained / bootstub / integrity
-  │                    └── validate/        PE 구조·로더 호환 전수 검증
+  │                    └── validate/        PE 구조·로더 호환 검증
   ├── vm/
-  │    ├── risc/       RISC micro-op · lifter · desynth · opt · flags
+  │    ├── risc/       RISC 마이크로-op · lifter · desynth · opt · flags
   │    ├── poly/       polymorphic ISA · rolling-key · encoder · interpreter
   │    ├── threaded/   direct tail-call · super-ops · native self-decoding handlers
-  │    ├── bytecode/   opcode registry · builder(rel8→rel32 widening)
-  │    ├── handlers/   native x86-64 handler codegen (threaded dispatch)
-  │    ├── interp/     reference interpreter (interp == native 차등)
+  │    ├── bytecode/   opcode registry · builder
+  │    ├── handlers/   native x86-64 handler codegen
+  │    ├── interp/     reference interpreter
   │    ├── lifter/     legacy 1:1 lifter + IR pipeline
   │    ├── text_lift/  프로그램 CFG lift · switch · SEH/panic 제외
   │    ├── self_test/  --vm-test 스위트
   │    └── semantics.rs canonical x86 flag semantics (ground truth)
-  ├── pe/             parser / multi-section builder / **reloc.rs (P0-7)**
+  ├── pe/             parser / multi-section builder / reloc
   ├── crypto/         BTG-C1 프리미티브 (state/key_schedule/nonlinear/round/permutation)
   ├── obfuscation/    MBA 폴리노미얼 생성 + x86-64 코드젠
   ├── sdk/            BTG_VM_START/END 마커 · selective virtualizer
   └── qa/             멀티 컴파일러 QA 벤치마크
 ```
 
-핵심 설계 문서: [`docs/architecture/vm-compiler-architecture.md`](docs/architecture/vm-compiler-architecture.md) ·
-[`docs/architecture/commercial-vm-engine.md`](docs/architecture/commercial-vm-engine.md) ·
-[`docs/README.md`](docs/README.md) (전체 문서 인덱스)
+자세한 실제 파이프라인: [`docs/architecture/actual-pipeline.md`](docs/architecture/actual-pipeline.md)
 
 ---
 
@@ -139,13 +154,13 @@ x86-64 PE
 # 릴리스 빌드
 cargo build --release
 
-# 전체 단위/차등 테스트 (285개)
+# 전체 단위/차등 테스트 (285개, 2026-08-17 실측 green)
 cargo test --release --lib
 
 # VM 셀프 테스트 (lifter/interpreter/native handler cross-check)
 cargo run --release -- --vm-test
 
-# 커버리지 진단
+# 커버리지 진단 (특정 대상 PE 기준 — 보편 커버리지 보장이 아님)
 cargo run --release -- --text-vm  --input <target.exe>
 cargo run --release -- --text-vm-oep --input <target.exe>
 
@@ -168,72 +183,114 @@ cargo run --release -- -t            # 멀티 컴파일러 QA 스위트
 btg-packer.exe -i <input.exe> -o <packed.exe> [옵션]
 ```
 
+`src/cli.rs`에 실제 정의된 옵션만 나열합니다.
+
 | 옵션 | 설명 |
 |---|---|
-| `-l, --obf-level <N>` | 난독화 레벨 0~3 |
-| `-a, --anti-debug` | 안티디버그 부트 스텁 |
+| `-i, --input <PATH>` | 입력 PE (기본 `dummy_target.exe`) |
+| `-o, --output <PATH>` | 출력 PE (기본 `protected_btg.exe`) |
 | `--seed <u64>` | 결정적 빌드 (모든 RNG 단일 시드) |
+| `-l, --obf-level <N>` | 난독화 레벨 (clamp 1..=3, 기본 3) |
+| `-a, --anti-debug` | 안티디버그 부트 스텁 |
+| `-t, --test-qa` | QA 벤치마크 스위트 |
+| `-d, --debug` | verbose 로그 |
+| `-g, --log-file <PATH>` | 로그 파일 출력 |
+| `--trace-blocks` | 런타임 블록 실행 트레이서 주입 |
 | `--no-crypto` | 암호화 끄기 (P0-7 relocation-aware/ASLR 보존 활성 경로) |
 | `--vm` | KSA/PRGA VM 가상화 |
-| `--vm-oep` | 프로그램 전체 → 프로그램 VM (`--vm` 필요) |
-| `--vm-commercial` | 상용 엔진 백엔드 (risc→poly→threaded, `--vm --vm-oep` 필요) |
+| `--vm-test` | VM 셀프 테스트 후 종료 |
+| `--text-vm` | `.text`→VM lift 커버리지 진단 |
+| `--text-vm-oep` | 도달 CFG→단일 VM 프로그램 lift 진단 |
+| `--payload-relocate` | 코드 페이로드를 실행 불가 `.vdata`로 이동 |
+| `--rsrc-register` | 페이로드를 RT_RCDATA 리소스로 등록 (`--payload-relocate` 필요) |
+| `--crypto-coverage <N>` | 코드 영역 암호화 커버리지(%) (기본 100) |
+| `--chained-crypto` | 256B 청크 체이닝 RC4 + 자기파괴 |
+| `--integrity` | 코드 영역 CRC32 (안티-패치) |
+| `--iat-hide` | import 은닉/재구성 (TLS 콜백 대상은 하드-에러) |
+| `--mem-harden` | 복호화 후 .textb RWX→RX (fail-open, 재암호화와 배타) |
 | `--dispatcher-reencrypt` | 블록별 개별 암호화 + 실행 후 재암호화 |
-| `--m7` | M7 on-demand 재암호화 (anti-dump, refcount-safe) |
-| `--m8` | VM handler 테이블 MBA 난독화 |
 | `--full` | 최대 보호 스택 단일 플래그 |
-| `--chained-crypto` | 256B 청크 체이닝 암호화 |
-| `--integrity` | 코드 영역 CRC32 + keyed-MAC |
-| `--custom-cipher` | BTG-C1 (기본값) |
-| `--rc4` | RC4 강제 (레거시) |
-| `--iat-hide` | import 은닉/재구성 |
-| `--mem-harden` | 복호화 후 .textb RWX→RX |
-| `--payload-relocate` | 코드 페이로드 .vdata 이동 |
-| `--rsrc-register` | 리소스 디렉터리 재구성 |
+| `--vm-oep` | OEP→VM entry 전환 (`--vm` 필요) |
+| `--vm-commercial` | 상용 엔진 백엔드 (`--vm --vm-oep` 필요) |
+| `--m7` | M7 on-demand 재암호화 (anti-dump) |
+| `--m8` | VM handler 테이블 MBA 난독화 |
+| `--vm-bench` | VM 성능 벤치마크 |
+| `--map` | VM 바이트코드 매퍼(`<output>.map`) |
+| `--sym-map` | 블록 단위 심볼릭 맵(`<output>.sym`, `--map` 필요) |
 | `--keep-pdata` | 원본 .pdata 바이트 유지 |
-| `--map / --sym-map` | VM 바이트코드 매퍼 덤프 |
-| `-t, --test-qa` | QA 벤치마크 |
-| `--vm-test` | VM 셀프 테스트 |
+| `--block-ring` | 디스패처 ring-buffer 진단 (표준 디스패처만) |
+| `--custom-cipher` | BTG-C1 (기본값) |
+| `--rc4` | RC4 강제 |
 
 대표 조합:
 
 ```bash
-# 상용 프로그램 가상화 (권장 검증 경로)
+# 상용 프로그램 가상화 경로 (선형 블록 단위 동치로 검증)
 btg-packer.exe -i test.exe -o packed.exe --vm --vm-oep --vm-commercial --seed 1234
 
 # 최대 보호
 btg-packer.exe -i test.exe -o packed.exe --full
 
-# ASLR 보존 + relocation-aware
+# ASLR 보존 + relocation-aware (암호화 없는 경로만)
 btg-packer.exe -i test.exe -o packed.exe --no-crypto
 ```
 
 ---
 
-## 검증 게이트
+## 알려진 한계 (구조적)
 
-모든 패킹 경로는 이 게이트를 통과해야 합니다:
+냉정하게 현재 코드 기준으로 남아 있는 제약입니다. 상용 보호기로 쓰기엔
+다음이 먼저 해소되어야 합니다.
 
-- `cargo build --release` green
-- `cargo test --release --lib` → **285 passed; 0 failed**
-- `--vm-test` ALL PASS
-- pack→run 16-test + **FINAL CHECKSUM `0x2cdc0e4511d84a64`** baseline 무회귀
-  (`--vm` / `--vm-oep` / `--vm-commercial` / `--no-crypto` / `--dispatcher-reencrypt`)
-- P0-7: cdb로 ASLR 리베이스 후에도 checksum 정상 확인
+1. **원본 `.text`가 대부분의 모드에서 평문으로 남는다.** TLS 콜백/CRT/네이티브
+   브리지가 정상 동작하도록 "안전 사본"을 평문으로 유지
+   (`patch_data.rs`, `pipeline/crypto/mod.rs`). "원본 코드의 평문 존재 제거"는
+   **미달성** 목표입니다.
+2. **VM↔네이티브 경계가 함수 단위로 원자적이지 않다.** lift 불가 블록은
+   네이티브로 남는데, 함수 중간에서 VM/native 경계가 생겨 스택 프레임이 깨질 수
+   있음 (P2 후속 과제 — `text_lift/commercial.rs:181-196`).
+3. **RIP-relative 리프트는 크래시(0xC0000005, keystream desync)로 비활성(gate).**
+   → "6040 블록 가상화"는 RIP-relative 포함 진단값으로, **실제 활성 경로에서는
+   그보다 적음** (`docs/journal/2026-08-17-commercial-p2-risc-lift.md`).
+4. **멀티스레드 재진입 취약.** 프로그램 VM state가 단일 정적 상태 — 멀티스레드
+   동시 진입 시 깨질 수 있음 (`vm/interp/state.rs`).
+5. **차등 검증이 "선형 블록 단위 동치"로 한정.** taken-분기(실제 제어흐름 이동)의
+   VM vs native 동치는 별도 테스트로만 다루고, 전체 프로그램 동치를 보장하지 않음.
+6. **플래그 의미론이 부분적.** PF/AF가 폴리 경로에서 제외되고(FLAG_MASK), RISC
+   분해가 x86 per-instruction 플래그를 완전히 재현하지 못하는 경우 있음
+   (`self_test/cross_path.rs:74-77`).
+7. **`--mem-harden`은 fail-open**, `--dispatcher-reencrypt`와 배타.
+   **`--integrity`의 keyed-MAC은 패킹 시 계산만 하고 런타임 미검증**(CRC32만 강제).
+8. **`--dispatcher-reencrypt`는 실제로 "decrypt-once"** — 첫 디스패치 후 평문 유지
+   (`reencrypt.rs:193-195`). 실행 후 **재암호화**는 `--m7`만 수행.
+9. **SDK 마커 경로(`poly_embed`)는 데이터 임베드만 배선** — 그것을 소비하는
+   롤링키 런타임은 별도 항목(T1-4)이며 실행 정합은 검증되지 않음.
+   `sdk/llvm_interface.rs`는 실질 stub.
+10. **BTG-C1은 홈메이드 암호** — 독자 설계(비표준 ARX/S-box)이고 암호학적 안전성
+    감사/표준화는 안 됨.
+11. **플래그셋/다중 백엔드로 인한 의미론 divergence 위험** — 같은 의미론을 여러
+    곳(interp/handlers/risc/poly/semantics)에서 재구현.
+12. 소스에 `unwrap()` 약 3000회 — PE 입력 검증 계층과 컴파일러 내부 불변식이
+    섞여 있어 악성 입력에 크래시할 수 있음.
+
+> "커버리지 100% (26,956/26,956)"·"6040 블록 가상화"는 **진단 도구(`--text-vm` /
+> `--text-vm-oep` / P2-RISC-GAP)가 특정 테스트 대상 1개(`test/target/debug/
+> rust_packer_test.exe`)에 대해 출력한 측정값**입니다. 이는 리프터가 *해당
+> 바이너리*에서 처리한 명령/블록 비율을 뜻하며, 임의의 PE에 대한 커버리지 보장
+> 또는 "상용 제품 수준 완성도"를 의미하지 않습니다.
 
 ---
 
-## 상용화 진행 (P0~P3)
+## 검증 상태
 
-상세 로드맵: [`docs/roadmap/commercial-readiness-plan.md`](docs/roadmap/commercial-readiness-plan.md) ·
-[`docs/roadmap/COMMERCIAL-VM-UPGRADE-PLAN.md`](docs/roadmap/COMMERCIAL-VM-UPGRADE-PLAN.md) ·
-[`docs/roadmap/milestones.md`](docs/roadmap/milestones.md)
+**실제 실행으로 확인한 것 (2026-08-17):**
+- `cargo build --release` → 성공
+- `cargo test --release --lib` → **285 passed; 0 failed**
+- `--seed` 결정적 빌드 → 동일 seed 2회 패킹 SHA256 동일
 
-- **P0-1** canonical semantics 단일화 · **P0-2** Win64 ABI 검증기 · **P0-4** PE 구조
-  전수 검증 · **P0-5** MUL/IMUL CF/OF · **P0-7** ASLR 보존 → 완료
-- **P1-1** unwrap 제거 · **P1-2** W^X · **P1-3** exception safety · **P1-4** 스레드
-  안전 · **P3-1** 결정적 seed → 완료
-- **P2** RISC 리프터 커버리지 → 진행 중 (가상화 6040블록, RIP-relative 게이트)
-- 재암호화/m7 at-rest 암호화 경로의 런타임 post-decrypt relocation → 후속 P0-7 확장
+**문서/자체 개발 기록에만 존재 (커밋 산출물로 재현 안 됨):**
+- "FINAL CHECKSUM `0x2cdc0e4511d84a64` baseline 무회귀" — 개발 메모(`docs/`)와
+  테스트 하네스 소스(`test/src/main.rs:269`)에만 기록. 자동화 게이트가 아님.
 
 ---
 
@@ -241,16 +298,14 @@ btg-packer.exe -i test.exe -o packed.exe --no-crypto
 
 | 문서 | 내용 |
 |---|---|
-| [`docs/README.md`](docs/README.md) | 전체 문서 인덱스 (카테고리별) |
-| [`docs/architecture/vm-compiler-architecture.md`](docs/architecture/vm-compiler-architecture.md) | 모듈 지도, 컴파일러 프론트엔드/부트 정합 |
-| [`docs/architecture/commercial-vm-engine.md`](docs/architecture/commercial-vm-engine.md) | Phase 1~4 상용 가상화 엔진 심층 설계 |
-| [`docs/architecture/coverage.md`](docs/architecture/coverage.md) | 명령 커버리지 베이스라인 |
-| [`docs/roadmap/COMMERCIAL-VM-UPGRADE-PLAN.md`](docs/roadmap/COMMERCIAL-VM-UPGRADE-PLAN.md) | 상용화 마스터플랜 (갭 분석) |
-| [`docs/roadmap/commercial-readiness-plan.md`](docs/roadmap/commercial-readiness-plan.md) | P0~P3 실행 로드맵 (상태 마커) |
-| [`docs/roadmap/milestones.md`](docs/roadmap/milestones.md) | 마일스톤 체크리스트 |
-| [`docs/engine/P3-handlers-wired-and-verified.md`](docs/engine/P3-handlers-wired-and-verified.md) | 상용 self-decoding 핸들러 검증 |
-| [`docs/engine/T1-2-RISC-Lifter-Coverage-DONE.md`](docs/engine/T1-2-RISC-Lifter-Coverage-DONE.md) | RISC 리프터 커버리지 |
-| [`docs/engine/T1-4-Native-SelfDecoding-Dispatcher-DONE.md`](docs/engine/T1-4-Native-SelfDecoding-Dispatcher-DONE.md) | 네이티브 self-decoding 디스패처 |
+| [`docs/README.md`](docs/README.md) | 전체 문서 인덱스 |
+| [`docs/architecture/actual-pipeline.md`](docs/architecture/actual-pipeline.md) | **실제 패킹 파이프라인 (냉정 기술)** |
+| [`docs/architecture/vm-compiler-architecture.md`](docs/architecture/vm-compiler-architecture.md) | 모듈 지도, 컴파일러 프론트엔드 |
+| [`docs/architecture/commercial-vm-engine.md`](docs/architecture/commercial-vm-engine.md) | 상용 가상화 엔진 설계 |
+| [`docs/architecture/coverage.md`](docs/architecture/coverage.md) | 명령 커버리지 베이스라인 (진단 수치) |
+| [`docs/roadmap/`](docs/roadmap/) | 로드맵 / 현황 |
+| [`docs/engine/`](docs/engine/) | 기능 구현·검증 리포트 |
+| [`docs/vault/`](docs/vault/) | btg_vault 챌린지 |
 | [`docs/journal/`](docs/journal/) | 일일 작업 기록 |
 
 ---

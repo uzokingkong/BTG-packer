@@ -16,8 +16,8 @@
 
 ## 2. VM ISA — 지원되는 opcode (v54)
 
-`src/vm/bytecode/registry.rs`의 `opcodes!` 레지스트리(현재 **171 opcode**,
-0x01..0xAB)가 단일 진실 공급원. `--vm-test` [30] P2-10이 레지스트리/핸들러/
+`src/vm/bytecode/registry.rs`의 `opcodes!` 레지스트리(현재 **194 opcode** (2026-08-17 직접 계수),
+0x01..0xBF)가 단일 진실 공급원. `--vm-test` [30] P2-10이 레지스트리/핸들러/
 인터프리터 sync를 검증한다.
 
 ### 지원 그룹

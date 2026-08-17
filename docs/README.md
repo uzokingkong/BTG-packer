@@ -14,6 +14,7 @@ BTG Packer (vm-obf) 프로젝트 문서의 카테고리별 인덱스입니다. �
 
 | 문서 | 내용 | 관련 코드 |
 |---|---|---|
+| [`architecture/actual-pipeline.md`](architecture/actual-pipeline.md) | **실제 패킹 파이프라인 (냉정 기술)** — 코드 기준 처리 순서, 미달성/주의 지점 | `src/main.rs`, `src/pipeline/`, `src/vm/` |
 | [`architecture/vm-compiler-architecture.md`](architecture/vm-compiler-architecture.md) | 모듈 지도, 컴파일러 프론트엔드, 부트/실행 정합 | `src/vm/`, `src/pipeline/`, `src/main.rs` |
 | [`architecture/commercial-vm-engine.md`](architecture/commercial-vm-engine.md) | Phase 1~4 상용 가상화 엔진 (RISC→Poly→Threaded) 심층 설계 | `src/vm/risc/`, `src/vm/poly/`, `src/vm/threaded/`, `src/sdk/` |
 | [`architecture/coverage.md`](architecture/coverage.md) | 명령 커버리지 베이스라인, 지원/제외 opcode 그룹 | `src/vm/bytecode/registry.rs`, `src/vm/lifter/` |
