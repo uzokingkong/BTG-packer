@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // BTG Pipeline - Build: PE Synthesis & Output
 // ==============================================================================
 
@@ -143,25 +143,28 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     }
 
     // ???? PE ??슢諭???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-    // v3: ?酉??遺? ?녹뮇議???됱몵筌??봔????쎈?boot stub)????筌욊쑴??癒?뵠 ??뺣뼄.
-    // ctx.boot_entry_offset = ?봔????쎈???諭??????쎈늄??(0????疫꿸퀣??OEP = ?諭????뽰삂)
+    // v3: ?酉€??遺? ?녹뮇議???됱몵筌??봔€????쎈€?boot stub)????筌욊쑴??癒?뵠 ??뺣뼄.
+    // ctx.boot_entry_offset = ?봔€????쎈€???諭€??????쎈늄??(0??€??疫꿸퀣??OEP = ?諭€????뽰삂)
     let entry_point_rva = dispatcher_rva + ctx.boot_entry_offset;
 
-    // ── P0-⑦: relocation-aware 출력 ────────────────────────────────────────────
-    // ASLR(DYNAMIC_BASE)/HIGH_ENTROPY_VA 보존을 위해, 최종 이미지의 절대 VA 슬롯을
-    // 커버하는 정식 `.reloc` data directory를 생성한다. 로더가 리베이스 시 이
-    // 테이블로 부트 영역(dispatcher/부트 스텁/VM 엔트리 스텁/핸들러 테이블)의 절대
-    // VA를 패치하므로 선호 base ≠ 실제 base 여도 정상 동작한다.
+    // ── P0-⑦ (T0-3): relocation-aware 출력 — 암호화 경로에서도 ASLR 보존 ──────────
+    // 기존 코드는 `at_rest_encrypted=true`이면 .reloc 생성을 포기해 ASLR이 완전히
+    // 비활성화됐다. T0-3 수정: 암호화된 영역 RVA만 encrypted_rva_ranges로 패스해
+    // reloc.rs가 해당 슬롯을 skip하도록 한다. 이로써 부트 스텁 imm64(모듈
+    // 엔트리 VA, 핸들러 테이블 VA 등)은 정상 reloc되는 반면, 암호문 영역은
+    // 안전하게 제외된다.
     //
-    // 안전 게이트: at-rest 암호화된 영역에 절대 VA가 있는 경로는 제외한다 —
-    // 로더는 부트 스텁 복호화 **전**에 .reloc을 적용하므로, 암호문에 relocation을
-    // 적용하면 복호화가 깨진다. `at_rest_encrypted`(crypto::run이 실제 암호화
-    // 적용 여부 기록)가 false인 경로만 커버한다:
-    //   * --no-crypto (아무것도 암호화 안 함) → 커버 가능 (절대 VA 전부 평문)
-    //   * --dispatcher-reencrypt / --m7 / 일반 crypto / --vm-oep(보존 .text 런
-    //     at-rest 암호화) → 로더 relocation이 암호문을 파괴 → 제외
-    //     (런타임 post-decrypt relocation은 후속 P0-⑦ 확장 항목).
-    let reloc_aware = !ctx.at_rest_encrypted;
+    // 암호화 단위:
+    //   - 코드 블록 영역 (.textb first_block_offset .. first_block_offset+code_len)
+    //   - .text at-rest 런 (암호화된 것만; 평문 유지 영역은 reloc OK)
+    //   - 구체적으로 알 수 없는 범위는 보수적으로 코드 블록 전체를 포함함
+    //   - 컈트르트는 항상 .textb 떠나 인접하지 않는 .btg 섬션 안에 있으므로
+    //   코드 블록 RVA 범위로만 충분함.
+    //
+    // 로더가 부트 스텁 복호화 전에 .reloc을 적용하더라도 암호문 슬롯은 skip되어
+    // 암호문이 다치지 않는다. 부트 스텁 imm64들(모듈 엔트리 VA 등)은 평문이라
+    // reloc되어도 안전하다.
+    let reloc_aware = true; // T0-3: 항상 reloc 시도 (암호화 범위는 encrypted_rva_ranges로 제어)
 
     let mut preserve_aslr_bits = false;
     let mut reloc_section: Option<SectionData> = None;
@@ -193,8 +196,50 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
             None => btg_end,
         };
 
-        // at-rest 암호화 영역 없음 (--no-crypto) → 빈 목록.
-        let encrypted_rva_ranges: Vec<(u32, u32)> = Vec::new();
+        // T0-3: 암호화된 RVA 범위를 파앙한다.
+        // 코드 블록 영역: dispatcher_rva + first_block_offset .. + code_len
+        // (crypto::run이 at_rest_encrypted=true로 기록한 경우에만 유효)
+        // 단순한 보수 범위: .textb 코드 블록 영역 전체(first_block_offset에서
+        // btg_section 끝까지). 실제 암호화 눁이가 code_len보다 작으면
+        // 일부 평문이 남아도 안전: 위양성(false-skip)이 암호문-skip만 못하는
+        // false-include보다 항상 안전하다 (reloc 빠지면 VM이 장로드되고, 
+        // reloc 두면 boot stub이 2회 체이닝 후 컴파일 복호화하므로 대부분
+        // OK임).
+        let mut encrypted_rva_ranges: Vec<(u32, u32)> = Vec::new();
+        if ctx.at_rest_encrypted {
+            // .textb 코드 블록 영역 (dispatcher부터 코드 끝까지)
+            let code_block_rva = ctx.dispatcher_rva + ctx.first_block_offset as u32;
+            let code_block_len = (btg_section.bytes.len() as u32)
+                .saturating_sub(ctx.first_block_offset as u32);
+            if code_block_len > 0 {
+                encrypted_rva_ranges.push((code_block_rva, code_block_len));
+            }
+            // .text 섹션 at-rest 런 (vm-oep 경로에서 암호화된 영역)
+            // 소스: patched_sections 중 .text 섹션 전체를 보수적으로 포함
+            // (at-rest 런 정보를 파이프라인에서 전달하지 않는 트레이드오프)
+            if ctx.vm_oep {
+                for sec in &relayed_sections {
+                    if sec.name == ".text" {
+                        // .text 셀션 전체를 알려진 범위로 포함
+                        // (실제 at-rest 런 정보는 place.rs에서만 알므로
+                        //  섹션 전체를 보수적 exclusion으로 등록)
+                        let len = sec.bytes.len() as u32;
+                        if len > 0 {
+                            encrypted_rva_ranges.push((sec.virtual_address, len));
+                        }
+                        break;
+                    }
+                }
+            }
+            println!(
+                "[+] T0-3 ASLR: at_rest_encrypted path — excluding {} encrypted range(s) from .reloc \
+                 (code_block RVA=0x{:X}/{}B{}). \
+                 Boot-stub imm64 slots (plaintext) will still get reloc entries.",
+                encrypted_rva_ranges.len(),
+                code_block_rva, code_block_len,
+                if ctx.vm_oep { " + .text at-rest" } else { "" }
+            );
+        }
 
         let image_base = ctx.target_info.image_base;
         let size_of_image = payload_end;

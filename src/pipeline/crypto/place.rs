@@ -532,9 +532,22 @@ pub(crate) fn place_boot_stub(
     // ── v5 용량 제어: 실제 사용분만 남기고 섹션 tail을 자른다 ──────────────────
     // (pass4가 여유 있게 예약한 BOOT_AREA_RESERVE 중 사용하지 않은 영역 제거 →
     //   raw 섹션 크기가 줄어 파일 크기 감소. .vdata도 잘린 .textb 직후에 붙는다.)
+    //
+    // T0-1 FIX ①: Program VM 모듈 전체(vm_prog_off + vm_prog_total + CALL_STACK_SIZE)를
+    // boot_end에 포함. 기존 코드는 KSA/PRGA VM만 포함해 truncate()가 Program VM 영역을
+    // 잘라버려 vm_prog_bc_off 이후가 모두 0x00이 되는 silent corruption이 발생했다.
+    // CALL_STACK_SIZE(0x2000): 부트 스텁 vm_embed.rs가 Program VM state 직후에 예약하는
+    // return-IP 스택 영역 — truncate가 이를 포함해야 한다.
+    let vm_prog_call_stack = if vm_prog_mod.is_some() {
+        crate::vm::interp::CALL_STACK_SIZE
+    } else {
+        0
+    };
     let boot_end = stub_end
         .max(c1_end)
         .max(vm_off + vm_total)
+        .max(vm_prga_off + vm_prga_total)
+        .max(vm_prog_off + vm_prog_total + vm_prog_call_stack)
         .max(runs_off + 8 + total_num_runs * 16)
         .max(text_runs_off + text_runs_block)
         .max(boot_data_end);
@@ -778,7 +791,22 @@ let prmod = build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed,
             }
         }
         if vm_prog_bc_len > 0 {
-            r.crypt(&mut btg.bytes[vm_prog_bc_off..vm_prog_bc_off + vm_prog_bc_len as usize]);
+            // T0-1 FIX ②: at-rest 암호화 슬라이스 전 bound 검사.
+            // boot_end FIX ① 이후에도 vm_prog_bc_off 계산 오류(code/table len 잘못
+            // 참조)가 있으면 여기서 OOB panic이 발생할 수 있다. truncate 후 섹션
+            // 경계를 초과하는 경우를 명시적 Err로 전환해 silent OOB를 방어한다.
+            let bc_end = vm_prog_bc_off + vm_prog_bc_len as usize;
+            if bc_end > btg.bytes.len() {
+                return Err(anyhow::anyhow!(
+                    "T0-1: Program VM bytecode at-rest encrypt OOB: \
+                     vm_prog_bc_off=0x{:X} len=0x{:X} but section is only 0x{:X}B \
+                     (boot_end=0x{:X} new_section_len=0x{:X}). \
+                     Likely vm_prog_off/vm_prog_total mismatch.",
+                    vm_prog_bc_off, vm_prog_bc_len, btg.bytes.len(),
+                    boot_end, new_section_len
+                ));
+            }
+            r.crypt(&mut btg.bytes[vm_prog_bc_off..bc_end]);
         }
         println!(
             "[+] --vm-oep at-rest: fresh-RC4(seed) encryption applied (preserved .text {} run(s)/{}B + Program VM bytecode {}B)",

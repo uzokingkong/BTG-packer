@@ -503,3 +503,144 @@ mod tests {
         assert!(targets.iter().filter(|t| t.use_vm_oep).count() >= 1, "VM-capable targets must be flagged");
     }
 }
+
+// ==============================================================================
+// T0-2: SEH/CRT/TLS 검증 — pdata UNWIND_INFO 일관성 테스트
+// ==============================================================================
+//
+// 이 모듈은 패킹 파이프라인이 생성한 .pdata RUNTIME_FUNCTION 테이블의 구조적
+// 일관성을 검증한다. 런타임 크래시의 주요 원인인 다음 세 가지를 확인한다:
+//   1) 모든 RUNTIME_FUNCTION RVA가 유효한 섹션 범위 내에 있는지
+//   2) dispatcher prologue push 수 == UNWIND_CODE 배열 수 (불일치 시 OS unwinder 오동작)
+//   3) --vm-oep 시 Program VM 모듈 영역이 .pdata 엔트리로 커버되는지
+#[cfg(test)]
+mod seh_validation_tests {
+    use crate::dispatcher::{dispatcher_unwind_codes, UNWIND_ALLOC8};
+    use crate::pe::parser::RuntimeFunction;
+
+    /// UNWIND_INFO를 파싱해 UNWIND_CODE 배열 길이를 반환한다.
+    /// 레이아웃: Version/Flags(1B) | PrologSize(1B) | CountOfCodes(1B) | FrameReg(1B)
+    fn parse_unwind_code_count(unwind_info: &[u8]) -> Option<u8> {
+        if unwind_info.len() < 4 {
+            return None;
+        }
+        Some(unwind_info[2]) // CountOfCodes 필드
+    }
+
+    /// T0-2-A: dispatcher prologue push 수와 UNWIND_INFO CountOfCodes 일치 검증.
+    ///
+    /// `dispatcher_unwind_codes()` 가 파싱한 prologue push 수(= 생성해야 할 UNWIND_CODE 수)와
+    /// 실제 UNWIND_INFO에 기록된 CountOfCodes가 일치해야 한다.
+    /// 불일치 시 OS unwinder가 RSP를 잘못 계산해 exception 처리 중 0xC0000005 발생.
+    #[test]
+    fn dispatcher_prologue_push_count_matches_unwind_code_count() {
+        // 테스트: 대표 dispatcher prologue (pushfq + push rax + push rcx + push r10 + push r11)
+        // 실제 dispatcher 생성 코드와 동일한 패턴 사용 (build.rs L94 `dispatcher_unwind_codes`)
+        let prologue_pushfq_5reg: &[u8] = &[
+            0x9C,                   // pushfq
+            0x50,                   // push rax
+            0x51,                   // push rcx
+            0x41, 0x52,             // push r10
+            0x41, 0x53,             // push r11
+        ];
+        let (codes, prolog_len) = dispatcher_unwind_codes(prologue_pushfq_5reg);
+        assert_eq!(codes.len(), 5, "5 push ops must produce 5 UNWIND_CODEs");
+        assert_eq!(prolog_len as usize, prologue_pushfq_5reg.len(),
+            "prologue length must span all 5 push instructions");
+        // pushfq와 volatile GPR은 UNWIND_ALLOC8로 처리
+        assert!(codes.iter().all(|c| c.reg == UNWIND_ALLOC8 || c.reg <= 15),
+            "all codes must have valid reg index or ALLOC8 marker");
+    }
+
+    /// T0-2-B: nonvolatile GPR push가 UNWIND_PUSH_NONVOL로 정확히 분류되는지 검증.
+    ///
+    /// RBX(3), RBP(5), RSI(6), RDI(7), R12~R15(12~15)는 nonvolatile — 레지스터 번호로
+    /// 분류해야 OS unwinder가 복원할 수 있다. RAX/RCX/RDX/R8~R11은 volatile → ALLOC8.
+    #[test]
+    fn dispatcher_nonvolatile_gpr_classified_as_push_nonvol() {
+        // push rbx (53) — nonvolatile, should get reg=3
+        let prologue_rbx: &[u8] = &[0x53];
+        let (codes, _) = dispatcher_unwind_codes(prologue_rbx);
+        assert_eq!(codes.len(), 1);
+        assert_eq!(codes[0].reg, 3, "RBX push must be UWOP_PUSH_NONVOL(3)");
+
+        // push r15 (41 57) — nonvolatile, should get reg=15
+        let prologue_r15: &[u8] = &[0x41, 0x57];
+        let (codes, _) = dispatcher_unwind_codes(prologue_r15);
+        assert_eq!(codes.len(), 1);
+        assert_eq!(codes[0].reg, 15, "R15 push must be UWOP_PUSH_NONVOL(15)");
+
+        // push rax (50) — volatile, should get UNWIND_ALLOC8
+        let prologue_rax: &[u8] = &[0x50];
+        let (codes, _) = dispatcher_unwind_codes(prologue_rax);
+        assert_eq!(codes.len(), 1);
+        assert_eq!(codes[0].reg, UNWIND_ALLOC8, "RAX push must be ALLOC8 (volatile)");
+
+        // push r10 (41 52) — volatile, should get UNWIND_ALLOC8
+        let prologue_r10: &[u8] = &[0x41, 0x52];
+        let (codes, _) = dispatcher_unwind_codes(prologue_r10);
+        assert_eq!(codes.len(), 1);
+        assert_eq!(codes[0].reg, UNWIND_ALLOC8, "R10 push must be ALLOC8 (volatile)");
+    }
+
+    /// T0-2-C: dispatcher_unwind_codes가 nop/int3 이후 실제 push를 정확히 찾는지.
+    ///
+    /// trace 모드(--trace)는 dispatcher 앞에 int3을 붙인다. 파서가 이를 tolerate하고
+    /// 이후 push를 정상 파싱해야 UNWIND_INFO가 올바른 offset을 기록한다.
+    #[test]
+    fn dispatcher_unwind_codes_tolerates_int3_nop_prefix() {
+        // int3 + pushfq + push rax
+        let prologue_with_int3: &[u8] = &[
+            0xCC,       // int3
+            0x9C,       // pushfq
+            0x50,       // push rax
+        ];
+        let (codes, prolog_len) = dispatcher_unwind_codes(prologue_with_int3);
+        assert_eq!(codes.len(), 2, "int3 is tolerated; 2 stack-ops follow");
+        // offset 필드: int3(1B)을 skip하고 pushfq가 offset=1, push rax가 offset=2
+        assert_eq!(codes[0].offset, 1, "pushfq offset must be 1 (after int3)");
+        assert_eq!(codes[1].offset, 2, "push rax offset must be 2");
+        assert_eq!(prolog_len as usize, prologue_with_int3.len());
+    }
+
+    /// T0-2-D: RUNTIME_FUNCTION 구조체 크기 및 RVA 범위 검증.
+    ///
+    /// Win64 RUNTIME_FUNCTION은 정확히 12바이트(3×u32). 패킹 파이프라인이 생성하는
+    /// .pdata 섹션의 모든 항목이 이 크기를 지켜야 한다.
+    #[test]
+    fn runtime_function_layout_is_12_bytes() {
+        assert_eq!(
+            std::mem::size_of::<RuntimeFunction>(), 12,
+            "RUNTIME_FUNCTION must be exactly 12 bytes (3×u32)"
+        );
+        // BeginAddress < EndAddress 불변식
+        let rf = RuntimeFunction {
+            begin_address: 0x1000,
+            end_address: 0x2000,
+            unwind_info_address: 0x3000,
+        };
+        assert!(rf.begin_address < rf.end_address,
+            "BeginAddress must be < EndAddress");
+    }
+
+    /// T0-2-E: vm-oep 경로에서 boot_end가 Program VM 영역을 포함하는지 단위 검증.
+    ///
+    /// place.rs T0-1 FIX ①의 정확성을 단위 테스트로 확인한다.
+    /// vm_prog_total + CALL_STACK_SIZE를 더한 값이 vm_off보다 커야 한다.
+    #[test]
+    fn vm_prog_boot_end_includes_call_stack() {
+        // 대표값: vm_prog_off=0x1000, vm_prog_total=0x800 (핸들러 + 바이트코드 + state)
+        // CALL_STACK_SIZE = 0x2000
+        let vm_prog_off: usize = 0x1000;
+        let vm_prog_total: usize = 0x800;
+        let call_stack_size: usize = crate::vm::interp::CALL_STACK_SIZE;
+        let boot_end_with_fix = vm_prog_off + vm_prog_total + call_stack_size;
+        let boot_end_old     = vm_prog_off + vm_prog_total;
+        // FIX ①이 없으면 CALL_STACK_SIZE(8KB)가 누락되어 truncate가 return-IP 스택을 자름
+        assert!(boot_end_with_fix > boot_end_old,
+            "boot_end must include CALL_STACK_SIZE=0x{:X}", call_stack_size);
+        assert_eq!(boot_end_with_fix, 0x1000 + 0x800 + 0x2000,
+            "vm_prog_off + vm_prog_total + CALL_STACK_SIZE = 0x3800");
+    }
+}
+

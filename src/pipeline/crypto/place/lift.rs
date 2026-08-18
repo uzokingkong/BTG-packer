@@ -51,12 +51,21 @@ pub(crate) fn lift_program(
             (lift.bytecode, lift.entry_native)
         };
         if prog_bytecode.is_empty() {
-            return Err(anyhow::anyhow!(
-                "M6 Phase-2 --vm-oep{}: original .text lifted to empty VM program",
+            // T0-1 FIX: 초소형 타깃(1.5KB 등)에서 lift 결과가 빈 bytecode인 경우,
+            // Err를 반환하면 호출자가 vm_prog_mod=None, vm_oep_effective=true인 상태로
+            // 부트 스텁 빌드를 진행해 존재하지 않는 VM 모듈 포인터(vm_prog_entry_va=0)를
+            // 심어 런타임 크래시를 유발한다.
+            // 대신 native OEP 폴백(entry_native=true)으로 처리: 부트 스텁이 복호화 완료 후
+            // OEP로 직접 점프 (Program VM 실행 없음). 동작은 --vm 단독 모드와 동일.
+            println!(
+                "[!] T0-1: --vm-oep{} lifted empty program (target too small or all blocks excluded) — \
+                 forcing native OEP fallback (entry_native=true). Boot stub will jump directly to OEP.",
                 if vm_commercial { " --vm-commercial" } else { "" }
-            ));
+            );
+            (Vec::new(), true, ep_va)
+        } else {
+            (prog_bytecode, entry_native, ep_va)
         }
-        (prog_bytecode, entry_native, ep_va)
     } else {
         (Vec::new(), false, 0)
     };
