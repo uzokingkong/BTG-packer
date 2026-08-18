@@ -43,6 +43,20 @@ pub enum RiscOp {
     /// 네이티브 API 및 런타임 콜 브릿지
     NativeCallBridge,
 
+    /// P1 (③): VM→VM 콜 브릿지 — 별도 VM 인스턴스(리전)로 진입해 실행 후 복귀.
+    ///
+    /// `imm` = 서브 VM 프로그램 id (`RiscProgram.sub_vms` 키). 참조 `eval_state`
+    /// 는 호출자 상태(regs/temps/flags/vsp/stack)를 스냅샷하고 서브 VM을 같은
+    /// regs/mem 으로 실행한 뒤 복귀 — RAX(vreg 0)만 서브 VM의 반환값으로 대체하고
+    /// mem 은 서브 VM 이 쓴 내용을 보존한다 (아웃-파라미터). 같은 VM 내 점프는
+    /// `VirtualBranch` 가 처리하므로 여기는 **다른 VM 인스턴스 진입**만 담당한다.
+    ///
+    /// 폴리 인코딩/네이티브 하네스에서는 인지된 no-op 스텁 (`NativeCallBridge` 와
+    /// 동일 계약 — 실제 nested-VM 실행은 런타임 계층, P3 상용 통합은 리전 레지스트리
+    /// 확장 필요). `is_encodable` 에 등록하지 않아 상용 `--vm-commercial` 은
+    /// VmCallBridge 를 포함한 함수를 네이티브로 유지한다.
+    VmCallBridge,
+
     /// 가상 플래그 레지스터 갱신 (CF, ZF, SF, OF)
     SetFlag,
 
@@ -125,6 +139,43 @@ pub enum RiscOp {
     IntToFloat { src_bits: u8, dst_bits: u8 },
     FloatToInt { src_bits: u8, dst_bits: u8, truncate: bool },
     FloatToFloat { src_bits: u8, dst_bits: u8 },
+
+    // ── P1 (보고서 ②): packed SSE — XMM 슬롯(16바이트 가상 메모리) 기반 ────────
+    // XMM 슬롯은 XMM_SLOT_BASE + idx*16 의 16바이트 가상 메모리로 모델링된다.
+    // packed op 는 슬롯 **주소**(src1/src2/dst)를 피연산자로 받아 내부에서
+    // 16바이트를 읽고 요소 단위로 연산한 뒤 16바이트를 기록한다. 요소 경계에서
+    // 캐리/보로우가 전파되지 않는다 (PADDD 는 32-bit add 4개와 동치 — 64-bit
+    // add 로 분해하면 lane 사이 캐리가 전파되어 틀리므로 전용 op 가 필요).
+    // x86 packed 정수 연산은 RFLAGS 를 변경하지 않는다 → 플래그 불변.
+    // `is_encodable`에는 **등록하지 않는다** (상용 `--vm-commercial`은 이런 함수를
+    // 네이티브로 유지 — XMM_SLOT_BASE 는 네이티브 arena에 매핑되지 않으므로
+    // 폴리 인코딩/네이티브 실행을 허용하면 조용히 틀린다).
+
+    /// MOVDQA/MOVDQU/MOVUPS/MOVAPS — 16바이트 슬롯 복사. src1 = 원본 슬롯/메모리
+    /// 주소, dst = 대상 슬롯 주소. (메모리 로드/스토어는 lifter 가 2× 8바이트
+    /// MemoryRead/MemoryWrite 로 분해한다.)
+    PackedMove,
+
+    /// PADDB(1,16)/PADDW(2,8)/PADDD(4,4)/PADDQ(8,2) — 요소 단위 가산(폭 랩).
+    PackedAdd { elem_width: u8, lanes: u8 },
+
+    /// PSUBB/PSUBW/PSUBD/PSUBQ — 요소 단위 감산(폭 랩).
+    PackedSub { elem_width: u8, lanes: u8 },
+
+    /// PXOR — 16바이트 배타적 논리합 (요소 폭 무관 비트열).
+    PackedXor,
+
+    /// PAND — 16바이트 논리곱.
+    PackedAnd,
+
+    /// POR — 16바이트 논리합.
+    PackedOr,
+
+    /// PANDN — 16바이트 (a & ~b).
+    PackedAndNot,
+
+    /// PCMPEQB/W/D/Q — 요소 단위 등가: 같은 요소 = 전-1, 다르면 0.
+    PackedCmpEq { elem_width: u8, lanes: u8 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

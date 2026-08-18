@@ -317,7 +317,18 @@ pub fn lift_cfg_switch(
                         continue;
                     }
                     FlowControl::Return => {
-                        b.ret();
+                        // P0-0 (vm-oep): 엔트리 블록의 종료 `ret` 는 프로그램 VM 의
+                        // 최상위 복귀다. 부트 스텁이 콜 프레임 없이 직접 JMP 로 진입하므로
+                        // (KSA/PRGA VM 과 달리 return-IP 가 VM 콜 스택에 없다) OP_RET 로
+                        // lift 하면 빈 콜 스택을 pop 해 r9=0 → 디스패처 0xC0000005 크래시
+                        // (실제 dummy 1.5KB에서 재현). HALT 로 대체해 프로그램 VM 을 종료한다.
+                        // (중첩 함수의 ret 는 in-VM CALL32 가 콜 스택을 push 하므로 그대로
+                        //  OP_RET — 여기선 엔트리 블록만 취급.)
+                        if Some(bb.start_va) == entry_va {
+                            b.halt();
+                        } else {
+                            b.ret();
+                        }
                         va += len;
                         continue;
                     }
@@ -334,7 +345,14 @@ pub fn lift_cfg_switch(
         let total = b.bytes.len();
         for (i, &(bc_start, src_va, native, src_len)) in sym_blocks.iter().enumerate() {
             let bc_end = sym_blocks.get(i + 1).map(|&(s, _, _, _)| s).unwrap_or(total);
-            crate::vm::mapper::record_block_start(bc_start, src_va, native);
+            crate::vm::mapper::record_block_start(
+                bc_start,
+                src_va,
+                native,
+                if native { "native" } else { "program" },
+                0,
+                if native { "plain" } else { "program-vm" },
+            );
             crate::vm::mapper::end_block(bc_end, src_va + src_len);
         }
     }

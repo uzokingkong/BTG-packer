@@ -1,4 +1,4 @@
-// ==============================================================================
+﻿// ==============================================================================
 // BTG v42 - VM Bytecode Mapper (debugging aid)
 // ==============================================================================
 //
@@ -66,6 +66,13 @@ pub struct MapBlock {
     pub src_va_end: u64,
     /// Whether this block was excluded from VMization (kept native).
     pub native: bool,
+    /// VM type of this block: "native" | "vm" | "program" | "risc".
+    pub vm_type: &'static str,
+    /// VM handler (opcode) id for this block (0 when not applicable/unknown).
+    pub handler_id: u32,
+    /// Crypto region of this block:
+    /// "plain" | "block-enc" | "reencrypt" | "m7" | "program-vm" | "ksa".
+    pub crypto_region: &'static str,
 }
 
 /// P3 (G1): 상용(RISC→poly) 프로그램 lift에서 lift된 원본 명령 하나를 기록하는
@@ -102,6 +109,12 @@ pub struct VmMapper {
     pub risc_offsets: Vec<usize>,
     /// Human label for the current map (e.g. "program" / "ksa").
     pub label: String,
+    /// P3-3: base VA of the bytecode region (protected_va = base_va + bc_offset).
+    pub base_va: u64,
+    /// P3-3: bytecode stream snapshot (opcode at an offset names the handler).
+    pub bytecode: Vec<u8>,
+    /// P3-3: dispatcher mode for crypto-region classification.
+    pub dispatcher_mode: String,
 }
 
 thread_local! {
@@ -118,6 +131,9 @@ pub fn begin(label: &str) {
             risc_op_src: Vec::new(),
             risc_offsets: Vec::new(),
             label: label.to_string(),
+            base_va: 0,
+            bytecode: Vec::new(),
+            dispatcher_mode: String::new(),
         })
     });
 }
@@ -125,6 +141,33 @@ pub fn begin(label: &str) {
 /// Is recording currently enabled?
 pub fn active() -> bool {
     SLOT.with(|s| s.borrow().is_some())
+}
+
+/// P3-3: record the bytecode region's base VA (for protected-VA mapping).
+pub fn set_base_va(base: u64) {
+    SLOT.with(|s| {
+        if let Some(m) = s.borrow_mut().as_mut() {
+            m.base_va = base;
+        }
+    });
+}
+
+/// P3-3: record a bytecode snapshot so handler ids can be resolved.
+pub fn set_bytecode(bytes: Vec<u8>) {
+    SLOT.with(|s| {
+        if let Some(m) = s.borrow_mut().as_mut() {
+            m.bytecode = bytes;
+        }
+    });
+}
+
+/// P3-3: record the dispatcher mode (plain/reencrypt/m7/commercial).
+pub fn set_dispatcher_mode(mode: &str) {
+    SLOT.with(|s| {
+        if let Some(m) = s.borrow_mut().as_mut() {
+            m.dispatcher_mode = mode.to_string();
+        }
+    });
 }
 
 /// Record one lifted original instruction.
@@ -156,7 +199,14 @@ pub fn record(
 /// Call once per block, immediately after emitting its entry label (so
 /// `bc_start` = bytecode offset where this block's code begins). The block is
 /// closed by [`end_block`] with the offset just past its code.
-pub fn record_block_start(bc_start: usize, src_va: u64, native: bool) {
+pub fn record_block_start(
+    bc_start: usize,
+    src_va: u64,
+    native: bool,
+    vm_type: &'static str,
+    handler_id: u32,
+    crypto_region: &'static str,
+) {
     SLOT.with(|s| {
         if let Some(m) = s.borrow_mut().as_mut() {
             m.blocks.push(MapBlock {
@@ -166,6 +216,9 @@ pub fn record_block_start(bc_start: usize, src_va: u64, native: bool) {
                 src_va,
                 src_va_end: src_va, // filled by end_block
                 native,
+                vm_type,
+                handler_id,
+                crypto_region,
             });
         }
     });
@@ -247,13 +300,16 @@ pub fn render(m: &VmMapper) -> String {
     out.push_str("; ----- basic blocks (symbolic map) -----\n");
     for b in &m.blocks {
         out.push_str(&format!(
-            "block {} bc=0x{:X}..0x{:X} va=0x{:X}..0x{:X} {}\n",
+            "block {} bc=0x{:X}..0x{:X} va=0x{:X}..0x{:X} {} vm_type={} handler=0x{:X} crypto={}\n",
             b.id,
             b.bc_start,
             b.bc_end,
             b.src_va,
             b.src_va_end,
-            if b.native { "native" } else { "vm" }
+            if b.native { "native" } else { "vm" },
+            b.vm_type,
+            b.handler_id,
+            b.crypto_region,
         ));
     }
     out.push_str("; ----- lifted instructions -----\n");
@@ -273,6 +329,50 @@ pub fn render(m: &VmMapper) -> String {
             e.len,
             e.risc_op_start,
             e.risc_op_start + e.risc_op_count,
+            e.disasm
+        ));
+    }
+    out.push_str("; ----- promoted mapping (original VA -> protected VA -> block -> vm type -> handler -> crypto region) -----\n");
+    out.push_str("; format: src_va protected_va block vm_type handler crypto_region bc_offset disasm\n");
+    for e in &m.entries {
+        let block_id = m
+            .blocks
+            .iter()
+            .find(|b| e.bc_offset >= b.bc_start && e.bc_offset < b.bc_end.max(b.bc_start + 1))
+            .map(|b| b.id);
+        let handler = m
+            .bytecode
+            .get(e.bc_offset)
+            .copied()
+            .map(|op| {
+                let name = crate::vm::bytecode::OPCODE_INFO
+                    .iter()
+                    .find(|&&(o, _, _)| o == op)
+                    .map(|&(_, n, _)| n)
+                    .unwrap_or("-");
+                format!("0x{:02X} {}", op, name)
+            })
+            .unwrap_or_else(|| "-".to_string());
+        let pva = if m.base_va != 0 {
+            format!("0x{:X}", m.base_va + e.bc_offset as u64)
+        } else {
+            "-".to_string()
+        };
+        let region = m
+            .blocks
+            .iter()
+            .find(|b| e.bc_offset >= b.bc_start && e.bc_offset < b.bc_end.max(b.bc_start + 1))
+            .map(|b| b.crypto_region.to_string())
+            .unwrap_or_else(|| "plain".to_string());
+        out.push_str(&format!(
+            "0x{:X} {} {} {} {} {} 0x{:X} {}\n",
+            e.src_va,
+            pva,
+            block_id.map(|b| format!("#{}", b)).unwrap_or_else(|| "-".to_string()),
+            e.kind,
+            handler,
+            region,
+            e.bc_offset,
             e.disasm
         ));
     }
@@ -305,7 +405,7 @@ pub fn render_sym(m: &VmMapper, funcs: &[(u64, u64)], image_base: u64) -> String
         out.push_str(&format!("func 0x{:X} 0x{:X}\n", fs, fe));
     }
     out.push_str("; ----- blocks -----\n");
-    out.push_str("; format: block <id> bc=<bc_start>..<bc_end> va=<va_start>..<va_end> <vm|native> func=<func_start>\n");
+    out.push_str("; format: block <id> bc=<bc_start>..<bc_end> va=<va_start>..<va_end> <vm|native> func=<func_start> vm_type=<> handler=<> crypto=<>\n");
     // attribute each block to a .pdata function
     for b in &m.blocks {
         let func_start = funcs
@@ -315,10 +415,13 @@ pub fn render_sym(m: &VmMapper, funcs: &[(u64, u64)], image_base: u64) -> String
             .map(|&(fs, _)| format!("0x{:X}", fs))
             .unwrap_or_else(|| String::from("-"));
         out.push_str(&format!(
-            "block {} bc=0x{:X}..0x{:X} va=0x{:X}..0x{:X} {} func={}\n",
+            "block {} bc=0x{:X}..0x{:X} va=0x{:X}..0x{:X} {} func={} vm_type={} handler=0x{:X} crypto={}\n",
             b.id, b.bc_start, b.bc_end, b.src_va, b.src_va_end,
             if b.native { "native" } else { "vm" },
             func_start,
+            b.vm_type,
+            b.handler_id,
+            b.crypto_region,
         ));
     }
     out.push_str("; ----- lifted instructions (reverse index) -----\n");
@@ -441,5 +544,31 @@ mod tests {
         assert!(text.contains("0x140001000,1,6"));
         assert!(text.contains("0x140001007,2,9"));
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// P3-3 (map 승격): MapBlock에 추가된 vm_type/handler_id/crypto_region 컬럼이
+    /// record_block_start + render/render_sym에서 채워지고 렌더링되는지 확인한다.
+    #[test]
+    fn block_extended_columns_roundtrip() {
+        begin("test");
+        record_block_start(0x100, 0x140001000, false, "program", 0x3C, "program-vm");
+        end_block(0x200, 0x140001007);
+        let m = take().expect("map present");
+        assert_eq!(m.blocks.len(), 1);
+        let b = &m.blocks[0];
+        assert_eq!(b.vm_type, "program");
+        assert_eq!(b.handler_id, 0x3C);
+        assert_eq!(b.crypto_region, "program-vm");
+        assert_eq!(b.native, false);
+
+        let map_body = render(&m);
+        assert!(map_body.contains("vm_type=program"));
+        assert!(map_body.contains("handler=0x3C"));
+        assert!(map_body.contains("crypto=program-vm"));
+
+        let sym_body = render_sym(&m, &[], 0x140000000);
+        assert!(sym_body.contains("vm_type=program"));
+        assert!(sym_body.contains("handler=0x3C"));
+        assert!(sym_body.contains("crypto=program-vm"));
     }
 }

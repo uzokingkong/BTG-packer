@@ -7,7 +7,10 @@ use iced_x86::{Code, Instruction, MemoryOperand, Register};
 
 pub(crate) fn emit_mem_harden(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
     // ── v6 --mem-harden: ntdll!NtProtectVirtualMemory로 .textb RWX->RX ──────
-    // fail-open: 슬롯/해석 실패 시 보호 없이 계속 진행.
+    // S3: fail-open 제거 — LoadLibraryA("ntdll.dll")/GetProcAddress(
+    // "NtProtectVirtualMemory") 해석 실패 및 NtProtectVirtualMemory의
+    // NTSTATUS != STATUS_SUCCESS(0) 모두 **명시적 거부(ud2)**로 강제 종료.
+    // (보호 없이 계속 실행하는 fail-open은 더 이상 없다.)
     // FIX(v12.2): reencrypt(런타임 블록 단위 복호화)와 동시에는 생략 — 디스패처의
     // in-place 복호화가 RX 페이지에 쓰면 0xC0000005 (fault @ PRGA xor [rcx],al).
     if stub.mem_harden && !stub.reencrypt {
@@ -15,20 +18,20 @@ pub(crate) fn emit_mem_harden(seq: &mut Vec<(Instruction, Option<Label>)>, stub:
         seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.mem_ntdll_name_va).unwrap(), None));
         seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, MemoryOperand::with_base(Register::R13)).unwrap(), None));
         seq.push((Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(), None));
-        seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Label::MemDone)));
+        seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Label::MemFail))); // LoadLibraryA 슬롯 없음 → 거부
         seq.push((Instruction::with1(Code::Call_rm64, Register::RAX).unwrap(), None));
         seq.push((Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(), None));
-        seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Label::MemDone)));
+        seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Label::MemFail))); // ntdll 로드 실패 → 거부
         seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RAX).unwrap(), None)); // ntdll handle
         // GetProcAddress(ntdll, "NtProtectVirtualMemory")
         seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX, stub.mem_ntprot_name_va).unwrap(), None));
         seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::R14).unwrap(), None));
         seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, MemoryOperand::with_base(Register::R15)).unwrap(), None));
         seq.push((Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(), None));
-        seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Label::MemDone)));
+        seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Label::MemFail))); // GetProcAddress 슬롯 없음 → 거부
         seq.push((Instruction::with1(Code::Call_rm64, Register::RAX).unwrap(), None));
         seq.push((Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(), None));
-        seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Label::MemDone)));
+        seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Label::MemFail))); // proc 해석 실패 → 거부
         // NtProtectVirtualMemory(-1, &base, &size, PAGE_EXECUTE_READ, &old)
         // 스크래치: [rsp+0x100]=base, [rsp+0x108]=size, [rsp+0x110]=old (프레임 0x138)
         seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R11, stub.mem_code_base).unwrap(), None));
@@ -43,7 +46,13 @@ pub(crate) fn emit_mem_harden(seq: &mut Vec<(Instruction, Option<Label>)>, stub:
         seq.push((Instruction::with2(Code::Lea_r64_m, Register::R10, MemoryOperand::with_base_displ(Register::RSP, 0x110)).unwrap(), None));
         seq.push((Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ(Register::RSP, 0x20), Register::R10).unwrap(), None)); // 5th arg
         seq.push((Instruction::with1(Code::Call_rm64, Register::RAX).unwrap(), None));
+        // S3: NTSTATUS 검사 — EAX(=STATUS_SUCCESS 0) 아니면 명시적 거부(ud2)
+        seq.push((Instruction::with2(Code::Test_rm32_r32, Register::EAX, Register::EAX).unwrap(), None));
+        seq.push((Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(), Some(Label::MemFail))); // NTSTATUS != 0 → 거부
+        seq.push((Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap(), Some(Label::MemDone))); // 성공 → 정상 경로
+        // MemFail: 명시적 거부 (ud2 — 절대 fall-through 금지)
+        seq.push((Instruction::with(Code::Ud2), Some(Label::MemFail)));
+        // MemDone: 정상 경로 종점 (NOP)
         seq.push((Instruction::with(Code::Nopd), Some(Label::MemDone)));
     }
 }
-

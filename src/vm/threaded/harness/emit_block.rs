@@ -21,6 +21,8 @@ impl NativeVmHarness {
         block_index: u64,
         static_target: Option<u64>,
         helper_va: Option<u64>,
+        mba_prob: u32,
+        diversity_seed: u64,
     ) -> Result<()> {
         // ?占쏀깭 踰꾪띁 ?占쎄렐??硫붾え占??占쏀띁?占쎈뱶 ?占쏀띁.
         let mem = |disp: i64| -> iced_x86::MemoryOperand {
@@ -193,6 +195,13 @@ impl NativeVmHarness {
                 instrs.push(Instruction::with1(Code::Pop_r64, Register::RAX).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xC4).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).map_err(|e| anyhow!("{e}"))?);
+                // P0-2: AF(auxiliary carry, bit3 carry) = (a ^ b ^ res) & 0x10 — eval_state
+                // update_add64 와 동일. R8=a, R9=b, R10=res; RCX 를 스크래치로 사용.
+                instrs.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::R8).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::Xor_r64_rm64, Register::RCX, Register::R9).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::Xor_r64_rm64, Register::RCX, Register::R10).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, 0x10).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with2(Code::Xor_rm64_r64, Register::R8, Register::R10).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with2(Code::Xor_rm64_r64, Register::R9, Register::R10).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with2(Code::And_rm64_r64, Register::R8, Register::R9).map_err(|e| anyhow!("{e}"))?);
@@ -209,17 +218,43 @@ impl NativeVmHarness {
             RiscOp::Add { width } => {
                 load(instrs, ins.src1, Register::R10)?;
                 load(instrs, ins.src2, Register::R11)?;
+                // P1 (④+다양화): ADD 핸들러 MBA — 64-bit 한정, (block_index ^ diversity_seed)
+                // 해시로 결정적 확률 선택. variant 0 `(a^b)+(a&b)` 후 `+(a&b)` / variant 1
+                // `(a|b)+(a&b)` — 둘 다 플래그(CF/ZF/SF/OF)가 x86 add 와 정확히 동일하다
+                // (P0-2 차등 검증: variant 0 의 `(a^b)+2*(a&b)` 는 2*(a&b) 랩 시 CF/OF 가
+                // 어긋나 수정). diversity_seed(빌드 키)로 빌드 간 핸들러 코드가 달라진다.
+                let mba_hash = (block_index ^ diversity_seed)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32;
+                let use_mba = width == 8 && mba_prob > 0
+                    && mba_hash % 100 < mba_prob as u64;
+                if use_mba {
+                    let variant = (mba_hash >> 16) as u32;
+                    crate::vm::threaded::inline_mba::InlineMbaObfuscator::emit_mba_add_reg_reg_variant(
+                        instrs,
+                        Register::R10,
+                        Register::R11,
+                        Register::R9,
+                        Register::RCX,
+                        variant,
+                    )?;
+                    store_flags(instrs)?;
+                    store(instrs, ins.dst)?;
+                    return Ok(());
+                }
                 match width {
                     1 => {
-                        // P2 (G3): x86 8비트 ADD는 low-byte만 갱신하고 상위 비트를
-                        // 유지한다. `add r10l, r11l`이 정확히 그 의미론을 준다
-                        // (r10 상위 비트 보존 + 8비트 폭 하드웨어 플래그).
-                        // 기존 `movzx r10d, r10l`는 상위를 0으로 밀어 잘못된 결과였다
-                        // (거기에 dst를 64비트 R10으로 줘 어셈블 실패 — Register 63).
+                        // RISC op 계약: `Add{width}` 는 eval_state 가 결과를 width 로
+                        // 마스킹(상위 제로)한다 (lifter 가 8/16-bit 레지스터 add 에서
+                        // 상위 보존을 preserve_upper 로 **별도** 합성). 네이티브 핸들러도
+                        // 이 계약을 따라야 하므로 좁은 add 뒤 movzx 로 상위를 제로화한다.
+                        // (x86 partial-register 보존은 op 계약이 아니며, P0-2 차등
+                        // 테스트가 불일치로 적발.)
                         instrs.push(Instruction::with2(Code::Add_rm8_r8, Register::R10L, Register::R11L).map_err(|e| anyhow!("{e}"))?);
+                        instrs.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).map_err(|e| anyhow!("{e}"))?);
                     }
                     2 => {
                         instrs.push(Instruction::with2(Code::Add_rm16_r16, Register::R10W, Register::R11W).map_err(|e| anyhow!("{e}"))?);
+                        instrs.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R10D, Register::R10W).map_err(|e| anyhow!("{e}"))?);
                     }
                     4 => {
                         instrs.push(Instruction::with2(Code::Add_rm32_r32, Register::R10D, Register::R11D).map_err(|e| anyhow!("{e}"))?);
@@ -236,10 +271,13 @@ impl NativeVmHarness {
                 load(instrs, ins.src2, Register::R11)?;
                 match width {
                     1 => {
+                        // Add{width}와 동일 계약: Sub{width} 는 마스킹 (상위 제로).
                         instrs.push(Instruction::with2(Code::Sub_rm8_r8, Register::R10L, Register::R11L).map_err(|e| anyhow!("{e}"))?);
+                        instrs.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).map_err(|e| anyhow!("{e}"))?);
                     }
                     2 => {
                         instrs.push(Instruction::with2(Code::Sub_rm16_r16, Register::R10W, Register::R11W).map_err(|e| anyhow!("{e}"))?);
+                        instrs.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R10D, Register::R10W).map_err(|e| anyhow!("{e}"))?);
                     }
                     4 => {
                         instrs.push(Instruction::with2(Code::Sub_rm32_r32, Register::R10D, Register::R11D).map_err(|e| anyhow!("{e}"))?);
@@ -319,8 +357,14 @@ impl NativeVmHarness {
                 load(instrs, ins.src2, Register::R11)?;
                 instrs.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R11D).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with2(Code::Shr_rm64_CL, Register::R10, Register::CL).map_err(|e| anyhow!("{e}"))?);
+                // P0-2: `test r10,r10`는 CF/OF 를 클리어하므로, 시프트 직후 CF 를
+                // setc(=Setb) 로 보존한 뒤 test(결과 기반 ZF/SF/PF, OF=0 — eval_state 와
+                // 동일) 다음 저장 플래그에 CF 를 OR 로 복원한다.
+                instrs.push(Instruction::with1(Code::Setb_rm8, Register::R11L).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).map_err(|e| anyhow!("{e}"))?);
                 store_flags(instrs)?;
+                instrs.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R11D, Register::R11L).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::Or_rm64_r64, mem(FLAGS_OFF as i64), Register::R11).map_err(|e| anyhow!("{e}"))?);
                 store(instrs, ins.dst)?;
             }
             RiscOp::ArithmeticShiftRight => {
@@ -328,8 +372,11 @@ impl NativeVmHarness {
                 load(instrs, ins.src2, Register::R11)?;
                 instrs.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R11D).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with2(Code::Sar_rm64_CL, Register::R10, Register::CL).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with1(Code::Setb_rm8, Register::R11L).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).map_err(|e| anyhow!("{e}"))?);
                 store_flags(instrs)?;
+                instrs.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R11D, Register::R11L).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::Or_rm64_r64, mem(FLAGS_OFF as i64), Register::R11).map_err(|e| anyhow!("{e}"))?);
                 store(instrs, ins.dst)?;
             }
             RiscOp::ShiftLeft => {
@@ -337,8 +384,11 @@ impl NativeVmHarness {
                 load(instrs, ins.src2, Register::R11)?;
                 instrs.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R11D).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with2(Code::Shl_rm64_CL, Register::R10, Register::CL).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with1(Code::Setb_rm8, Register::R11L).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).map_err(|e| anyhow!("{e}"))?);
                 store_flags(instrs)?;
+                instrs.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R11D, Register::R11L).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::Or_rm64_r64, mem(FLAGS_OFF as i64), Register::R11).map_err(|e| anyhow!("{e}"))?);
                 store(instrs, ins.dst)?;
             }
             RiscOp::VirtualPush => {
@@ -610,11 +660,16 @@ impl NativeVmHarness {
                     }
                 }
             }
-            RiscOp::NativeCallBridge => {
-                // ?占쏙옙???no-op ???占쏀깭 遺덌옙?, tail dispatch 占??占쎌쓬 紐낅졊 吏꾪뻾.
+RiscOp::NativeCallBridge => {
+                // ?占쏙옙???no-op ???占쏀깭 遺덌옙?, tail dispatch 占??占占쎌쓬 紐낅졊 吏꾪뻾.
             }
+            // P1 (③): VmCallBridge — VM→VM 콜 브릿지. 네이티브 하네스에서는 인지된
+            // no-op (서브 VM 레지스트리 기반 nested-VM 실행은 런타임 계층). 상용
+            // `--vm-commercial` 은 is_encodable=false 로 이 op 를 포함한 함수를
+            // 네이티브로 유지한다.
+            RiscOp::VmCallBridge => {}
             RiscOp::Halt => {
-                // ret (caller?占쎌꽌 泥섎━)
+                // ret (caller?占占쎌꽌 泥섎━)
             }
             // P2 SSE/FPU scalar - not yet native-compilable (not poly-encodable).
             // Lifter-level diff tests use eval_state (reference); no-op here.
@@ -624,7 +679,19 @@ impl NativeVmHarness {
             | RiscOp::FloatDiv { .. }
             | RiscOp::IntToFloat { .. }
             | RiscOp::FloatToInt { .. }
-            | RiscOp::FloatToFloat { .. } => {}
+            | RiscOp::FloatToFloat { .. }
+            // P1 (②): packed SSE — XMM 슬롯(16B 가상 메모리) 기반이라 네이티브
+            // arena 에 매핑되지 않는다. emit_block 네이티브 하네스에서는 no-op 으로
+            // 두고 (참조 eval_state / poly 인터프리터에서 실행), 상용 `--vm-commercial`
+            // 은 is_encodable=false 로 이런 함수를 네이티브로 유지한다.
+            | RiscOp::PackedMove
+            | RiscOp::PackedAdd { .. }
+            | RiscOp::PackedSub { .. }
+            | RiscOp::PackedXor
+            | RiscOp::PackedAnd
+            | RiscOp::PackedOr
+            | RiscOp::PackedAndNot
+            | RiscOp::PackedCmpEq { .. } => {}
         }
         Ok(())
     }

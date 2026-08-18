@@ -222,6 +222,96 @@ impl RiscLifter {
         Ok(())
     }
 
+    // ── P1 (②): packed SSE — XMM 슬롯(16B 가상 메모리) 기반 128-bit 정수 연산 ──
+    // MOVDQA/MOVDQU/MOVUPS/MOVAPS/MOVUPD/MOVAPD 는 16바이트 복사(PackedMove),
+    // PADDB/W/D/Q·PSUBB/W/D/Q·PXOR·PAND·POR·PANDN·PCMPEQB/W/D/Q 는 요소 단위
+    // 연산(PackedAdd/Sub/Xor/And/Or/AndNot/CmpEq)으로 lift 한다.
+    // x86 packed 정수 연산은 RFLAGS 를 변경하지 않으므로 SetFlag 를 만들지 않는다.
+    //
+    // 피연산자 계약: src1/src2/dst 모두 **주소**(XMM 슬롯 절대주소 또는 네이티브
+    // 메모리 유효주소). 인터프리터(eval_state / poly)가 16바이트를 읽고 요소 경계를
+    // 지켜 연산한 뒤 16바이트를 기록한다. emit_block 네이티브 하네스에서는 no-op
+    // (XMM_SLOT_BASE 는 네이티브 arena 에 매핑되지 않음), `is_encodable`에는 등록하지
+    // 않아 상용 `--vm-commercial`은 packed 를 포함한 함수를 네이티브로 유지한다.
+
+    /// 128-bit 이동: MOVDQA/MOVDQU/MOVUPS/MOVAPS/MOVUPD/MOVAPD.
+    /// load/reg-reg: dst=slot(op0), src1=slot(op1)/mem(op1)
+    /// store:        dst=mem(op0),   src1=slot(op1)
+    pub(super) fn lift_sse_packed_move(&mut self, inst: &Instruction) -> Result<()> {
+        let dst = MicroOperand::Temp(4);
+        let src = MicroOperand::Temp(5);
+        if inst.op0_kind() == OpKind::Register {
+            let i0 = Self::xmm_index(inst.op0_register())
+                .ok_or_else(|| anyhow!("invalid packed move dst"))?;
+            self.xmm_slot_addr(i0, dst);
+        } else if inst.op0_kind() == OpKind::Memory {
+            self.lower_effective_address(inst, dst)?;
+        } else {
+            return Err(anyhow!("risc lifter: invalid packed move op0"));
+        }
+        if inst.op1_kind() == OpKind::Register {
+            let i1 = Self::xmm_index(inst.op1_register())
+                .ok_or_else(|| anyhow!("invalid packed move src"))?;
+            self.xmm_slot_addr(i1, src);
+        } else if inst.op1_kind() == OpKind::Memory {
+            self.lower_effective_address(inst, src)?;
+        } else {
+            return Err(anyhow!("risc lifter: invalid packed move op1"));
+        }
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::PackedMove).with_dst(dst).with_src1(src),
+        );
+        Ok(())
+    }
+
+    /// packed 정수 이항 연산 (op0=XMM dst 겸 src, op1=XMM/mem).
+    /// dst==src1==slot(op0) — 인터프리터가 요소별로 읽고 쓰므로 in-place 안전.
+    pub(super) fn lift_sse_packed_bin(&mut self, inst: &Instruction, op: RiscOp) -> Result<()> {
+        if inst.op0_kind() != OpKind::Register {
+            return Err(anyhow!("risc lifter: packed bin requires register dst"));
+        }
+        let i0 = Self::xmm_index(inst.op0_register())
+            .ok_or_else(|| anyhow!("invalid packed bin dst"))?;
+        let a = MicroOperand::Temp(4);
+        self.xmm_slot_addr(i0, a);
+        let b = MicroOperand::Temp(5);
+        if inst.op1_kind() == OpKind::Register {
+            let i1 = Self::xmm_index(inst.op1_register())
+                .ok_or_else(|| anyhow!("invalid packed bin src"))?;
+            self.xmm_slot_addr(i1, b);
+        } else if inst.op1_kind() == OpKind::Memory {
+            self.lower_effective_address(inst, b)?;
+        } else {
+            return Err(anyhow!("risc lifter: invalid packed bin op1"));
+        }
+        self.desynth.instrs.push(MicroInstr::new(op).with_dst(a).with_src1(a).with_src2(b));
+        Ok(())
+    }
+
+    /// packed SSE opcode → RiscOp. 미지원/비-legacy 계열이면 None.
+    pub(super) fn packed_op_for(code: iced_x86::Code) -> Option<RiscOp> {
+        use iced_x86::Code::*;
+        Some(match code {
+            Paddb_xmm_xmmm128 => RiscOp::PackedAdd { elem_width: 1, lanes: 16 },
+            Paddw_xmm_xmmm128 => RiscOp::PackedAdd { elem_width: 2, lanes: 8 },
+            Paddd_xmm_xmmm128 => RiscOp::PackedAdd { elem_width: 4, lanes: 4 },
+            Paddq_xmm_xmmm128 => RiscOp::PackedAdd { elem_width: 8, lanes: 2 },
+            Psubb_xmm_xmmm128 => RiscOp::PackedSub { elem_width: 1, lanes: 16 },
+            Psubw_xmm_xmmm128 => RiscOp::PackedSub { elem_width: 2, lanes: 8 },
+            Psubd_xmm_xmmm128 => RiscOp::PackedSub { elem_width: 4, lanes: 4 },
+            Psubq_xmm_xmmm128 => RiscOp::PackedSub { elem_width: 8, lanes: 2 },
+            Pxor_xmm_xmmm128 => RiscOp::PackedXor,
+            Pand_xmm_xmmm128 => RiscOp::PackedAnd,
+            Por_xmm_xmmm128 => RiscOp::PackedOr,
+            Pandn_xmm_xmmm128 => RiscOp::PackedAndNot,
+            Pcmpeqb_xmm_xmmm128 => RiscOp::PackedCmpEq { elem_width: 1, lanes: 16 },
+            Pcmpeqw_xmm_xmmm128 => RiscOp::PackedCmpEq { elem_width: 2, lanes: 8 },
+            Pcmpeqd_xmm_xmmm128 => RiscOp::PackedCmpEq { elem_width: 4, lanes: 4 },
+            Pcmpeqq_xmm_xmmm128 => RiscOp::PackedCmpEq { elem_width: 8, lanes: 2 },
+            _ => return None,
+        })
+    }
+
     /// CVTTSS2SI/CVTSS2SI/CVTTSD2SI/CVTSD2SI — vreg[dst] = (int)xmm[src].low.
 
     pub(super) fn lift_cvtfp2si(&mut self, inst: &Instruction) -> Result<()> {

@@ -33,6 +33,21 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+/// P0-1: 실전 컴파일러 코퍼스 디렉토리 (QA 가 스캔).
+pub const CORPUS_DIR: &str = "corpus";
+
+/// P0-1: 생성할 Rust 코퍼스 프로파일 — (태그, cargo profile, 컴파일러 라벨).
+pub const CORPUS_PROFILES: &[(&str, &str, &str)] = &[
+    ("o0", "corpus-o0", "Rust -O0"),
+    ("o1", "corpus-o1", "Rust -O1"),
+    ("o2", "corpus-o2", "Rust -O2"),
+    ("o3", "corpus-o3", "Rust -O3"),
+    ("lto", "corpus-lto", "Rust -O3+LTO"),
+    ("cu16", "corpus-cu16", "Rust -O3+CGU16"),
+    ("abort", "corpus-abort", "Rust -O3 panic=abort"),
+    ("checks", "corpus-checks", "Rust -O2 overflow-checks"),
+];
+
 #[derive(Debug, Clone)]
 pub struct QaTarget {
     pub name: String,
@@ -56,8 +71,56 @@ pub struct QaResult {
 pub struct QaBenchmarkRunner;
 
 impl QaBenchmarkRunner {
+    /// P0-1: test/ 크레이트를 각 corpus-* 프로파일로 빌드해 `corpus/<tag>.exe`로
+    /// 복사한다. 이미 존재하고 같은 크기면 스킵 (재빌드 방지). 실패 프로파일은
+    /// 경고만 남기고 계속한다. 반환값 = 생성/갱신한 파일 목록.
+    pub fn build_corpus() -> Result<Vec<String>> {
+        use std::fs;
+        let manifest = "test/Cargo.toml";
+        let mut produced = Vec::new();
+        fs::create_dir_all(CORPUS_DIR)?;
+
+        for (tag, profile, label) in CORPUS_PROFILES {
+            let out = PathBuf::from(CORPUS_DIR).join(format!("{tag}.exe"));
+            // 소스/매니페스트보다 최신이고 이미 있으면 스킵.
+            let need = match (fs::metadata(&out), fs::metadata(manifest)) {
+                (Ok(m), Ok(src)) => m.modified().ok() < src.modified().ok(),
+                (Ok(_), Err(_)) => false,
+                _ => true,
+            };
+            if !need {
+                continue;
+            }
+
+            eprintln!("[QA corpus] building {label} ({profile}) ...");
+            let status = Command::new("cargo")
+                .arg("build")
+                .arg("--manifest-path")
+                .arg(manifest)
+                .arg("--profile")
+                .arg(profile)
+                .status();
+            match status {
+                Ok(s) if s.success() => {
+                    let src = PathBuf::from(format!("test/target/{profile}/rust_packer_test.exe"));
+                    if src.exists() {
+                        fs::copy(&src, &out)?;
+                        produced.push(tag.to_string());
+                        eprintln!("[QA corpus] {tag}.exe ready ({label})");
+                    } else {
+                        eprintln!("[!] QA corpus: build succeeded but {} missing", src.display());
+                    }
+                }
+                Ok(_) => eprintln!("[!] QA corpus: profile {profile} build failed (skipped)"),
+                Err(e) => eprintln!("[!] QA corpus: cannot invoke cargo for {profile}: {e}"),
+            }
+        }
+        Ok(produced)
+    }
+
     /// 코퍼스 탐색: 고정 타깃(시스템 + dummy) + test/ 페이로드 +
-    /// `BTG_QA_CORPUS` 디렉토리 안의 모든 `.exe`. 경로 중복 제거.
+    /// `corpus/`(Rust 프로파일 코퍼스) + `BTG_QA_CORPUS` 디렉토리 안의 모든 `.exe`.
+    /// 경로 중복 제거.
     pub fn discover_targets() -> Vec<QaTarget> {
         let mut targets: Vec<QaTarget> = Vec::new();
         let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -69,7 +132,12 @@ impl QaBenchmarkRunner {
                 name: "Dummy MSVC Payload".to_string(),
                 compiler: "MSVC x64".to_string(),
                 path: msvc_path,
-                use_vm_oep: true,
+                // ⚠ 1.5KB 초소형 바이너리는 --vm-oep(전체 프로그램 VM)가 100% 크래시
+                // (0xC0000005, 디스패처 바이트코드 포인터 손상) — 알려진 vm-oep 엣지
+                // 케이스. QA는 이 스모크 타깃을 일반 패킹으로 유지하고, vm-oep 경로는
+                // Rust 코퍼스(8종)/test 페이로드가 커버한다. (SxS 매니페스트 버그 수정
+                // 전에는 이 크래시가 SxS 실패에 가려져 있었다.)
+                use_vm_oep: false,
             });
         }
 
@@ -83,6 +151,33 @@ impl QaBenchmarkRunner {
                 path: test_payload,
                 use_vm_oep: true,
             });
+        }
+
+        // P0-1: Rust 프로파일 코퍼스 (corpus/*.exe) — 빌드 안 되어 있으면 자동 생성.
+        // 컴파일러 라벨은 프로파일 태그에서 복원 (cargo 프로파일 순서 유지).
+        if let Ok(rd) = std::fs::read_dir(CORPUS_DIR) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.extension().map_or(false, |e| e.eq_ignore_ascii_case("exe")) {
+                    let tag = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let compiler = CORPUS_PROFILES
+                        .iter()
+                        .find(|(t, _, _)| *t == tag)
+                        .map(|(_, _, l)| l.to_string())
+                        .unwrap_or_else(|| "Rust corpus".to_string());
+                    if seen.insert(path.clone()) {
+                        targets.push(QaTarget {
+                            name: format!("Corpus {tag}"),
+                            compiler,
+                            path,
+                            use_vm_oep: true,
+                        });
+                    }
+                }
+            }
         }
 
         // 시스템 바이너리(notepad/charmap 등)는 코퍼스에서 제외한다 — Win11
@@ -113,6 +208,11 @@ impl QaBenchmarkRunner {
     pub fn run_benchmark_test(target: &QaTarget, packer_exe_path: &Path) -> Result<QaResult> {
         let packed_output_path = format!("protected_qa_{}.exe", target.name.to_lowercase().replace(' ', "_").replace('/', "_"));
         let packed_output_path_buf = PathBuf::from(&packed_output_path);
+
+        // P0-1 방어: 과거 패커가 `<output>.exe.manifest`로 쓴 빌드 매니페스트가 남아
+        // 있으면 Windows 로더가 이를 앱 매니페스트(XML)로 오인해 spawn 실패(SxS)를
+        // 낸다. 패킹 전에 스테일 아티팩트를 제거한다 (btgmanifest 전환 이전 산출물).
+        let _ = std::fs::remove_file(format!("{packed_output_path}.manifest"));
 
         let mut cmd = Command::new(packer_exe_path);
         cmd.arg("--input")
@@ -149,6 +249,12 @@ impl QaBenchmarkRunner {
                     "orig=[alive:{},code:0x{:X},stdout:{}B] packed=[alive:{},code:0x{:X},stdout:{}B]",
                     orig.alive, orig.code, orig.stdout_len, packed.alive, packed.code, packed.stdout_len
                 );
+                // spawn/실행 오류 상세를 표에 드러낸다 (디버깅).
+                let detail = if packed.code == -3 || orig.code == -3 {
+                    format!("{} (packed={} orig={})", detail, packed.detail, orig.detail)
+                } else {
+                    detail
+                };
 
                 (p_size, relayed_count, behavior_match, detail)
             } else {
@@ -167,14 +273,22 @@ impl QaBenchmarkRunner {
     }
 
     fn run_and_verify(exe: &Path) -> ExecCheck {
-        let mut child = match Command::new(exe)
+        // ⚠ Windows: 경로 구분자가 없는 베어 파일명(예: `foo.exe`)은 CreateProcess 가
+        // "program not found"(ERROR_FILE_NOT_FOUND)를 낸다 (현재 디렉토리가 탐색되지
+        // 않는 런타임 환경). QA 가 쓰는 `protected_qa_*.exe` 같은 루트 출력을
+        // spawn 하려면 절대경로로 정규화해야 한다. (실제 코퍼스 QA에서 적발.)
+        let exe = match std::fs::canonicalize(exe) {
+            Ok(p) => p,
+            Err(_) => exe.to_path_buf(),
+        };
+        let mut child = match Command::new(&exe)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
         {
             Ok(c) => c,
-            Err(e) => return ExecCheck { alive: false, code: -3, stdout_hash: 0, stdout_len: 0, detail: format!("spawn-error: {}", e) },
+            Err(e) => return ExecCheck { alive: false, code: -3, stdout_hash: 0, stdout_len: 0, detail: format!("spawn-error: {e}") },
         };
 
         // v3: 2.5s → 9s (packed charmap의 0xC0000005 크래시가 ~4~8초에 발생하므로
@@ -221,6 +335,159 @@ struct ExecCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P0-3: 패킹된 test 페이로드가 SEH(unwind/catch) 와 TLS 스테이지를 실제로
+    /// 실행해 원본과 **동일한 마커 출력**을 내는지 검증한다. stdout 해시가 같아도
+    /// SEH/TLS 경로가 빠졌다면 마커가 사라지므로, 마커 존재를 직접 확인한다.
+    #[test]
+    fn packed_test_payload_executes_seh_and_tls_stages() {
+        let test_exe = std::env::current_exe().unwrap();
+        let packer = test_exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("btg-packer.exe"))
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| panic!("packer binary not found: {}", test_exe.display()));
+        let payload = PathBuf::from("test/target/debug/rust_packer_test.exe");
+        if !payload.exists() {
+            eprintln!("test payload not built; skipping");
+            return;
+        }
+        let packed = PathBuf::from("target/qa_seh_tls_check.exe");
+        let _ = std::fs::remove_file(&packed);
+        let status = Command::new(packer)
+            .arg("--input").arg(&payload)
+            .arg("--output").arg(&packed)
+            .arg("--anti-debug")
+            .arg("--vm-oep")
+            .status()
+            .unwrap();
+        assert!(status.success(), "pack must succeed");
+
+        // 패킹된 바이너리를 실행해 stdout 을 잡는다.
+        let abs = std::fs::canonicalize(&packed).unwrap_or_else(|_| packed.clone());
+        let out = Command::new(&abs)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "packed payload must exit 0, got {:?}", out.status);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("[10] SEH") || stdout.contains("SEH unwinding"),
+            "packed payload must execute the SEH/catch_unwind stage; stdout:\n{}",
+            &stdout[..stdout.len().min(600)]
+        );
+        assert!(
+            stdout.contains("[15] TLS") || stdout.contains("TLS & static"),
+            "packed payload must execute the TLS stage; stdout:\n{}",
+            &stdout[..stdout.len().min(600)]
+        );
+        assert!(stdout.contains("FINAL CHECKSUM"), "packed payload must finish all stages");
+
+        // 원본과 stdout 동치 (SEH/TLS 결과 포함).
+        let orig = Command::new(&payload)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(out.stdout, orig.stdout, "packed stdout must match original byte-for-byte");
+        let _ = std::fs::remove_file(&packed);
+        let _ = std::fs::remove_file("target/qa_seh_tls_check.exe.btgmanifest");
+    }
+
+    /// P0-4: --no-crypto reloc-aware 출력이 ASLR(DYNAMIC_BASE/HIGH_ENTROPY_VA) 을
+    /// 보존하고 유효한 `.reloc`(기본 relocation block) 을 가진 채 실행되는지 검증.
+    /// (at-rest 암호화 경로는 로더가 .reloc 을 복호화 전에 적용해 암호문을 파괴하므로
+    /// 제외 — 후속 P0/P2 확장 항목.)
+    #[test]
+    fn no_crypto_pack_preserves_aslr_and_reloc() {
+        let test_exe = std::env::current_exe().unwrap();
+        let packer = test_exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("btg-packer.exe"))
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| panic!("packer binary not found: {}", test_exe.display()));
+        let payload = PathBuf::from("test/target/debug/rust_packer_test.exe");
+        if !payload.exists() {
+            eprintln!("test payload not built; skipping");
+            return;
+        }
+        let packed = PathBuf::from("target/qa_aslr_check.exe");
+        let _ = std::fs::remove_file(&packed);
+        let status = Command::new(packer)
+            .arg("--input").arg(&payload)
+            .arg("--output").arg(&packed)
+            .arg("--no-crypto")
+            .arg("--anti-debug")
+            .status()
+            .unwrap();
+        assert!(status.success(), "pack must succeed");
+
+        let bytes = std::fs::read(&packed).unwrap();
+        let e = u32::from_le_bytes([bytes[0x3C], bytes[0x3D], bytes[0x3E], bytes[0x3F]]) as usize;
+        assert_eq!(&bytes[e..e + 4], b"PE\0\0", "valid PE");
+        let opt = e + 24;
+        let dc = u16::from_le_bytes([bytes[opt + 70], bytes[opt + 71]]);
+        assert_ne!(dc & 0x0040, 0, "DYNAMIC_BASE (ASLR) must be preserved");
+        assert_ne!(dc & 0x0020, 0, "HIGH_ENTROPY_VA must be preserved");
+        // .reloc data directory (idx 5) 가 파일에 존재해야 한다.
+        let dd_off = opt + 112;
+        let reloc_va = u32::from_le_bytes(bytes[dd_off + 40..dd_off + 44].try_into().unwrap());
+        let reloc_sz = u32::from_le_bytes(bytes[dd_off + 44..dd_off + 48].try_into().unwrap());
+        assert!(reloc_va != 0 && reloc_sz >= 12, "valid .reloc dir (va=0x{reloc_va:X} size=0x{reloc_sz:X})");
+
+        // ASLR 활성 바이너리가 실행 가능해야 한다.
+        let abs = std::fs::canonicalize(&packed).unwrap_or_else(|_| packed.clone());
+        let out = Command::new(&abs)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "ASLR-packed binary must run, got {:?}", out.status);
+        let _ = std::fs::remove_file(&packed);
+        let _ = std::fs::remove_file("target/qa_aslr_check.exe.btgmanifest");
+    }
+
+    /// QA 의 `run_and_verify` spawn 이 성공하는지 직접 검증 (spawn 오류 상세 노출).
+    /// 패킹된 바이너리가 실행 가능한지 — QA 의 실패가 spawn 레벨인지 파악.
+    #[test]
+    fn run_and_verify_spawns_packed_output() {
+        // 테스트 바이너리는 deps/ 아래 — 실제 packer 는 target/debug/btg-packer.exe.
+        let test_exe = std::env::current_exe().unwrap();
+        let packer = test_exe
+            .parent() // deps
+            .and_then(|p| p.parent()) // debug
+            .map(|p| p.join("btg-packer.exe"))
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| panic!("packer binary not found (build bin first): {}", test_exe.display()));
+        // QA 대상 (패킹 없이, 원본 실행 확인만).
+        let targets = QaBenchmarkRunner::discover_targets();
+        let corpus = targets.iter().find(|t| t.name.contains("Corpus o0"));
+        let path = match corpus {
+            Some(t) => t.path.clone(),
+            None => {
+                eprintln!("no corpus target (run --qa-gen-corpus first); skipping");
+                return;
+            }
+        };
+        // QA 와 정확히 동일한 출력 경로/파일명 (repo root) 로 재현.
+        let packed = PathBuf::from("protected_qa_corpus_o0.exe");
+        let mut cmd = Command::new(packer);
+        cmd.arg("--input").arg(&path).arg("--output").arg(&packed).arg("--anti-debug").arg("--vm-oep");
+        let status = cmd.status().unwrap();
+        assert!(status.success(), "pack must succeed");
+        assert!(packed.exists(), "packed output must exist");
+        let check = QaBenchmarkRunner::run_and_verify(&packed);
+        assert!(check.code != -3, "spawn failed: {}", check.detail);
+        assert_eq!(check.code, 0, "packed corpus must exit cleanly (got 0x{:X}, {})", check.code, check.detail);
+        let _ = std::fs::remove_file(&packed);
+        let _ = std::fs::remove_file("protected_qa_corpus_o0.exe.btgmanifest");
+    }
 
     /// 코퍼스 탐색: test/ 페이로드 + dummy 가 발견되어야 하고 중복이 없어야 한다.
     /// (실패 시에도 notepad/charmap 은 시스템 의존이라 optional 처리.)

@@ -176,7 +176,7 @@ impl VirtualFlags {
         if (res as u8).count_ones() % 2 == 0 {
             flags |= VFLAG_PF;
         }
-        self.raw = (self.raw & !(VFLAG_CF | VFLAG_PF | VFLAG_OF | VFLAG_ZF | VFLAG_SF)) | flags;
+        self.raw = (self.raw & !(VFLAG_CF | VFLAG_PF | VFLAG_OF | VFLAG_ZF | VFLAG_SF | VFLAG_AF)) | flags;
     }
 
     /// MUL/IMUL쨌DIV/IDIV ??CF/OF 留?媛깆떊 (?ㅻⅨ ?뚮옒洹몃뒗 蹂댁〈 ??x86 "undefined" ?뺤콉).

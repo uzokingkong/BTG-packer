@@ -58,3 +58,5 @@ test_analysis.exe
 
 # Local test scratch dir
 /test/target
+/_qa/
+/_head_wt/

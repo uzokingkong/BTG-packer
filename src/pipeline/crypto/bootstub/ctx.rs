@@ -86,6 +86,7 @@ pub(crate) struct BootStubCtx {
     pub(crate) integrity: bool,
     /// 저장된 CRC32 값의 VA (4바이트, seed 뒤)
     pub(crate) crc_va: u64,
+    pub(crate) mac_va: u64,
     // ── v6 IAT hiding (--iat-hide) ───────────────────────────────────────────
     /// true = 복호화 후 리졸브 테이블을 따라 원본 IAT 슬롯을 채운다
     pub(crate) iat_enabled: bool,
@@ -147,6 +148,11 @@ pub(crate) enum Label {
     CrcSkip,
     CrcDone,
     CrcOk,
+    // S1 keyed-MAC runtime verification loop
+    MacInitLoop,
+    MacDataLoop,
+    MacDone,
+    MacOk,
     // ── v6 IAT resolve ──
     DllLoop,
     FuncLoop,
@@ -156,6 +162,7 @@ pub(crate) enum Label {
     ResolveDone,
     // ── v6 mem-harden ──
     MemDone,
+    MemFail,
     // ── v4 payload-relocate: .vdata → 코드 영역 복사 루프 ──
     PayloadCopyLoop,
     PayloadCopyDone,

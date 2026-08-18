@@ -1236,6 +1236,21 @@ impl RiscLifter {
             | Code::Cvttsd2si_r32_xmmm64 | Code::Cvttsd2si_r64_xmmm64
             | Code::Cvtsd2si_r32_xmmm64 | Code::Cvtsd2si_r64_xmmm64 => self.lift_cvtfp2si(inst)?,
 
+            // ???? P1 (??: packed SSE — 128-bit XMM 슬롯/메모리 이동 + 요소 단위
+            // 정수 연산. MOVDQA/DQU/UPS/APS/UPD/APD(load·store) → PackedMove,
+            // PADDB/W/D/Q·PSUBB/W/D/Q·PXOR·PAND·POR·PANDN·PCMPEQB/W/D/Q → Packed*.
+            // RFLAGS 불변. (`is_encodable` 비등록 — 폴리 인코딩/네이티브 실행 제외.)
+            Code::Movdqa_xmm_xmmm128 | Code::Movdqu_xmm_xmmm128
+            | Code::Movups_xmm_xmmm128 | Code::Movaps_xmm_xmmm128
+            | Code::Movupd_xmm_xmmm128 | Code::Movapd_xmm_xmmm128
+            | Code::Movdqa_xmmm128_xmm | Code::Movdqu_xmmm128_xmm
+            | Code::Movups_xmmm128_xmm | Code::Movaps_xmmm128_xmm
+            | Code::Movupd_xmmm128_xmm | Code::Movapd_xmmm128_xmm => self.lift_sse_packed_move(inst)?,
+            code_packed if Self::packed_op_for(code_packed).is_some() => {
+                let op = Self::packed_op_for(code_packed).unwrap();
+                self.lift_sse_packed_bin(inst, op)?;
+            }
+
             _ => {
                 // Fallback for unsupported complex instruction
                 return Err(anyhow!("risc lifter: unsupported opcode {:?}", code));
@@ -2496,5 +2511,206 @@ mod tests {
             v |= (*st.mem.get(&(0x1000 + i)).unwrap_or(&0) as u64) << (i * 8);
         }
         assert_eq!(v, 0xFFF0, "NEG word [mem] = 0xFFF0");
+    }
+
+    // ── P1 (②): packed SSE — XMM 슬롯 기반 128-bit 정수 연산 ───────────────────
+    // lifter → `eval_state`(참조) 실행. 검증 포인트:
+    // (a) 요소 단위 연산 (PADDQ 에서 lane 간 캐리 미전파 — 보고서 ② 핵심),
+    // (b) RFLAGS 불변 (packed 정수 연산은 x86 에서도 플래그를 안 바꾼다),
+    // (c) 메모리 소스/대상 폼.
+
+    /// 16바이트 시드 (하위 8B + 상위 8B).
+    fn seed_slot(mem: &mut HashMap<u64, u8>, addr: u64, lo: u64, hi: u64) {
+        seed_mem(mem, addr, 8, lo);
+        seed_mem(mem, addr + 8, 8, hi);
+    }
+
+    fn read_slot(mem: &HashMap<u64, u8>, addr: u64) -> (u64, u64) {
+        (read_mem(mem, addr, 8), read_mem(mem, addr + 8, 8))
+    }
+
+    /// PADDQ lane 경계 — lane 0 이 캐리를 만들면 lane 1 로 **전파되지 않아야** 한다.
+    /// (64-bit add 로 분해했다면 캐리가 전파되어 틀렸을 케이스)
+    #[test]
+    fn test_lift_paddq_no_lane_carry() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::Paddq_xmm_xmmm128, Register::XMM0, Register::XMM1).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut mem = HashMap::new();
+        // xmm0.lane0 = 0xFFFF_FFFF_FFFF_FFFF, xmm0.lane1 = 0x11
+        seed_slot(&mut mem, xmm_slot(0), 0xFFFF_FFFF_FFFF_FFFF, 0x11);
+        // xmm1.lane0 = 1, xmm1.lane1 = 0x22
+        seed_slot(&mut mem, xmm_slot(1), 1, 0x22);
+        let st = run_mem(&raw, 0x140001000, [0u64; 16], mem);
+        let (lo, hi) = read_slot(&st.mem, xmm_slot(0));
+        assert_eq!(lo, 0, "lane0 wraps: 0xFFFF.. + 1 = 0");
+        assert_eq!(hi, 0x33, "lane1 = 0x11 + 0x22 (no carry from lane0)");
+    }
+
+    /// PADDD 4× 32-bit 요소 단위 가산.
+    #[test]
+    fn test_lift_paddd_lanes() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::Paddd_xmm_xmmm128, Register::XMM0, Register::XMM1).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut mem = HashMap::new();
+        // seed_slot 은 little-endian → dword lane0=bytes0-3, lane1=bytes4-7...
+        // xmm0: lane0=0x10, lane1=0xFFFF_FFFF, lane2=0x30, lane3=0xFFFF_FFFF
+        seed_slot(&mut mem, xmm_slot(0), 0xFFFF_FFFF_0000_0010, 0xFFFF_FFFF_0000_0030);
+        // xmm1: lane0=0x20, lane1=0x1, lane2=0x40, lane3=0x2
+        seed_slot(&mut mem, xmm_slot(1), 0x0000_0001_0000_0020, 0x0000_0002_0000_0040);
+        let st = run_mem(&raw, 0x140001000, [0u64; 16], mem);
+        let (lo, hi) = read_slot(&st.mem, xmm_slot(0));
+        // lane0=0x30, lane1=0xFFFF_FFFF+1=0 (wrap, no carry to lane2)
+        assert_eq!(lo, 0x0000_0000_0000_0030, "dword lanes wrap independently");
+        // lane2=0x70, lane3=0xFFFF_FFFF+2=1
+        assert_eq!(hi, 0x0000_0001_0000_0070, "dword lanes wrap independently");
+    }
+
+    /// PADDB — 16× 8-bit 요소 가산 (각 바이트 랩).
+    #[test]
+    fn test_lift_paddb_lanes() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::Paddb_xmm_xmmm128, Register::XMM0, Register::XMM1).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut mem = HashMap::new();
+        seed_slot(&mut mem, xmm_slot(0), 0xFF_FF_FF_FF_FF_FF_FF_FF, 0x01_01_01_01_01_01_01_01);
+        seed_slot(&mut mem, xmm_slot(1), 0x01_01_01_01_01_01_01_01, 0x01_01_01_01_01_01_01_01);
+        let st = run_mem(&raw, 0x140001000, [0u64; 16], mem);
+        let (lo, hi) = read_slot(&st.mem, xmm_slot(0));
+        assert_eq!(lo, 0, "8-bit lanes wrap: 0xFF+1 = 0");
+        assert_eq!(hi, 0x02_02_02_02_02_02_02_02, "8-bit lanes add");
+    }
+
+    /// PSUBQ 요소 단위 감산.
+    #[test]
+    fn test_lift_psubq() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::Psubq_xmm_xmmm128, Register::XMM0, Register::XMM1).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut mem = HashMap::new();
+        seed_slot(&mut mem, xmm_slot(0), 0x10, 0xFFFF_FFFF_FFFF_FFFF);
+        seed_slot(&mut mem, xmm_slot(1), 0x20, 0x1);
+        let st = run_mem(&raw, 0x140001000, [0u64; 16], mem);
+        let (lo, hi) = read_slot(&st.mem, xmm_slot(0));
+        assert_eq!(lo, 0xFFFF_FFFF_FFFF_FFF0, "lane0: 0x10 - 0x20 wraps");
+        assert_eq!(hi, 0xFFFF_FFFF_FFFF_FFFE, "lane1: 0xFFFF.. - 1");
+    }
+
+    /// PXOR / PAND / POR / PANDN 16바이트 비트열 연산.
+    #[test]
+    fn test_lift_packed_logic() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::Pxor_xmm_xmmm128, Register::XMM0, Register::XMM1).unwrap(),
+            Instruction::with2(Code::Pand_xmm_xmmm128, Register::XMM2, Register::XMM1).unwrap(),
+            Instruction::with2(Code::Por_xmm_xmmm128, Register::XMM3, Register::XMM1).unwrap(),
+            Instruction::with2(Code::Pandn_xmm_xmmm128, Register::XMM4, Register::XMM1).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut mem = HashMap::new();
+        // xmm0 = 0x0F0F..., xmm1 = 0xFF00...
+        seed_slot(&mut mem, xmm_slot(0), 0x0F0F_0F0F_0F0F_0F0F, 0x0F0F_0F0F_0F0F_0F0F);
+        seed_slot(&mut mem, xmm_slot(1), 0xFF00_FF00_FF00_FF00, 0xFF00_FF00_FF00_FF00);
+        // xmm2 = 0xAAAA..., xmm3 = 0x5555..., xmm4 = 0xFFFF...
+        seed_slot(&mut mem, xmm_slot(2), 0xAAAA_AAAA_AAAA_AAAA, 0xAAAA_AAAA_AAAA_AAAA);
+        seed_slot(&mut mem, xmm_slot(3), 0x5555_5555_5555_5555, 0x5555_5555_5555_5555);
+        seed_slot(&mut mem, xmm_slot(4), 0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF);
+        let st = run_mem(&raw, 0x140001000, [0u64; 16], mem);
+        let (x0lo, _) = read_slot(&st.mem, xmm_slot(0));
+        let (x2lo, _) = read_slot(&st.mem, xmm_slot(2));
+        let (x3lo, _) = read_slot(&st.mem, xmm_slot(3));
+        let (x4lo, _) = read_slot(&st.mem, xmm_slot(4));
+        assert_eq!(x0lo, 0x0F0F_0F0F_0F0F_0F0F ^ 0xFF00_FF00_FF00_FF00, "PXOR bytewise");
+        assert_eq!(x2lo, 0xAAAA_AAAA_AAAA_AAAA & 0xFF00_FF00_FF00_FF00, "PAND bytewise");
+        assert_eq!(x3lo, 0x5555_5555_5555_5555 | 0xFF00_FF00_FF00_FF00, "POR bytewise");
+        assert_eq!(x4lo, 0xFFFF_FFFF_FFFF_FFFF & !0xFF00_FF00_FF00_FF00, "PANDN = a & ~b");
+    }
+
+    /// PCMPEQD — 요소 단위 등가: 같으면 전-1, 다르면 0.
+    #[test]
+    fn test_lift_pcmpeqd() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::Pcmpeqd_xmm_xmmm128, Register::XMM0, Register::XMM1).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut mem = HashMap::new();
+        // lane0: 0x11111111 == lane0 of src; lane1: 0x22222222 != 0x33333333
+        seed_slot(&mut mem, xmm_slot(0), 0x2222_2222_1111_1111, 0);
+        seed_slot(&mut mem, xmm_slot(1), 0x3333_3333_1111_1111, 0x4444_4444_4444_4444);
+        let st = run_mem(&raw, 0x140001000, [0u64; 16], mem);
+        let (lo, _) = read_slot(&st.mem, xmm_slot(0));
+        // lane0 == -> 0xFFFF_FFFF, lane1 != -> 0
+        assert_eq!(lo, 0x0000_0000_FFFF_FFFF, "PCMPEQD equal lane all-ones, diff lane 0");
+    }
+
+    /// MOVDQU — XMM ↔ 메모리 16바이트 이동 (load + store).
+    #[test]
+    fn test_lift_movdqu_mem_load_store() {
+        let raw = enc_block(vec![
+            Instruction::with2(
+                Code::Movdqu_xmmm128_xmm,
+                iced_x86::MemoryOperand::with_base(Register::RAX),
+                Register::XMM0,
+            )
+            .unwrap(),
+            Instruction::with2(
+                Code::Movdqu_xmm_xmmm128,
+                Register::XMM1,
+                iced_x86::MemoryOperand::with_base(Register::RAX),
+            )
+            .unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut init = [0u64; 16];
+        init[0] = 0x5000;
+        let mut mem = HashMap::new();
+        seed_slot(&mut mem, xmm_slot(0), 0xDEAD_BEEF_CAFE_1234, 0x1122_3344_5566_7788);
+        let st = run_mem(&raw, 0x140001000, init, mem);
+        assert_eq!(read_slot(&st.mem, 0x5000), (0xDEAD_BEEF_CAFE_1234, 0x1122_3344_5566_7788), "stored 16B to mem");
+        assert_eq!(read_slot(&st.mem, xmm_slot(1)), (0xDEAD_BEEF_CAFE_1234, 0x1122_3344_5566_7788), "loaded 16B back to xmm1");
+    }
+
+    /// PADDD xmm0, [rax] — 메모리 소스 폼 (유효주소에서 16바이트 읽기).
+    #[test]
+    fn test_lift_paddd_mem_src() {
+        let raw = enc_block(vec![
+            Instruction::with2(
+                Code::Paddd_xmm_xmmm128,
+                Register::XMM0,
+                iced_x86::MemoryOperand::with_base(Register::RAX),
+            )
+            .unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let mut init = [0u64; 16];
+        init[0] = 0x5000;
+        let mut mem = HashMap::new();
+        // xmm0: lane0=2, lane1=1, lane2=4, lane3=3
+        seed_slot(&mut mem, xmm_slot(0), 0x0000_0001_0000_0002, 0x0000_0003_0000_0004);
+        // mem:   lane0=0xB, lane1=0xA, lane2=0xD, lane3=0xC
+        seed_slot(&mut mem, 0x5000, 0x0000_000A_0000_000B, 0x0000_000C_0000_000D);
+        let st = run_mem(&raw, 0x140001000, init, mem);
+        let (lo, hi) = read_slot(&st.mem, xmm_slot(0));
+        assert_eq!(lo, 0x0000_000B_0000_000D, "lane0+mem0=0xD, lane1+mem1=0xB");
+        assert_eq!(hi, 0x0000_000F_0000_0011, "lane2+mem2=0x11, lane3+mem3=0xF");
+    }
+
+    /// packed SSE lift 는 RiscOp::Packed* 를 만들고 SetFlag 를 만들지 않는다.
+    #[test]
+    fn test_lift_packed_no_flag_write() {
+        let raw = enc_block(vec![
+            Instruction::with2(Code::Paddd_xmm_xmmm128, Register::XMM0, Register::XMM1).unwrap(),
+            Instruction::with2(Code::Movdqu_xmm_xmmm128, Register::XMM2, Register::XMM3).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let prog = lift(&raw, 0x140001000);
+        let packed = prog.instrs.iter().filter(|i| matches!(i.op, RiscOp::PackedAdd { .. } | RiscOp::PackedMove)).count();
+        let flag_writes = prog.instrs.iter().filter(|i| matches!(i.op, RiscOp::SetFlag)).count();
+        assert_eq!(packed, 2, "PADDD + MOVDQU lifted to Packed ops");
+        assert_eq!(flag_writes, 0, "packed integer ops never write RFLAGS");
     }
 }

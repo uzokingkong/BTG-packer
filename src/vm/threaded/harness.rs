@@ -55,6 +55,15 @@ impl NativeVmHarness {
 
     /// RISC ?�로그램???�문???�이?�브 블록?�로 컴파?�해 arena??배치?�다.
     pub fn compile(prog: &RiscProgram, key: u8) -> Result<Self> {
+        Self::compile_with_mba(prog, key, 0)
+    }
+
+    /// P1 (④+다양화): `mba_prob`(0..=100) 확률로 `Add{width:8}` 핸들러를 MBA 시퀀스로
+    /// emit 한다. 기본값 0 = 기존 `add r10, r11` 직렬 emit (회귀 무변경).
+    ///
+    /// `key`(빌드 키)는 `diversity_seed`로 전달되어, 같은 프로그램도 빌드마다
+    /// 다른 블록 집합이 MBA(variant 0/1)로 emit 된다 (handler 코드 다형화).
+    pub fn compile_with_mba(prog: &RiscProgram, key: u8, mba_prob: u32) -> Result<Self> {
         let mut arena = Arena::new(ARENA_SIZE)?;
         let state_base = (arena.base + OFF_STATE) as u64;
         let stack_base = (arena.base + OFF_STACK_BASE) as u64;
@@ -129,6 +138,8 @@ impl NativeVmHarness {
                 i as u64,
                 static_targets[i],
                 helper_va,
+                mba_prob,
+                key as u64,
             )?;
             if ins.op != RiscOp::Halt {
                 DirectTailEmitter::emit_tail_dispatch(&mut instrs)?;

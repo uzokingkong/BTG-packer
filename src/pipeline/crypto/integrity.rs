@@ -1,5 +1,5 @@
 // ==============================================================================
-// Integrity (--integrity): CRC32 over the code region (boot-time tamper check)
+// Integrity (--integrity): CRC32 + keyed-MAC over the code region (boot-time tamper check)
 // ==============================================================================
 
 use super::bootstub::{BootStubCtx, Label};
@@ -68,3 +68,156 @@ pub(crate) fn emit_integrity_crc(seq: &mut Vec<(Instruction, Option<Label>)>, st
     }
 }
 
+/// ── S1 (T2-3): keyed-MAC 런타임 검증 (불일치 시 ud2) ───────────────────────────
+/// 부트 스텁이 패킹 시 `BtgKeyedMac::mac(seed_stored, crc_source)`로 저장한
+/// 8바이트 MAC 값을 런타임에 재계산해 비교한다. CRC32(키 없음)와 달리 키 결합
+/// MAC이라 데이터+MAC을 함께 변조해도 통과할 수 없다 (2^-64).
+///
+/// **키 재구성**: 파일의 seed_stored는 base_bind_loop가 실제 base로 XOR해 메모리
+/// 상 seed_masked가 된다. 런타임 MAC 키 = `seed_va[i] ^ bind_byte`로 다시
+/// seed_stored와 일치시킨다 (actual_base == image_base 가정 — at-rest 암호화는
+/// ASLR을 비활성화하므로 성립). 데이터 = 코드 영역 [code_va, code_va+code_len)
+/// — 패킹 시 crc_source와 동일 바이트 (reencrypt=파일 암호문, 그 외=평문).
+///
+/// **배치**: `emit_integrity_crc` **직전**에 emit된다. CRC의 성공 분기(`je CrcOk`)
+/// 는 `emit_run_decrypt` 시작으로 앞으로 점프하므로, CRC 뒤에 두면 성공 경로에서
+/// MAC이 통째로 건너뛰어진다. 코드 복호화 직후 + CRC와 같은 시점/영역에서 계산하면
+/// 데이터 동치가 유지된다.
+///
+/// **길이 불변성**: 모든 상수/주소는 imm64/imm32, 분기는 rel32 — 값과 무관 고정
+/// 길이. RBX(S-box base)와 RSP는 건드리지 않는다. (나머지 GPR은 이후 경로가 다시
+/// 초기화하므로 스크래치로 안전.)
+pub(crate) fn emit_integrity_mac(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
+    use iced_x86::MemoryOperand as M;
+    const PHI: u64 = 0x9E37_79B9_7F4A_7C15u64;
+    if stub.integrity {
+        // R10 = PHI ; RBP = h0 ; RDI = h1 (초기 상태)
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R10, PHI).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RBP, 0x6A09_E667_F3BC_C909u64).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDI, 0xBB67_AE85_84CA_A73Bu64).unwrap(), None));
+
+        // ── bind_byte 재계산 (base_bind_loop와 동일 유도) → R11b ──────────────
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX,
+            M::with_base_displ_bcst_seg(Register::None, 0x60, false, Register::GS)).unwrap(), None)); // PEB
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX,
+            M::with_base_displ(Register::RAX, 0x10)).unwrap(), None)); // PEB.ImageBaseAddress
+        // (base>>16) & 0xFF
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap(), None));
+        seq.push((Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 16).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r32_rm32, Register::R11D, Register::EDX).unwrap(), None));
+        seq.push((Instruction::with2(Code::And_rm32_imm32, Register::R11D, 0xFF).unwrap(), None));
+        // ^ (base>>24)
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap(), None));
+        seq.push((Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 24).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EDX).unwrap(), None));
+        seq.push((Instruction::with2(Code::Xor_rm32_r32, Register::R11D, Register::ECX).unwrap(), None));
+        // ^ (base>>32)
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap(), None));
+        seq.push((Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 32).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EDX).unwrap(), None));
+        seq.push((Instruction::with2(Code::Xor_rm32_r32, Register::R11D, Register::ECX).unwrap(), None));
+        seq.push((Instruction::with2(Code::And_rm32_imm32, Register::R11D, 0xFF).unwrap(), None));
+        // R11b = bind_byte
+
+        // ── Phase A: 키(seed_stored) 흡수 — 256바이트 루프 ────────────────────
+        // R9 = init i-계수 0x100000001B3
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R9, 0x1000_0000_01B3u64).unwrap(), None));
+        // RSI = seed_va ; R8D = i = 0
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RSI, stub.seed_va).unwrap(), None));
+        seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::R8D, Register::R8D).unwrap(), None));
+        // MacInitLoop:
+        seq.push((Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, M::with_base(Register::RSI)).unwrap(), Some(Label::MacInitLoop)));
+        seq.push((Instruction::with2(Code::Xor_rm8_r8, Register::AL, Register::R11L).unwrap(), None)); // b = seed ^ bind_byte
+        // rcx = b*PHI
+        seq.push((Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EAX).unwrap(), None));
+        seq.push((Instruction::with2(Code::Imul_r64_rm64, Register::RCX, Register::R10).unwrap(), None));
+        // rax = rol(h0, i&63)
+        seq.push((Instruction::with2(Code::Mov_r32_rm32, Register::EDX, Register::R8D).unwrap(), None));
+        seq.push((Instruction::with2(Code::And_rm32_imm32, Register::EDX, 63).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r8_rm8, Register::CL, Register::DL).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RBP).unwrap(), None));
+        seq.push((Instruction::with2(Code::Rol_rm64_CL, Register::RAX, Register::CL).unwrap(), None));
+        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RCX, Register::RAX).unwrap(), None));
+        // rcx += i*0x100000001B3
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R8).unwrap(), None));
+        seq.push((Instruction::with2(Code::Imul_r64_rm64, Register::RAX, Register::R9).unwrap(), None));
+        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RCX, Register::RAX).unwrap(), None));
+        // h1 ^= rcx
+        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RDI, Register::RCX).unwrap(), None));
+        // h1 = rol(h1,23)*PHI + h0
+        seq.push((Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 23).unwrap(), None));
+        seq.push((Instruction::with2(Code::Rol_rm64_CL, Register::RDI, Register::CL).unwrap(), None));
+        seq.push((Instruction::with2(Code::Imul_r64_rm64, Register::RDI, Register::R10).unwrap(), None));
+        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RDI, Register::RBP).unwrap(), None));
+        // h0 = rol(h0,17) ^ h1
+        seq.push((Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 17).unwrap(), None));
+        seq.push((Instruction::with2(Code::Rol_rm64_CL, Register::RBP, Register::CL).unwrap(), None));
+        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RBP, Register::RDI).unwrap(), None));
+        // advance + loop
+        seq.push((Instruction::with1(Code::Inc_rm64, Register::RSI).unwrap(), None));
+        seq.push((Instruction::with1(Code::Inc_rm32, Register::R8D).unwrap(), None));
+        seq.push((Instruction::with2(Code::Cmp_rm32_imm32, Register::R8D, 256).unwrap(), None));
+        seq.push((Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(), Some(Label::MacInitLoop)));
+
+        // ── Phase B: 코드 영역 데이터 흡수 ────────────────────────────────────
+        // R9 = update i-계수 0x9E3779B9 (r32 mov는 zero-extend)
+        seq.push((Instruction::with2(Code::Mov_r32_imm32, Register::R9D, 0x9E37_79B9u32).unwrap(), None));
+        // RSI = code_va ; R8D = i = 0 ; RDX = code_len
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RSI, stub.code_va).unwrap(), None));
+        seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::R8D, Register::R8D).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX, stub.code_len as u64).unwrap(), None));
+        seq.push((Instruction::with2(Code::Test_rm64_r64, Register::RDX, Register::RDX).unwrap(), None));
+        seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Label::MacDone)));
+        // MacDataLoop:
+        seq.push((Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, M::with_base(Register::RSI)).unwrap(), Some(Label::MacDataLoop)));
+        // rcx = b*PHI
+        seq.push((Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EAX).unwrap(), None));
+        seq.push((Instruction::with2(Code::Imul_r64_rm64, Register::RCX, Register::R10).unwrap(), None));
+        // rax = rol(h0, i&63)
+        seq.push((Instruction::with2(Code::Mov_r32_rm32, Register::EDX, Register::R8D).unwrap(), None));
+        seq.push((Instruction::with2(Code::And_rm32_imm32, Register::EDX, 63).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r8_rm8, Register::CL, Register::DL).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RBP).unwrap(), None));
+        seq.push((Instruction::with2(Code::Rol_rm64_CL, Register::RAX, Register::CL).unwrap(), None));
+        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RCX, Register::RAX).unwrap(), None));
+        // rcx += i*0x9E3779B9
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R8).unwrap(), None));
+        seq.push((Instruction::with2(Code::Imul_r64_rm64, Register::RAX, Register::R9).unwrap(), None));
+        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RCX, Register::RAX).unwrap(), None));
+        // h1 ^= rcx
+        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RDI, Register::RCX).unwrap(), None));
+        // h1 = rol(h1,17)*PHI + h0
+        seq.push((Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 17).unwrap(), None));
+        seq.push((Instruction::with2(Code::Rol_rm64_CL, Register::RDI, Register::CL).unwrap(), None));
+        seq.push((Instruction::with2(Code::Imul_r64_rm64, Register::RDI, Register::R10).unwrap(), None));
+        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RDI, Register::RBP).unwrap(), None));
+        // h0 = rol(h0,31) ^ h1
+        seq.push((Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 31).unwrap(), None));
+        seq.push((Instruction::with2(Code::Rol_rm64_CL, Register::RBP, Register::CL).unwrap(), None));
+        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RBP, Register::RDI).unwrap(), None));
+        // advance + loop
+        seq.push((Instruction::with1(Code::Inc_rm64, Register::RSI).unwrap(), None));
+        seq.push((Instruction::with1(Code::Inc_rm32, Register::R8D).unwrap(), None));
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R8).unwrap(), None));
+        seq.push((Instruction::with2(Code::Cmp_rm64_imm32, Register::RAX, stub.code_len as i64).unwrap(), None));
+        seq.push((Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(), Some(Label::MacDataLoop)));
+
+        // ── Phase C: finish + 저장값 비교 ─────────────────────────────────────
+        seq.push((Instruction::with(Code::Nopd), Some(Label::MacDone)));
+        // out = rol(h1,32) ^ h0 ^ rol(h0,47)
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RDI).unwrap(), None)); // h1
+        seq.push((Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 32).unwrap(), None));
+        seq.push((Instruction::with2(Code::Rol_rm64_CL, Register::RAX, Register::CL).unwrap(), None)); // rol(h1,32)
+        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RBP).unwrap(), None)); // ^ h0
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RBP).unwrap(), None)); // h0
+        seq.push((Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 47).unwrap(), None));
+        seq.push((Instruction::with2(Code::Rol_rm64_CL, Register::RDX, Register::CL).unwrap(), None)); // rol(h0,47)
+        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RDX).unwrap(), None)); // out
+        // mac_va 저장값(8B)과 비교 — 불일치 시 ud2
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RSI, stub.mac_va).unwrap(), None));
+        seq.push((Instruction::with2(Code::Cmp_r64_rm64, Register::RAX, M::with_base(Register::RSI)).unwrap(), None));
+        seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Label::MacOk)));
+        seq.push((Instruction::with(Code::Ud2), None));
+        seq.push((Instruction::with(Code::Nopd), Some(Label::MacOk)));
+    }
+}

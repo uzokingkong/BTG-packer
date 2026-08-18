@@ -345,6 +345,12 @@ impl PolymorphicInterpreter {
                     // 인지된 no-op 스텁. 실제 네이티브/호스트 콜은 런타임 계층(Phase P3) 책임.
                     // 평가된 피연산자 바이트는 스트림에서 소비됐지만 VM 상태에는 영향을 주지 않는다.
                 }
+                RiscOp::VmCallBridge => {
+                    // P1 (③): 인지된 no-op 스텁 — 서브 VM 레지스트리 기반 실제
+                    // nested-VM 실행은 런타임 계층(P3 상용 통합) 책임. `is_encodable`
+                    // 에 등록하지 않으므로 폴리 경로가 이 op 를 만나지 않는다.
+                    // (참조 eval_state 가 서브 VM 실행으로 VM→VM 콜 의미론을 검증.)
+                }
                 // ── P2: 정수/비트/제어 복합 연산 (eval_state 와 동일 의미론) ────────
                 RiscOp::Multiply { signed, width } => {
                     let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
@@ -525,6 +531,98 @@ impl PolymorphicInterpreter {
                         (f64::from_bits(a) as f32).to_bits() as u64
                     };
                     self.store_operand(op_dst_raw, res);
+                }
+                // ── P1 (②): packed SSE — 슬롯 주소 피연산자, 16바이트 메모리 I/O, 플래그 불변 ──
+                // eval_state(참조)와 동치. packed 정수 연산은 RFLAGS 를 바꾸지 않는다.
+                // (참조: XMM 슬롯은 XMM_SLOT_BASE + idx*16 가상 메모리 — self.mem 에
+                //  놓이며, lifter 가 슬롯 주소를 피연산자로 만들어 준다.)
+                RiscOp::PackedMove => {
+                    let src = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let dst = get_operand_val(op_dst_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, 0);
+                    let mut bytes = [0u8; 16];
+                    for i in 0..16u64 {
+                        bytes[i as usize] = self.mem.get(&src.wrapping_add(i)).copied().unwrap_or(0);
+                    }
+                    for i in 0..16u64 {
+                        self.mem.insert(dst.wrapping_add(i), bytes[i as usize]);
+                    }
+                }
+                RiscOp::PackedAdd { elem_width, lanes } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    let d = get_operand_val(op_dst_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, 0);
+                    let mask = crate::vm::risc::flags::mask_for_width(elem_width);
+                    for lane in 0..lanes as u64 {
+                        let off = lane * elem_width as u64;
+                        let ea = mem_read(&self.mem, a.wrapping_add(off), elem_width);
+                        let eb = mem_read(&self.mem, b.wrapping_add(off), elem_width);
+                        mem_write(&mut self.mem, d.wrapping_add(off), elem_width, ea.wrapping_add(eb) & mask);
+                    }
+                }
+                RiscOp::PackedSub { elem_width, lanes } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    let d = get_operand_val(op_dst_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, 0);
+                    let mask = crate::vm::risc::flags::mask_for_width(elem_width);
+                    for lane in 0..lanes as u64 {
+                        let off = lane * elem_width as u64;
+                        let ea = mem_read(&self.mem, a.wrapping_add(off), elem_width);
+                        let eb = mem_read(&self.mem, b.wrapping_add(off), elem_width);
+                        mem_write(&mut self.mem, d.wrapping_add(off), elem_width, ea.wrapping_sub(eb) & mask);
+                    }
+                }
+                RiscOp::PackedXor => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    let d = get_operand_val(op_dst_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, 0);
+                    for i in 0..16u64 {
+                        let ba = self.mem.get(&a.wrapping_add(i)).copied().unwrap_or(0);
+                        let bb = self.mem.get(&b.wrapping_add(i)).copied().unwrap_or(0);
+                        self.mem.insert(d.wrapping_add(i), ba ^ bb);
+                    }
+                }
+                RiscOp::PackedAnd => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    let d = get_operand_val(op_dst_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, 0);
+                    for i in 0..16u64 {
+                        let ba = self.mem.get(&a.wrapping_add(i)).copied().unwrap_or(0);
+                        let bb = self.mem.get(&b.wrapping_add(i)).copied().unwrap_or(0);
+                        self.mem.insert(d.wrapping_add(i), ba & bb);
+                    }
+                }
+                RiscOp::PackedOr => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    let d = get_operand_val(op_dst_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, 0);
+                    for i in 0..16u64 {
+                        let ba = self.mem.get(&a.wrapping_add(i)).copied().unwrap_or(0);
+                        let bb = self.mem.get(&b.wrapping_add(i)).copied().unwrap_or(0);
+                        self.mem.insert(d.wrapping_add(i), ba | bb);
+                    }
+                }
+                RiscOp::PackedAndNot => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    let d = get_operand_val(op_dst_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, 0);
+                    for i in 0..16u64 {
+                        let ba = self.mem.get(&a.wrapping_add(i)).copied().unwrap_or(0);
+                        let bb = self.mem.get(&b.wrapping_add(i)).copied().unwrap_or(0);
+                        self.mem.insert(d.wrapping_add(i), ba & !bb);
+                    }
+                }
+                RiscOp::PackedCmpEq { elem_width, lanes } => {
+                    let a = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let b = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    let d = get_operand_val(op_dst_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, 0);
+                    let all_ones = (0..elem_width).fold(0u64, |acc, _| (acc << 8) | 0xFF);
+                    for lane in 0..lanes as u64 {
+                        let off = lane * elem_width as u64;
+                        let ea = mem_read(&self.mem, a.wrapping_add(off), elem_width);
+                        let eb = mem_read(&self.mem, b.wrapping_add(off), elem_width);
+                        let er = if ea == eb { all_ones } else { 0 };
+                        mem_write(&mut self.mem, d.wrapping_add(off), elem_width, er);
+                    }
                 }
             }
         }

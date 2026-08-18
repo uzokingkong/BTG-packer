@@ -16,4 +16,54 @@ panic = "unwind"
 strip = false
 debug = true
 
+# ── P0-1: 실전 컴파일러 코퍼스 프로파일 (QA corpus) ────────────────────────────
+# 같은 소스를 컴파일러 최적화/코드생성 설정을 달리해 여러 개의 실제 PE로 만들고,
+# QA가 각각 패킹→실행 동치를 검증한다. 커버 목표:
+#   -O0/-O1/-O2/-O3, LTO, codegen-units(코드 스케줄링 변화), panic=abort(SEH 제거),
+#   overflow-checks(checked 산술 코드 경로).
+# 프로파일 이름 = corpus-<태그>. 각 빌드 산출물을 corpus/<태그>.exe 로 복사한다.
+[profile.corpus-o0]
+inherits = "release"
+opt-level = 0
+lto = false
+
+[profile.corpus-o1]
+inherits = "release"
+opt-level = 1
+lto = false
+
+[profile.corpus-o2]
+inherits = "release"
+opt-level = 2
+lto = false
+
+[profile.corpus-o3]
+inherits = "release"
+opt-level = 3
+lto = false
+
+[profile.corpus-lto]
+inherits = "release"
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.corpus-cu16]
+inherits = "release"
+opt-level = 3
+lto = false
+codegen-units = 16
+
+[profile.corpus-abort]
+inherits = "release"
+opt-level = 3
+panic = "abort"
+lto = false
+
+[profile.corpus-checks]
+inherits = "release"
+opt-level = 2
+overflow-checks = true
+lto = false
+
 [dependencies]

@@ -132,7 +132,8 @@ pub fn run(
     // ── M7: on-demand 재암호화(anti-dump) — refcount-safe 디스패처가 블록을
     // 실행 후 즉시 재암호화한다 (어느 순간에도 실행 중 블록만 평문). 블록별 개별
     // 암호화 + 부트 스텁 일괄 복호화 생략은 위 `reencrypt` 플러밍을 공유한다.
-    if ctx.m7 {
+    // S2: --dispatcher-reencrypt도 M7식 디스패처로 승격 — ctx.reencrypt 기준 로그
+    if ctx.reencrypt {
         println!(
             "[+] M7 on-demand re-encrypt: blocks individually {}-encrypted; dispatcher decrypts on entry and re-encrypts on last-exit (refcount-safe anti-dump)",
             if c1_mode { "BTG-C1" } else { "RC4" }

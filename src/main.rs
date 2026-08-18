@@ -7,7 +7,7 @@ use btg_packer::cli::CliArgs;
 use btg_packer::error;
 use btg_packer::pe::{self, TargetPeInfo, generate_dummy_target_pe};
 use btg_packer::pipeline::{self, PipelineContext};
-use btg_packer::qa::{self, QaBenchmarkRunner};
+use btg_packer::qa::QaBenchmarkRunner;
 use btg_packer::vm;
 use btg_packer::debug;
 use clap::Parser;
@@ -31,32 +31,42 @@ impl Drop for LogFlushGuard {
 fn main() -> error::Result<()> {
     let args = CliArgs::parse();
 
+    // ── P1: feature resolver 리팩터링 — RequestedConfig → ResolvedConfig ─────────
+    // CLI 플래그의 정책 결정(--full 확장 · vm-oep/reencrypt/mem-harden 상충 해소 ·
+    // crypto gate · m7/m8 파생)을 main.rs 인라인에서 `protection_profile::resolve`
+    // 로 분리한다. 순수 함수라 단위 테스트로 정책 매트릭스를 검증할 수 있다.
+    // 기존 main.rs 규칙을 의미 보존 — 이하 코드는 오직 해석된 값을 소비한다.
+    let profile_req = btg_packer::protection_profile::RequestedConfig::from_cli(&args);
+    let profile = btg_packer::protection_profile::resolve(&profile_req);
+    for w in &profile.warnings {
+        eprintln!("[!] {w}");
+    }
+    let cfg = &profile.config;
+
+    // 하드 에러 (정책 위반 → 조기 종료) — resolve 가 수집한 내용을 Err 로 승격.
+    for e in &profile.errors {
+        return Err(error::BtgError::Anyhow(anyhow::anyhow!("{}", e.message())));
+    }
+
     // ── v9: --full — 최대 보호 스택을 단일 플래그로 켠다 ─────────────────────────
-    // 개별 플래그가 함께 주어지면 그 플래그가 우선(OR), --full은 부족한 나머지를
-    // 채운다. 상충 조합은 기존 규칙(재암호화 우선, chained/vm 무효화)으로 해소.
-    let full = args.full;
+    // (해석은 protection_profile::resolve 로 이동 — 아래는 값 소비만.)
+    let full = cfg.full;
     // FIX(v14 --vm-oep + --full): --vm-oep(전체 프로그램 VM 가상화)와 --full이
     // 함의하는 --dispatcher-reencrypt(블록 단위 네이티브 디스패치 재암호화)는 서로
     // 배타적인 디스패치 모델이다. vm-oep는 부트 스텁 bulk-복호화 경로를 써서 원본
     // 프로그램을 프로그램 VM으로 lift하므로, 둘을 함께 주면(--full --vm-oep) vm-oep가
     // 우선해서 reencrypt는 끈다. 이로써 두 플래그가 동시에 동작한다.
-    let vm_oep_requested = args.vm_oep;
-    let anti_debug = args.anti_debug || full;
-    let dispatcher_reencrypt = (args.dispatcher_reencrypt || full) && !vm_oep_requested;
-    if (args.dispatcher_reencrypt || full) && vm_oep_requested {
-        eprintln!("[!] --vm-oep takes precedence over --dispatcher-reencrypt (implied by --full): per-block re-encryption skipped so the whole program can be virtualized into the program VM");
-    }
-    let integrity = args.integrity || full;
-    let payload_relocate = args.payload_relocate || full;
-    let rsrc_register = args.rsrc_register || full;
+    // (상충 해소 자체는 protection_profile::resolve 가 처리 — 아래는 값 소비.)
+    let anti_debug = cfg.anti_debug;
+    let dispatcher_reencrypt = cfg.dispatcher_reencrypt;
+    let integrity = cfg.integrity;
+    let payload_relocate = cfg.payload_relocate;
+    let rsrc_register = cfg.rsrc_register;
     // FIX(v14 --vm-oep + --full): --iat-hide(--full이 켬)는 네이티브 디스패치용 IAT
     // 은닉/재구성이므로, 원본 프로그램 전체를 VM으로 lift해 데이터·import 포인터를
     // 평문으로 직접 읽는 --vm-oep와 양립하지 않는다. 게다가 TLS callback이 있는 PE
     // (Rust/CRT 대상)에선 iat-hide가 하드-에러로 실패한다. --vm-oep가 우선한다.
-    let iat_hide = (args.iat_hide || full) && !vm_oep_requested;
-    if (args.iat_hide || full) && vm_oep_requested {
-        eprintln!("[!] --vm-oep takes precedence over --iat-hide (implied by --full): IAT hiding skipped (incompatible with full-program VM virtualization / TLS-callback targets)");
-    }
+    let iat_hide = cfg.iat_hide;
     // FIX(v12.2): --dispatcher-reencrypt(런타임 블록 단위 복호화)는 .textb 블록
     // 영역에 대한 쓰기 권한이 계속 필요하다. --mem-harden(RX 전환)과 동시 적용하면
     // 디스패처의 첫 in-place 복호화가 RX 페이지에 쓰다 0xC0000005 크래시
@@ -65,13 +75,8 @@ fn main() -> error::Result<()> {
     // FIX(v14 --vm-oep + --full): --mem-harden(.textb → RX 전환)은 프로그램 VM
     // 런타임과도 양립하지 않는다 (lift된 프로그램 실행 중 .textb 쓰기 → 0xC0000005).
     // --vm-oep가 우선해 mem-harden도 끈다.
-    let mem_harden = (args.mem_harden || full) && !dispatcher_reencrypt && !vm_oep_requested;
-    if (args.mem_harden || full) && dispatcher_reencrypt {
-        eprintln!("[!] --dispatcher-reencrypt takes precedence over --mem-harden: runtime per-block decryption needs writable .textb (RX transition skipped)");
-    } else if (args.mem_harden || full) && vm_oep_requested {
-        eprintln!("[!] --vm-oep takes precedence over --mem-harden (implied by --full): .textb RX switch skipped (incompatible with the program VM's runtime)");
-    }
-    let obf_level = if full { 3u32 } else { args.obf_level };
+    let mem_harden = cfg.mem_harden;
+    let obf_level = cfg.obf_level;
 
     // ── 로그 초기화 ───────────────────────────────────────────────────────────────
     let log_level = if args.debug {
@@ -236,12 +241,29 @@ fn main() -> error::Result<()> {
 
     // ── QA 벤치마크 모드 ──────────────────────────────────────────────────────────
     if args.test_qa {
+        // P0-1: QA 실행 전 실전 코퍼스 자동 생성 (없는 프로파일만 빌드).
+        let built = btg_packer::qa::QaBenchmarkRunner::build_corpus()?;
+        if !built.is_empty() {
+            println!("[+] P0-1 QA corpus: generated {} variant(s): {}", built.len(), built.join(", "));
+        }
         run_qa_suite()?;
         return Ok(());
     }
 
+    // ── P0-1: 실전 컴파일러 코퍼스 생성 전용 모드 ──────────────────────────────────
+    if args.qa_gen_corpus {
+        let built = btg_packer::qa::QaBenchmarkRunner::build_corpus()?;
+        let status = if built.is_empty() { "all up-to-date".to_string() } else { built.join(", ") };
+        println!(
+            "[+] P0-1 QA corpus: {} variant(s) under ./corpus ({})",
+            btg_packer::qa::CORPUS_PROFILES.len(),
+            status
+        );
+        return Ok(());
+    }
+
     // v3: 복합 VM 암호화 (기본 ON) — 먼저 정의 (아래 가드에서 사용)
-    let crypto_enabled = !args.no_crypto;
+    let crypto_enabled = cfg.crypto_enabled;
 
     // ── 재점검 보고서 기반 가드 (H3/H4) ───────────────────────────────────────
     if rsrc_register && !payload_relocate {
@@ -295,10 +317,7 @@ fn main() -> error::Result<()> {
     }
 
     // v3-composite: VM 가상화 (KSA 키 스케줄 → 바이트코드 + 핸들러)
-    let vm_enabled = (args.vm || args.vm_oep) && crypto_enabled;
-    if (args.vm || args.vm_oep) && !crypto_enabled {
-        println!("[!] --vm / --vm-oep requires the crypto layer; ignoring (use without --no-crypto)");
-    }
+    let vm_enabled = cfg.vm_enabled;
     if vm_enabled {
         println!("[+] Composite VM: ENABLED (boot-stub RC4 KSA executed via generated VM handlers)");
     }
@@ -355,44 +374,36 @@ fn main() -> error::Result<()> {
     // ── v61: M7 (on-demand 재암호화) 판정 — per-block reencrypt 계열 디스패처를
     // 쓰므로 --dispatcher-reencrypt와 상호 배타, --vm/--vm-oep(일괄 복호화 부트
     // 흐름)와도 배타. crypto 필수. (ctx.reencrypt가 아래에서 이를 반영)
-    let m7_effective = args.m7 && crypto_enabled && !vm_enabled && !dispatcher_reencrypt;
+    let m7_effective = cfg.m7;
     // v8: Phase 0.3 디스패처 재암호화 (pass2 테이블 배치/디스패처/부트 스텁에 전달)
     // v61: --m7(on-demand 재암호화)도 per-block reencrypt 플러밍(블록별 암호화 +
     // 3-푸시 규약 + 부트 스텁 일괄 복호화 생략)을 재사용하므로 reencrypt로 묶는다.
     // 단, M7은 v14의 "평문 유지" 대신 refcount-safe "실행 후 재암호화" 디스패처를 쓴다.
-    ctx.reencrypt = dispatcher_reencrypt || m7_effective;
+    ctx.reencrypt = cfg.reencrypt;
     // v6: IAT 은닉/메모리 하드닝 — pass4가 부트 영역/특성을 결정하기 전에 설정
     // (crypto off여도 부트 스텁이 필요할 수 있으므로 pass4보다 먼저 알아야 한다)
-    ctx.iat_hide = iat_hide;
-    ctx.mem_harden = mem_harden;
+    ctx.iat_hide = cfg.iat_hide;
+    ctx.mem_harden = cfg.mem_harden;
     // v13.4d experiment (A/B): 원본 .pdata 유지 여부 — build.rs의 .pdata 재구성 gate
     ctx.keep_pdata = args.keep_pdata;
     // v13.4d diag: 디스패처 ring-buffer (마지막 32개 block id) 주입 여부
     ctx.block_ring = args.block_ring;
     // v62: BTG-C1을 기본 암호로 (--rc4로 RC4 복귀). --custom-cipher는 기본값이라
     // 명시적 동의에만 쓰이고, --rc4와 함께 주면 --rc4가 우선한다.
-    if args.rc4 && args.custom_cipher {
-        eprintln!("[!] --rc4 takes precedence over --custom-cipher (BTG-C1 is the default cipher; --rc4 forces RC4-256)");
-    }
-    ctx.custom_cipher = !args.rc4;
+    ctx.custom_cipher = cfg.custom_cipher;
     // M6 Phase-2: OEP→VM entry 전환 — 부트 스텁이 원본 .text를 평문 복호화하지
     // 않고 lift된 프로그램 VM 모듈로 디스패치. (--vm 필요)
     // v59: patch_data가 .rdata/.data 포인터 재배치를 vm_oep 모드에서 원본 .text
     // 유지로 바꾸므로 **pass1 이전에** 설정해야 한다. (기존엔 crypto 직전 설정)
-    ctx.vm_oep = args.vm_oep && vm_enabled;
+    ctx.vm_oep = cfg.vm_oep;
     // P3 (G1): --vm-commercial — --vm-oep의 백엔드를 상용 엔진으로 전환 (회귀 안전).
     // `--vm --vm-oep --vm-commercial` 모두 켜야 상용 경로를 쓰고, 레거시 --vm-oep
     // 경로는 바이트 동일 유지한다.
-    ctx.vm_commercial = args.vm_commercial && args.vm_oep && vm_enabled;
+    ctx.vm_commercial = cfg.vm_commercial;
     // ── M7: on-demand 재암호화(anti-dump) — 실행 후 블록을 즉시 재암호화하는
     // refcount-safe 디스패처로, 어느 순간에도 "실행 중인 블록만 평문"이다.
     // (m7_effective는 위에서 crypto/vm/reencrypt 배타성과 함께 판정됨.
     //  ⚠ pass2가 상태 테이블을 예약하므로 **pass1 이전에** 설정해야 한다.)
-    if args.m7 && !m7_effective {
-        eprintln!(
-            "[!] --m7 (on-demand re-encrypt) requires the crypto layer and conflicts with --dispatcher-reencrypt / --vm / --vm-oep (per-block dispatcher vs bulk-decrypt boot flow); ignored"
-        );
-    }
     ctx.m7 = m7_effective;
 
     // ── Phase 6: SDK Marker Selective VM Pass (if markers present) ───────────────
@@ -419,7 +430,7 @@ fn main() -> error::Result<()> {
     let anti_debug_enabled = anti_debug || args.trace_blocks;
     // v9: crypto가 꺼져 있어도 IAT/메모리 하드닝/페이로드 재배치가 있으면
     // 부트 스텁 영역을 예약해야 한다.
-    let needs_boot_stub = crypto_enabled || iat_hide || mem_harden || payload_relocate;
+    let needs_boot_stub = cfg.needs_boot_stub;
     pipeline::pass4_section::run(&mut ctx, anti_debug_enabled, needs_boot_stub, args.trace_blocks)?;
 
     // ── Patch: 섹션 재배치 + CFG 픽스업 ──────────────────────────────────────────
@@ -437,7 +448,7 @@ fn main() -> error::Result<()> {
     // (v59: vm_oep는 pass1 이전에 이미 설정됨 — 위의 초기화 참조)
 
     // ── M8: VM handler 테이블 MBA 난독화 (--vm 필요, 기본 false → 기존 경로 유지)
-    ctx.m8 = args.m8 && vm_enabled;
+    ctx.m8 = cfg.m8;
 
     // ── v3 Crypto: 코드 영역 + 문자열 암호화, 부트 스텁 설치 (--vm 시 KSA 가상화) ──
     // v9: crypto가 꺼져 있어도 --iat-hide/--mem-harden/--payload-relocate가 있으면
@@ -490,6 +501,61 @@ fn main() -> error::Result<()> {
 
     // ── v5: 자체검증 — 출력 PE를 다시 파싱해 구조적 불변식 검증 ──────────────────
     pipeline::validate::run(&ctx, &output_pe_bytes)?;
+
+
+    // ── 상용 3-2: Build Manifest — 패킹 로그 + <output>.manifest ─────────────
+    // input/output SHA-256 + 결정적 build_id + vm/crypto 버전 + 적용 feature
+    // flags 를 기록한다. build_id 는 (seed, input_hash) 의 순수 함수라 같은
+    // input+seed+config 는 같은 build_id 를 낸다 (크래시 재현/지원용).
+    {
+        let input_hash = btg_packer::manifest::sha256_hex(&input_pe_bytes);
+        let output_hash = btg_packer::manifest::sha256_hex(&output_pe_bytes);
+        let flags = btg_packer::manifest::feature_flags(
+            anti_debug,
+            vm_enabled,
+            ctx.vm_oep,
+            ctx.vm_commercial,
+            ctx.m7,
+            ctx.m8,
+            integrity,
+            dispatcher_reencrypt,
+            payload_relocate,
+            rsrc_register,
+            iat_hide,
+            mem_harden,
+            ctx.custom_cipher,
+            args.map,
+            args.sym_map,
+            args.seed.is_some(),
+        );
+        let manifest = btg_packer::manifest::BuildManifest::new(
+            args.seed,
+            flags,
+            input_hash,
+            output_hash,
+        );
+        println!("[+] Build manifest (P3-2):");
+        for line in manifest.render().lines() {
+            println!("      {}", line);
+        }
+        // ⚠ P0-1: 확장자를 `<exe>.manifest`로 쓰면 Windows 로더가 이를 **외부 앱
+        // 매니페스트(XML)**로 인식해 활성화에 실패하고 "side-by-side configuration
+        // is incorrect" 로 모든 패킹 바이너리 실행이 차단된다 (실제 코퍼스 QA에서
+        // 적발). 로더가 자동 활성화하는 `<exe>.manifest` 와 충돌하지 않는
+        // `.btgmanifest` 확장자를 사용한다.
+        let mut manifest_path = output_path.clone();
+        manifest_path.set_extension(
+            output_path
+                .extension()
+                .map(|e| format!("{}.btgmanifest", e.to_string_lossy()))
+                .unwrap_or_else(|| "btgmanifest".to_string()),
+        );
+        manifest
+            .write_manifest(&manifest_path)
+            .map_err(|e| error::BtgError::Anyhow(anyhow::anyhow!(
+                "P3-2: failed to write build manifest {}: {}", manifest_path.display(), e)))?;
+        println!("[+] P3-2 Build manifest written: {}", manifest_path.display());
+    }
 
     // ── v42 (M9) / v50 (M10): VM 매퍼 덤프 ─────────────────────────────
     // `--map` 명령 단위(bytecode offset→원본 VA)를 <output>.map으로,

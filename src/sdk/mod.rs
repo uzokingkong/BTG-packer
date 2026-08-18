@@ -6,7 +6,9 @@ pub mod llvm_interface;
 pub mod markers;
 pub mod selective;
 
-pub use llvm_interface::{LlvmIngestionInterface, LlvmVirtualFunction};
+pub use llvm_interface::{
+    LlvmIngestionInterface, LlvmSynthesizer, LlvmVirtualFunction, PolyConsumptionRuntime,
+};
 pub use markers::{MarkerScanner, SIG_VM_END, SIG_VM_START, VmMarkerRegion};
 pub use selective::SelectiveVirtualizer;
 

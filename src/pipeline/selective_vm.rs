@@ -17,7 +17,7 @@
 // ==============================================================================
 
 use crate::pipeline::PipelineContext;
-use crate::sdk::{MarkerScanner, SelectiveVirtualizer};
+use crate::sdk::{MarkerScanner, PolyConsumptionRuntime, SelectiveVirtualizer};
 use crate::vm::poly::PolymorphicEncoder;
 use crate::vm::risc::{RiscLifter, RiscProgram};
 use anyhow::{anyhow, Result};
@@ -101,6 +101,16 @@ impl SelectiveVmPass {
             let seed = base_seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(idx as u64 * 0x9E37_79B9);
             let mut enc = PolymorphicEncoder::new(seed);
             let bytecode = enc.encode(&prog)?;
+
+            // ── S5: rolling-key 소비 런타임 검증 (데이터 임베드에 그치지 않고 실행 정합) ──
+            if let Err(e) = PolyConsumptionRuntime::verify_region(&bytecode, seed, &prog) {
+                println!(
+                    "    [Region {}] REJECTED (consumption runtime verification failed): {e} — region left native, NOT virtualized",
+                    idx + 1
+                );
+                rejected.push((reg.start_offset, format!("consumption-verify: {e}")));
+                continue;
+            }
 
             let region = PolyVmRegion {
                 start_offset: reg.start_offset,
@@ -201,5 +211,84 @@ mod tests {
             }
         }
         assert!(any_err, "xgetbv must be unsupported so the region is rejected");
+    }
+
+    /// S5: SDK 마커 타깃 pack→run 테스트.
+    ///
+    /// 마커로 감싼 리프트 가능 x86 코드를 lift → rolling-key 폴리모픽 encode 한 뒤
+    /// `PolyConsumptionRuntime`(같은 시드로 복호화·실행)로 소비해 원본 프로그램과
+    /// **실행 정합**인지 검증한다. 이는 `selective_vm.rs::run` 이 실제로 각 리전을
+    /// 임베드하기 전에 거치는 바로 그 경로다 — 데이터 임베드에 그치지 않고
+    /// 소비 런타임이 실행 결과를 검증함을 확인한다.
+    #[test]
+    fn test_sdk_marker_pack_run_consumption_verify() {
+        let mut text_data = Vec::new();
+        text_data.extend_from_slice(&[0x90, 0x90]); // NOPs
+        text_data.extend_from_slice(&SIG_VM_START);
+
+        // x86 code: mov rax, 42; add rax, 8; ret  →  RAX == 50
+        let marked_code = [
+            0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00, // mov rax, 42
+            0x48, 0x83, 0xC0, 0x08,                   // add rax, 8
+            0xC3,                                     // ret
+        ];
+        text_data.extend_from_slice(&marked_code);
+        text_data.extend_from_slice(&SIG_VM_END);
+        text_data.extend_from_slice(&[0x90, 0x90]);
+
+        let regions = MarkerScanner::scan_markers(&text_data);
+        assert_eq!(regions.len(), 1);
+
+        let slice = &text_data[regions[0].start_offset..regions[0].end_offset];
+        let base_va = 0x140001000u64;
+        let mut decoder = Decoder::with_ip(64, slice, base_va, DecoderOptions::NONE);
+        let mut lifter = RiscLifter::new();
+        while decoder.can_decode() {
+            let inst = decoder.decode();
+            lifter.lift_instruction(&inst).unwrap();
+        }
+        let prog = RiscProgram::new(lifter.desynth.instrs);
+
+        // pack: rolling-key 폴리모픽 encode (seed 0x8899AABBCCDDEEFF)
+        let seed = 0x8899AABBCCDDEEFFu64;
+        let mut enc = PolymorphicEncoder::new(seed);
+        let bytecode = enc.encode(&prog).unwrap();
+
+        // run: 같은 시드로 소비(복호화) → 원본과 실행 정합 검증.
+        PolyConsumptionRuntime::verify_region(&bytecode, seed, &prog).unwrap();
+
+        // 소비된 바이트코드가 실제로 50 을 산출하는지도 확인 (pack→run 동치).
+        let consumed = PolyConsumptionRuntime::decode(&bytecode, seed).unwrap();
+        let out = consumed.eval_registers(&[0u64; 16]);
+        assert_eq!(out[0], 50);
+    }
+
+    /// S5: 잘못된 시드(롤링키 desync)로 소비하면 검증이 실패해야 한다 —
+    /// 임베드 전 거부 경로가 실제로 동작함을 확인.
+    #[test]
+    fn test_sdk_marker_consumption_rejects_wrong_seed() {
+        let mut text_data = Vec::new();
+        text_data.extend_from_slice(&SIG_VM_START);
+        text_data.extend_from_slice(&[0x48, 0x31, 0xC0, 0x48, 0x83, 0xC0, 0x07, 0xC3]); // xor rax,rax; add rax,7; ret
+        text_data.extend_from_slice(&SIG_VM_END);
+
+        let regions = MarkerScanner::scan_markers(&text_data);
+        assert_eq!(regions.len(), 1);
+        let slice = &text_data[regions[0].start_offset..regions[0].end_offset];
+        let mut decoder = Decoder::with_ip(64, slice, 0x140001000, DecoderOptions::NONE);
+        let mut lifter = RiscLifter::new();
+        while decoder.can_decode() {
+            let inst = decoder.decode();
+            lifter.lift_instruction(&inst).unwrap();
+        }
+        let prog = RiscProgram::new(lifter.desynth.instrs);
+
+        let seed = 0x1122334455667788u64;
+        let mut enc = PolymorphicEncoder::new(seed);
+        let bytecode = enc.encode(&prog).unwrap();
+
+        // 원본 시드로는 통과, 잘못된 시드로는 실패.
+        PolyConsumptionRuntime::verify_region(&bytecode, seed, &prog).unwrap();
+        assert!(PolyConsumptionRuntime::verify_region(&bytecode, seed ^ 1, &prog).is_err());
     }
 }

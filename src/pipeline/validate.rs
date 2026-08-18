@@ -87,11 +87,13 @@ pub(crate) fn section_for_rva<'a>(sections: &'a [SectionInfo], rva: u32) -> Opti
 
 mod pe;
 mod rsrc;
+mod dirs;
 #[cfg(test)]
 mod tests;
 
 pub(crate) use pe::validate_pe_structure;
 pub(crate) use rsrc::{ResDataEntry, expected_chunks, validate_rsrc, walk_dir, walk_resource_tree};
+pub(crate) use dirs::{report_pe_diff, validate_all_directories};
 
 /// Post-build structural self-validation of the synthesized output PE.
 pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
@@ -364,7 +366,7 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
     // 3d. v61 (--m7): on-demand 상태 테이블 — 일반 블록은 0xFFFFFFFF(암호화),
     //     call-target 블록은 0(평문 유지)으로 초기화되어야 디스패처 상태 머신이
     //     올바르게 시작한다. (점프 테이블 + 길이 테이블 뒤 = table_offset + 2*N*4)
-    if ctx.m7 {
+    if ctx.reencrypt {
         let tb = sections
             .iter()
             .rev().find(|s| s.name == ".textb")
@@ -424,6 +426,10 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
     if ctx.rsrc_dir_rva > 0 {
         validate_rsrc(ctx, &pe, &sections, out)?;
     }
+
+    // 5b. 상용 1-4: 데이터 디렉터리 전수 재파싱 검증 + 원본↔보호 구조 diff.
+    validate_all_directories(out, &pe, &sections, ctx)?;
+    report_pe_diff(ctx.target_info.original_pe_bytes.as_slice(), &pe, out)?;
 
     println!("[VALIDATE] all structural checks passed ✔");
     Ok(())

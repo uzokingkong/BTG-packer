@@ -157,6 +157,7 @@ pub(crate) fn place_boot_stub(
         payload_len: if payload_relocate { code_len } else { 0 },
         integrity: integrity_effective,
         crc_va: 0,
+        mac_va: 0,
         iat_enabled: !iat_table_blob.is_empty(),
         mba_master: ctx.mba_constant,
         mba_c: IMPORT_MBA_C,
@@ -426,7 +427,7 @@ pub(crate) fn place_boot_stub(
     } else {
         8 + text_enc_runs.len() * 16
     };
-    let text_runs_off = (seed_off + 256 + if integrity_effective { 4 } else { 0 } + 7) & !7;
+    let text_runs_off = (seed_off + 256 + if integrity_effective { 4 + 8 } else { 0 } + 7) & !7;
     let text_runs_va = if text_enc_runs.is_empty() {
         0
     } else {
@@ -519,7 +520,7 @@ pub(crate) fn place_boot_stub(
     let boot_data_end = if ctx.iat_hide || ctx.mem_harden {
         iat_end
     } else {
-        seed_off + 256 + if integrity_effective { 4 } else { 0 }
+        seed_off + 256 + if integrity_effective { 4 + 8 } else { 0 }
     };
     if runs_off < stub_end || boot_data_end > boot_off + BOOT_AREA_RESERVE {
         return Err(anyhow::anyhow!(
@@ -586,9 +587,11 @@ pub(crate) fn place_boot_stub(
 
     // ── 3rd pass: 최종 스텁 (payload_va + crc_va 반영) ─────────────────────────
     let crc_va = dispatcher_va + (seed_off + 256) as u64;
+    let mac_va = dispatcher_va + (seed_off + 260) as u64;
     let stub3 = BootStubCtx {
         payload_va,
         crc_va,
+        mac_va,
         // M6 Phase-2.3: at-rest 암호화 대상 VA/길이 확정 (imm64/imm32 — 길이 불변)
         vm_oep_bc_va: vm_prog_bc_va,
         vm_oep_bc_len: vm_prog_bc_len,
@@ -824,6 +827,13 @@ let prmod = build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed,
         let mac_val = crate::crypto::BtgKeyedMac::mac(seed_stored, crc_source.as_deref().unwrap_or(&[]));
         println!("[+] T2-3 Integrity keyed-MAC over code region: {:016X} (keyed)", mac_val);
         btg.bytes[seed_off + 256..seed_off + 260].copy_from_slice(&crc_val.to_le_bytes());
+        // S1: keyed-MAC(8B)를 crc 뒤 seed_off+260에 저장 — 부트 스텁이 런타임에
+        // 재계산·비교 (불일치 시 ud2). 키 = seed_stored.
+        btg.bytes[seed_off + 260..seed_off + 268].copy_from_slice(&mac_val.to_le_bytes());
+        println!(
+            "[+] S1 Integrity keyed-MAC stored @0x{:X} (8B, keyed=seed_stored; boot stub re-verifies -> ud2 on mismatch)",
+            seed_off + 260
+        );
         println!(
             "[+] v5 Integrity: code-region CRC32 = 0x{:08X} stored @0x{:X} (stub traps on mismatch)",
             crc_val,

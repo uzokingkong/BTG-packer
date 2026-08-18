@@ -24,6 +24,7 @@ pub use m7_c1::build_dispatcher_m7_c1;
 pub use reencrypt::build_dispatcher_reencrypt;
 pub use reencrypt_c1::build_dispatcher_reencrypt_c1;
 pub use validate::validate_dispatcher;
+pub use validate::validate_dispatcher_with_base;
 
 /// Marker for an 8-byte stack push that needs no register restore (pushfq,
 /// volatile-GPR push, or immediate push). Modelled as `UWOP_ALLOC_SMALL(8)`.

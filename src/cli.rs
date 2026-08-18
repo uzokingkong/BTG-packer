@@ -39,6 +39,12 @@ pub struct CliArgs {
     #[arg(short = 't', long, default_value_t = false)]
     pub test_qa: bool,
 
+    /// P0-1: 실전 컴파일러 코퍼스를 생성하고 종료한다 (corpus/*.exe).
+    /// test/ 크레이트를 -O0/-O1/-O2/-O3/LTO/CGU16/panic-abort/overflow-checks
+    /// 프로파일로 각각 빌드해 QA가 패킹·실행 검증할 실제 PE 집합을 만든다.
+    #[arg(long, default_value_t = false)]
+    pub qa_gen_corpus: bool,
+
     /// Enable verbose Debug logging mode
     #[arg(short = 'd', long, default_value_t = false)]
     pub debug: bool,

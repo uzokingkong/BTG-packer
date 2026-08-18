@@ -7,7 +7,7 @@ pub mod opt;
 use std::collections::HashMap;
 
 pub use desynth::RiscDesynthesizer;
-pub use flags::{VFLAG_CF, VFLAG_DF};
+pub use flags::{VFLAG_CF, VFLAG_DF, mask_for_width};
 pub use flags::VirtualFlags;
 pub use lifter::RiscLifter;
 pub use opcodes::{BranchCondition, MicroInstr, MicroOperand, RiscOp};
@@ -21,6 +21,11 @@ pub struct RiscProgram {
     /// `instrs` ?뺢껴?㎬땻?????戮곗굚 ?筌뤾퍓????댁Ŧ ?곌떠???臾먰돵 `eval_state`?띠럾? ?釉뚯뫅?깃퀋紐????덈뺄???우벟 ??類ｋ펲.
     /// `None`?????`VirtualBranch.imm`??嶺뚯쉳????筌뤾퍓????댁Ŧ ??怨댄맍??類ｋ펲(??ル쪇援????덈뺄 ?곌랜???.
     ip_map: Option<HashMap<u64, usize>>,
+    /// P1 (③): VM→VM 콜 브릿지 서브 VM 레지스트리 — `VmCallBridge.imm` 프로그램
+    /// id → 서브 `RiscProgram`. 각 리전(별도 시드/bytecode VM 인스턴스)이 여기
+    /// 등록되고, 참조 `eval_state` 는 VmCallBridge 실행 시 호출자 상태를 스냅샷한
+    /// 뒤 서브 VM 을 실행·복귀한다.
+    sub_vms: HashMap<u64, RiscProgram>,
 }
 
 /// `RiscProgram::eval_state` ???덈뺄 ?롪퍒???앹뿉?????사뛾?녿즴???띠럾????誘⑹굣????⑤객臾?
@@ -72,6 +77,7 @@ impl RiscProgram {
         Self {
             instrs,
             ip_map: None,
+            sub_vms: HashMap::new(),
         }
     }
 
@@ -81,7 +87,22 @@ impl RiscProgram {
         Self {
             instrs,
             ip_map: Some(ip_map),
+            sub_vms: HashMap::new(),
         }
+    }
+
+    /// P1 (③): VmCallBridge 서브 VM 레지스트리를 함께 설정한 RiscProgram.
+    pub fn with_sub_vms(instrs: Vec<MicroInstr>, sub_vms: HashMap<u64, RiscProgram>) -> Self {
+        Self {
+            instrs,
+            ip_map: None,
+            sub_vms,
+        }
+    }
+
+    /// VmCallBridge 서브 VM 조회 (프로그램 id → 서브 RiscProgram).
+    pub fn sub_vm(&self, id: u64) -> Option<&RiscProgram> {
+        self.sub_vms.get(&id)
     }
 
 /// ip_map(???裕?IP ???熬곣뫁夷?윜諛몄굡???筌뤾퍓???????????釉뚯뫅????濚???? x86 IP??
@@ -418,6 +439,32 @@ impl RiscProgram {
                 }
                 RiscOp::Halt => break,
                 RiscOp::NativeCallBridge => {}
+                // ── P1 (③): VM→VM 콜 브릿지 — 서브 VM 실행 후 복귀 ──────────────
+                // 호출자 상태(regs/temps/flags/vsp/stack)를 스냅샷하고, `imm`의
+                // 프로그램 id 로 서브 VM을 **현재 regs/mem** 위에서 실행한다 (인자는
+                // 레지스터로 전달 — x64 유사 컨벤션). 복귀 시 호출자 상태를 복원하되
+                // RAX(vreg 0)만 서브 VM 반환값으로 대체하고, 서브 VM이 쓴 mem 을
+                // 보존한다 (아웃-파라미터/스택/힙 반영). 서브 VM은 Halt 까지 실행.
+                RiscOp::VmCallBridge => {
+                    if let Some(sub) = self.sub_vm(ins.imm) {
+                        let saved_regs = st.regs;
+                        let saved_temps = st.temps;
+                        let saved_flags = flags.raw;
+                        let saved_vsp = st.vsp;
+                        let saved_stack = std::mem::take(&mut st.stack);
+                        let sub_state = sub.eval_state_impl(&saved_regs, &st.mem);
+                        // 호출자 상태 복원 (스택 포인터·플래그·temps 유지).
+                        st.regs = saved_regs;
+                        st.temps = saved_temps;
+                        flags.raw = saved_flags;
+                        st.vsp = saved_vsp;
+                        st.stack = saved_stack;
+                        // 반환값 RAX + 서브 VM이 기록한 메모리 반영.
+                        st.regs[0] = sub_state.regs[0];
+                        st.mem = sub_state.mem;
+                    }
+                    // 등록되지 않은 id → 참조도 no-op (NativeCallBridge와 동일 계약).
+                }
                 // ???? P2: ?筌먦끇?????????戮?꽑 ?곌랜踰뤻뜮? ??⑥ろ뀰 ??????????????????????????????????????????????????????????????????
                 RiscOp::Multiply { signed, width } => {
                     let a = get_val(ins.src1, &st, flags.raw);
@@ -589,6 +636,100 @@ impl RiscProgram {
                         (f64::from_bits(a) as f32).to_bits() as u64
                     };
                     store(ins.dst, &mut st, res);
+                }
+                // ── P1 (②): packed SSE — XMM 슬롯 주소 피연산자, 16바이트 메모리 I/O ──
+                // x86 packed 정수 연산은 RFLAGS 를 바꾸지 않으므로 flags 무변경.
+                // (참조: `PADDQ` = 2× 64-bit add → 64-bit add 로 분해하면 lane 간
+                //  캐리 전파가 생겨 틀리므로 전용 op 로 요소 경계를 지킨다.)
+                RiscOp::PackedMove => {
+                    let src = get_val(ins.src1, &st, flags.raw);
+                    let dst = get_val(ins.dst, &st, flags.raw);
+                    let mut bytes = [0u8; 16];
+                    for i in 0..16 {
+                        bytes[i] = st.mem.get(&src.wrapping_add(i as u64)).copied().unwrap_or(0);
+                    }
+                    for i in 0..16 {
+                        st.mem.insert(dst.wrapping_add(i as u64), bytes[i]);
+                    }
+                }
+                RiscOp::PackedAdd { elem_width, lanes } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let d = get_val(ins.dst, &st, flags.raw);
+                    let mask = mask_for_width(elem_width);
+                    for lane in 0..lanes as u64 {
+                        let off = lane * elem_width as u64;
+                        let ea = mem_read(&st.mem, a.wrapping_add(off), elem_width);
+                        let eb = mem_read(&st.mem, b.wrapping_add(off), elem_width);
+                        let er = ea.wrapping_add(eb) & mask;
+                        mem_write(&mut st.mem, d.wrapping_add(off), elem_width, er);
+                    }
+                }
+                RiscOp::PackedSub { elem_width, lanes } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let d = get_val(ins.dst, &st, flags.raw);
+                    let mask = mask_for_width(elem_width);
+                    for lane in 0..lanes as u64 {
+                        let off = lane * elem_width as u64;
+                        let ea = mem_read(&st.mem, a.wrapping_add(off), elem_width);
+                        let eb = mem_read(&st.mem, b.wrapping_add(off), elem_width);
+                        let er = ea.wrapping_sub(eb) & mask;
+                        mem_write(&mut st.mem, d.wrapping_add(off), elem_width, er);
+                    }
+                }
+                RiscOp::PackedXor => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let d = get_val(ins.dst, &st, flags.raw);
+                    for i in 0..16u64 {
+                        let ba = st.mem.get(&a.wrapping_add(i)).copied().unwrap_or(0);
+                        let bb = st.mem.get(&b.wrapping_add(i)).copied().unwrap_or(0);
+                        st.mem.insert(d.wrapping_add(i), ba ^ bb);
+                    }
+                }
+                RiscOp::PackedAnd => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let d = get_val(ins.dst, &st, flags.raw);
+                    for i in 0..16u64 {
+                        let ba = st.mem.get(&a.wrapping_add(i)).copied().unwrap_or(0);
+                        let bb = st.mem.get(&b.wrapping_add(i)).copied().unwrap_or(0);
+                        st.mem.insert(d.wrapping_add(i), ba & bb);
+                    }
+                }
+                RiscOp::PackedOr => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let d = get_val(ins.dst, &st, flags.raw);
+                    for i in 0..16u64 {
+                        let ba = st.mem.get(&a.wrapping_add(i)).copied().unwrap_or(0);
+                        let bb = st.mem.get(&b.wrapping_add(i)).copied().unwrap_or(0);
+                        st.mem.insert(d.wrapping_add(i), ba | bb);
+                    }
+                }
+                RiscOp::PackedAndNot => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let d = get_val(ins.dst, &st, flags.raw);
+                    for i in 0..16u64 {
+                        let ba = st.mem.get(&a.wrapping_add(i)).copied().unwrap_or(0);
+                        let bb = st.mem.get(&b.wrapping_add(i)).copied().unwrap_or(0);
+                        st.mem.insert(d.wrapping_add(i), ba & !bb);
+                    }
+                }
+                RiscOp::PackedCmpEq { elem_width, lanes } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let b = get_val(ins.src2, &st, flags.raw);
+                    let d = get_val(ins.dst, &st, flags.raw);
+                    let all_ones = (0..elem_width).fold(0u64, |acc, _| (acc << 8) | 0xFF);
+                    for lane in 0..lanes as u64 {
+                        let off = lane * elem_width as u64;
+                        let ea = mem_read(&st.mem, a.wrapping_add(off), elem_width);
+                        let eb = mem_read(&st.mem, b.wrapping_add(off), elem_width);
+                        let er = if ea == eb { all_ones } else { 0 };
+                        mem_write(&mut st.mem, d.wrapping_add(off), elem_width, er);
+                    }
                 }
             }
             vip += 1;
@@ -763,6 +904,7 @@ impl RiscProgram {
             }
             RiscOp::Halt => ExecResult::Halt,
             RiscOp::NativeCallBridge => ExecResult::Next,
+            RiscOp::VmCallBridge => ExecResult::Next,
             RiscOp::Multiply { signed, width } => {
                 let a = get_val(ins.src1, st, flags.raw);
                 let b = get_val(ins.src2, st, flags.raw);
@@ -950,6 +1092,103 @@ impl RiscProgram {
                     (f64::from_bits(a) as f32).to_bits() as u64
                 };
                 store(ins.dst, st, res);
+                ExecResult::Next
+            }
+            // ── P1 (②): packed SSE — 슬롯 주소 피연산자, 16바이트 메모리 I/O, 플래그 불변 ──
+            RiscOp::PackedMove => {
+                let src = get_val(ins.src1, st, flags.raw);
+                let dst = get_val(ins.dst, st, flags.raw);
+                let mut bytes = [0u8; 16];
+                for i in 0..16u64 {
+                    bytes[i as usize] = st.mem.get(&src.wrapping_add(i)).copied().unwrap_or(0);
+                }
+                for i in 0..16u64 {
+                    st.mem.insert(dst.wrapping_add(i), bytes[i as usize]);
+                }
+                ExecResult::Next
+            }
+            RiscOp::PackedAdd { elem_width, lanes } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                let d = get_val(ins.dst, st, flags.raw);
+                let mask = mask_for_width(elem_width);
+                for lane in 0..lanes as u64 {
+                    let off = lane * elem_width as u64;
+                    let ea = mem_read(&st.mem, a.wrapping_add(off), elem_width);
+                    let eb = mem_read(&st.mem, b.wrapping_add(off), elem_width);
+                    mem_write(&mut st.mem, d.wrapping_add(off), elem_width, ea.wrapping_add(eb) & mask);
+                }
+                ExecResult::Next
+            }
+            RiscOp::PackedSub { elem_width, lanes } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                let d = get_val(ins.dst, st, flags.raw);
+                let mask = mask_for_width(elem_width);
+                for lane in 0..lanes as u64 {
+                    let off = lane * elem_width as u64;
+                    let ea = mem_read(&st.mem, a.wrapping_add(off), elem_width);
+                    let eb = mem_read(&st.mem, b.wrapping_add(off), elem_width);
+                    mem_write(&mut st.mem, d.wrapping_add(off), elem_width, ea.wrapping_sub(eb) & mask);
+                }
+                ExecResult::Next
+            }
+            RiscOp::PackedXor => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                let d = get_val(ins.dst, st, flags.raw);
+                for i in 0..16u64 {
+                    let ba = st.mem.get(&a.wrapping_add(i)).copied().unwrap_or(0);
+                    let bb = st.mem.get(&b.wrapping_add(i)).copied().unwrap_or(0);
+                    st.mem.insert(d.wrapping_add(i), ba ^ bb);
+                }
+                ExecResult::Next
+            }
+            RiscOp::PackedAnd => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                let d = get_val(ins.dst, st, flags.raw);
+                for i in 0..16u64 {
+                    let ba = st.mem.get(&a.wrapping_add(i)).copied().unwrap_or(0);
+                    let bb = st.mem.get(&b.wrapping_add(i)).copied().unwrap_or(0);
+                    st.mem.insert(d.wrapping_add(i), ba & bb);
+                }
+                ExecResult::Next
+            }
+            RiscOp::PackedOr => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                let d = get_val(ins.dst, st, flags.raw);
+                for i in 0..16u64 {
+                    let ba = st.mem.get(&a.wrapping_add(i)).copied().unwrap_or(0);
+                    let bb = st.mem.get(&b.wrapping_add(i)).copied().unwrap_or(0);
+                    st.mem.insert(d.wrapping_add(i), ba | bb);
+                }
+                ExecResult::Next
+            }
+            RiscOp::PackedAndNot => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                let d = get_val(ins.dst, st, flags.raw);
+                for i in 0..16u64 {
+                    let ba = st.mem.get(&a.wrapping_add(i)).copied().unwrap_or(0);
+                    let bb = st.mem.get(&b.wrapping_add(i)).copied().unwrap_or(0);
+                    st.mem.insert(d.wrapping_add(i), ba & !bb);
+                }
+                ExecResult::Next
+            }
+            RiscOp::PackedCmpEq { elem_width, lanes } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let b = get_val(ins.src2, st, flags.raw);
+                let d = get_val(ins.dst, st, flags.raw);
+                let all_ones = (0..elem_width).fold(0u64, |acc, _| (acc << 8) | 0xFF);
+                for lane in 0..lanes as u64 {
+                    let off = lane * elem_width as u64;
+                    let ea = mem_read(&st.mem, a.wrapping_add(off), elem_width);
+                    let eb = mem_read(&st.mem, b.wrapping_add(off), elem_width);
+                    let er = if ea == eb { all_ones } else { 0 };
+                    mem_write(&mut st.mem, d.wrapping_add(off), elem_width, er);
+                }
                 ExecResult::Next
             }
         }
@@ -1532,5 +1771,94 @@ mod tests {
         interp.run(&bc).unwrap();
         assert_eq!(interp.regs[0], 0, "poly interp: RAX must be 0 on div-by-zero");
         assert_eq!(interp.regs[2], 0, "poly interp: RDX must be 0 on div-by-zero");
+    }
+
+    // ── P1 (③): VM→VM 콜 브릿지 — 서브 VM 레지스트리 기반 nested-VM 참조 의미론 ──
+
+    /// VmCallBridge 가 (a) 호출자 상태(regs/temps/flags/vsp/stack)를 보존하고,
+    /// (b) 서브 VM을 현재 regs/mem 위에서 실행해 RAX 반환값을 가져오며,
+    /// (c) 서브 VM이 쓴 메모리를 보존하는지 검증한다.
+    #[test]
+    fn vm_call_bridge_runs_sub_vm_and_restores_caller() {
+        use std::collections::HashMap;
+        // 서브 VM (id=7): callee(a, b) → RAX = a + b, mem[0x3000] = a ^ b.
+        // 인자는 레지스터로 전달 (RCX=1, RDX=2), 반환은 RAX(vreg 0).
+        let mut sub = RiscDesynthesizer::new();
+        sub.emit_add(MicroOperand::VReg(0), MicroOperand::VReg(1), MicroOperand::VReg(2)); // RAX = RCX + RDX
+        sub.instrs.push(
+            MicroInstr::new(RiscOp::MemoryWrite { width: 8 })
+                .with_src1(MicroOperand::Imm64(0x3000))
+                .with_src2(MicroOperand::VReg(0)),
+        );
+        sub.instrs.push(MicroInstr::new(RiscOp::Halt));
+        let sub_prog = RiscProgram::new(sub.instrs);
+
+        // 호출자: R3 = 0x777 (보존 확인), VmCallBridge(id=7), R4 = R0 (반환값 복사).
+        let mut caller = RiscDesynthesizer::new();
+        caller.emit_add(MicroOperand::VReg(3), MicroOperand::Imm64(0x777), MicroOperand::Imm64(0));
+        caller.instrs.push(
+            MicroInstr::new(RiscOp::VmCallBridge).with_imm(7),
+        );
+        caller.emit_add(MicroOperand::VReg(4), MicroOperand::VReg(0), MicroOperand::Imm64(0));
+        caller.instrs.push(MicroInstr::new(RiscOp::Halt));
+
+        let mut sub_vms = HashMap::new();
+        sub_vms.insert(7, sub_prog);
+        let prog = RiscProgram::with_sub_vms(caller.instrs, sub_vms);
+
+        // 인자: RCX(vreg1) = 30, RDX(vreg2) = 12 → RAX = 42, mem[0x3000] = 42.
+        let mut init = [0u64; 16];
+        init[1] = 30;
+        init[2] = 12;
+        let st = prog.eval_state(&init);
+
+        assert_eq!(st.regs[0], 42, "RAX = callee return value (30+12)");
+        assert_eq!(st.regs[4], 42, "caller copied return value after bridge");
+        assert_eq!(st.regs[3], 0x777, "caller register preserved across bridge");
+        assert_eq!(st.mem.get(&0x3000), Some(&42), "callee memory write propagated");
+    }
+
+    /// VmCallBridge 가 호출자의 스택/플래그/temps 를 보존하는지 + 미등록 id 는
+    /// no-op 인지 검증한다.
+    #[test]
+    fn vm_call_bridge_preserves_stack_flags_temps() {
+        use std::collections::HashMap;
+        // 서브 VM (id=1): RAX = 5 (단순 반환).
+        let mut sub = RiscDesynthesizer::new();
+        sub.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(5), MicroOperand::Imm64(0));
+        sub.instrs.push(MicroInstr::new(RiscOp::Halt));
+        let sub_prog = RiscProgram::new(sub.instrs);
+
+        // 호출자: push R1 (스택), SetFlag, VmCallBridge(id=1), pop R2.
+        // VmCallBridge 사이에 스택/플래그가 보존되어야 한다.
+        let mut caller = RiscDesynthesizer::new();
+        caller.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(0xCAFE), MicroOperand::Imm64(0));
+        caller.emit_push(MicroOperand::VReg(1));
+        caller.instrs.push(
+            MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Imm64(0x8C1)),
+        );
+        caller.instrs.push(
+            MicroInstr::new(RiscOp::VmCallBridge).with_imm(1),
+        );
+        caller.emit_pop(MicroOperand::VReg(2));
+        caller.instrs.push(MicroInstr::new(RiscOp::Halt));
+
+        let mut sub_vms = HashMap::new();
+        sub_vms.insert(1, sub_prog);
+        let prog = RiscProgram::with_sub_vms(caller.instrs, sub_vms);
+
+        let st = prog.eval_state(&[0u64; 16]);
+        assert_eq!(st.regs[0], 5, "RAX = callee return");
+        assert_eq!(st.regs[2], 0xCAFE, "caller stack (push/pop across bridge) preserved");
+        assert_eq!(st.flags & 0x8D5, 0x8C1 & 0x8D5, "caller flags preserved across bridge");
+
+        // 미등록 id → no-op (NativeCallBridge 계약): RAX 는 그대로 유지.
+        let mut d2 = RiscDesynthesizer::new();
+        d2.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(99), MicroOperand::Imm64(0));
+        d2.instrs.push(MicroInstr::new(RiscOp::VmCallBridge).with_imm(0xDEAD));
+        d2.instrs.push(MicroInstr::new(RiscOp::Halt));
+        let prog2 = RiscProgram::new(d2.instrs);
+        let st2 = prog2.eval_state(&[0u64; 16]);
+        assert_eq!(st2.regs[0], 99, "unregistered VmCallBridge id is a no-op");
     }
 }

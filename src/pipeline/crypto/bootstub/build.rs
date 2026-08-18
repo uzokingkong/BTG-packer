@@ -99,6 +99,7 @@ pub(crate) fn build_rc4_block(stub: &BootStubCtx) -> Vec<u8> {
     }
     payload::emit_payload_copy(&mut seq, stub);
     emit_code_decrypt(&mut seq, stub);
+    integrity::emit_integrity_mac(&mut seq, stub);
     integrity::emit_integrity_crc(&mut seq, stub);
     emit_run_decrypt(&mut seq, stub);
     emit_rest_decrypt(&mut seq, stub);
