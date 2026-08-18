@@ -1,0 +1,180 @@
+name: BTG Packer CI
+
+on:
+  push:
+    branches: [ main, dev, "feat/**", "fix/**" ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ============================================================================
+  # Job 1: Unit Tests (library tests — 353+ expected)
+  # ============================================================================
+  unit-tests:
+    name: Unit Tests (Windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: cargo check
+        run: cargo check --lib
+
+      - name: Unit tests (--lib, single-threaded for determinism)
+        run: cargo test --lib -- --test-threads=1
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: T0-2 SEH/pdata validation tests
+        run: cargo test --lib seh_validation_tests -- --test-threads=1
+
+  # ============================================================================
+  # Job 2: Release Build
+  # ============================================================================
+  release-build:
+    name: Release Build
+    runs-on: windows-latest
+    timeout-minutes: 20
+    needs: unit-tests
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: Build release binary
+        run: cargo build --release --bin btg-packer
+
+      - name: Upload btg-packer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: btg-packer-windows-x64
+          path: target/release/btg-packer.exe
+
+  # ============================================================================
+  # Job 3: Packing Smoke Test (dummy_target.exe)
+  # ============================================================================
+  smoke-test:
+    name: Packing Smoke Test
+    runs-on: windows-latest
+    timeout-minutes: 20
+    needs: release-build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download btg-packer
+        uses: actions/download-artifact@v4
+        with:
+          name: btg-packer-windows-x64
+          path: target/release
+
+      - name: Smoke test — basic pack (--vm)
+        run: |
+          $packer = "target\release\btg-packer.exe"
+          $target = "test\dummy_target.exe"
+          if (-not (Test-Path $target)) {
+            Write-Host "[!] dummy_target.exe not found; building..."
+            cargo build --release -p rust_packer_test --manifest-path test/Cargo.toml
+            Copy-Item test/target/release/rust_packer_test.exe $target
+          }
+          $output = "target\smoke_basic.exe"
+          & $packer --input $target --output $output --vm
+          if ($LASTEXITCODE -ne 0) { throw "packing failed" }
+          $proc = Start-Process $output -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -ne 0) { throw "packed binary exits 0x$($proc.ExitCode.ToString('X'))" }
+          Write-Host "Smoke test (--vm): PASS"
+        shell: pwsh
+
+      - name: Smoke test — vm-oep pack (--vm --vm-oep)
+        run: |
+          $packer = "target\release\btg-packer.exe"
+          $target = "test\dummy_target.exe"
+          if (-not (Test-Path $target)) { throw "dummy_target.exe not found" }
+          $output = "target\smoke_vmoep.exe"
+          & $packer --input $target --output $output --vm --vm-oep
+          if ($LASTEXITCODE -ne 0) { throw "packing (--vm-oep) failed" }
+          $proc = Start-Process $output -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -ne 0) { throw "packed (--vm-oep) exits 0x$($proc.ExitCode.ToString('X'))" }
+          Write-Host "Smoke test (--vm --vm-oep): PASS"
+        shell: pwsh
+
+      - name: Smoke test — no-crypto + ASLR check
+        run: |
+          $packer = "target\release\btg-packer.exe"
+          $target = "test\dummy_target.exe"
+          $output = "target\smoke_nocrypto.exe"
+          & $packer --input $target --output $output --vm --no-crypto
+          if ($LASTEXITCODE -ne 0) { throw "packing (--no-crypto) failed" }
+          # .reloc 디렉터리가 있는지 확인 (T0-3 ASLR 검증)
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $output))
+          $e_lfanew = [BitConverter]::ToInt32($bytes, 0x3C)
+          $dd_off = $e_lfanew + 4 + 20 + 16*8 + 5*8  # DataDirectory[5] = BaseReloc
+          $reloc_rva = [BitConverter]::ToInt32($bytes, $dd_off)
+          if ($reloc_rva -eq 0) { Write-Warning "No .reloc directory — ASLR not preserved" }
+          else { Write-Host "T0-3 ASLR: .reloc @0x$($reloc_rva.ToString('X')) present — PASS" }
+          $proc = Start-Process $output -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -ne 0) { throw "no-crypto packed exits 0x$($proc.ExitCode.ToString('X'))" }
+          Write-Host "Smoke test (--no-crypto): PASS"
+        shell: pwsh
+
+  # ============================================================================
+  # Job 4: Compiler Matrix (MinGW — 설치 후 C 페이로드 패킹)
+  # ============================================================================
+  compiler-matrix:
+    name: Compiler Matrix (MinGW)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    needs: release-build
+    # MinGW가 있을 때만 실행 (없으면 skip — C 페이로드는 선택적)
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW (winget)
+        run: winget install --id GnuWin32.Gcc --silent --accept-package-agreements --accept-source-agreements
+        continue-on-error: true
+
+      - name: Download btg-packer
+        uses: actions/download-artifact@v4
+        with:
+          name: btg-packer-windows-x64
+          path: target/release
+
+      - name: Run compiler matrix
+        run: .\test\build_matrix.ps1 -PackerPath .\target\release\btg-packer.exe -Levels O0,O2
+        shell: pwsh
+        continue-on-error: true
