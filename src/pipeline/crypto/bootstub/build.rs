@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // BTG - boot-stub build orchestrators - split from bootstub.rs
 // ==============================================================================
 // Public entry points: build_anti_debug_raw_block (static byte blob) and
@@ -55,7 +55,7 @@ pub(crate) fn build_anti_debug_raw_block() -> Vec<u8> {
 /// RBX에서 스냅샷하므로, 여기서는 ptr_buf/RDX와 v3(len)/R8만 세팅해 엔트리 호출.
 /// (i/j는 VM 상태 v0/v1에 지속 — 첫 호출 전 emit_prga_vm_init으로 0 초기화)
 
-pub(crate) fn build_rc4_block(stub: &BootStubCtx) -> Vec<u8> {
+pub(crate) fn build_rc4_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     // ── 1. 명령어 목록 구성 ────────────────────────────────────────────────────────────────
     // (inst, Option<분기 레이블>)
     let mut seq: Vec<(Instruction, Option<super::ctx::Label>)> = Vec::new();
@@ -65,8 +65,10 @@ pub(crate) fn build_rc4_block(stub: &BootStubCtx) -> Vec<u8> {
     vm_embed::emit_program_vm_state_capture(&mut seq, stub);
 
     // 스택에 S-box 할당 (v6: 외부 API 호출 시 16B 정렬 프레임 사용)
-    seq.push((Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, stub.stack_frame).unwrap(), None));
-    seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::RSP).unwrap(), None));
+    seq.push((Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, stub.stack_frame)
+        .map_err(|e| anyhow::anyhow!("boot stub Sub_rm64_imm32 failed: {e}"))?, None));
+    seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::RSP)
+        .map_err(|e| anyhow::anyhow!("boot stub Mov_r64_rm64 failed: {e}"))?, None));
 
     // v17 (TrashFormer-기반): 프로시저 서문에 데드 레지스터 정크 명령을 삽입해,
     // 부트 스텁 바이트가 **빌드마다 달라지게** 한다. 이 지점에선 rax/rcx/rdx/rsi/rdi/

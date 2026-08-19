@@ -27,9 +27,16 @@ pub mod permutation;
 pub mod round;
 pub mod state;
 
+// T3-1: ChaCha20 (RFC 8439) — reference + boot-stub native crypt blob.
+pub mod chacha20;
+pub mod chacha20_native;
+
 pub use mac::BtgKeyedMac;
 pub use provider::{chain_encrypt, chain_encrypt_with, BlockCryptoMeta, CryptoError, CryptoProvider};
 pub use state::{BtgCipher, BtgState};
 
 #[cfg(test)]
 mod cipher_tests;
+
+#[cfg(test)]
+mod chacha20_tests;

@@ -31,6 +31,7 @@ use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 
 mod bootstub;
+pub(crate) mod chacha;
 pub(crate) mod cipher;
 mod encode;
 mod iat;

@@ -35,7 +35,7 @@
 
 | # | 미션 | 상세 | 상태 |
 |---|---|---|---|
-| T3-1 | **crypto 교체** | BTG-C1/custom MAC을 검증된 AES-GCM/ChaCha20-Poly1305로 (현재는 obfuscation primitive로 봐야 함) | ⬜ |
+| T3-1 | **crypto 교체** | BTG-C1/custom MAC을 검증된 AES-GCM/ChaCha20-Poly1305로 (현재는 obfuscation primitive로 봐야 함) | 🔶 |
 | T3-2 | **성능** | VM 오버헤드 측정·튜닝 (handler 인라인화, dispatch 최적화), packer 자체 크기/속도 | ⬜ |
 | T3-3 | **안정성/재현** | `unwrap()` 3,205개 정리, malformed PE 파서 하드닝, build_id 기반 크래시 재현 체계 | ⬜ |
 
@@ -52,3 +52,4 @@
 | 일자 | 미션 | 작업 | 상태 |
 |---|---|---|---|
 | 2026-08-18 | — | 미션 보드 등록 | ✅ |
+| 2026-08-19 | T3-1 | **Phase A**: 패커측 ChaCha20-Poly1305 AEAD 엔진(`src/pipeline/crypto/chacha.rs`, `derive_chacha_key_nonce` + encrypt/decrypt + pack format) + 7 단위 테스트. **Phase C**: RFC 8439 reference(`src/crypto/chacha20.rs`) + boot-stub 네이티브 crypt blob(`src/crypto/chacha20_native.rs::emit_chacha20_blob`, C1 blob과 동일 계약 — 연속 호출 키스트림). 차등 테스트 4개 green (RFC 8439 §2.3.2/§2.4.2 벡터, native==reference 다중 호출, 패커 키 유도==native 복호화). `cargo test --release --lib` 369 passed. ⬜ Phase B/D: BootStubCtx `CryptoMode::ChaCha20` + `--crypto-mode chacha20` 배선 + 코드 영역 at-rest 암호화 전환 | 🔶 |

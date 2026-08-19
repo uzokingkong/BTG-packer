@@ -282,7 +282,8 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
             if entry_off + 4 > out.len() {
                 bail!("Phase 0.3: length table entry for block {} beyond EOF", id);
             }
-            let len_enc = u32::from_le_bytes(out[entry_off..entry_off + 4].try_into().unwrap());
+            let len_enc = u32::from_le_bytes(out[entry_off..entry_off + 4].try_into()
+                .expect("T3-3: 4-byte slice for length table entry (bounds checked above)"));
             let decoded_len = len_enc ^ key;
             if decoded_len != (if is_call_target {0} else {len as u32}) {
             }
@@ -383,7 +384,8 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
             if entry_off + 4 > out.len() {
                 bail!("v61 m7: state table entry for block {} beyond EOF", id);
             }
-            let st = u32::from_le_bytes(out[entry_off..entry_off + 4].try_into().unwrap());
+            let st = u32::from_le_bytes(out[entry_off..entry_off + 4].try_into()
+                .expect("T3-3: 4-byte slice for state table entry (bounds checked above)"));
             let is_call_target = ctx.call_target_block_ids.contains(&block.id);
             if is_call_target {
                 call_target_count += 1;

@@ -125,7 +125,7 @@ use crate::pipeline::PipelineContext;
         };
         let ad = build_anti_debug_raw_block();
         assert_eq!(ad.len(), ANTI_DEBUG_BLOCK_LEN);
-        let code = build_rc4_block(&stub);
+        let code = build_rc4_block(&stub).expect("boot stub encode must succeed");
         assert!(!code.is_empty());
         assert!(code.len() > 100, "rc4 block too small: {}", code.len());
         // 마지막 명령이 ret(0xC3)이어야 한다 (prga 서브루틴 종료)
@@ -133,7 +133,7 @@ use crate::pipeline::PipelineContext;
 
         // anti_debug=false 변형도 인코딩 가능해야 한다
         let stub2 = BootStubCtx { anti_debug: false, ..stub };
-        let code2 = build_rc4_block(&stub2);
+        let code2 = build_rc4_block(&stub2).expect("boot stub (no anti-debug) encode must succeed");
         assert!(!code2.is_empty());
     }
 
@@ -245,7 +245,7 @@ use crate::pipeline::PipelineContext;
             c1_sbox_va: 0,
             c1_state_va: 0,
         };
-        let code = build_rc4_block(&stub);
+        let code = build_rc4_block(&stub).expect("boot stub encode must succeed");
         assert!(!code.is_empty());
         assert_eq!(*code.last().unwrap(), 0xC3);
     }
@@ -406,7 +406,7 @@ use crate::pipeline::PipelineContext;
             c1_sbox_va: 0,
             c1_state_va: 0,
         };
-        let code = build_rc4_block(&stub);
+        let code = build_rc4_block(&stub).expect("boot stub encode must succeed");
         assert!(!code.is_empty());
         // 마지막 명령이 ret(0xC3)이어야 한다 (prga 서브루틴 종료)
         assert_eq!(*code.last().unwrap(), 0xC3);

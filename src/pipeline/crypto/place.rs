@@ -183,7 +183,7 @@ pub(crate) fn place_boot_stub(
     };
 
     // 1st pass: stub 길이 측정 (runs_va/seed_va/vm_* = 0)
-    let stub_code_len = build_rc4_block(&stub).len();
+    let stub_code_len = build_rc4_block(&stub)?.len();
 
     // FIX(v3): 안티디버그 블록은 RC4 코드 **앞**에 붙는다. 과거 코드는
     // cursor = boot_off + stub_code_len (RC4 코드 길이만) 로 잡아서, --anti-debug 사용 시
@@ -312,7 +312,8 @@ pub(crate) fn place_boot_stub(
         0
     };
     let vm_prog_bc_off = if vm_prog_bc_len > 0 {
-        let m = vm_prog_mod.as_ref().unwrap();
+        let m = vm_prog_mod.as_ref()
+            .expect("T3-3: vm_prog_bc_len > 0 implies vm_prog_mod is Some (checked above)");
         vm_prog_off + m.code.len() + m.table.len()
     } else {
         0
@@ -335,7 +336,9 @@ pub(crate) fn place_boot_stub(
             }
             let off = (dir.virtual_address - sec.virtual_address) as usize;
             off + 0x20 <= sec.bytes.len()
-                && u64::from_le_bytes(sec.bytes[off + 0x18..off + 0x20].try_into().unwrap()) != 0
+                && sec.bytes[off + 0x18..off + 0x20].try_into().ok()
+                    .map(|b: [u8; 8]| u64::from_le_bytes(b) != 0)
+                    .unwrap_or(false)
         })
     }).unwrap_or(false);
 
@@ -498,8 +501,10 @@ pub(crate) fn place_boot_stub(
         c1_state_va,
         ..stub
     };
-    let stub_code = build_rc4_block(&stub2);
-    assert_eq!(stub_code.len(), stub_code_len, "boot stub size changed after VA fixup");
+    let stub_code = build_rc4_block(&stub2)?;
+    if stub_code.len() != stub_code_len {
+        anyhow::bail!("boot stub size changed after VA fixup: {} vs {}", stub_code.len(), stub_code_len);
+    }
 
     // 안티디버그 블록 + RC4 블록 결합 (길이 확정용)
     let mut full_stub = Vec::with_capacity(ad_bytes.len() + stub_code.len());
@@ -636,16 +641,20 @@ pub(crate) fn place_boot_stub(
         mem_code_size: ((new_section_len as u64) + 0xFFF) & !0xFFF,
         ..stub2
     };
-    let stub_code_final = build_rc4_block(&stub3);
-    assert_eq!(
-        stub_code_final.len(),
-        stub_code_len,
-        "boot stub size changed after payload/crc VA fixup"
-    );
+    let stub_code_final = build_rc4_block(&stub3)?;
+    if stub_code_final.len() != stub_code_len {
+        anyhow::bail!(
+            "boot stub size changed after payload/crc VA fixup: {} vs {}",
+            stub_code_final.len(),
+            stub_code_len
+        );
+    }
     let mut full_stub_final = Vec::with_capacity(ad_bytes.len() + stub_code_final.len());
     full_stub_final.extend_from_slice(&ad_bytes);
     full_stub_final.extend_from_slice(&stub_code_final);
-    assert_eq!(full_stub_final.len(), full_stub.len());
+    if full_stub_final.len() != full_stub.len() {
+        anyhow::bail!("boot stub final length mismatch: {} vs {}", full_stub_final.len(), full_stub.len());
+    }
 
     // 부트 스텁 복사
     btg.bytes[boot_off..stub_end].copy_from_slice(&full_stub_final);

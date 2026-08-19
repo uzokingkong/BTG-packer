@@ -35,7 +35,7 @@ fn is_branch_code(code: iced_x86::Code) -> bool {
     )
 }
 
-pub(crate) fn encode_rc4_block(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) -> Vec<u8> {
+pub(crate) fn encode_rc4_block(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     // 모든 경로에서 분기 최적화(rel8 축소)를 끄고 측정/최종 인코딩을 일치시킨다.
     // (rel8로 측정했다가 최종 레이아웃에서 rel32로 늘어나면 길이 검증이 깨진다.
     //  v6: IAT/mem 블록의 근거리 `je`가 rel8로 축소돼 4바이트 불일치를 일으켰음)
@@ -51,7 +51,8 @@ pub(crate) fn encode_rc4_block(seq: &mut Vec<(Instruction, Option<Label>)>, stub
         // 측정 시 분기 타깃은 자기 자신 IP로 설정 (rel32라 길이 불변)
         let mut m = *inst;
         if lbl.is_some() && is_branch_code(inst.code()) {
-            m = Instruction::with_branch(inst.code(), ip).unwrap();
+            m = Instruction::with_branch(inst.code(), ip)
+                .map_err(|e| anyhow::anyhow!("boot stub branch re-measure failed: {e}"))?;
         }
         let len = measure_inst(&m, ip, enc_opts);
         if let Some(l) = lbl {
@@ -67,8 +68,11 @@ pub(crate) fn encode_rc4_block(seq: &mut Vec<(Instruction, Option<Label>)>, stub
     for (inst, lbl) in seq.iter_mut() {
         if let Some(l) = lbl {
             if is_branch_code(inst.code()) {
-                let target = label_ips[&l];
-                *inst = Instruction::with_branch(inst.code(), target).unwrap();
+                let target = label_ips.get(&l).copied().ok_or_else(|| {
+                    anyhow::anyhow!("boot stub label {:?} referenced but never defined", l)
+                })?;
+                *inst = Instruction::with_branch(inst.code(), target)
+                    .map_err(|e| anyhow::anyhow!("boot stub branch target fix failed: {e}"))?;
             }
         }
     }
@@ -76,14 +80,16 @@ pub(crate) fn encode_rc4_block(seq: &mut Vec<(Instruction, Option<Label>)>, stub
     let insts: Vec<Instruction> = seq.iter().map(|(i, _)| *i).collect();
     let block = InstructionBlock::new(&insts, rc4_start_va);
     let enc = BlockEncoder::encode(64, block, enc_opts)
-        .expect("boot stub BlockEncoder failed");
+        .map_err(|e| anyhow::anyhow!("boot stub BlockEncoder failed: {e}"))?;
     let code = enc.code_buffer;
     let expected = (ip - rc4_start_va) as usize;
-    assert_eq!(
-        code.len(), expected,
-        "boot stub length mismatch: measured {} vs encoded {}",
-        expected, code.len()
-    );
-    code
+    if code.len() != expected {
+        anyhow::bail!(
+            "boot stub length mismatch: measured {} vs encoded {}",
+            expected,
+            code.len()
+        );
+    }
+    Ok(code)
 
 }
