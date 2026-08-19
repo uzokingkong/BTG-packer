@@ -1,6 +1,7 @@
 pub mod desynth;
 pub mod flags;
 pub mod lifter;
+pub mod native_abi;
 pub mod opcodes;
 pub mod opt;
 
@@ -1483,6 +1484,9 @@ fn store_dst(st: &mut RiscEvalState, dst: Option<MicroOperand>, val: u64) {
         }
     }
 }
+
+#[cfg(test)]
+mod bridge_abi_tests;
 
 #[cfg(test)]
 mod tests {

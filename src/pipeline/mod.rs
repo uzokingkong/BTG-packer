@@ -11,6 +11,7 @@ pub mod patch_data;
 pub mod crypto;
 pub mod iat_hide;
 pub mod pack;
+pub mod ownership;
 pub mod ondemand;
 pub mod poly_embed;
 pub mod rsrc_register;

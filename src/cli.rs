@@ -35,6 +35,12 @@ pub struct CliArgs {
     #[arg(short = 'a', long, default_value_t = false)]
     pub anti_debug: bool,
 
+    /// readccc §4.5: anti-debug 탐지 시 실패 정책 — `trap`(ud2/SIGILL, 기본) |
+    /// `hang`(무한 루프) | `warn`(fail-open, 정상 경로로 계속). 프로파일별
+    /// graceful failure를 위한 risk-signal 정책.
+    #[arg(long, value_enum, default_value_t = crate::dispatcher::antidebug::AntiDebugPolicy::Trap)]
+    pub anti_debug_policy: crate::dispatcher::antidebug::AntiDebugPolicy,
+
     /// Run Automated Multi-Compiler QA Benchmark Suite
     #[arg(short = 't', long, default_value_t = false)]
     pub test_qa: bool,

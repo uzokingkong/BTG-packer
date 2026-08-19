@@ -15,6 +15,9 @@ pub use isa_spec::VirtualIsaSpec;
 pub use rolling_key::RollingKeyEngine;
 
 #[cfg(test)]
+mod polymorphism_hardening_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::vm::risc::{MicroOperand, RiscDesynthesizer, RiscProgram};

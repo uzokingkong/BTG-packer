@@ -44,7 +44,7 @@ pub const BOOT_AREA_RESERVE: usize = 0x4000000; // v61: 0x120000??x4000000 (64 M
 /// `needs_boot_stub`??true?????tail????딅텑???????읐????ㅼ굡??????怨좊뭿??筌먲퐢??
 /// v9: crypto??좊읈? false????IAT/癲ル슢?????袁⑤렓???嚥▲꺁??????쒓낮??棺??짆?삠궘????띠룇???? ???源끹걬癲???딅텑???????읐?
 /// (?濡ろ뜑?????IAT ???⑤똾留??怨뚮옖甕곕?苡?癲ル슢?????袁⑤렓???嚥▲꺁???筌뤾쑴??????ш낄援η뵳????ㅼ굡??????怨좊뭿??筌먲퐢??
-pub fn run(ctx: &mut PipelineContext, anti_debug: bool, needs_boot_stub: bool, trace_blocks: bool) -> Result<()> {
+pub fn run(ctx: &mut PipelineContext, anti_debug: bool, anti_debug_policy: crate::dispatcher::antidebug::AntiDebugPolicy, needs_boot_stub: bool, trace_blocks: bool) -> Result<()> {
     let layout = ctx.shuffled_layout.as_ref()
         .ok_or_else(|| anyhow::anyhow!("ShuffledLayout not yet built ??run Pass 2 first"))?;
     let table_offset = ctx.table_offset;
@@ -223,8 +223,13 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, needs_boot_stub: bool, t
             let ad = dispatcher::antidebug::build_anti_debug_shellcode(
                 dispatcher_va + off as u64,
                 dispatcher_va + 0x20,
+                anti_debug_policy,
             );
-            println!("[+] Anti-Debug: Generated {} bytes of anti-debugging shellcode.", ad.len());
+            println!(
+                "[+] Anti-Debug: Generated {} bytes of anti-debugging shellcode (policy={}).",
+                ad.len(),
+                anti_debug_policy.as_str()
+            );
             (ad, off)
         }
     } else {

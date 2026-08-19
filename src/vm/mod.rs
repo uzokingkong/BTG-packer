@@ -21,6 +21,9 @@
 
 
 pub mod bytecode;
+pub mod conceal;
+pub mod dispatch_perm;
+pub mod nested;
 pub mod c1;
 pub mod flags;
 pub mod abi;

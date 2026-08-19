@@ -53,6 +53,15 @@ pub struct BuildManifest {
     pub integrity: bool,
     /// v63/P3-2: effective crypto coverage (%).
     pub crypto_coverage: u32,
+    /// readccc §4.5: anti-debug 탐지 실패 정책 (`trap`/`hang`/`warn`).
+    pub anti_debug_policy: String,
+    /// readccc §4.4: W^X 메모리 계약 — 실행 코드가 어떤 권한 라이프사이클을
+    /// 갖는지 기록한다. 값 (쉼표 구분):
+    ///   `rwx-at-rest`   : `.textb`가 파일에서 RWX로 매핑 (in-place 부트 복호화)
+    ///   `rx-after-verify`: `--mem-harden` — 복호화+무결성 검증 후 RX 전환
+    ///   `code-data-split`: `--payload-relocate` — 암호화 페이로드는 비실행
+    ///                      `.vdata`(데이터)에, 실행 스텁은 `.textb`에 분리
+    pub wx_contract: String,
     /// SHA-256 (hex) of the input PE bytes.
     pub input_hash: String,
     /// SHA-256 (hex) of the output PE bytes.
@@ -84,6 +93,8 @@ impl BuildManifest {
             aslr_preserved: true,
             integrity: false,
             crypto_coverage: 0,
+            anti_debug_policy: "trap".to_string(),
+            wx_contract: "rwx-at-rest".to_string(),
             input_hash,
             output_hash,
         }
@@ -99,12 +110,16 @@ impl BuildManifest {
         aslr_preserved: bool,
         integrity: bool,
         crypto_coverage: u32,
+        anti_debug_policy: &str,
+        wx_contract: &str,
     ) -> Self {
         self.crypto_mode = crypto_mode.to_string();
         self.at_rest_encryption = at_rest_encryption;
         self.aslr_preserved = aslr_preserved;
         self.integrity = integrity;
         self.crypto_coverage = crypto_coverage;
+        self.anti_debug_policy = anti_debug_policy.to_string();
+        self.wx_contract = wx_contract.to_string();
         self
     }
 
@@ -127,6 +142,8 @@ impl BuildManifest {
         out.push_str(&format!("aslr_preserved = {}\n", self.aslr_preserved));
         out.push_str(&format!("integrity = {}\n", self.integrity));
         out.push_str(&format!("crypto_coverage = {}\n", self.crypto_coverage));
+        out.push_str(&format!("anti_debug_policy = {}\n", self.anti_debug_policy));
+        out.push_str(&format!("wx_contract = {}\n", self.wx_contract));
         out
     }
 

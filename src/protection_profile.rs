@@ -26,6 +26,7 @@
 
 use crate::cli::{CliArgs, CryptoModeCli};
 use crate::crypto::CryptoMode;
+use crate::dispatcher::antidebug::AntiDebugPolicy;
 
 /// 패킹 정책에 영향을 주는 원시 CLI 플래그 스냅샷. `resolve()`의 입력.
 #[derive(Debug, Clone)]
@@ -33,6 +34,8 @@ pub struct RequestedConfig {
     pub full: bool,
     pub obf_level: u32,
     pub anti_debug: bool,
+    /// readccc §4.5: anti-debug 탐지 실패 정책 (Trap/Hang/Warn).
+    pub anti_debug_policy: AntiDebugPolicy,
     pub no_crypto: bool,
     pub vm: bool,
     pub vm_oep: bool,
@@ -59,6 +62,7 @@ impl RequestedConfig {
             full: args.full,
             obf_level: args.obf_level,
             anti_debug: args.anti_debug,
+            anti_debug_policy: args.anti_debug_policy,
             no_crypto: args.no_crypto,
             vm: args.vm,
             vm_oep: args.vm_oep,
@@ -87,6 +91,8 @@ pub struct ResolvedConfig {
     /// --full 이면 3, 아니면 요청 값 (clamp 는 호출부가 유지).
     pub obf_level: u32,
     pub anti_debug: bool,
+    /// readccc §4.5: anti-debug 탐지 실패 정책 (Trap/Hang/Warn).
+    pub anti_debug_policy: AntiDebugPolicy,
     pub dispatcher_reencrypt: bool,
     pub integrity: bool,
     pub payload_relocate: bool,
@@ -282,6 +288,7 @@ pub fn resolve(req: &RequestedConfig) -> ResolveOutcome {
             full,
             obf_level,
             anti_debug,
+            anti_debug_policy: req.anti_debug_policy,
             dispatcher_reencrypt,
             integrity,
             payload_relocate,
@@ -313,6 +320,7 @@ mod tests {
             full: false,
             obf_level: 2,
             anti_debug: false,
+            anti_debug_policy: AntiDebugPolicy::Trap,
             no_crypto: false,
             vm: false,
             vm_oep: false,

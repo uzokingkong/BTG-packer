@@ -175,3 +175,53 @@
       리프트 **OEP entry-jump** — `--vm-commercial` whole-program run 16-test + checksum
       `0x2cdc0e4511d84a64` green (0xC0000005 해소).
 - [x] `cargo test --release --lib` → **236 passed; 0 failed**; `--vm`/`--vm-oep` 16-test + checksum 무회귀.
+
+---
+
+## 2026-08-19 — T3-1 Phase D + readccc §4.6 명세 + T2 hardening (작업 트리)
+
+### T3-1 Phase D — ChaCha20-Poly1305 AEAD 부트 스텁 복호화-전 인증 ✅ (코드 + 차등 테스트)
+- [x] 네이티브 Poly1305 verify blob (`src/crypto/poly1305_native.rs`): RFC 8439 §2.8 AEAD 태그를
+      26-bit limb로 완전 전개, `rcx/rdx/r8/r9 → rax` 자립형 셸코드. rel32 분기 → VA 길이 불변.
+- [x] 패커 AEAD surface (`poly1305_aead_tag` / `POLY1305_AEAD_AAD` / `chacha_poly1305_key_from_block0`).
+- [x] 부트 스텁 연결: chacha 경로가 at-rest 암호문을 복호화 **전에** 태그 검증, 불일치 시 ud2
+      (fail-safe). RC4/C1 무회귀.
+- [x] 차등 테스트: RFC 벡터, RustCrypto AEAD 권위, 네이티브==reference (len 0..4096),
+      변조(태그/암호문/AAD) 거부, boot-stub AEAD 길이 불변.
+
+### readccc §4.6 — 함수 원자성 + Win64 콜 브리지 명세 ✅ (명세 문서 + 안전 구현)
+- [x] `docs/architecture/function-atomicity-bridge-spec.md` (function-ownership, bridge ABI,
+      EH/SEH/TLS tier, 요구↔모듈 매핑, 명시적 후속 작업).
+- [x] `src/vm/risc/bridge_abi_tests.rs` — NativeCallBridge no-op 전체 가상 상태 보존 차등 가드.
+
+### T2 hardening — per-seed 핸들러/opcode 다형화 검증 ✅ (P6 계열과 일관)
+- [x] `src/vm/poly/polymorphism_hardening_tests.rs` — seed별 opcode 맵 다형화 + 단일 빌드 주입성.
+
+### 게이트 (2026-08-19)
+- [x] `cargo build --release` exit 0 · `cargo test --release --lib` → **398 passed; 0 failed**
+      (기준 384 → +14: WS1 10 · WS2 2 · WS3 2).
+---
+
+## 2026-08-19 - WS1/WS2/WS3 execution (shared tree)
+
+### WS1 - ChaCha20-Poly1305 AEAD end-to-end execution [OK]
+- [x] `--crypto-mode chacha20` plain bulk path pack->run - packed exe output byte-identical to baseline
+      (1460 B, SHA `4366e2530f32a088306efe497d1762e5a087c54ac6c114b44f3ee13d422dcfe5`, exit 0).
+- [x] manifest `crypto_mode = chacha20` / `crypto_version = 63` / `at_rest_encryption = true`.
+- [x] chacha20 gate documented: plain bulk at-rest only; chained/reencrypt/`--vm`/`--vm-oep`/`--vm-commercial` fall back to RC4/BTG-C1. No open item.
+
+### WS2 - Function atomicity / bridge ABI (spec section 6)
+- [x] **2.1 function-ownership <-> .pdata AUTO-CHECK** (`src/pipeline/ownership.rs` + `validate.rs` + `main.rs` CSV wiring). Clean on program-VM builds, emits `<output>.ownership.csv`. DONE
+- [x] **2.2 reentrant callback / vtable dispatch test matrix** (`src/vm/risc/bridge_abi_tests.rs` +3, linear block equivalence). DONE
+- [~~] **2.3 NativeCallBridge Win64 ABI** - `src/vm/risc/native_abi.rs` verified ABI emission layer (PRE/CALL/POST, shadow/align/callee-saved/ret_ip resume) implemented+verified; reference/poly/threaded stay no-op. Real runtime host-call integration open. OPEN
+- [~~] **2.4 commercial T5 full SEH virtualization differential** - commercial keeps SEH-minimal(132) native; `BTG_SEH_NONE=1` is legacy `--vm --vm-oep` only. RISC-lift fidelity gap + function-atomicity gap -> blockers documented, not forced. OPEN
+
+### WS3 - Nested VM / state concealment (t2-hardening follow-ups)
+- [~~] **3.1 Nested VM runtime layer (VmCallBridge)** - `src/vm/nested.rs` `NestedVmFrame`/`run_nested` + 2 differential tests (outer-state save/restore equivalence). Host-layer real execution integration open. OPEN
+- [x] **3.2 State concealment auto-verification** - `src/vm/conceal.rs` `wipe_sensitive`/`SensitiveWipeGuard` + 4 tests. DONE
+- [x] **3.3 Dispatcher metadata minimization** - `src/vm/dispatch_perm.rs` per-seed opcode->handler permutation + 4 tests (bijection/round-trip/polymorphism). DONE
+
+### Gate (2026-08-19 final)
+- [x] `cargo build --release` **exit 0**.
+- [x] `cargo test --release --lib` -> **423 passed; 0 failed** (baseline 398 -> +25: ownership 8 / bridge_abi 5 / native_abi 4 / conceal 4 / dispatch_perm 4 / nested 2).
+- [x] `--vm --vm-oep` and `--vm --vm-oep --vm-commercial` pack->run SHA matches baseline, **FINAL CHECKSUM `0x2cdc0e4511d84a64` no regression**, exit 0.

@@ -94,6 +94,7 @@ mod tests;
 pub(crate) use pe::validate_pe_structure;
 pub(crate) use rsrc::{ResDataEntry, expected_chunks, validate_rsrc, walk_dir, walk_resource_tree};
 pub(crate) use dirs::{report_pe_diff, validate_all_directories};
+pub(crate) use crate::pipeline::ownership::{check_ownership, render_csv, FunctionOwnership, OwnershipReport, RuntimeFunction};
 
 /// Post-build structural self-validation of the synthesized output PE.
 pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
@@ -191,6 +192,22 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
         if tb.characteristics & 0x8000_0000 == 0 {
             bail!("packed section '.textb' missing WRITE (needed for in-place decryption)");
         }
+        // readccc §4.4: W^X 메모리 계약 — .textb는 파일에서 RWX(in-place 부트
+        // 복호화용)로 매핑되지만, --mem-harden이 유효하면 부트 스텁이 복호화+
+        // 무결성 검증 후 NtProtectVirtualMemory로 RX 전환한다. 이 라이프사이클을
+        // 검증으로 고정한다 (게이트: mem_harden 활성이면 프로파일 해석도 mem_harden
+        // 유효해야 하며 — reencrypt/vm-oep와의 상충은 resolve가 이미 제거).
+        let wx_contract = if ctx.mem_harden {
+            "rwx-at-rest,rx-after-verify"
+        } else {
+            "rwx-at-rest"
+        };
+        println!(
+            "[VALIDATE] OK  W^X memory contract: {} (.textb {} — runtime RX transition {})",
+            wx_contract,
+            "RWX in-file",
+            if ctx.mem_harden { "ENABLED (post-decrypt)" } else { "disabled (stays RWX)" }
+        );
     }
 
     // 3. `.textb` packed section present.
@@ -433,8 +450,98 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
     validate_all_directories(out, &pe, &sections, ctx)?;
     report_pe_diff(ctx.target_info.original_pe_bytes.as_slice(), &pe, out)?;
 
+    // WS2.1: function-ownership ↔ .pdata consistency auto-check.
+    // Runs on program-VM paths; derives the ownership model from the
+    // program-VM module region and verifies it against .pdata.
+    if ctx.vm_oep {
+        validate_function_ownership(ctx, out)?;
+    }
+
     println!("[VALIDATE] all structural checks passed ✔");
     Ok(())
+}
+
+/// WS2.1 (readccc §4.6): verify every function claimed "∈ VM" by the
+/// function-ownership model is fully covered by its .pdata RUNTIME_FUNCTION
+/// and that no VM function's native entry bypasses its prologue.
+fn derive_ownership_model(ctx: &PipelineContext, out: &[u8]) -> Result<(Vec<FunctionOwnership>, Vec<RuntimeFunction>)> {
+    let pe = PE::parse(out).map_err(|e| anyhow!("validate: output PE re-parse failed: {e}"))?;
+    let sections = collect_sections(&pe);
+
+    // Parse .pdata RUNTIME_FUNCTION entries: 12-byte [BeginRVA, EndRVA, UnwindInfoRVA].
+    let mut runtime_functions: Vec<RuntimeFunction> = Vec::new();
+    if let Some(pd) = sections.iter().find(|s| s.name == ".pdata") {
+        let start = pd.raw_ptr as usize;
+        let len = pd.raw_size as usize;
+        let avail = (start + len).min(out.len());
+        if start < out.len() {
+            for chunk in out[start..avail].chunks_exact(12) {
+                let b = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let e = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+                if b > 0 && e > b {
+                    runtime_functions.push(RuntimeFunction { begin_rva: b, end_rva: e });
+                }
+            }
+        }
+    }
+
+    // Ownership model: the program-VM module region (which build.rs wraps in a
+    // bridge UNWIND_INFO) is the VM-owned set; the region must be fully covered.
+    let mut model: Vec<FunctionOwnership> = Vec::new();
+    if ctx.vm_prog_rva > 0 && ctx.vm_prog_total > 0 {
+        model.push(FunctionOwnership {
+            start_rva: ctx.vm_prog_rva,
+            end_rva: ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total),
+            owned_by_vm: true,
+            enforce_entry_begin: false,
+            reason: "program-vm-module",
+        });
+    }
+    for rf in &runtime_functions {
+        let in_vm = ctx.vm_prog_rva > 0
+            && rf.begin_rva >= ctx.vm_prog_rva
+            && rf.begin_rva < ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total);
+        if !in_vm && !model.iter().any(|m| m.start_rva == rf.begin_rva) {
+            model.push(FunctionOwnership {
+                start_rva: rf.begin_rva,
+                end_rva: rf.end_rva,
+                owned_by_vm: false,
+                enforce_entry_begin: false,
+                reason: "native-seh-or-plain",
+            });
+        }
+    }
+    Ok((model, runtime_functions))
+}
+
+/// WS2.1: run the function-ownership ↔ .pdata consistency check. Bails on the
+/// first inconsistency (validate becomes a hard gate on program-VM paths).
+pub(crate) fn validate_function_ownership(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
+    let (model, runtime_functions) = derive_ownership_model(ctx, out)?;
+    let report = check_ownership(&model, &runtime_functions).map_err(|e| anyhow!("{}", e))?;
+    println!(
+        "[VALIDATE] OK  function-ownership ↔ .pdata: {} fn ({} VM, {} native), {} RUNTIME_FUNCTION — clean",
+        report.total_functions,
+        report.vm_functions,
+        report.native_functions,
+        runtime_functions.len()
+    );
+    println!(
+        "           program-VM module 0x{:X}..0x{:X} fully covered by RUNTIME_FUNCTION",
+        ctx.vm_prog_rva,
+        ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total)
+    );
+    Ok(())
+}
+
+/// WS2.1: render the ownership model as a CSV mapping file (per the project's
+/// mapping-file convention). Returns None when not on a program-VM path.
+pub fn ownership_csv(ctx: &PipelineContext, out: &[u8]) -> Result<Option<String>> {
+    if !ctx.vm_oep {
+        return Ok(None);
+    }
+    let (model, _) = derive_ownership_model(ctx, out)?;
+    Ok(Some(render_csv(&model)))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

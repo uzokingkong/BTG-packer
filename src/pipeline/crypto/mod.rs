@@ -88,6 +88,7 @@ pub fn run(
     ctx: &mut PipelineContext,
     enabled: bool,
     anti_debug: bool,
+    anti_debug_policy: crate::dispatcher::antidebug::AntiDebugPolicy,
     vm: bool,
     coverage: u32,
     payload_relocate: bool,
@@ -258,6 +259,9 @@ pub fn run(
     let mut rc4 = Rc4::new(&key);
     let mut c1: Option<crate::crypto::BtgCipher> = None;
     let mut chacha_state: Option<[u8; CHA_STATE_SIZE]> = None;
+    // T3-1 Phase D: chacha 경로의 Poly1305 AEAD one-time 키/태그 (암호문+AAD로 계산).
+    let mut chacha_aead_key: Option<[u8; 32]> = None;
+    let mut chacha_aead_tag: Option<[u8; 16]> = None;
 
     // 5a. 코드 영역
     // v5(--integrity) CRC 소스:
@@ -326,6 +330,17 @@ pub fn run(
             let mut st = [0u8; CHA_STATE_SIZE];
             chacha_init_state(&mut st, &ckey, &cnonce);
             chacha_apply(&mut st, &mut btg.bytes[code_start..code_end]);
+            // T3-1 Phase D: Poly1305 AEAD 태그를 at-rest 암호문(+고정 AAD)으로 계산.
+            // 부트 스텁이 복호화 전에 동일 태그를 검증해 변조 시 ud2 (decrypt-and-run 금지).
+            let block0 = crate::crypto::chacha20::chacha20_block(&ckey, 0, &cnonce);
+            let poly_key = crate::crypto::poly1305::chacha_poly1305_key_from_block0(&block0);
+            let tag = crate::crypto::poly1305::poly1305_aead_tag(
+                &crate::crypto::poly1305::POLY1305_AEAD_AAD,
+                &btg.bytes[code_start..code_end],
+                &poly_key,
+            );
+            chacha_aead_key = Some(poly_key);
+            chacha_aead_tag = Some(tag);
             chacha_state = Some(st);
         } else if c1_mode {
             // v60 (--custom-cipher): BTG-C1 — 키/논스는 seed_masked에서 유도(단일
@@ -395,6 +410,7 @@ pub fn run(
         payload_bytes,
         no_crypto,
         anti_debug,
+        anti_debug_policy,
         vm_effective,
         vm_oep_effective,
         vm_commercial_effective,
@@ -416,6 +432,8 @@ pub fn run(
         // (요청값)가 아니라 이 함수가 판정한 유효 모드(chacha_mode/c1_mode)여야
         // 패커 암호화와 부트 스텁 복호화가 일치한다.
         effective_mode,
+        chacha_aead_key,
+        chacha_aead_tag,
         &mut rng,
     )?;
     // P3-1: 시드 RNG를 ctx에 다시 기록 (단일 소스 유지).

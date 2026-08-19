@@ -58,6 +58,7 @@ fn main() -> error::Result<()> {
     // 우선해서 reencrypt는 끈다. 이로써 두 플래그가 동시에 동작한다.
     // (상충 해소 자체는 protection_profile::resolve 가 처리 — 아래는 값 소비.)
     let anti_debug = cfg.anti_debug;
+    let anti_debug_policy = cfg.anti_debug_policy;
     let dispatcher_reencrypt = cfg.dispatcher_reencrypt;
     let integrity = cfg.integrity;
     let payload_relocate = cfg.payload_relocate;
@@ -291,7 +292,7 @@ fn main() -> error::Result<()> {
     }
 
     if anti_debug {
-        println!("[+] Anti-Debugging: ENABLED (PEB.BeingDebugged + NtGlobalFlag + Heap.Flags)");
+        println!("[+] Anti-Debugging: ENABLED (PEB.BeingDebugged + NtGlobalFlag + Heap.Flags, failure policy={})", anti_debug_policy.as_str());
     }
 
     if crypto_enabled {
@@ -439,7 +440,14 @@ fn main() -> error::Result<()> {
     // v9: crypto가 꺼져 있어도 IAT/메모리 하드닝/페이로드 재배치가 있으면
     // 부트 스텁 영역을 예약해야 한다.
     let needs_boot_stub = cfg.needs_boot_stub;
-    pipeline::pass4_section::run(&mut ctx, anti_debug_enabled, needs_boot_stub, args.trace_blocks)?;
+    // readccc §4.5: graceful failure 정책을 부트 스텁/디스패처에 전달.
+    pipeline::pass4_section::run(
+        &mut ctx,
+        anti_debug_enabled,
+        anti_debug_policy,
+        needs_boot_stub,
+        args.trace_blocks,
+    )?;
 
     // ── Patch: 섹션 재배치 + CFG 픽스업 ──────────────────────────────────────────
     let relayed_sections = ctx.target_info.relayed_sections.clone();
@@ -477,6 +485,7 @@ fn main() -> error::Result<()> {
         &mut ctx,
         crypto_enabled,
         anti_debug_enabled,
+        anti_debug_policy,
         vm_enabled,
         args.crypto_coverage,
         payload_relocate,
@@ -509,6 +518,16 @@ fn main() -> error::Result<()> {
 
     // ── v5: 자체검증 — 출력 PE를 다시 파싱해 구조적 불변식 검증 ──────────────────
     pipeline::validate::run(&ctx, &output_pe_bytes)?;
+    // WS2.1: emit the function-ownership ↔ .pdata mapping CSV on program-VM paths.
+    if let Some(own_csv) = pipeline::validate::ownership_csv(&ctx, &output_pe_bytes)? {
+        let mut own_path = output_path.clone();
+        own_path.set_extension(format!(
+            "{}.ownership.csv",
+            output_path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| "out".into())
+        ));
+        std::fs::write(&own_path, own_csv)?;
+        println!("[+] WS2.1 function-ownership map written: {}", own_path.display());
+    }
 
 
     // ── 상용 3-2: Build Manifest — 패킹 로그 + <output>.manifest ─────────────
@@ -537,6 +556,21 @@ fn main() -> error::Result<()> {
             args.sym_map,
             args.seed.is_some(),
         );
+        // readccc §4.4: W^X 메모리 계약 기술 — 실행 코드의 권한 라이프사이클을
+        // capability manifest에 기록한다 (고객이 무엇을 보장하는지 알 수 있게).
+        // resolve()가 mem_harden/reencrypt/vm-oep 상충을 이미 해소했으므로
+        // cfg 값 그대로 사용한다. mem_harden이 유효하면 부트 스텁이 복호화+
+        // 무결성 검증 후 .textb를 RX로 전환(rx-after-verify)한다.
+        let mut wx_contract = "rwx-at-rest".to_string();
+        if cfg.mem_harden {
+            wx_contract.push_str(",rx-after-verify");
+        }
+        if payload_relocate {
+            wx_contract.push_str(",code-data-split");
+        }
+        if ctx.at_rest_encrypted {
+            wx_contract.push_str(",at-rest-ciphertext");
+        }
         let manifest = btg_packer::manifest::BuildManifest::new(
             args.seed,
             flags,
@@ -544,7 +578,8 @@ fn main() -> error::Result<()> {
             output_hash,
         )
         // P3-2/readccc §6.1: capability manifest — effective crypto primitive,
-        // at-rest encryption, ASLR trade-off, integrity, coverage.
+        // at-rest encryption, ASLR trade-off, integrity, coverage, anti-debug
+        // policy, W^X memory contract.
         .with_capabilities(
             match cfg.crypto_mode {
                 btg_packer::crypto::CryptoMode::Rc4 => "rc4",
@@ -555,6 +590,8 @@ fn main() -> error::Result<()> {
             !ctx.at_rest_encrypted,
             integrity,
             args.crypto_coverage,
+            anti_debug_policy.as_str(),
+            &wx_contract,
         );
         println!("[+] Build manifest (P3-2):");
         for line in manifest.render().lines() {

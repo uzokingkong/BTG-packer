@@ -58,10 +58,44 @@ use crate::pipeline::PipelineContext;
 
     #[test]
     fn test_anti_debug_block_length() {
-        let b = build_anti_debug_raw_block();
+        let b = build_anti_debug_raw_block(crate::dispatcher::antidebug::AntiDebugPolicy::Trap);
         assert_eq!(b.len(), ANTI_DEBUG_BLOCK_LEN);
         assert_eq!(&b[b.len()-4..b.len()-2], &[0x0F, 0x0B]); // ud2
         assert_eq!(&b[b.len()-2..], &[0x58, 0x9D]); // pop rax; popfq
+    }
+
+    /// readccc §4.5: raw 블록의 세 정책이 모두 고정 길이(ANTI_DEBUG_BLOCK_LEN)를
+    /// 유지하고, 정상 경로(pop rax; popfq)는 동일해야 한다.
+    #[test]
+    fn test_anti_debug_raw_block_policies() {
+        for policy in [
+            crate::dispatcher::antidebug::AntiDebugPolicy::Trap,
+            crate::dispatcher::antidebug::AntiDebugPolicy::Hang,
+            crate::dispatcher::antidebug::AntiDebugPolicy::Warn,
+        ] {
+            let b = build_anti_debug_raw_block(policy);
+            assert_eq!(b.len(), ANTI_DEBUG_BLOCK_LEN, "policy {:?} must keep fixed length", policy);
+            // 정상 경로 종점은 항상 pop rax; popfq
+            assert_eq!(&b[b.len()-2..], &[0x58, 0x9D], "normal path tail must be pop rax; popfq");
+        }
+        // Trap: 실패 슬롯 = ud2
+        let trap = build_anti_debug_raw_block(crate::dispatcher::antidebug::AntiDebugPolicy::Trap);
+        assert_eq!(&trap[trap.len()-4..trap.len()-2], &[0x0F, 0x0B]);
+        // Hang: 실패 슬롯 = jmp $ (EB FE)
+        let hang = build_anti_debug_raw_block(crate::dispatcher::antidebug::AntiDebugPolicy::Hang);
+        assert_eq!(&hang[hang.len()-4..hang.len()-2], &[0xEB, 0xFE]);
+        // Warn: 실패 슬롯 = nop nop + 세 jnz가 정상 경로(끝)로 리다이렉트
+        let warn = build_anti_debug_raw_block(crate::dispatcher::antidebug::AntiDebugPolicy::Warn);
+        assert_eq!(&warn[warn.len()-4..warn.len()-2], &[0x90, 0x90]);
+        // jnz@0x11 → 정상 경로 0x47: next=0x13, disp=0x34
+        let rel1 = warn[0x12] as u16;
+        assert_eq!(0x13 + rel1, 0x47, "warn jnz #1 must target normal path 0x47");
+        // jnz@0x27 → 0x47: next=0x29, disp=0x1E
+        let rel2 = warn[0x28] as u16;
+        assert_eq!(0x29 + rel2, 0x47, "warn jnz #2 must target normal path 0x47");
+        // jnz@0x41 → 0x47: next=0x43, disp=0x04
+        let rel3 = warn[0x42] as u16;
+        assert_eq!(0x43 + rel3, 0x47, "warn jnz #3 must target normal path 0x47");
     }
 
     #[test]
@@ -121,8 +155,12 @@ use crate::pipeline::PipelineContext;
             c1_state_va: 0,
             chacha_blob_va: 0,
             chacha_state_va: 0,
+            chacha_aead: false,
+            poly_blob_va: 0,
+            poly_key_va: 0,
+            poly_tag_va: 0,
         };
-        let ad = build_anti_debug_raw_block();
+        let ad = build_anti_debug_raw_block(crate::dispatcher::antidebug::AntiDebugPolicy::Trap);
         assert_eq!(ad.len(), ANTI_DEBUG_BLOCK_LEN);
         let code = build_rc4_block(&stub).expect("boot stub encode must succeed");
         assert!(!code.is_empty());
@@ -195,6 +233,10 @@ use crate::pipeline::PipelineContext;
             c1_state_va: 0,
             chacha_blob_va: 0x140002000,
             chacha_state_va: 0x140002080,
+            chacha_aead: false,
+            poly_blob_va: 0,
+            poly_key_va: 0,
+            poly_tag_va: 0,
         };
         let code = build_rc4_block(&stub).expect("chacha boot stub encode must succeed");
         assert!(!code.is_empty());
@@ -205,6 +247,10 @@ use crate::pipeline::PipelineContext;
         let stub2 = BootStubCtx {
             chacha_blob_va: 0x140003000,
             chacha_state_va: 0x140003080,
+            chacha_aead: false,
+            poly_blob_va: 0,
+            poly_key_va: 0,
+            poly_tag_va: 0,
             ..stub
         };
         let code2 = build_rc4_block(&stub2).expect("chacha stub VA fixup must encode");
@@ -317,6 +363,10 @@ use crate::pipeline::PipelineContext;
             c1_state_va: 0,
             chacha_blob_va: 0,
             chacha_state_va: 0,
+            chacha_aead: false,
+            poly_blob_va: 0,
+            poly_key_va: 0,
+            poly_tag_va: 0,
         };
         let code = build_rc4_block(&stub).expect("boot stub encode must succeed");
         assert!(!code.is_empty());
@@ -393,10 +443,10 @@ use crate::pipeline::PipelineContext;
         crate::pipeline::pass1_slice::run(&mut ctx).unwrap();
         crate::pipeline::pass2_shuffle::run(&mut ctx).unwrap();
         crate::pipeline::pass3_encode::run(&mut ctx).unwrap();
-        crate::pipeline::pass4_section::run(&mut ctx, true, true, false).unwrap();
+        crate::pipeline::pass4_section::run(&mut ctx, true, crate::dispatcher::antidebug::AntiDebugPolicy::Trap, true, false).unwrap();
         let relayed = ctx.target_info.relayed_sections.clone();
         crate::pipeline::patch_data::run(&mut ctx, relayed).unwrap();
-        run(&mut ctx, true, true, false, 100, false, false, false, false).unwrap();
+        run(&mut ctx, true, true, crate::dispatcher::antidebug::AntiDebugPolicy::Trap, false, 100, false, false, false, false).unwrap();
 
         // 부트 스텁의 마지막 바이트(ret, 0xC3)가 런테이블/시드에 덮이지 않아야 한다.
         let btg = ctx.btg_section_data.as_ref().unwrap();
@@ -477,6 +527,10 @@ use crate::pipeline::PipelineContext;
             c1_state_va: 0,
             chacha_blob_va: 0,
             chacha_state_va: 0,
+            chacha_aead: false,
+            poly_blob_va: 0,
+            poly_key_va: 0,
+            poly_tag_va: 0,
         };
         let code = build_rc4_block(&stub).expect("boot stub encode must succeed");
         assert!(!code.is_empty());
@@ -512,10 +566,10 @@ use crate::pipeline::PipelineContext;
         crate::pipeline::pass1_slice::run(&mut ctx).unwrap();
         crate::pipeline::pass2_shuffle::run(&mut ctx).unwrap();
         crate::pipeline::pass3_encode::run(&mut ctx).unwrap();
-        crate::pipeline::pass4_section::run(&mut ctx, true, true, false).unwrap();
+        crate::pipeline::pass4_section::run(&mut ctx, true, crate::dispatcher::antidebug::AntiDebugPolicy::Trap, true, false).unwrap();
         let relayed = ctx.target_info.relayed_sections.clone();
         crate::pipeline::patch_data::run(&mut ctx, relayed).unwrap();
-        run(&mut ctx, true, true, false, 40, false, false, false, true)
+        run(&mut ctx, true, true, crate::dispatcher::antidebug::AntiDebugPolicy::Trap, false, 40, false, false, false, true)
             .unwrap();
 
         let btg = ctx.btg_section_data.as_ref().unwrap();
@@ -560,4 +614,84 @@ use crate::pipeline::PipelineContext;
                 );
             }
         }
+    #[test]
+    fn test_boot_stub_generates_chacha20_aead_mode() {
+        // T3-1 Phase D: chacha + Poly1305 AEAD pre-decrypt 인증 스테이지가 포함된
+        // 부트 스텁이 인코딩 가능하고 길이 불변(VA 픽스업)해야 한다.
+        let stub = BootStubCtx {
+            boot_va: 0x140001000,
+            anti_debug: false,
+            dispatcher_va: 0x140001020,
+            code_va: 0x140005000,
+            code_len: 0x100,
+            runs_va: 0x140001400,
+            num_runs: 1,
+            seed_va: 0x140001500,
+            k1: 0xDEADBEEF,
+            k2: 0x12345678,
+            k3: 0x0BADF00D,
+            entry_block_id: 7,
+            entry_seed: 0xAABBCCDD,
+            vm: false,
+            chained: false,
+            reencrypt: false,
+            no_crypto: false,
+            vm_entry_va: 0,
+            vm_state_va: 0,
+            vm_prga: false,
+            vm_prga_entry_va: 0,
+            vm_prga_state_va: 0,
+            vm_oep: false,
+            vm_prog_entry_va: 0,
+            vm_prog_state_va: 0,
+            vm_oep_native_entry: false,
+            vm_oep_native_va: 0,
+            vm_oep_bc_va: 0,
+            vm_oep_bc_len: 0,
+            vm_oep_text_runs_va: 0,
+            vm_oep_text_runs_count: 0,
+            payload_va: 0,
+            payload_len: 0,
+            integrity: false,
+            crc_va: 0,
+            mac_va: 0,
+            iat_enabled: false,
+            iat_table_va: 0,
+            iat_ll_slot_va: 0,
+            iat_gpa_slot_va: 0,
+            mba_master: 0x12345678,
+            mba_c: IMPORT_MBA_C,
+            mem_harden: false,
+            mem_ntdll_name_va: 0,
+            mem_ntprot_name_va: 0,
+            mem_code_base: 0,
+            mem_code_size: 0,
+            stack_frame: 0x118,
+            crypto_mode: crate::crypto::CryptoMode::ChaCha20,
+            c1_blob_va: 0,
+            c1_state_va: 0,
+            chacha_blob_va: 0x140002000,
+            chacha_state_va: 0x140002080,
+            chacha_aead: true,
+            poly_blob_va: 0x140002100,
+            poly_key_va: 0x140003000,
+            poly_tag_va: 0x140003020,
+        };
+        let code = build_rc4_block(&stub).expect("chacha AEAD boot stub encode must succeed");
+        assert!(!code.is_empty());
+        assert!(code.len() > 100, "chacha AEAD block too small: {}", code.len());
+        assert_eq!(*code.last().unwrap(), 0xC3);
+        // Poly1305 AEAD 스테이지는 ud2 트랩 + PolyOk 지점을 포함하므로 VA 픽스업 시
+        // 길이가 불변해야 한다.
+        let stub2 = BootStubCtx {
+            chacha_blob_va: 0x140003000,
+            chacha_state_va: 0x140003080,
+            poly_blob_va: 0x140003100,
+            poly_key_va: 0x140003200,
+            poly_tag_va: 0x140003220,
+            ..stub
+        };
+        let code2 = build_rc4_block(&stub2).expect("chacha AEAD stub VA fixup must encode");
+        assert_eq!(code.len(), code2.len(), "chacha AEAD stub size must be VA-independent");
+    }
     }

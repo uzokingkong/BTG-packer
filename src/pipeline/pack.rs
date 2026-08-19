@@ -62,12 +62,12 @@ pub fn run_full(
     pass1_slice::run(&mut ctx)?;
     pass2_shuffle::run(&mut ctx)?;
     pass3_encode::run(&mut ctx)?;
-    pass4_section::run(&mut ctx, false, true, false)?;
+    pass4_section::run(&mut ctx, false, crate::dispatcher::antidebug::AntiDebugPolicy::Trap, true, false)?;
 
     let relayed = ctx.target_info.relayed_sections.clone();
     patch_data::run(&mut ctx, relayed)?;
 
-    crypto::run(&mut ctx, true, false, false, crypto_coverage, true, false, false, false)?;
+    crypto::run(&mut ctx, true, false, crate::dispatcher::antidebug::AntiDebugPolicy::Trap, false, crypto_coverage, true, false, false, false)?;
 
     // build::run writes to the given path; pass the caller's optional path.
     // None → build in-memory only (no side-effect file in the caller's cwd).
@@ -134,11 +134,11 @@ mod tests {
             pass1_slice::run(&mut ctx).expect("pass1");
             pass2_shuffle::run(&mut ctx).expect("pass2");
             pass3_encode::run(&mut ctx).expect("pass3");
-            pass4_section::run(&mut ctx, false, true, false).expect("pass4");
+            pass4_section::run(&mut ctx, false, crate::dispatcher::antidebug::AntiDebugPolicy::Trap, true, false).expect("pass4");
             let relayed = ctx.target_info.relayed_sections.clone();
             patch_data::run(&mut ctx, relayed).expect("patch");
             // vm=true → KSA/PRGA VM 모듈이 build_vm_module_mba 경로를 탄다.
-            crypto::run(&mut ctx, true, false, true, 100, true, false, false, false).expect("crypto");
+            crypto::run(&mut ctx, true, false, crate::dispatcher::antidebug::AntiDebugPolicy::Trap, true, 100, true, false, false, false).expect("crypto");
             build::run(&ctx, None).expect("build")
         };
         let a = pack(0x1234);

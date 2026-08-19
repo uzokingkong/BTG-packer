@@ -32,6 +32,7 @@ pub(crate) fn place_boot_stub(
     payload_bytes: Vec<u8>,
     no_crypto: bool,
     anti_debug: bool,
+    anti_debug_policy: crate::dispatcher::antidebug::AntiDebugPolicy,
     vm_effective: bool,
     vm_oep_effective: bool,
     vm_commercial: bool,
@@ -50,6 +51,10 @@ pub(crate) fn place_boot_stub(
     k3: u32,
     m8_mod: bool,
     crypto_mode: crate::crypto::CryptoMode,
+    // T3-1 Phase D: chacha 경로의 Poly1305 AEAD one-time 키 + 태그 (run()에서
+    // 암호문+고정 AAD로 계산해 전달). None이면 chacha_aead 비활성 (RC4/C1 no-op).
+    chacha_aead_key: Option<[u8; 32]>,
+    chacha_aead_tag: Option<[u8; 16]>,
     rng: &mut impl RngCore,
 ) -> Result<()> {
     let boot_va = dispatcher_va + boot_off as u64;
@@ -183,6 +188,11 @@ pub(crate) fn place_boot_stub(
         // v63: ChaCha20 blob도 rel32 call 타깃 — 동일한 자리표시자 방침.
         chacha_blob_va: if chacha_mode { dispatcher_va } else { 0 },
         chacha_state_va: 0,
+        // ── T3-1 Phase D: Poly1305 AEAD (chacha 경로) — 1st pass 자리표시자 ──
+        chacha_aead: chacha_mode && chacha_aead_tag.is_some(),
+        poly_blob_va: if chacha_mode { dispatcher_va } else { 0 },
+        poly_key_va: 0,
+        poly_tag_va: 0,
     };
 
     // 1st pass: stub 길이 측정 (runs_va/seed_va/vm_* = 0)
@@ -192,7 +202,11 @@ pub(crate) fn place_boot_stub(
     // cursor = boot_off + stub_code_len (RC4 코드 길이만) 로 잡아서, --anti-debug 사용 시
     // 런 테이블/시드가 RC4 코드 꼬리(PRGA 루프 + ret 포함)를 덮어써 부트 스텁이
     // 쓰레기를 실행하고 0xC0000005로 크래시했다. 실제 스텁 전체 길이를 반영한다.
-    let ad_bytes = if anti_debug { build_anti_debug_raw_block() } else { Vec::new() };
+    let ad_bytes = if anti_debug {
+        build_anti_debug_raw_block(anti_debug_policy)
+    } else {
+        Vec::new()
+    };
 
     // ── v3-composite VM 모듈 (부트 스텁 직후 배치) ────────────────────────────
     // 바이트코드는 VA 독립적이므로 1차 sizing(VA=0)으로 크기를 확정한 뒤,
@@ -291,6 +305,45 @@ pub(crate) fn place_boot_stub(
         cursor
     };
     cursor = chacha_end;
+
+    // ── T3-1 Phase D (--crypto-mode chacha20 + AEAD): Poly1305 blob + 키/태그 ──
+    // RFC 8439 네이티브 Poly1305 verify blob을 chacha 상태 버퍼 뒤에 배치하고,
+    // 그 뒤에 32B ChaCha20-Poly1305 one-time 키와 16B AEAD 태그를 붙인다 (패커가
+    // run()에서 암호문+고정 AAD로 계산해 전달). blob 길이는 imm64/rel32만 써서
+    // VA 무관(고정) — 1차 sizing에서 확정 가능.
+    let mut poly_blob_off = 0usize;
+    let mut poly_key_off = 0usize;
+    let mut poly_tag_off = 0usize;
+    let poly_blob_len = if chacha_mode {
+        let len = crate::crypto::poly1305_native::emit_poly1305_verify_blob(0).len();
+        poly_blob_off = cursor;
+        poly_key_off = poly_blob_off + len;
+        poly_tag_off = poly_key_off + 32;
+        len
+    } else {
+        0
+    };
+    let poly_blob_va = if chacha_mode {
+        dispatcher_va + poly_blob_off as u64
+    } else {
+        0
+    };
+    let poly_key_va = if chacha_mode {
+        dispatcher_va + poly_key_off as u64
+    } else {
+        0
+    };
+    let poly_tag_va = if chacha_mode {
+        dispatcher_va + poly_tag_off as u64
+    } else {
+        0
+    };
+    let poly_end = if chacha_mode {
+        poly_tag_off + 16
+    } else {
+        cursor
+    };
+    cursor = poly_end;
 
     let vm_off = cursor;
     let (vm_entry_va, vm_state_va, vm_total) = if let Some(m) = &vm_mod {
@@ -528,6 +581,10 @@ pub(crate) fn place_boot_stub(
         // v63: ChaCha20 blob/상태 VA (rel32/imm64 — 길이 불변)
         chacha_blob_va,
         chacha_state_va,
+        // T3-1 Phase D: Poly1305 blob/키/태그 VA (rel32/imm64 — 길이 불변)
+        poly_blob_va,
+        poly_key_va,
+        poly_tag_va,
         ..stub
     };
     let stub_code = build_rc4_block(&stub2)?;
@@ -580,6 +637,7 @@ pub(crate) fn place_boot_stub(
     let boot_end = stub_end
         .max(c1_end)
         .max(chacha_end)
+        .max(poly_end)
         .max(vm_off + vm_total)
         .max(vm_prga_off + vm_prga_total)
         .max(vm_prog_off + vm_prog_total + vm_prog_call_stack)
@@ -716,6 +774,23 @@ pub(crate) fn place_boot_stub(
         println!(
             "[+] v63 ChaCha20: crypt blob @0x{:X} ({}B), state @0x{:X}",
             chacha_blob_off, blob.len(), chacha_state_off
+        );
+    }
+
+    // ── T3-1 Phase D: Poly1305 verify blob + 키/태그 기록 (chacha 경로) ────────
+    if chacha_mode {
+        let blob = crate::crypto::poly1305_native::emit_poly1305_verify_blob(0);
+        debug_assert_eq!(blob.len(), poly_blob_len, "Poly1305 blob length must be VA-independent");
+        btg.bytes[poly_blob_off..poly_blob_off + blob.len()].copy_from_slice(&blob);
+        if let Some(k) = chacha_aead_key {
+            btg.bytes[poly_key_off..poly_key_off + 32].copy_from_slice(&k);
+        }
+        if let Some(t) = chacha_aead_tag {
+            btg.bytes[poly_tag_off..poly_tag_off + 16].copy_from_slice(&t);
+        }
+        println!(
+            "[+] T3-1 Phase D: Poly1305 verify blob @0x{:X} ({}B), AEAD key @0x{:X}, tag @0x{:X}",
+            poly_blob_off, blob.len(), poly_key_off, poly_tag_off
         );
     }
 

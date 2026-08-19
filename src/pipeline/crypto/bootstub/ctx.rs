@@ -122,6 +122,17 @@ pub(crate) struct BootStubCtx {
     /// ChaCha20 상태 버퍼 VA (0x80B: key[32]@+0x00, ctr[8]@+0x20, nonce[12]@+0x28,
     /// ks[64]@+0x38, ks_off[4]@+0x78). 부트 스텁 emit_chacha_init이 런타임에 초기화.
     pub(crate) chacha_state_va: u64,
+    // ── T3-1 Phase D (--crypto-mode chacha20 + AEAD): Poly1305 pre-decrypt 인증 ──
+    /// true = chacha 경로가 at-rest 암호문을 복호화 **전에** Poly1305 AEAD 태그로
+    /// 인증한다 (태그 불일치 시 ud2 — fail-safe, decrypt-and-run 금지).
+    /// place.rs가 chacha_mode일 때만 켠다 (RC4/C1 경로 무영향).
+    pub(crate) chacha_aead: bool,
+    /// Poly1305 네이티브 verify blob 엔트리 VA (rel32 call 타깃).
+    pub(crate) poly_blob_va: u64,
+    /// 32B ChaCha20-Poly1305 one-time 키 VA (패커가 seed에서 파생해 기록).
+    pub(crate) poly_key_va: u64,
+    /// 16B Poly1305 AEAD 태그 VA (패커가 암호문+AAD로 계산해 기록).
+    pub(crate) poly_tag_va: u64,
 }
 
 impl BootStubCtx {
@@ -203,6 +214,8 @@ pub(crate) enum Label {
     C1KeyLoop,
     // ── v63: ChaCha20 상태 초기화 (키[32]/ctr/nonce[12]/ks_off 기록) ──
     ChaKeyLoop,
+    // ── T3-1 Phase D: Poly1305 AEAD 인증 통과 (ud2 우회) ──
+    PolyOk,
 }
 
 /// 단일 Instruction을 어셈블해 정확한 인코딩 길이를 측정한다.
