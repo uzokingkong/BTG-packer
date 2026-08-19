@@ -31,6 +31,17 @@ pub mod state;
 pub mod chacha20;
 pub mod chacha20_native;
 
+/// T3-1 Phase B: 부트 스텁/패커가 공유하는 crypto primitive 모드.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CryptoMode {
+    /// RC4-256 (레거시 — chained/--vm-oep 폴백).
+    Rc4,
+    /// BTG-C1 커스텀 512-bit 스트림 사이퍼 (v60+, 기본).
+    C1,
+    /// ChaCha20 (RFC 8439) — T3-1.
+    ChaCha20,
+}
+
 pub use mac::BtgKeyedMac;
 pub use provider::{chain_encrypt, chain_encrypt_with, BlockCryptoMeta, CryptoError, CryptoProvider};
 pub use state::{BtgCipher, BtgState};

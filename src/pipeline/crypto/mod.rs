@@ -23,7 +23,8 @@
 //   → 정적 파일에서 단순 추출 불가, 실행 시점에만 복원됨
 // ==============================================================================
 
-use crate::crypto::{chain_encrypt, BlockCryptoMeta, CryptoProvider};
+use crate::crypto::{chain_encrypt, BlockCryptoMeta, CryptoMode, CryptoProvider};
+use crate::crypto::chacha20::{chacha_apply, chacha_init_state, CHA_STATE_SIZE};
 use crate::pipeline::pass4_section::BOOT_AREA_RESERVE;
 use crate::pipeline::PipelineContext;
 use anyhow::Result;
@@ -31,6 +32,10 @@ use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 
 mod bootstub;
+/// T3-1 Phase-A: ChaCha20-Poly1305 (AEAD) engine — 키 유도/encrypt/decrypt/pack.
+/// 현재 at-rest 스트림 경로는 RFC 8439 원시 `chacha20`(reference)를 쓰므로 이
+/// AEAD API는 Phase-D/E 통합 전까지 비-테스트 빌드에서 사용되지 않는다.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod chacha;
 pub(crate) mod cipher;
 mod encode;
@@ -50,10 +55,12 @@ pub use integrity::crc32;
 ///
 /// `place_boot_stub`가 IAT 리졸브 테이블 run을 코드 영역 + 문자열 런 뒤에서
 /// 이어서 암호화해야 하므로, 코드/런 암호화에 사용한 인스턴스를 그대로 넘긴다.
-/// RC4와 BTG-C1 모두 `crypt`가 in-place XOR (encrypt == decrypt)이다.
+/// RC4/BTG-C1/ChaCha20 모두 `crypt`가 in-place XOR (encrypt == decrypt)이다.
 pub(crate) enum BootStreamCipher<'a> {
     Rc4(&'a mut Rc4),
     C1(crate::crypto::BtgCipher),
+    /// v63 (--crypto-mode chacha20): RFC 8439 상태 버퍼 (reference chacha_apply).
+    ChaCha20([u8; CHA_STATE_SIZE]),
 }
 
 impl<'a> BootStreamCipher<'a> {
@@ -61,6 +68,7 @@ impl<'a> BootStreamCipher<'a> {
         match self {
             BootStreamCipher::Rc4(r) => r.crypt(buf),
             BootStreamCipher::C1(c) => c.crypt(buf),
+            BootStreamCipher::ChaCha20(st) => chacha_apply(st, buf),
         }
     }
 }
@@ -120,8 +128,22 @@ pub fn run(
     // 쓰므로 이 조합에서는 --custom-cipher를 무시하고 RC4로 폴백한다.
     // v61: 평문(벌크)·reencrypt·--m7·--vm(비-oep) 경로는 모두 BTG-C1로 교체된다
     //     (--vm은 C1 상태 초기화를 VM으로 virtualize, 키스트림은 C1 blob).
-    let c1_mode = ctx.custom_cipher && !chained_effective && !vm_oep_effective;
-    if ctx.custom_cipher && !c1_mode {
+    // v63 (--crypto-mode chacha20): chained/reencrypt/--vm/--vm-oep 경로는
+    //     RC4/C1 전용 서브루틴·디스패처를 쓰므로 이 조합에서는 chacha를 무시하고
+    //     폴백한다 (chacha는 평문 bulk at-rest 경로 전용).
+    let chacha_mode = ctx.crypto_mode == CryptoMode::ChaCha20
+        && !chained_effective
+        && !reencrypt
+        && !vm_oep_effective
+        && !vm_effective;
+    if ctx.crypto_mode == CryptoMode::ChaCha20 && !chacha_mode {
+        println!(
+            "[!] --crypto-mode chacha20 ignored for this mode: chained/reencrypt/--vm/--vm-oep use the RC4/BTG-C1 boot-stub subroutines (falls back to {})",
+            if ctx.custom_cipher { "BTG-C1" } else { "RC4" }
+        );
+    }
+    let c1_mode = ctx.custom_cipher && !chained_effective && !vm_oep_effective && !chacha_mode;
+    if ctx.custom_cipher && !c1_mode && !chacha_mode {
         println!(
             "[!] --custom-cipher (BTG-C1) ignored for this mode: chained/--vm-oep use the RC4 boot-stub/VM subroutines (falls back to RC4)"
         );
@@ -129,6 +151,20 @@ pub fn run(
     if c1_mode {
         println!("[+] v60 Custom Cipher: BTG-C1 512-bit stream cipher ENABLED (string runs via seed stream; reencrypt/m7 per-block via per-block C1 keys; --vm routes C1 state init through the VM)");
     }
+    if chacha_mode {
+        println!("[+] v63 Crypto Mode: ChaCha20 (RFC 8439) stream cipher ENABLED (code region + string runs via seed-derived key/nonce; boot-stub native chacha blob decrypts)");
+    }
+
+    // v63 (T3-1 Phase B): 유효 crypto primitive — 패커 암호화 == 부트 스텁 복호화.
+    // (요청 `ctx.crypto_mode`가 아니라 게이트(chained/reencrypt/vm/vm-oep)를 통과한
+    //  최종 모드. chacha가 게이트에서 걸리면 custom_cipher 기준 C1/RC4 폴백.)
+    let effective_mode = if chacha_mode {
+        CryptoMode::ChaCha20
+    } else if c1_mode {
+        CryptoMode::C1
+    } else {
+        CryptoMode::Rc4
+    };
 
     // ── M7: on-demand 재암호화(anti-dump) — refcount-safe 디스패처가 블록을
     // 실행 후 즉시 재암호화한다 (어느 순간에도 실행 중 블록만 평문). 블록별 개별
@@ -221,6 +257,7 @@ pub fn run(
     }
     let mut rc4 = Rc4::new(&key);
     let mut c1: Option<crate::crypto::BtgCipher> = None;
+    let mut chacha_state: Option<[u8; CHA_STATE_SIZE]> = None;
 
     // 5a. 코드 영역
     // v5(--integrity) CRC 소스:
@@ -281,7 +318,16 @@ pub fn run(
             code_len
         );
     } else if !no_crypto {
-        if c1_mode {
+        if chacha_mode {
+            // v63 (--crypto-mode chacha20): 키/논스는 seed_masked에서 원시 파생
+            // (단일 소스 — 부트 스텁 emit_chacha_init과 동일), 카운터 모드 연속
+            // 키스트림은 reference `chacha_apply`로 생성 (네이티브 blob과 bit 동일).
+            let (ckey, cnonce) = cipher::derive_chacha_key_nonce_raw(&seed_masked);
+            let mut st = [0u8; CHA_STATE_SIZE];
+            chacha_init_state(&mut st, &ckey, &cnonce);
+            chacha_apply(&mut st, &mut btg.bytes[code_start..code_end]);
+            chacha_state = Some(st);
+        } else if c1_mode {
             // v60 (--custom-cipher): BTG-C1 — 키/논스는 seed_masked에서 유도(단일
             // 소스), 카운터 모드 연속 키스트림은 부트 스텁 blob이 동일하게 재생한다.
             let (c1_key, c1_nonce) = cipher::derive_c1_key_nonce(&seed_masked);
@@ -323,15 +369,20 @@ pub fn run(
         let sec = &mut ctx.patched_sections[run.sec_idx];
         if let Some(c) = c1.as_mut() {
             c.crypt(&mut sec.bytes[run.offset..run.offset + run.len]);
+        } else if let Some(st) = chacha_state.as_mut() {
+            chacha_apply(st, &mut sec.bytes[run.offset..run.offset + run.len]);
         } else {
             rc4.apply(&mut sec.bytes[run.offset..run.offset + run.len]);
         }
     }
 
     // v60: place_boot_stub로 넘길 연속 키스트림 (코드 영역 + 런을 이미 소모한 인스턴스)
-    let mut stream: BootStreamCipher = match c1.take() {
-        Some(c) => BootStreamCipher::C1(c),
-        None => BootStreamCipher::Rc4(&mut rc4),
+    let mut stream: BootStreamCipher = if let Some(c) = c1.take() {
+        BootStreamCipher::C1(c)
+    } else if let Some(st) = chacha_state.take() {
+        BootStreamCipher::ChaCha20(st)
+    } else {
+        BootStreamCipher::Rc4(&mut rc4)
     };
 
     place::place_boot_stub(
@@ -361,7 +412,10 @@ pub fn run(
         k2,
         k3,
         m8_mod,
-        c1_mode,
+        // v63: 부트 스텁에 실제 사용한 암호 primitive를 전달 — `ctx.crypto_mode`
+        // (요청값)가 아니라 이 함수가 판정한 유효 모드(chacha_mode/c1_mode)여야
+        // 패커 암호화와 부트 스텁 복호화가 일치한다.
+        effective_mode,
         &mut rng,
     )?;
     // P3-1: 시드 RNG를 ctx에 다시 기록 (단일 소스 유지).

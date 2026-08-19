@@ -49,11 +49,6 @@ pub(crate) struct BootStubCtx {
     /// 스텁이 디스패치 직전 fresh RC4(seed)로 복호화한다. (0이면 비활성)
     pub(crate) vm_oep_bc_va: u64,
     pub(crate) vm_oep_bc_len: u32,
-    /// 보존된 원본 .text VA/길이. TLS 콜백이 없는 타깃에서만 at-rest 암호화해,
-    /// 로더가 부트 전에 실행하는 콜백이 평문을 보게 하지 않으면서 정적 분석에서
-    /// 원본 .text 평문 노출을 제거한다. (0이면 비활성)
-    pub(crate) vm_oep_text_va: u64,
-    pub(crate) vm_oep_text_len: u32,
     /// P5: pointer to the .text at-rest decrypt run-table (array of {va:u64, len:u64} pairs),
     /// covering exactly the non-TLS `.text` regions encrypted at rest. The boot stub decrypts
     /// these runs (fresh RC4 seed keystream) in order, then the program-VM bytecode, so the
@@ -111,18 +106,33 @@ pub(crate) struct BootStubCtx {
     pub(crate) mba_master: u32,
     /// 리졸브 테이블 이름 XOR 키 유도용 MBA 상수
     pub(crate) mba_c: u32,
-    // ── v60: --custom-cipher (BTG-C1) 부트 스텁 경로 ───────────────────────
-    /// true = 부트 스텁이 RC4 KSA/PRGA 대신 BTG-C1 상태형 키스트림 blob을 쓴다.
-    /// (--custom-cipher + 평문/재암호화 불포함 경로에서만 활성 — chained/reencrypt/
-    /// vm/vm-oep는 RC4 전용 서브루틴을 쓰므로 이 모드에서는 자동으로 비활성.)
-    pub(crate) c1_mode: bool,
+    // ── v60/v63: --custom-cipher / --crypto-mode 부트 스텁 경로 ───────────────
+    /// 선택된 crypto primitive (RC4 / BTG-C1 / ChaCha20). v63 (T3-1 Phase B):
+    /// `c1_mode` 불리언을 `CryptoMode` variant로 승격 — 부트 스텁이 키스트림
+    /// 서브루틴(Prga) 대신 상태형 blob(BTG-C1 / ChaCha20)을 선택한다.
+    pub(crate) crypto_mode: crate::crypto::CryptoMode,
     /// BTG-C1 crypt blob 엔트리 VA (rcx=buf, rdx=len — 상태는 c1_state_va 유지).
     pub(crate) c1_blob_va: u64,
-    /// BTG-C1 256B S-box 상수 테이블 VA (패커가 boot 데이터 영역에 기록).
-    pub(crate) c1_sbox_va: u64,
     /// BTG-C1 상태 버퍼 VA (0x80B: key[32]@+0x00, ctr[8]@+0x20, nonce[4]@+0x28,
     /// ks[64]@+0x30, ks_off[4]@+0x70). 부트 스텁 emit_c1_init이 런타임에 초기화.
     pub(crate) c1_state_va: u64,
+    /// ChaCha20 crypt blob 엔트리 VA (rcx=buf, rdx=len — 상태는 chacha_state_va 유지).
+    /// (--crypto-mode chacha20 + 평문 경로에서만 활성.)
+    pub(crate) chacha_blob_va: u64,
+    /// ChaCha20 상태 버퍼 VA (0x80B: key[32]@+0x00, ctr[8]@+0x20, nonce[12]@+0x28,
+    /// ks[64]@+0x38, ks_off[4]@+0x78). 부트 스텁 emit_chacha_init이 런타임에 초기화.
+    pub(crate) chacha_state_va: u64,
+}
+
+impl BootStubCtx {
+    /// true = BTG-C1 상태형 키스트림 blob 사용 (v60 --custom-cipher).
+    pub(crate) fn c1_mode(&self) -> bool {
+        self.crypto_mode == crate::crypto::CryptoMode::C1
+    }
+    /// true = ChaCha20 (RFC 8439) crypt blob 사용 (v63 --crypto-mode chacha20).
+    pub(crate) fn chacha_mode(&self) -> bool {
+        self.crypto_mode == crate::crypto::CryptoMode::ChaCha20
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -191,6 +201,8 @@ pub(crate) enum Label {
     UxFuncDone,
     // ── v60: BTG-C1 상태 초기화 (키/카운터/nonce/ks_off 기록) ──
     C1KeyLoop,
+    // ── v63: ChaCha20 상태 초기화 (키[32]/ctr/nonce[12]/ks_off 기록) ──
+    ChaKeyLoop,
 }
 
 /// 단일 Instruction을 어셈블해 정확한 인코딩 길이를 측정한다.

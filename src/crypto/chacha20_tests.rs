@@ -154,3 +154,60 @@ fn chacha_packer_key_native_decrypt_equivalence() {
         );
     }
 }
+
+/// v63 at-rest 계약: 패커 `derive_chacha_key_nonce_raw`(seed 원시 파생 — 부트 스텁
+/// emit_chacha_init과 동일) + reference 스트림 암호화 → 네이티브 blob 복호화 == 원문.
+/// 이 테스트는 `--crypto-mode chacha20`의 코드/문자열 영역 at-rest 왕복을 정확히
+/// 재현한다. (SHA-256 기반 derive_chacha_key_nonce가 아니라 시드 원시 바이트 계약.)
+#[test]
+fn chacha_raw_seed_at_rest_roundtrip_matches_native_blob() {
+    use crate::pipeline::crypto::cipher::derive_chacha_key_nonce_raw;
+
+    let blob_off = 0x0000usize;
+    let state_off = 0x9000usize;
+    let buf_off = 0x9100usize;
+
+    let mut arena = Arena::new(0x40000).unwrap();
+    let state_va = (arena.base + state_off) as u64;
+    let code = crate::crypto::chacha20_native::emit_chacha20_blob(state_va);
+    assert!(code.len() <= state_off, "chacha blob ({}B) overlaps state", code.len());
+    {
+        let b = arena.bytes();
+        b[blob_off..blob_off + code.len()].copy_from_slice(&code);
+    }
+
+    // 256B seed (패커 seed_masked) → key = seed[0..32], nonce = seed[32..44]
+    let seed: Vec<u8> = (0u8..=255).map(|i| i.wrapping_mul(17).wrapping_add(3)).collect();
+    let (key, nonce) = derive_chacha_key_nonce_raw(&seed);
+    assert_eq!(&key[..], &seed[..32], "raw key = seed[0..32]");
+    assert_eq!(&nonce[..], &seed[32..44], "raw nonce = seed[32..44]");
+
+    for len in [1usize, 63, 64, 65, 130, 1000, 4096] {
+        let plain: Vec<u8> = (0..len).map(|i| ((i as u32 * 251 + 13) % 241) as u8).collect();
+
+        // packer: reference stream encrypt
+        let mut st = [0u8; 0x80];
+        chacha_init_state(&mut st, &key, &nonce);
+        let mut ct = plain.clone();
+        chacha_apply(&mut st, &mut ct);
+        assert_ne!(ct, plain, "stream must change bytes (len={len})");
+
+        // native: state init + blob 1 call -> decrypt back to plain
+        {
+            let b = arena.bytes();
+            chacha_init_state(
+                (&mut b[state_off..state_off + 0x80]).try_into().unwrap(),
+                &key,
+                &nonce,
+            );
+            b[buf_off..buf_off + len].copy_from_slice(&ct);
+        }
+        arena.call2(blob_off, arena.base + buf_off, len as u64);
+        let b = arena.bytes();
+        assert_eq!(
+            &b[buf_off..buf_off + len],
+            plain.as_slice(),
+            "raw-seed at-rest roundtrip must decrypt via native blob (len={len})"
+        );
+    }
+}

@@ -93,6 +93,19 @@ pub(crate) fn derive_c1_key_nonce(seed_masked: &[u8]) -> ([u8; 32], u32) {
     (key, nonce)
 }
 
+/// v63 (--crypto-mode chacha20): ChaCha20 키/논스 원시 파생 (패커 ↔ 부트 스텁
+/// 단일 소스). seed_masked 앞 32바이트 = 256-bit key, 다음 12바이트 = 96-bit
+/// nonce (RFC 8439 IETF 변형). 부트 스텁 `emit_chacha_init`이 seed_va에서 같은
+/// 바이트를 그대로 복사하므로 패커와 런타임이 항상 일치한다.
+pub(crate) fn derive_chacha_key_nonce_raw(seed_masked: &[u8]) -> ([u8; 32], [u8; 12]) {
+    debug_assert!(seed_masked.len() >= 44, "seed must be 256 bytes for ChaCha20");
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&seed_masked[..32]);
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&seed_masked[32..44]);
+    (key, nonce)
+}
+
 /// v61 (--custom-cipher + reencrypt/m7): 4바이트 MBA per-block 키 → 32바이트
 /// BTG-C1 키 (8회 반복). M7/reencrypt C1 디스패처의 C1Init이 같은 확장을
 /// 어셈블리로 수행한다 — 패커와 런타임이 항상 일치해야 한다.

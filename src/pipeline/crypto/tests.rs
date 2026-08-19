@@ -97,8 +97,6 @@ use crate::pipeline::PipelineContext;
             vm_oep_native_va: 0,
             vm_oep_bc_va: 0,
             vm_oep_bc_len: 0,
-            vm_oep_text_va: 0,
-            vm_oep_text_len: 0,
             vm_oep_text_runs_va: 0,
             vm_oep_text_runs_count: 0,
             payload_va: 0,
@@ -118,10 +116,11 @@ use crate::pipeline::PipelineContext;
             mem_code_base: 0,
             mem_code_size: 0,
             stack_frame: 0x118,
-            c1_mode: false,
+            crypto_mode: crate::crypto::CryptoMode::Rc4,
             c1_blob_va: 0,
-            c1_sbox_va: 0,
             c1_state_va: 0,
+            chacha_blob_va: 0,
+            chacha_state_va: 0,
         };
         let ad = build_anti_debug_raw_block();
         assert_eq!(ad.len(), ANTI_DEBUG_BLOCK_LEN);
@@ -135,6 +134,81 @@ use crate::pipeline::PipelineContext;
         let stub2 = BootStubCtx { anti_debug: false, ..stub };
         let code2 = build_rc4_block(&stub2).expect("boot stub (no anti-debug) encode must succeed");
         assert!(!code2.is_empty());
+    }
+
+    #[test]
+    fn test_boot_stub_generates_chacha20_mode() {
+        // v63 (--crypto-mode chacha20): ChaCha20 모드 부트 스텁이 인코딩 가능하고
+        // 길이 불변(VA 픽스업)하며 ret로 끝나야 한다. chacha_blob_va는 rel32 call
+        // 타깃이라 in-range 자리표시자(dispatcher_va)를 쓴다.
+        let stub = BootStubCtx {
+            boot_va: 0x140001000,
+            anti_debug: false,
+            dispatcher_va: 0x140001020,
+            code_va: 0x140005000,
+            code_len: 0x100,
+            runs_va: 0x140001400,
+            num_runs: 1,
+            seed_va: 0x140001500,
+            k1: 0xDEADBEEF,
+            k2: 0x12345678,
+            k3: 0x0BADF00D,
+            entry_block_id: 7,
+            entry_seed: 0xAABBCCDD,
+            vm: false,
+            chained: false,
+            reencrypt: false,
+            no_crypto: false,
+            vm_entry_va: 0,
+            vm_state_va: 0,
+            vm_prga: false,
+            vm_prga_entry_va: 0,
+            vm_prga_state_va: 0,
+            vm_oep: false,
+            vm_prog_entry_va: 0,
+            vm_prog_state_va: 0,
+            vm_oep_native_entry: false,
+            vm_oep_native_va: 0,
+            vm_oep_bc_va: 0,
+            vm_oep_bc_len: 0,
+            vm_oep_text_runs_va: 0,
+            vm_oep_text_runs_count: 0,
+            payload_va: 0,
+            payload_len: 0,
+            integrity: false,
+            crc_va: 0,
+            mac_va: 0,
+            iat_enabled: false,
+            iat_table_va: 0,
+            iat_ll_slot_va: 0,
+            iat_gpa_slot_va: 0,
+        mba_master: 0x12345678,
+        mba_c: IMPORT_MBA_C,
+            mem_harden: false,
+            mem_ntdll_name_va: 0,
+            mem_ntprot_name_va: 0,
+            mem_code_base: 0,
+            mem_code_size: 0,
+            stack_frame: 0x118,
+            crypto_mode: crate::crypto::CryptoMode::ChaCha20,
+            c1_blob_va: 0,
+            c1_state_va: 0,
+            chacha_blob_va: 0x140002000,
+            chacha_state_va: 0x140002080,
+        };
+        let code = build_rc4_block(&stub).expect("chacha boot stub encode must succeed");
+        assert!(!code.is_empty());
+        assert!(code.len() > 100, "chacha block too small: {}", code.len());
+        // 마지막 명령이 ret(0xC3)이어야 한다 (zeromem 서브루틴 종료)
+        assert_eq!(*code.last().unwrap(), 0xC3);
+        // 길이 불변성: chacha_blob_va/state_va를 바꿔도 인코딩 길이가 같아야 한다.
+        let stub2 = BootStubCtx {
+            chacha_blob_va: 0x140003000,
+            chacha_state_va: 0x140003080,
+            ..stub
+        };
+        let code2 = build_rc4_block(&stub2).expect("chacha stub VA fixup must encode");
+        assert_eq!(code.len(), code2.len(), "chacha stub size must be VA-independent");
     }
 
     #[test]
@@ -219,8 +293,6 @@ use crate::pipeline::PipelineContext;
             vm_oep_native_va: 0,
             vm_oep_bc_va: 0,
             vm_oep_bc_len: 0,
-            vm_oep_text_va: 0,
-            vm_oep_text_len: 0,
             vm_oep_text_runs_va: 0,
             vm_oep_text_runs_count: 0,
             payload_va: 0,
@@ -240,10 +312,11 @@ use crate::pipeline::PipelineContext;
             mem_code_base: 0,
             mem_code_size: 0,
             stack_frame: 0x118,
-            c1_mode: false,
+            crypto_mode: crate::crypto::CryptoMode::Rc4,
             c1_blob_va: 0,
-            c1_sbox_va: 0,
             c1_state_va: 0,
+            chacha_blob_va: 0,
+            chacha_state_va: 0,
         };
         let code = build_rc4_block(&stub).expect("boot stub encode must succeed");
         assert!(!code.is_empty());
@@ -380,8 +453,6 @@ use crate::pipeline::PipelineContext;
             vm_oep_native_va: 0,
             vm_oep_bc_va: 0,
             vm_oep_bc_len: 0,
-            vm_oep_text_va: 0,
-            vm_oep_text_len: 0,
             vm_oep_text_runs_va: 0,
             vm_oep_text_runs_count: 0,
             payload_va: 0x140006000,
@@ -401,10 +472,11 @@ use crate::pipeline::PipelineContext;
             mem_code_base: 0,
             mem_code_size: 0,
             stack_frame: 0x138,
-            c1_mode: false,
+            crypto_mode: crate::crypto::CryptoMode::Rc4,
             c1_blob_va: 0,
-            c1_sbox_va: 0,
             c1_state_va: 0,
+            chacha_blob_va: 0,
+            chacha_state_va: 0,
         };
         let code = build_rc4_block(&stub).expect("boot stub encode must succeed");
         assert!(!code.is_empty());

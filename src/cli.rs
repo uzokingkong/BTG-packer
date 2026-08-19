@@ -209,4 +209,25 @@ pub struct CliArgs {
     /// (chained/--vm-oep)의 폴백/디버그/테스트용 — 기본은 BTG-C1.
     #[arg(long, default_value_t = false)]
     pub rc4: bool,
+
+    /// v63 (T3-1 Phase B): crypto primitive 선택 — `rc4` | `c1` | `chacha20`.
+    /// `chacha20` = ChaCha20 (RFC 8439) 스트림 — 코드/문자열 영역 at-rest 암호화를
+    /// 검증된 현대 암호로 전환 (평문 bulk 경로 전용; chained/reencrypt/--vm/--vm-oep
+    /// 조합에서는 폴백). 지정 시 `--rc4`/`--custom-cipher`보다 우선한다.
+    #[arg(long, value_enum)]
+    pub crypto_mode: Option<CryptoModeCli>,
+}
+
+/// v63: `--crypto-mode` 선택지.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CryptoModeCli {
+    /// RC4-256 (레거시).
+    #[value(name = "rc4")]
+    Rc4,
+    /// BTG-C1 커스텀 512-bit 스트림 사이퍼 (기본).
+    #[value(name = "c1")]
+    C1,
+    /// ChaCha20 (RFC 8439) — T3-1.
+    #[value(name = "chacha20")]
+    ChaCha20,
 }

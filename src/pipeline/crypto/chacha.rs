@@ -10,11 +10,15 @@
 //
 // 현재 통합 전략 (단계적 마이그레이션):
 //   Phase A (완료): 패커 측 암호화 엔진 구현 + 단위 테스트
-//   Phase B: BootStubCtx에 CryptoMode::ChaCha20Poly1305 variant 추가
-//   Phase C (스트림 primitive 완료): boot-stub용 네이티브 ChaCha20 crypt blob
+//   Phase B (완료): BootStubCtx `CryptoMode` variant + `--crypto-mode chacha20` 배선 +
+//       코드/문자열 영역 at-rest 암호화 전환 (RFC 8439 원시 스트림 — 패커 reference
+//       `chacha20::chacha_apply` ↔ 부트 스텁 네이티브 blob, seed 원시 파생 계약).
+//       `repro/test_prog.exe` pack→run 16-test + FINAL CHECKSUM baseline 무회귀.
+//   Phase C (완료): boot-stub용 네이티브 ChaCha20 crypt blob
 //       `crypto::chacha20_native::emit_chacha20_blob` (RFC 8439 reference와 차등
-//       검증 — src/crypto/chacha20_tests.rs). bootstub/emit.rs 배선은 Phase B/D.
-//   Phase D: 기존 RC4 경로와 --crypto-mode 플래그로 선택
+//       검증 — src/crypto/chacha20_tests.rs).
+//   Phase D (예정): ChaCha20-Poly1305 AEAD 무결성 검증 (Poly1305 태그 — 부트 스텁
+//       복호화 전 인증). 아래 AEAD API는 Phase-D/E 통합 전까지 예약.
 //
 // 참조: chacha20poly1305 crate (RustCrypto, MIT/Apache-2.0)
 // ==============================================================================

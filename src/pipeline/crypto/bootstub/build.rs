@@ -90,7 +90,9 @@ pub(crate) fn build_rc4_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     // (chained/vm-oep는 RC4 전용 — c1_mode는 place.rs가 비활성화해 이 분기에
     //  도달하지 않는다.) v61: --vm과 함께면 C1 상태 초기화를 VM으로 virtualize
     //  (emit_ksa_init의 c1_mode && vm 분기), 아니면 네이티브 emit_c1_init.
-    if stub.c1_mode {
+    // v63 (--crypto-mode chacha20): ChaCha20 상태 초기화는 emit_ksa_init의
+    //  chacha_mode 분기에서 처리한다 (네이티브 emit_chacha_init).
+    if stub.c1_mode() {
         if stub.vm {
             emit_ksa_init(&mut seq, stub);
         } else {

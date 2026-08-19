@@ -49,10 +49,12 @@ pub(crate) fn place_boot_stub(
     k2: u32,
     k3: u32,
     m8_mod: bool,
-    c1_mode: bool,
+    crypto_mode: crate::crypto::CryptoMode,
     rng: &mut impl RngCore,
 ) -> Result<()> {
     let boot_va = dispatcher_va + boot_off as u64;
+    let c1_mode = crypto_mode == crate::crypto::CryptoMode::C1;
+    let chacha_mode = crypto_mode == crate::crypto::CryptoMode::ChaCha20;
 
     // M8: VM module builders live in `vm_build` (MBA-variant vs plain routing).
     // P3 (G1): 상용 프로그램 리프트의 ip_map (source-IP -> micro-op index) — the
@@ -145,11 +147,9 @@ pub(crate) fn place_boot_stub(
         vm_prog_state_va: 0, // imm64 라 길이 불변 — 0으로 두고 아래에서 채움
         vm_oep_native_entry: vm_oep_native_entry,
         vm_oep_native_va: oep_va,
-        // M6 Phase-2.3 at-rest: VM bytecode + 보존 .text VA/길이 (imm — 최종 패스에서 채움)
+        // M6 Phase-2.3 at-rest: VM bytecode VA/길이 (imm — 최종 패스에서 채움)
         vm_oep_bc_va: 0,
         vm_oep_bc_len: 0,
-        vm_oep_text_va: 0,
-        vm_oep_text_len: 0,
         vm_oep_text_runs_va: 0,
         vm_oep_text_runs_count: 0,
         // payload_va/crc_va는 imm64라 길이 불변 — 최종 패스(stub3)에서 채운다.
@@ -172,14 +172,17 @@ pub(crate) fn place_boot_stub(
         // Win64 entry에서 RSP는 16-byte 경계보다 8만큼 어긋나 있다. 8 mod 16인
         // 프레임을 빼야 VM/native helper CALL 직전 RSP가 16-byte 정렬된다.
         stack_frame: if ctx.iat_hide || ctx.mem_harden { 0x138 } else { 0x118 },
-        // v60 (--custom-cipher): BTG-C1 경로 (1st pass 자리표시자 — stub2/3에서 확정)
-        c1_mode,
+        // v60/v63 (--custom-cipher / --crypto-mode): 선택된 crypto primitive
+        // (1st pass 자리표시자 — stub2/3에서 확정)
+        crypto_mode,
         // c1_blob_va는 rel32 `call` 타깃이라 패스1에서 유효한 in-range 자리표시자
         // (dispatcher_va)를 써야 BlockEncoder가 측정/인코딩에 실패하지 않는다.
         // (0이면 diff가 i32를 벗어나 "Branch distance is too far away" — VM 엔트리와 동일 방침)
         c1_blob_va: if c1_mode { dispatcher_va } else { 0 },
-        c1_sbox_va: 0,
         c1_state_va: 0,
+        // v63: ChaCha20 blob도 rel32 call 타깃 — 동일한 자리표시자 방침.
+        chacha_blob_va: if chacha_mode { dispatcher_va } else { 0 },
+        chacha_state_va: 0,
     };
 
     // 1st pass: stub 길이 측정 (runs_va/seed_va/vm_* = 0)
@@ -256,6 +259,37 @@ pub(crate) fn place_boot_stub(
     let c1_state_va = if c1_mode { dispatcher_va + c1_state_off as u64 } else { 0 };
     let c1_end = if c1_mode { c1_state_off + C1_STATE_SIZE } else { cursor };
     cursor = c1_end;
+
+    // ── v63 (--crypto-mode chacha20): ChaCha20 crypt blob + 상태 영역 배치 ──────
+    // RFC 8439 네이티브 blob(완전 전개 20 라운드)을 스텁 직후에 두고, 그 뒤에
+    // 0x80B 상태 버퍼(key/ctr/nonce/ks/ks_off — 스텁 emit_chacha_init이 초기화)를
+    // 붙인다. blob 길이는 imm64/rel32만 써서 VA와 무관(고정) — 1차 sizing 확정.
+    let mut chacha_blob_off = 0usize;
+    let mut chacha_state_off = 0usize;
+    let chacha_blob_len = if chacha_mode {
+        let len = crate::crypto::chacha20_native::emit_chacha20_blob(0).len();
+        chacha_blob_off = cursor;
+        chacha_state_off = chacha_blob_off + len;
+        len
+    } else {
+        0
+    };
+    let chacha_blob_va = if chacha_mode {
+        dispatcher_va + chacha_blob_off as u64
+    } else {
+        0
+    };
+    let chacha_state_va = if chacha_mode {
+        dispatcher_va + chacha_state_off as u64
+    } else {
+        0
+    };
+    let chacha_end = if chacha_mode {
+        chacha_state_off + crate::crypto::chacha20::CHA_STATE_SIZE
+    } else {
+        cursor
+    };
+    cursor = chacha_end;
 
     let vm_off = cursor;
     let (vm_entry_va, vm_state_va, vm_total) = if let Some(m) = &vm_mod {
@@ -383,14 +417,6 @@ pub(crate) fn place_boot_stub(
     }
     let text_enc = vm_oep_effective && !text_enc_runs.is_empty();
     let text_enc_total: u64 = text_enc_runs.iter().map(|&(_, l)| l as u64).sum();
-    let (vm_oep_text_va, vm_oep_text_len) = if text_enc {
-        match ctx.patched_sections.iter().find(|s| s.name == ".text") {
-            Some(sec) => (image_base + sec.virtual_address as u64, sec.bytes.len() as u32),
-            None => (0, 0),
-        }
-    } else {
-        (0, 0)
-    };
     if vm_oep_effective {
         println!(
             "[+] --vm-oep at-rest: Program VM bytecode {}",
@@ -495,10 +521,12 @@ pub(crate) fn place_boot_stub(
         vm_prga_state_va,
         vm_prog_entry_va,
         vm_prog_state_va,
-        // v60: BTG-C1 blob/상태/S-box VA (imm64/rel32 — 길이 불변)
+        // v60: BTG-C1 blob/상태 VA (imm64/rel32 — 길이 불변)
         c1_blob_va,
-        c1_sbox_va,
         c1_state_va,
+        // v63: ChaCha20 blob/상태 VA (rel32/imm64 — 길이 불변)
+        chacha_blob_va,
+        chacha_state_va,
         ..stub
     };
     let stub_code = build_rc4_block(&stub2)?;
@@ -550,6 +578,7 @@ pub(crate) fn place_boot_stub(
     };
     let boot_end = stub_end
         .max(c1_end)
+        .max(chacha_end)
         .max(vm_off + vm_total)
         .max(vm_prga_off + vm_prga_total)
         .max(vm_prog_off + vm_prog_total + vm_prog_call_stack)
@@ -613,8 +642,6 @@ pub(crate) fn place_boot_stub(
         // M6 Phase-2.3: at-rest 암호화 대상 VA/길이 확정 (imm64/imm32 — 길이 불변)
         vm_oep_bc_va: vm_prog_bc_va,
         vm_oep_bc_len: vm_prog_bc_len,
-        vm_oep_text_va,
-        vm_oep_text_len,
         vm_oep_text_runs_va: text_runs_va,
         vm_oep_text_runs_count: text_runs_count,
         // v6: 배치 확정 후 반영 (모두 imm64 — 길이 불변)
@@ -673,6 +700,21 @@ pub(crate) fn place_boot_stub(
         println!(
             "[+] v60 BTG-C1: crypt blob @0x{:X} ({}B), sbox @0x{:X}, state @0x{:X}",
             c1_blob_off, blob.len(), c1_sbox_off, c1_state_off
+        );
+    }
+
+    // ── v63 (--crypto-mode chacha20): ChaCha20 blob + 상태 영역 기록 ──────────
+    if chacha_mode {
+        // blob은 최종 VA(chacha_state_va)로 재생성 — 길이는 1차와 동일.
+        let blob = crate::crypto::chacha20_native::emit_chacha20_blob(chacha_state_va);
+        debug_assert_eq!(blob.len(), chacha_blob_len, "ChaCha20 blob length must be VA-independent");
+        btg.bytes[chacha_blob_off..chacha_blob_off + blob.len()].copy_from_slice(&blob);
+        // 상태 버퍼는 0으로 초기화 (스텁 emit_chacha_init이 런타임에 key/ctr/nonce/ks_off 기록)
+        let st_size = crate::crypto::chacha20::CHA_STATE_SIZE;
+        btg.bytes[chacha_state_off..chacha_state_off + st_size].fill(0);
+        println!(
+            "[+] v63 ChaCha20: crypt blob @0x{:X} ({}B), state @0x{:X}",
+            chacha_blob_off, blob.len(), chacha_state_off
         );
     }
 

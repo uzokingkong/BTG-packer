@@ -22,7 +22,8 @@ use std::path::Path;
 /// VM ISA version this packer emits (roadmap v31 — full ISA milestone line).
 pub const VM_VERSION: u32 = 31;
 /// Composite VM crypto engine version (BTG-C1 default, v62).
-pub const CRYPTO_VERSION: u32 = 62;
+/// v63 (T3-1 Phase B): --crypto-mode chacha20 추가.
+pub const CRYPTO_VERSION: u32 = 63;
 
 /// A fully-qualified description of one pack run.
 #[derive(Debug, Clone)]
@@ -111,6 +112,7 @@ pub fn feature_flags(
     iat_hide: bool,
     mem_harden: bool,
     custom_cipher: bool,
+    chacha20: bool,
     map: bool,
     sym_map: bool,
     seed: bool,
@@ -129,6 +131,7 @@ pub fn feature_flags(
     if iat_hide { v.push("iat_hide".to_string()); }
     if mem_harden { v.push("mem_harden".to_string()); }
     if custom_cipher { v.push("custom_cipher".to_string()); }
+    if chacha20 { v.push("chacha20".to_string()); }
     if map { v.push("map".to_string()); }
     if sym_map { v.push("sym_map".to_string()); }
     if seed { v.push("seed".to_string()); }
@@ -248,7 +251,7 @@ mod tests {
         assert!(body.contains("build_id = BTG-"));
         assert!(body.contains("seed_id = 0x0000000000001234"));
         assert!(body.contains("vm_version = 31"));
-        assert!(body.contains("crypto_version = 62"));
+        assert!(body.contains("crypto_version = 63"));
         assert!(body.contains("input_hash = "));
         assert!(body.contains("output_hash = "));
         assert!(body.contains("feature_flags = vm,m8"));

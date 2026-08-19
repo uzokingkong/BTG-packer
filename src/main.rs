@@ -295,9 +295,14 @@ fn main() -> error::Result<()> {
     }
 
     if crypto_enabled {
+        let mode_str = match cfg.crypto_mode {
+            btg_packer::crypto::CryptoMode::Rc4 => "RC4",
+            btg_packer::crypto::CryptoMode::C1 => "BTG-C1",
+            btg_packer::crypto::CryptoMode::ChaCha20 => "ChaCha20 (RFC 8439)",
+        };
         println!(
             "[+] Composite VM Crypto: ENABLED ({} keyed stream — code region + string literals)",
-            if !args.rc4 { "BTG-C1" } else { "RC4" }
+            mode_str
         );
     } else {
         println!("[!] Composite VM Crypto: DISABLED (--no-crypto)");
@@ -391,6 +396,9 @@ fn main() -> error::Result<()> {
     // v62: BTG-C1을 기본 암호로 (--rc4로 RC4 복귀). --custom-cipher는 기본값이라
     // 명시적 동의에만 쓰이고, --rc4와 함께 주면 --rc4가 우선한다.
     ctx.custom_cipher = cfg.custom_cipher;
+    // v63 (T3-1 Phase B): --crypto-mode 선택 (RC4/C1/ChaCha20) — 커스텀 암호 경로
+    // (재암호화/VM)는 계속 custom_cipher를 쓰고, 평문 bulk at-rest 경로만 crypto_mode.
+    ctx.crypto_mode = cfg.crypto_mode;
     // M6 Phase-2: OEP→VM entry 전환 — 부트 스텁이 원본 .text를 평문 복호화하지
     // 않고 lift된 프로그램 VM 모듈로 디스패치. (--vm 필요)
     // v59: patch_data가 .rdata/.data 포인터 재배치를 vm_oep 모드에서 원본 .text
@@ -524,6 +532,7 @@ fn main() -> error::Result<()> {
             iat_hide,
             mem_harden,
             ctx.custom_cipher,
+            cfg.crypto_mode == btg_packer::crypto::CryptoMode::ChaCha20,
             args.map,
             args.sym_map,
             args.seed.is_some(),

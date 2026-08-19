@@ -138,6 +138,9 @@ pub struct PipelineContext {
     pub block_ring: bool,
     /// v59: --custom-cipher — BTG-C1 커스텀 512-bit 스트림 사이퍼 사용 (기본 RC4).
     pub custom_cipher: bool,
+    /// v63 (T3-1 Phase B): --crypto-mode — 선택된 crypto primitive (RC4/C1/ChaCha20).
+    /// 커스텀 암호 경로(재암호화/VM)는 이 값 대신 custom_cipher를 계속 쓴다.
+    pub crypto_mode: crate::crypto::CryptoMode,
     /// T1-1: 폴리모픽 VM 시드 (빌드마다 OsRng로 생성).
     pub poly_vm_seed: u64,
     /// T1-1: 폴리모픽 VM 시드 마스킹 분할 저장 값.
@@ -207,6 +210,7 @@ impl PipelineContext {
             vm_prog_total: 0,
             block_ring: false,
             custom_cipher: false,
+            crypto_mode: crate::crypto::CryptoMode::C1,
             poly_vm_seed: 0,
             poly_vm_seed_masked: 0,
             poly_vm_regions: Vec::new(),
