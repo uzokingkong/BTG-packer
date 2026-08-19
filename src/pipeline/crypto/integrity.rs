@@ -91,6 +91,15 @@ pub(crate) fn emit_integrity_mac(seq: &mut Vec<(Instruction, Option<Label>)>, st
     use iced_x86::MemoryOperand as M;
     const PHI: u64 = 0x9E37_79B9_7F4A_7C15u64;
     if stub.integrity {
+        // FIX(full-combo string corruption): the MAC is emitted between
+        // emit_code_decrypt and emit_run_decrypt. emit_code_decrypt leaves the
+        // RC4 PRGA i/j state in ESI/EDI (chained: zeroed at ChainDone; non-chained:
+        // mid-stream after the code-region Prga), and emit_run_decrypt continues
+        // that keystream to decrypt the string literals. The MAC clobbers RSI
+        // (seed_va/mac_va pointers) and RDI (h1), so without saving them the
+        // string runs decrypt to garbage. Preserve RSI/RDI across the MAC.
+        seq.push((Instruction::with1(Code::Push_r64, Register::RSI).unwrap(), None));
+        seq.push((Instruction::with1(Code::Push_r64, Register::RDI).unwrap(), None));
         // R10 = PHI ; RBP = h0 ; RDI = h1 (초기 상태)
         seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R10, PHI).unwrap(), None));
         seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RBP, 0x6A09_E667_F3BC_C909u64).unwrap(), None));
@@ -120,24 +129,25 @@ pub(crate) fn emit_integrity_mac(seq: &mut Vec<(Instruction, Option<Label>)>, st
         // R11b = bind_byte
 
         // ── Phase A: 키(seed_stored) 흡수 — 256바이트 루프 ────────────────────
-        // R9 = init i-계수 0x100000001B3
-        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R9, 0x1000_0000_01B3u64).unwrap(), None));
+        // R9 = init i-계수 0x100000001B3 (Phase A — must match packer BtgKeyedMac::new)
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R9, 0x100_0000_01B3u64).unwrap(), None));
         // RSI = seed_va ; R8D = i = 0
         seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RSI, stub.seed_va).unwrap(), None));
         seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::R8D, Register::R8D).unwrap(), None));
         // MacInitLoop:
         seq.push((Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, M::with_base(Register::RSI)).unwrap(), Some(Label::MacInitLoop)));
         seq.push((Instruction::with2(Code::Xor_rm8_r8, Register::AL, Register::R11L).unwrap(), None)); // b = seed ^ bind_byte
-        // rcx = b*PHI
-        seq.push((Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EAX).unwrap(), None));
-        seq.push((Instruction::with2(Code::Imul_r64_rm64, Register::RCX, Register::R10).unwrap(), None));
-        // rax = rol(h0, i&63)
-        seq.push((Instruction::with2(Code::Mov_r32_rm32, Register::EDX, Register::R8D).unwrap(), None));
-        seq.push((Instruction::with2(Code::And_rm32_imm32, Register::EDX, 63).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_r8_rm8, Register::CL, Register::DL).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RBP).unwrap(), None));
-        seq.push((Instruction::with2(Code::Rol_rm64_CL, Register::RAX, Register::CL).unwrap(), None));
-        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RCX, Register::RAX).unwrap(), None));
+        // FIX: compute rol(h0,i&63) into RAX (CL=shift count) BEFORE building
+        // RCX=b*PHI, and preserve b in RDX — otherwise `mov cl, dl` clobbers the
+        // low byte of RCX holding b*PHI, corrupting the MAC (packer vs runtime mismatch).
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap(), None)); // rdx = b
+        seq.push((Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R8D).unwrap(), None)); // ecx = i
+        seq.push((Instruction::with2(Code::And_rm32_imm32, Register::ECX, 63).unwrap(), None));          // cl = i&63
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RBP).unwrap(), None)); // rax = h0
+        seq.push((Instruction::with2(Code::Rol_rm64_CL, Register::RAX, Register::CL).unwrap(), None));   // rax = rol(h0, i&63)
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::RDX).unwrap(), None)); // rcx = b
+        seq.push((Instruction::with2(Code::Imul_r64_rm64, Register::RCX, Register::R10).unwrap(), None));// rcx = b*PHI
+        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RCX, Register::RAX).unwrap(), None)); // rcx = b*PHI + rol(h0,i&63)
         // rcx += i*0x100000001B3
         seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R8).unwrap(), None));
         seq.push((Instruction::with2(Code::Imul_r64_rm64, Register::RAX, Register::R9).unwrap(), None));
@@ -170,16 +180,17 @@ pub(crate) fn emit_integrity_mac(seq: &mut Vec<(Instruction, Option<Label>)>, st
         seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Label::MacDone)));
         // MacDataLoop:
         seq.push((Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, M::with_base(Register::RSI)).unwrap(), Some(Label::MacDataLoop)));
-        // rcx = b*PHI
-        seq.push((Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EAX).unwrap(), None));
-        seq.push((Instruction::with2(Code::Imul_r64_rm64, Register::RCX, Register::R10).unwrap(), None));
-        // rax = rol(h0, i&63)
-        seq.push((Instruction::with2(Code::Mov_r32_rm32, Register::EDX, Register::R8D).unwrap(), None));
-        seq.push((Instruction::with2(Code::And_rm32_imm32, Register::EDX, 63).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_r8_rm8, Register::CL, Register::DL).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RBP).unwrap(), None));
-        seq.push((Instruction::with2(Code::Rol_rm64_CL, Register::RAX, Register::CL).unwrap(), None));
-        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RCX, Register::RAX).unwrap(), None));
+        // FIX: compute rol(h0,i&63) into RAX (CL=shift count) BEFORE building
+        // RCX=b*PHI, and preserve b in RDX — otherwise `mov cl, dl` clobbers the
+        // low byte of RCX holding b*PHI, corrupting the MAC (packer vs runtime mismatch).
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap(), None)); // rdx = b
+        seq.push((Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R8D).unwrap(), None)); // ecx = i
+        seq.push((Instruction::with2(Code::And_rm32_imm32, Register::ECX, 63).unwrap(), None));          // cl = i&63
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RBP).unwrap(), None)); // rax = h0
+        seq.push((Instruction::with2(Code::Rol_rm64_CL, Register::RAX, Register::CL).unwrap(), None));   // rax = rol(h0, i&63)
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::RDX).unwrap(), None)); // rcx = b
+        seq.push((Instruction::with2(Code::Imul_r64_rm64, Register::RCX, Register::R10).unwrap(), None));// rcx = b*PHI
+        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RCX, Register::RAX).unwrap(), None)); // rcx = b*PHI + rol(h0,i&63)
         // rcx += i*0x9E3779B9
         seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R8).unwrap(), None));
         seq.push((Instruction::with2(Code::Imul_r64_rm64, Register::RAX, Register::R9).unwrap(), None));
@@ -218,6 +229,9 @@ pub(crate) fn emit_integrity_mac(seq: &mut Vec<(Instruction, Option<Label>)>, st
         seq.push((Instruction::with2(Code::Cmp_r64_rm64, Register::RAX, M::with_base(Register::RSI)).unwrap(), None));
         seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Label::MacOk)));
         seq.push((Instruction::with(Code::Ud2), None));
-        seq.push((Instruction::with(Code::Nopd), Some(Label::MacOk)));
+        // restore the PRGA i/j state saved at MAC entry (success path only —
+        // the ud2 failure path never returns here)
+        seq.push((Instruction::with1(Code::Pop_r64, Register::RDI).unwrap(), Some(Label::MacOk)));
+        seq.push((Instruction::with1(Code::Pop_r64, Register::RSI).unwrap(), None));
     }
 }

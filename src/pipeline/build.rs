@@ -164,7 +164,11 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     // 로더가 부트 스텁 복호화 전에 .reloc을 적용하더라도 암호문 슬롯은 skip되어
     // 암호문이 다치지 않는다. 부트 스텁 imm64들(모듈 엔트리 VA 등)은 평문이라
     // reloc되어도 안전하다.
-    let reloc_aware = true; // T0-3: 항상 reloc 시도 (암호화 범위는 encrypted_rva_ranges로 제어)
+    // FIX(T0-3): boot stub/VM runtime is not ASLR-safe (hand-assembled preferred-base
+    // absolute addresses), so the at-rest-encrypted (protected) path disables ASLR/
+    // .reloc entirely. The no-crypto path installs no boot stub and no at-rest
+    // ciphertext, so it keeps the relocation-aware output (ASLR preserved).
+    let reloc_aware = !ctx.at_rest_encrypted;
 
     let mut preserve_aslr_bits = false;
     let mut reloc_section: Option<SectionData> = None;
