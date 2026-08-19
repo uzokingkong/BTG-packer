@@ -21,6 +21,7 @@ use anyhow::{anyhow, Result};
 use crate::vm::bytecode::{BytecodeBuilder, FLAG_MASK};
 use crate::vm::{interp, risc};
 use iced_x86::{Code, Instruction, Register};
+use rand::SeedableRng;
 
 /// Lift `inst` through BOTH paths and run them with identical seeded registers.
 /// Returns (bytecode_state, risc_state) for comparison.
@@ -210,6 +211,7 @@ mod tests {
         let prog = bc.finish();
 
         let mut codes = std::collections::HashSet::new();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
         for _ in 0..3 {
             let m = crate::vm::build_vm_module_mba(
                 0x14000_1000,
@@ -217,6 +219,7 @@ mod tests {
                 0x14000_A000,
                 prog.clone(),
                 EntryMode::Ksa,
+                &mut rng,
             )
             .expect("build mba vm");
             validate_vm_code(&m.code).expect("obfuscated MBA code must validate");
@@ -250,9 +253,10 @@ mod tests {
         .expect("build plain vm");
 
         let mut bad: Vec<String> = Vec::new();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
         for trial in 0..100 {
             let m = crate::vm::build_vm_module_mba(
-                0x14000_1000, 0x14000_9000, 0x14000_A000, prog.clone(), EntryMode::Ksa,
+                0x14000_1000, 0x14000_9000, 0x14000_A000, prog.clone(), EntryMode::Ksa, &mut rng,
             )
             .expect("build mba vm");
             for op in 1..crate::vm::bytecode::NUM_OPS {

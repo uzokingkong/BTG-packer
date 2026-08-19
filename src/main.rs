@@ -542,6 +542,19 @@ fn main() -> error::Result<()> {
             flags,
             input_hash,
             output_hash,
+        )
+        // P3-2/readccc §6.1: capability manifest — effective crypto primitive,
+        // at-rest encryption, ASLR trade-off, integrity, coverage.
+        .with_capabilities(
+            match cfg.crypto_mode {
+                btg_packer::crypto::CryptoMode::Rc4 => "rc4",
+                btg_packer::crypto::CryptoMode::C1 => "c1",
+                btg_packer::crypto::CryptoMode::ChaCha20 => "chacha20",
+            },
+            ctx.at_rest_encrypted,
+            !ctx.at_rest_encrypted,
+            integrity,
+            args.crypto_coverage,
         );
         println!("[+] Build manifest (P3-2):");
         for line in manifest.render().lines() {

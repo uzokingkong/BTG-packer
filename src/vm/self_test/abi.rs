@@ -7,6 +7,7 @@
 // wiring changed.
 
 use rand::RngCore;
+use rand::SeedableRng;
 use anyhow::{Result, anyhow};
 use crate::vm::{bytecode, handlers, interp, ksa, lifter};
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, MemoryOperand, Register};
@@ -438,6 +439,7 @@ pub(crate) fn run_m8_handler_mba_test() -> Result<()> {
     // stub's r9/r10 point at the actual bytecode/table. Returns S-box match.
     let run_module = |use_mba: bool| -> Result<bool> {
         let mut arena = Arena::new(0x20000)?;
+        let mut m8_rng = rand::rngs::StdRng::seed_from_u64(0xA8B1);
         let sbox_va = arena.base + 0x2000;
         let seed_va = arena.base + 0x3000;
         let code_va = arena.base + 0x5000;
@@ -450,7 +452,7 @@ pub(crate) fn run_m8_handler_mba_test() -> Result<()> {
         let vsbox_va = arena.base + 0xB000;
         let tramp_va = arena.base + 0xC000;
         let module = if use_mba {
-            build_vm_module_mba(code_va as u64, table_va as u64, bc_va as u64, bc.clone(), handlers::EntryMode::Ksa)?
+            build_vm_module_mba(code_va as u64, table_va as u64, bc_va as u64, bc.clone(), handlers::EntryMode::Ksa, &mut m8_rng)?
         } else {
             build_vm_module(code_va as u64, table_va as u64, bc_va as u64, bc.clone(), handlers::EntryMode::Ksa)?
         };
@@ -482,7 +484,8 @@ pub(crate) fn run_m8_handler_mba_test() -> Result<()> {
     // absolute addresses are XOR-encrypted, not stored in the clear).
     let (pc, pt, pb) = (0x1000u64, 0x3000u64, 0x4000u64);
     let plain = build_vm_module(pc, pt, pb, bc.clone(), handlers::EntryMode::Ksa)?;
-    let mba = build_vm_module_mba(pc, pt, pb, bc.clone(), handlers::EntryMode::Ksa)?;
+    let mut m8_rng2 = rand::rngs::StdRng::seed_from_u64(0xA8B2);
+    let mba = build_vm_module_mba(pc, pt, pb, bc.clone(), handlers::EntryMode::Ksa, &mut m8_rng2)?;
     assert_ne!(mba.table, plain.table, "[28] MBA table must differ from plaintext table");
     assert_ne!(
         &mba.table[0..8],

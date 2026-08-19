@@ -6,6 +6,7 @@
 // else the plain builder. Used by both the sizing pass and the final placement.
 
 use crate::vm;
+use rand::RngCore;
 
 pub(crate) fn build_vm_mod(
     m8_mod: bool,
@@ -14,9 +15,10 @@ pub(crate) fn build_vm_mod(
     bytecode_va: u64,
     bc: Vec<u8>,
     mode: vm::handlers::EntryMode,
+    rng: &mut impl RngCore,
 ) -> anyhow::Result<vm::VmModule> {
     if m8_mod {
-        vm::build_vm_module_mba(code_va, table_va, bytecode_va, bc, mode)
+        vm::build_vm_module_mba(code_va, table_va, bytecode_va, bc, mode, rng)
     } else {
         vm::build_vm_module(code_va, table_va, bytecode_va, bc, mode)
     }
@@ -35,6 +37,7 @@ pub(crate) fn build_prog_vm_mod(
     state_va: u64,
     ip_map: Option<&std::collections::HashMap<u64, usize>>,
     m8_mod: bool,
+    rng: &mut impl RngCore,
 ) -> anyhow::Result<vm::VmModule> {
     if vm_commercial {
         vm::build_program_vm_commercial(
@@ -47,6 +50,6 @@ pub(crate) fn build_prog_vm_mod(
             ip_map,
         )
     } else {
-        vm::build_program_vm(code_va, table_va, bytecode_va, bc, state_va, m8_mod)
+        vm::build_program_vm(code_va, table_va, bytecode_va, bc, state_va, m8_mod, rng)
     }
 }

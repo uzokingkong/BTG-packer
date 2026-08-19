@@ -105,4 +105,46 @@ mod tests {
         let c = run_full(&input, 3, 100, None, Some(0x5678)).expect("pack seed B");
         assert_ne!(a, c, "different seeds should (usually) differ in output");
     }
+
+    /// readccc.md §4.2 회귀: `--seed --vm --m8`는 과거 `build_vm_module_mba`의
+    /// 내부 `rand::thread_rng()` 때문에 같은 seed로 두 번 빌드해도 다른 바이트를
+    /// 냈다 (결정적 빌드 계약 위반). 이제 MBA immediate 키가 단일 시드 RNG
+    /// (`ctx.rng`)에서 파생되므로 바이트 동일해야 한다.
+    #[test]
+    fn deterministic_seed_vm_m8_same_bytes() {
+        let input = crate::pe::generate_dummy_target_pe().expect("generate dummy PE");
+        let pack = |seed: u64| -> Vec<u8> {
+            let info = TargetPeInfo::parse(&input).expect("parse");
+            let section_alignment = if info.section_alignment == 0 { 0x1000 } else { info.section_alignment };
+            let dispatcher_rva: u32 = info
+                .relayed_sections
+                .iter()
+                .map(|s| {
+                    s.virtual_address
+                        + ((s.virtual_size.max(s.bytes.len() as u32) + section_alignment - 1) / section_alignment)
+                            * section_alignment
+                })
+                .max()
+                .unwrap_or(0x2000);
+            let dispatcher_va = info.image_base + dispatcher_rva as u64;
+            let mut ctx = PipelineContext::new(info, dispatcher_va, dispatcher_rva, 3);
+            ctx.rng = StdRng::seed_from_u64(seed);
+            ctx.mba_constant = ctx.rng.next_u32();
+            ctx.m8 = true; // --m8: MBA-obfuscated handler table
+            pass1_slice::run(&mut ctx).expect("pass1");
+            pass2_shuffle::run(&mut ctx).expect("pass2");
+            pass3_encode::run(&mut ctx).expect("pass3");
+            pass4_section::run(&mut ctx, false, true, false).expect("pass4");
+            let relayed = ctx.target_info.relayed_sections.clone();
+            patch_data::run(&mut ctx, relayed).expect("patch");
+            // vm=true → KSA/PRGA VM 모듈이 build_vm_module_mba 경로를 탄다.
+            crypto::run(&mut ctx, true, false, true, 100, true, false, false, false).expect("crypto");
+            build::run(&ctx, None).expect("build")
+        };
+        let a = pack(0x1234);
+        let b = pack(0x1234);
+        assert_eq!(a, b, "--seed --vm --m8 must be byte-identical (readccc §4.2 determinism)");
+        assert!(!a.is_empty());
+        assert_ne!(a, input);
+    }
 }

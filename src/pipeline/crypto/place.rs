@@ -201,10 +201,10 @@ pub(crate) fn place_boot_stub(
     let vm_mod: Option<vm::VmModule> = if vm_effective {
         if c1_mode {
             let bc = vm::c1::build_c1_init_bytecode();
-            Some(build_vm_mod(m8_mod, 0, 0, 0, bc, vm::handlers::EntryMode::C1Init)?)
+            Some(build_vm_mod(m8_mod, 0, 0, 0, bc, vm::handlers::EntryMode::C1Init, rng)?)
         } else {
             let bc = vm::lifter::lift_ksa(&vm::ksa::build_ksa_instructions(0, k1, k2, k3))?;
-            Some(build_vm_mod(m8_mod, 0, 0, 0, bc, vm::handlers::EntryMode::Ksa)?)
+            Some(build_vm_mod(m8_mod, 0, 0, 0, bc, vm::handlers::EntryMode::Ksa, rng)?)
         }
     } else {
         None
@@ -217,6 +217,7 @@ pub(crate) fn place_boot_stub(
             0, 0, 0,
             vm::prga::build_prga_bytecode(),
             vm::handlers::EntryMode::Prga,
+            rng,
         )?)
     } else {
         None
@@ -226,7 +227,7 @@ pub(crate) fn place_boot_stub(
     let vm_prog_mod: Option<vm::VmModule> = if vm_oep_effective {
         // use the lift computed above (before the 1st-pass stub) so the entry
         // decision and the module bytecode come from the same single lift.
-        Some(build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed, 0, 0, 0, vm_prog_bytecode, 0, vm_prog_ip_map.as_ref(), m8_mod)?)
+        Some(build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed, 0, 0, 0, vm_prog_bytecode, 0, vm_prog_ip_map.as_ref(), m8_mod, rng)?)
     } else {
         None
     };
@@ -728,6 +729,7 @@ pub(crate) fn place_boot_stub(
             vm_va + (m.code.len() + m.table.len()) as u64,
             m.bytecode.clone(),
             mode,
+            rng,
         )?;
         let vm_end = vm_off + module.total_len();
         if vm_end > boot_off + BOOT_AREA_RESERVE {
@@ -761,6 +763,7 @@ pub(crate) fn place_boot_stub(
             pva + (m.code.len() + m.table.len()) as u64,
             m.bytecode.clone(),
             vm::handlers::EntryMode::Prga,
+            rng,
         )?;
         let pend = vm_prga_off + pmod.total_len();
         if pend > boot_off + BOOT_AREA_RESERVE {
@@ -796,6 +799,7 @@ let prmod = build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed,
               vm_prog_state_va,
               vm_prog_ip_map.as_ref(),
               m8_mod,
+              rng,
           )?;
         let prend = vm_prog_off + prmod.total_len();
         if prend > boot_off + BOOT_AREA_RESERVE {

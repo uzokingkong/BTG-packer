@@ -7,7 +7,8 @@ use super::encode::encode_trampoline;
 use super::{build_vm_module_mba, VM_STATE_SIZE};
 use crate::vm::{handlers, interp, ksa, lifter};
 use anyhow::{Result, anyhow};
-use rand::RngCore;
+use rand::rngs::StdRng;
+use rand::{RngCore, SeedableRng};
 
 /// M8 (v45): VM 성능 벤치마크 — `--vm-bench`.
 ///
@@ -36,7 +37,8 @@ pub fn run_vm_bench() -> Result<()> {
     let state_va = arena.base + 0x9000;
     let vsbox_va = arena.base + 0xA000;
     let tramp_va = arena.base + 0xB000;
-    let module = build_vm_module_mba(code_va as u64, table_va as u64, bc_va as u64, bc.clone(), handlers::EntryMode::Ksa)?;
+    let mut m8_rng = StdRng::seed_from_u64(0xB7AB);
+    let module = build_vm_module_mba(code_va as u64, table_va as u64, bc_va as u64, bc.clone(), handlers::EntryMode::Ksa, &mut m8_rng)?;
     handlers::validate_vm_code(&module.code)?;
     let tramp = encode_trampoline(state_va as u64, vsbox_va as u64, seed_va as u64, code_va as u64, tramp_va as u64)?;
     {

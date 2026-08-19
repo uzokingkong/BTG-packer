@@ -40,6 +40,19 @@ pub struct BuildManifest {
     pub crypto_version: u32,
     /// Effective feature flags (ordered, CSV in `render`).
     pub feature_flags: Vec<String>,
+    /// v63/P3-2: effective crypto primitive (`rc4`/`c1`/`chacha20`) used by the
+    /// boot stub at-rest decryption (readccc.md §6.1 capability manifest).
+    pub crypto_mode: String,
+    /// v63/P3-2: at-rest encryption was applied to the code region and/or data runs.
+    pub at_rest_encryption: bool,
+    /// v63/P3-2: ASLR (relocation-aware output) preserved. at-rest encryption
+    /// disables it (loader relocation would corrupt ciphertext) — record the
+    /// trade-off so the artifact states its guarantees.
+    pub aslr_preserved: bool,
+    /// v63/P3-2: integrity (CRC32 + keyed-MAC) active.
+    pub integrity: bool,
+    /// v63/P3-2: effective crypto coverage (%).
+    pub crypto_coverage: u32,
     /// SHA-256 (hex) of the input PE bytes.
     pub input_hash: String,
     /// SHA-256 (hex) of the output PE bytes.
@@ -66,9 +79,33 @@ impl BuildManifest {
             vm_version: VM_VERSION,
             crypto_version: CRYPTO_VERSION,
             feature_flags,
+            crypto_mode: "c1".to_string(),
+            at_rest_encryption: false,
+            aslr_preserved: true,
+            integrity: false,
+            crypto_coverage: 0,
             input_hash,
             output_hash,
         }
+    }
+
+    /// P3-2/readccc §6.1: record effective protection capabilities so the
+    /// artifact self-describes its guarantees (crypto primitive, at-rest,
+    /// ASLR trade-off, integrity, coverage).
+    pub fn with_capabilities(
+        mut self,
+        crypto_mode: &str,
+        at_rest_encryption: bool,
+        aslr_preserved: bool,
+        integrity: bool,
+        crypto_coverage: u32,
+    ) -> Self {
+        self.crypto_mode = crypto_mode.to_string();
+        self.at_rest_encryption = at_rest_encryption;
+        self.aslr_preserved = aslr_preserved;
+        self.integrity = integrity;
+        self.crypto_coverage = crypto_coverage;
+        self
     }
 
     /// Render as `key = value` lines (one per field), CSV for feature_flags.
@@ -85,6 +122,11 @@ impl BuildManifest {
         out.push_str(&format!("input_hash = {}\n", self.input_hash));
         out.push_str(&format!("output_hash = {}\n", self.output_hash));
         out.push_str(&format!("feature_flags = {}\n", self.feature_flags.join(",")));
+        out.push_str(&format!("crypto_mode = {}\n", self.crypto_mode));
+        out.push_str(&format!("at_rest_encryption = {}\n", self.at_rest_encryption));
+        out.push_str(&format!("aslr_preserved = {}\n", self.aslr_preserved));
+        out.push_str(&format!("integrity = {}\n", self.integrity));
+        out.push_str(&format!("crypto_coverage = {}\n", self.crypto_coverage));
         out
     }
 

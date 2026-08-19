@@ -1,0 +1,6 @@
+# P0-4 (readccc.md §4.1): toolchain pin — clean checkout에서 동일 toolchain 보장.
+# bump on a deliberate toolchain upgrade; keep in lockstep with CI (dtolnay/rust-toolchain).
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

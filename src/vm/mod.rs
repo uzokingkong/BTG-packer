@@ -99,15 +99,20 @@ pub fn build_vm_module(
 /// loaded handler entry with `K` before `jmp` ??so handler addresses are never
 /// stored (nor `K` embedded) as a single plaintext constant. This is the opt-in
 /// `--m8` path; the default `build_vm_module` above is byte-identical to pre-M8.
+///
+/// P3-1 (결정적 빌드): `rng`는 **호출자가 공급**해야 한다 (`--seed` 시 단일 시드
+/// RNG). 과거 `rand::thread_rng()`를 내부에서 생성해 `--seed --m8` 빌드가 매번
+/// 다른 출력을 냈다 — readccc.md §4.2 (build-affecting randomness는 하나의
+/// derivation tree에서만). 이제 패커는 `ctx.rng`를, 테스트/벤치는 고정 시드
+/// RNG를 넘긴다.
 pub fn build_vm_module_mba(
     code_va: u64,
     table_va: u64,
     bytecode_va: u64,
     bytecode: Vec<u8>,
     mode: handlers::EntryMode,
+    rng: &mut impl RngCore,
 ) -> Result<VmModule> {
-    use rand::RngCore;
-    let mut rng = rand::thread_rng();
     // Two random immediates whose MBA sum is the table key. Pick b so that
     // K = a + b is non-zero (avoid an identity key).
     let a: u64 = rng.next_u64();
@@ -139,9 +144,10 @@ pub fn build_program_vm(
     bytecode: Vec<u8>,
     state_va: u64,
     m8: bool,
+    rng: &mut impl RngCore,
 ) -> Result<VmModule> {
     let m = if m8 {
-        build_vm_module_mba(code_va, table_va, bytecode_va, bytecode, handlers::EntryMode::Program)?
+        build_vm_module_mba(code_va, table_va, bytecode_va, bytecode, handlers::EntryMode::Program, rng)?
     } else {
         build_vm_module(code_va, table_va, bytecode_va, bytecode, handlers::EntryMode::Program)?
     };
