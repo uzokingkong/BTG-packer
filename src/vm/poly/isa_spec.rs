@@ -135,6 +135,10 @@ impl VirtualIsaSpec {
                 }
             }
         }
+        // F1: 네이티브 브릿지 FP 리턴 힌트 (0=정수/무시, 4=f32, 8=f64).
+        ops.push(RiscOp::SetNativeFpReturn { width: 0 });
+        ops.push(RiscOp::SetNativeFpReturn { width: 4 });
+        ops.push(RiscOp::SetNativeFpReturn { width: 8 });
 
         let mut used_bytes = std::collections::HashSet::new();
         let mut opcode_map = HashMap::new();

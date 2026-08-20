@@ -345,6 +345,9 @@ impl PolymorphicInterpreter {
                     // 인지된 no-op 스텁. 실제 네이티브/호스트 콜은 런타임 계층(Phase P3) 책임.
                     // 평가된 피연산자 바이트는 스트림에서 소비됐지만 VM 상태에는 영향을 주지 않는다.
                 }
+                RiscOp::SetNativeFpReturn { .. } => {
+                    // F1: 네이티브 브릿지 FP 리턴 힌트 — 폴리 경로엔 브릿지가 없으므로 no-op.
+                }
                 RiscOp::VmCallBridge => {
                     // P1 (③): 인지된 no-op 스텁 — 서브 VM 레지스트리 기반 실제
                     // nested-VM 실행은 런타임 계층(P3 상용 통합) 책임. `is_encodable`

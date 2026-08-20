@@ -169,6 +169,15 @@ pub enum RiscOp {
     FloatToInt { src_bits: u8, dst_bits: u8, truncate: bool },
     FloatToFloat { src_bits: u8, dst_bits: u8 },
 
+    /// F1: 네이티브 브릿지 FP 리턴 힌트 — `width`(0=정수/무시, 4=f32, 8=f64).
+    ///
+    /// 상용 self-decoding 디스패처가 네이티브 콜 직후 VM 상태 슬롯 `FP_RET_OFF`
+    /// (0xE8)에 이 폭을 기록해, 브릿지가 반환값을 XMM0(FP) 대신 RAX(정수) 중
+    /// 어느 것에서 regs[0] 로 동기화할지 결정한다. 참조 `eval_state` 와 폴리
+    /// 인터프리터, 그리고 블록 단위 하네스에서는 no-op(네이티브 브릿지가 없는
+    /// 경로) — FP 리턴 값은 XMM 슬롯/레지스터로만 전달되므로 가상 상태 불변.
+    SetNativeFpReturn { width: u8 },
+
     // ── P1 (보고서 ②): packed SSE — XMM 슬롯(16바이트 가상 메모리) 기반 ────────
     // XMM 슬롯은 XMM_SLOT_BASE + idx*16 의 16바이트 가상 메모리로 모델링된다.
     // packed op 는 슬롯 **주소**(src1/src2/dst)를 피연산자로 받아 내부에서

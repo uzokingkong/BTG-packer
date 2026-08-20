@@ -986,17 +986,124 @@
         }
     }
 
-    /// P1-8: 네이티브 브릿지(nf_real)가 Win64 FP ABI 를 위해 VM XMM 슬롯
-    /// (state+XMM_OFF, XMM_SLOTS×16B)에서 XMM0-5 를 물질화/동기화하는 `movups`
-    /// 시퀀스를 생성하는지 검증한다. (실제 FP 인자 전달은 lifter/ABI 분석이 XMM
-    /// 슬롯을 채울 때 의미 — 브릿지의 전달 경로 자체가 ABI-정확함을 고정한다.)
+    /// F1: 네이티브 브릿지(nf_real)가 Win64 FP ABI 를 실제로 구현하는지 검증한다.
+    ///  - positional XMM0-3 미러링: FP 인자(regs[1]..=regs[4] = RCX/RDX/R8/R9)를
+    ///    `movq xmmN, gpr` 로 전달한다 (Win64: i 번째 인자가 FP 이면 XMM[i-1]).
+    ///  - FP 리턴: `SetNativeFpReturn{4/8}` 힌트가 FP_RET_OFF 슬롯에 기록되면,
+    ///    브릿지가 반환값을 XMM0(FP)의 low 폭 바이트에서 regs[0] 으로 동기화한다.
+    ///  네이티브 callee(arena 안)를 실제로 호출해 결과를 확인하는 실행 검증.
     #[test]
-    fn test_bridge_emits_xmm_pass_through() {
+    fn test_native_bridge_fp_arg_and_return_matches_abi() {
+        for (w, callee, val, expected) in [
+            (8u8, Code::Mulsd_xmm_xmmm64, 2.5f64.to_bits(), 6.25f64.to_bits()),          // 2.5*2.5
+            (4u8, Code::Mulss_xmm_xmmm32, 2.5f32.to_bits() as u64, 6.25f32.to_bits() as u64), // f32
+        ] {
+            for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
+                let mut arena = Arena::new(ARENA_SIZE).unwrap();
+                // native callee: op xmm0, xmm0 ; ret  (squares XMM0).
+                let callee_off = 0x30000usize;
+                {
+                    let buf = arena.bytes();
+                    let callee_instrs = vec![
+                        Instruction::with2(callee, Register::XMM0, Register::XMM0).unwrap(),
+                        Instruction::with(Code::Retnq),
+                    ];
+                    let blk = iced_x86::InstructionBlock::new(&callee_instrs, 0x140000000);
+                    let enc = iced_x86::BlockEncoder::encode(
+                        64,
+                        blk,
+                        iced_x86::BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+                    )
+                    .unwrap();
+                    buf[callee_off..callee_off + enc.code_buffer.len()].copy_from_slice(&enc.code_buffer);
+                }
+                let callee_va = (arena.base + callee_off) as u64;
+
+                // RISC program: arg1(regs[1]=RCX→XMM0) = FP 값; FP-return 힌트;
+                // push ret_ip; branch to native callee (not in ip_map → bridge); Halt.
+                let build_prog = |ret_ip: u64| {
+                    let mut d = RiscDesynthesizer::new();
+                    d.instrs.push(
+                        MicroInstr::new(RiscOp::Mov)
+                            .with_dst(MicroOperand::VReg(1))
+                            .with_src1(MicroOperand::Imm64(val)),
+                    );
+                    d.instrs.push(MicroInstr::new(RiscOp::SetNativeFpReturn { width: w }));
+                    d.instrs.push(MicroInstr::new(RiscOp::VirtualPush).with_src1(MicroOperand::Imm64(ret_ip)));
+                    d.instrs.push(
+                        MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Always })
+                            .with_imm(callee_va),
+                    );
+                    d.instrs.push(MicroInstr::new(RiscOp::Halt));
+                    RiscProgram::new(d.instrs)
+                };
+
+                // 첫 인코딩으로 Halt 의 바이트 오프셋(=ret_ip) 확보 후 재인코딩.
+                let probe = build_prog(0);
+                let mut enc = PolymorphicEncoder::new(seed);
+                let (_, offsets) = enc.encode_with_offsets(&probe).unwrap();
+                let ret_ip = offsets[offsets.len() - 1] as u64; // Halt offset
+                let prog = build_prog(ret_ip);
+                let mut enc = PolymorphicEncoder::new(seed);
+                let bytecode = enc.encode(&prog).unwrap();
+
+                let code_off = OFF_CODE;
+                let table_off = OFF_TABLE;
+                let bytecode_off = OFF_BYTECODE;
+                let state_off = OFF_STATE;
+                let code_va = (arena.base + code_off) as u64;
+                let table_va = (arena.base + table_off) as u64;
+                let bytecode_va = (arena.base + bytecode_off) as u64;
+                let state_va = (arena.base + state_off) as u64;
+                let stack_base = (arena.base + OFF_STACK_BASE) as u64;
+
+                let parts = build_self_decoding_parts_with(
+                    &bytecode, seed, code_va, table_va, bytecode_va, state_va, stack_base, None,
+                )
+                .expect("build parts");
+
+                {
+                    let buf = arena.bytes();
+                    buf[code_off..code_off + parts.code.len()].copy_from_slice(&parts.code);
+                    for (i, v) in parts.table.iter().enumerate() {
+                        buf[table_off + i * 8..table_off + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+                    }
+                    buf[OFF_OP_OFFS..OFF_OP_OFFS + 256].copy_from_slice(&parts.offs_tab);
+                    buf[OFF_OP_FLAGS..OFF_OP_FLAGS + 256].copy_from_slice(&parts.flags_tab);
+                    buf[OFF_COND_CODES..OFF_COND_CODES + 256].copy_from_slice(&parts.cond_codes);
+                    buf[OFF_BRANCH_MAP..OFF_BRANCH_MAP + parts.branch_map.len()]
+                        .copy_from_slice(&parts.branch_map);
+                    buf[bytecode_off..bytecode_off + bytecode.len()].copy_from_slice(&bytecode);
+                    buf[state_off..state_off + STATE_END as usize].fill(0);
+                    buf[OFF_STACK_BASE - 0x2000..OFF_STACK_BASE].fill(0);
+                    buf[state_off + REGS_OFF as usize + 8..state_off + REGS_OFF as usize + 16]
+                        .copy_from_slice(&val.to_le_bytes()); // regs[1] = FP arg
+                }
+
+                arena.call(code_off);
+
+                let buf = arena.bytes();
+                let s = state_off;
+                let r0 = u64::from_le_bytes(buf[s + 0x00..s + 0x08].try_into().unwrap());
+                // 브릿지가 FP 리턴을 XMM0 에서 가져와 regs[0] 로 썼어야 한다.
+                assert_eq!(
+                    r0, expected,
+                    "w{w} seed {seed:#x}: bridge FP return regs[0] wrong (got {r0:#x}, want {expected:#x})"
+                );
+                // FP 인자가 XMM0 으로 전달됐는지 간접 증명: callee 는 xmm0*xmm0 를 했으므로
+                // regs[0] = val*val 가 성립하면 positional mirror 가 정확히 동작한 것이다.
+                assert_ne!(r0, val, "w{w} seed {seed:#x}: callee did not square XMM0 (arg not delivered?)");
+            }
+        }
+    }
+
+    /// F1: 네이티브 브릿지의 positional XMM 미러(movq xmmN, rcx/rdx/r8/r9)와
+    /// FP 리턴 동기화(movq rax,xmm0 / movd eax,xmm0) 시퀀스가 코드에 존재하는지.
+    #[test]
+    fn test_bridge_emits_xmm_mirror_and_fp_return() {
         use crate::vm::poly::PolymorphicDecoder;
         let seed = 0x13579BDF2468ACE0u64;
         let mut d = RiscDesynthesizer::new();
-        // 가상 스택에 ret_ip push 후 branch-map 에 없는 target 으로 분기 → 네이티브
-        // 브릿지 진입 (구조 검증이 목적이므로 실행 결과보다 코드 생성 확인).
         d.instrs.push(MicroInstr::new(RiscOp::VirtualPush).with_src1(MicroOperand::Imm64(0x140001002)));
         d.instrs.push(
             MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Always })
@@ -1023,30 +1130,27 @@
         let parts = build_self_decoding_parts(&bytecode, seed, code_va, table_va, bytecode_va, state_va, stack_base)
             .expect("build parts");
 
-        // 디스패처 코드를 디코드해 movups xmmN, [r12 + XMM_OFF + N*16] (load) 와
-        // movups [r12 + XMM_OFF + N*16], xmmN (store) 가 모두 존재하는지 확인.
-        let mut loads = [false; 6];
-        let mut stores = [false; 6];
+        let mut mir = [false; 4];
+        let mut ret_movq = false;
+        let mut ret_movd = false;
         let mut dec = iced_x86::Decoder::with_ip(64, &parts.code, code_va, iced_x86::DecoderOptions::NONE);
         while dec.can_decode() {
             let ins = dec.decode();
-            if ins.memory_base() == Register::R12 {
-                let disp = ins.memory_displacement64();
-                let d = disp as i64;
-                if (0..6).any(|i| d == XMM_OFF as i64 + i as i64 * 16) {
-                    let idx = ((d - XMM_OFF as i64) / 16) as usize;
-                    if idx < 6 {
-                        match ins.code() {
-                            Code::Movups_xmm_xmmm128 => loads[idx] = true,
-                            Code::Movups_xmmm128_xmm => stores[idx] = true,
-                            _ => {}
+            match ins.code() {
+                Code::Movq_xmm_rm64 => {
+                    for (i, gpr) in [Register::RCX, Register::RDX, Register::R8, Register::R9].iter().enumerate() {
+                        if ins.op1_register() == *gpr {
+                            mir[i] = true;
                         }
                     }
                 }
+                Code::Movq_rm64_xmm => ret_movq = true,  // f64 return sync
+                Code::Movd_rm32_xmm => ret_movd = true,  // f32 return sync
+                _ => {}
             }
         }
-        assert!(loads.iter().all(|&b| b), "bridge must materialize XMM0-5 before the native call (loads={loads:?})");
-        assert!(stores.iter().all(|&b| b), "bridge must sync XMM0-5 back after the native call (stores={stores:?})");
+        assert!(mir.iter().all(|&b| b), "bridge must mirror regs[1..4] -> XMM0-3 (mir={mir:?})");
+        assert!(ret_movq && ret_movd, "bridge must support FP return sync (movq rax,xmm0 + movd eax,xmm0)");
     }
 
     /// Differential: native self-decoding Divide/IDivide == interpreter ==

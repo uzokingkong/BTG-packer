@@ -753,6 +753,8 @@ RiscOp::Halt => {
             | RiscOp::IntToFloat { .. }
             | RiscOp::FloatToInt { .. }
             | RiscOp::FloatToFloat { .. }
+            // F1: FP 리턴 힌트 — 블록 단위 하네스엔 네이티브 브릿지가 없으므로 no-op.
+            | RiscOp::SetNativeFpReturn { .. }
             // P1 (②): packed SSE — XMM 슬롯(16B 가상 메모리) 기반이라 네이티브
             // arena 에 매핑되지 않는다. emit_block 네이티브 하네스에서는 no-op 으로
             // 두고 (참조 eval_state / poly 인터프리터에서 실행), 상용 `--vm-commercial`

@@ -106,6 +106,34 @@ impl RiscProgram {
         self.sub_vms.get(&id)
     }
 
+    /// F1: 네이티브 콜 사이트의 FP 리턴 힌트 주입.
+    ///
+    /// 직접 콜은 `VirtualPush(ret_ip); VirtualBranch{Always}.with_imm(target)` 로
+    /// lift 된다. `fp_returns`(타깃 VA → 4=f32 / 8=f64)에 해당 타깃이 있으면 그
+    /// VirtualBranch **직전**에 `SetNativeFpReturn{width}` 를 삽입해, 타깃이
+    /// branch-map 에 없어 네이티브 브릿지로 나갈 때 반환값을 XMM0(FP)에서
+    /// regs[0] 으로 동기화하도록 한다. (VM 내부 타깃이면 브릿지가 안 쓰이므로
+    /// 무해한 스테일 슬롯 기록일 뿐.)
+    pub fn annotate_native_fp_returns(&mut self, fp_returns: &std::collections::HashMap<u64, u8>) {
+        if fp_returns.is_empty() {
+            return;
+        }
+        let mut out = Vec::with_capacity(self.instrs.len() + fp_returns.len());
+        for ins in &self.instrs {
+            if let RiscOp::VirtualBranch { cond: BranchCondition::Always } = ins.op {
+                if ins.src1.is_none() {
+                    if let Some(&w) = fp_returns.get(&ins.imm) {
+                        if w == 4 || w == 8 {
+                            out.push(MicroInstr::new(RiscOp::SetNativeFpReturn { width: w }));
+                        }
+                    }
+                }
+            }
+            out.push(ins.clone());
+        }
+        self.instrs = out;
+    }
+
 /// ip_map(???裕?IP ???熬곣뫁夷?윜諛몄굡???筌뤾퍓???????????釉뚯뫅????濚???? x86 IP??
     /// ?熬곣뫁夷?윜諛몄굡???筌뤾퍓????댁Ŧ ??怨댄맍??類ｋ펲. (ip_map????怨몃さ嶺?imm???잙갭梨????筌뤾퍓????댁Ŧ ??????
     /// eval_state??VirtualBranch?? ???됰뎄????怨댄맍)
@@ -463,6 +491,7 @@ impl RiscProgram {
                     }
                 }
                 RiscOp::NativeCallBridge => {}
+                RiscOp::SetNativeFpReturn { .. } => {}
                 // ── P1 (③): VM→VM 콜 브릿지 — 서브 VM 실행 후 복귀 ──────────────
                 // 호출자 상태(regs/temps/flags/vsp/stack)를 스냅샷하고, `imm`의
                 // 프로그램 id 로 서브 VM을 **현재 regs/mem** 위에서 실행한다 (인자는
@@ -969,6 +998,7 @@ impl RiscProgram {
                 }
             }
             RiscOp::NativeCallBridge => ExecResult::Next,
+            RiscOp::SetNativeFpReturn { .. } => ExecResult::Next,
             RiscOp::VmCallBridge => ExecResult::Next,
             RiscOp::Multiply { signed, width } => {
                 let a = get_val(ins.src1, st, flags.raw);

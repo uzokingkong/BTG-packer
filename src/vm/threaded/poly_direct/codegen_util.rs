@@ -33,6 +33,12 @@ pub(crate) const DEC_IMM1: i32 = 0x0D8; // u64
 pub(crate) const DEC_IMM2: i32 = 0x0E0; // u64
 pub(crate) const DEC_CIN: i32 = 0x0E8;  // u64
 pub(crate) const STATE_END: i32 = 0x100;
+/// F1: 네이티브 브릿지 FP 리턴 폭 슬롯 (u64, 0=정수/무시, 4=f32, 8=f64).
+/// 상용 self-decoding 디스패처의 `SetNativeFpReturn{width}` 핸들러가 기록하고,
+/// 브릿지(nf_real)가 네이티브 콜 후 반환값을 XMM0(FP) 대신 RAX(정수) 중 어느
+/// 것에서 regs[0] 로 동기화할지 결정한다. DEC_* (0xD0..0xEF) 와 겹치지 않는
+/// 여유 영역 0xF0..0xFF 사용.
+pub(crate) const FP_RET_OFF: i32 = 0x0F0;
 /// P1-8: Win64 FP/vector ABI — 네이티브 브릿지가 VM 상태의 XMM 슬롯에서
 /// XMM0-5 로 물질화/동기화한다 (state_base + XMM_OFF, 6 × 16B). 로더가 이
 /// 슬롯에 FP 인자를 심으면 (lifter/ABI 분석 — 후속) 브릿지가 ABI-정확하게

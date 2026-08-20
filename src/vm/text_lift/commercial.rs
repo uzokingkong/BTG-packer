@@ -42,6 +42,79 @@ fn block_poly_liftable(real: &[Instruction]) -> bool {
     true
 }
 
+/// F1: 네이티브 유지(제외) 함수 중 **FP 리턴** 함수를 감지 — VA → (4=f32, 8=f64).
+///
+/// 보수적 휴리스틱: 함수를 디코드해 (a) FP-클래스 연산이 XMM0 를 마지막으로 쓰는
+/// (예: `movsd xmm0,[x]; ret`, `addsd xmm0,xmm1; ...; ret`) 반면 (b) 그 뒤에
+/// RAX/EAX/AX/AL 를 다시 쓰는 (=정수 리턴) 쓰기가 없으면 FP 리턴으로 분류한다.
+/// 순수 스칼라 FP 산술/cvtsi2*/movsd/movss 만 세고, 모호한 movaps/movups/movq
+/// (벡터/정수 이동일 수 있음) 는 세지 않는다 — false positive 는 브릿지가 정수
+/// 리턴을 XMM0(가비지)에서 읽는 조용한 오답으로 이어지므로 보수적으로.
+/// 이 분류 결과는 `RiscProgram::annotate_native_fp_returns` 로 직접 콜 사이트에
+/// `SetNativeFpReturn{width}` 힌트를 주입하는 데 쓰인다.
+fn detect_fp_return_functions(
+    text_bytes: &[u8],
+    base_va: u64,
+    func_ranges: &[(u64, u64)],
+) -> HashMap<u64, u8> {
+    use iced_x86::{Decoder, DecoderOptions, OpKind, Register};
+    let mut out = HashMap::new();
+    for &(s, e) in func_ranges {
+        if e <= s {
+            continue;
+        }
+        let off = s.wrapping_sub(base_va) as usize;
+        if off + 1 > text_bytes.len() {
+            continue;
+        }
+        let len = (e - s) as usize;
+        let end = len.min(text_bytes.len().saturating_sub(off));
+        let mut dec = Decoder::with_ip(64, &text_bytes[off..off + end], s, DecoderOptions::NONE);
+        let mut width: u8 = 0;
+        let mut last_xmm0_fp: Option<u64> = None;
+        let mut last_rax_write: Option<u64> = None;
+        while dec.can_decode() {
+            let inst = dec.decode();
+            let m = format!("{:?}", inst.mnemonic()).to_ascii_lowercase();
+            let writes_xmm0 = inst.op_count() > 0
+                && inst.op0_kind() == OpKind::Register
+                && inst.op0_register() == Register::XMM0;
+            if writes_xmm0 {
+                // FP-클래스 스칼라: sd/ss 접미 산술 + 변환 + FP 로드.
+                let fp_class = m.ends_with("sd") || m.ends_with("ss") || m.starts_with("cvtsi2");
+                if fp_class {
+                    let w = if m.ends_with("sd") || m.starts_with("cvtsi2") && m.ends_with("sd") {
+                        8u8
+                    } else {
+                        4u8
+                    };
+                    width = width.max(w);
+                    last_xmm0_fp = Some(inst.ip());
+                }
+            }
+            let writes_rax = inst.op_count() > 0
+                && inst.op0_kind() == OpKind::Register
+                && matches!(inst.op0_register(), Register::RAX | Register::EAX | Register::AX | Register::AL);
+            if writes_rax {
+                last_rax_write = Some(inst.ip());
+            }
+        }
+        // XMM0 FP 쓰기가 RAX 마지막 쓰기 **이후**이면 FP 리턴 (RAX 재쓰기가 없으면 FP).
+        if let Some(xmm) = last_xmm0_fp {
+            match last_rax_write {
+                None => {
+                    out.insert(s, width);
+                }
+                Some(rax) if rax < xmm => {
+                    out.insert(s, width);
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 
 /// P3 (G1): --vm-oep 상용 엔진 백엔드용 프로그램 리프트 결과.
 #[derive(Debug, Clone)]
@@ -362,6 +435,19 @@ pub fn lift_program_cfg_commercial(
         println!(
             "[+] P0-① boundary atomicity: redirected {} direct branch(es) to excluded function entry (prologue-preserving native bridge)",
             redirected
+        );
+    }
+
+    // F1: 네이티브 유지 함수의 FP 리턴 감지 → 직접 콜 사이트에 SetNativeFpReturn
+    // 힌트 주입. 네이티브 브릿지가 double/float 리턴 함수를 XMM0(FP)가 아니라
+    // RAX(정수)에서 읽는 조용한 오답을 막는다. (보수적 — false positive 는 정수
+    // 함수를 XMM0 가비지로 잘못 읽으므로 위험.)
+    let fp_returns = detect_fp_return_functions(text_bytes, base_va, &excl.func_ranges);
+    if !fp_returns.is_empty() {
+        program.annotate_native_fp_returns(&fp_returns);
+        println!(
+            "[+] F1 bridge FP-return: {} native function(s) detected as FP-returning (f32/f64) — SetNativeFpReturn hints injected",
+            fp_returns.len()
         );
     }
 

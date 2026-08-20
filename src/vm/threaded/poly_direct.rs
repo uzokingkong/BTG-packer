@@ -33,7 +33,7 @@ pub(crate) use codegen_util::{
     ARENA_SIZE, C1, C2, C3, C4, C5, DEC_CIN, DEC_DST, DEC_IMM1, DEC_IMM2, DEC_SRC1, DEC_SRC2, DEC_COND,
     FLAG_MASK, FLAGS_OFF, K_IMM, K_NONE, K_REG, OFF_BRANCH_MAP, OFF_BYTECODE, OFF_COND_CODES, OFF_CODE,
     OFF_OP_FLAGS, OFF_OP_OFFS, OFF_STACK_BASE, OFF_STATE, OFF_TABLE, REGS_OFF, STATE_END,
-    TEMPS_OFF, VSP_OFF, XMM_OFF, XMM_SLOTS,
+    TEMPS_OFF, VSP_OFF, XMM_OFF, XMM_SLOTS, FP_RET_OFF,
     COND_ABOVE, COND_ABOVE_OR_EQUAL, COND_ALWAYS, COND_BELOW, COND_BELOW_OR_EQUAL, COND_CARRY,
     COND_COUNTER_ZERO_2, COND_COUNTER_ZERO_4, COND_COUNTER_ZERO_8, COND_GREATER,
     COND_GREATER_OR_EQUAL, COND_INVALID, COND_LESS, COND_LESS_OR_EQUAL, COND_NOT_CARRY,
@@ -1007,6 +1007,21 @@ pub fn build_self_decoding_parts_with(
         b.jmp(dispatch);
     }
 
+    // ── F1: SET_NATIVE_FP_RETURN{width} — FP 리턴 힌트. 폭(0/4/8)은 variant 에
+    //    bake 되므로 핸들러는 상수 폭을 FP_RET_OFF 슬롯에 기록하고 dispatch.
+    //    (sub_dec_ops 가 3개 오퍼랜드 바이트를 소비해 롤링키를 유지한다.)
+    let mut h_set_fp_ret = std::collections::HashMap::new();
+    for w in [0u8, 4, 8] {
+        let h = b.len();
+        {
+            b.call(sub_dec_ops);
+            movi(&mut b, Register::RAX, w as u64);
+            store_m(&mut b, FP_RET_OFF, Register::RAX);
+            b.jmp(dispatch);
+        }
+        h_set_fp_ret.insert(RiscOp::SetNativeFpReturn { width: w }, h);
+    }
+
     // ── P3: VIRTUAL_BRANCH — conditional branch: DEC_COND decides taken/not-taken;
     //    a taken branch resolves the target to a bytecode byte offset via the branch
     //    map (OFF_BRANCH_MAP, built from ip_map) and re-syncs the rolling key (forward
@@ -1105,24 +1120,22 @@ pub fn build_self_decoding_parts_with(
             sl(&mut b, Register::R10, 0x50);
             sl(&mut b, Register::R11, 0x58);
 
-            // 3b. P1-8: Win64 FP/vector ABI — VM 상태의 XMM 슬롯(state+XMM_OFF,
-            //     XMM_SLOTS×16B)에서 네이티브 XMM0-5 로 물질화. 호출자가 FP 인자를
-            //     XMM 슬롯에 심었을 때(ABI 분석/lifter — 후속) 브릿지가 정확히
-            //     전달한다. 캘리-세이브 레지스터는 건드리지 않는다.
-            for i in 0..XMM_SLOTS {
-                let xmm = match i {
-                    0 => Register::XMM0,
-                    1 => Register::XMM1,
-                    2 => Register::XMM2,
-                    3 => Register::XMM3,
-                    4 => Register::XMM4,
-                    _ => Register::XMM5,
-                };
-                b.push(Instruction::with2(
-                    Code::Movups_xmm_xmmm128,
-                    xmm,
-                    MemoryOperand::with_base_displ_size(Register::R12, (XMM_OFF + (i as i32) * 16) as i64, 16),
-                ).unwrap());
+            // 3b. F1: Win64 FP/vector ABI — FP 인자를 XMM0-3 으로 positional 미러링.
+            //   Win64 규칙: i 번째 인자가 FP 이면 XMM[i-1] 로 전달된다 (정수 인자는
+            //   RCX/RDX/R8/R9). FP 값은 VM 레지스터(regs[1..4] = RCX/RDX/R8/R9)에
+            //   IEEE 비트패턴으로 있으므로, 해당 레지스터를 XMM 슬롯으로 **위치 그대로**
+            //   복사하면 FP 인자가 정확히 전달되고, 정수 인자가 차지한 XMM 슬롯은
+            //   callee 가 읽지 않는 가비지로 무해하다. `movq xmm, r64` 는 low 64 비트만
+            //   복사(상위 zero) — f64 는 64-bit IEEE 비트 전체, f32 는 low 32 비트가
+            //   값이므로 정확하다. (기존 XMM_OFF 슬롯 로드는 실제 FP 값을 담지 않아
+            //   무의미했다 — 이 위치 미러링으로 대체.)
+            for (i, gpr) in [
+                (Register::XMM0, Register::RCX),
+                (Register::XMM1, Register::RDX),
+                (Register::XMM2, Register::R8),
+                (Register::XMM3, Register::R9),
+            ] {
+                b.push(Instruction::with2(Code::Movq_xmm_rm64, i, gpr).unwrap());
             }
 
             // 4. native frame: align RSP to 16, allocate 0x70 (ret + 0x20 home +
@@ -1182,7 +1195,31 @@ pub fn build_self_decoding_parts_with(
             b.push(Instruction::with1(Code::Call_rm64, Register::RDI).unwrap());
 
             // 7. after the call: RSP == RSP_call. Sync volatile GPRs + RFLAGS back.
+            // F1: regs[0] 동기화는 FP 리턴 여부에 따라 달라진다 — `SetNativeFpReturn`
+            // 핸들러가 FP_RET_OFF(0=FALSE, 4=f32, 8=f64)를 기록한다. FP 면 XMM0 의
+            // low 폭 바이트를 regs[0] 으로, 아니면 RAX(기존)를 그대로 쓴다. RBX 는
+            // orig-RSP 스크래치라 sync-back 대상이 아니므로 스크래치로 안전하다
+            // (step 9가 RBX=R15로 다시 적재). sentinel: 0xBC00=int, 0xBC01=f32, 0xBC02=store.
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, MemoryOperand::with_base_displ_size(Register::R12, FP_RET_OFF as i64, 8)).unwrap());
+            b.push(Instruction::with2(Code::Test_rm64_r64, Register::RBX, Register::RBX).unwrap());
+            b.br(Code::Je_rel32_64, 0xBC00); // width == 0 -> integer return (RAX 그대로)
+            b.push(Instruction::with2(Code::Cmp_rm64_imm8, Register::RBX, 4).unwrap());
+            b.br(Code::Je_rel32_64, 0xBC01); // width == 4 -> f32
+            b.push(Instruction::with2(Code::Movq_rm64_xmm, Register::RAX, Register::XMM0).unwrap()); // f64
+            b.br(Code::Jmp_rel32_64, 0xBC02);
+            let fp4_ret = b.len();
+            b.push(Instruction::with2(Code::Movd_rm32_xmm, Register::EAX, Register::XMM0).unwrap()); // f32 (low 32)
+            let store_r0 = b.len();
             b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x00, 8), Register::RAX).unwrap());
+            for &mut (bi, ref mut ti) in b.branches.iter_mut() {
+                if *ti == 0xBC00 {
+                    *ti = store_r0;
+                } else if *ti == 0xBC01 {
+                    *ti = fp4_ret;
+                } else if *ti == 0xBC02 {
+                    *ti = store_r0;
+                }
+            }
             b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x08, 8), Register::RCX).unwrap());
             b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x10, 8), Register::RDX).unwrap());
             b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x40, 8), Register::R8).unwrap());
@@ -2596,6 +2633,9 @@ pub fn build_self_decoding_parts_with(
         h.insert(RiscOp::VirtualPush, h_push);
         h.insert(RiscOp::VirtualPop, h_pop);
         h.insert(RiscOp::SetFlag, h_setflag);
+        for w in [0u8, 4, 8] {
+            h.insert(RiscOp::SetNativeFpReturn { width: w }, h_set_fp_ret[&RiscOp::SetNativeFpReturn { width: w }]);
+        }
         h.insert(RiscOp::MemoryRead { width: 8 }, h_memrd8);
         h.insert(RiscOp::MemoryRead { width: 4 }, h_memrd4);
         h.insert(RiscOp::MemoryRead { width: 2 }, h_memrd2);
