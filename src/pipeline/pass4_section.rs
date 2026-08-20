@@ -158,6 +158,7 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, anti_debug_policy: crate
             ctx.mba_constant,
             block_ring,
             ring_va,
+            ctx.effective_obf_level(),
         ))
     })?;
     dispatcher::validate_dispatcher(&dispatcher_bytes)?;

@@ -55,6 +55,56 @@ pub const RING_META_OFF: usize = 0x80;
 /// `key = ((seed ^ block_id) + 2*(seed & block_id)) ^ mba_constant` (레벨 2).
 /// 패커(패스3)가 동일 식으로 테이블 엔트리를 암호화하므로 상수 키가 파일에
 /// 노출되지 않고, 시드만 push된다.
+/// O1: --obf-level 에 따른 디스패처 런타임 MBA 키 스케줄 코드 생성.
+/// 패커 측 `MbaGenerator::compute_key(seed, id, C, level)` 와 **정확히 동일**한
+/// 값을 재현한다 (레벨 불일치 시 테이블 복호화가 깨지므로 절대 어긋나면 안 된다).
+///   level 1: K = (id ^ seed) ^ C
+///   level 2: K = (id^seed) + 2*(id&seed) ^ C   (기존 기본)
+///   level 3: K = ((id^seed) + 2*(id&seed) ^ C) + (id&seed)  (overlap + MBA)
+/// 입력 레지스터: r10 = block_id, r11 = seed. 출력: eax = key. r11 은 스크래치
+/// (스택에 push 되어 있어 클로버 안전), eax 는 이후 entry XOR 용. RDX 미사용
+/// (과거 RDX 클로버 크래시 방지 — 인자 레지스터 보존).
+fn emit_mba_key_schedule(instructions: &mut Vec<Instruction>, level: usize, mba_constant: u32) {
+    let lvl = level.clamp(1, 3);
+    // eax = id
+    if let Ok(inst) = Instruction::with2(Code::Mov_r32_rm32, Register::EAX, Register::R10D) {
+        instructions.push(inst);
+    }
+    if lvl == 1 {
+        // K = (id ^ seed) ^ C — 단순 XOR 만 (분석 비용 최소).
+        if let Ok(inst) = Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::R11D) {
+            instructions.push(inst); // eax = id ^ seed
+        }
+        if let Ok(inst) = Instruction::with2(Code::Xor_rm32_imm32, Register::EAX, mba_constant) {
+            instructions.push(inst); // eax = (id^seed) ^ C
+        }
+    } else {
+        // level 2/3: (id ^ seed) + 2*(id & seed) MBA 항등식.
+        if let Ok(inst) = Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::R11D) {
+            instructions.push(inst); // eax = id ^ seed
+        }
+        if let Ok(inst) = Instruction::with2(Code::And_rm32_r32, Register::R11D, Register::R10D) {
+            instructions.push(inst); // r11 = id & seed
+        }
+        if let Ok(inst) = Instruction::with2(
+            Code::Lea_r32_m,
+            Register::EAX,
+            MemoryOperand::with_base_index_scale(Register::RAX, Register::R11, 2),
+        ) {
+            instructions.push(inst); // eax = (id^seed) + 2*(id&seed)
+        }
+        if let Ok(inst) = Instruction::with2(Code::Xor_rm32_imm32, Register::EAX, mba_constant) {
+            instructions.push(inst); // eax = ((id^seed) + 2*(id&seed)) ^ C
+        }
+        if lvl == 3 {
+            // K = (...) ^ C + (id & seed) — r11 은 아직 (id & seed) 보유.
+            if let Ok(inst) = Instruction::with2(Code::Add_rm32_r32, Register::EAX, Register::R11D) {
+                instructions.push(inst);
+            }
+        }
+    }
+}
+
 pub fn build_dispatcher(
     dispatcher_va: u64,
     table_offset: usize,
@@ -63,6 +113,7 @@ pub fn build_dispatcher(
     mba_constant: u32,
     block_ring: bool,
     ring_va: u64,
+    obf_level: usize,
 ) -> Vec<u8> {
     // 디스패처 셸코드는 .btg 섹션 오프셋 0x20에 위치
     let disp_base_va = dispatcher_va + 0x20;
@@ -174,40 +225,10 @@ pub fn build_dispatcher(
         instructions.push(inst);
     }
 
-    // 10. v6/v10: MBA 항등식으로 키 재도출 후 복호화
-    //     key = ((seed ^ id) + 2*(seed & id)) ^ C   (r11=seed, r10=block_id)
-    //     ≡ (seed + id) ^ C (mod 2^32) — XOR/AND 항등식
-    //
-    //     v10: 기존 단일 `lea eax,[r10+r11]`(평범한 덧셈)을 실제 XOR/AND
-    //     항등식 4-명령 시퀀스로 교체 — 정적 분석 시 덧셈 패턴이 아니라
-    //     (x^y)+2*(x&y) MBA 패턴으로 보인다. 값은 동일하므로 패커
-    //     compute_key(level 2)와 여전히 일치한다. RDX는 끝까지 사용하지 않는다.
-    //
-    //     FIX (0xC0000005 h3_noad 크래시 근본 원인): 과거 구현은
-    //     `mov edx,r10d; and edx,r11d; lea eax,[rax+rdx*2]`로 RDX를 스크래치로
-    //     썼는데, RDX는 **인자 레지스터**라 push/pop 복원 목록(rax/rcx/r10/r11/
-    //     flags)에 없어 **모든 디스패치가 RDX를 (block_id & seed)로 덮어썼다**.
-    //     함수 진입이 디스패처 경유일 때 2번째 인자(RDX)가 파괴되어, 경로→UTF-16
-    //     인코더가 쓰레기 포인터를 받고 next_code_point에서 0xc0000005 크래시.
-    if let Ok(inst) = Instruction::with2(Code::Mov_r32_rm32, Register::EAX, Register::R10D) {
-        instructions.push(inst); // eax = id
-    }
-    if let Ok(inst) = Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::R11D) {
-        instructions.push(inst); // eax = id ^ seed
-    }
-    if let Ok(inst) = Instruction::with2(Code::And_rm32_r32, Register::R11D, Register::R10D) {
-        instructions.push(inst); // r11 = seed & id  (r11은 스택에서 복원 — 클로버 OK)
-    }
-    if let Ok(inst) = Instruction::with2(
-        Code::Lea_r32_m,
-        Register::EAX,
-        MemoryOperand::with_base_index_scale(Register::RAX, Register::R11, 2),
-    ) {
-        instructions.push(inst); // eax = (id^seed) + 2*(id&seed)
-    }
-    if let Ok(inst) = Instruction::with2(Code::Xor_rm32_imm32, Register::EAX, mba_constant) {
-        instructions.push(inst); // ^ C
-    }
+    // 10. O1: --obf-level 에 따른 MBA 키 재도출 후 복호화.
+    //     (r11=seed, r10=block_id → eax=key; 패커 compute_key(level) 와 동일)
+    //     RDX 는 끝까지 사용하지 않는다 (과거 RDX 클로버 크래시 방지).
+    emit_mba_key_schedule(&mut instructions, obf_level, mba_constant);
     if let Ok(inst) = Instruction::with2(Code::Xor_rm32_r32, Register::ECX, Register::EAX) {
         instructions.push(inst); // 복호화된 오프셋 = entry ^ key
     }

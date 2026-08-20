@@ -157,6 +157,17 @@ pub struct PipelineContext {
 }
 
 impl PipelineContext {
+    /// O1: 실제로 적용할 MBA 키 스케줄 레벨. reencrypt(dispatcher-reencrypt /
+    /// M7) 경로는 전용 디스패처의 키 유도가 레벨 2 하드코딩이라 2 로 고정하고
+    /// (패커/런타임 정합), 그 외 경로는 --obf-level 1..3 을 그대로 사용한다.
+    pub fn effective_obf_level(&self) -> usize {
+        if self.reencrypt {
+            2
+        } else {
+            self.obf_complexity.clamp(1, 3)
+        }
+    }
+
     pub fn new(
         target_info: TargetPeInfo,
         dispatcher_va: u64,

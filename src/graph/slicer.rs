@@ -294,8 +294,14 @@ impl MicroSlicer {
 
                 if let Some(target_block_id) = target_block_id_opt {
                     let seed = MbaGenerator::seed_for(self.mba_constant, target_block_id);
+                    // O1: --obf-level 에 따른 키 스케줄 (reencrypt/M7 디스패처는 레벨 2 고정).
+                    let level = if self.reencrypt {
+                        2
+                    } else {
+                        self.obf_level.clamp(1, 3)
+                    };
                     let key =
-                        MbaGenerator::compute_key(seed, target_block_id, self.mba_constant, 2);
+                        MbaGenerator::compute_key(seed, target_block_id, self.mba_constant, level);
 
                     // v10 FIX: current_id push는 재암호화(3-푸시) 모드에서만.
                     if self.reencrypt {

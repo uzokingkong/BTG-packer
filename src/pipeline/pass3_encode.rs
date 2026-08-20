@@ -31,7 +31,7 @@ fn encode_block_at(
     text_end_va: u64,
     va_to_trigger_id: &BTreeMap<u64, u32>,
     table_offsets: &[u32],
-    obf_complexity: usize,
+    obf_level: usize,
     mba_constant: u32,
 ) -> Result<(u32, u32)> {
     let real_block_va = dispatcher_va + phys_offset as u64;
@@ -140,11 +140,12 @@ fn encode_block_at(
 
     block.instructions = final_bytes;
 
-    // v6: MBA 키로 테이블 엔트리 암호화 — 디스패처가 런타임에 동일 항등식으로 재도출.
-    //     key = ((seed ^ id) + 2*(seed & id)) ^ C, seed = seed_for(C, id)
-    let _ = obf_complexity; // 키 스케줄은 항상 레벨 2 항등식을 사용 (v6)
+    // O1: --obf-level 에 따라 테이블 엔트리 암호화 키 스케줄을 달리 적용한다.
+    //   level 1 = 단순 XOR, level 2 = MBA 항등식, level 3 = overlap+MBA.
+    //   (디스패처 runtime 키 유도와 동일 레벨이어야 복호화가 성립한다.
+    //    reencrypt/M7 경로는 디스패처가 레벨 2 고정이라 2 로 클램프.)
     let seed = crate::mba::MbaGenerator::seed_for(mba_constant, block.id);
-    let dynamic_table_key = crate::mba::MbaGenerator::compute_key(seed, block.id, mba_constant, 2);
+    let dynamic_table_key = crate::mba::MbaGenerator::compute_key(seed, block.id, mba_constant, obf_level);
 
     let real_code_phys_offset = (phys_offset as u32) + (entry_offset as u32);
     Ok((real_code_phys_offset, dynamic_table_key))
@@ -176,7 +177,7 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
 
     let (text_start_va, text_end_va) = ctx.text_va_range();
     let dispatcher_va = ctx.dispatcher_va;
-    let obf_complexity = ctx.obf_complexity;
+    let obf_level = ctx.effective_obf_level();
 
     // ── 블록별 처리 ──────────────────────────────────────────────────────────────
     let layout = ctx.shuffled_layout.as_mut()
@@ -212,7 +213,7 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
                 text_end_va,
                 &ctx.va_to_trigger_id,
                 &dense_offsets,
-                obf_complexity,
+                obf_level,
                 ctx.mba_constant,
             )?;
             lens.push(wb.instructions.len());
@@ -255,7 +256,7 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
             text_end_va,
             &ctx.va_to_trigger_id,
             &dense_offsets,
-            obf_complexity,
+            obf_level,
             ctx.mba_constant,
         )?;
 

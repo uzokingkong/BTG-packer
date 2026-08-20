@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn generated_dispatchers_preserve_win64_abi() {
         let cases: Vec<(&str, Vec<u8>)> = vec![
-            ("plain", crate::dispatcher::build_dispatcher(0x140001000, 0x80, 16, false, 0xCAFEBABE, false, 0)),
+            ("plain", crate::dispatcher::build_dispatcher(0x140001000, 0x80, 16, false, 0xCAFEBABE, false, 0, 2)),
             ("reencrypt", crate::dispatcher::build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false).unwrap()),
             ("m7", crate::dispatcher::build_dispatcher_m7(0x140001000, 0x600, 16, 0xCAFEBABE, false).unwrap()),
             ("m7_c1", crate::dispatcher::build_dispatcher_m7_c1(0x140001000, 0x600, 16, 0xCAFEBABE, false, 0x140003000, 0x140003100).unwrap()),

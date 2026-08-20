@@ -935,8 +935,8 @@ mod tests {
     #[test]
     fn bridge_unwind_info_matches_real_dispatcher_prologue() {
         for (code, name) in [
-            (build_dispatcher(0x140001000, 0x80, 16, false, 0xCAFEBABE, false, 0), "plain"),
-            (build_dispatcher(0x140001000, 0x80, 16, true, 0xCAFEBABE, false, 0), "plain+trace"),
+            (build_dispatcher(0x140001000, 0x80, 16, false, 0xCAFEBABE, false, 0, 2), "plain"),
+            (build_dispatcher(0x140001000, 0x80, 16, true, 0xCAFEBABE, false, 0, 2), "plain+trace"),
             (build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false).unwrap(), "reencrypt"),
         ] {
             let (codes, prolog_len) = crate::dispatcher::dispatcher_unwind_codes(&code);

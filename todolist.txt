@@ -1,0 +1,2146 @@
+7m 18s 동안 처리함
+
+이번에는 실제로 올린 ZIP 전체를 다시 뜯어서 봤다. 앞에서처럼 구조만 보고 평가한 게 아니다.
+
+분석 범위
+
+225개 Rust 파일
+
+69,461 LOC
+
+428개 #[test]
+
+assert!/assert_eq! 계열 약 1,668개
+
+unsafe 35
+
+.unwrap() 3,595
+
+.expect() 88
+
+panic! 14
+
+Cargo.toml/Cargo.lock은 ZIP에 없음
+
+핵심 경로는 PE → CFG → BTG → Pass3 → crypto/place → VM lift → RISC → poly ISA → threaded native dispatcher → native bridge까지 교차 추적했다.
+
+다만 이 ZIP에는 Cargo manifest가 없어서 여기서 실제 Windows PE를 빌드/실행하는 동적 검증은 할 수 없다. 아래는 소스 전체 정적 분석 + 테스트 코드/호출관계 분석이다.
+
+그리고 결론부터 말하면:
+
+설계는 상당히 수준 높지만, 현재 commercial VM backend에는 "보호가 약하다" 수준이 아니라 실제 x86 semantic correctness를 깨뜨릴 수 있는 핵심 결함이 몇 개 있다.
+
+특히 CALL/RET, signed MUL/IMUL, narrow-width flags, atomic XCHG/XADD, ASLR relocation, VM↔native 함수 경계는 반드시 고쳐야 한다.
+
+───
+
+1. 먼저 가장 큰 정정: BTG는 현재 생각보다 덜 구현되어 있다
+
+이 프로젝트 이름은 BTG이고 EntryPointType에도:
+
+Normal
+Misaligned
+Polymorphic
+
+가 있다.
+
+그런데 실제 graph/slicer.rs를 보면:
+
+let enable_overlap = false;
+
+다.
+
+즉 현재 실제 생성되는 것은 사실상:
+
+BasicBlock
+↓
+TriggerBlock 1:1
+↓
+shuffle
+↓
+dispatcher
+
+이다.
+
+Misaligned entry point 생성 코드는 죽어 있고,
+
+Polymorphic entry point를 실제로 만드는 코드도 찾을 수 없다.
+
+그리고:
+
+MicroSlicer::new(usize::MAX, ...)
+
+이므로 기본 블록을 더 작은 조각으로 자르는 것도 사실상 하지 않는다.
+
+따라서 현재 BTG의 실제 모습
+
+원본 CFG
+↓
+Basic Block
+↓
+Trigger Block
+↓
+Physical Shuffle
+↓
+MBA Jump Table
+↓
+Dispatcher
+
+이다.
+
+"다중 entry / misaligned / polymorphic trigger graph"는 현재 구현된 핵심 기능이 아니라 scaffold에 가깝다.
+
+이건 앞서 내가 BTG를 너무 높게 평가한 부분이다.
+
+───
+
+2. BidirectionalGraph도 이름만큼 특별하지 않다
+
+core/graph.rs를 보면 forward/backward edge를 동시에 저장한다.
+
+이건 구현 자체는 정상이다.
+
+하지만 validate_bidirectionality()는 사실상:
+
+forward edge를 만들 때
+동시에
+backward edge도 만든다
+
+라는 현재 자료구조의 생성 방식 때문에 구조적으로 거의 항상 통과한다.
+
+즉:
+
+A → B
+
+를 add_edge() 하면 동시에:
+
+forward[A] = B
+backward[B] = A
+
+가 들어간다.
+
+따라서 이 검증은:
+
+실제 PE CFG가 올바르게 복원됐는가?
+
+를 검증하지 않는다.
+
+그냥:
+
+내가 만든 forward/backward 자료구조가 서로 일관적인가?
+
+에 가깝다.
+
+───
+
+3. CFG 추출 자체가 가장 큰 원천적인 약점 중 하나
+
+graph/cfg.rs는 OEP에서 reachable CFG를 따라가는 recursive traversal이 아니다.
+
+실제로:
+
+.text 전체
+↓
+linear decode
+↓
+branch target 수집
+↓
+block split
+
+방식이다.
+
+즉:
+
+.text
+├─ 실제 code
+├─ jump table
+├─ embedded constant
+├─ compiler padding
+└─ compiler-specific data
+
+가 섞여 있으면 모두 선형 디코드 대상이 된다.
+
+0xCC는 특별히 처리하지만 일반적인 embedded data는 완전히 해결하지 않는다.
+
+그리고 .rdata/.data/.pdata에서도 4-byte 값을 전부 RVA 후보로 검사한다.
+
+따라서:
+
+random uint32
+image_base + text_rva
+
+같은 우연한 값도 block start 후보가 될 수 있다.
+
+결과
+
+virtualized_blocks / blocks
+
+같은 지표는 실제 실행 reachable coverage가 아니다.
+
+죽은 코드/오탐 block까지 포함한다.
+
+───
+
+4. 더 중요한 CFG 버그: block 내부 target 처리
+
+resolve_block_id()는:
+
+exact match
+없으면
+VA 이하에서 가장 가까운 block
+
+형태로 fallback한다.
+
+즉:
+
+Block A:
+1000 mov
+1005 mov
+1008 ...
+
+에서 어떤 데이터/branch가:
+
+1005
+
+를 가리키면 실제로는 1005에서 실행해야 한다.
+
+그런데 block mapping을:
+
+1000 → Block A
+
+로 처리해서 Block A 시작점 1000으로 보내는 경로가 생길 수 있다.
+
+코드에서도 이 문제를 인지해서 일부 경로에서는 정확한 block entry만 허용하도록 고치고 있지만, 전체 pipeline에 동일한 invariant가 적용된 것은 아니다.
+
+이건 PE compatibility에서 상당히 위험하다.
+
+───
+
+5. Pass3의 fixed-point layout은 꽤 잘 만들었다
+
+이 부분은 높게 평가한다.
+
+pipeline/pass3_encode.rs에서:
+
+현재 offset
+↓
+BlockEncoder
+↓
+실제 length
+↓
+새 offset
+↓
+재인코딩
+↓
+수렴
+
+을 한다.
+
+단순히:
+
+original length
+
+만 믿지 않는다.
+
+그리고 RIP-relative / rel32 확장을 고려한다.
+
+이건 실제 PE transformer로서 좋은 구현이다.
+
+다만:
+
+const MAX_ITERS: usize = 8;
+
+이후에도 완전 수렴하지 않으면 명시적인 fatal failure가 아니라 마지막 상태를 사용한다.
+
+따라서 8회 내 수렴을 보장하는 invariant가 없다면 이론적으로 마지막 offset과 실제 encoding length가 어긋날 수 있다.
+
+여기는:
+
+8회 실패 → Err
+
+로 하는 게 맞다.
+
+───
+
+6. 그리고 Misaligned entry 구현은 현재 꺼져 있지만, 코드 자체도 안전하지 않다
+
+pass3_encode.rs:
+
+EB 02
+C0
+90
+
+을 넣는다.
+
+주석은 "register operation only"처럼 설명하지만:
+
+02 C0
+
+는:
+
+add al, al
+
+이다.
+
+RFLAGS가 바뀐다.
+
+즉 만약 이 entry가 활성화되면:
+
+normal entry
+↓
+flags = X
+
+misaligned entry
+↓
+add al,al
+↓
+flags = Y
+
+가 된다.
+
+특히:
+
+CMP
+JCC
+
+직전에 잘못된 entry로 들어오면 의미가 깨질 수 있다.
+
+현재 enable_overlap=false라서 당장 실전 버그는 아니지만, 이 기능을 다시 켜면 그대로 터질 가능성이 높다.
+
+───
+
+7. obf-level은 현재 사실상 죽어 있다
+
+이건 꽤 명확한 문제다.
+
+CLI에서:
+
+--obf-level 1/2/3
+
+을 받고 ctx.obf_complexity로 전달한다.
+
+그런데 실제 Pass3:
+
+let _ = obf_complexity;
+
+라고 명시되어 있다.
+
+그리고 key schedule도:
+
+항상 level 2
+
+다.
+
+MbaGenerator에는:
+
+level 1
+level 2
+level 3
+
+가 있지만 실제 BTG runtime dispatcher는 level 2만 사용한다.
+
+즉 현재:
+
+--obf-level 1
+--obf-level 2
+--obf-level 3
+
+의 실제 BTG 변환 차이가 거의 없다.
+
+Metrics에서만 level을 사용한다.
+
+이건 제품 옵션 관점에서는 명백한 구현 미완성이다.
+
+───
+
+8. 이제 가장 중요한 문제: Commercial RISC VM의 CALL/RET
+
+이건 Critical이다.
+
+vm/risc/lifter.rs에서:
+
+CALL
+↓
+VirtualPush(return_ip)
+↓
+VirtualBranch(target)
+
+로 만든다.
+
+즉:
+
+CALL A
+
+→ push return address
+→ jump A
+
+까지는 맞다.
+
+그런데 같은 파일에서:
+
+RET
+↓
+RiscOp::Halt
+
+이다.
+
+즉:
+
+main
+↓
+call foo
+↓
+foo
+↓
+ret
+↓
+HALT
+
+가 된다.
+
+caller로 돌아가지 않는다.
+
+───
+
+Legacy VM은 이 문제가 없다
+
+vm/lifter/cfg.rs를 보면 legacy VM은:
+
+CALL
+↓
+push return IP
+↓
+OP_CALL
+
+그리고:
+
+RET
+↓
+OP_RET
+
+으로 VM call stack을 사용한다.
+
+즉 legacy backend에는 return semantic이 존재한다.
+
+───
+
+Commercial RISC에는 없다
+
+Commercial RISC에는:
+
+VirtualCall
+VirtualRet
+
+같은 opcode가 없다.
+
+VmCallBridge는 존재하지만 RiscLifter의 일반 CALL lowering에서 사용되지 않는다.
+
+따라서:
+
+commercial VM은 일반적인 VM 내부 함수 호출/복귀를 표현할 semantic primitive가 없다.
+
+이건 단순히 "테스트 부족"이 아니라 ISA 설계 자체의 결손이다.
+
+이게 왜 치명적이냐
+
+실제 Rust/C/C++ 프로그램은:
+
+main
+→ function
+→ function
+→ helper
+→ memcpy
+→ ...
+
+처럼 call tree가 엄청 깊다.
+
+Commercial VM이 OEP부터 일반 함수까지 가상화하려면 반드시 이 문제를 해결해야 한다.
+
+───
+
+9. 그래서 현재 Commercial VM의 실제 호출 모델은 이상하다
+
+현재:
+
+VirtualBranch
+
+가 branch-map에 있는 target이면:
+
+VM 내부 jump
+
+로 간다.
+
+branch-map에 없으면:
+
+Native Call Bridge
+
+로 간다.
+
+즉:
+
+VM → VM function call
+
+은 제대로 지원되지 않고,
+
+VM → native function
+
+만 비교적 제대로 지원된다.
+
+이 구조는 현재 commercial backend를:
+
+"full program VM"
+
+이라고 부르는 데 가장 큰 장애물이다.
+
+───
+
+10. Native Bridge 자체는 상당히 공들였다
+
+반대로 h_branch의 native bridge는 꽤 좋다.
+
+실제로:
+
+virtual stack에서 return IP pop
+↓
+VM state → GPR materialization
+↓
+Win64 stack alignment
+↓
+shadow/home space
+↓
+stack arguments forwarding
+↓
+native call
+↓
+volatile GPR sync
+↓
+RFLAGS sync
+↓
+return IP
+↓
+branch_map
+↓
+rolling-key resync
+
+까지 한다.
+
+이건 그냥:
+
+call rax
+
+수준이 아니다.
+
+이 부분은 실제 보호기 개발 경험이 상당히 들어간 코드다.
+
+───
+
+11. 하지만 Native Bridge에도 큰 ABI 구멍이 있다: XMM
+
+VM state는 scalar FP를 지원한다.
+
+그런데 native bridge가 native callee에게 전달하는 것은 사실상:
+
+RAX
+RCX
+RDX
+R8
+R9
+R10
+R11
+stack args
+RFLAGS
+
+이다.
+
+XMM0~XMM3에 FP arguments를 넣지 않는다.
+
+따라서:
+
+double foo(double x, double y);
+
+같은 함수가 native fallback으로 호출되면:
+
+VM scalar FP state
+↓
+native bridge
+↓
+XMM0/XMM1?
+
+변환이 없다.
+
+결과적으로 Win64 floating-point ABI가 깨진다.
+
+벡터 인자도 마찬가지다.
+
+이건 commercial VM의 native fallback에서 중요한 compatibility 문제다.
+
+───
+
+12. RISC의 signed MUL/IMUL semantic이 잘못되어 있다
+
+이건 내가 이번 분석에서 발견한 가장 심각한 arithmetic bug 중 하나다.
+
+vm/risc/mod.rs의 mul_wide()는:
+
+am = a & mask
+bm = b & mask
+
+full = am * bm
+
+으로 계산한다.
+
+그리고 signed는 overflow 판단에만 사용한다.
+
+그런데 x86 signed MUL/IMUL의 high half는 signed product다.
+
+예를 들어 8-bit:
+
+-1 * 2 = -2
+
+signed 16-bit 결과는:
+
+0xFFFE
+
+이고 high byte는:
+
+0xFF
+
+이어야 한다.
+
+현재 unsigned masked multiplication은:
+
+0xFF * 0x02
+= 0x01FE
+
+이므로 high byte:
+
+0x01
+
+이 된다.
+
+즉:
+
+RDX/AX high half
+
+가 완전히 틀린다.
+
+───
+
+13. Native commercial handler도 같은 오류를 공유한다
+
+더 심각한 것은 vm/threaded/poly_direct.rs의 multiply handler도:
+
+mul
+→ unsigned full product
+→ signed면 overflow만 검사
+
+구조다.
+
+즉:
+
+RiscProgram reference
+
+와
+
+native commercial handler
+
+가 둘 다 같은 잘못된 semantic을 구현한다.
+
+그래서 differential test가 통과해도:
+
+원본 x86과 맞는다는 보장이 없다.
+
+이게 VM 테스트에서 가장 위험한 유형이다.
+
+───
+
+14. Signed IMUL low도 overflow flag가 잘못될 수 있다
+
+MultiplyLow는 low bits만 필요해서:
+
+low
+
+자체는 signed/unsigned가 같은 modulo 결과다.
+
+하지만 overflow 판정은 signed product의 high half를 봐야 한다.
+
+현재 unsigned high를 사용한다.
+
+따라서:
+
+IMUL
+→ CF/OF
+→ JG/JL/JO/JNO
+
+같은 코드에서 잘못된 branch가 발생할 수 있다.
+
+───
+
+15. DIV/IDIV도 x86 #DE semantic을 구현하지 않는다
+
+div_wide():
+
+divisor == 0
+↓
+result = 0
+
+으로 끝난다.
+
+실제 x86은:
+
+DIV 0
+IDIV 0
+
+에서:
+
+#DE / STATUS_INTEGER_DIVIDE_BY_ZERO
+
+예외가 발생한다.
+
+또 quotient가 destination width에 맞지 않아도 x86은 #DE다.
+
+현재 구현은 잘라서 저장한다.
+
+즉:
+
+DIV/IDIV exception semantics
+
+이 완전히 다르다.
+
+물론 commercial target에서 이런 경우는 native fallback으로 보내는 전략을 취할 수도 있지만, 현재 RISC ISA 자체의 semantic correctness는 틀려 있다.
+
+───
+
+16. Shift flags도 문제가 있다
+
+vm/risc/mod.rs의 shift 구현:
+
+ShiftRight
+ShiftLeft
+ArithmeticShiftRight
+
+는 최종적으로:
+
+update_logic64()
+
+를 호출한다.
+
+이 과정에서:
+
+CF
+ZF
+SF
+PF
+OF
+AF
+
+를 logical-op 방식으로 재계산한다.
+
+그런데 x86 shift의 OF는:
+
+count = 1이면 정의됨
+
+count > 1이면 undefined
+
+count = 0이면 기존 flags 유지
+
+다.
+
+현재 구현은 OF를 제대로 계산하지 않는다.
+
+예를 들어:
+
+shl rax, 1
+jo target
+
+같은 코드에서 문제가 될 수 있다.
+
+───
+
+17. 더 심각한 narrow shift bug
+
+vm/risc/lifter/arith.rs를 보면 8/16-bit shift를 위해:
+
+mask
+sign extend
+shift
+mask result
+preserve upper
+
+여러 개의 synthetic RISC op를 삽입한다.
+
+문제는 mask, preserve_upper가 emit_and()/emit_or()를 사용한다는 것이다.
+
+이 연산들은 VM flags를 변경한다.
+
+따라서:
+
+원본 x86 shift
+
+가 flags를 한 번 계산한 뒤 끝나야 하는데,
+
+shift
+↓
+AND
+↓
+OR
+
+를 거치면서 최종 flags가 다시 덮어써질 수 있다.
+
+특히:
+
+count = 0
+
+에서는 원래 flags가 보존되어야 하는데 synthetic mask 연산 때문에 바뀔 가능성이 높다.
+
+이건 상당히 위험하다.
+
+───
+
+18. XCHG/XADD atomicity가 깨져 있다
+
+이건 concurrency 쪽에서 매우 중요하다.
+
+RiscLifter는:
+
+XCHG
+
+를:
+
+MemoryRead
+MemoryWrite
+
+로 내린다.
+
+XADD도:
+
+MemoryRead
+ADD
+MemoryWrite
+
+다.
+
+그런데 x86에서:
+
+XCHG r, [mem]
+
+은 memory operand일 경우 implicit LOCK이다.
+
+그리고:
+
+LOCK XADD
+
+는 당연히 atomic RMW다.
+
+현재 RISC ISA에는:
+
+Xchg
+Xadd
+
+primitive 자체가 없다.
+
+───
+
+19. 이건 기존 코드의 주석과 실제 구현이 충돌한다
+
+text_lift/mod.rs 쪽에는:
+
+lock-prefixed memory RMW를 실제 VM opcode로 처리한다
+
+는 취지의 설명이 있다.
+
+하지만 commercial RISC에서는:
+
+CMPXCHG
+
+만 실제 atomic primitive가 있고,
+
+XCHG
+XADD
+
+는 결국 일반 memory read/write다.
+
+따라서 Rust의:
+
+Once
+Mutex
+atomic counter
+reference count
+lock-free algorithm
+
+등을 VM화할 때 매우 위험하다.
+
+특히 프로젝트 자체가 once.rs crash를 여러 번 추적했던 것과 직접 연결되는 부분이다.
+
+───
+
+20. CMPXCHG도 flags semantic이 축소되어 있다
+
+Commercial handler:
+
+lock cmpxchg
+
+후:
+
+ZF만 저장
+
+한다.
+
+참조 구현도:
+
+set_zf()
+
+만 한다.
+
+즉 CMPXCHG 이후:
+
+CF/SF/OF/PF/AF
+
+를 원본처럼 처리하지 않는다.
+
+x86 CMPXCHG의 flag semantics를 그대로 모델링하려면 비교 결과에 대한 flags가 필요하다.
+
+현재는:
+
+CMPXCHG
+→ ZF only
+
+라는 별도의 semantic이다.
+
+───
+
+21. 이것 때문에 "reference == native" 테스트가 충분하지 않다
+
+현재 테스트 구조는 주로:
+
+RISC reference
+==
+native commercial
+
+를 검증한다.
+
+그런데 둘이 동일하게 틀릴 수 있다.
+
+예:
+
+x86
+↓
+wrong RISC semantic
+↓
+wrong native handler
+
+이면:
+
+RISC == native
+
+테스트는 PASS다.
+
+따라서 진짜 필요한 것은:
+
+real x86 CPU
+==
+RISC interpreter
+==
+poly interpreter
+==
+native threaded VM
+
+4-way differential test다.
+
+현재 가장 중요한 테스트 부족 부분이다.
+
+───
+
+22. Native bridge의 또 다른 문제: VM XMM 상태 동기화
+
+RISC VM은 XMM을:
+
+state memory slot
+
+로 모델링한다.
+
+그런데 native bridge는:
+
+XMM state → native XMM registers
+native XMM → VM XMM state
+
+변환이 없다.
+
+따라서:
+
+VM FP calculation
+↓
+native function
+↓
+FP argument
+
+경계가 정확하지 않다.
+
+이건 위에서 말한 ABI 문제와 연결된다.
+
+───
+
+23. Commercial VM의 함수 원자성 문제가 코드에 스스로 기록되어 있다
+
+vm/text_lift/commercial.rs에는 사실상 명시적인 경고가 있다.
+
+현재 알고리즘은:
+
+RISC-unliftable block
+↓
+그 block만 native
+
+가 될 수 있다.
+
+그런데 함수가:
+
+foo:
+block A ← VM
+block B ← native
+block C ← VM
+
+가 되면:
+
+VM → native block
+
+경계가 함수 중간에 생긴다.
+
+그리고 native block이:
+
+add rsp,...
+pop rbp
+ret
+
+같은 tail이라면 함수 prologue 없이 진입해서 stack을 망가뜨릴 수 있다.
+
+코드 주석에도 이 위험을 직접 적어놓았다.
+
+───
+
+24. 현재 bridge_to_function_entries()가 해결하는 범위가 제한적이다
+
+이 함수는:
+
+excluded_func_ranges
+
+안의 target이면:
+
+function entry
+
+로 redirect한다.
+
+좋다.
+
+하지만 .pdata 기반 function range가 없는 함수에는 적용할 수 없다.
+
+즉:
+
+.pdata가 있는 함수
+→ 비교적 안전
+
+.pdata 없는 leaf / synthetic function
+→ block-level native fallback 가능
+→ function-middle entry 위험
+
+이라는 구조다.
+
+PE64 leaf function / hand-written thunk / compiler-generated tiny function에서 취약하다.
+
+───
+
+25. M7 재암호화는 아이디어가 좋지만 plaintext island가 많아질 수 있다
+
+M7은:
+
+decrypt
+→ execute
+→ refcount
+→ last exit
+→ reencrypt
+
+구조다.
+
+이건 좋다.
+
+그런데 call_target_block_ids가:
+
+direct call target
+data function pointer
+.pdata Begin/End
+RIP-relative materialized target
+mov imm64 target
+terminal block
+
+등을 계속 plaintext set에 추가한다.
+
+즉 실제 프로그램에서는:
+
+Encrypted blocks
++
+많은 plaintext blocks
+
+가 될 수 있다.
+
+특히 direct call이 많은 일반적인 compiled binary에서는 plaintext set이 상당히 커질 가능성이 있다.
+
+따라서:
+
+"항상 현재 실행 중인 block만 plaintext"
+
+라는 설명은 실제 구현과 다르다.
+
+정확히는:
+
+실행 중 block + 직접 참조 때문에 영구 plaintext인 island
+
+이다.
+
+───
+
+26. M7의 exception 처리도 security tradeoff가 명확하다
+
+코드가 말하는 정책은:
+
+block 실행 중 exception
+↓
+refcount decrement 안 됨
+↓
+block plaintext 유지
+
+다.
+
+이건 deadlock/double-encrypt 방지 측면에서는 합리적이다.
+
+하지만 공격자 입장에서는:
+
+의도적으로 exception 유도
+→ 해당 block plaintext 유지
+
+라는 공격 surface가 생긴다.
+
+즉 M7은:
+
+안정성: 좋음
+anti-dump: 좋음
+exception-assisted dump resistance: 약함
+
+이다.
+
+───
+
+27. RISC VM의 opcode polymorphism은 실제로는 꽤 괜찮다
+
+이 부분은 제대로 평가할 가치가 있다.
+
+VirtualIsaSpec에서:
+
+opcode permutation
+branch condition permutation
+register permutation
+operand mask
+
+를 build마다 변경한다.
+
+그리고 handler table도:
+
+handler VA ^ per_op_key(op)
+
+로 저장한다.
+
+이건 실제로 static signature를 상당히 깨뜨린다.
+
+───
+
+28. 하지만 여기서 중요한 사실: seed가 runtime에 존재한다
+
+Commercial dispatcher entry에서:
+
+init_key = seed * constant ^ constant
+
+가 초기화되고,
+
+그 값이 code에 들어간다.
+
+그리고 seed → init_key 변환에 사용되는 곱셈 상수는 odd다.
+
+따라서 modulo 2^64에서 역원이 존재한다.
+
+즉 공격자가:
+
+init_key
+
+를 찾으면 seed를 역산할 수 있다.
+
+그러면:
+
+seed
+↓
+VirtualIsaSpec
+↓
+opcode map
+↓
+register permutation
+↓
+branch condition map
+
+를 전부 재생성할 수 있다.
+
+───
+
+29. M8의 "MBA로 key 숨김"도 실제 보안성은 제한적
+
+현재:
+
+K = a + b
+
+를:
+
+(a ^ b) + 2(a & b)
+
+로 계산한다.
+
+하지만 a, b 자체가 code에 들어 있다.
+
+따라서 공격자는 그냥:
+
+K = a + b
+
+하면 된다.
+
+MBA가:
+
+key를 숨기는 암호
+
+는 아니다.
+
+그냥:
+
+정적 패턴을 조금 더 귀찮게 만드는 표현 변환
+
+이다.
+
+───
+
+30. 더 나쁜 점: branch_map이 원본 IP를 직접 보존한다
+
+Commercial table의:
+
+branch_map
+
+에는:
+
+source IP
+→ bytecode offset
+
+가 들어간다.
+
+즉 보호기가 원본 CFG를 실행하기 위해 필요한 정보를 그대로 binary에 넣는다.
+
+리버서가 이 구조를 찾으면:
+
+0x140xxxxxxx
+↓
+VM bytecode offset
+
+mapping을 그대로 얻는다.
+
+그러면:
+
+원본 instruction address
+→ VM offset
+→ handler
+
+가 연결된다.
+
+이건 commercial VM의 가장 큰 static-analysis 정보 leak 중 하나다.
+
+───
+
+31. 따라서 현재 VM의 실제 공격 순서는 상당히 명확하다
+
+내가 이걸 devirtualizer로 공격한다면:
+
+1. .textb/.btgvm 찾기
+2. self-decoding dispatcher 찾기
+3. R12/R14/R15/RDX ABI 식별
+4. init_key 추출
+5. seed 역산
+6. VirtualIsaSpec 재생성
+7. handler table decode
+8. branch_map 추출
+9. source-IP → bytecode offset 복원
+10. handler semantic classification
+11. RISC IR 복구
+12. original CFG 재구성
+
+이다.
+
+즉 opcode permutation은 풀 수 있지만 분석 비용을 증가시키는 역할은 분명히 한다.
+
+───
+
+32. 그래도 dispatcher 자체는 상당히 잘 만들었다
+
+특히 이 부분:
+
+unused opcode
+→ UD2 trap
+
+으로 바뀐 것은 좋다.
+
+예전의:
+
+unknown opcode
+→ h_nop
+
+보다 훨씬 낫다.
+
+그리고:
+
+table checksum
+
+도 들어가 있다.
+
+이건 runtime table patching을 어렵게 만든다.
+
+하지만 checksum 역시:
+
+검증 코드
++
+checksum constant
+
+가 binary에 존재하므로 공격자가 패치할 수 없는 수준은 아니다.
+
+───
+
+33. Commercial VM의 "self decoding"은 실제로 의미가 있다
+
+단순:
+
+decrypt all bytecode
+
+가 아니라:
+
+fetch 1
+decode
+key advance
+handler
+fetch 2
+...
+
+형태라서 memory dump 한 번으로 전체 plaintext를 얻는 구조보다 낫다.
+
+이건 이 프로젝트의 실질적인 강점 중 하나다.
+
+───
+
+34. Rolling-key도 암호학적으로 강한 건 아니다
+
+현재 key evolution은:
+
+key
+→ mix
+→ rotate
+→ xor
+→ plaintext/opcode feedback
+
+류다.
+
+이건 static extraction을 어렵게 만드는 데는 도움이 된다.
+
+하지만 공격자는:
+
+decoder code
++
+initial key
++
+ciphertext
+
+를 가지고 있다.
+
+따라서 cryptographic secrecy가 아니라 reverse-engineering cost 증가다.
+
+이 구분을 README에서 명확하게 해야 한다.
+
+───
+
+35. PE relocation은 현재 가장 위험한 부분 중 하나
+
+pe/reloc.rs가 relocation을:
+
+8-byte aligned
++
+값이 image range 안에 있음
+
+으로 추측한다.
+
+문제는 injected code에:
+
+mov rax, 0x1400...
+
+같은 imm64가 많다는 것이다.
+
+mov r64, imm64에서 immediate는 보통:
+
+instruction offset + 2
+
+에 있다.
+
+즉 8-byte alignment가 보장되지 않는다.
+
+그런데 relocation scanner는:
+
+i * 8
+
+만 검사한다.
+
+따라서:
+
+injected imm64 VA
+
+를 relocation entry로 못 잡을 가능성이 높다.
+
+───
+
+36. 그런데 동시에 ASLR bit를 켠다
+
+pipeline/build.rs에서 relocation-aware 경로가 성공하면:
+
+DYNAMIC_BASE
+HIGH_ENTROPY_VA
+
+를 복구한다.
+
+그러면 OS가 image를 다른 base로 옮길 수 있다.
+
+그런데 일부 absolute VA가 relocation되지 않으면:
+
+preferred base != actual base
+
+에서 injected code가 잘못된 주소를 사용한다.
+
+즉 현재 ASLR 구현은 실전 검증 없이는 믿으면 안 된다.
+
+내 평가에서는:
+
+ASLR 지원이라고 표시하기 전에 relocation provenance를 명시적으로 관리해야 한다.
+
+가 맞다.
+
+───
+
+37. 더 좋은 relocation 설계는 "추측"이 아니다
+
+현재:
+
+8-byte value looks like VA
+→ relocation
+
+이다.
+
+상용 패커라면:
+
+code generator
+↓
+absolute reference 생성 시 relocation record 등록
+↓
+RVA/offset 저장
+↓
+.reloc 생성
+
+이어야 한다.
+
+원본 PE는:
+
+원본 .reloc
+
+을 유지/변환하고,
+
+새로 만든:
+
+dispatcher
+VM
+handler table
+boot stub
+crypto blob
+
+은 생성 시점에 정확한 relocation list를 가지고 있어야 한다.
+
+이걸 바꾸면 ASLR 안정성이 크게 올라간다.
+
+───
+
+38. PE Builder 자체는 꽤 잘 되어 있다
+
+pe/builder.rs는:
+
+section alignment
+file alignment
+data directories
+section characteristics
+SizeOfImage
+SizeOfHeaders
+
+등을 직접 처리한다.
+
+그리고 .pdata, .reloc, .rsrc도 고려한다.
+
+단순한 binary append 수준은 아니다.
+
+───
+
+39. 하지만 signed PE는 당연히 깨진다
+
+build.rs에서:
+
+DataDirectory[4] Security
+→ zero
+
+한다.
+
+즉 Authenticode certificate table이 제거된다.
+
+물론 PE를 변경하면 원래 signature가 무효가 되는 게 정상이다.
+
+다만 제품 관점에서는:
+
+signed executable
+→ packed executable
+
+에 대한 signature policy가 필요하다.
+
+현재는 그냥 제거다.
+
+───
+
+40. IAT hiding도 실제로는 상당히 괜찮다
+
+원본:
+
+kernel32!...
+ucrtbase!...
+ntdll!...
+
+등을 제거하고:
+
+LoadLibraryA
+GetProcAddress
+
+만 남기는 구조는 static import reconnaissance를 어렵게 만든다.
+
+그리고 per-entry MBA XOR까지 넣었다.
+
+이건 실질적인 분석 방해 효과가 있다.
+
+───
+
+41. 하지만 "모든 import를 숨긴다"는 의미로 보면 부족하다
+
+코드상 핵심 수집은 일반 import directory다.
+
+PE에는:
+
+Import
+Delay Import
+Bound Import
+IAT
+
+등이 별도로 존재할 수 있다.
+
+따라서 특정 PE에서는:
+
+normal import
+→ 숨김
+
+delay import / bound metadata
+→ 흔적
+
+이 남을 수 있다.
+
+특히 DataDirectory[13] Delay Import는 별도 취급된다.
+
+따라서 제품 목표가:
+
+import surface concealment
+
+이라면 모든 관련 directory를 함께 처리해야 한다.
+
+───
+
+42. CFG 처리도 상당히 공격적이다
+
+Load Config의:
+
+GuardCFCheckFunctionPointer
+GuardCFDispatchFunctionPointer
+GuardCFFunctionTable
+GuardFlags
+
+등을 무력화하는 방향이다.
+
+호환성 문제를 피하기 위한 선택인 건 이해한다.
+
+하지만 결과적으로:
+
+원래 PE의 CFG 보호를 제거한다.
+
+즉 보호기를 적용하면서 OS-level CFG security를 없애는 셈이다.
+
+상용 제품이라면:
+
+CFG preserve mode
+CFG strip mode
+
+를 분리하는 것이 좋다.
+
+───
+
+43. TLS 처리에는 실제 경험이 많이 들어가 있다
+
+tls_guard.rs, patch_data/protect.rs를 보면:
+
+TLS directory
+AddressOfCallbacks
+TLS raw data
+TLS callback function
+
+을 상당히 자세히 고려한다.
+
+특히:
+
+loader가 boot stub보다 먼저 TLS callback을 실행한다
+
+는 Windows PE lifecycle을 고려해서 plaintext 영역을 보호하는 것은 맞는 설계다.
+
+이건 높게 평가한다.
+
+───
+
+44. .pdata 처리도 상당히 진지하다
+
+특히:
+
+RUNTIME_FUNCTION
+UNWIND_INFO
+
+를 건드리고,
+
+VM module에 bridge unwind를 넣는다.
+
+Windows x64에서 이걸 무시하는 패커는 쉽게:
+
+0xC0000409
+0xC0000005
+
+를 만든다.
+
+이 프로젝트가 과거 crash를 추적하면서 이 부분을 상당히 개선한 흔적이 있다.
+
+───
+
+45. 하지만 SEH를 "완전히 가상화"한 것은 아니다
+
+Commercial path는:
+
+minimal SEH native set
+
+을 유지한다.
+
+즉 실제로는:
+
+SEH virtualization
++
+native exceptions islands
+
+이다.
+
+이건 괜찮다.
+
+다만 정확한 표현은:
+
+SEH-aware virtualization
+
+이지:
+
+full SEH virtualization
+
+은 아니다.
+
+───
+
+46. QA 시스템은 이 프로젝트의 강점
+
+qa.rs는 단순 unit test보다 훨씬 낫다.
+
+실제로:
+
+Rust O0
+O1
+O2
+O3
+LTO
+CGU16
+panic=abort
+overflow-checks
+
+코퍼스를 만들려고 한다.
+
+그리고:
+
+original
+vs
+packed
+
+실행 결과를 비교한다.
+
+이건 방향이 아주 좋다.
+
+───
+
+47. 하지만 QA가 검증하는 범위에는 구멍이 있다
+
+run_and_verify()는:
+
+9초 기다림
+↓
+살아있으면 kill
+
+이다.
+
+따라서:
+
+원본 = 30초 실행
+packed = 9초 후 kill
+
+같은 경우도 둘 다 alive라면 PASS가 될 수 있다.
+
+또:
+
+GUI program
+
+은 stdout이 없으므로 행동 동치 검증이 매우 약하다.
+
+그리고 source ZIP에는:
+
+test/Cargo.toml
+
+도 없다.
+
+따라서 지금 올린 ZIP만으로 QA corpus를 재현할 수 없다.
+
+───
+
+48. 테스트 428개가 많다는 것과 correctness가 증명됐다는 것은 다르다
+
+현재 테스트 대부분은:
+
+RISC reference
+vs
+native harness
+
+다.
+
+이건 좋다.
+
+하지만 앞에서 본 것처럼:
+
+reference semantic 자체가 x86과 틀린 경우
+
+에는 테스트가 전부 PASS할 수 있다.
+
+따라서 앞으로는 반드시:
+
+x86 hardware
+↓
+reference
+↓
+RISC
+↓
+poly interpreter
+↓
+native threaded
+
+를 비교해야 한다.
+
+───
+
+49. 특히 반드시 추가해야 할 differential corpus
+
+최소한:
+
+MUL/IMUL
+DIV/IDIV
+CMPXCHG
+XCHG
+XADD
+SHL/SHR/SAR count=0
+SHL/SHR/SAR count=1
+8-bit flags
+16-bit flags
+32-bit flags
+CALL nested depth 1
+CALL nested depth 10
+CALL recursive
+RET
+RET imm16
+TLS callback
+SEH
+FP argument native bridge
+XMM return
+indirect call
+jump table
+
+이 정도는 반드시 CPU 결과와 비교해야 한다.
+
+───
+
+50. CALL/RET 테스트가 특히 이상하다
+
+vm/risc/lifter.rs 테스트:
+
+CALL
+→ callee
+→ RET
+
+에서 확인하는 것이:
+
+callee executed
+stack contains return address
+
+다.
+
+그런데:
+
+caller가 실제로 return address로 돌아와 계속 실행했는가?
+
+를 테스트하지 않는다.
+
+이게 바로 commercial backend의 가장 중요한 missing test다.
+
+───
+
+51. 현재 Commercial VM의 진짜 구조를 정확히 그리면
+
+x86-64
+│
+▼
+Linear-sweep CFG
+│
+▼
+RISC Lifter
+│
+┌──────────┴─────────┐
+│ │
+supported unsupported
+│ │
+▼ ▼
+RISC VM native
+│
+▼
+Poly ISA permutation
+│
+▼
+Rolling-key bytecode
+│
+▼
+Native threaded dispatcher
+│
+┌──┴──┐
+│ │
+VM target native target
+│ │
+▼ ▼
+VM jump Native bridge
+│
+▼
+RET
+│
+▼
+HALT ← 문제
+
+이 마지막 부분이 핵심이다.
+
+───
+
+52. 따라서 현재 프로젝트를 기능별로 다시 점수화하면
+
+영역 점수 판단
+
+PE engineering 8/10 상당히 진지함
+PE compatibility 6/10 아직 위험
+CFG transformer 7/10 실제 동작하지만 linear sweep 한계
+BTG 아이디어 7.5/10 아이디어 좋지만 현재 구현은 단순화됨
+BTG 실제 구현 6/10 overlap/misaligned/polymorphic entry가 꺼져 있음
+Legacy VM 7.5/10 call stack 포함해 상대적으로 성숙
+Commercial RISC ISA 7/10 상당히 큰 semantic 범위
+Commercial correctness 4.5/10 critical semantic gap 존재
+Poly ISA 8/10 실제 분석 비용 상승
+Threaded dispatcher 8.5/10 가장 잘 만든 부분
+Native bridge 7.5/10 GPR/stack은 상당히 좋음
+Native bridge ABI 5.5/10 XMM/FP ABI gap
+Re-encryption 8/10 좋은 설계
+Anti-debug 5/10 기본적인 기법
+IAT hiding 7/10 실질적 효과 있음
+Crypto implementation 7.5/10 구현은 공들임
+Crypto security claim 4/10 runtime-visible key라 암호학적 비밀은 아님
+QA architecture 8/10 방향 좋음
+QA coverage 6.5/10 실제 PE/CPU semantics gap
+Production readiness 5.5~6/10 안정성 문제가 아직 큼
+
+───
+
+53. 내가 가장 심각하다고 보는 순위
+
+🔴 P0 — 반드시 고쳐야 함
+
+1. Commercial CALL/RET
+
+CALL → VirtualPush + VirtualBranch
+RET → HALT
+
+이건 ISA 차원의 문제.
+
+VirtualCall/VirtualRet 또는 VM call stack semantic이 필요하다.
+
+───
+
+2. Signed MUL/IMUL
+
+현재:
+
+signed = overflow 계산에만 사용
+
+이고 high half가 잘못된다.
+
+───
+
+3. Narrow-width flag corruption
+
+8/16-bit
+mask
+preserve_upper
+AND/OR
+
+때문에 최종 flags가 원본과 달라질 수 있다.
+
+───
+
+4. XCHG/XADD atomicity
+
+XCHG → read/write
+XADD → read/add/write
+
+는 lock-free/atomic 코드에서 위험하다.
+
+───
+
+5. ASLR relocation
+
+8-byte aligned VA scanning
+
+으로 injected imm64 relocation을 완전히 추적할 수 없다.
+
+───
+
+54. 🟠 P1
+
+6. CMPXCHG flags
+
+ZF만 유지하는 semantic.
+
+7. DIV/IDIV exception semantics
+
+#DE를 0 결과로 대체.
+
+8. Native bridge XMM ABI
+
+FP/vector native fallback에 문제.
+
+9. .pdata 없는 함수의 block-level native fallback
+
+function-middle entry 위험.
+
+10. branch_map의 source-IP 노출
+
+정적 devirtualization에 상당히 유리한 데이터.
+
+11. plaintext call-target island
+
+M7의 실제 보호율을 떨어뜨림.
+
+───
+
+55. 🟡 P2
+
+12. --obf-level 실질적 미사용
+
+13. --m8가 commercial VM에서는 사실상 적용되지 않음
+
+build_prog_vm_mod()에서 commercial이면 m8_mod를 무시한다.
+
+14. BTG overlap/polymorphism 비활성
+
+현재 실질적인 BTG는 block shuffle 중심.
+
+15. CFG metrics 과대평가 가능
+
+모든 shuffled edge를 flattening으로 계산하지만 실제 dispatcher routing 여부와 정확히 동일하지 않다.
+
+16. validate_bidirectionality()의 검증력이 약함.
+
+───
+
+56. 반대로 정말 잘 만든 부분
+
+이걸 전부 부정적으로 보면 안 된다.
+
+특히 다음은 실제로 수준이 있다.
+
+① RISC IR 설계
+
+opcode 수가 많고:
+
+width
+flags
+memory
+branch
+atomic
+FP
+SSE
+
+를 분리했다.
+
+② native threaded dispatcher
+
+이건 상당히 좋다.
+
+③ rolling decode
+
+단순 bulk decrypt보다 훨씬 낫다.
+
+④ handler permutation
+
+실제 static signature를 깨뜨린다.
+
+⑤ .pdata/TLS/LoadConfig 처리
+
+Windows PE 보호기에서 중요한 영역을 실제로 다루고 있다.
+
+⑥ differential testing 인프라
+
+428개 테스트를 만든 건 단순 장난감 프로젝트와 확실히 다르다.
+
+⑦ M7 refcount
+
+멀티스레드 상황까지 고려하려고 한 흔적이 명확하다.
+
+⑧ native bridge
+
+Win64 stack/shadow space/volatile GPR까지 고려한 건 상당히 괜찮다.
+
+───
+
+57. 그래서 이 프로젝트의 정확한 현재 위치
+
+내가 지금 이걸 GitHub에서 발견했다면:
+
+"학생이 VM 난독화 한번 만들어봤다"
+
+라고 보지는 않는다.
+
+코드량 때문이 아니라 실제로:
+
+PE transformation
+CFG
+RISC lifting
+custom ISA
+native threaded VM
+crypto
+IAT
+SEH
+TLS
+relocation
+native bridge
+QA corpus
+
+까지 연결되어 있기 때문이다.
+
+다만 동시에 소스를 깊게 읽으면:
+
+"아직 commercial VM backend를 안정적인 compiler-grade semantic engine으로 만들기 전 단계"
+
+라는 것도 바로 보인다.
+
+───
+
+58. 그리고 가장 중요한 결론
+
+지금 기능을 더 추가하면 안 된다.
+
+예를 들어 지금:
+
+• opcode 30개
+• MBA 더 세게
+• anti-debug 10개
+• 새로운 cipher
+• BTG level 4
+
+를 추가하는 건 우선순위가 아니다.
+
+현재 필요한 것은 오히려:
+
+x86 CPU
+│
+▼
+Semantic Oracle
+│
+┌───────────┼───────────┐
+▼ ▼ ▼
+RISC Poly Native
+│ │ │
+└───────────┼───────────┘
+▼
+exact equality
+
+를 만드는 것이다.
+
+그리고 그 위에:
+
+PE corpus
+×
+compiler versions
+×
+optimization levels
+×
+threads
+×
+SEH
+×
+TLS
+×
+FP
+×
+atomic
+×
+nested calls
+
+를 돌려야 한다.
+
+───
+
+최종 판정
+
+아이디어/아키텍처: 8~8.5/10
+실제 구현의 야심: 9/10
+현재 commercial VM correctness: 4.5~5/10
+실제 reverse-engineering resistance: 7~8/10
+Windows PE engineering: 7~8/10
+현재 상용화 가능성: 5.5~6/10
+
+가장 중요한 한 문장으로 줄이면:
+
+이 프로젝트는 "보호기 아이디어가 부족한 프로젝트"가 아니라, 이미 보호 계층은 충분히 많고 이제는 그 계층들을 더 추가하는 것보다 x86 → RISC → poly → native 전체 semantic을 정확하게 만드는 것이 압도적으로 중요한 단계다.
+
+특히 CALL/RET, signed MUL/IMUL, narrow flags, XCHG/XADD atomicity, ASLR relocation 이 다섯 개를 해결하기 전에는 --vm-commercial을 "상용 수준"이라고 평가하면 안 된다.
+
+그리고 이 다섯 개를 해결하고 실제 PE corpus에서 원본 CPU 실행과 commercial VM 실행이 동일하다는 것을 증명하면 이야기가 완전히 달라진다. 그때부터는 정말로 VM protector 연구 프로젝트로 상당히 강한 편이라고 평가할 수 있다.
