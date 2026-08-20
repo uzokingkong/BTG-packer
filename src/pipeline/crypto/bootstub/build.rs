@@ -66,6 +66,16 @@ pub(crate) fn build_anti_debug_raw_block(policy: crate::dispatcher::antidebug::A
             b[n - 4] = 0xEB;
             b[n - 3] = 0xFE;
         }
+        crate::dispatcher::antidebug::AntiDebugPolicy::Poison => {
+            // Stealth poison: fail-open to normal path with dirty flags/state
+            let normal = (b.len() - 2) as u8;
+            b[0x12] = normal.wrapping_sub(0x13);
+            b[0x28] = normal.wrapping_sub(0x29);
+            b[0x42] = normal.wrapping_sub(0x43);
+            let n = b.len();
+            b[n - 4] = 0xEB;
+            b[n - 3] = 0x02;
+        }
         crate::dispatcher::antidebug::AntiDebugPolicy::Warn => {
             // 세 jnz를 정상 경로(끝 pop rax, 오프셋 len-2)로 리다이렉트.
             // 레이아웃: jnz@0x11(+0x32), jnz@0x27(+0x1C), jnz@0x41(+0x02),

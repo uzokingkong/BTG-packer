@@ -31,6 +31,7 @@
 /// | `Trap` | `ud2` (SIGILL) | sensitive (기본) |
 /// | `Hang` | `jmp $` 무한 루프 | research/툴 고정 |
 /// | `Warn` | 정상 경로로 계속 (fail-open) | consumer/diagnostic |
+/// | `Poison` | 상태 오염 후 계속 (stealth poison) | stealth / anti-analysis |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum AntiDebugPolicy {
     /// 탐지 시 `ud2` (SIGILL) — 민감 프로파일 기본.
@@ -42,6 +43,9 @@ pub enum AntiDebugPolicy {
     /// 탐지 시 정상 경로로 계속 (fail-open) — consumer/diagnostic.
     #[value(name = "warn")]
     Warn,
+    /// 탐지 시 상태 오염(Stealth Poison) 후 계속 — 즉시 트랩 없이 런타임 가비지 연산 유도.
+    #[value(name = "poison")]
+    Poison,
 }
 
 impl AntiDebugPolicy {
@@ -51,6 +55,7 @@ impl AntiDebugPolicy {
             AntiDebugPolicy::Trap => "trap",
             AntiDebugPolicy::Hang => "hang",
             AntiDebugPolicy::Warn => "warn",
+            AntiDebugPolicy::Poison => "poison",
         }
     }
 }
@@ -117,6 +122,9 @@ pub fn build_anti_debug_shellcode(ad_va: u64, dispatcher_va: u64, policy: AntiDe
         AntiDebugPolicy::Trap => b.extend_from_slice(&[0x0F, 0x0B]),
         // Hang: `jmp $` (EB FE) — 무한 루프, 분석 툴 고정
         AntiDebugPolicy::Hang => b.extend_from_slice(&[0xEB, 0xFE]),
+        // Poison: Stealth state poisoning — jumps back to 0x41 (EB F9) with non-zero RAX
+        // to poison the initial dispatcher key/state without immediate trap.
+        AntiDebugPolicy::Poison => b.extend_from_slice(&[0xEB, 0xF9]),
         // Warn: fail-open — 세 jnz가 정상 경로(0x41의 jmp rel32)로 향하도록
         // 디스패치 직전의 정상 jmp로 리다이렉트. 실패 슬롯은 도달 불가 nop.
         AntiDebugPolicy::Warn => {
@@ -225,12 +233,20 @@ mod tests {
         assert_eq!(&code[0x46..0x48], &[0x90, 0x90]);
     }
 
-    /// readccc §4.5: 세 정책 모두 정상 경로(디스패처 점프)는 동일하게 유지되어야 한다.
+    /// Stealth: Poison 정책 — 탐지 시 EB F9 (jmp -7)로 0x41(디스패처 점프)로 복귀.
+    #[test]
+    fn test_anti_debug_poison_policy() {
+        let code = build_anti_debug_shellcode(0x140001000, 0x140002000, AntiDebugPolicy::Poison);
+        assert_eq!(code.len(), ANTI_DEBUG_SIZE);
+        assert_eq!(&code[0x46..0x48], &[0xEB, 0xF9], "poison slot must be jmp -7 to 0x41");
+    }
+
+    /// readccc §4.5: 모든 정책에서 정상 경로(디스패처 점프)는 동일하게 유지되어야 한다.
     #[test]
     fn test_anti_debug_policies_share_normal_path() {
         let ad_va = 0x140001000u64;
         let disp_va = 0x140002000u64;
-        for policy in [AntiDebugPolicy::Trap, AntiDebugPolicy::Hang, AntiDebugPolicy::Warn] {
+        for policy in [AntiDebugPolicy::Trap, AntiDebugPolicy::Hang, AntiDebugPolicy::Warn, AntiDebugPolicy::Poison] {
             let code = build_anti_debug_shellcode(ad_va, disp_va, policy);
             assert_eq!(code.len(), ANTI_DEBUG_SIZE);
             let disp = i32::from_le_bytes(code[0x42..0x46].try_into().unwrap()) as i64;
@@ -245,5 +261,6 @@ mod tests {
         assert_eq!(AntiDebugPolicy::Trap.as_str(), "trap");
         assert_eq!(AntiDebugPolicy::Hang.as_str(), "hang");
         assert_eq!(AntiDebugPolicy::Warn.as_str(), "warn");
+        assert_eq!(AntiDebugPolicy::Poison.as_str(), "poison");
     }
 }

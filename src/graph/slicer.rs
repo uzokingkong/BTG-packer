@@ -146,9 +146,9 @@ impl MicroSlicer {
                 execution_path: vec![block_id],
             }).unwrap_or_default();
 
-            // Overlapping entry points (+1 offset) are disabled to guarantee 100% EFLAGS preservation.
-            // Opcode 0x02 (ADD) at +1 offset mutated CPU flags (ZF/SF/CF), corrupting conditional branches.
-            let enable_overlap = false;
+            // O2: Multi-entry polymorphic trigger blocks (RFLAGS-safe 0x66 0x90 prefix).
+            // Enabled when obf_level >= 3 for maximum anti-disassembly without flag mutation.
+            let enable_overlap = self.obf_level >= 3;
             if enable_overlap {
                 tb.add_entry_point(EntryPointInfo {
                     offset: 1,

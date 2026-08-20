@@ -345,8 +345,50 @@ impl PeMultiSectionBuilder {
             }
         }
 
+        // H4: Standard PE CheckSum calculation (Windows CheckSumMappedFile algorithm)
+        let checksum_offset = opt_pos + 64;
+        let calculated_checksum = calculate_pe_checksum(&pe_bytes, checksum_offset);
+        pe_bytes[checksum_offset..checksum_offset + 4].copy_from_slice(&calculated_checksum.to_le_bytes());
+
         Ok(pe_bytes)
     }
+}
+
+/// Calculate standard Microsoft PE image checksum (CheckSumMappedFile algorithm).
+///
+/// 1. Sums all 16-bit little-endian words with carry folding into a 32-bit accumulator.
+/// 2. Skips the 4-byte CheckSum field at `checksum_offset`.
+/// 3. Adds the total file length to the folded 16-bit sum.
+pub fn calculate_pe_checksum(pe_bytes: &[u8], checksum_offset: usize) -> u32 {
+    let mut sum: u64 = 0;
+    let len = pe_bytes.len();
+    let num_words = len / 2;
+
+    for i in 0..num_words {
+        let byte_idx = i * 2;
+        if byte_idx == checksum_offset || byte_idx == checksum_offset + 2 {
+            continue;
+        }
+        let word = u16::from_le_bytes([pe_bytes[byte_idx], pe_bytes[byte_idx + 1]]) as u64;
+        sum += word;
+        if sum > 0xFFFF_FFFF {
+            sum = (sum & 0xFFFF_FFFF) + (sum >> 32);
+        }
+    }
+
+    if len % 2 != 0 {
+        let word = pe_bytes[len - 1] as u64;
+        sum += word;
+        if sum > 0xFFFF_FFFF {
+            sum = (sum & 0xFFFF_FFFF) + (sum >> 32);
+        }
+    }
+
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    (sum + len as u64) as u32
 }
 
 // Preserve existing PeBuilder compatibility
@@ -392,5 +434,25 @@ impl PeBuilder {
             Vec::new(),
         );
         builder.build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pe_checksum_calculation() {
+        let dummy = vec![0x4Du8, 0x5A, 0x90, 0x00, 0x03, 0x00, 0x00, 0x00];
+        let csum = calculate_pe_checksum(&dummy, 0x40);
+        assert!(csum > 0, "checksum must be non-zero");
+
+        // Building minimal PE should produce non-zero CheckSum at opt_pos + 64
+        let builder = PeBuilder::new(0x140000000, 0x1000, vec![0x90, 0xC3]);
+        let pe_bytes = builder.build().unwrap();
+        let e_lfanew = u32::from_le_bytes(pe_bytes[0x3C..0x40].try_into().unwrap()) as usize;
+        let opt_pos = e_lfanew + 24;
+        let checksum = u32::from_le_bytes(pe_bytes[opt_pos + 64..opt_pos + 68].try_into().unwrap());
+        assert!(checksum > 0, "PE OptionalHeader.CheckSum must be populated and > 0");
     }
 }

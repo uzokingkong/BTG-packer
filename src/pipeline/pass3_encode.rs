@@ -41,16 +41,16 @@ fn encode_block_at(
             .map_err(|e| anyhow::anyhow!("Polymorphism validation failed: {}", e))?;
     }
 
-    // Misaligned entry가 있으면 4-byte prefix stub 삽입
+    // O2: Misaligned entry가 있으면 RFLAGS-Safe 2-byte prefix stub 삽입
     let mut prefix_bytes = Vec::new();
     let mut entry_offset: u64 = 0;
     for entry in block.entries.values() {
         if let crate::core::trigger_block::EntryPointType::Misaligned(offset) = entry.entry_type {
             if offset > 0 {
-                // Normal entry (+0):     0xEB 0x02 → jmp short +2 (→ code_start_va)
-                // Misaligned entry (+1): 0x02 0xC0 (add al,al) + 0x90 (nop) — 레지스터 연산만
-                prefix_bytes.extend_from_slice(&[0xEB, 0x02, 0xC0, 0x90]);
-                entry_offset = 4;
+                // Normal entry (+0):     0x66 0x90 (2B NOP `xchg ax, ax` — 100% RFLAGS/GPR/RSP 보존)
+                // Misaligned entry (+1): 0x90 (1B NOP — 100% RFLAGS/GPR/RSP 보존)
+                prefix_bytes.extend_from_slice(&[0x66, 0x90]);
+                entry_offset = 2;
                 break;
             }
         }

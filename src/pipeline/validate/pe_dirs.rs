@@ -408,6 +408,50 @@ fn val_load_config(
     Ok(())
 }
 
+/// idx 13 — DelayImport: walk IMAGE_DELAYLOAD_DESCRIPTOR (32 B) array.
+fn val_delay_import(out: &[u8], sections: &[SectionInfo], rva: u32, size: u32) -> Result<()> {
+    const DESC_SIZE: usize = 32;
+    const MAX_DESCS: usize = 0x100;
+    let max_descs = ((size as usize / DESC_SIZE) + 1).min(MAX_DESCS + 1);
+    let mut dlls = 0usize;
+
+    for i in 0..max_descs {
+        let off = (i as u32)
+            .checked_mul(DESC_SIZE as u32)
+            .and_then(|v| rva.checked_add(v))
+            .ok_or_else(|| anyhow!("DelayImport: descriptor offset overflow"))?;
+        let b = raw_at(out, sections, off, DESC_SIZE)?;
+        let dll_name_rva = u32at(b, 4);
+        let module_handle_rva = u32at(b, 8);
+        let iat_rva = u32at(b, 12);
+        let int_rva = u32at(b, 16);
+
+        if dll_name_rva == 0 && module_handle_rva == 0 && iat_rva == 0 && int_rva == 0 {
+            break; // all-zero terminator
+        }
+        if i + 1 >= max_descs {
+            bail!("DelayImport: descriptor array has no all-zero terminator within dir size 0x{size:X}");
+        }
+
+        let _ = section_for_rva(sections, dll_name_rva)
+            .ok_or_else(|| anyhow!("DelayImport: DLL #{dlls} Name RVA 0x{dll_name_rva:X} outside all sections"))?;
+
+        if iat_rva != 0 {
+            let _ = section_for_rva(sections, iat_rva)
+                .ok_or_else(|| anyhow!("DelayImport: DLL #{dlls} IAT RVA 0x{iat_rva:X} outside all sections"))?;
+        }
+        if int_rva != 0 {
+            let _ = section_for_rva(sections, int_rva)
+                .ok_or_else(|| anyhow!("DelayImport: DLL #{dlls} INT RVA 0x{int_rva:X} outside all sections"))?;
+        }
+
+        dlls += 1;
+    }
+
+    println!("[VALIDATE] OK  DelayImport: {dlls} delay-load DLL(s), descriptors terminated");
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Entry point: iterate the 16 directories and re-parse each present one.
 // ──────────────────────────────────────────────────────────────────────────────
@@ -433,8 +477,9 @@ pub(crate) fn validate_data_directories(
             6 => val_debug(out, sections, rva, size)?,
             9 => val_tls(out, sections, image_base, rva, size)?,
             10 => val_load_config(out, sections, image_base, rva, size)?,
+            13 => val_delay_import(out, sections, rva, size)?,
             // 2 Resource: deep-validated in rsrc.rs when --rsrc-register; skip here.
-            // 4 Security / 5 Reloc(policy) / 12 IAT / 13 DelayImport / 0/1/3/6/9/10 handled.
+            // 4 Security / 5 Reloc(policy) / 11 BoundImport / 12 IAT handled.
             _ => {
                 // Any other present directory must already have had its RVA
                 // section-membership enforced by validate_pe_structure. Report it.
@@ -526,7 +571,7 @@ pub(crate) fn diff_orig_protected(
         );
         // Directory existed in original but is missing (0) in output.
         if orig_dd.0 != 0 && prot_dd.0 == 0 {
-            let intentional = matches!(i, 4 | 5); // Security / BaseReloc (ASLR stripped)
+            let intentional = matches!(i, 4 | 5 | 11); // Security / BaseReloc (ASLR stripped) / BoundImport
             if !intentional {
                 missing.push((i, DIR_NAMES[i], orig_dd.0));
             }
