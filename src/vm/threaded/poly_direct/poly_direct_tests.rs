@@ -464,12 +464,11 @@
 
             let old: u64 = 0xFEDC_BA98_7654_3210;
 
-            let scenarios: [(&str, u64, u64, bool); 2] = [
-
+            let scenarios: [(&str, u64, u64, bool); 3] = [
                 ("success", old, old, true),
-
                 ("failure", old ^ 0x1, old, false),
-
+                // P1-6: acc(0) < old(0x10) → CMP borrow → CF=1 (비-ZF 플래그 검증).
+                ("below", 0x0, old, false),
             ];
 
             for (label, acc, old, success) in scenarios {
@@ -603,11 +602,147 @@
                 );
 
                 assert_eq!(nat.flags & 0x40 != 0, success, "w{width} {label}: ZF wrong (nat.flags={:#x})", nat.flags);
+                // P1-6: 비-ZF 상태 플래그도 CMP(acc-old) 기준으로 set 된다 — "below"는
+                // acc(0) < old 이므로 borrow → CF=1 이어야 한다.
+                if label == "below" {
+                    assert_ne!(nat.flags & 0x1, 0, "w{width} below: CF must be set (CMP borrow)");
+                }
 
             }
 
         }
 
+    }
+
+    /// P0-4: AtomicExchange / AtomicAdd — native self-decoding handler == eval_state
+    /// (모든 폭). 원자 RMW 의미론: XCHG 는 swap(플래그 불변), XADD 는 덧셈 플래그
+    /// 를 폭별로 set. arena window 를 메모리 주소로 사용하고 참조 HashMap 과 동일
+    /// 시드해 레지스터/플래그/메모리 부수효과를 비교한다.
+    #[test]
+    fn test_poly_direct_atomic_exchange_add_all_widths_matches_reference() {
+        use std::collections::HashMap;
+
+        let seed = 0x13579BDF2468ACE0u64;
+        let mut arena = Arena::new(ARENA_SIZE).unwrap();
+        let base = arena.base;
+        let code_off = OFF_CODE;
+        let table_off = OFF_TABLE;
+        let bytecode_off = OFF_BYTECODE;
+        let state_off = OFF_STATE;
+        let window_off = 0x30000usize; // clear of code/table/bytecode/state/stack
+        let addr = (base + window_off) as u64;
+        let code_va = (base + code_off) as u64;
+        let table_va = (base + table_off) as u64;
+        let bytecode_va = (base + bytecode_off) as u64;
+        let state_va = (base + state_off) as u64;
+        let stack_base = (base + OFF_STACK_BASE) as u64;
+
+        for width in [1u8, 2, 4, 8] {
+            let mask = if width == 8 { u64::MAX } else { (1u64 << (width * 8)) - 1 };
+            let ex_val: u64 = 0x0BAD_F00D_CAFE_1234; // 레지스터에 들어갈 교환값 (폭 마스크)
+            let addend: u64 = 0x05;
+            let old: u64 = 0xFEDC_BA98_7654_3210;
+
+            let mut d = RiscDesynthesizer::new();
+            // AtomicExchange{width}: dst = VReg(0) (레지스터), src1 = VReg(1) (addr).
+            d.instrs.push(
+                MicroInstr::new(RiscOp::AtomicExchange { width })
+                    .with_dst(MicroOperand::VReg(0))
+                    .with_src1(MicroOperand::VReg(1)),
+            );
+            // AtomicAdd{width}: dst = VReg(0) (이전 [addr]), src1 = addr, src2 = addend.
+            d.instrs.push(
+                MicroInstr::new(RiscOp::AtomicAdd { width })
+                    .with_dst(MicroOperand::VReg(0))
+                    .with_src1(MicroOperand::VReg(1))
+                    .with_src2(MicroOperand::VReg(2)),
+            );
+            d.instrs.push(MicroInstr::new(RiscOp::Halt));
+            let prog = RiscProgram::new(d.instrs);
+
+            let mut enc = PolymorphicEncoder::new(seed);
+            let bytecode = enc.encode(&prog).unwrap();
+
+            let parts = build_self_decoding_parts(
+                &bytecode, seed, code_va, table_va, bytecode_va, state_va, stack_base,
+            )
+            .expect("build self-decoding parts");
+            assert!(
+                parts.code.len() + OFF_CODE <= OFF_TABLE,
+                "dispatcher code overflowed into table region: code_len={}",
+                parts.code.len()
+            );
+
+            {
+                let buf = arena.bytes();
+                buf[code_off..code_off + parts.code.len()].copy_from_slice(&parts.code);
+                for (i, v) in parts.table.iter().enumerate() {
+                    buf[table_off + i * 8..table_off + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+                }
+                buf[OFF_OP_OFFS..OFF_OP_OFFS + 256].copy_from_slice(&parts.offs_tab);
+                buf[OFF_OP_FLAGS..OFF_OP_FLAGS + 256].copy_from_slice(&parts.flags_tab);
+                buf[bytecode_off..bytecode_off + bytecode.len()].copy_from_slice(&bytecode);
+            }
+
+            let mut init = [0u64; 16];
+            init[0] = ex_val;
+            init[1] = addr;
+            init[2] = addend;
+
+            {
+                let buf = arena.bytes();
+                buf[window_off..window_off + 8].copy_from_slice(&old.to_le_bytes());
+                buf[state_off..state_off + STATE_END as usize].fill(0);
+                for (i, v) in init.iter().enumerate() {
+                    buf[state_off + REGS_OFF as usize + i * 8..state_off + REGS_OFF as usize + i * 8 + 8]
+                        .copy_from_slice(&v.to_le_bytes());
+                }
+            }
+            let mut seed_mem = HashMap::new();
+            for (k, b) in old.to_le_bytes().iter().enumerate() {
+                seed_mem.insert(addr.wrapping_add(k as u64), *b);
+            }
+
+            let ref_st = prog.eval_state_with_mem(&init, seed_mem);
+
+            arena.call(code_off);
+
+            let buf = arena.bytes();
+            let s = state_off;
+            let mut nat = RiscEvalState::default();
+            for i in 0..16 {
+                nat.regs[i] = u64::from_le_bytes(
+                    buf[s + REGS_OFF as usize + i * 8..s + REGS_OFF as usize + i * 8 + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+            }
+            for i in 0..8 {
+                nat.temps[i] = u64::from_le_bytes(
+                    buf[s + TEMPS_OFF as usize + i * 8..s + TEMPS_OFF as usize + i * 8 + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+            }
+            nat.flags = u64::from_le_bytes(buf[s + FLAGS_OFF as usize..s + FLAGS_OFF as usize + 8].try_into().unwrap());
+            nat.vsp = u64::from_le_bytes(buf[s + VSP_OFF as usize..s + VSP_OFF as usize + 8].try_into().unwrap());
+
+            assert_eq!(nat.regs, ref_st.regs, "w{width}: regs mismatch (nat={:?} ref={:?})", nat.regs, ref_st.regs);
+            assert_eq!(nat.flags, ref_st.flags, "w{width}: flags nat={:#x} ref={:#x}", nat.flags, ref_st.flags);
+            assert_eq!(nat.temps, ref_st.temps, "w{width}: temps mismatch");
+            assert_eq!(nat.vsp, ref_st.vsp, "w{width}: vsp mismatch");
+
+            // 메모리 부수효과: XCHG 후 [addr] = ex_val, XADD 후 [addr] = ex_val + addend.
+            let nat_mem = u64::from_le_bytes(buf[window_off..window_off + 8].try_into().unwrap());
+            let mut ref_mem = 0u64;
+            for k in 0..width as usize {
+                ref_mem |= (*ref_st.mem.get(&addr.wrapping_add(k as u64)).unwrap_or(&0) as u64) << (k * 8);
+            }
+            assert_eq!(nat_mem & mask, ref_mem, "w{width}: mem mismatch nat={:#x} ref={:#x}", nat_mem & mask, ref_mem);
+            // XCHG: reg[0] = old [addr]; XADD: reg[0] = 이전 [addr] (= ex_val).
+            assert_eq!(nat.regs[0] & mask, ex_val & mask, "w{width}: dst = old [addr] after exchange+add");
+            assert_eq!(nat_mem & mask, (ex_val.wrapping_add(addend)) & mask, "w{width}: [addr] = ex_val + addend");
+        }
     }
 
 
@@ -621,124 +756,298 @@
     /// AX packing ((high<<8)|low).
 
     #[test]
-
     fn test_poly_direct_multiply_matches_reference() {
-
         for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
-
             let mut d = RiscDesynthesizer::new();
-
             // Load operands via adds (interpreter starts from zero regs).
-
             d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x1_0000_0001), MicroOperand::Imm64(0));
-
             d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(3), MicroOperand::Imm64(0));
-
             d.emit_add(MicroOperand::VReg(3), MicroOperand::Imm64(0x7FFF_FFFF), MicroOperand::Imm64(0));
-
             d.emit_add(MicroOperand::VReg(4), MicroOperand::Imm64(0xFF), MicroOperand::Imm64(0));
-
             // Clean flag base: isolates the multiply CF/OF handling from the
-
             // AddWithCarry setup (native h_add preserves PF/AF instead of recomputing).
-
             d.instrs.push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Imm64(0)));
-
             // unsigned MUL r64: R0=0x1_0000_0001, R1=3 -> RDX:RAX, low->R0, high->R2.
-
             d.instrs.push(
-
                 MicroInstr::new(RiscOp::Multiply { signed: false, width: 8 })
-
                     .with_dst(MicroOperand::VReg(0))
-
                     .with_src1(MicroOperand::VReg(0))
-
                     .with_src2(MicroOperand::VReg(1)),
-
             );
-
             // signed IMUL r32 (MultiplyLow): 0x7FFFFFFF * 2 = 0xFFFFFFFE, CF=OF=1.
-
             d.instrs.push(
-
                 MicroInstr::new(RiscOp::MultiplyLow { signed: true, width: 4 })
-
                     .with_dst(MicroOperand::VReg(6))
-
                     .with_src1(MicroOperand::VReg(3))
-
                     .with_src2(MicroOperand::Imm64(2)),
-
             );
-
-            // signed IMUL r8 (Multiply width 1): 0xFF * 0xFF -> AX = 0xFE01, CF=OF=1.
-
+            // P0-2 signed IMUL r8 — 부호 확장 고 half:
+            //  (a) -1 * -1 = +1 -> AX=0x0001, CF=OF=0 (기존 버그: 0xFE01 + CF|OF).
             d.instrs.push(
-
                 MicroInstr::new(RiscOp::Multiply { signed: true, width: 1 })
-
                     .with_dst(MicroOperand::VReg(7))
-
                     .with_src1(MicroOperand::VReg(4))
-
                     .with_src2(MicroOperand::VReg(4)),
-
             );
-
+            //  (b) -1 * 2 = -2 -> AX=0xFFFE, CF=OF=0 (고 half 0xFF).
+            d.instrs.push(
+                MicroInstr::new(RiscOp::Multiply { signed: true, width: 1 })
+                    .with_dst(MicroOperand::VReg(8))
+                    .with_src1(MicroOperand::VReg(4))
+                    .with_src2(MicroOperand::Imm64(2)),
+            );
+            //  (c) 127 * 2 = 254 > signed-8-bit -> AX=0x00FE, CF=OF=1.
+            d.instrs.push(
+                MicroInstr::new(RiscOp::Multiply { signed: true, width: 1 })
+                    .with_dst(MicroOperand::VReg(9))
+                    .with_src1(MicroOperand::Imm64(0x7F))
+                    .with_src2(MicroOperand::Imm64(2)),
+            );
+            //  (d) signed IMUL r16 (Multiply, RDX high): -1 * -1 = 1 -> low=1, RDX=0.
+            d.emit_add(MicroOperand::VReg(5), MicroOperand::Imm64(0xFFFF), MicroOperand::Imm64(0));
+            d.instrs.push(
+                MicroInstr::new(RiscOp::Multiply { signed: true, width: 2 })
+                    .with_dst(MicroOperand::VReg(10))
+                    .with_src1(MicroOperand::VReg(5))
+                    .with_src2(MicroOperand::VReg(5)),
+            );
+            //  (e) signed IMUL r64 오버플로: 0x4000_0000_0000_0000 * 2 → low=0x8000_0000_0000_0000,
+            //      CF=OF=1 (고 half(0) != low 부호 확장). 먼저 실행 — regs[2]/flags 는 (f)가 덮어쓴다.
+            d.instrs.push(
+                MicroInstr::new(RiscOp::Multiply { signed: true, width: 8 })
+                    .with_dst(MicroOperand::VReg(11))
+                    .with_src1(MicroOperand::Imm64(0x4000_0000_0000_0000))
+                    .with_src2(MicroOperand::Imm64(2)),
+            );
+            //  (f) signed IMUL r64 (Multiply, RDX high): -1 * 2 = -2 → low=0xFFFF_FFFF_FFFF_FFFE,
+            //      high(RDX) = 0xFFFF_FFFF_FFFF_FFFF (-1, 부호 확장 — unsigned mul 의 1 이 아님).
+            //      마지막 실행 → 최종 regs[2]/flags 가 (f) 결과를 반영한다.
+            d.instrs.push(
+                MicroInstr::new(RiscOp::Multiply { signed: true, width: 8 })
+                    .with_dst(MicroOperand::VReg(12))
+                    .with_src1(MicroOperand::Imm64(0xFFFF_FFFF_FFFF_FFFF))
+                    .with_src2(MicroOperand::Imm64(2)),
+            );
             d.instrs.push(MicroInstr::new(RiscOp::Halt));
-
             let prog = RiscProgram::new(d.instrs);
 
-
-
             let mut enc = PolymorphicEncoder::new(seed);
-
             let bytecode = enc.encode(&prog).unwrap();
-
             let native = run_native_poly_direct(&bytecode, seed, &[0u64; 16]).unwrap();
-
             let mut interp = PolymorphicInterpreter::new(seed);
-
             interp.run(&bytecode).unwrap();
-
             let ref_st = prog.eval_state(&[0u64; 16]);
 
-
-
             assert_eq!(native.regs, ref_st.regs, "seed {seed:#x}: mul native regs != ref");
-
             assert_eq!(interp.regs, ref_st.regs, "seed {seed:#x}: mul interp regs != ref");
-
             assert_eq!(native.temps, ref_st.temps, "seed {seed:#x}: mul native temps != ref");
-
             assert_eq!(
-
                 native.flags, ref_st.flags,
-
                 "seed {seed:#x}: mul native flags {:#x} != ref {:#x}",
-
                 native.flags, ref_st.flags
-
             );
-
             assert_eq!(interp.flags.raw, ref_st.flags, "seed {seed:#x}: mul interp flags != ref");
-
             assert_eq!(native.regs[0], 0x3_0000_0003, "seed {seed:#x}: MUL low wrong");
-
-            assert_eq!(native.regs[2], 0, "seed {seed:#x}: MUL high wrong");
-
+            assert_eq!(native.regs[2], 0xFFFF_FFFF_FFFF_FFFF, "seed {seed:#x}: final MUL high wrong (last Multiply overwrites RDX)");
             assert_eq!(native.regs[6], 0xFFFF_FFFE, "seed {seed:#x}: IMUL low wrong");
-
-            assert_eq!(native.regs[7], 0xFE01, "seed {seed:#x}: IMUL r8 AX pack wrong");
-
-            assert_eq!(native.flags & 0x801, 0x801, "seed {seed:#x}: CF|OF not set");
-
+            // P0-2 부호 고 half 정합: -1*-1=+1, -1*2=-2, 127*2=overflow.
+            assert_eq!(native.regs[7], 0x0001, "seed {seed:#x}: IMUL r8 -1*-1 wrong");
+            assert_eq!(native.regs[8], 0xFFFE, "seed {seed:#x}: IMUL r8 -1*2 wrong");
+            assert_eq!(native.regs[9], 0x00FE, "seed {seed:#x}: IMUL r8 127*2 wrong");
+            assert_eq!(native.regs[10], 1, "seed {seed:#x}: IMUL r16 -1*-1 low wrong");
+            // P0-2 signed IMUL r64: 오버플로 low=0x8000_0000_0000_0000, 마지막 -1*2 는
+            // low=0xFFFF_FFFF_FFFF_FFFE + high(RDX)=−1 (부호 확장 — unsigned mul 의 1 이 아님).
+            assert_eq!(native.regs[11], 0x8000_0000_0000_0000, "seed {seed:#x}: IMUL r64 overflow low wrong");
+            assert_eq!(native.regs[12], 0xFFFF_FFFF_FFFF_FFFE, "seed {seed:#x}: IMUL r64 -1*2 low wrong");
+            assert_eq!(native.regs[2], 0xFFFF_FFFF_FFFF_FFFF, "seed {seed:#x}: IMUL r64 -1*2 high(RDX) wrong (unsigned mul bug)");
+            // 최종 CF|OF: 마지막 -1*2 는 오버플로 아님 → CF=OF=0.
+            assert_eq!(native.flags & 0x801, 0, "seed {seed:#x}: final IMUL CF|OF must be clear");
         }
-
     }
 
 
+
+    #[test]
+    fn test_narrow_shift_flags_preserved_matches_reference() {
+        use iced_x86::{Decoder, DecoderOptions};
+        use crate::vm::risc::RiscLifter;
+
+        // P0-3: 8/16비트 시프트의 합성 mask/sign-extend/preserve op(Nor 시퀀스)가
+        // 시프트 flags를 덮어쓰지 않아야 한다:
+        //   mov rax, 0x1122334455667788 ; sub al, 1 → al=0x87 (SF=1, CF=0)
+        //   shl al, 0  ; count==0 → x86 flags 보존 (SF=1 유지, AND/OR 로 소실 금지)
+        //   shr al, 1  ; 0x87>>1 = 0x43, CF = shift-out bit0 = 1 (test 가 CF 를
+        //               ; clear 하면 안 됨), 최종 rax = 0x1122334455667743
+        let raw = [
+            0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, imm64
+            0x2C, 0x01, // sub al, 1
+            0xC0, 0xE0, 0x00, // shl al, 0
+            0xC0, 0xE8, 0x01, // shr al, 1
+            0xC3, // ret
+        ];
+        let base = 0x140001000u64;
+
+        let mut decoder = Decoder::with_ip(64, &raw, base, DecoderOptions::NONE);
+        let mut lifter = RiscLifter::new();
+        while decoder.can_decode() {
+            lifter.lift_instruction(&decoder.decode()).expect("all RISC-liftable");
+        }
+        let prog = RiscProgram::new(lifter.desynth.instrs);
+        let init = [0u64; 16];
+        let ref_st = prog.eval_state(&init);
+
+        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
+            let mut enc = PolymorphicEncoder::new(seed);
+            let bytecode = enc.encode(&prog).unwrap();
+            let native = run_native_poly_direct(&bytecode, seed, &init).unwrap();
+            let mut interp = PolymorphicInterpreter::new(seed);
+            interp.run(&bytecode).unwrap();
+
+            assert_eq!(native.regs, ref_st.regs, "seed {seed:#x}: shift native regs != ref");
+            assert_eq!(interp.regs, ref_st.regs, "seed {seed:#x}: shift interp regs != ref");
+            assert_eq!(native.temps, ref_st.temps, "seed {seed:#x}: shift native temps != ref");
+            assert_eq!(
+                native.flags, ref_st.flags,
+                "seed {seed:#x}: shift native flags {:#x} != ref {:#x}",
+                native.flags, ref_st.flags
+            );
+            assert_eq!(interp.flags.raw, ref_st.flags, "seed {seed:#x}: shift interp flags != ref");
+            assert_eq!(native.vsp, ref_st.vsp, "seed {seed:#x}: vsp mismatch");
+            assert_eq!(native.stack, ref_st.stack, "seed {seed:#x}: stack mismatch");
+
+            // x86 실제 의미론 값 단언:
+            //  * 최종 rax: 상위 보존 + low byte 0x43.
+            assert_eq!(native.regs[0], 0x1122334455667743, "seed {seed:#x}: rax final");
+            //  * shr al,1 의 CF = shift-out bit0(=1) — 합성 AND 가 CF 를 소실하면 안 됨.
+            assert_ne!(
+                native.flags & crate::vm::risc::flags::VFLAG_CF,
+                0,
+                "seed {seed:#x}: shift CF lost by synthetic AND/OR"
+            );
+            //  * shl al,0 후에도 SF 는 sub al,1 이 set 한 값이 유지되어야 함 — 위 shr 의
+            //    결과(0x43)는 bit63 미셋이라 최종 SF=0 (참조와 동일).
+            assert_eq!(native.flags & crate::vm::risc::flags::VFLAG_SF, 0, "seed {seed:#x}: SF after shr");
+        }
+    }
+
+    /// P0-1: 네이티브 self-decoding CALL/RET 라운드트립 — callee 의 `VirtualRet` 가
+    /// 가상 스택의 복귀 주소(source-IP, ip_map)를 branch-map 으로 해석해 호출자로
+    /// **복귀**하고, 호출자는 fallthrough 를 계속 실행해야 한다 (이전엔 RET→Halt 로
+    /// 복귀가 불가능했다). 최상위(빈 스택) ret 는 Halt 로 종료.
+    #[test]
+    fn test_poly_direct_call_ret_roundtrip_matches_reference() {
+        use std::collections::HashMap;
+        for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
+            let mut d = RiscDesynthesizer::new();
+            // idx0: push 복귀 주소 0x140001004 (= idx4, 호출자 fallthrough).
+            d.instrs.push(MicroInstr::new(RiscOp::VirtualPush).with_src1(MicroOperand::Imm64(0x140001004)));
+            // idx1: call → callee (source-IP 0x140001005 = idx5).
+            d.instrs.push(
+                MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Always })
+                    .with_imm(0x140001005),
+            );
+            d.emit_add(MicroOperand::VReg(2), MicroOperand::Imm64(99), MicroOperand::Imm64(0)); // idx2: skipped
+            d.emit_add(MicroOperand::VReg(3), MicroOperand::Imm64(55), MicroOperand::Imm64(0)); // idx3: skipped
+            d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x2A), MicroOperand::Imm64(0)); // idx4: caller resumes
+            d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(7), MicroOperand::Imm64(0)); // idx5: callee
+            d.instrs.push(MicroInstr::new(RiscOp::VirtualRet)); // idx6: ret → idx4
+            d.instrs.push(MicroInstr::new(RiscOp::Halt)); // idx7
+
+            let mut ip_map = HashMap::new();
+            for i in 0..8u64 {
+                ip_map.insert(0x140001000u64 + i, i as usize);
+            }
+            let prog = RiscProgram::with_ip_map(d.instrs, ip_map.clone());
+            let init = [0u64; 16];
+            let ref_st = prog.eval_state(&init);
+
+            let mut enc = PolymorphicEncoder::new(seed);
+            let bytecode = enc.encode(&prog).unwrap();
+            let native = run_native_poly_direct_with(&bytecode, seed, &init, Some(&ip_map)).unwrap();
+
+            assert_eq!(native.regs, ref_st.regs, "seed {seed:#x}: call/ret regs");
+            assert_eq!(native.temps, ref_st.temps, "seed {seed:#x}: call/ret temps");
+            assert_eq!(
+                native.flags, ref_st.flags,
+                "seed {seed:#x}: flags (nat={:#x} ref={:#x})",
+                native.flags, ref_st.flags
+            );
+            assert_eq!(native.vsp, ref_st.vsp, "seed {seed:#x}: vsp");
+            assert_eq!(native.stack, ref_st.stack, "seed {seed:#x}: stack");
+            // caller resumed at idx4 → R0=0x2A, callee ran → R1=7.
+            assert_eq!(native.regs[0], 0x2A, "seed {seed:#x}: caller resumed after ret");
+            assert_eq!(native.regs[1], 7, "seed {seed:#x}: callee executed");
+            // skipped idx2/idx3.
+            assert_eq!(native.regs[2], 0, "seed {seed:#x}: idx2 skipped");
+            assert_eq!(native.regs[3], 0, "seed {seed:#x}: idx3 skipped");
+            // top-level ret (빈 스택) → halt → 복귀 주소는 pop 되어 스택 비어 있음.
+            assert_eq!(native.stack.len(), 0, "seed {seed:#x}: stack empty after roundtrip");
+            assert_eq!(native.vsp, 0, "seed {seed:#x}: vsp balanced");
+        }
+    }
+
+    /// P1-8: 네이티브 브릿지(nf_real)가 Win64 FP ABI 를 위해 VM XMM 슬롯
+    /// (state+XMM_OFF, XMM_SLOTS×16B)에서 XMM0-5 를 물질화/동기화하는 `movups`
+    /// 시퀀스를 생성하는지 검증한다. (실제 FP 인자 전달은 lifter/ABI 분석이 XMM
+    /// 슬롯을 채울 때 의미 — 브릿지의 전달 경로 자체가 ABI-정확함을 고정한다.)
+    #[test]
+    fn test_bridge_emits_xmm_pass_through() {
+        use crate::vm::poly::PolymorphicDecoder;
+        let seed = 0x13579BDF2468ACE0u64;
+        let mut d = RiscDesynthesizer::new();
+        // 가상 스택에 ret_ip push 후 branch-map 에 없는 target 으로 분기 → 네이티브
+        // 브릿지 진입 (구조 검증이 목적이므로 실행 결과보다 코드 생성 확인).
+        d.instrs.push(MicroInstr::new(RiscOp::VirtualPush).with_src1(MicroOperand::Imm64(0x140001002)));
+        d.instrs.push(
+            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Always })
+                .with_src1(MicroOperand::VReg(0)),
+        );
+        d.instrs.push(MicroInstr::new(RiscOp::Halt));
+        let prog = RiscProgram::new(d.instrs);
+
+        let mut enc = PolymorphicEncoder::new(seed);
+        let bytecode = enc.encode(&prog).unwrap();
+
+        let code_off = 0x1000usize;
+        let table_off = 0x8000usize;
+        let bytecode_off = 0x9000usize;
+        let state_off = 0xA000usize;
+        let mut arena = Arena::new(ARENA_SIZE).unwrap();
+        let base = arena.base;
+        let code_va = (base + code_off) as u64;
+        let table_va = (base + table_off) as u64;
+        let bytecode_va = (base + bytecode_off) as u64;
+        let state_va = (base + state_off) as u64;
+        let stack_base = (base + OFF_STACK_BASE) as u64;
+
+        let parts = build_self_decoding_parts(&bytecode, seed, code_va, table_va, bytecode_va, state_va, stack_base)
+            .expect("build parts");
+
+        // 디스패처 코드를 디코드해 movups xmmN, [r12 + XMM_OFF + N*16] (load) 와
+        // movups [r12 + XMM_OFF + N*16], xmmN (store) 가 모두 존재하는지 확인.
+        let mut loads = [false; 6];
+        let mut stores = [false; 6];
+        let mut dec = iced_x86::Decoder::with_ip(64, &parts.code, code_va, iced_x86::DecoderOptions::NONE);
+        while dec.can_decode() {
+            let ins = dec.decode();
+            if ins.memory_base() == Register::R12 {
+                let disp = ins.memory_displacement64();
+                let d = disp as i64;
+                if (0..6).any(|i| d == XMM_OFF as i64 + i as i64 * 16) {
+                    let idx = ((d - XMM_OFF as i64) / 16) as usize;
+                    if idx < 6 {
+                        match ins.code() {
+                            Code::Movups_xmm_xmmm128 => loads[idx] = true,
+                            Code::Movups_xmmm128_xmm => stores[idx] = true,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        assert!(loads.iter().all(|&b| b), "bridge must materialize XMM0-5 before the native call (loads={loads:?})");
+        assert!(stores.iter().all(|&b| b), "bridge must sync XMM0-5 back after the native call (stores={stores:?})");
+    }
 
     /// Differential: native self-decoding Divide/IDivide == interpreter ==
 

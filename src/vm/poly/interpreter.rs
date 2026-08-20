@@ -449,16 +449,59 @@ impl PolymorphicInterpreter {
                     let mask = width_mask_interp(bits);
                     let acc = self.regs[0] & mask;
                     let old = mem_read(&self.mem, addr, width) & mask;
+                    // P1-6: CMP(acc - old) 전체 상태 플래그 (ZF 포함).
+                    let _ = self.flags.update_sub(acc, old, width);
                     if old == acc {
                         mem_write(&mut self.mem, addr, width, newv & mask);
-                        self.flags.set_zf(true);
                     } else {
                         self.regs[0] = old;
-                        self.flags.set_zf(false);
                     }
+                }
+                RiscOp::AtomicExchange { width } => {
+                    // P0-4: old = [addr]; [addr] = dst; dst = old. 플래그 불변.
+                    let addr = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let old = mem_read(&self.mem, addr, width);
+                    let reg_v = get_operand_val(op_dst_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    mem_write(&mut self.mem, addr, width, reg_v);
+                    self.store_operand(op_dst_raw, old);
+                }
+                RiscOp::AtomicAdd { width } => {
+                    // P0-4: old = [addr]; new = old + src2 (폭별 플래그); [addr] = new; dst = old.
+                    let addr = get_operand_val(op_src1_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm1);
+                    let addend = get_operand_val(op_src2_raw, &self.spec, &self.regs, &self.temps, self.flags.raw, self.vsp, imm2);
+                    let old = mem_read(&self.mem, addr, width);
+                    let mask = width_mask_interp(width as u32 * 8);
+                    let newv = self.flags.update_add(old, addend, width) & mask;
+                    mem_write(&mut self.mem, addr, width, newv);
+                    self.store_operand(op_dst_raw, old & mask);
                 }
                 RiscOp::Halt => {
                     break;
+                }
+                RiscOp::VirtualRet => {
+                    // P0-1: eval_state `VirtualRet` 와 동일 — 가상 스택 pop 후,
+                    // 인스트럭션 인덱스(ip_map 없는 폴리 경로)로 해석. 범위 밖/
+                    // 빈 스택 → 실행 종료(네이티브/최상위 복귀).
+                    let ret_ip = match self.stack.pop() {
+                        Some(v) => {
+                            self.vsp = self.vsp.wrapping_add(8);
+                            v
+                        }
+                        None => {
+                            vip = bytecode.len();
+                            continue;
+                        }
+                    };
+                    let Some((&target_off, &target_key)) = instr_starts
+                        .get(ret_ip as usize)
+                        .zip(key_snapshots.get(ret_ip as usize))
+                    else {
+                        vip = bytecode.len();
+                        continue;
+                    };
+                    self.rolling.current_key = target_key;
+                    vip = target_off;
+                    continue;
                 }
                 // R4: SSE/FPU 스칼라 — eval_state(참조)와 동치. FloatAdd/Sub/Mul/Div
                 // 는 폭별(4/8) f32/f64 비트 해석 후 산술, 결과는 다시 비트로 저장.
@@ -1487,8 +1530,19 @@ mod tests {
                     .with_dst(MicroOperand::VReg(0))
                     .with_src1(MicroOperand::VReg(1)),
             );
-            // 32비트 signed IDIV: EDX:EAX = 0xFFFFFFFD:... → -1000 / 7
+            // 32비트 signed IDIV: EDX:EAX = -1000 (0xFFFFFFFF:0xFFFFFC18) / 7 → q=-142, r=-6.
+            // (첫 64비트 DIV 가 R0/R2 를 덮어쓰므로 IDIV 전에 피제수를 정확히 재세팅한다.)
             d.emit_add(MicroOperand::VReg(3), MicroOperand::Imm64(0), MicroOperand::Imm64(0));
+            d.instrs.push(
+                MicroInstr::new(RiscOp::Mov)
+                    .with_dst(MicroOperand::VReg(0))
+                    .with_src1(MicroOperand::Imm64(0xFFFF_FC18)),
+            );
+            d.instrs.push(
+                MicroInstr::new(RiscOp::Mov)
+                    .with_dst(MicroOperand::VReg(2))
+                    .with_src1(MicroOperand::Imm64(0xFFFF_FFFF)),
+            );
             d.instrs.push(
                 MicroInstr::new(RiscOp::Divide { signed: true, width: 4 })
                     .with_dst(MicroOperand::VReg(3))

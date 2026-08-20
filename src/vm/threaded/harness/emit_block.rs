@@ -442,6 +442,10 @@ impl NativeVmHarness {
                 load(instrs, ins.src1, Register::R10)?; // addr
                 load(instrs, ins.src2, Register::R11)?; // new
                 instrs.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, mem(REGS_OFF as i64)).map_err(|e| anyhow!("{e}"))?); // acc
+                // orig acc: RBX 는 Win64 callee-saved — 하네스는 RBX 를 저장하지 않으므로
+                // clobber 하면 Rust 호출자(레지스터에 vm 포인터 보관)가 깨진다. volatile
+                // R8 을 사용한다 (이 블록에선 R8 를 다른 용도로 쓰지 않음).
+                instrs.push(Instruction::with2(Code::Mov_r64_rm64, Register::R8, Register::RAX).map_err(|e| anyhow!("{e}"))?); // orig acc
                 if width < 8 {
                     let mask: u64 = match width {
                         1 => 0xFF,
@@ -458,8 +462,73 @@ impl NativeVmHarness {
                     _ => (Code::Cmpxchg_rm64_r64, Register::R11),
                 };
                 instrs.push(Instruction::with2(code, addr, vreg).map_err(|e| anyhow!("{e}"))?);
+                // P1-6: 성공 시 원본 regs[0] 복원(cmove 는 flags 불변) → 이후 전체
+                // CMP(acc-old) 상태 플래그를 캡처한다 (cmpxchg 의 ZF 포함).
+                instrs.push(Instruction::with2(Code::Cmove_r64_rm64, Register::RAX, Register::R8).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with2(Code::Mov_rm64_r64, mem(REGS_OFF as i64), Register::RAX).map_err(|e| anyhow!("{e}"))?);
-                store_zf(instrs)?;
+                instrs.push(Instruction::with(Code::Pushfq));
+                instrs.push(Instruction::with1(Code::Pop_r64, Register::RAX).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x8D5).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, mem(FLAGS_OFF as i64)).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x8D5i64) as i32).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::Mov_rm64_r64, mem(FLAGS_OFF as i64), Register::RAX).map_err(|e| anyhow!("{e}"))?);
+            }
+            RiscOp::AtomicExchange { width } => {
+                // P0-4: x86 XCHG r, [mem] — 하드웨어 xchg 는 원자적. 플래그 불변.
+                load(instrs, ins.src1, Register::R10)?; // addr
+                load(instrs, ins.dst, Register::R11)?; // reg value
+                let addr = iced_x86::MemoryOperand::with_base(Register::R10);
+                let (code, vreg) = match width {
+                    1 => (Code::Xchg_rm8_r8, Register::R11L),
+                    2 => (Code::Xchg_rm16_r16, Register::R11W),
+                    4 => (Code::Xchg_rm32_r32, Register::R11D),
+                    _ => (Code::Xchg_rm64_r64, Register::R11),
+                };
+                instrs.push(Instruction::with2(code, addr, vreg).map_err(|e| anyhow!("{e}"))?);
+                // 폭별 zero-extend (상위 비트 정화) 후 dst 저장.
+                if width < 8 {
+                    let zc = match width {
+                        1 => Code::Movzx_r64_rm8,
+                        2 => Code::Movzx_r64_rm16,
+                        _ => Code::Mov_r32_rm32,
+                    };
+                    instrs.push(Instruction::with2(zc, Register::R11, vreg).map_err(|e| anyhow!("{e}"))?);
+                }
+                store(instrs, ins.dst)?;
+            }
+            RiscOp::AtomicAdd { width } => {
+                // P0-4: LOCK XADD [mem], reg — 원자 RMW, 폭별 플래그는 하드웨어가 set.
+                load(instrs, ins.src1, Register::R10)?; // addr
+                load(instrs, ins.src2, Register::R11)?; // addend
+                let addr = iced_x86::MemoryOperand::with_base(Register::R10);
+                let (code, vreg) = match width {
+                    1 => (Code::Xadd_rm8_r8, Register::R11L),
+                    2 => (Code::Xadd_rm16_r16, Register::R11W),
+                    4 => (Code::Xadd_rm32_r32, Register::R11D),
+                    _ => (Code::Xadd_rm64_r64, Register::R11),
+                };
+                let mut xi = Instruction::with2(code, addr, vreg).map_err(|e| anyhow!("{e}"))?;
+                xi.set_has_lock_prefix(true);
+                instrs.push(xi);
+                // 폭별 zero-extend 후 dst 저장 (R11 = old [addr]).
+                if width < 8 {
+                    let zc = match width {
+                        1 => Code::Movzx_r64_rm8,
+                        2 => Code::Movzx_r64_rm16,
+                        _ => Code::Mov_r32_rm32,
+                    };
+                    instrs.push(Instruction::with2(zc, Register::R11, vreg).map_err(|e| anyhow!("{e}"))?);
+                }
+                store(instrs, ins.dst)?;
+                // flags: 하드웨어 xadd 의 폭별 status 를 캡처 (참조 update_add 동치).
+                instrs.push(Instruction::with(Code::Pushfq));
+                instrs.push(Instruction::with1(Code::Pop_r64, Register::RAX).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x8D5).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, mem(FLAGS_OFF as i64)).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x8D5i64) as i32).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with2(Code::Mov_rm64_r64, mem(FLAGS_OFF as i64), Register::RAX).map_err(|e| anyhow!("{e}"))?);
             }
             RiscOp::Multiply { signed, width } => {
                 load(instrs, ins.src1, Register::R10)?;
@@ -668,9 +737,13 @@ RiscOp::NativeCallBridge => {
             // `--vm-commercial` 은 is_encodable=false 로 이 op 를 포함한 함수를
             // 네이티브로 유지한다.
             RiscOp::VmCallBridge => {}
-            RiscOp::Halt => {
+RiscOp::Halt => {
                 // ret (caller?占占쎌꽌 泥섎━)
             }
+            // P0-1: VirtualRet — 블록 단위 하네스에서는 최상위 복귀가 블록 종료와
+            // 동일하므로 no-op (상용 self-decoding 디스패처가 pop→branch-map 복귀를
+            // 정확히 처리). 참조 eval_state 는 빈 스택/미가상화 복귀에서 Halt 로 종료.
+            RiscOp::VirtualRet => {}
             // P2 SSE/FPU scalar - not yet native-compilable (not poly-encodable).
             // Lifter-level diff tests use eval_state (reference); no-op here.
             RiscOp::FloatAdd { .. }

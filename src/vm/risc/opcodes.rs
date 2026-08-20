@@ -63,6 +63,18 @@ pub enum RiscOp {
     /// VM 실행 종료 및 네이티브 컨텍스트 복귀
     Halt,
 
+    /// x86 RET — 가상 스택에서 복귀 주소를 pop 해 VM 내부(ip_map) 타깃이면
+    /// 그쪽으로 분기하고, ip_map 에 없으면(빈 스택/네이티브 복귀 주소) **Halt** 로
+    /// 종료해 네이티브 호출자에게 돌아간다.
+    ///
+    /// P0-1: 이전엔 RET 가 그대로 Halt 로 내려가 VM 내부 함수 호출(call foo; ret)의
+    /// 복귀를 표현할 수 없었다. `VirtualRet` 는 pop → branch-map 복귀 → 없으면 종료
+    /// 의미론으로 VM→VM nested call 과 최상위(프로그램 종료) ret 를 모두 처리한다.
+    /// CALL 쪽은 `VirtualPush(ret_ip); VirtualBranch(target)` 이고, 네이티브로 나가는
+    /// 콜은 브릿지(h_branch not-found)가 pop+네이티브 호출을 담당하므로 VirtualRet 의
+    /// not-found 는 항상 "VM 프로그램 종료"다.
+    VirtualRet,
+
     /// 값 복사 (dst = src1) — **플래그를 변경하지 않는다**.
     /// (MOV/XCHG/XADD/POP 등 플래그 보존이 필요한 복사에 사용.
     /// AddWithCarry(+,0) 로는 플래그를 오염시키므로 전용 op 로 분리.)
@@ -130,6 +142,23 @@ pub enum RiscOp {
     /// CMPXCHG — `[src1] == RAX` 이면 `[src1] = src2`·ZF=1, 아니면 `RAX = [src1]`·ZF=0.
     /// (누산기 RAX = regs[0], 폭별 마스크. 폭 8 이면 RAX 전체.)
     CompareExchange { width: u8 },
+
+    /// P0-4: 원자적 XCHG — `dst`(레지스터) ↔ `[src1]`(메모리) 교환.
+    ///
+    /// x86 `XCHG r, [mem]` 은 memory 피연산자에서 **암시적 LOCK** 이므로
+    /// read-modify-write 가 원자적이어야 한다. 일반 MemoryRead/MemoryWrite 분해는
+    /// 중간 상태를 노출한다(lock-free/atomic counter/Rust `AtomicUsize` 스핀락 등).
+    /// 이 op 는 메모리 상호 교환을 단일 원자로 모델링한다: `old = [src1]; [src1] =
+    /// dst; dst = old`. 플래그 불변 (x86 XCHG 는 RFLAGS 무변경). 레지스터↔레지스터
+    /// XCHG 는 원자성이 불필요하므로 lifter 는 기존대로 Mov 3개로 분해한다.
+    AtomicExchange { width: u8 },
+
+    /// P0-4: 원자적 XADD — `[src1] += src2`, `dst` = 이전 `[src1]`.
+    ///
+    /// x86 `LOCK XADD [mem], reg` 는 원자 RMW 이며 flags 는 덧셈 기준이다.
+    /// `old = [src1]; new = old + src2 (폭별 플래그); [src1] = new; dst = old`.
+    /// 레지스터 형태(XADD r/m, r) 는 원자성이 불필요하지만 동일 op 로 표현한다.
+    AtomicAdd { width: u8 },
 
     // P2: SSE/FPU scalar
     FloatAdd { width: u8 },

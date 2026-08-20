@@ -219,6 +219,29 @@ mod tests {
             }
         }
 
+        // P0-5: dispatcher code 의 `mov r64, imm64` 절대 VA 슬롯이 이미지 범위
+        // [base, base+0x20000) 안에 존재해야 한다 — ASLR 재배치(.reloc) 대상.
+        // (module.code 는 arena 가 아닌 빌드 시점 VAs 를 즉시값으로 박는다.)
+        // entry stub: R8=bytecode_base, R13=stack_base, R15=table_base, RDX=state_base
+        // (code_va 는 arena.call 의 상대 점프로 진입하므로 imm64 로 박지 않는다.)
+        let va_lo = (base) as u64;
+        let va_hi = (base + 0x20000) as u64;
+        let slots = crate::pe::reloc::scan_mov_imm64_slots(&module.code, va_lo, va_hi);
+        for (label, want) in [
+            ("table_va", table_va),
+            ("bytecode_va", bytecode_va),
+            ("state_va", state_va),
+        ] {
+            assert!(
+                slots.iter().any(|&off| u64::from_le_bytes(
+                    module.code[off as usize..off as usize + 8].try_into().unwrap()
+                ) == want),
+                "dispatcher must embed {label} (0x{want:X}) as a mov-imm64 relocatable slot ({} in-range slot(s): {:?})",
+                slots.len(),
+                slots
+            );
+        }
+
         arena.call(code_off);
 
         let buf = arena.bytes();

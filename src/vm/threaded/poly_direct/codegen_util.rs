@@ -33,6 +33,12 @@ pub(crate) const DEC_IMM1: i32 = 0x0D8; // u64
 pub(crate) const DEC_IMM2: i32 = 0x0E0; // u64
 pub(crate) const DEC_CIN: i32 = 0x0E8;  // u64
 pub(crate) const STATE_END: i32 = 0x100;
+/// P1-8: Win64 FP/vector ABI — 네이티브 브릿지가 VM 상태의 XMM 슬롯에서
+/// XMM0-5 로 물질화/동기화한다 (state_base + XMM_OFF, 6 × 16B). 로더가 이
+/// 슬롯에 FP 인자를 심으면 (lifter/ABI 분석 — 후속) 브릿지가 ABI-정확하게
+/// 전달한다. 상태 버퍼 뒤의 예약 영역이라 기존 REGS/TEMPS/FLAGS 와 겹치지 않는다.
+pub(crate) const XMM_OFF: i32 = 0x100;
+pub(crate) const XMM_SLOTS: usize = 6; // XMM0..XMM5 (Win64 FP 레지스터 인자)
 
 // operand kind flags (OFF_OP_FLAGS)
 pub(crate) const K_REG: u8 = 0;

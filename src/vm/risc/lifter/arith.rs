@@ -184,6 +184,22 @@ impl RiscLifter {
             _ => return Err(anyhow!("risc lifter: invalid shift op0")),
         };
         let narrow = width == 1 || width == 2;
+        // P0-3: 8/16비트 시프트의 합성 op(주소 계산·카운트 마스크·sign-extend·
+        // mask·preserve_upper — 전부 Nor 시퀀스)는 flags를 덮어쓴다. x86 시프트는
+        // flags를 **한 번** 계산하고 count==0 에선 원본 flags를 보존하므로,
+        // Temp(7)에 원본 flags를 보존해 (1) 시프트 직전에 복원(count==0 보존),
+        // (2) 시프트 후 합성 op 뒤에 시프트 결과 flags를 복원한다.
+        let save_flags = |d: &mut Self| {
+            d.desynth.instrs.push(
+                MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::Temp(7)).with_src1(MicroOperand::Vflags),
+            );
+        };
+        let restore_flags = |d: &mut Self| {
+            d.desynth.instrs.push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
+        };
+        if narrow {
+            save_flags(self);
+        }
         // x86: 8/16/32비트는 mod 32, 64비트는 mod 64.
         let count = match inst.op1_kind() {
             OpKind::Immediate8
@@ -244,11 +260,18 @@ impl RiscLifter {
                         // 하위 폭 결과가 상위 비트와 무관하지만 동일 패턴으로 마스크.
                         self.mask_operand_into(dst, width, MicroOperand::Temp(3))?
                     };
+                    // P0-3: 합성 op가 flags를 오염시켰으므로 원본 flags 복원
+                    // (count==0 에서 x86 flags 보존 의미론).
+                    restore_flags(self);
                     self.desynth
                         .instrs
                         .push(MicroInstr::new(op).with_dst(dst).with_src1(src).with_src2(count));
+                    // P0-3: 시프트 결과 flags를 보존했다가 mask/preserve 합성 op
+                    // 뒤에 복원한다 (합성 AND/OR 가 시프트 flags를 덮어쓰지 않게).
+                    save_flags(self);
                     self.mask_result(width, inst, dst)?;
                     self.preserve_upper_from(dst, width, MicroOperand::Temp(5));
+                    restore_flags(self);
                 } else if width == 4 {
                     self.desynth
                         .instrs
@@ -276,6 +299,12 @@ impl RiscLifter {
                 } else {
                     left
                 };
+                // P0-3: 주소 계산·카운트 마스크·sign-extend 가 flags를 오염시켰으므로
+                // 원본 flags 복원 (count==0 보존). MemoryWrite 는 flags 불변이라
+                // 시프트 결과 flags 는 그대로 유지된다.
+                if narrow {
+                    restore_flags(self);
+                }
                 self.desynth
                     .instrs
                     .push(MicroInstr::new(op).with_dst(left).with_src1(src).with_src2(count));
@@ -552,18 +581,14 @@ impl RiscLifter {
         let t_addr = MicroOperand::Temp(4);
         self.lower_effective_address(inst, t_addr)?;
         let width = inst.memory_size().size() as u8;
-        let old = MicroOperand::Temp(5);
+        // P0-4: 메모리 XCHG 는 암시적 LOCK — AtomicExchange 단일 원자로 lift 한다.
+        // (기존 MemoryRead/MemoryWrite 분해는 중간 상태를 노출해 lock-free/atomic
+        //  코드에서 위험하다.) old = [addr]; [addr] = reg; reg = old, 플래그 불변.
         self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::MemoryRead { width })
-                .with_dst(old)
+            MicroInstr::new(RiscOp::AtomicExchange { width })
+                .with_dst(reg)
                 .with_src1(t_addr),
         );
-        self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::MemoryWrite { width })
-                .with_src1(t_addr)
-                .with_src2(reg),
-        );
-        self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(reg).with_src1(old));
         Ok(())
     }
 
@@ -592,24 +617,15 @@ impl RiscLifter {
             OpKind::Memory => {
                 let addr = MicroOperand::Temp(4);
                 self.lower_effective_address(inst, addr)?;
-                let old = MicroOperand::Temp(5);
+                let width = inst.memory_size().size() as u8;
+                // P0-4: LOCK XADD 는 원자 RMW — AtomicAdd 단일 원자로 lift 한다.
+                // old = [addr]; new = old + reg (폭별 플래그); [addr] = new; reg = old.
                 self.desynth.instrs.push(
-                    MicroInstr::new(RiscOp::MemoryRead { width })
-                        .with_dst(old)
-                        .with_src1(addr),
-                );
-                // 이전 [addr] 값을 폭별 마스크해 reg 로 옮길 값을 보존 (덧셈 전).
-                let oldm = self.mask_operand(old, width)?;
-                // [addr] = old + reg (플래그)
-                self.desynth.emit_add(old, old, reg);
-                self.mask_result(width, inst, old)?;
-                self.desynth.instrs.push(
-                    MicroInstr::new(RiscOp::MemoryWrite { width })
+                    MicroInstr::new(RiscOp::AtomicAdd { width })
+                        .with_dst(reg)
                         .with_src1(addr)
-                        .with_src2(old),
+                        .with_src2(reg),
                 );
-                // reg = 이전 [addr] (플래그 보존)
-                self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(reg).with_src1(oldm));
             }
             _ => return Err(anyhow!("risc lifter: invalid xadd op0")),
         }

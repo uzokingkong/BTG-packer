@@ -439,6 +439,29 @@ impl RiscProgram {
                     }
                 }
                 RiscOp::Halt => break,
+                RiscOp::VirtualRet => {
+                    // P0-1: 가상 스택에서 복귀 주소를 pop. ip_map(가상화 블록)에 있으면
+                    // VM 내부 복귀 분기, 없으면(빈 스택/네이티브 복귀) Halt 로 종료.
+                    let ret_ip = match st.stack.pop() {
+                        Some(v) => {
+                            st.vsp = st.vsp.wrapping_add(8);
+                            v
+                        }
+                        None => break, // 빈 스택 → VM 프로그램 종료
+                    };
+                    let idx = self
+                        .ip_map
+                        .as_ref()
+                        .and_then(|m| m.get(&ret_ip))
+                        .copied();
+                    match idx {
+                        Some(i) => {
+                            vip = i;
+                            continue;
+                        }
+                        None => break, // 네이티브/미가상화 복귀 주소 → 종료
+                    }
+                }
                 RiscOp::NativeCallBridge => {}
                 // ── P1 (③): VM→VM 콜 브릿지 — 서브 VM 실행 후 복귀 ──────────────
                 // 호출자 상태(regs/temps/flags/vsp/stack)를 스냅샷하고, `imm`의
@@ -565,13 +588,35 @@ impl RiscProgram {
                     let mask = width_mask(bits);
                     let acc = st.regs[0] & mask;
                     let old = mem_read(&st.mem, addr, width) & mask;
+                    // P1-6: CMPXCHG 는 ZF 뿐 아니라 CMP(acc - old) 의 모든 상태 플래그
+                    // (CF/SF/OF/PF/AF) 를 set 한다 — `update_sub` 가 폭별 SUB 플래그를
+                    // 계산하며 ZF 는 acc == old 일 때 1 (성공) 과 정확히 일치한다.
+                    let _ = flags.update_sub(acc, old, width);
                     if old == acc {
                         mem_write(&mut st.mem, addr, width, newv & mask);
-                        flags.set_zf(true);
                     } else {
                         st.regs[0] = old;
-                        flags.set_zf(false);
                     }
+                }
+                RiscOp::AtomicExchange { width } => {
+                    // P0-4: 원자적 XCHG — old = [src1]; [src1] = dst; dst = old.
+                    // 플래그 불변 (x86 XCHG 는 RFLAGS 무변경).
+                    let addr = get_val(ins.src1, &st, flags.raw);
+                    let old = mem_read(&st.mem, addr, width);
+                    let reg_v = get_val(ins.dst, &st, flags.raw);
+                    mem_write(&mut st.mem, addr, width, reg_v);
+                    store(ins.dst, &mut st, old);
+                }
+                RiscOp::AtomicAdd { width } => {
+                    // P0-4: 원자적 XADD — old = [src1]; new = old + src2 (폭별 플래그);
+                    // [src1] = new; dst = old.
+                    let addr = get_val(ins.src1, &st, flags.raw);
+                    let addend = get_val(ins.src2, &st, flags.raw);
+                    let old = mem_read(&st.mem, addr, width);
+                    let mask = width_mask(width as u32 * 8);
+                    let newv = flags.update_add(old, addend, width) & mask;
+                    mem_write(&mut st.mem, addr, width, newv);
+                    store(ins.dst, &mut st, old & mask);
                 }
                 RiscOp::FloatAdd { width } => {
                     let a = get_val(ins.src1, &st, flags.raw);
@@ -904,6 +949,25 @@ impl RiscProgram {
                 ExecResult::Next
             }
             RiscOp::Halt => ExecResult::Halt,
+            RiscOp::VirtualRet => {
+                // P0-1: pop → ip_map(가상화) 복귀 분기, 없으면(빈 스택/네이티브) 종료.
+                let ret_ip = match st.stack.pop() {
+                    Some(v) => {
+                        st.vsp = st.vsp.wrapping_add(8);
+                        v
+                    }
+                    None => return ExecResult::Halt,
+                };
+                let idx = self
+                    .ip_map
+                    .as_ref()
+                    .and_then(|m| m.get(&ret_ip))
+                    .copied();
+                match idx {
+                    Some(i) => ExecResult::Jump(i),
+                    None => ExecResult::Halt,
+                }
+            }
             RiscOp::NativeCallBridge => ExecResult::Next,
             RiscOp::VmCallBridge => ExecResult::Next,
             RiscOp::Multiply { signed, width } => {
@@ -1014,13 +1078,34 @@ impl RiscProgram {
                 let mask = width_mask(bits);
                 let acc = st.regs[0] & mask;
                 let old = mem_read(&st.mem, addr, width) & mask;
+                // P1-6: CMP(acc - old) 의 전체 상태 플래그 (ZF 포함) — update_sub.
+                let _ = flags.update_sub(acc, old, width);
                 if old == acc {
                     mem_write(&mut st.mem, addr, width, newv & mask);
-                    flags.set_zf(true);
                 } else {
                     st.regs[0] = old;
-                    flags.set_zf(false);
                 }
+                ExecResult::Next
+            }
+            RiscOp::AtomicExchange { width } => {
+                // P0-4: 원자적 XCHG — old = [src1]; [src1] = dst; dst = old. 플래그 불변.
+                let addr = get_val(ins.src1, st, flags.raw);
+                let old = mem_read(&st.mem, addr, width);
+                let reg_v = get_val(ins.dst, st, flags.raw);
+                mem_write(&mut st.mem, addr, width, reg_v);
+                store(ins.dst, st, old);
+                ExecResult::Next
+            }
+            RiscOp::AtomicAdd { width } => {
+                // P0-4: 원자적 XADD — old = [src1]; new = old + src2 (폭별 플래그);
+                // [src1] = new; dst = old.
+                let addr = get_val(ins.src1, st, flags.raw);
+                let addend = get_val(ins.src2, st, flags.raw);
+                let old = mem_read(&st.mem, addr, width);
+                let mask = width_mask(width as u32 * 8);
+                let newv = flags.update_add(old, addend, width) & mask;
+                mem_write(&mut st.mem, addr, width, newv);
+                store(ins.dst, st, old & mask);
                 ExecResult::Next
             }
             RiscOp::FloatAdd { width } => {
@@ -1369,6 +1454,18 @@ fn sign_extend_i128(v: u128, bits: u32) -> i128 {
     ((v << shift) as i128) >> shift
 }
 
+/// x86 signed MUL/IMUL 고 half 정합용 부호 확장.
+/// signed 곱셈은 피연산자를 부호 확장해 폭×2 결과를 만들어야 하므로
+/// (8-bit −1 × 2 → 16-bit 0xFFFE, high 0xFF), `from_bits` 값을
+/// `to_bits`(≤128) 폭으로 부호 확장해 돌려준다.
+fn sign_extend_to(v: u64, from_bits: u32, to_bits: u32) -> u128 {
+    debug_assert!(from_bits >= 1 && from_bits <= 64 && to_bits >= from_bits && to_bits <= 128);
+    let sign = (v >> (from_bits - 1)) & 1;
+    let low = (v as u128) & ((1u128 << from_bits) - 1);
+    let ext = if sign != 0 { low | (u128::MAX << from_bits) } else { low };
+    ext & (if to_bits < 128 { (1u128 << to_bits) - 1 } else { u128::MAX })
+}
+
 /// 1-??源낆뿼??⑥ъ겱 MUL/IMUL 嶺뚣볦굣?? low ??dst, high ??RDX(????2) ???裕?AX(??1).
 fn mul_wide(
     st: &mut RiscEvalState,
@@ -1381,10 +1478,14 @@ fn mul_wide(
 ) {
     let bits = width as u32 * 8;
     let mask = width_mask(bits);
-    let am = a & mask;
-    let bm = b & mask;
-    let full = (am as u128) * (bm as u128);
-    let low = full as u64;
+    // x86 signed MUL/IMUL: 피연산자를 부호 확장한 폭×2 곱의 low/high half를
+    // 만든다 (unsigned는 폭 마스크 그대로). high half가 원본과 일치하도록
+    // signed 피연산자는 2*bits 폭으로 부호 확장한다.
+    let am = if signed { sign_extend_to(a & mask, bits, bits * 2) } else { (a & mask) as u128 };
+    let bm = if signed { sign_extend_to(b & mask, bits, bits * 2) } else { (b & mask) as u128 };
+    let full = am.wrapping_mul(bm);
+    // low half = 2w-bit 곱의 하위 half (signed 부호 확장 잔여/상위 가비지 제거).
+    let low = (full & width_mask(bits * 2) as u128) as u64;
     let high = ((full >> bits) as u64) & mask;
     let ovf = if signed {
         let sign_ext = if low & (1u64 << (bits - 1)) != 0 { mask } else { 0 };
@@ -1414,10 +1515,14 @@ fn mul_low(
 ) {
     let bits = width as u32 * 8;
     let mask = width_mask(bits);
-    let am = a & mask;
-    let bm = b & mask;
-    let full = (am as u128) * (bm as u128);
-    let low = full as u64;
+    // signed IMUL low: low는 signed/unsigned가 동일(모듈로)하지만 overflow
+    // 판정(CF=OF)은 signed 고 half를 봐야 하므로 피연산자를 2*bits 폭으로
+    // 부호 확장한 곱으로 계산한다.
+    let am = if signed { sign_extend_to(a & mask, bits, bits * 2) } else { (a & mask) as u128 };
+    let bm = if signed { sign_extend_to(b & mask, bits, bits * 2) } else { (b & mask) as u128 };
+    let full = am.wrapping_mul(bm);
+    // low half = 2w-bit 곱의 하위 half (signed 부호 확장 잔여 제거).
+    let low = (full & width_mask(bits * 2) as u128) as u64;
     let high = ((full >> bits) as u64) & mask;
     let ovf = if signed {
         let sign_ext = if low & (1u64 << (bits - 1)) != 0 { mask } else { 0 };
@@ -1446,7 +1551,10 @@ fn div_wide(st: &mut RiscEvalState, divisor: u64, signed: bool, width: u8, dst: 
     };
     let dv = (divisor & mask) as u128;
     if dv == 0 {
-        // #DE ??嶺뚣볦굣???リ옇???泥?(0). ??1 ?? AX(dst) ?筌먐븍Ф.
+        // P1-7: x86 DIV/IDIV divisor==0 → #DE (STATUS_INTEGER_DIVIDE_BY_ZERO).
+        // 네이티브 핸들러와 동일한 가드 계약(0 결과, 문서화된 완화)을 유지해
+        // 차등 테스트 정합을 지킨다 — 정확한 #DE 는 네이티브 경로의 하드웨어
+        // div 가 담당한다 (참조는 VM 크래시를 피하는 완화).
         if width == 1 {
             store_dst(st, dst, 0);
         } else {
@@ -1455,17 +1563,34 @@ fn div_wide(st: &mut RiscEvalState, divisor: u64, signed: bool, width: u8, dst: 
         }
         return;
     }
-    let (q, r) = if signed {
+    // P1-7: x86 DIV/IDIV 는 몫이 destination 폭에 안 맞으면 #DE 를 발생시키고
+    // **아무 레지스터도 쓰지 않는다** (fault-before-store). 네이티브 핸들러는
+    // 하드웨어 div 가 #DE 로 크래시하지만, 참조는 조용히 잘라 저장하지 않도록
+    // 명시적으로 감지해 실패시킨다 (조용한 오답 방지).
+    let overflow;
+    let (q, r): (u128, u128) = if signed {
         let d = sign_extend_i128(dividend, dvbits);
         let s = sign_extend_i128(dv as u64 as u128, bits);
-        // Rust ?筌먦끇????濡ル빟??? 0 嶺뚯옕????뿉????덈펺 ??IDIV ?? ???됰뎄.
+        // Rust ?筌먦끇????濡ル빟??? 0 嶺嶺뚯옕????뿉????덈펺 ??IDIV ?? ???됰뎄.
         let (q, r) = (d / s, d % s);
+        let qmin = -(1i128 << (bits - 1));
+        let qmax = (1i128 << (bits - 1)) - 1;
+        overflow = q < qmin || q > qmax;
         (q as u128, r as u128)
     } else {
-        (dividend / dv, dividend % dv)
+        let (q, r) = (dividend / dv, dividend % dv);
+        let qmax: u128 = (if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 }) as u128;
+        overflow = q > qmax;
+        (q, r)
     };
+    if overflow {
+        panic!(
+            "RISC DIV/IDIV: x86 #DE — quotient does not fit destination width {} bits (dividend 0x{dividend:X}, divisor 0x{dv:X})",
+            bits
+        );
+    }
     if width == 1 {
-        // AL = 嶺? AH = ??濡?룫嶺뚯솘? ??AX(dst).
+        // AL = 嶺? AH = ??濡?룫嶺濡?룫嶺뚯솘? ??AX(dst).
         let ax = ((r as u64) & 0xFF) << 8 | ((q as u64) & 0xFF);
         store_dst(st, dst, ax);
     } else {
@@ -1775,6 +1900,27 @@ mod tests {
         interp.run(&bc).unwrap();
         assert_eq!(interp.regs[0], 0, "poly interp: RAX must be 0 on div-by-zero");
         assert_eq!(interp.regs[2], 0, "poly interp: RDX must be 0 on div-by-zero");
+    }
+
+    /// P1-7: x86 DIV/IDIV 몫이 destination 폭을 초과하면 #DE — 참조 eval_state 는
+    /// 조용히 잘라 저장하지 않고 명시적으로 실패(panic)해야 한다 (네이티브 하드웨어
+    /// div 의 #DE 크래시와 동일한 '조용한 오답 방지').
+    #[test]
+    #[should_panic(expected = "x86 #DE")]
+    fn div_quotient_overflow_panics_reference() {
+        // 64비트 unsigned DIV: RDX:RAX = 0x1_0000_0000 (2^32), divisor = 1.
+        // 몫 = 0x1_0000_0000 > 0xFFFF_FFFF → 32비트 폭엔 안 맞음 → #DE.
+        let mut d = RiscDesynthesizer::new();
+        d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0), MicroOperand::Imm64(0)); // RAX = 0
+        d.emit_add(MicroOperand::VReg(2), MicroOperand::Imm64(1), MicroOperand::Imm64(0)); // RDX = 1
+        d.instrs.push(
+            MicroInstr::new(RiscOp::Divide { signed: false, width: 4 })
+                .with_dst(MicroOperand::VReg(0))
+                .with_src1(MicroOperand::Imm64(1)), // divisor = 1
+        );
+        d.instrs.push(MicroInstr::new(RiscOp::Halt));
+        let prog = RiscProgram::new(d.instrs);
+        let _ = prog.eval_state(&[0u64; 16]); // must panic (#DE)
     }
 
     // ── P1 (③): VM→VM 콜 브릿지 — 서브 VM 레지스트리 기반 nested-VM 참조 의미론 ──

@@ -89,8 +89,13 @@ pub(crate) fn mul_wide_interp(
 ) {
     let bits = width as u32 * 8;
     let mask = width_mask_interp(bits);
-    let full = ((a & mask) as u128) * ((b & mask) as u128);
-    let low = full as u64;
+    // P0-2 signed MUL/IMUL: 피연산자를 2*bits 폭으로 부호 확장해 고 half 정합.
+    let full = if signed {
+        sign_extend_to_interp(a & mask, bits, bits * 2).wrapping_mul(sign_extend_to_interp(b & mask, bits, bits * 2))
+    } else {
+        ((a & mask) as u128).wrapping_mul((b & mask) as u128)
+    };
+    let low = (full & width_mask_interp(bits * 2) as u128) as u64;
     let high = ((full >> bits) as u64) & mask;
     let ovf = if signed {
         let sign_ext = if low & (1u64 << (bits - 1)) != 0 { mask } else { 0 };
@@ -121,8 +126,12 @@ pub(crate) fn mul_low_interp(
 ) {
     let bits = width as u32 * 8;
     let mask = width_mask_interp(bits);
-    let full = ((a & mask) as u128) * ((b & mask) as u128);
-    let low = full as u64;
+    let full = if signed {
+        sign_extend_to_interp(a & mask, bits, bits * 2).wrapping_mul(sign_extend_to_interp(b & mask, bits, bits * 2))
+    } else {
+        ((a & mask) as u128).wrapping_mul((b & mask) as u128)
+    };
+    let low = (full & width_mask_interp(bits * 2) as u128) as u64;
     let high = ((full >> bits) as u64) & mask;
     let ovf = if signed {
         let sign_ext = if low & (1u64 << (bits - 1)) != 0 { mask } else { 0 };
@@ -132,6 +141,14 @@ pub(crate) fn mul_low_interp(
     };
     flags.set_cf_of(ovf);
     interp_store(regs, temps, spec, op_dst, low);
+}
+
+/// `from_bits` 폭 값을 `to_bits`(≤128) 폭으로 부호 확장 (signed MUL/IMUL 고 half).
+pub(crate) fn sign_extend_to_interp(v: u64, from_bits: u32, to_bits: u32) -> u128 {
+    let sign = (v >> (from_bits - 1)) & 1;
+    let low = (v as u128) & ((1u128 << from_bits) - 1);
+    let ext = if sign != 0 { low | (u128::MAX << from_bits) } else { low };
+    ext & (if to_bits < 128 { (1u128 << to_bits) - 1 } else { u128::MAX })
 }
 
 /// DIV/IDIV — eval_state `div_wide`와 동일. (제수 0 → 참조 기본값 0.)
@@ -171,6 +188,22 @@ pub(crate) fn div_wide_interp(
     } else {
         (dividend / dv, dividend % dv)
     };
+    // P1-7: x86 DIV/IDIV 몫 폭 초과 → #DE (참조 eval_state 와 동일 — 조용한 잘림 방지).
+    let overflow = if signed {
+        let q = q as i128;
+        let qmin = -(1i128 << (bits - 1));
+        let qmax = (1i128 << (bits - 1)) - 1;
+        q < qmin || q > qmax
+    } else {
+        let qmax: u128 = (if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 }) as u128;
+        q > qmax
+    };
+    if overflow {
+        panic!(
+            "RISC DIV/IDIV interp: x86 #DE — quotient does not fit destination width {} bits (dividend 0x{dividend:X}, divisor 0x{dv:X})",
+            bits
+        );
+    }
     if width == 1 {
         interp_store(regs, temps, spec, op_dst, ((r as u64) & 0xFF) << 8 | ((q as u64) & 0xFF));
     } else {

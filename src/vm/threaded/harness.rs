@@ -141,10 +141,10 @@ impl NativeVmHarness {
                 mba_prob,
                 key as u64,
             )?;
-            if ins.op != RiscOp::Halt {
+            if !matches!(ins.op, RiscOp::Halt | RiscOp::VirtualRet) {
                 DirectTailEmitter::emit_tail_dispatch(&mut instrs)?;
             } else {
-                // HALT: Win64 callee-saved ?��??�터(R12~R15) 복원 ??ret.
+                // HALT / VIRTUAL_RET(최상위): Win64 callee-saved ?��??�터(R12~R15) 복원 ??ret.
                 instrs.push(Instruction::with1(Code::Pop_r64, Register::R15).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with1(Code::Pop_r64, Register::R14).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with1(Code::Pop_r64, Register::R13).map_err(|e| anyhow!("{e}"))?);

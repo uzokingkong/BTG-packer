@@ -28,6 +28,37 @@ use crate::pe::builder::{DataDirectory, SectionData};
 /// IMAGE_REL_BASED_DIR64 — 64-bit absolute-address fixup (PE32+).
 pub const IMAGE_REL_BASED_DIR64: u16 = 10;
 
+/// x86-64 `mov r64, imm64` = REX.W(0x48-0x4F, W bit set) + opcode 0xB8-0xBF +
+/// 8-byte little-endian immediate. The immediate starts at **offset+2** (not
+/// 8-byte aligned), so the 8-aligned slot scan in `build_reloc_directory` misses
+/// it. Scan a code blob for this exact instruction pattern and return the byte
+/// offset of each immediate whose value falls inside `[va_lo, va_hi)`.
+///
+/// This is provenance-by-pattern: unlike the 8-aligned value scan (which can
+/// false-positive on a random constant that happens to land in the image range),
+/// here the slot is provably the operand of a `mov r64, imm64` instruction —
+/// exactly the encoding the packer's own generators (`movi`) use to embed module
+/// entry / table / state / stack-base VAs into the dispatcher and boot stub.
+/// Derived keys (init_key / mba_a / mba_b) are naturally excluded because they
+/// are not inside the image range.
+pub(crate) fn scan_mov_imm64_slots(code: &[u8], va_lo: u64, va_hi: u64) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 10 <= code.len() {
+        // REX.W (W bit 0x08 set) + 0xB8..=0xBF (mov r64, imm64).
+        if (code[i] & 0x08) != 0 && (0xB8..=0xBF).contains(&code[i + 1]) {
+            let imm = u64::from_le_bytes(code[i + 2..i + 10].try_into().unwrap());
+            if imm >= va_lo && imm < va_hi {
+                out.push((i + 2) as u32);
+            }
+            i += 10;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Result of building the relocation directory.
 pub struct RelocOutput {
     /// The `.reloc` section to append to the image (VA must be set by the caller).
@@ -73,6 +104,22 @@ pub fn build_reloc_directory(
             }
             let v = u64::from_le_bytes([sec.bytes[i * 8], sec.bytes[i * 8 + 1], sec.bytes[i * 8 + 2], sec.bytes[i * 8 + 3], sec.bytes[i * 8 + 4], sec.bytes[i * 8 + 5], sec.bytes[i * 8 + 6], sec.bytes[i * 8 + 7]]);
             if v < va_lo || v >= va_hi {
+                continue;
+            }
+            let page = slot_rva & !0xFFF;
+            let off_in_page = (slot_rva & 0xFFF) as u16;
+            pages.entry(page).or_default().push(off_in_page);
+        }
+        // P0-5: 8-정렬 슬롯 스캔만으로는 injected 코드의 `mov r64, imm64` 즉시값
+        // (명령어 offset+2, 비정렬) 절대 VA 를 놓친다 — 보호기/부트 스텁/디스패처가
+        // R8/R13/R14/R15/RDX/모듈 엔트리 VA 를 imm64 로 박는데, ASLR 재배치가 빠지면
+        // preferred base != actual base 에서 잘못된 주소로 점프해 크래시한다.
+        // `mov r64, imm64` = REX.W(0x48-0x4F) + 0xB8-0xBF + 8B immediate (LE) 패턴으로
+        // 이미지 범위 내 값만 정확히 추적한다 (임의 데이터가 8-정렬 우연 일치로
+        // 오탐되는 8-정렬 스캔보다 정밀 — 값이 실제 명령어 피연산자임이 보장된다).
+        for off in scan_mov_imm64_slots(&sec.bytes, va_lo, va_hi) {
+            let slot_rva = sec_rva.wrapping_add(off);
+            if in_encrypted(slot_rva) {
                 continue;
             }
             let page = slot_rva & !0xFFF;
@@ -203,5 +250,57 @@ mod tests {
         let p1 = u32::from_le_bytes(out.section.bytes[12..16].try_into().unwrap());
         assert_eq!(p0, 0x2000);
         assert_eq!(p1, 0x3000);
+    }
+
+    /// P0-5: injected `mov r64, imm64` 절대 VA (명령어 offset+2, 비정렬) 슬롯이
+    /// .reloc 에 잡혀야 한다 — 8-정렬 스캔만으로는 놓치는 보호기/디스패처/부트 스텁
+    /// imm64 이며, 이미지 범위 밖 값(파생 키 등)은 제외된다.
+    #[test]
+    fn mov_imm64_slots_get_reloc_entries() {
+        let ib: u64 = 0x14000_0000;
+        // 코드 블록: 3바이트 서브루틴 시작 + `mov r8, imm64` (49 B8 + imm64) + 계속.
+        // imm64 는 bytecode_va (이미지 내부, 8-정렬 아님) → reloc 되어야 한다.
+        let mut b = vec![0u8; 0x40];
+        b[0x00] = 0x90; // nop
+        b[0x01] = 0x90; // nop
+        b[0x02] = 0x49; // REX.W+R.B (mov r8, imm64)
+        b[0x03] = 0xB8;
+        b[0x04..0x0C].copy_from_slice(&(ib + 0x4000).to_le_bytes()); // 이미지 내부 VA
+        // 별도 mov r10, imm64 (4D B8) — 파생 키 (이미지 밖) → 제외.
+        b[0x0C] = 0x4D;
+        b[0x0D] = 0xB8;
+        b[0x0E..0x16].copy_from_slice(&0xDEAD_BEEF_CAFE_F000u64.to_le_bytes());
+        let sections = vec![sec(".btgvm", 0x1000, b)];
+        let out = build_reloc_directory(&sections, ib, 0x200000, &[]).expect("relocs");
+        // 유일한 reloc 슬롯: imm64 at offset 0x04 → RVA 0x1004.
+        let block = &out.section.bytes;
+        assert_eq!(out.directory.size, 12); // 1 entry + DWORD pad
+        let e0 = u16::from_le_bytes(block[8..10].try_into().unwrap());
+        assert_eq!(e0 >> 12, IMAGE_REL_BASED_DIR64);
+        assert_eq!(e0 & 0xFFF, 0x04, "imm64 slot at instruction offset+2 (not 8-aligned)");
+        let pad = u16::from_le_bytes(block[10..12].try_into().unwrap());
+        assert_eq!(pad >> 12, 0, "pad entry is ABSOLUTE");
+    }
+
+    /// P0-5: scan_mov_imm64_slots 는 실제 `mov r64, imm64` 명령만 잡고, 8-정렬
+    /// 임의 데이터(우연 일치)는 잡지 않는다 — 오탐 방지.
+    #[test]
+    fn scan_mov_imm64_rejects_plain_data() {
+        let ib: u64 = 0x14000_0000;
+        // 8-정렬된 평문 데이터가 이미지 범위 값을 갖더라도 8-정렬 스캔은 잡지만,
+        // mov-imm64 패턴 스캔은 실제 명령어 인코딩이 아니면 잡지 않는다.
+        let mut b = vec![0u8; 0x20];
+        b[0x00..0x08].copy_from_slice(&(ib + 0x1000).to_le_bytes()); // plain data (8-aligned)
+        let slots = scan_mov_imm64_slots(&b, ib, ib + 0x200000);
+        assert!(slots.is_empty(), "plain data must not be caught as mov-imm64");
+        // 반대로 실제 명령어 패턴(REX.W + 0xB8 + imm64 in range)은 정확히 offset+2.
+        let mut c = vec![0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0]; // mov rax, imm64
+        c[2..10].copy_from_slice(&(ib + 0x2000).to_le_bytes());
+        let slots = scan_mov_imm64_slots(&c, ib, ib + 0x200000);
+        assert_eq!(slots, vec![2], "mov-imm64 immediate slot at offset+2");
+        // 이미지 범위 밖 값은 제외.
+        c[2..10].copy_from_slice(&0x7000_0000_0000_0000u64.to_le_bytes());
+        let slots = scan_mov_imm64_slots(&c, ib, ib + 0x200000);
+        assert!(slots.is_empty(), "out-of-range imm64 must be excluded");
     }
 }

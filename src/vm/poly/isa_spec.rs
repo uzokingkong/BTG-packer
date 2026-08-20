@@ -64,6 +64,7 @@ impl VirtualIsaSpec {
         ops.push(RiscOp::NativeCallBridge);
         ops.push(RiscOp::SetFlag);
         ops.push(RiscOp::Halt);
+        ops.push(RiscOp::VirtualRet);
         ops.push(RiscOp::Mov);
         // P2: 정수/비트/제어 복합 연산 — 부호/폭/모드별로 별도 Opcode.
         // (signed/width/mode 는 variant 에 Bake — 각각 유일 Opcode.)
@@ -103,6 +104,8 @@ impl VirtualIsaSpec {
         });
         for w in [1u8, 2, 4, 8] {
             ops.push(RiscOp::CompareExchange { width: w });
+            ops.push(RiscOp::AtomicExchange { width: w });
+            ops.push(RiscOp::AtomicAdd { width: w });
         }
         // P0-1: x86 정확 플래그 전용 산술 op (ADD/SUB borrow-CF, INC/DEC CF 보존, NOT 무변경).
         for w in [1u8, 2, 4, 8] {

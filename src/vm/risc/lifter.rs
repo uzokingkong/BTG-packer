@@ -679,9 +679,11 @@ impl RiscLifter {
                 self.emit_jcxz(8, target);
             }
             Code::Retnq | Code::Retnw => {
-                self.desynth.instrs.push(MicroInstr::new(RiscOp::Halt));
+                // P0-1: RET → VirtualRet — 가상 스택에서 복귀 주소를 pop 해
+                // ip_map 안이면 VM 내부 복귀, 아니면 Halt(프로그램 종료)로.
+                self.desynth.instrs.push(MicroInstr::new(RiscOp::VirtualRet));
             }
-            // RET imm16: RSP += imm ??Halt.
+            // RET imm16: RSP += imm ??VirtualRet (복귀 주소는 그대로 스택에서 pop).
             Code::Retnq_imm16 | Code::Retnw_imm16 => {
                 let imm = inst.immediate16() as u64;
                 if imm != 0 {
@@ -691,7 +693,7 @@ impl RiscLifter {
                         MicroOperand::Imm64(imm),
                     );
                 }
-                self.desynth.instrs.push(MicroInstr::new(RiscOp::Halt));
+                self.desynth.instrs.push(MicroInstr::new(RiscOp::VirtualRet));
             }
 
             // ???? P2: MUL / IMUL (1-??깅염?怨쀬쁽, RAX ?遺용뻻) ??????????????????????????????????????????????????????
@@ -1342,15 +1344,14 @@ mod tests {
             0x48, 0xC7, 0xC3, 0x07, 0x00, 0x00, 0x00, // mov rbx, 7
             0xC3,                                     // ret
         ];
-        let st = run(&raw, 0x140001000, [0u64; 16]);
+let st = run(&raw, 0x140001000, [0u64; 16]);
         // callee ??쎈뻬
         assert_eq!(regs(&st)[3], 7, "rbx set in callee");
-        // call ??꾩뜎 fallthrough 沃섎챷???
-        assert_eq!(regs(&st)[1], 0, "rcx not executed");
-        assert_eq!(regs(&st)[2], 0, "rdx not executed");
-        // ??쎄문 筌ㅼ뮇湲??= call??癰귣벀? 雅뚯눘??(0x140001005)
-        assert_eq!(st.stack.len(), 1, "one return address pushed");
-        assert_eq!(st.stack[0], 0x140001005, "return address = call.next_ip");
+        // P0-1: callee 의 ret 가 호출자 next_ip(ip_map)로 **복귀**해 fallthrough 실행.
+        assert_eq!(regs(&st)[1], 1, "rcx executed after return (VM→VM call roundtrip)");
+        assert_eq!(regs(&st)[2], 2, "rdx executed after return (VM→VM call roundtrip)");
+        // 복귀 주소는 pop 되어 스택이 비고, 최상위(빈 스택) ret 는 Halt.
+        assert_eq!(st.stack.len(), 0, "return address popped by callee ret");
     }
 
     /// A(揶쏄쑴??: Call_rm64 ??push 癰귣벀? 雅뚯눘??+ 揶쏄쑴???브쑨由??????쎄숲 揶?.
@@ -1373,8 +1374,9 @@ mod tests {
         init[0] = 0x14000100A; // rax = callee
         let st = run(&raw, 0x140001000, init);
         assert_eq!(regs(&st)[3], 0x2A, "indirect callee executed");
-        assert_eq!(regs(&st)[1], 0, "fallthrough not executed");
-        assert_eq!(st.stack[0], 0x140001002, "indirect call return addr");
+        // P0-1: 간접 call 도 복귀해 fallthrough 실행.
+        assert_eq!(regs(&st)[1], 9, "fallthrough executed after indirect call return");
+        assert_eq!(st.stack.len(), 0, "return address popped by callee ret");
     }
 
     /// B: JE taken / JE not-taken / JNE taken.
@@ -1966,20 +1968,26 @@ mod tests {
         // xchg [rax], rbx (48 87 18) ; ret
         let raw = [0x48, 0x87, 0x18, 0xC3];
         let prog = lift(&raw, 0x140001000);
+        // P0-4: 메모리 XCHG 는 암시적 LOCK — AtomicExchange 단일 원자로 lift.
+        let has_atomic = prog.instrs.iter().any(|i| matches!(i.op, RiscOp::AtomicExchange { .. }));
         let has_rd = prog.instrs.iter().any(|i| matches!(i.op, RiscOp::MemoryRead { .. }));
         let has_wr = prog.instrs.iter().any(|i| matches!(i.op, RiscOp::MemoryWrite { .. }));
-        assert!(has_rd && has_wr, "XCHG mem lifts to memory RMW");
+        assert!(has_atomic, "XCHG mem lifts to AtomicExchange");
+        assert!(!has_rd && !has_wr, "XCHG mem must not decompose into non-atomic RMW");
     }
 
-    /// XADD (mem form) ??lift path emits memory RMW.
+    /// XADD (mem form) ??lift path emits atomic LOCK XADD.
     #[test]
     fn test_lift_xadd_mem() {
         // xadd [rax], rbx (48 0F C1 18) ; ret
         let raw = [0x48, 0x0F, 0xC1, 0x18, 0xC3];
         let prog = lift(&raw, 0x140001000);
+        // P0-4: LOCK XADD 는 원자 RMW — AtomicAdd 단일 원자로 lift.
+        let has_atomic = prog.instrs.iter().any(|i| matches!(i.op, RiscOp::AtomicAdd { .. }));
         let has_rd = prog.instrs.iter().any(|i| matches!(i.op, RiscOp::MemoryRead { .. }));
         let has_wr = prog.instrs.iter().any(|i| matches!(i.op, RiscOp::MemoryWrite { .. }));
-        assert!(has_rd && has_wr, "XADD mem lifts to memory RMW");
+        assert!(has_atomic, "XADD mem lifts to AtomicAdd");
+        assert!(!has_rd && !has_wr, "XADD mem must not decompose into non-atomic RMW");
     }
 
     /// BMI1 ANDN ??lift path emits NOT+AND (VEX encoding via BlockEncoder).

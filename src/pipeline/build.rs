@@ -585,15 +585,32 @@ fn update_pdata_seh(
         if vm_prog_rva > 0 && vm_prog_total > 0 {
             vm_begin = vm_prog_rva;
             vm_end = vm_prog_rva.saturating_add(vm_prog_total);
+            // FIX(commercial-vm-pdata): vm_entry_unwind_ops fails on commercial VM
+            // (entry starts with JMP, not a push/sub-rsp prologue). Even when
+            // vm_prog_unwind is None we must register a RUNTIME_FUNCTION covering
+            // [vm_prog_rva..vm_prog_rva+vm_prog_total) so that
+            // validate_function_ownership does not fall back to the original .pdata
+            // entry (which is narrower) and report "extends beyond".
             if let Some(uwi) = vm_prog_unwind {
                 vm_unwind = uwi.to_vec();
-                if !rf_list.iter().any(|rf| rf.begin_address == vm_begin) {
-                    rf_list.push(RuntimeFunction {
-                        begin_address: vm_begin,
-                        end_address: vm_end,
-                        unwind_info_address: 0, // ????筌뤴뫀???뷀뒗??
-                    });
-                }
+            } else {
+                // Leaf / no unwind info — SEH inside the VM module will unwind to
+                // the caller frame without prologue restoration. Acceptable for the
+                // commercial self-decoding dispatcher (no non-volatile registers saved
+                // before the JMP trampoline).
+                println!(
+                    "[+] P4 .pdata: Program-VM RUNTIME_FUNCTION (leaf/no-unwind-info) \
+                     covering 0x{:X}..0x{:X} ({}B)",
+                    vm_begin, vm_end, vm_prog_total
+                );
+            }
+            // Register the RUNTIME_FUNCTION regardless of unwind-info availability.
+            if !rf_list.iter().any(|rf| rf.begin_address == vm_begin) {
+                rf_list.push(RuntimeFunction {
+                    begin_address: vm_begin,
+                    end_address: vm_end,
+                    unwind_info_address: 0, // patched below when vm_unwind is non-empty
+                });
             }
         }
 

@@ -33,7 +33,7 @@ pub(crate) use codegen_util::{
     ARENA_SIZE, C1, C2, C3, C4, C5, DEC_CIN, DEC_DST, DEC_IMM1, DEC_IMM2, DEC_SRC1, DEC_SRC2, DEC_COND,
     FLAG_MASK, FLAGS_OFF, K_IMM, K_NONE, K_REG, OFF_BRANCH_MAP, OFF_BYTECODE, OFF_COND_CODES, OFF_CODE,
     OFF_OP_FLAGS, OFF_OP_OFFS, OFF_STACK_BASE, OFF_STATE, OFF_TABLE, REGS_OFF, STATE_END,
-    TEMPS_OFF, VSP_OFF,
+    TEMPS_OFF, VSP_OFF, XMM_OFF, XMM_SLOTS,
     COND_ABOVE, COND_ABOVE_OR_EQUAL, COND_ALWAYS, COND_BELOW, COND_BELOW_OR_EQUAL, COND_CARRY,
     COND_COUNTER_ZERO_2, COND_COUNTER_ZERO_4, COND_COUNTER_ZERO_8, COND_GREATER,
     COND_GREATER_OR_EQUAL, COND_INVALID, COND_LESS, COND_LESS_OR_EQUAL, COND_NOT_CARRY,
@@ -634,6 +634,31 @@ pub fn build_self_decoding_parts_with(
         store_m(b, FLAGS_OFF, Register::RAX);
     }
 
+    // P0-3/P2: 시프트 플래그 저장 — 참조 eval_state 의
+    // `update_logic64(res) + CF = shift-out bit` 와 동일하게:
+    //   * CF 는 시프트 명령이 set 한 shift-out 비트를 유지한다 (후속 `test` 가
+    //     CF/OF 를 clear 하므로 시프트 **직후** pushfq 로 캡처한다),
+    //   * ZF/SF/PF 는 결과 기준 (`test r10, r10`),
+    //   * OF/AF 는 clear (update_logic64 가 clear — 하드웨어의 count==1 OF 무시),
+    //   * DF 는 보존 (FLAGS_OFF 의 비-status 비트 유지).
+    // 호출자는 반드시 시프트 명령 직후, R10 = 시프트 결과 상태에서 호출해야 한다.
+    // R9/RAX/RCX 를 clobber 한다 (이 지점 이후엔 sub_store 가 재사용한다).
+    fn emit_store_shift_flags(b: &mut CodeBuilder) {
+        b.push(Instruction::with(Code::Pushfq));
+        b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
+        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 1).unwrap());
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::RAX).unwrap()); // CF
+        b.push(Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).unwrap());
+        b.push(Instruction::with(Code::Pushfq));
+        b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
+        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xC4).unwrap()); // ZF|SF|PF
+        b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::R9).unwrap()); // +CF
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(FLAGS_OFF)).unwrap());
+        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x8D5i64) as i32).unwrap());
+        b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap());
+        store_m(b, FLAGS_OFF, Register::RAX);
+    }
+
     // store CF|ZF helper for TZCNT/LZCNT: the reference sets ZF=1 when the
     // (width-truncated) source is zero, which HW tzcnt/lzcnt reports via CF, so
     // ZF' = ZF_hw | CF_hw.
@@ -898,14 +923,14 @@ pub fn build_self_decoding_parts_with(
         b.je(skip0);
         b.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R11D).unwrap());
         b.push(Instruction::with2(Code::Shr_rm64_CL, Register::R10, Register::CL).unwrap());
+        // P0-3: count!=0 만 flags 갱신 — count==0 은 x86 flags 보존(skip0 → done0).
+        emit_store_shift_flags(&mut b);
         let done0 = b.len();
         for &mut (bi, ref mut ti) in b.branches.iter_mut() {
             if *ti == skip0 {
                 *ti = done0;
             }
         }
-        b.push(Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).unwrap());
-        emit_store_flags(&mut b);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
         b.call(sub_store);
         b.jmp(dispatch);
@@ -928,14 +953,14 @@ pub fn build_self_decoding_parts_with(
         b.je(skip0);
         b.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R11D).unwrap());
         b.push(Instruction::with2(Code::Shl_rm64_CL, Register::R10, Register::CL).unwrap());
+        // P0-3: count!=0 만 flags 갱신 (count==0 은 x86 flags 보존).
+        emit_store_shift_flags(&mut b);
         let done0 = b.len();
         for &mut (bi, ref mut ti) in b.branches.iter_mut() {
             if *ti == skip0 {
                 *ti = done0;
             }
         }
-        b.push(Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).unwrap());
-        emit_store_flags(&mut b);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
         b.call(sub_store);
         b.jmp(dispatch);
@@ -1080,6 +1105,26 @@ pub fn build_self_decoding_parts_with(
             sl(&mut b, Register::R10, 0x50);
             sl(&mut b, Register::R11, 0x58);
 
+            // 3b. P1-8: Win64 FP/vector ABI — VM 상태의 XMM 슬롯(state+XMM_OFF,
+            //     XMM_SLOTS×16B)에서 네이티브 XMM0-5 로 물질화. 호출자가 FP 인자를
+            //     XMM 슬롯에 심었을 때(ABI 분석/lifter — 후속) 브릿지가 정확히
+            //     전달한다. 캘리-세이브 레지스터는 건드리지 않는다.
+            for i in 0..XMM_SLOTS {
+                let xmm = match i {
+                    0 => Register::XMM0,
+                    1 => Register::XMM1,
+                    2 => Register::XMM2,
+                    3 => Register::XMM3,
+                    4 => Register::XMM4,
+                    _ => Register::XMM5,
+                };
+                b.push(Instruction::with2(
+                    Code::Movups_xmm_xmmm128,
+                    xmm,
+                    MemoryOperand::with_base_displ_size(Register::R12, (XMM_OFF + (i as i32) * 16) as i64, 16),
+                ).unwrap());
+            }
+
             // 4. native frame: align RSP to 16, allocate 0x70 (ret + 0x20 home +
             //    0x40 stack args). RSI = align remainder for the restore.
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSI, Register::RBX).unwrap());
@@ -1149,6 +1194,23 @@ pub fn build_self_decoding_parts_with(
             b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
             b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x8D5).unwrap());
             b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0xC0, 8), Register::RAX).unwrap());
+            // P1-8: callee 가 clobber 한 XMM0-5 를 VM XMM 슬롯으로 동기화 (반환값/
+            // 변경된 FP 상태 보존).
+            for i in 0..XMM_SLOTS {
+                let xmm = match i {
+                    0 => Register::XMM0,
+                    1 => Register::XMM1,
+                    2 => Register::XMM2,
+                    3 => Register::XMM3,
+                    4 => Register::XMM4,
+                    _ => Register::XMM5,
+                };
+                b.push(Instruction::with2(
+                    Code::Movups_xmmm128_xmm,
+                    MemoryOperand::with_base_displ_size(Register::R12, (XMM_OFF + (i as i32) * 16) as i64, 16),
+                    xmm,
+                ).unwrap());
+            }
 
             // 8. restore the VM real stack (RSP = original S) and infra.
             b.push(Instruction::with2(Code::Add_rm64_imm32, Register::RSP, 0x70).unwrap());
@@ -1240,6 +1302,64 @@ pub fn build_self_decoding_parts_with(
         b.push(Instruction::with(Code::Retnq));
     }
 
+    // ── P0-1: VIRTUAL_RET — x86 RET. 가상 스택에서 복귀 주소를 pop 해 branch-map
+    //    (ip_map 기반: source-IP → byte offset)에서 찾으면 rolling-key 재동기 후 해당
+    //    오프셋으로 dispatch(VM 내부 복귀). branch-map 에 없으면(빈 스택/네이티브 복귀
+    //    주소) Halt 로 종료해 네이티브 호출자에게 돌아간다 — not-found 를 native-call-
+    //    bridge 로 보내면 복귀 주소를 call 해 잘못된다.
+    let h_ret = b.len();
+    {
+        // 0. VSP < 0 인 경우에만 pop (빈 스택/최상위 ret 는 pop 없이 Halt —
+        //    참조 eval_state 의 `stack.pop()` None 과 동일).
+        mov_m(&mut b, Register::RAX, VSP_OFF);
+        b.push(Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap());
+        b.br(Code::Jns_rel32_64, 0xD200); // VSP >= 0 -> empty -> halt
+        // 1. pop ret_ip (R13 top) -> R10, update VSP slot.
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, MemoryOperand::with_base(Register::R13)).unwrap());
+        b.push(Instruction::with2(Code::Add_rm64_imm8, Register::R13, 8).unwrap());
+        mov_m(&mut b, Register::RAX, VSP_OFF);
+        b.push(Instruction::with2(Code::Add_rm64_imm8, Register::RAX, 8).unwrap());
+        store_m(&mut b, VSP_OFF, Register::RAX);
+
+        // 2. branch-map scan for R10 (target_value -> byte_offset).
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::R15).unwrap());
+        b.push(Instruction::with2(Code::Add_rm64_imm32, Register::RBX, (OFF_BRANCH_MAP - OFF_TABLE) as i32).unwrap());
+        b.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, MemoryOperand::with_base(Register::RBX)).unwrap());
+        b.push(Instruction::with2(Code::Test_rm64_r64, Register::RCX, Register::RCX).unwrap());
+        b.br(Code::Je_rel32_64, 0xD100); // count == 0 -> not found (halt)
+        b.push(Instruction::with2(Code::Lea_r64_m, Register::R11, MemoryOperand::with_base_displ_size(Register::RBX, 4, 8)).unwrap());
+        let scan_top = b.len();
+        {
+            b.push(Instruction::with2(Code::Cmp_rm64_r64, MemoryOperand::with_base(Register::R11), Register::R10).unwrap());
+            b.br(Code::Je_rel32_64, 0xD101); // found
+            b.push(Instruction::with2(Code::Add_rm64_imm32, Register::R11, 16).unwrap());
+            b.push(Instruction::with1(Code::Dec_rm64, Register::RCX).unwrap());
+            b.push(Instruction::with2(Code::Test_rm64_r64, Register::RCX, Register::RCX).unwrap());
+            b.jne(scan_top);
+        }
+        // not found: fall through to halt path.
+        b.br(Code::Jmp_rel32_64, 0xD100);
+        // found: byte offset = [R11 + 8]; re-sync rolling key, then dispatch.
+        let ret_found = b.len();
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, MemoryOperand::with_base_displ_size(Register::R11, 8, 8)).unwrap());
+        let ret_resync = b.len();
+        b.call(sub_resync);
+        b.jmp(dispatch);
+        // not found / empty -> halt (native caller return).
+        let ret_halt = b.len();
+        for i in 0..b.branches.len() {
+            let t = b.branches[i].1;
+            if t == 0xD100 {
+                b.branches[i].1 = ret_halt;
+            } else if t == 0xD101 {
+                b.branches[i].1 = ret_found;
+            } else if t == 0xD200 {
+                b.branches[i].1 = ret_halt;
+            }
+        }
+        b.jmp(h_halt);
+    }
+
     // ── P3: MOV — dst = src1 (no flags). ──
     let h_mov = b.len();
     {
@@ -1270,14 +1390,14 @@ pub fn build_self_decoding_parts_with(
         b.je(skip0);
         b.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R11D).unwrap());
         b.push(Instruction::with2(Code::Sar_rm64_CL, Register::R10, Register::CL).unwrap());
+        // P0-3: count!=0 만 flags 갱신 (count==0 은 x86 flags 보존).
+        emit_store_shift_flags(&mut b);
         let done0 = b.len();
         for &mut (bi, ref mut ti) in b.branches.iter_mut() {
             if *ti == skip0 {
                 *ti = done0;
             }
         }
-        b.push(Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).unwrap());
-        emit_store_flags(&mut b);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
         b.call(sub_store);
         b.jmp(dispatch);
@@ -1426,37 +1546,69 @@ pub fn build_self_decoding_parts_with(
         mov_m(b, Register::R11, DEC_IMM2);
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
-        // width-mask the operands (zero-extend the kept low bits).
+        // width-mask the operands. unsigned는 폭 마스크(제로 확장), signed는
+        // 폭×2 부호 확장 — x86 signed MUL/IMUL의 고 half가 폭 마스크 곱과 다르므로
+        // (8-bit −1×2 → high 0xFF) movsx 로 64비트 폭으로 부호 확장한다.
         match width {
             1 => {
-                b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).unwrap());
-                b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R11D, Register::R11L).unwrap());
+                if signed {
+                    b.push(Instruction::with2(Code::Movsx_r64_rm8, Register::R10, Register::R10L).unwrap());
+                    b.push(Instruction::with2(Code::Movsx_r64_rm8, Register::R11, Register::R11L).unwrap());
+                } else {
+                    b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).unwrap());
+                    b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R11D, Register::R11L).unwrap());
+                }
             }
             2 => {
-                b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R10D, Register::R10W).unwrap());
-                b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R11D, Register::R11W).unwrap());
+                if signed {
+                    b.push(Instruction::with2(Code::Movsx_r64_rm16, Register::R10, Register::R10W).unwrap());
+                    b.push(Instruction::with2(Code::Movsx_r64_rm16, Register::R11, Register::R11W).unwrap());
+                } else {
+                    b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R10D, Register::R10W).unwrap());
+                    b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R11D, Register::R11W).unwrap());
+                }
             }
             4 => {
-                b.push(Instruction::with2(Code::Mov_r32_rm32, Register::R10D, Register::R10D).unwrap());
-                b.push(Instruction::with2(Code::Mov_r32_rm32, Register::R11D, Register::R11D).unwrap());
+                if signed {
+                    b.push(Instruction::with2(Code::Movsxd_r64_rm32, Register::R10, Register::R10D).unwrap());
+                    b.push(Instruction::with2(Code::Movsxd_r64_rm32, Register::R11, Register::R11D).unwrap());
+                } else {
+                    b.push(Instruction::with2(Code::Mov_r32_rm32, Register::R10D, Register::R10D).unwrap());
+                    b.push(Instruction::with2(Code::Mov_r32_rm32, Register::R11D, Register::R11D).unwrap());
+                }
             }
             _ => {}
         }
         // stage state_base (RDX) in RBX, then RDX:RAX = a*b.
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::RDX).unwrap());
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
-        b.push(Instruction::with1(Code::Mul_rm64, Register::R11).unwrap());
-        // high = (full>>bits)&mask -> R9 (low = RAX). For bits<64 the product
-        // already fits in RAX so no mask is needed after the shift.
+        // P0-2: signed 64-bit MUL 은 부호 확장 128-bit 곱(high = RDX) 이 필요하다 —
+        // unsigned `mul` 을 쓰면 -1×2 의 high 가 0xFFFFFFFFFFFFFFFF 가 아닌 1 이 된다.
+        // 8/16/32비트 signed 는 movsx 로 64비트 부호 확장 후 low-64 를 마스크/시프트로
+        // 정합하지만 64비트는 RDX(high)를 그대로 쓰므로 반드시 `imul` 을 사용해야 한다.
+        let mcode = if signed { Code::Imul_rm64 } else { Code::Mul_rm64 };
+        b.push(Instruction::with1(mcode, Register::R11).unwrap());
+        // high = (full>>bits)&mask -> R9 (low = RAX). signed/64비트 곱은 low 64비트
+        // = RAX, high = RDX. bits<64 는 high 를 폭 마스크로 잘라 상위 가비지(부호
+        // 확장 잔여)를 제거한다.
         if bits == 64 {
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::RDX).unwrap());
         } else {
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::RAX).unwrap());
             b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::R9, bits as i32).unwrap());
+            if mask != u64::MAX {
+                movi(b, Register::R10, mask);
+                b.push(Instruction::with2(Code::And_rm64_r64, Register::R9, Register::R10).unwrap());
+            }
         }
-        // width 1 packs the 16-bit AX result (low|high<<8).
+        // low half 정합: 2w-bit 곱의 하위 half로 마스크해 signed 부호 확장 잔여
+        // (movsx→mul 의 상위 가비지)를 제거한다. width 1 은 AX=(high<<8)|low 를
+        // 0xFFFF 로, width 2 는 low 를 2w-bit(0xFFFFFFFF)로 자른다. width 4/8 은
+        // 2w-bit 마스크가 64비트 전체라 추가 AND 가 필요 없다 (참조 low 동일).
         if width == 1 {
             b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xFFFF).unwrap());
+        } else if width == 2 && signed {
+            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, -1i32).unwrap());
         }
         // restore state_base.
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RBX).unwrap());
@@ -2140,21 +2292,112 @@ pub fn build_self_decoding_parts_with(
             let mut ci = Instruction::with2(cmp_code, MemoryOperand::with_base(Register::R10), regx).unwrap();
             ci.set_has_lock_prefix(true);
             b.push(ci);
+            // P1-6: CMPXCHG 는 ZF 뿐 아니라 CMP(acc - old) 의 전체 상태 플래그를 set
+            // 한다. 하드웨어 cmpxchg 의 폭별 CMP 플래그를 보존하되, cmove 는 cmpxchg
+            // 의 ZF 를 읽으므로 **먼저** 성공/실패 복원을 수행한 뒤 (cmov 는 flags
+            // 불변) pushfq 로 상태 플래그를 캡처한다. DF 는 slot 에서 보존
+            // (참조 update_sub 와 동일).
             // success -> restore original regs[0]; failure -> regs[0]=old (RAX).
             b.push(Instruction::with2(Code::Cmove_r64_rm64, Register::RAX, Register::RBX).unwrap());
             store_m(&mut b, REGS_OFF, Register::RAX);
-            // store ZF only (preserve CF/SF/OF/PF/AF), matching eval_state.
+            // capture the full CMP status flags (0x8D5) — cmov 는 flags 를 바꾸지 않는다.
             b.push(Instruction::with(Code::Pushfq));
-            b.push(Instruction::with1(Code::Pop_r64, Register::RCX).unwrap());
-            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, 0x40).unwrap());
-            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RCX).unwrap());
+            b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
+            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x8D5).unwrap());
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(FLAGS_OFF)).unwrap());
-            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x40i32)).unwrap());
+            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x8D5i64) as i32).unwrap());
             b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap());
             store_m(&mut b, FLAGS_OFF, Register::RAX);
             b.jmp(dispatch);
         }
         h_cmpxchg.insert(w, h);
+    }
+
+    // ── P0-4: ATOMIC_EXCHANGE — x86 `XCHG r, [mem]` (memory 피연산자에서 암시적
+    // LOCK). old = [addr]; [addr] = dst; dst = old. 플래그 불변 (x86 XCHG).
+    // 하드웨어 `xchg` 는 자체로 원자적이라 RMW 중간 상태가 노출되지 않는다.
+    let mut h_xchg = std::collections::HashMap::new();
+    for (w, xchg_code, regx, zext) in [
+        (8u8, Code::Xchg_rm64_r64, Register::R11, None),
+        (4u8, Code::Xchg_rm32_r32, Register::R11D, None),
+        (2u8, Code::Xchg_rm16_r16, Register::R11W, Some(Code::Movzx_r64_rm16)),
+        (1u8, Code::Xchg_rm8_r8, Register::R11L, Some(Code::Movzx_r64_rm8)),
+    ] {
+        let h = b.len();
+        {
+            b.call(sub_dec_ops);
+            // addr = resolve(src1) -> R10
+            movzx8_m(&mut b, Register::EAX, DEC_SRC1);
+            mov_m(&mut b, Register::R11, DEC_IMM1);
+            b.call(sub_resolve);
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+            // reg = resolve(DEC_DST) -> R11 (XCHG의 레지스터 피연산자)
+            movzx8_m(&mut b, Register::EAX, DEC_DST);
+            mov_m(&mut b, Register::R11, DEC_IMM1);
+            b.call(sub_resolve);
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
+            // atomic xchg [r10], r11 — R11 = old [r10], [r10] = old R11.
+            b.push(Instruction::with2(xchg_code, MemoryOperand::with_base(Register::R10), regx).unwrap());
+            // 폭별 zero-extend (하드웨어는 상위 비트를 보존하므로 vreg 모델 정합).
+            if let Some(zc) = zext {
+                b.push(Instruction::with2(zc, Register::R11, regx).unwrap());
+            }
+            // store R11 (old memory value) -> dst.
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R11).unwrap());
+            b.call(sub_store);
+            b.jmp(dispatch);
+        }
+        h_xchg.insert(w, h);
+    }
+
+    // ── P0-4: ATOMIC_ADD — x86 `LOCK XADD [mem], reg`. old = [addr];
+    // [addr] += src2 (폭별 플래그 — 하드웨어 xadd 는 폭 경계 CF/OF/AF 를 set),
+    // dst = old. `lock` 접두사로 원자 RMW 보장.
+    let mut h_xadd = std::collections::HashMap::new();
+    for (w, xadd_code, regx, zext) in [
+        (8u8, Code::Xadd_rm64_r64, Register::R11, None),
+        (4u8, Code::Xadd_rm32_r32, Register::R11D, None),
+        (2u8, Code::Xadd_rm16_r16, Register::R11W, Some(Code::Movzx_r64_rm16)),
+        (1u8, Code::Xadd_rm8_r8, Register::R11L, Some(Code::Movzx_r64_rm8)),
+    ] {
+        let h = b.len();
+        {
+            b.call(sub_dec_ops);
+            // addr = resolve(src1) -> R10
+            movzx8_m(&mut b, Register::EAX, DEC_SRC1);
+            mov_m(&mut b, Register::R11, DEC_IMM1);
+            b.call(sub_resolve);
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+            // addend = resolve(src2) -> R11
+            movzx8_m(&mut b, Register::EAX, DEC_SRC2);
+            mov_m(&mut b, Register::R11, DEC_IMM2);
+            b.call(sub_resolve);
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
+            // lock xadd [r10], r11 — R11 = old [r10]; [r10] += old addend.
+            let mut xi = Instruction::with2(xadd_code, MemoryOperand::with_base(Register::R10), regx).unwrap();
+            xi.set_has_lock_prefix(true);
+            b.push(xi);
+            // flags: 참조 `update_add(old, addend, width)` 는 폭별 CF/OF/AF/SF/ZF/PF
+            // 를 set 하고 DF 를 보존한다. 하드웨어 xadd 의 폭별 플래그를 **xadd 직후**
+            // 0x8D5 로 캡처하고 비-status(DF)만 slot 에서 유지한다. 반드시 sub_store
+            // (내부 `test` 로 flags 를 오염) **이전에** 저장해야 한다.
+            b.push(Instruction::with(Code::Pushfq));
+            b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
+            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x8D5).unwrap());
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(FLAGS_OFF)).unwrap());
+            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x8D5i64) as i32).unwrap());
+            b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap());
+            store_m(&mut b, FLAGS_OFF, Register::RAX);
+            // 폭별 zero-extend (R11 = old 값, 상위 비트 정화) 후 dst 저장.
+            if let Some(zc) = zext {
+                b.push(Instruction::with2(zc, Register::R11, regx).unwrap());
+            }
+            // store R11 (old [addr]) -> dst.
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R11).unwrap());
+            b.call(sub_store);
+            b.jmp(dispatch);
+        }
+        h_xadd.insert(w, h);
     }
 
     // ── P2: BSWAP{4,8} — dst = bswap(src1); no flags. ──
@@ -2365,6 +2608,10 @@ pub fn build_self_decoding_parts_with(
         h.insert(RiscOp::CompareExchange { width: 4 }, h_cmpxchg[&4]);
         h.insert(RiscOp::CompareExchange { width: 2 }, h_cmpxchg[&2]);
         h.insert(RiscOp::CompareExchange { width: 1 }, h_cmpxchg[&1]);
+        for w in [1u8, 2, 4, 8] {
+            h.insert(RiscOp::AtomicExchange { width: w }, h_xchg[&w]);
+            h.insert(RiscOp::AtomicAdd { width: w }, h_xadd[&w]);
+        }
         // P2: BSwap / BitScan / Count / PopCount native handlers.
         h.insert(RiscOp::BSwap { width: 4 }, h_bswap4);
         h.insert(RiscOp::BSwap { width: 8 }, h_bswap8);
@@ -2380,6 +2627,7 @@ pub fn build_self_decoding_parts_with(
         h.insert(RiscOp::Setcc { cond: BranchCondition::Always }, h_setcc);
         h.insert(RiscOp::ConditionalMove { cond: BranchCondition::Always }, h_cmov);
         h.insert(RiscOp::VirtualBranch { cond: BranchCondition::Always }, h_branch);
+        h.insert(RiscOp::VirtualRet, h_ret);
         for (si, signed) in [false, true].iter().enumerate() {
             for (wi, w) in [1u8, 2, 4, 8].iter().enumerate() {
                 h.insert(RiscOp::Multiply { signed: *signed, width: *w }, mul_h[si][wi]);
