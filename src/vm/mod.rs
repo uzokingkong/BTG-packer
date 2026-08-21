@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // BTG v3 - Composite VM Module
 // ==============================================================================
 //
@@ -25,6 +25,7 @@ pub mod conceal;
 pub mod dispatch_perm;
 pub mod nested;
 pub mod c1;
+pub mod semantic_obf;
 pub mod flags;
 pub mod abi;
 pub mod handlers;
@@ -40,8 +41,16 @@ pub mod risc;
 pub mod semantics;
 pub mod text_lift;
 pub mod threaded;
+pub mod canonical_semantics;
 pub mod commercial_build;
+pub mod embed_hardening;
+pub mod handler_poly;
+pub mod ownership_verifier;
+pub mod seed_lifecycle;
+pub mod table_layout;
+pub mod vm_context;
 pub use commercial_build::{build_program_vm_commercial, COMMERCIAL_STATE_SIZE};
+pub use vm_context::VmExecutionContext;
 
 use crate::vm::lifter::LiftedInstr;
 use anyhow::{Result, anyhow};
@@ -125,13 +134,18 @@ pub fn build_vm_module_mba(
             break b;
         }
     };
-    let key = a.wrapping_add(b);
+    let master = a.wrapping_add(b);
     let vmc = handlers::generate_vm_code(code_va, bytecode_va, table_va, mode, Some((a, b)))?;
     handlers::validate_vm_code(&vmc.code)?;
+    // Per-opcode derived dispatch key: each entry is XORed with
+    // key(op) = (op*C1) ^ (op<<17) ^ C4 ^ master (see handlers::per_op_dispatch_key),
+    // matching the runtime dispatch exactly. No single constant recovers
+    // `handler[opcode] = table[opcode] ^ K` anymore.
     let mut table = Vec::with_capacity(bytecode::NUM_OPS * 8);
     for op in 0..bytecode::NUM_OPS {
         let handler_va = code_va + vmc.handler_offsets[op] as u64;
-        table.extend_from_slice(&(handler_va ^ key).to_le_bytes());
+        let k = handlers::per_op_dispatch_key(op as u8, master);
+        table.extend_from_slice(&(handler_va ^ k).to_le_bytes());
     }
     Ok(VmModule { code: vmc.code, table, bytecode, handler_offsets: vmc.handler_offsets.clone() })
 }
@@ -159,6 +173,62 @@ pub fn build_program_vm(
     // state vregs before calling. Keep the entry convention Ksa (state in RCX).
     let _ = state_va;
     Ok(m)
+}
+
+/// Build a VM module that executes a *fused / permuted / variable-length*
+/// bytecode stream (audit weakness #6). The plain handler table is permuted by
+/// the seed-keyed `SemanticObfuscator` so the opcode→semantic mapping differs
+/// per build, and fused (multi-op) handlers + a 256-entry table carry the
+/// fused families. `obf_bytecode` must be the output of
+/// `semantic_obf::SemanticObfuscator::from_seed(seed).encode(plain_bc)`.
+///
+/// Layout: `code` = plain handler code (entry stub + dispatch + 1:1 handlers)
+/// followed by the fused-handler region. The table is 256 u64 slots indexed by
+/// the encoded opcode byte: permuted plain opcodes -> their plain handlers,
+/// fused family tags -> the fused handlers, everything else -> the invalid
+/// (ud2) handler.
+pub fn build_vm_module_obf(
+    code_va: u64,
+    table_va: u64,
+    bytecode_va: u64,
+    obf_bytecode: Vec<u8>,
+    mode: handlers::EntryMode,
+    seed: u64,
+) -> Result<VmModule> {
+    let vmc = handlers::generate_vm_code(code_va, bytecode_va, table_va, mode, None)?;
+    handlers::validate_vm_code(&vmc.code)?;
+
+    let obf = crate::vm::semantic_obf::SemanticObfuscator::from_seed(seed);
+    let fused_base_va = code_va + vmc.code.len() as u64;
+    let fused = handlers::fused::emit_fused_handlers(&obf, fused_base_va)?;
+
+    let invalid_off = vmc.handler_offsets[0];
+    let invalid_va = code_va + invalid_off as u64;
+
+    // Combined code: plain handlers, then fused handlers.
+    let mut code = vmc.code;
+    let fused_base = code.len();
+    code.extend_from_slice(&fused.code);
+
+    // 256-entry handler table indexed by encoded opcode byte.
+    let mut table = vec![0u8; 256 * 8];
+    for slot in 0..256usize {
+        let va = if slot < bytecode::NUM_OPS {
+            let op = obf.dec_op(slot as u8);
+            code_va + vmc.handler_offsets[op as usize] as u64
+        } else {
+            invalid_va
+        };
+        table[slot * 8..slot * 8 + 8].copy_from_slice(&va.to_le_bytes());
+    }
+    // Override fused family slots.
+    for (fam_byte, off) in &fused.entries {
+        let va = code_va + (fused_base + *off) as u64;
+        let s = *fam_byte as usize;
+        table[s * 8..s * 8 + 8].copy_from_slice(&va.to_le_bytes());
+    }
+
+    Ok(VmModule { code, table, bytecode: obf_bytecode, handler_offsets: vmc.handler_offsets })
 }
 
 // ?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧??

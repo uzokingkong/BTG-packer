@@ -157,20 +157,48 @@ fn emit_dispatch(seq: &mut Vec<(Instruction, Option<Cl>)>, lbl: Option<Cl>) {
         lbl,
     ));
     seq.push((Instruction::with1(Code::Inc_rm64, Register::R9).unwrap(), None));
-    seq.push((
-        Instruction::with2(
-            Code::Mov_r64_rm64,
-            Register::RAX,
-            MemoryOperand::with_base_index_scale(Register::R10, Register::RAX, 8),
-        )
-        .unwrap(),
-        None,
-    ));
-    // r15 holds K (MBA) or 0 (plain); XOR decrypts the table entry. Also clears
-    // ZF etc. — RFLAGS are never read at a handler entry (handlers capture the
-    // modelled flags into STATE_FLAGS via cap_flags), so this is safe.
-    seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R15).unwrap(), None));
-    seq.push((Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap(), None));
+
+    // Per-opcode rolling dispatch key (state-dependent) — see per_op_dispatch_key.
+    let rolling = MBA_ROLLING.with(|c| c.get());
+    if rolling {
+        // key(op) = (op*C1) ^ (op<<17) ^ C4 ^ master(r15). rax keeps the opcode
+        // (the table index); scratch rcx/rdx/r11 hold the derivation.
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::RAX).unwrap(), None)); // rcx = op
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX, DISPATCH_C1).unwrap(), None)); // rdx = C1
+        seq.push((Instruction::with2(Code::Imul_r64_rm64, Register::RDX, Register::RCX).unwrap(), None)); // rdx = op*C1
+        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RCX).unwrap(), None)); // r11 = op
+        seq.push((Instruction::with2(Code::Shl_rm64_imm8, Register::R11, 17).unwrap(), None)); // r11 = op<<17
+        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RDX, Register::R11).unwrap(), None)); // rdx = op*C1 ^ op<<17
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R11, DISPATCH_C4).unwrap(), None)); // r11 = C4
+        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RDX, Register::R11).unwrap(), None)); // rdx ^= C4
+        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RDX, Register::R15).unwrap(), None)); // rdx ^= master
+        seq.push((
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base_index_scale(Register::R10, Register::RAX, 8),
+            )
+            .unwrap(),
+            None,
+        )); // rax = table[op]
+        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RDX).unwrap(), None)); // decrypt with key(op)
+        seq.push((Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap(), None));
+    } else {
+        seq.push((
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base_index_scale(Register::R10, Register::RAX, 8),
+            )
+            .unwrap(),
+            None,
+        ));
+        // r15 holds K (MBA) or 0 (plain); XOR decrypts the table entry. Also clears
+        // ZF etc. — RFLAGS are never read at a handler entry (handlers capture the
+        // modelled flags into STATE_FLAGS via cap_flags), so this is safe.
+        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R15).unwrap(), None));
+        seq.push((Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap(), None));
+    }
 }
 
 /// Append a handler: first instruction gets the Handler(op) label, then the
@@ -328,6 +356,36 @@ fn obfuscate_handler_layout(seq: &mut Vec<(Instruction, Option<Cl>)>, seed: u64)
 }
 
 /// original (plain) dispatch semantics (with r15 zeroed; identical behaviour).
+/// Per-opcode derived dispatch key (rolling / state-dependent) — used by the MBA
+/// path so a static extractor can no longer recover `handler[opcode]` with a
+/// single constant XOR (`handler[opcode] = table[opcode] ^ K`). The key depends
+/// on the opcode byte AND the seed-derived master, so the on-disk handler table
+/// is not a single-constant-maskable image of the handler addresses.
+///
+/// key(op) = (op * C1) ^ (op << 17) ^ C4 ^ master
+///
+/// The packer encrypts each table entry with this same function, and the runtime
+/// dispatcher (`emit_dispatch`, MBA path) recomputes it from the fetched opcode
+/// byte and the master held in r15 — so packer and runtime stay exactly in sync.
+pub(crate) const DISPATCH_C1: u64 = 0x9E37_79B9_7F4A_7C15;
+pub(crate) const DISPATCH_C4: u64 = 0x1337_BEEF_CAFE_0001;
+
+/// The per-opcode dispatch key shared by the packer (table encryption) and the
+/// runtime dispatcher (decryption). Pure function of `(op, master)`.
+pub(crate) fn per_op_dispatch_key(op: u8, master: u64) -> u64 {
+    let o = op as u64;
+    (o.wrapping_mul(DISPATCH_C1) ^ (o << 17) ^ DISPATCH_C4) ^ master
+}
+
+/// Codegen-time flag: true while building an MBA (rolling-key) VM module. Set at
+/// the top of `generate_vm_code`; `emit_dispatch` reads it to decide whether to
+/// emit the per-opcode derived-key decrypt (rolling, state-dependent) or the
+/// legacy single-constant `xor rax, r15`. The plain path (mba_key=None) keeps
+/// its byte-exact layout so all differential/native tests are unaffected.
+thread_local! {
+    static MBA_ROLLING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub fn generate_vm_code(
     code_va: u64,
     bytecode_va: u64,
@@ -335,6 +393,8 @@ pub fn generate_vm_code(
     mode: EntryMode,
     mba_key: Option<(u64, u64)>,
 ) -> Result<VmCode> {
+    MBA_ROLLING.with(|c| c.set(mba_key.is_some()));
+
     let mut seq: Vec<(Instruction, Option<Cl>)> = Vec::new();
 
     // ── Entry stub ─────────────────────────────────────────────────────────────
@@ -688,6 +748,7 @@ pub fn validate_vm_code(code: &[u8]) -> Result<()> {
 mod alu;
 mod atomic;
 mod branch;
+pub(crate) mod fused;
 mod mem;
 mod mov;
 mod muldiv;
