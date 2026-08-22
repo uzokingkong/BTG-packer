@@ -4,6 +4,12 @@
 
 ## 진행 기록
 
+### 2026-08-22 — shared lifetime global sync-table ABI 배치
+
+- entry-family state `+0x4000..+0x5000`에 최대 512개, 항목당 8바이트인 `(atomic lock u32, refcount u32)` ABI를 추가했다. 객체 RVA를 정렬·중복 제거해 build마다 결정적인 index와 절대 VA를 만든다.
+- table은 family-local state마다 복제하지 않고 entry state 한 곳만 소유하므로 이후 모든 family/thread의 acquire/release가 동일 atomic word를 볼 수 있다. production placement가 영역을 명시적으로 zero-init하고 sizing/final VA drift를 검사한다.
+- validator는 table capacity와 entry layout뿐 아니라 `+0x5000` cross-family continuation metadata 및 `+0x6000..+0x8000` return call-stack과의 충돌을 fail-closed 처리한다. 신규 2개 테스트를 포함해 library 기준은 573개다. 다음 단계는 lift placeholder를 최종 table VA로 relocate하고 atomic acquire/release를 scoped toggle 앞뒤에 연결하는 것이다.
+
 ### 2026-08-22 — P2-14 register-resident lazy hot state
 
 - lazy flag snapshot과 validity를 memory state ABI에서 제거하고 module entry가 보존하는 `RSI/RDI` carrier에 상주시켰다. 일반 handler 사이에는 canonical 또는 lazy token memory write가 발생하지 않는다.

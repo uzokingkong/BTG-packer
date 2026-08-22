@@ -11,6 +11,75 @@ pub struct LiteralObject {
     pub references: Vec<u32>,
 }
 
+/// Shared production ABI for lifetime synchronization.  The table lives in
+/// the entry-family state stride so every VM family and OS thread addresses
+/// the same atomic words instead of accidentally using family-local locks.
+pub const LIFETIME_SYNC_TABLE_OFFSET: u64 = 0x4000;
+pub const LIFETIME_SYNC_ENTRY_SIZE: usize = 8;
+pub const LIFETIME_SYNC_CAPACITY: usize = 512;
+pub const LIFETIME_SYNC_TABLE_SIZE: usize = LIFETIME_SYNC_ENTRY_SIZE * LIFETIME_SYNC_CAPACITY;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifetimeSyncEntry {
+    pub object_rva: u32,
+    pub lock_va: u64,
+    pub refcount_va: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifetimeSyncTable {
+    pub base_va: u64,
+    pub entries: Vec<LifetimeSyncEntry>,
+}
+
+impl LifetimeSyncTable {
+    pub fn build(entry_state_va: u64, objects: &[LiteralObject]) -> anyhow::Result<Self> {
+        let mut rvas: Vec<_> = objects.iter().map(|object| object.rva).collect();
+        rvas.sort_unstable();
+        rvas.dedup();
+        if rvas.len() > LIFETIME_SYNC_CAPACITY {
+            anyhow::bail!(
+                "data-lifetime sync table capacity exceeded: {} > {}",
+                rvas.len(),
+                LIFETIME_SYNC_CAPACITY
+            );
+        }
+        let base_va = entry_state_va
+            .checked_add(LIFETIME_SYNC_TABLE_OFFSET)
+            .ok_or_else(|| anyhow::anyhow!("data-lifetime sync table VA overflow"))?;
+        let entries = rvas
+            .into_iter()
+            .enumerate()
+            .map(|(index, object_rva)| LifetimeSyncEntry {
+                object_rva,
+                lock_va: base_va + (index * LIFETIME_SYNC_ENTRY_SIZE) as u64,
+                refcount_va: base_va + (index * LIFETIME_SYNC_ENTRY_SIZE + 4) as u64,
+            })
+            .collect();
+        Ok(Self { base_va, entries })
+    }
+
+    pub fn validate_stride(&self, stride: usize) -> anyhow::Result<()> {
+        let start = LIFETIME_SYNC_TABLE_OFFSET as usize;
+        let end = start
+            .checked_add(LIFETIME_SYNC_TABLE_SIZE)
+            .ok_or_else(|| anyhow::anyhow!("data-lifetime sync table range overflow"))?;
+        let call_stack_start = stride
+            .checked_sub(crate::vm::interp::CALL_STACK_SIZE)
+            .ok_or_else(|| anyhow::anyhow!("VM family stride is smaller than call stack"))?;
+        if end > call_stack_start || end > 0x5000 {
+            anyhow::bail!("data-lifetime sync table overlaps cross-family/call-stack state");
+        }
+        if self.entries.iter().enumerate().any(|(index, entry)| {
+            entry.lock_va != self.base_va + (index * LIFETIME_SYNC_ENTRY_SIZE) as u64
+                || entry.refcount_va != entry.lock_va + 4
+        }) {
+            anyhow::bail!("data-lifetime sync table entry layout drift");
+        }
+        Ok(())
+    }
+}
+
 /// Builds a conservative reference graph for NUL-terminated literals in one
 /// read-only PE section. Only direct RIP-relative x64 references are accepted;
 /// objects with no statically proven reference are omitted. The returned
@@ -472,6 +541,43 @@ mod tests {
             section_object_bytes(std::slice::from_ref(&section), &object).unwrap(),
             before
         );
+    }
+
+    #[test]
+    fn shared_sync_table_is_deterministic_and_disjoint_from_call_stack() {
+        let objects = [
+            LiteralObject {
+                class: DataClass::Ascii,
+                rva: 0x3100,
+                len: 8,
+                references: vec![0x1100],
+            },
+            LiteralObject {
+                class: DataClass::Utf16,
+                rva: 0x3000,
+                len: 10,
+                references: vec![0x1200],
+            },
+        ];
+        let table = LifetimeSyncTable::build(0x1400_8000_0, &objects).unwrap();
+        table.validate_stride(0x8000).unwrap();
+        assert_eq!(table.entries[0].object_rva, 0x3000);
+        assert_eq!(table.entries[0].lock_va, 0x1400_8400_0);
+        assert_eq!(table.entries[0].refcount_va, 0x1400_8400_4);
+        assert_eq!(table.entries[1].lock_va, table.entries[0].lock_va + 8);
+    }
+
+    #[test]
+    fn shared_sync_table_rejects_capacity_overflow() {
+        let objects: Vec<_> = (0..=LIFETIME_SYNC_CAPACITY)
+            .map(|index| LiteralObject {
+                class: DataClass::Ascii,
+                rva: 0x3000 + index as u32 * 8,
+                len: 8,
+                references: vec![0x1000],
+            })
+            .collect();
+        assert!(LifetimeSyncTable::build(0x1400_0000_0, &objects).is_err());
     }
 
     #[test]

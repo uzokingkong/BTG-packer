@@ -20,6 +20,7 @@ pub(crate) struct MultiFamilyVmModule {
     pub native_bridge_ranges: Vec<(usize, usize)>,
     pub entry_byte_offset: usize,
     pub chunks: Vec<(usize, vm::chunk_crypto::BytecodeChunk)>,
+    pub lifetime_sync: crate::vm::data_lifetime::LifetimeSyncTable,
 }
 
 pub(crate) fn build_multi_family_prog_mod(
@@ -29,7 +30,11 @@ pub(crate) fn build_multi_family_prog_mod(
     code_va: u64,
     state_va: u64,
     enable_m7: bool,
+    lifetime_objects: &[crate::vm::data_lifetime::LiteralObject],
 ) -> anyhow::Result<MultiFamilyVmModule> {
+    let lifetime_sync =
+        crate::vm::data_lifetime::LifetimeSyncTable::build(state_va, lifetime_objects)?;
+    lifetime_sync.validate_stride(MULTI_FAMILY_STATE_STRIDE)?;
     let mut modules: Vec<_> = materialized.modules.iter().collect();
     modules.sort_by_key(|module| (module.family != entry_family, module.family as u8));
     let index_by_family: std::collections::HashMap<_, _> = modules
@@ -233,6 +238,7 @@ pub(crate) fn build_multi_family_prog_mod(
         native_bridge_ranges,
         entry_byte_offset,
         chunks,
+        lifetime_sync,
     })
 }
 

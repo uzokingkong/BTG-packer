@@ -391,6 +391,7 @@ pub(crate) fn place_boot_stub(
             0,
             0,
             ctx.m7,
+            &ctx.vm_data_lifetime_objects,
         )?)
     } else {
         None
@@ -1287,6 +1288,7 @@ pub(crate) fn place_boot_stub(
                 prva,
                 vm_prog_state_va,
                 ctx.m7,
+                &ctx.vm_data_lifetime_objects,
             )?)
         } else {
             None
@@ -1358,8 +1360,28 @@ pub(crate) fn place_boot_stub(
                     .fill(0);
                 btg.bytes[state_off + 0x5000..state_off + 0x5018].fill(0);
                 if index == 0 {
+                    let sync_start =
+                        state_off + crate::vm::data_lifetime::LIFETIME_SYNC_TABLE_OFFSET as usize;
+                    let sync_end = sync_start + crate::vm::data_lifetime::LIFETIME_SYNC_TABLE_SIZE;
+                    btg.bytes[sync_start..sync_end].fill(0);
+                    let expected_sync_va =
+                        vm_prog_state_va + crate::vm::data_lifetime::LIFETIME_SYNC_TABLE_OFFSET;
+                    if multi.lifetime_sync.base_va != expected_sync_va {
+                        anyhow::bail!(
+                            "P2-14 lifetime sync table VA drift: built=0x{:X} placed=0x{:X}",
+                            multi.lifetime_sync.base_va,
+                            expected_sync_va
+                        );
+                    }
                     btg.bytes[state_off + 0x5000..state_off + 0x5008]
                         .copy_from_slice(&(multi.entry_byte_offset as u64).to_le_bytes());
+                    if !multi.lifetime_sync.entries.is_empty() {
+                        println!(
+                            "[+] P2-14 shared lifetime sync: {} global lock/refcount entry(s) @0x{:X}",
+                            multi.lifetime_sync.entries.len(),
+                            multi.lifetime_sync.base_va,
+                        );
+                    }
                 }
                 let ptr = state_off + crate::vm::interp::STATE_PTR_CALL_STACK;
                 btg.bytes[ptr..ptr + 8].copy_from_slice(&call_stack_va.to_le_bytes());
