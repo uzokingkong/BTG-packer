@@ -196,6 +196,12 @@ pub enum RiscOp {
         width: u8,
     },
 
+    /// Acquire/release one entry in the production shared data-lifetime table.
+    /// `src1` is the deterministic table index. Native handlers preserve all
+    /// virtual registers and flags while performing the atomic protocol.
+    LifetimeAcquire,
+    LifetimeRelease,
+
     /// P0-4: 원자적 XCHG — `dst`(레지스터) ↔ `[src1]`(메모리) 교환.
     ///
     /// x86 `XCHG r, [mem]` 은 memory 피연산자에서 **암시적 LOCK** 이므로

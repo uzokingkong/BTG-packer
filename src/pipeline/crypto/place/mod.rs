@@ -66,6 +66,10 @@ pub(crate) fn place_boot_stub(
     // P3 (G1): 상용 프로그램 리프트의 ip_map (source-IP -> micro-op index) — the
     // VirtualBranch native handler uses it to resolve branch targets to bytecode
     // byte offsets. Populated in the lift below and passed to build_prog_vm_mod.
+    // Preserve the pre-lift candidate order/domain. Emitted acquire/release
+    // indices are derived from this set even if final all-reference proof later
+    // removes an object; unused sync entries are harmless and remain zero.
+    let lifetime_sync_candidates = ctx.vm_data_lifetime_objects.clone();
     let (
         vm_prog_bytecode,
         vm_oep_native_entry,
@@ -391,7 +395,7 @@ pub(crate) fn place_boot_stub(
             0,
             0,
             ctx.m7,
-            &ctx.vm_data_lifetime_objects,
+            &lifetime_sync_candidates,
         )?)
     } else {
         None
@@ -1288,7 +1292,7 @@ pub(crate) fn place_boot_stub(
                 prva,
                 vm_prog_state_va,
                 ctx.m7,
-                &ctx.vm_data_lifetime_objects,
+                &lifetime_sync_candidates,
             )?)
         } else {
             None
@@ -1359,6 +1363,8 @@ pub(crate) fn place_boot_stub(
                     ..state_off + crate::vm::commercial_build::COMMERCIAL_STATE_SIZE as usize]
                     .fill(0);
                 btg.bytes[state_off + 0x5000..state_off + 0x5018].fill(0);
+                btg.bytes[state_off + 0x5010..state_off + 0x5018]
+                    .copy_from_slice(&multi.lifetime_sync.base_va.to_le_bytes());
                 if index == 0 {
                     let sync_start =
                         state_off + crate::vm::data_lifetime::LIFETIME_SYNC_TABLE_OFFSET as usize;

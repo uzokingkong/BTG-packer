@@ -72,6 +72,17 @@ fn emit_lifetime_toggle(
         .push(MicroInstr::new(RiscOp::SetFlag).with_src1(flags));
 }
 
+fn emit_lifetime_sync(lifter: &mut RiscLifter, index: usize, acquire: bool) {
+    lifter.desynth.instrs.push(
+        MicroInstr::new(if acquire {
+            RiscOp::LifetimeAcquire
+        } else {
+            RiscOp::LifetimeRelease
+        })
+        .with_src1(MicroOperand::Imm64(index as u64)),
+    );
+}
+
 /// 블록의 모든 명령이 RISC lift 되고, 생성된 RISC op 가 전부 **폴리 인코딩 가능**한지.
 ///
 /// RISC 리프터는 Float 스칼라(FloatAdd/FloatToFloat/...)를 lift 할 수 있지만, 폴리
@@ -567,6 +578,15 @@ pub fn lift_program_cfg_commercial(
         })
         .cloned()
         .collect();
+    let lifetime_sync_indices: HashMap<u32, usize> = {
+        let mut rvas: Vec<_> = lifetime_objects.iter().map(|object| object.rva).collect();
+        rvas.sort_unstable();
+        rvas.dedup();
+        rvas.into_iter()
+            .enumerate()
+            .map(|(index, rva)| (rva, index))
+            .collect()
+    };
     let mut applied_lifetime_references: HashMap<u32, HashSet<u32>> = HashMap::new();
     // P3 (G1): CfgExtractor는 블록을 주소 순으로 나열하므로 OEP가 바이트코드[0]이
     // 아니다. 레거시 `lift_cfg_switch(.., Some(entry_va))`의 entry-jump와 동일하게,
@@ -631,12 +651,14 @@ pub fn lift_program_cfg_commercial(
                     None
                 };
             if let Some(object) = direct_scope {
+                emit_lifetime_sync(&mut lifter, lifetime_sync_indices[&object.rva], true);
                 emit_lifetime_toggle(&mut lifter, &object, image_base, lifetime_key);
                 if lifter.lift_instruction(i).is_err() {
                     ok = false;
                     break;
                 }
                 emit_lifetime_toggle(&mut lifter, &object, image_base, lifetime_key);
+                emit_lifetime_sync(&mut lifter, lifetime_sync_indices[&object.rva], false);
                 applied_lifetime_references
                     .entry(object.rva)
                     .or_default()
@@ -652,6 +674,7 @@ pub fn lift_program_cfg_commercial(
                 scoped.sort_by_key(|(object, _)| object.rva);
                 scoped.dedup_by_key(|(object, _)| object.rva);
                 for (object, _) in &scoped {
+                    emit_lifetime_sync(&mut lifter, lifetime_sync_indices[&object.rva], true);
                     emit_lifetime_toggle(&mut lifter, object, image_base, lifetime_key);
                 }
                 if lifter.lift_instruction(i).is_err() {
@@ -660,6 +683,7 @@ pub fn lift_program_cfg_commercial(
                 }
                 for (object, reference) in &scoped {
                     emit_lifetime_toggle(&mut lifter, object, image_base, lifetime_key);
+                    emit_lifetime_sync(&mut lifter, lifetime_sync_indices[&object.rva], false);
                     applied_lifetime_references
                         .entry(object.rva)
                         .or_default()
@@ -1086,6 +1110,18 @@ pub fn lift_program_cfg_commercial(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifetime_scope_emits_balanced_global_sync_ops() {
+        let mut lifter = RiscLifter::new();
+        emit_lifetime_sync(&mut lifter, 9, true);
+        emit_lifetime_sync(&mut lifter, 9, false);
+        assert_eq!(lifter.desynth.instrs.len(), 2);
+        assert_eq!(lifter.desynth.instrs[0].op, RiscOp::LifetimeAcquire);
+        assert_eq!(lifter.desynth.instrs[1].op, RiscOp::LifetimeRelease);
+        assert_eq!(lifter.desynth.instrs[0].src1, Some(MicroOperand::Imm64(9)));
+        assert_eq!(lifter.desynth.instrs[1].src1, Some(MicroOperand::Imm64(9)));
+    }
 
     /// lift_program_cfg_commercial과 lift_program_cfg가 같은 블록 셋을 커버하는지
     /// (RISC lift 가능한 소형 합성 프로그램) 검증. 또한 RISC-unliftable 블록이

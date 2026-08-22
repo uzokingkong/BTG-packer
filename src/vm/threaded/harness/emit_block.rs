@@ -965,7 +965,9 @@ RiscOp::Halt => {
             RiscOp::BitTest { .. } => {}
             RiscOp::PackedMovMaskBytes | RiscOp::PackedMovMaskPs | RiscOp::PackedInsertWord => {}
             RiscOp::CpuId | RiscOp::XGetBv => {}
-            RiscOp::ReadSegmentBase { .. } => {}
+            RiscOp::ReadSegmentBase { .. }
+            | RiscOp::LifetimeAcquire
+            | RiscOp::LifetimeRelease => {}
         }
         Ok(())
     }

@@ -4939,6 +4939,81 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         }
     }
 
+    // ── P2-14: shared data-lifetime scope synchronization. ──
+    // Every family state stores the same entry-family sync-table pointer at
+    // +0x5010. src1 is a deterministic 8-byte entry index. These handlers do
+    // not publish host flags into virtual FLAGS and do not touch virtual GPRs.
+    let h_lifetime_acquire = b.len();
+    {
+        b.call(sub_dec_ops);
+        movzx8_m(&mut b, Register::EAX, DEC_SRC1);
+        mov_m(&mut b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::RAX).unwrap());
+        b.push(
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::R10,
+                MemoryOperand::with_base_displ_size(Register::RDX, 0x5010, 8),
+            )
+            .unwrap(),
+        );
+        b.push(
+            Instruction::with2(
+                Code::Lea_r64_m,
+                Register::R10,
+                MemoryOperand::with_base_index_scale(Register::R10, Register::RCX, 8),
+            )
+            .unwrap(),
+        );
+        let spin = b.len();
+        b.push(Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::EAX).unwrap());
+        b.push(Instruction::with2(Code::Mov_r32_imm32, Register::R11D, 1).unwrap());
+        let mut cas = Instruction::with2(
+            Code::Cmpxchg_rm32_r32,
+            MemoryOperand::with_base(Register::R10),
+            Register::R11D,
+        )
+        .unwrap();
+        cas.set_has_lock_prefix(true);
+        b.push(cas);
+        b.br(Code::Jne_rel32_64, spin);
+        b.jmp(dispatch);
+    }
+    let h_lifetime_release = b.len();
+    {
+        b.call(sub_dec_ops);
+        movzx8_m(&mut b, Register::EAX, DEC_SRC1);
+        mov_m(&mut b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::RAX).unwrap());
+        b.push(
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::R10,
+                MemoryOperand::with_base_displ_size(Register::RDX, 0x5010, 8),
+            )
+            .unwrap(),
+        );
+        b.push(
+            Instruction::with2(
+                Code::Lea_r64_m,
+                Register::R10,
+                MemoryOperand::with_base_index_scale(Register::R10, Register::RCX, 8),
+            )
+            .unwrap(),
+        );
+        b.push(
+            Instruction::with2(
+                Code::Mov_rm32_imm32,
+                MemoryOperand::with_base(Register::R10),
+                0,
+            )
+            .unwrap(),
+        );
+        b.jmp(dispatch);
+    }
+
     // ── P3: COMPARE_EXCHANGE{width} — atomic lock cmpxchg (Once/futex CAS). ──
     // Semantics == eval_state CompareExchange: addr=src1, newv=src2, acc=regs[0].
     //   if [addr]&mask == acc: mem[addr]=newv&mask, ZF=1, regs[0] unchanged.
@@ -5348,6 +5423,8 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         h.insert(RiscOp::CompareExchange { width: 4 }, h_cmpxchg[&4]);
         h.insert(RiscOp::CompareExchange { width: 2 }, h_cmpxchg[&2]);
         h.insert(RiscOp::CompareExchange { width: 1 }, h_cmpxchg[&1]);
+        h.insert(RiscOp::LifetimeAcquire, h_lifetime_acquire);
+        h.insert(RiscOp::LifetimeRelease, h_lifetime_release);
         for w in [1u8, 2, 4, 8] {
             h.insert(RiscOp::AtomicExchange { width: w }, h_xchg[&w]);
             h.insert(RiscOp::AtomicAdd { width: w }, h_xadd[&w]);

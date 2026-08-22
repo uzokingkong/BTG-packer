@@ -608,6 +608,7 @@ impl RiscProgram {
                         st.regs[0] = old;
                     }
                 }
+                RiscOp::LifetimeAcquire | RiscOp::LifetimeRelease => {}
                 RiscOp::AtomicExchange { width } => {
                     // P0-4: 원자적 XCHG — old = [src1]; [src1] = dst; dst = old.
                     // 플래그 불변 (x86 XCHG 는 RFLAGS 무변경).
@@ -1317,6 +1318,7 @@ impl RiscProgram {
                 }
                 ExecResult::Next
             }
+            RiscOp::LifetimeAcquire | RiscOp::LifetimeRelease => ExecResult::Next,
             RiscOp::AtomicExchange { width } => {
                 // P0-4: 원자적 XCHG — old = [src1]; [src1] = dst; dst = old. 플래그 불변.
                 let addr = get_val(ins.src1, st, flags.raw);

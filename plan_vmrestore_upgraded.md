@@ -4,6 +4,12 @@
 
 ## 진행 기록
 
+### 2026-08-22 — shared lifetime atomic acquire/release production 연결
+
+- canonical ISA에 `LifetimeAcquire/LifetimeRelease`를 추가하고 strict direct/call scope의 decrypt toggle 전과 re-encrypt 후에 균형 삽입했다. operand는 pre-lift candidate RVA 정렬에서 얻은 결정적 global-table index다.
+- 모든 family state `+0x5010`에 entry-family sync-table의 동일 절대 VA를 relocation한다. native acquire handler는 `lock cmpxchg` spin으로 32-bit lock word를 획득하고 release handler가 clear하며, 두 handler 모두 virtual GPR/FLAGS를 변경하지 않는다. interpreter/reference는 경쟁자가 없는 단일-thread 의미에서 no-op이다.
+- 46개 lifetime 객체가 활성인 `corpus/o1.exe` 최대 조합에서 pack/구조검증/실행동치(exit 0, stdout 1,460B, stderr 0B)를 통과했다. library 기준은 신규 balanced-scope 검사를 포함해 574개다. 4-byte refcount는 owner-aware 재진입과 중첩 scope 확장을 위해 예약 상태다.
+
 ### 2026-08-22 — shared lifetime global sync-table ABI 배치
 
 - entry-family state `+0x4000..+0x5000`에 최대 512개, 항목당 8바이트인 `(atomic lock u32, refcount u32)` ABI를 추가했다. 객체 RVA를 정렬·중복 제거해 build마다 결정적인 index와 절대 VA를 만든다.

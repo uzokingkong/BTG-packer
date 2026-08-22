@@ -869,6 +869,9 @@ impl PolymorphicInterpreter {
                         self.regs[0] = old;
                     }
                 }
+                // The single-threaded semantic interpreter has no competing
+                // lifetime scopes; production atomicity lives in native handlers.
+                RiscOp::LifetimeAcquire | RiscOp::LifetimeRelease => {}
                 RiscOp::AtomicExchange { width } => {
                     // P0-4: old = [addr]; [addr] = dst; dst = old. 플래그 불변.
                     let addr = get_operand_val(

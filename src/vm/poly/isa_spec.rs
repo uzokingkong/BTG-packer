@@ -319,6 +319,8 @@ impl VirtualIsaSpec {
             ops.push(RiscOp::AtomicExchange { width: w });
             ops.push(RiscOp::AtomicAdd { width: w });
         }
+        ops.push(RiscOp::LifetimeAcquire);
+        ops.push(RiscOp::LifetimeRelease);
         // P0-1: x86 정확 플래그 전용 산술 op (ADD/SUB borrow-CF, INC/DEC CF 보존, NOT 무변경).
         for w in [1u8, 2, 4, 8] {
             ops.push(RiscOp::Add { width: w });

@@ -20,10 +20,10 @@ partition한 뒤 독립 bytecode/module/state/table과 native self-decoding runt
 | Bytecode 보호 | 구현됨 | rolling-key stream, family별 ISA, M7 instruction-aligned chunk 암호화 |
 | Handler table | 구현됨 | per-opcode key, MBA key derivation, family별 integrity traversal |
 | Distributed integrity | 구현됨 | family별 code/table/bytecode 12개 BTGI descriptor와 boot verifier |
-| Data lifetime | 부분 구현 | strict scoped toggle과 entry-family global lock/refcount table production 배치 |
+| Data lifetime | 부분 구현 | strict scoped toggle과 global atomic acquire/release production 연결 |
 | P2-13 grammar | 완료 | family operand/compact immediate/control token 및 독립 super-op grammar production 연결 |
 | P2-14 state/lazy flags | 부분 완료 | split domains와 RSI/RDI hot lazy state, branch/native/HALT materialization 연결 |
-| Release gate | 부분 완료 | library 573/573 및 P2-13 20-seed grammar gate 통과; 전체 pack gate 재실행 필요 |
+| Release gate | 부분 완료 | library 574/574 및 P2-13 20-seed grammar gate 통과; 전체 pack gate 재실행 필요 |
 
 완료/부분/계획의 상세 근거는 [현재 구현 상태](docs/current-status.md)를 기준으로
 합니다. 오래된 journal·audit 문서의 상태 문구는 당시 시점의 기록이며 현재 상태를
@@ -88,7 +88,7 @@ target\release\btg-packer.exe `
 ```
 
 `--verify-output`은 원본과 보호본의 exit code/stdout/stderr를 byte 단위로
-비교합니다. 현재 기록된 기준은 library 573/573, 대표 최대 조합 exit 0,
+비교합니다. 현재 기록된 기준은 library 574/574, 대표 최대 조합 exit 0,
 stdout 1,460B, stderr 0B입니다. 검증 범위와 재현 명령은
 [검증 기준](docs/verification.md)을 참고하세요.
 
