@@ -593,6 +593,25 @@ pub(crate) fn place_boot_stub(
         };
     cursor = (cursor + 7) & !7; // align 8
 
+    // Reserve a stable in-image ABI for 4 families × code/table/bytecode.
+    // The exact count is written after final M7 bytes have been sealed.
+    const MAX_VM_INTEGRITY_DESCRIPTORS: usize = 12;
+    let vm_integrity_table_off = cursor;
+    let vm_integrity_table_capacity = if integrity_effective && vm_multi_family_active {
+        vm::distributed_integrity::SERIALIZED_TABLE_HEADER_SIZE
+            + MAX_VM_INTEGRITY_DESCRIPTORS * vm::distributed_integrity::SERIALIZED_DESCRIPTOR_SIZE
+    } else {
+        0
+    };
+    cursor += vm_integrity_table_capacity;
+    cursor = (cursor + 7) & !7;
+    ctx.vm_integrity_table_rva = if vm_integrity_table_capacity > 0 {
+        dispatcher_rva + vm_integrity_table_off as u32
+    } else {
+        0
+    };
+    ctx.vm_integrity_table_len = 0;
+
     // ── P4 (전체 SEH 가상화): Program VM 모듈 위치를 ctx에 기록 — build.rs가
     // .pdata 브리지 UNWIND_INFO로 이 영역을 커버해 OS unwinder가 VM 내부 프레임을
     // (더미 핸들러 대신) 결정적으로 걷게 한다. ---------------------------------
@@ -954,6 +973,7 @@ pub(crate) fn place_boot_stub(
         .max(vm_off + vm_total)
         .max(vm_prga_off + vm_prga_total)
         .max(vm_prog_off + vm_prog_total + vm_prog_call_stack)
+        .max(vm_integrity_table_off + vm_integrity_table_capacity)
         .max(runs_off + 8 + total_num_runs * 16)
         .max(text_runs_off + text_runs_block)
         .max(boot_data_end);
@@ -1437,9 +1457,31 @@ pub(crate) fn place_boot_stub(
                 dispatcher_va - image_base,
                 ctx.poly_vm_seed,
             )?;
+            let serialized =
+                vm::distributed_integrity::serialize_table(&ctx.vm_integrity_descriptors)?;
+            if serialized.len() > vm_integrity_table_capacity {
+                return Err(anyhow::anyhow!(
+                    "distributed integrity table {}B exceeds reserved {}B",
+                    serialized.len(),
+                    vm_integrity_table_capacity
+                ));
+            }
+            let table_end = vm_integrity_table_off + serialized.len();
+            if table_end > btg.bytes.len() {
+                return Err(anyhow::anyhow!(
+                    "distributed integrity table write OOB: {}..{} > {}",
+                    vm_integrity_table_off,
+                    table_end,
+                    btg.bytes.len()
+                ));
+            }
+            btg.bytes[vm_integrity_table_off..table_end].copy_from_slice(&serialized);
+            ctx.vm_integrity_table_len = serialized.len() as u32;
             println!(
-                "[+] Distributed integrity: sealed {} family-scoped code/table/bytecode descriptor(s)",
-                ctx.vm_integrity_descriptors.len()
+                "[+] Distributed integrity: sealed {} family-scoped descriptor(s), runtime table RVA=0x{:X} size={}B",
+                ctx.vm_integrity_descriptors.len(),
+                ctx.vm_integrity_table_rva,
+                ctx.vm_integrity_table_len
             );
         }
     }

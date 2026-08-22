@@ -39,6 +39,12 @@
 - `corpus/o1.exe` seed 31010 최대 조합에서 4 family × 3 region = 12 descriptor가 생성됐고 실행 차등검증이 통과했다. 전체 library는 신규 범위 회귀 테스트를 포함해 560/560 통과했다.
 - 이 단계는 production region/tag materialization까지다. 다음은 12 descriptor serialization과 boot/runtime consumer를 연결해 변조 시 실제 fail-closed/poison 경로를 실행하고 tamper corpus로 닫는다.
 
+### 2026-08-22 — Distributed integrity runtime-table serialization
+
+- 고정 BTGI ABI를 추가했다. 8B header(`magic`,`count`) 뒤에 40B descriptor entries가 이어지며 각 entry는 kind/policy, RVA, length, keyed tag, domain key를 담는다.
+- production placer가 4 family × 3 region의 최대 12-entry 공간을 mutable Program-VM state 뒤에 별도로 예약한다. 최종 M7 runtime 표현을 seal한 뒤 488B 테이블을 실제 `.textb`에 기록하고 RVA/size를 pipeline context에 보존한다. 예약 초과와 table write OOB는 fail-closed한다.
+- `corpus/o1.exe` seed 31010 최대 조합에서 BTGI table RVA `0x293000`, size 488B, count 12를 확인했고 실행 차등검증이 통과했다. 다음은 boot/runtime verifier가 이 ABI를 순회하며 tag를 재계산하고 tamper를 차단하도록 연결하는 작업이다.
+
 ### 2026-08-22 — P2-10 실제 multi-family module/state/table 및 call/return routing 완료
 
 - production placer가 entry family를 첫 module로 정렬하고 4개 family의 code, handler/operand/condition/branch table, bytecode를 각각 독립 생성한다. mutable state, virtual stack, cross-family control slots, return-IP stack은 family마다 `0x8000` stride로 격리한다.

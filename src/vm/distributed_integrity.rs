@@ -30,6 +30,10 @@ pub struct IntegrityDescriptor {
     domain_key: u64,
 }
 
+pub const SERIALIZED_DESCRIPTOR_SIZE: usize = 40;
+pub const SERIALIZED_TABLE_HEADER_SIZE: usize = 8;
+pub const SERIALIZED_TABLE_MAGIC: u32 = u32::from_le_bytes(*b"BTGI");
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntegrityOutcome {
     Valid,
@@ -74,6 +78,29 @@ impl IntegrityDescriptor {
             IntegrityFailurePolicy::Telemetry => IntegrityOutcome::Telemetry(self.kind),
         }
     }
+
+    pub(crate) fn domain_key(&self) -> u64 {
+        self.domain_key
+    }
+}
+
+pub fn serialize_table(descriptors: &[IntegrityDescriptor]) -> anyhow::Result<Vec<u8>> {
+    let count = u32::try_from(descriptors.len())?;
+    let mut out = Vec::with_capacity(
+        SERIALIZED_TABLE_HEADER_SIZE + descriptors.len() * SERIALIZED_DESCRIPTOR_SIZE,
+    );
+    out.extend_from_slice(&SERIALIZED_TABLE_MAGIC.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    for descriptor in descriptors {
+        out.push(descriptor.kind as u8);
+        out.push(descriptor.policy as u8);
+        out.extend_from_slice(&[0u8; 6]);
+        out.extend_from_slice(&descriptor.offset.to_le_bytes());
+        out.extend_from_slice(&descriptor.len.to_le_bytes());
+        out.extend_from_slice(&descriptor.tag.to_le_bytes());
+        out.extend_from_slice(&descriptor.domain_key().to_le_bytes());
+    }
+    Ok(out)
 }
 
 /// Seal non-overlapping region slices from the exact image representation that
@@ -222,5 +249,32 @@ mod tests {
         assert!(
             seal_region_set(&image, &[(ProtectedRegionKind::VmBytecode, 80, 32)], 0, 9,).is_err()
         );
+    }
+
+    #[test]
+    fn serialized_table_has_stable_runtime_abi() {
+        let descriptors = seal_region_set(
+            &[0xA5; 32],
+            &[(ProtectedRegionKind::HandlerCode, 0, 32)],
+            0x9000,
+            7,
+        )
+        .unwrap();
+        let table = serialize_table(&descriptors).unwrap();
+        assert_eq!(
+            table.len(),
+            SERIALIZED_TABLE_HEADER_SIZE + SERIALIZED_DESCRIPTOR_SIZE
+        );
+        assert_eq!(
+            u32::from_le_bytes(table[0..4].try_into().unwrap()),
+            SERIALIZED_TABLE_MAGIC
+        );
+        assert_eq!(u32::from_le_bytes(table[4..8].try_into().unwrap()), 1);
+        assert_eq!(table[8], ProtectedRegionKind::HandlerCode as u8);
+        assert_eq!(
+            u64::from_le_bytes(table[16..24].try_into().unwrap()),
+            0x9000
+        );
+        assert_eq!(u64::from_le_bytes(table[24..32].try_into().unwrap()), 32);
     }
 }

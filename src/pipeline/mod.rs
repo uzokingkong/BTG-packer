@@ -174,6 +174,8 @@ pub struct PipelineContext {
     /// Family-scoped integrity descriptors sealed over the exact immutable
     /// runtime representation (including the persistent M7 bytecode layer).
     pub vm_integrity_descriptors: Vec<crate::vm::distributed_integrity::IntegrityDescriptor>,
+    pub vm_integrity_table_rva: u32,
+    pub vm_integrity_table_len: u32,
     /// P2-5 conservative read-only literal/reference graph. Only objects with
     /// statically proven RIP-relative x64 use sites are recorded here.
     pub vm_data_lifetime_objects: Vec<crate::vm::data_lifetime::LiteralObject>,
@@ -274,6 +276,8 @@ impl PipelineContext {
             vm_prog_bytecode_len: 0,
             vm_prog_runtime_cipher_hash: None,
             vm_integrity_descriptors: Vec::new(),
+            vm_integrity_table_rva: 0,
+            vm_integrity_table_len: 0,
             vm_data_lifetime_objects: Vec::new(),
             block_ring: false,
             custom_cipher: false,
