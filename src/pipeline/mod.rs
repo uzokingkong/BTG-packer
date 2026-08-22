@@ -171,6 +171,9 @@ pub struct PipelineContext {
     pub vm_prog_bytecode_rva: u32,
     pub vm_prog_bytecode_len: u32,
     pub vm_prog_runtime_cipher_hash: Option<String>,
+    /// P2-5 conservative read-only literal/reference graph. Only objects with
+    /// statically proven RIP-relative x64 use sites are recorded here.
+    pub vm_data_lifetime_objects: Vec<crate::vm::data_lifetime::LiteralObject>,
     /// v13.4d diag: --block-ring — 표준 디스패처에 마지막 32개 logical block id
     /// ring-buffer 를 주입한다 (재암호화 디스패처는 미지원).
     pub block_ring: bool,
@@ -267,6 +270,7 @@ impl PipelineContext {
             vm_prog_bytecode_rva: 0,
             vm_prog_bytecode_len: 0,
             vm_prog_runtime_cipher_hash: None,
+            vm_data_lifetime_objects: Vec::new(),
             block_ring: false,
             custom_cipher: false,
             crypto_mode: crate::crypto::CryptoMode::C1,

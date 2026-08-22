@@ -1,6 +1,92 @@
 //! Object-granular encrypted data with decrypt/use/re-encrypt lifetime control.
 
 use crate::vm::seed_lifecycle::derive_seed;
+use iced_x86::{Decoder, DecoderOptions, Instruction};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiteralObject {
+    pub class: DataClass,
+    pub rva: u32,
+    pub len: u32,
+    pub references: Vec<u32>,
+}
+
+/// Builds a conservative reference graph for NUL-terminated literals in one
+/// read-only PE section. Only direct RIP-relative x64 references are accepted;
+/// objects with no statically proven reference are omitted. The returned
+/// instruction RVAs let the production transformer prove that every selected
+/// object use has a concrete rewrite site instead of encrypting data blindly.
+pub fn analyze_referenced_literals(
+    text: &[u8],
+    text_rva: u32,
+    data: &[u8],
+    data_rva: u32,
+    image_base: u64,
+) -> Vec<LiteralObject> {
+    let mut candidates = scan_literal_objects(data, data_rva);
+    if candidates.is_empty() {
+        return candidates;
+    }
+
+    let ip = image_base.saturating_add(text_rva as u64);
+    let mut decoder = Decoder::with_ip(64, text, ip, DecoderOptions::NONE);
+    let mut instruction = Instruction::default();
+    while decoder.can_decode() {
+        decoder.decode_out(&mut instruction);
+        if !instruction.is_ip_rel_memory_operand() {
+            continue;
+        }
+        let target = instruction.ip_rel_memory_address();
+        let Some(target_rva) = target
+            .checked_sub(image_base)
+            .and_then(|rva| u32::try_from(rva).ok())
+        else {
+            continue;
+        };
+        let Some(reference_rva) = instruction
+            .ip()
+            .checked_sub(image_base)
+            .and_then(|rva| u32::try_from(rva).ok())
+        else {
+            continue;
+        };
+        if let Some(object) = candidates.iter_mut().find(|object| {
+            target_rva >= object.rva && target_rva < object.rva.saturating_add(object.len)
+        }) {
+            object.references.push(reference_rva);
+        }
+    }
+    candidates.retain(|object| !object.references.is_empty());
+    for object in &mut candidates {
+        object.references.sort_unstable();
+        object.references.dedup();
+    }
+    candidates
+}
+
+fn scan_literal_objects(data: &[u8], data_rva: u32) -> Vec<LiteralObject> {
+    let mut objects = Vec::new();
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let start = offset;
+        while offset < data.len() && data[offset] != 0 {
+            offset += 1;
+        }
+        if offset < data.len() && offset > start {
+            let bytes = &data[start..offset];
+            if let Some(class) = classify_literal(bytes) {
+                objects.push(LiteralObject {
+                    class,
+                    rva: data_rva.saturating_add(start as u32),
+                    len: (bytes.len() + 1) as u32,
+                    references: Vec::new(),
+                });
+            }
+        }
+        offset = offset.saturating_add(1);
+    }
+    objects
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataClass {
@@ -102,6 +188,9 @@ pub fn classify_literal(bytes: &[u8]) -> Option<DataClass> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced_x86::{
+        BlockEncoder, BlockEncoderOptions, Code, InstructionBlock, MemoryOperand, Register,
+    };
     #[test]
     fn secrets_are_absent_at_rest_and_scope_reencrypts() {
         let secret = b"BTG-designated-secret-value";
@@ -123,5 +212,32 @@ mod tests {
             Some(DataClass::Utf8)
         );
         assert_eq!(classify_literal(b"w\0i\0d\0e\0"), Some(DataClass::Utf16));
+    }
+
+    #[test]
+    fn reference_graph_keeps_only_directly_referenced_literals() {
+        let image_base = 0x1400_0000_0u64;
+        let text_rva = 0x1000u32;
+        let data_rva = 0x3000u32;
+        let mut lea = Instruction::with2(
+            Code::Lea_r64_m,
+            Register::RCX,
+            MemoryOperand::with_base_displ(Register::RIP, (image_base + data_rva as u64) as i64),
+        )
+        .unwrap();
+        lea.set_ip(image_base + text_rva as u64);
+        let encoded = BlockEncoder::encode(
+            64,
+            InstructionBlock::new(&[lea], image_base + text_rva as u64),
+            BlockEncoderOptions::NONE,
+        )
+        .unwrap()
+        .code_buffer;
+        let data = b"tracked-secret\0unreferenced-secret\0";
+        let objects = analyze_referenced_literals(&encoded, text_rva, data, data_rva, image_base);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].rva, data_rva);
+        assert_eq!(objects[0].len, 15);
+        assert_eq!(objects[0].references, vec![text_rva]);
     }
 }

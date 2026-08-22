@@ -161,6 +161,40 @@ pub(crate) fn gather_runs(
     vm_oep_effective: bool,
 ) -> Vec<StringRun> {
     let image_base = ctx.target_info.image_base;
+    if vm_oep_effective {
+        let cookie_rva = locate_security_cookie(ctx, &ctx.patched_sections);
+        let protected = collect_protected_rva_ranges(ctx, &ctx.patched_sections, cookie_rva);
+        let mut objects = Vec::new();
+        for section in &ctx.patched_sections {
+            let name = section.name.to_ascii_lowercase();
+            if name != ".rdata" && name != ".rodata" {
+                continue;
+            }
+            objects.extend(crate::vm::data_lifetime::analyze_referenced_literals(
+                &ctx.target_info.text_bytes,
+                ctx.target_info.text_rva,
+                &section.bytes,
+                section.virtual_address,
+                image_base,
+            ));
+        }
+        objects.retain(|object| {
+            let end = object.rva.saturating_add(object.len);
+            !protected
+                .iter()
+                .any(|&(start, protected_end)| object.rva < protected_end && end > start)
+        });
+        objects.sort_by_key(|object| object.rva);
+        objects.dedup_by_key(|object| object.rva);
+        let references: usize = objects.iter().map(|object| object.references.len()).sum();
+        println!(
+            "[+] P2-5 data-lifetime graph: {} referenced literal object(s), {} proven RIP-relative use site(s)",
+            objects.len(), references
+        );
+        ctx.vm_data_lifetime_objects = objects;
+    } else {
+        ctx.vm_data_lifetime_objects.clear();
+    }
     let mut runs = if no_crypto || vm_oep_effective {
         // C-1 (--vm-oep): --no-crypto와 동일하게 부트-복호화 런을 비운다.
         Vec::new()
