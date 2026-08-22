@@ -4,6 +4,12 @@
 
 ## 진행 기록
 
+### 2026-08-22 — P2-14 register-resident lazy hot state
+
+- lazy flag snapshot과 validity를 memory state ABI에서 제거하고 module entry가 보존하는 `RSI/RDI` carrier에 상주시켰다. 일반 handler 사이에는 canonical 또는 lazy token memory write가 발생하지 않는다.
+- 연속 producer는 `RDI`를 검사해 `CMOVNE`로 `RSI` snapshot을 계승하며, canonical writer는 공통 store helper에서 `RDI`를 지운다. condition/native/cross-family/HALT 경계만 snapshot을 canonical flags에 materialize한다.
+- super-op 복제, forward/reverse branch, seeded layout, cross-family call/resume, Win64 FP bridge를 통과했다. shared lifetime은 family-local lock으로는 thread/cross-family race를 해결하지 못하므로 전역 atomic lock/refcount table ABI를 먼저 설계·배치하는 다음 단계로 유지한다.
+
 ### 2026-08-22 — P2-14 transient spill state domain 분리
 
 - production temp 8개를 GPR bank에서 제거하고 `+0x800` 독립 spill window 안에서 family seed별로 순열한다. persistent vreg bank와 transient handler scratch가 같은 permutation domain을 공유하지 않게 했다.
@@ -14,7 +20,7 @@
 
 - 일반 산술/논리 flag producer는 canonical flags를 매번 쓰지 않고 전용 snapshot slot과 1-byte validity token을 갱신한다. 연속 producer는 branch-free `CMOVNE` 선택으로 최신 token의 비상태 비트를 계승해 super-op handler 복제 규칙도 유지한다.
 - condition 평가와 VM→native/cross-family bridge, HALT는 token이 유효할 때만 canonical flags를 materialize한다. specialized producer가 canonical flags를 직접 쓰면 공통 store helper가 오래된 token을 즉시 무효화하므로 이전 snapshot이 새 결과를 덮어쓰지 않는다.
-- validity token은 packed decode qword의 사용하지 않는 상위 절반에 고정했으며 validator가 이 ABI와 state/XMM 범위를 검사한다. forward/reverse branch, super-op rewritten branch, seeded layout, Win64 FP native bridge를 포함한 library 570/570을 통과했다. P2-14의 다음 범위는 register-resident/stack-window state domain 확대와 shared lifetime 동시성이다.
+- 이 단계에서는 validity token을 packed decode qword의 예약 상위 절반에 두었으나 후속 register-hot-state 단계에서 snapshot/token memory ABI 자체를 제거했다. 당시 forward/reverse branch, super-op rewritten branch, seeded layout, Win64 FP native bridge를 포함한 library 570/570을 통과했다.
 
 ### 2026-08-22 — P2-14 production split-state ABI 1단계
 

@@ -1014,12 +1014,10 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
     }
 
     fn emit_materialize_lazy_flags(b: &mut CodeBuilder) {
-        movzx8_m(b, Register::EAX, LAZY_VALID_OFF);
-        b.push(Instruction::with2(Code::Test_rm32_r32, Register::EAX, Register::EAX).unwrap());
+        b.push(Instruction::with2(Code::Test_rm64_r64, Register::RDI, Register::RDI).unwrap());
         let clean_edge = b.br(Code::Je_rel32_64, usize::MAX);
-        mov_m(b, Register::RAX, LAZY_FLAGS_OFF);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RSI).unwrap());
         store_m(b, FLAGS_OFF, Register::RAX);
-        b.push(Instruction::with2(Code::Mov_rm8_imm8, m8(LAZY_VALID_OFF), 0).unwrap());
         let done = b.len();
         for (branch, target) in &mut b.branches {
             if *branch == clean_edge {
@@ -1035,16 +1033,14 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
         b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, FLAG_MASK as u32).unwrap());
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(FLAGS_OFF)).unwrap());
-        b.push(Instruction::with2(Code::Cmp_rm8_imm8, m8(LAZY_VALID_OFF), 0).unwrap());
-        b.push(
-            Instruction::with2(Code::Cmovne_r64_rm64, Register::RCX, m(LAZY_FLAGS_OFF)).unwrap(),
-        );
+        b.push(Instruction::with2(Code::Test_rm64_r64, Register::RDI, Register::RDI).unwrap());
+        b.push(Instruction::with2(Code::Cmovne_r64_rm64, Register::RCX, Register::RSI).unwrap());
         b.push(
             Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!FLAG_MASK) as i32).unwrap(),
         );
         b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap());
-        store_m(b, LAZY_FLAGS_OFF, Register::RAX);
-        b.push(Instruction::with2(Code::Mov_rm8_imm8, m8(LAZY_VALID_OFF), 1).unwrap());
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSI, Register::RAX).unwrap());
+        b.push(Instruction::with2(Code::Mov_r32_imm32, Register::EDI, 1).unwrap());
     }
 
     // P2 (G3): INC/DEC 플래그 저장 — x86 INC/DEC는 **CF를 보존**한다 (eval_state의
@@ -1156,6 +1152,9 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         movi(&mut b, Register::R14, init_key);
         movi(&mut b, Register::R15, table_base);
         movi(&mut b, Register::RDX, state_base);
+        // P2-14 hot state: RSI carries the deferred flag snapshot and RDI its
+        // validity.  Every module entry starts canonical/clean.
+        b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RDI, Register::RDI).unwrap());
         if cross_family_routes.is_empty() {
             b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RBX, Register::RBX).unwrap());
         } else {
@@ -1614,7 +1613,6 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x8D5).unwrap());
         store_m(&mut b, FLAGS_OFF, Register::RAX);
-        b.push(Instruction::with2(Code::Mov_rm8_imm8, m8(LAZY_VALID_OFF), 0).unwrap());
         b.jmp(dispatch);
     }
 

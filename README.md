@@ -22,7 +22,7 @@ partition한 뒤 독립 bytecode/module/state/table과 native self-decoding runt
 | Distributed integrity | 구현됨 | family별 code/table/bytecode 12개 BTGI descriptor와 boot verifier |
 | Data lifetime | 부분 구현 | strict proof가 가능한 ASCII/UTF-16 literal을 사용 직전 복호화 후 재암호화 |
 | P2-13 grammar | 완료 | family operand/compact immediate/control token 및 독립 super-op grammar production 연결 |
-| P2-14 state/lazy flags | 부분 완료 | split GPR banks, 독립 temp spill/XMM/stack domain, lazy boundary materialization 연결 |
+| P2-14 state/lazy flags | 부분 완료 | split domains와 RSI/RDI hot lazy state, branch/native/HALT materialization 연결 |
 | Release gate | 부분 완료 | library 571/571 및 P2-13 20-seed grammar gate 통과; 전체 pack gate 재실행 필요 |
 
 완료/부분/계획의 상세 근거는 [현재 구현 상태](docs/current-status.md)를 기준으로
@@ -118,8 +118,8 @@ stdout 1,460B, stderr 0B입니다. 검증 범위와 재현 명령은
 ## 알려진 한계
 
 - P2-13 control grammar는 family별 compact direct/keyed/table-selector/continuation token과 super-op tag/descriptor-mask ABI까지 production 연결됐습니다.
-- P2-14 split state와 lazy flag 경계 물질화는 연결됐고 register-resident/stack-window
-  확대 및 공유 lifetime 객체 동시성은 남아 있습니다.
+- P2-14 split state, temp spill window, register-resident lazy flag와 경계 물질화는
+  연결됐고 공유 lifetime 객체 동시성은 남아 있습니다.
 - P2-15 native bridge oracle 감소는 미완료입니다.
 - 일부 TLS, unwind, panic, setjmp/longjmp, loader-critical 함수는 안전을 위해
   native로 유지됩니다.

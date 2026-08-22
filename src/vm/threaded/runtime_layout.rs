@@ -27,9 +27,6 @@ pub struct VmRuntimeLayout {
     pub imm2: i32,
     pub carry_in: i32,
     pub fp_return: i32,
-    /// Deferred canonical status-bit snapshot and its one-byte validity token.
-    pub lazy_flags: i32,
-    pub lazy_valid: i32,
     pub xmm: i32,
     pub xmm_slots: usize,
     pub total_size: usize,
@@ -56,8 +53,6 @@ impl VmRuntimeLayout {
             imm2: 0xE0,
             carry_in: 0xE8,
             fp_return: 0xF0,
-            lazy_flags: 0xF8,
-            lazy_valid: 0xD4,
             xmm: 0x100,
             xmm_slots: 6,
             total_size: 0x160,
@@ -114,8 +109,6 @@ impl VmRuntimeLayout {
             imm2: off1(14),
             carry_in: off0(14),
             fp_return: off1(15),
-            lazy_flags: off0(15),
-            lazy_valid: off1(13) + 4,
             xmm: XMM_WINDOW_BASE,
             xmm_slots: 6,
             total_size: SPLIT_STATE_SIZE,
@@ -125,7 +118,7 @@ impl VmRuntimeLayout {
     }
 
     pub fn validate(&self) -> Result<()> {
-        let mut offsets = Vec::with_capacity(32);
+        let mut offsets = Vec::with_capacity(31);
         offsets.extend(self.vregs);
         offsets.extend(self.temps);
         offsets.extend([
@@ -136,11 +129,10 @@ impl VmRuntimeLayout {
             self.imm2,
             self.carry_in,
             self.fp_return,
-            self.lazy_flags,
         ]);
         offsets.sort_unstable();
         offsets.dedup();
-        if offsets.len() != 32 {
+        if offsets.len() != 31 {
             return Err(anyhow!("VM runtime layout contains overlapping core slots"));
         }
         if offsets.iter().any(|off| {
@@ -173,18 +165,6 @@ impl VmRuntimeLayout {
         if self.total_size > u16::MAX as usize {
             return Err(anyhow!(
                 "VM runtime layout exceeds the u16 operand-offset ABI"
-            ));
-        }
-        // decode_operands owns only its low four bytes (DST/SRC1/SRC2/COND).
-        // The upper half of that reserved qword is the stable byte-token area;
-        // pinning it here prevents a future layout change from aliasing live data.
-        if self.lazy_valid != self.decode_operands + 4
-            || self.lazy_valid < 0
-            || self.lazy_valid >= self.xmm
-            || self.lazy_valid as usize >= self.total_size
-        {
-            return Err(anyhow!(
-                "VM lazy-flag validity token is outside the state buffer"
             ));
         }
         Ok(())
@@ -226,16 +206,32 @@ mod tests {
     }
 
     #[test]
-    fn layout_rejects_lazy_token_outside_reserved_decode_tail() {
-        let mut l = VmRuntimeLayout::from_seed(7);
-        l.lazy_valid = l.flags;
-        assert!(l.validate().is_err());
-    }
-
-    #[test]
     fn layout_rejects_spill_window_alias_with_persistent_bank() {
         let mut l = VmRuntimeLayout::from_seed(11);
         l.temps[0] = l.vregs[0];
         assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn production_layout_contains_only_canonical_memory_state_slots() {
+        let l = VmRuntimeLayout::from_seed(13);
+        let mut offsets = l.vregs.to_vec();
+        offsets.extend(l.temps);
+        offsets.extend([
+            l.flags,
+            l.vsp,
+            l.decode_operands,
+            l.imm1,
+            l.imm2,
+            l.carry_in,
+            l.fp_return,
+        ]);
+        offsets.sort_unstable();
+        offsets.dedup();
+        assert_eq!(
+            offsets.len(),
+            31,
+            "lazy hot state must remain register-resident"
+        );
     }
 }
