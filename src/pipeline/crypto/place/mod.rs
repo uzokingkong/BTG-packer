@@ -1383,7 +1383,7 @@ pub(crate) fn place_boot_stub(
                         .copy_from_slice(&(multi.entry_byte_offset as u64).to_le_bytes());
                     if !multi.lifetime_sync.entries.is_empty() {
                         println!(
-                            "[+] P2-14 shared lifetime sync: {} global lock/refcount entry(s) @0x{:X}",
+                            "[+] P2-14 shared lifetime sync: {} global lock/depth/owner entry(s) @0x{:X}",
                             multi.lifetime_sync.entries.len(),
                             multi.lifetime_sync.base_va,
                         );

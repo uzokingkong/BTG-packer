@@ -4,6 +4,12 @@
 
 ## 진행 기록
 
+### 2026-08-22 — data-lifetime exact-width ConstantPool 확대
+
+- 문자열 scanner 후보가 없어도 instruction reference 분석을 계속하고, register destination의 순수 MOV/MOVSS/MOVSD/MOVUPS/MOVDQU 계열 RIP-relative 4/8/16-byte read를 exact-width `ConstantPool` 객체로 생성한다. RMW, XCHG/CMPXCHG, memory destination, 폭 불명 접근은 fail-closed 제외한다.
+- direct instruction scope는 기존 owner-aware acquire → decrypt → read → re-encrypt → release를 그대로 사용한다. `corpus/o1.exe`에서 candidate 182개/438 refs, strict scope 116개/191 refs, 최종 all-reference proof 54개로 확대됐으며 이전 문자열 중심 46개보다 8개 실제 객체가 추가됐다.
+- 최대 조합 pack/실행동치(exit 0, stdout 1,460B, stderr 0B)를 통과했고 신규 exact-width graph 테스트를 포함한 library 기준은 575개다. 다음 범위는 exception/unwind cleanup과 복합 constant/table access proof다.
+
 ### 2026-08-22 — shared lifetime owner-aware 재진입/depth protocol
 
 - sync entry를 16바이트 `(lock u32, depth u32, owner thread-id u64)`로 확대하고 동일 4KB table에서 capacity를 256개로 조정했다. Windows x64 TEB `GS:[0x48]`의 thread ID가 owner token이다.

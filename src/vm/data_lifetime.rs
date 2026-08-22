@@ -1,7 +1,9 @@
 //! Object-granular encrypted data with decrypt/use/re-encrypt lifetime control.
 
 use crate::vm::seed_lifecycle::derive_seed;
-use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Instruction, Register};
+use iced_x86::{
+    Code, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiteralObject {
@@ -96,9 +98,6 @@ pub fn analyze_referenced_literals(
     image_base: u64,
 ) -> Vec<LiteralObject> {
     let mut candidates = scan_literal_objects(data, data_rva);
-    if candidates.is_empty() {
-        return candidates;
-    }
 
     let ip = image_base.saturating_add(text_rva as u64);
     let mut decoder = Decoder::with_ip(64, text, ip, DecoderOptions::NONE);
@@ -126,6 +125,17 @@ pub fn analyze_referenced_literals(
             target_rva >= object.rva && target_rva < object.rva.saturating_add(object.len)
         }) {
             object.references.push(reference_rva);
+        } else if let Some(width) = direct_constant_load_width(&instruction) {
+            let end = target_rva.saturating_add(width);
+            let data_end = data_rva.saturating_add(data.len() as u32);
+            if target_rva >= data_rva && end <= data_end {
+                candidates.push(LiteralObject {
+                    class: DataClass::ConstantPool,
+                    rva: target_rva,
+                    len: width,
+                    references: vec![reference_rva],
+                });
+            }
         }
     }
     candidates.retain(|object| !object.references.is_empty());
@@ -134,6 +144,32 @@ pub fn analyze_referenced_literals(
         object.references.dedup();
     }
     candidates
+}
+
+/// Exact-width, read-only RIP-relative loads only.  Excluding arithmetic RMW,
+/// XCHG/CMPXCHG and memory destinations keeps constant-pool encryption from
+/// changing writable/static state semantics.
+fn direct_constant_load_width(instruction: &Instruction) -> Option<u32> {
+    if !instruction.is_ip_rel_memory_operand()
+        || instruction.op0_kind() != OpKind::Register
+        || instruction.op1_kind() != OpKind::Memory
+        || !matches!(instruction.memory_size().size(), 4 | 8 | 16)
+        || !matches!(
+            instruction.mnemonic(),
+            Mnemonic::Mov
+                | Mnemonic::Movss
+                | Mnemonic::Movsd
+                | Mnemonic::Movups
+                | Mnemonic::Movupd
+                | Mnemonic::Movaps
+                | Mnemonic::Movapd
+                | Mnemonic::Movdqu
+                | Mnemonic::Movdqa
+        )
+    {
+        return None;
+    }
+    Some(instruction.memory_size().size() as u32)
 }
 
 /// Selects the strict subset whose address is loaded directly into a Win64
@@ -473,6 +509,46 @@ mod tests {
         assert_eq!(objects.len(), 1);
         assert_eq!(objects[0].rva, data_rva);
         assert_eq!(objects[0].len, 15);
+        assert_eq!(objects[0].references, vec![text_rva]);
+    }
+
+    #[test]
+    fn reference_graph_adds_exact_width_read_only_constant_pool() {
+        let image_base = 0x1400_0000_0u64;
+        let text_rva = 0x1000u32;
+        let data_rva = 0x3000u32;
+        let mut load = Instruction::with2(
+            Code::Mov_r64_rm64,
+            Register::RAX,
+            MemoryOperand::with_base_displ(Register::RIP, (image_base + data_rva as u64) as i64),
+        )
+        .unwrap();
+        load.set_ip(image_base + text_rva as u64);
+        let encoded = BlockEncoder::encode(
+            64,
+            InstructionBlock::new(&[load], image_base + text_rva as u64),
+            BlockEncoderOptions::NONE,
+        )
+        .unwrap()
+        .code_buffer;
+        let mut decoder = Decoder::with_ip(
+            64,
+            &encoded,
+            image_base + text_rva as u64,
+            DecoderOptions::NONE,
+        );
+        let decoded = decoder.decode();
+        assert_eq!(
+            decoded.ip_rel_memory_address(),
+            image_base + data_rva as u64
+        );
+        assert_eq!(direct_constant_load_width(&decoded), Some(8));
+        let data = [0x13, 0xA7, 0x02, 0xFE, 0x55, 0x91, 0xC4, 0x28];
+        let objects = analyze_referenced_literals(&encoded, text_rva, &data, data_rva, image_base);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].class, DataClass::ConstantPool);
+        assert_eq!(objects[0].rva, data_rva);
+        assert_eq!(objects[0].len, 8);
         assert_eq!(objects[0].references, vec![text_rva]);
     }
 

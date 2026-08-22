@@ -86,6 +86,9 @@
   객체를 at-rest ciphertext로 저장합니다.
 - call 또는 direct access 직전에 decrypt하고 사용 직후 re-encrypt합니다.
 - proof가 불완전하거나 native/loader가 공유하는 객체는 보호 대상에서 제외합니다.
+- 문자열 외에는 register destination의 순수 MOV 계열 RIP-relative 4/8/16-byte read만
+  `ConstantPool`로 추가합니다. RMW/XCHG/memory destination과 폭이 모호한 접근은 제외하고,
+  해당 단일 instruction 앞뒤에서 동일 owner-aware scope로 toggle합니다.
 - entry-family state의 `+0x4000..+0x5000`에는 RVA 정렬된 16-byte
   `(atomic lock u32, depth u32, owner thread-id u64)` 항목 최대 256개를 위한 전역 sync table을 둡니다.
   모든 family가 같은 절대 VA를 사용하도록 table ownership은 entry state에만 있으며,
@@ -104,8 +107,8 @@
 | P2-12 anchor 분산 | 4 instance, 4 integrity topology, ownership gate | RIP-relative runtime bundle materialization, N=20 signature gate |
 | P2-13 grammar | family operand/compact immediate/control token, super-op tag+descriptor-mask ABI | 완료 |
 | P2-14 state/lazy flags | u16 metadata, split GPR banks, temp spill/XMM/stack 분리, RSI/RDI lazy hot state, cross-family/native materialization | shared lifetime 동시성 및 추가 hot-state 후보 |
-| Data lifetime | strict ASCII/UTF-16 scope, global relocation, owner-aware atomic 재진입/depth | wider format/direct-memory 및 unwind cleanup cases |
-| Release gate | 574 library tests, P2-13 20-seed grammar gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
+| Data lifetime | strict ASCII/UTF-16 + exact 4/8/16B constant read, global owner-aware scope | wider format, complex memory proof 및 unwind cleanup |
+| Release gate | 575 library tests, P2-13 20-seed grammar gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
 
 ## 미구현 또는 다음 단계
 
