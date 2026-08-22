@@ -1,9 +1,9 @@
 # BTG Packer
 
-Windows x86-64 PE를 대상으로 하는 연구용 코드 가상화·난독화 패커입니다. 현재의
-주력 경로는 x86 함수를 RISC micro-op으로 lift하고, 서로 다른 네 VM family로
-partition한 뒤 독립 bytecode/module/state/table과 native self-decoding runtime을
-생성하는 Program-VM 파이프라인입니다.
+Windows x86-64 PE를 대상으로 하는 연구용 패커입니다. native CFG slicing/shuffle,
+PE 재배치, boot crypto, integrity, import/memory hardening, selective SDK VM, legacy VM,
+whole-program multi-family Program-VM, QA·재현·진단 산출물을 하나의 파이프라인에서
+제공합니다. Commercial Program-VM은 주력 고보호 경로이지만 프로젝트 전체는 아닙니다.
 
 > 이 저장소는 연구용 프로토타입입니다. 검증된 범위 밖의 PE, 드라이버, 다른
 > 아키텍처 또는 적대적인 입력에 대한 범용 호환성을 보장하지 않습니다.
@@ -14,6 +14,10 @@ partition한 뒤 독립 bytecode/module/state/table과 native self-decoding runt
 
 | 영역 | 상태 | 실제 구현 |
 |---|---|---|
+| Native CFG packer | 구현됨 | CFG slicing, shuffle, RIP fixup, dispatcher와 PE section 재합성 |
+| PE/platform | 구현됨 | parse/build, import/resource/reloc/`.pdata`, structural validator |
+| Crypto/runtime | 구현됨 | C1/RC4/ChaCha20, boot/chained/per-block 경로, IAT/memory hardening |
+| Selective SDK VM | 구현됨 | marker scan, poly VM embed, entry trampoline patch |
 | Program VM | 구현됨 | x86 → RISC → family ISA → native threaded runtime |
 | Multi-family | 구현됨 | Stack/Register/MixedRisc/FusedCisc 4개 독립 module/state/table/bytecode |
 | Cross-family control | 구현됨 | CALL, tail-JUMP, return/resume canonical routing |
@@ -24,6 +28,7 @@ partition한 뒤 독립 bytecode/module/state/table과 native self-decoding runt
 | P2-13 grammar | 완료 | family operand/compact immediate/control token 및 독립 super-op grammar production 연결 |
 | P2-14 state/lazy flags | 핵심 완료 | split domains와 RSI/RDI hot lazy state, branch/native/HALT materialization 연결 |
 | Release gate | 부분 완료 | library 575/575 및 P2-13 20-seed grammar gate 통과; 전체 pack gate 재실행 필요 |
+| QA/diagnostics | 구현됨 | compiler corpus, differential/multi-seed, manifest, ownership와 VM maps |
 
 완료/부분/계획의 상세 근거는 [현재 구현 상태](docs/current-status.md)를 기준으로
 합니다. 오래된 journal·audit 문서의 상태 문구는 당시 시점의 기록이며 현재 상태를
@@ -34,24 +39,23 @@ partition한 뒤 독립 bytecode/module/state/table과 native self-decoding runt
 ```text
 input PE
   │
-  ├─ parse / CFG / function ownership
-  ├─ native-safe exclusions (TLS, unwind, setjmp, loader-critical)
-  ├─ x86 → RISC micro-op lift
-  ├─ function-stable family partition
-  │    ├─ Stack
-  │    ├─ Register
-  │    ├─ MixedRisc
-  │    └─ FusedCisc
-  ├─ independent polymorphic bytecode + native runtime per family
-  ├─ canonical cross-family routing
-  ├─ M7 / data-lifetime / BTGI integrity sealing
-  ├─ boot stub + PE sections + .pdata/.reloc policy
+  ├─ PE parse / CFG extraction / trigger-block slicing
+  ├─ layout shuffle / RIP fixup / dispatcher generation
+  ├─ optional selective SDK marker VM
+  ├─ optional legacy boot/program VM
+  ├─ optional commercial Program-VM
+  │    └─ RISC lift → 4-family partition → independent runtimes/routes
+  ├─ crypto / integrity / IAT hide / memory hardening / payload relocation
+  ├─ PE sections + resources + .pdata/.reloc reconstruction
   └─ structural validation + optional execution differential
 output PE
+  └─ manifest / ownership / maps / diagnostics
 ```
 
 구성요소와 소유권, 데이터 배치, 부트 순서는
 [시스템 아키텍처](docs/architecture/system-overview.md)에 정리되어 있습니다.
+모든 269개 Rust 파일의 책임 지도는 [전체 소스 지도](docs/architecture/source-map.md)를
+참고하세요.
 
 ## 핵심 소스 지도
 
@@ -94,7 +98,9 @@ stdout 1,460B, stderr 0B입니다. 검증 범위와 재현 명령은
 
 ## 주요 CLI
 
-정확한 전체 목록은 항상 `btg-packer.exe --help`와 `src/cli.rs`가 기준입니다.
+전체 42개 option과 resolver 충돌 규칙은 [CLI 전체 레퍼런스](docs/cli-reference.md)에
+정리되어 있습니다. 실제 이름은 `btg-packer.exe --help`, effective 적용은
+`src/protection_profile.rs`가 최종 기준입니다.
 
 | 옵션 | 의미 |
 |---|---|
@@ -111,6 +117,9 @@ stdout 1,460B, stderr 0B입니다. 검증 범위와 재현 명령은
 | `--anti-debug` | 부트 안티디버그 검사 |
 | `--map --sym-map` | VM/source 진단 매핑 생성 |
 | `--crypto-mode` | `rc4`, `c1`, `chacha20` 선택 |
+
+`--full`은 native CFG 보호 bundle이며 commercial Program-VM을 자동으로 켜지 않습니다.
+Commercial 경로는 `--vm --vm-oep --vm-commercial`을 명시하세요.
 
 옵션은 조합에 따라 effective profile이 달라질 수 있으므로 배포 검증에서는
 `--strict-profile` 사용을 권장합니다.
@@ -132,10 +141,12 @@ stdout 1,460B, stderr 0B입니다. 검증 범위와 재현 명령은
 
 1. [현재 구현 상태](docs/current-status.md)
 2. [시스템 아키텍처](docs/architecture/system-overview.md)
-3. [실제 production 파이프라인](docs/architecture/actual-pipeline.md)
-4. [검증 기준](docs/verification.md)
-5. [문서 인덱스](docs/README.md)
-6. [현재 구현 계획](plan_vmrestore_upgraded.md)
+3. [전체 소스 지도](docs/architecture/source-map.md)
+4. [CLI 전체 레퍼런스](docs/cli-reference.md)
+5. [실제 production 파이프라인](docs/architecture/actual-pipeline.md)
+6. [검증 기준](docs/verification.md)
+7. [문서 인덱스](docs/README.md)
+8. [현재 구현 계획](plan_vmrestore_upgraded.md)
 
 `docs/journal/`, 날짜가 붙은 분석·audit·engine 보고서는 변경 당시의 증거와
 디버깅 기록을 보존하는 역사 문서입니다.

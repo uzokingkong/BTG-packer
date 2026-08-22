@@ -9,7 +9,9 @@
 |---|---|
 | [루트 README](../README.md) | 프로젝트 소개, 빠른 시작, 현재 요약 |
 | [현재 구현 상태](current-status.md) | 구현/부분 구현/미구현의 단일 기준 |
-| [시스템 아키텍처](architecture/system-overview.md) | multi-family compiler/runtime/배치 구조 |
+| [시스템 아키텍처](architecture/system-overview.md) | 전체 CFG/PE/crypto/VM/QA 계층과 backend 관계 |
+| [전체 소스 지도](architecture/source-map.md) | 269개 Rust 파일의 제품 계층·책임·API 지도 |
+| [CLI 전체 레퍼런스](cli-reference.md) | 42개 option, 실행 모드, resolver 충돌 규칙, 산출물 |
 | [실제 패킹 파이프라인](architecture/actual-pipeline.md) | pass와 boot/build 처리 순서 |
 | [검증 기준](verification.md) | unit, structural, execution, tamper gate |
 | [현재 구현 계획](../plan_vmrestore_upgraded.md) | 앞으로 구현할 작업과 완료 기준 |

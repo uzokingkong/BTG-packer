@@ -1,114 +1,116 @@
 # 실제 production 파이프라인
 
-현재 `main`의 Program-VM 최대 경로를 코드 처리 순서대로 설명합니다. 상태 판정은
-[현재 구현 상태](../current-status.md), 구성요소 관계는
-[시스템 아키텍처](system-overview.md)를 함께 참고하세요.
+현재 `src/main.rs`의 정상 패킹 경로를 코드 순서대로 설명합니다. CLI 조기 종료 모드는
+[CLI 전체 레퍼런스](../cli-reference.md)에 별도로 정리합니다.
 
-## 1. Profile 정규화
+## 1. 요청 profile 해석
 
-`src/cli.rs`의 요청 옵션을 `src/pipeline/config.rs`가 effective profile로
-정규화합니다. 상충 기능은 비활성화되거나 fallback될 수 있으며,
-`--strict-profile`은 이 downgrade를 오류로 바꿉니다.
+1. clap이 42개 CLI field를 `CliArgs`로 parse합니다.
+2. `protection_profile::RequestedConfig::from_cli`가 보호 관련 요청을 snapshot합니다.
+3. `resolve()`가 `--full`, crypto/VM 전제, M7 backend, cipher 우선순위,
+   reencrypt/mem-harden 충돌을 effective config로 정규화합니다.
+4. hard error는 즉시 종료하고 warning은 출력합니다.
+5. `--strict-profile`은 warning도 오류로 승격합니다.
 
-주력 commercial path:
+## 2. 입력 PE와 context
 
-```text
---vm --vm-oep --vm-commercial [--m7] [--m8] [--integrity]
-```
+- 입력이 없으면 기본 dummy PE를 생성할 수 있습니다.
+- parser가 image base, entry RVA, `.text`, relayed sections, alignment와 directories를
+  수집합니다.
+- 마지막 original section 이후의 aligned RVA를 dispatcher base로 정합니다.
+- `PipelineContext`를 만들고 seed가 있으면 모든 pack RNG를 고정합니다.
+- MBA constant, effective crypto/VM/IAT/memory/diagnostic flags를 pass1 전에 기록합니다.
 
-## 2. 입력 분석과 native exclusion
+## 3. Optional selective marker 분석
 
-1. PE header, section, import, `.pdata`, relocation 정보를 parse합니다.
-2. OEP reachable CFG와 함수 범위를 수집합니다.
-3. TLS, unwind/panic, setjmp/longjmp, loader-critical 함수와 proof가 불완전한
-   범위를 native로 유지합니다.
-4. virtualized 함수와 native 함수 ownership overlap을 fail-closed 검사합니다.
+crypto가 켜진 정상 pack에서 SDK marker를 scan합니다. 발견된 region은 selective
+polymorphic VM으로 lift해 `poly_vm_regions`에 보존하고, 실패 region은 reject count에
+기록합니다. 실제 section embed와 trampoline patch는 crypto placement 뒤 수행됩니다.
 
-핵심 코드: `src/pe/`, `src/vm/text_lift/`, `src/pipeline/crypto/place/lift.rs`.
+## 4. 공통 CFG/PE compiler pass
 
-## 3. RISC lift와 family partition
+1. `pass1_slice`: `.text` CFG extraction과 trigger block slicing;
+2. `pass2_shuffle`: seed 기반 physical order, table/block offsets;
+3. `pass3_encode`: RIP/branch fixup과 native block encode;
+4. `pass4_section`: dispatcher, table, boot reservation을 포함한 `.textb` 조립;
+5. `patch_data`: moved sections, code/data pointers, security cookie와 CFG reference patch;
+6. optional `iat_hide`: original import 수집/삭제, dummy import와 resolver metadata 준비.
 
-1. 선택된 x86 함수 body를 canonical RISC micro-op으로 lift합니다.
-2. `ProductionFamilyPlan`이 function id/seed로 architecture family를 정합니다.
-3. function op range를 family-local `RiscProgram`으로 절단합니다.
-4. direct edge 중 family가 다른 CALL/JUMP를 canonical route record로 만듭니다.
-5. 대형 production 입력은 instance 3개 이상, 최대 단일 ownership 50% 미만을
-   검사합니다.
+이 단계는 native/legacy/commercial backend 모두가 공유합니다.
 
-핵심 코드: `src/vm/risc/`, `src/vm/poly/architecture_family.rs`,
-`src/vm/multi_family.rs`.
+## 5. Crypto placement와 backend 선택
 
-## 4. Family-local materialization
+`pipeline::crypto::run`이 effective profile을 소비해 다음을 선택적으로 합성합니다.
 
-각 family에 대해 독립적으로 다음을 수행합니다.
+- bulk C1/RC4/ChaCha20 encryption;
+- chained crypto 또는 native per-block reencrypt/M7 dispatcher;
+- anti-debug and integrity boot stages;
+- payload relocation, import resolution, memory hardening metadata;
+- legacy KSA/PRGA VM module;
+- legacy OEP Program-VM;
+- commercial multi-family Program-VM.
 
-1. family/seed domain의 opcode/register/condition map 생성;
-2. family별 operand 순서와 branch token grammar로 bytecode encode;
-3. rolling-key stream encryption;
-4. native self-decoding handlers/runtime 생성;
-5. concealed handler table과 family별 integrity traversal 생성;
-6. state/stack/control area 할당;
-7. cross-family route target VA/state/layout 확정.
+### Commercial sub-pipeline
 
-두 번의 sizing/final build는 code/table length drift를 검사합니다.
+1. OEP reachable CFG/function과 native exclusion 수집;
+2. x86 → canonical RISC lift 및 ownership 검증;
+3. function-stable 4-family partition과 cross-family route 생성;
+4. family별 ISA/grammar/rolling-key bytecode encode;
+5. family별 native runtime/handler table/state/stack sizing build;
+6. final VA로 route/state/table relocation 후 final build;
+7. optional M7 family chunk와 data-lifetime object proof/toggle;
+8. code/table/bytecode BTGI descriptor sealing;
+9. family bridge `.pdata` range와 manifest ownership metadata 기록.
 
-핵심 코드: `src/vm/poly/`, `src/vm/threaded/poly_direct/`,
-`src/pipeline/crypto/place/vm_build.rs`.
+## 6. Boot 실행 순서
 
-## 5. 보호 계층과 배치
-
-1. family code/table/bytecode blob을 합치되 각 range metadata를 유지합니다.
-2. M7 사용 시 family bytecode를 instruction boundary chunk로 persistent 암호화합니다.
-3. strict proof를 통과한 문자열과 exact-width constant-pool lifetime object를
-   at-rest ciphertext로 변환하고 공통 owner/depth/lock table을 연결합니다.
-4. final runtime representation을 기준으로 family code/table/bytecode를 sealing합니다.
-5. 최대 12개 descriptor를 `BTGI` table로 serialize합니다.
-6. profile에 따른 transient boot crypto wrapper를 적용합니다.
-7. boot stub, run table, seed/state, VM blob을 PE section에 배치합니다.
-
-핵심 코드: `src/pipeline/crypto/place/mod.rs`, `src/vm/chunk_crypto.rs`,
-`src/vm/data_lifetime.rs`, `src/vm/distributed_integrity.rs`.
-
-## 6. Boot 순서
-
-RC4 Program-VM/integrity 경로의 주요 순서는 다음과 같습니다.
+정확한 stage는 profile마다 다르지만 일반적인 순서는 다음과 같습니다.
 
 ```text
 anti-debug / base bind / key setup
-  → code and run decrypt
-  → Program-VM transient bytecode decrypt
-  → BTGI distributed integrity verification
-  → additional multisite integrity checks
-  → IAT/memory hardening stages
-  → selected family runtime entry
+  → bulk or per-block payload preparation
+  → code/string/program-bytecode decrypt as selected
+  → CRC/multisite/BTGI integrity verification
+  → IAT runtime resolution
+  → memory protection transition
+  → native dispatcher, legacy VM, or selected commercial family entry
 ```
 
-BTGI verifier는 magic, 1..12 count, region tag를 fail-closed하고 성공 시 사용한
-GPR을 복원하여 이후 integrity stage의 live state를 보존합니다.
+Program-VM M7의 persistent family chunk와 object-lifetime toggle은 native M7 dispatcher와
+다른 runtime입니다.
 
-핵심 코드: `src/pipeline/crypto/bootstub/build.rs`,
-`src/pipeline/crypto/integrity.rs`.
+## 7. 후속 section 처리와 PE build
 
-## 7. PE 합성과 unwind
+1. `--rsrc-register`이면 relocated payload용 resource tree를 재구성합니다.
+2. selective marker region이 있으면 `.btgvm` module을 embed하고 marker trampoline을
+   patch합니다.
+3. PE builder가 relayed sections, `.textb`, optional payload/VM sections와 directories,
+   entry, checksum을 직렬화합니다.
+4. `.pdata`/unwind, relocation/ASLR, load config와 section protection은 effective
+   profile 및 실제 생성 range를 기준으로 만듭니다.
 
-- family runtime/bridge range를 기준으로 `.pdata` `RUNTIME_FUNCTION`을 생성합니다.
-- native 원본 entries와 새 bridge unwind contract를 검증합니다.
-- relocation/ASLR과 memory protection은 effective crypto profile에 따라 결정됩니다.
-- 항상 고정된 `.btgvmx/.btgvmd/.btgvms` 세 section이 생성된다고 가정하지 않습니다.
+## 8. 검증과 sidecar
 
-핵심 코드: `src/pipeline/build.rs`, `src/pipeline/validate.rs`.
+1. entropy report 출력;
+2. structural validator로 새 PE 재parse/검사;
+3. `--verify-output`이면 원본/보호본 실행 차등;
+4. Program-VM ownership CSV 생성;
+5. `.btgmanifest`에 hashes, build id, effective capabilities, ownership, execution 결과;
+6. `--map/--sym-map` instruction/block/function/RISC mapping;
+7. optional debug layout/disassembly 검증.
 
-## 8. 검증
+실행 차등 실패 산출물은 `.failed` 이름으로 격리됩니다.
 
-패킹 후 structural validator가 section/entry/ownership/`.pdata`/VM range를 검사합니다.
-`--verify-output`을 사용하면 원본과 보호본의 exit/stdout/stderr도 비교합니다.
+## Library API 차이
 
-현재 대표 실측은 [검증 기준](../verification.md)에 기록합니다.
+`btg_packer::pack()`과 `pipeline::pack::run_full()`은 CLI 전체 profile resolver를 통과하는
+동등 entry가 아닙니다. 기본 CFG pass와 crypto path를 in-memory로 호출하는 제한된 API로,
+commercial VM, QA, maps와 모든 CLI 조합을 직접 노출하지 않습니다.
 
 ## 현재 미완료
 
-- lifetime scope의 exception/unwind cleanup과 복합 memory proof;
-- P2-11 handler body recipe의 execution-weight 80% 확대;
-- RIP-relative runtime bundle과 N=20 anchor signature gate;
-- native bridge live-set marshaling 및 canonical image zeroization;
-- 최신 전체 hostile corpus와 실제 20-seed pack+execute gate.
+- lifetime exception/unwind cleanup과 복합 memory proof;
+- P2-11 handler body recipe execution-weight 확대;
+- P2-12 RIP-relative runtime bundle과 N=20 signature gate;
+- P2-15 bridge live-set/zeroization/oracle reduction;
+- 최신 hostile/compiler corpus와 실제 20-seed release matrix.

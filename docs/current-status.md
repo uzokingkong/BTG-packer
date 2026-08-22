@@ -10,6 +10,34 @@
 
 ## 구현 완료
 
+### Native CFG/PE packer 기반
+
+- PE parse, CFG extraction, trigger-block slicing, layout shuffle, RIP/branch fixup,
+  dispatcher/table emission과 moved section/data patch를 production pipeline에 연결했습니다.
+- standard dispatcher와 native per-block reencrypt/M7 variant, anti-debug policy,
+  payload relocation/resource registration, IAT runtime resolution과 memory hardening을
+  effective profile에 따라 합성합니다.
+- PE builder는 relayed section, entry, imports/resources/relocs/load-config/`.pdata`를
+  재구성하고 output을 다시 parse하는 structural validator를 실행합니다.
+
+### Crypto와 integrity 기반
+
+- 기본 C1, legacy RC4, 지원되는 bulk 경로의 ChaCha20과 Poly1305/AEAD helper/native
+  emitter가 있습니다.
+- boot bulk/chained/per-block crypto, CRC/multisite checks, seed/state zeroization과
+  Program-VM BTGI distributed integrity가 각각 profile별 경로에 연결됩니다.
+- `protection_profile` resolver가 cipher 우선순위, crypto 전제, reencrypt/mem-harden
+  충돌과 strict-profile 오류 승격을 단일 정책으로 관리합니다.
+
+### Selective VM, QA와 진단
+
+- SDK marker scan → region lift → polymorphic VM section embed → marker trampoline patch의
+  selective VM 경로가 있습니다.
+- multi-compiler corpus 생성/QA, byte-exact execution differential, multi-seed child gate,
+  실패 artifact 격리와 구조/tamper 검증 계층을 제공합니다.
+- `.btgmanifest`, ownership CSV, instruction/block/RISC maps, crash diagnostic와 entropy/
+  layout report를 생성할 수 있습니다.
+
 ### Multi-family Program VM
 
 - 함수 단위 ownership을 Stack, Register, MixedRisc, FusedCisc family로 고정합니다.
@@ -117,12 +145,15 @@ continuation/sync pointer metadata는 `0x5000..0x5018`, return call stack은 str
 | P2-14 state/lazy flags | u16 metadata, split GPR banks, temp spill/XMM/stack 분리, RSI/RDI lazy hot state, cross-family/native materialization | canonical bridge image zeroization은 P2-15에서 진행 |
 | Data lifetime | strict ASCII/UTF-16 + exact 4/8/16B constant read, global owner-aware scope | wider format, complex memory proof 및 unwind cleanup |
 | Release gate | 575 library tests, P2-13 20-seed grammar gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
+| Library API | 기본 CFG+crypto in-memory `pack/run_full` | CLI effective profile 전체를 노출하는 typed API |
+| Platform/PE matrix | 대표 Windows x64 PE, `.pdata`/reloc/IAT/resource 구조 검증 | 전체 ASLR/CFG/CET/TLS/compiler matrix 최신 재실행 |
 
 ## 미구현 또는 다음 단계
 
 - shared lifetime scope의 exception/unwind cleanup과 wider object proof.
 - P2-15 native bridge canonical-image lifetime 축소와 oracle 감소.
 - 최신 전체 hostile corpus/20-seed release gate.
+- CLI와 동등한 full-profile library API 및 capability introspection.
 
 ## 현재 측정 기준
 
