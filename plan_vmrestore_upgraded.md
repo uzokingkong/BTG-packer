@@ -4,6 +4,16 @@
 
 ## 진행 기록
 
+### 2026-08-22 — 현재 기준선 갱신 (`main` bb7dfaf)
+
+- 아래의 “미완료” 문구 중 이 항목보다 오래된 P2-9/P2-10/P2-11/P2-5 기록은 당시 단계의 역사적 스냅샷이며 현재 상태 판정으로 사용하지 않는다.
+- P2-9는 family별 active-register-only M7으로 확대됐다. `corpus/o1.exe`, seed 31010 최대 조합에서 4개 family stream과 254개 독립 instruction-aligned chunk가 생성되고 실행 동치가 통과했다.
+- P2-10은 4개 독립 code/handler-table/bytecode/state module, canonical cross-family CALL/tail-JUMP/return routing, family별 unwind range까지 production 배치 완료다.
+- P2-11은 canonical ISA와 super-op extension의 모든 최종 handler-table target에 seed/opcode-derived synthesis wrapper를 적용했다. 전체 ISA production reachability는 완료됐지만 handler 본체의 micro-op decomposition/MBA/register allocation/control split 다양성은 추가 강화 대상으로 유지한다.
+- P2-5는 helper-only 상태를 종료했다. PE literal reference graph와 strict `LEA literal → Win64 argument → call` proof를 production에 연결하고, VM 소유권까지 재검증된 45개 객체를 at-rest ciphertext로 저장한다. call 직전 RISC toggle로 복호화하고 복귀 직후 재암호화하며 flags를 복원한다. 일부 참조/native 참조/loader-critical 객체는 fail-closed 제외한다.
+- 최신 검증: library 557/557, `corpus/o1.exe` 일반 및 `--m7 --m8 --integrity` 실행 동치 exit 0/stdout 1,460B/stderr 0B. 최신 data-lifetime 변경 이후 20-seed/전체 hostile corpus는 다시 수행해야 한다.
+- 다음 구현 순서: (1) data-lifetime 직접 메모리·wide/format·동시성 확대, (2) P2-11 handler 본체 synthesis 강화, (3) distributed integrity production descriptor/runtime wiring, (4) P2-12 runtime anchor 분산, P2-13 grammar polymorphism, P2-14 state splitting/lazy flags, P2-15 bridge oracle 감소, (5) 최신 20-seed 및 hostile/tamper release gate.
+
 ### 2026-08-22 — P2-10 실제 multi-family module/state/table 및 call/return routing 완료
 
 - production placer가 entry family를 첫 module로 정렬하고 4개 family의 code, handler/operand/condition/branch table, bytecode를 각각 독립 생성한다. mutable state, virtual stack, cross-family control slots, return-IP stack은 family마다 `0x8000` stride로 격리한다.
