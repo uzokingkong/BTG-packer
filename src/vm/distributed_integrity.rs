@@ -26,6 +26,7 @@ pub struct IntegrityDescriptor {
     pub offset: u64,
     pub len: u64,
     pub tag: u64,
+    pub runtime_tag: u64,
     pub policy: IntegrityFailurePolicy,
     domain_key: u64,
 }
@@ -54,11 +55,13 @@ impl IntegrityDescriptor {
             build_key,
             0x494E_5445_4752_0000 ^ kind as u64 ^ offset.rotate_left(17),
         );
+        let len = bytes.len() as u64;
         Self {
             kind,
             offset,
-            len: bytes.len() as u64,
+            len,
             tag: keyed_tag(bytes, domain_key),
+            runtime_tag: runtime_tag(bytes, domain_key, len),
             policy,
             domain_key,
         }
@@ -97,7 +100,7 @@ pub fn serialize_table(descriptors: &[IntegrityDescriptor]) -> anyhow::Result<Ve
         out.extend_from_slice(&[0u8; 6]);
         out.extend_from_slice(&descriptor.offset.to_le_bytes());
         out.extend_from_slice(&descriptor.len.to_le_bytes());
-        out.extend_from_slice(&descriptor.tag.to_le_bytes());
+        out.extend_from_slice(&descriptor.runtime_tag.to_le_bytes());
         out.extend_from_slice(&descriptor.domain_key().to_le_bytes());
     }
     Ok(out)
@@ -149,6 +152,15 @@ pub fn seal_region_set(
 
 fn keyed_tag(bytes: &[u8], key: u64) -> u64 {
     crate::crypto::mac::BtgKeyedMac::mac(&key.to_le_bytes(), bytes)
+}
+
+fn runtime_tag(bytes: &[u8], key: u64, len: u64) -> u64 {
+    let mut hash = key ^ len ^ 0xCBF2_9CE4_8422_2325;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
 }
 
 fn constant_time_eq(a: u64, b: u64) -> bool {
@@ -276,5 +288,32 @@ mod tests {
             0x9000
         );
         assert_eq!(u64::from_le_bytes(table[24..32].try_into().unwrap()), 32);
+    }
+
+    #[test]
+    fn serialized_runtime_tag_is_keyed_fnv_and_mutation_sensitive() {
+        let bytes = b"BTGI runtime lockstep";
+        let key = 0x0123_4567_89AB_CDEF;
+        let descriptor = IntegrityDescriptor::seal(
+            ProtectedRegionKind::VmBytecode,
+            0x1400_1000,
+            bytes,
+            key,
+            IntegrityFailurePolicy::FailClosed,
+        );
+        let table = serialize_table(&[descriptor]).unwrap();
+        let serialized_tag = u64::from_le_bytes(table[32..40].try_into().unwrap());
+        let domain_key = u64::from_le_bytes(table[40..48].try_into().unwrap());
+        assert_eq!(
+            serialized_tag,
+            runtime_tag(bytes, domain_key, bytes.len() as u64)
+        );
+
+        let mut changed = bytes.to_vec();
+        changed[7] ^= 1;
+        assert_ne!(
+            serialized_tag,
+            runtime_tag(&changed, domain_key, changed.len() as u64)
+        );
     }
 }

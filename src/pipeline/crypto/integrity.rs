@@ -211,6 +211,174 @@ pub(crate) fn emit_integrity_crc(seq: &mut Vec<(Instruction, Option<Label>)>, st
     }
 }
 
+/// Verify the serialized BTGI family-region table after the transient boot
+/// cipher has restored the Program-VM bytecode to its persistent M7 form.
+pub(crate) fn emit_distributed_integrity(
+    seq: &mut Vec<(Instruction, Option<Label>)>,
+    stub: &BootStubCtx,
+) {
+    // In VM/RC4 mode Poly1305 is inactive, so poly_tag_va is an available
+    // build-context carrier for the BTGI table address without widening the
+    // already-stable BootStubCtx ABI used by older modes.
+    let table_va = stub.poly_tag_va;
+    if !stub.integrity || !stub.vm_oep || table_va == 0 || stub.chacha_mode() {
+        return;
+    }
+    // This verifier runs in the middle of the boot pipeline. Later integrity
+    // stages consume several of these registers as live secret/state values,
+    // so the descriptor walk must be observationally transparent on success.
+    let saved = [
+        Register::RAX,
+        Register::RCX,
+        Register::RDX,
+        Register::RBP,
+        Register::R8,
+        Register::R10,
+        Register::R11,
+        Register::R15,
+    ];
+    for register in saved {
+        seq.push((Instruction::with1(Code::Push_r64, register).unwrap(), None));
+    }
+    let m = MemoryOperand::with_base_displ;
+    seq.push((
+        Instruction::with2(Code::Mov_r64_imm64, Register::RBP, table_va).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Cmp_rm32_imm32, m(Register::RBP, 0), 0x4947_5442u32).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(),
+        Some(Label::DistMagicOk),
+    ));
+    seq.push((Instruction::with(Code::Ud2), None));
+    seq.push((Instruction::with(Code::Nopd), Some(Label::DistMagicOk)));
+    seq.push((
+        Instruction::with2(Code::Mov_r32_rm32, Register::R15D, m(Register::RBP, 4)).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Add_rm64_imm32, Register::RBP, 8).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Test_rm64_r64, Register::R15, Register::R15).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
+        Some(Label::DistCountOk),
+    ));
+    seq.push((Instruction::with(Code::Ud2), None));
+    seq.push((Instruction::with(Code::Nopd), Some(Label::DistCountOk)));
+    seq.push((
+        Instruction::with2(Code::Cmp_rm32_imm32, Register::R15D, 13).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(),
+        Some(Label::DistDescLoop),
+    ));
+    seq.push((Instruction::with(Code::Ud2), None));
+    seq.push((
+        Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(Register::RBP, 8)).unwrap(),
+        Some(Label::DistDescLoop),
+    ));
+    seq.push((
+        Instruction::with2(Code::Mov_r64_rm64, Register::RDX, m(Register::RBP, 16)).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RDX).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::RBP, 32)).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R10).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Mov_r64_imm64, Register::R11, 0xCBF2_9CE4_8422_2325u64).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R11).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Mov_r64_imm64, Register::R11, 0x0000_0100_0000_01B3u64).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Test_rm64_r64, Register::RDX, Register::RDX).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(),
+        Some(Label::DistByteDone),
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Movzx_r32_rm8,
+            Register::R8D,
+            MemoryOperand::with_base(Register::RCX),
+        )
+        .unwrap(),
+        Some(Label::DistByteLoop),
+    ));
+    seq.push((
+        Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R8).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Imul_r64_rm64, Register::RAX, Register::R11).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with1(Code::Inc_rm64, Register::RCX).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with1(Code::Dec_rm64, Register::RDX).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
+        Some(Label::DistByteLoop),
+    ));
+    seq.push((Instruction::with(Code::Nopd), Some(Label::DistByteDone)));
+    seq.push((
+        Instruction::with2(Code::Cmp_r64_rm64, Register::RAX, m(Register::RBP, 24)).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(),
+        Some(Label::DistDescOk),
+    ));
+    seq.push((Instruction::with(Code::Ud2), None));
+    seq.push((
+        Instruction::with2(Code::Add_rm64_imm32, Register::RBP, 40).unwrap(),
+        Some(Label::DistDescOk),
+    ));
+    seq.push((
+        Instruction::with1(Code::Dec_rm64, Register::R15).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
+        Some(Label::DistDescLoop),
+    ));
+    seq.push((Instruction::with(Code::Nopd), Some(Label::DistAllOk)));
+    for register in saved.into_iter().rev() {
+        seq.push((Instruction::with1(Code::Pop_r64, register).unwrap(), None));
+    }
+}
+
 /// ── S1 (T2-3): keyed-MAC 런타임 검증 (불일치 시 ud2) ───────────────────────────
 /// 부트 스텁이 패킹 시 `BtgKeyedMac::mac(seed_stored, crc_source)`로 저장한
 /// 8바이트 MAC 값을 런타임에 재계산해 비교한다. CRC32(키 없음)와 달리 키 결합

@@ -304,6 +304,7 @@ pub(crate) fn build_rc4_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     integrity::emit_integrity_crc(&mut seq, stub);
     emit_run_decrypt(&mut seq, stub);
     emit_rest_decrypt(&mut seq, stub);
+    integrity::emit_distributed_integrity(&mut seq, stub);
     // S2 (--integrity multi-site): run/rest decrypt 직후 두 번째 독립 CRC32 검증.
     integrity::emit_integrity_crc2(&mut seq, stub);
     iat::emit_iat_slots(&mut seq, stub);

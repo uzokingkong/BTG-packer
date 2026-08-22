@@ -11,8 +11,8 @@
 - P2-10은 4개 독립 code/handler-table/bytecode/state module, canonical cross-family CALL/tail-JUMP/return routing, family별 unwind range까지 production 배치 완료다.
 - P2-11은 canonical ISA와 super-op extension의 모든 최종 handler-table target에 seed/opcode-derived synthesis wrapper를 적용했다. 전체 ISA production reachability는 완료됐지만 handler 본체의 micro-op decomposition/MBA/register allocation/control split 다양성은 추가 강화 대상으로 유지한다.
 - P2-5는 helper-only 상태를 종료했다. PE literal reference graph와 strict `LEA literal → Win64 argument → call` proof를 production에 연결하고, VM 소유권까지 재검증된 45개 객체를 at-rest ciphertext로 저장한다. call 직전 RISC toggle로 복호화하고 복귀 직후 재암호화하며 flags를 복원한다. 일부 참조/native 참조/loader-critical 객체는 fail-closed 제외한다.
-- 최신 검증: library 559/559, `corpus/o1.exe` 일반 및 `--m7 --m8 --integrity` 실행 동치 exit 0/stdout 1,460B/stderr 0B. 최신 data-lifetime/handler-body 변경 이후 20-seed/전체 hostile corpus는 다시 수행해야 한다.
-- 다음 구현 순서: (1) data-lifetime 직접 메모리·wide/format·동시성 확대, (2) P2-11 handler 본체 synthesis 강화, (3) distributed integrity production descriptor/runtime wiring, (4) P2-12 runtime anchor 분산, P2-13 grammar polymorphism, P2-14 state splitting/lazy flags, P2-15 bridge oracle 감소, (5) 최신 20-seed 및 hostile/tamper release gate.
+- 최신 검증: library 562/562(아래 runtime verifier 회귀 포함), `corpus/o1.exe` 일반 및 `--m7 --m8 --integrity` 실행 동치 exit 0/stdout 1,460B/stderr 0B. 최신 data-lifetime/handler-body 변경 이후 20-seed/전체 hostile corpus는 다시 수행해야 한다.
+- 다음 구현 순서: (1) P2-12 runtime anchor 분산, (2) P2-13 grammar polymorphism, (3) P2-14 state splitting/lazy flags와 data-lifetime 동시성, (4) P2-15 bridge oracle 감소, (5) 최신 20-seed 및 hostile/tamper release gate 확대.
 
 ### 2026-08-22 — P2-5 direct-access lifetime 확대
 
@@ -44,6 +44,12 @@
 - 고정 BTGI ABI를 추가했다. 8B header(`magic`,`count`) 뒤에 40B descriptor entries가 이어지며 각 entry는 kind/policy, RVA, length, keyed tag, domain key를 담는다.
 - production placer가 4 family × 3 region의 최대 12-entry 공간을 mutable Program-VM state 뒤에 별도로 예약한다. 최종 M7 runtime 표현을 seal한 뒤 488B 테이블을 실제 `.textb`에 기록하고 RVA/size를 pipeline context에 보존한다. 예약 초과와 table write OOB는 fail-closed한다.
 - `corpus/o1.exe` seed 31010 최대 조합에서 BTGI table RVA `0x293000`, size 488B, count 12를 확인했고 실행 차등검증이 통과했다. 다음은 boot/runtime verifier가 이 ABI를 순회하며 tag를 재계산하고 tamper를 차단하도록 연결하는 작업이다.
+
+### 2026-08-22 — Distributed integrity boot/runtime verifier 연결
+
+- VM/RC4 부트 경로가 transient bytecode 복호화 직후 BTGI 12-entry table을 실제로 순회한다. 각 family의 handler code/table/bytecode를 domain key와 length로 초기화한 64-bit FNV-1a lockstep tag로 다시 계산하고 magic/count/tag 불일치 시 `UD2` fail-closed한다.
+- verifier가 기존 S3/S4 무결성 단계의 live secret register를 훼손하던 회귀를 디버거로 추적해 수정했다. verifier가 사용하는 8개 GPR을 성공 경로에서 완전히 복원하므로 뒤 단계에 관찰 가능한 상태 변화가 없다.
+- `corpus/o1.exe --vm --vm-oep --vm-commercial --m7 --m8 --integrity --verify-output --seed 31010` 정상 산출물은 exit 0/stdout 1,460B/stderr 0B 차등검증을 통과했다. 실제 PE의 첫 VM bytecode, handler code, handler table descriptor 영역을 각각 1 bit 변조한 3개 산출물은 모두 `STATUS_ILLEGAL_INSTRUCTION(0xC000001D)`, stdout/stderr 0B로 부트 차단됐다.
 
 ### 2026-08-22 — P2-10 실제 multi-family module/state/table 및 call/return routing 완료
 

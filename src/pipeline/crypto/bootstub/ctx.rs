@@ -235,6 +235,13 @@ pub(crate) enum Label {
     Crc4Skip,
     Crc4Done,
     Crc4Ok,
+    DistDescLoop,
+    DistMagicOk,
+    DistCountOk,
+    DistByteLoop,
+    DistByteDone,
+    DistDescOk,
+    DistAllOk,
     // S1 runtime-derived poison interlock (emit_run_decrypt) — tamper 시 런/리졸브 손상
     PoisonLoop,
     PoisonDone,

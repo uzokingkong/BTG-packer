@@ -296,7 +296,11 @@ pub(crate) fn place_boot_stub(
         chacha_aead: chacha_mode && chacha_aead_tag.is_some(),
         poly_blob_va: if chacha_mode { dispatcher_va } else { 0 },
         poly_key_va: 0,
-        poly_tag_va: 0,
+        poly_tag_va: if integrity_effective && vm_oep_effective && !chacha_mode {
+            dispatcher_va
+        } else {
+            0
+        },
     };
 
     // 1st pass: stub 길이 측정 (runs_va/seed_va/vm_* = 0)
@@ -528,6 +532,8 @@ pub(crate) fn place_boot_stub(
     };
     let poly_tag_va = if chacha_mode {
         dispatcher_va + poly_tag_off as u64
+    } else if integrity_effective && vm_oep_effective {
+        dispatcher_va
     } else {
         0
     };
@@ -1041,6 +1047,13 @@ pub(crate) fn place_boot_stub(
         crc3_va,
         crc4_va,
         w32_slot_va,
+        // RC4 Program-VM mode reuses the otherwise inactive Poly1305 tag
+        // pointer as the BTGI runtime-table carrier.
+        poly_tag_va: if vm_integrity_table_capacity > 0 {
+            dispatcher_va + vm_integrity_table_off as u64
+        } else {
+            stub2.poly_tag_va
+        },
         // M6 Phase-2.3: at-rest 암호화 대상 VA/길이 확정 (imm64/imm32 — 길이 불변)
         vm_oep_bc_va: vm_prog_bc_va,
         vm_oep_bc_len: vm_prog_bc_len,
@@ -1454,7 +1467,7 @@ pub(crate) fn place_boot_stub(
             ctx.vm_integrity_descriptors = vm::distributed_integrity::seal_region_set(
                 &btg.bytes,
                 &regions,
-                dispatcher_va - image_base,
+                dispatcher_va,
                 ctx.poly_vm_seed,
             )?;
             let serialized =
