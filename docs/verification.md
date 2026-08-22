@@ -10,7 +10,7 @@ cargo test --lib
 
 encoder/decoder roundtrip, interpreter/reference differential, native runtime, PE placement,
 cross-family routing, integrity serialization과 QA 경로를 포함합니다. 2026-08-22 기준
-최근 실행은 564 passed / 0 failed입니다.
+최근 실행은 575 passed / 0 failed입니다.
 
 ### 2. Structural validation
 

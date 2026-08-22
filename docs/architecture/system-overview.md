@@ -97,6 +97,24 @@ family native bridge range를 별도 `RUNTIME_FUNCTION`으로 등록합니다.
 문서에서 `.btgvmx/.btgvmd/.btgvms`가 항상 생성된다고 가정하면 안 됩니다. 실제
 section 이름과 protection은 선택 profile과 PE builder 결과가 기준입니다.
 
+## Family state 배치
+
+각 production family는 `0x8000` stride로 격리됩니다.
+
+| Family-relative 범위 | 용도 |
+|---|---|
+| `0x0000..0x0400` | split GPR/control bank A |
+| `0x0400..0x0800` | split GPR/control bank B |
+| `0x0800..0x1000` | transient spill window |
+| `0x1000..0x1060` | XMM backing window; core state 끝 |
+| `0x4000..0x5000` | entry family가 소유하는 256×16B lifetime sync table |
+| `0x5000..0x5018` | cross-family continuation과 shared table pointer metadata |
+| stride 끝쪽 | return call stack |
+
+`0x1060`은 handler가 사용하는 core state의 크기이고 `0x8000`은 sidecar/control 영역을
+포함한 family allocation stride입니다. lifetime table은 entry family에 한 번만 있으며
+다른 family는 `+0x5010`의 절대 pointer로 같은 table을 참조합니다.
+
 ## 안전 경계
 
 - ownership proof가 실패한 함수나 객체는 native/fail-safe로 남깁니다.
@@ -106,8 +124,7 @@ section 이름과 protection은 선택 profile과 PE builder 결과가 기준입
 
 ## 아직 남은 구조 작업
 
-- block-local/control-flow 추가 variable-length grammar;
 - RIP-relative runtime bundle materialization;
-- split state/lazy flags;
-- shared data-lifetime concurrency;
+- handler synthesis recipe coverage 확대;
+- data-lifetime exception/unwind cleanup과 복합 access proof;
 - native bridge canonical-image zeroization/oracle reduction.

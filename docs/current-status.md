@@ -5,6 +5,9 @@
 
 기준일: 2026-08-22
 
+요약 진척도는 기능 구현 약 82%, 전체 release 완료도 약 75%입니다. 이 백분율은
+아래 완료 기준을 묶은 계획 추정치이며 테스트 커버리지 비율을 뜻하지 않습니다.
+
 ## 구현 완료
 
 ### Multi-family Program VM
@@ -72,6 +75,11 @@
   무효화합니다. module entry는 clean 상태로 초기화되고 native/condition/HALT 경계만
   canonical memory flags를 관찰합니다.
 
+production family 하나는 `0x8000` stride를 소유합니다. 그 안에서 core split state는
+`0x0000..0x1060`, lifetime sync table은 entry family의 `0x4000..0x5000`, cross-family
+continuation/sync pointer metadata는 `0x5000..0x5018`, return call stack은 stride 끝쪽에
+배치됩니다. core state 크기와 family allocation stride는 서로 다른 개념입니다.
+
 ### Distributed integrity
 
 - 4 family × handler code/table/bytecode = 최대 12개 region을 독립 sealing합니다.
@@ -105,15 +113,14 @@
 |---|---|---|
 | P2-11 handler synthesis | full ISA target wrapper, 일부 실제 body recipe | execution-weight 80%에 3개 이상 body recipe |
 | P2-12 anchor 분산 | 4 instance, 4 integrity topology, ownership gate | RIP-relative runtime bundle materialization, N=20 signature gate |
-| P2-13 grammar | family operand/compact immediate/control token, super-op tag+descriptor-mask ABI | 완료 |
-| P2-14 state/lazy flags | u16 metadata, split GPR banks, temp spill/XMM/stack 분리, RSI/RDI lazy hot state, cross-family/native materialization | shared lifetime 동시성 및 추가 hot-state 후보 |
+| P2-13 grammar | family operand/compact immediate/control token, super-op tag+descriptor-mask ABI | 완료; 추가 grammar는 선택적 hardening |
+| P2-14 state/lazy flags | u16 metadata, split GPR banks, temp spill/XMM/stack 분리, RSI/RDI lazy hot state, cross-family/native materialization | canonical bridge image zeroization은 P2-15에서 진행 |
 | Data lifetime | strict ASCII/UTF-16 + exact 4/8/16B constant read, global owner-aware scope | wider format, complex memory proof 및 unwind cleanup |
 | Release gate | 575 library tests, P2-13 20-seed grammar gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
 
 ## 미구현 또는 다음 단계
 
 - shared lifetime scope의 exception/unwind cleanup과 wider object proof.
-- shared lifetime object의 thread-safe state/locking.
 - P2-15 native bridge canonical-image lifetime 축소와 oracle 감소.
 - 최신 전체 hostile corpus/20-seed release gate.
 
@@ -127,13 +134,14 @@ btg-packer.exe -i corpus\o1.exe -o protected.exe `
   --verify-output --seed 31010
 ```
 
-- library tests: 568 passed, 0 failed.
+- library tests: 575 passed, 0 failed.
 - P2-13 uninformed grammar normalization: 20 seeds × 4 families, 허용률 ≤10% 통과.
 - family runtime instances: 4.
 - 최대 family instruction ownership: 37,117 / 130,685 = 28.40%.
 - cross-family routes: 513.
-- M7 chunks: 255 across 4 streams.
+- M7 chunks: 대표 측정 254~255 across 4 streams (빌드 시점의 lift 결과에 따라 변동).
 - BTGI descriptors: 12.
+- exact-width lifetime final protected objects: 54.
 - differential execution: exit 0, stdout 1,460B, stderr 0B.
 
 이 수치는 `corpus/o1.exe`, seed 31010의 측정값이며 모든 입력에 대한 보장은 아닙니다.

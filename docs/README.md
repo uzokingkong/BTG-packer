@@ -12,7 +12,9 @@
 | [시스템 아키텍처](architecture/system-overview.md) | multi-family compiler/runtime/배치 구조 |
 | [실제 패킹 파이프라인](architecture/actual-pipeline.md) | pass와 boot/build 처리 순서 |
 | [검증 기준](verification.md) | unit, structural, execution, tamper gate |
-| [현재 개선 계획](../plan_vmrestore_upgraded.md) | P2 단계별 다음 작업과 진행 기록 |
+| [현재 구현 계획](../plan_vmrestore_upgraded.md) | 앞으로 구현할 작업과 완료 기준 |
+| [2026-08-22 전체 계획 기록](history/plan_vmrestore_upgraded-2026-08-22-full.md) | 이전 감사·진행일지·장기 계획 원문 |
+| [역사 문서 안내](history/README.md) | 대형 과거 원문과 현재 대체 문서 매핑 |
 
 ## 보조 아키텍처 문서
 
@@ -45,6 +47,10 @@
 - `docs/audit-*.md`: 특정 시점의 gap audit
 - `docs/vault/`: 별도 CTF/challenge 기록
 - `docs/integrity-*.md`: 이전 integrity 단계의 설계·실험 기록
+- `docs/history/`: 현재 문서에서 분리한 대형 과거 계획·감사 원문
+
+`docs/journal/2026-08-15.md` 일부에는 과거 저장 과정에서 손상된 문자(U+FFFD)가
+남아 있습니다. 실행 계약의 근거로 사용하지 않으며 원문 추정 복원도 하지 않습니다.
 
 ## 유지보수 규칙
 
@@ -54,3 +60,4 @@
 3. 계획은 “구현됨”, “부분 구현”, “계획”을 명시적으로 구분합니다.
 4. 존재하지 않는 section/module 이름을 production 사실처럼 쓰지 않습니다.
 5. 날짜 문서는 수정 당시 사실을 보존하고, 최신 판정은 canonical 문서로 링크합니다.
+6. 현재 계획에는 미완료 작업만 두고 완료 과정은 journal/history로 이동합니다.

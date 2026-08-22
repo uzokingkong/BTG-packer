@@ -59,7 +59,8 @@
 
 1. family code/table/bytecode blob을 합치되 각 range metadata를 유지합니다.
 2. M7 사용 시 family bytecode를 instruction boundary chunk로 persistent 암호화합니다.
-3. strict proof를 통과한 lifetime object를 at-rest ciphertext로 변환합니다.
+3. strict proof를 통과한 문자열과 exact-width constant-pool lifetime object를
+   at-rest ciphertext로 변환하고 공통 owner/depth/lock table을 연결합니다.
 4. final runtime representation을 기준으로 family code/table/bytecode를 sealing합니다.
 5. 최대 12개 descriptor를 `BTGI` table로 serialize합니다.
 6. profile에 따른 transient boot crypto wrapper를 적용합니다.
@@ -106,8 +107,8 @@ GPR을 복원하여 이후 integrity stage의 live state를 보존합니다.
 
 ## 현재 미완료
 
-- compact immediate와 추가 variable-length grammar;
-- split state/lazy flags;
-- shared lifetime object concurrency;
-- native bridge oracle reduction;
-- 최신 전체 hostile corpus와 20-seed gate.
+- lifetime scope의 exception/unwind cleanup과 복합 memory proof;
+- P2-11 handler body recipe의 execution-weight 80% 확대;
+- RIP-relative runtime bundle과 N=20 anchor signature gate;
+- native bridge live-set marshaling 및 canonical image zeroization;
+- 최신 전체 hostile corpus와 실제 20-seed pack+execute gate.
