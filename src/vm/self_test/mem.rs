@@ -165,17 +165,16 @@ pub(crate) fn run_mem_model_test() -> Result<()> {
     Ok(())
 }
 
-/// [27] M7 (v41): on-demand 재암호화(anti-dump) — RC4 청크를 복호화→사용→재암호화하여
+/// [27] M7 (v41): on-demand 재암호화(anti-dump) — RC1 청크를 복호화→사용→재암호화하여
 /// 반환 시점에 다시 암호문이 되고, "사용 직후 덤프"가 평문을 노출하지 않는지 검증한다.
 pub(crate) fn run_m7_ondemand_reencrypt_test() -> Result<()> {
-    use crate::pipeline::ondemand::{process_on_demand, simulate_dump, Rc4};
+    use crate::pipeline::ondemand::{crypt_on_demand_region, process_on_demand, simulate_dump};
 
     let key = b"m7-ondemand-key-0x9E3779B9";
     let plain: &[u8] = b"The original .text must not be plaintext at dump time. 0123456789abcdef";
     // file-state ciphertext
     let mut cipher = plain.to_vec();
-    let mut rc4 = Rc4::new(key);
-    rc4.crypt(&mut cipher);
+    crypt_on_demand_region(&mut cipher, key, 0);
     assert_ne!(cipher, plain, "[27] cipher should differ from plain");
 
     // on-demand: decrypt→use→re-encrypt leaves it encrypted (anti-dump)
@@ -196,8 +195,7 @@ pub(crate) fn run_m7_ondemand_reencrypt_test() -> Result<()> {
     );
 
     // round-trip: decrypt again recovers plaintext (functional correctness kept)
-    let mut rc4b = Rc4::new(key);
-    rc4b.crypt(&mut buf);
+    crypt_on_demand_region(&mut buf, key, 0);
     assert_eq!(buf, plain, "[27] re-decrypt must recover plaintext");
 
     Ok(())

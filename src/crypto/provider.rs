@@ -20,6 +20,10 @@
 // 이루어진다 (plan.txt 4~6단계).
 // ==============================================================================
 
+use crate::crypto::chacha20::{chacha_apply, chacha_init_state, CHA_STATE_SIZE};
+use crate::crypto::region_cipher::{
+    derive_region_key_nonce, derive_root_secret, RegionContext, RegionKind,
+};
 use crate::crypto::state::BtgCipher;
 use crate::pipeline::crypto::cipher::Rc4;
 use std::fmt;
@@ -110,6 +114,72 @@ pub trait CryptoProvider: Sized {
     /// 블록 전체를 복호화 (스트림 암호에서 encrypt와 동일).
     fn decrypt_block(&mut self, meta: &BlockCryptoMeta, buf: &mut [u8]) -> Result<(), CryptoError> {
         self.encrypt_block(meta, buf)
+    }
+}
+
+/// BTG-RC1 provider adapter for consumers which still use the stream-oriented
+/// `CryptoProvider` boundary.  A derived provider key is `key[32] || nonce[12]`;
+/// unlike the legacy provider it carries an independent nonce and never builds
+/// an RC4 permutation table.
+pub struct RegionCipherProvider {
+    state: [u8; CHA_STATE_SIZE],
+}
+
+impl CryptoProvider for RegionCipherProvider {
+    fn derive_block_key(master_key: &[u8], meta: &BlockCryptoMeta) -> Vec<u8> {
+        let root = derive_root_secret(master_key);
+        let context = RegionContext {
+            region_id: meta.block_id as u64,
+            family_id: meta.nonce,
+            function_id: meta.offset,
+            predecessor_token: ((meta.offset as u32) ^ meta.length) as u64,
+            integrity_epoch: meta.epoch as u64,
+            kind: RegionKind::NativeText,
+        };
+        let (key, nonce) = derive_region_key_nonce(&root, context);
+        let mut material = Vec::with_capacity(44);
+        material.extend_from_slice(&key);
+        material.extend_from_slice(&nonce);
+        material
+    }
+
+    fn from_key(material: &[u8]) -> Self {
+        // Derived keys are the provider ABI.  For direct callers, domain-separate
+        // arbitrary input once and use a fixed provider context rather than
+        // padding/truncating it into a raw ChaCha key.
+        let (key, nonce) = if material.len() == 44 {
+            let mut key = [0u8; 32];
+            let mut nonce = [0u8; 12];
+            key.copy_from_slice(&material[..32]);
+            nonce.copy_from_slice(&material[32..]);
+            (key, nonce)
+        } else {
+            let root = derive_root_secret(material);
+            derive_region_key_nonce(
+                &root,
+                RegionContext {
+                    region_id: 0,
+                    family_id: 0,
+                    function_id: 0,
+                    predecessor_token: 0,
+                    integrity_epoch: 0,
+                    kind: RegionKind::Metadata,
+                },
+            )
+        };
+        let mut state = [0u8; CHA_STATE_SIZE];
+        chacha_init_state(&mut state, &key, &nonce);
+        Self { state }
+    }
+
+    fn apply(&mut self, buf: &mut [u8]) {
+        chacha_apply(&mut self.state, buf);
+    }
+}
+
+impl Drop for RegionCipherProvider {
+    fn drop(&mut self) {
+        self.state.fill(0);
     }
 }
 
@@ -274,6 +344,53 @@ mod tests {
         assert_ne!(data, orig);
         dec.decrypt_block(&meta, &mut data).unwrap();
         assert_eq!(data, orig);
+    }
+
+    #[test]
+    fn region_cipher_provider_roundtrip_and_context_separation() {
+        let master = b"provider root material";
+        let a = BlockCryptoMeta::new(7, 0x2000, 512);
+        let mut b = a;
+        b.epoch = 1;
+        let key_a = RegionCipherProvider::derive_block_key(master, &a);
+        let key_b = RegionCipherProvider::derive_block_key(master, &b);
+        assert_eq!(key_a.len(), 44);
+        assert_ne!(key_a, key_b, "integrity epoch must rotate key material");
+
+        let plain = vec![0x5A; 512];
+        let mut encrypted = plain.clone();
+        RegionCipherProvider::from_key(&key_a)
+            .encrypt_block(&a, &mut encrypted)
+            .unwrap();
+        assert_ne!(encrypted, plain);
+        RegionCipherProvider::from_key(&key_a)
+            .decrypt_block(&a, &mut encrypted)
+            .unwrap();
+        assert_eq!(encrypted, plain);
+    }
+
+    #[test]
+    fn region_cipher_provider_chain_roundtrip() {
+        let anchor = [0x31; 256];
+        let mut data: Vec<u8> = (0..700).map(|i| (i * 29) as u8).collect();
+        let plain = data.clone();
+        chain_encrypt_with::<RegionCipherProvider>(&mut data, &anchor);
+        assert_ne!(data, plain);
+
+        let mut previous = anchor;
+        let mut offset = 0;
+        while offset < data.len() {
+            let length = (data.len() - offset).min(256);
+            RegionCipherProvider::from_key(&previous).apply(&mut data[offset..offset + length]);
+            if offset + length >= 256 {
+                previous.copy_from_slice(&plain[offset + length - 256..offset + length]);
+            } else {
+                previous = [0; 256];
+                previous[..offset + length].copy_from_slice(&plain[..offset + length]);
+            }
+            offset += length;
+        }
+        assert_eq!(data, plain);
     }
 
     #[test]
