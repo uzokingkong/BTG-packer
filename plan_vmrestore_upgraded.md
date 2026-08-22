@@ -4,6 +4,12 @@
 
 ## 진행 기록
 
+### 2026-08-22 — P2-14 transient spill state domain 분리
+
+- production temp 8개를 GPR bank에서 제거하고 `+0x800` 독립 spill window 안에서 family seed별로 순열한다. persistent vreg bank와 transient handler scratch가 같은 permutation domain을 공유하지 않게 했다.
+- XMM window는 `+0x1000`, 전체 state는 `0x1060`으로 이동했고 virtual stack base와 production allocation은 상수를 따라 함께 이동한다. validator는 spill window의 정렬/범위와 persistent bank alias를 fail-closed 검사한다.
+- seeded native runtime, super-op 전체, cross-family call/resume, Win64 FP bridge 회귀가 통과했다. library 기준은 571개이며 다음 P2-14 범위는 안전한 hot-state register cache와 shared lifetime 동시성이다.
+
 ### 2026-08-22 — P2-14 lazy flag producer 및 경계 materialization
 
 - 일반 산술/논리 flag producer는 canonical flags를 매번 쓰지 않고 전용 snapshot slot과 1-byte validity token을 갱신한다. 연속 producer는 branch-free `CMOVNE` 선택으로 최신 token의 비상태 비트를 계승해 super-op handler 복제 규칙도 유지한다.
