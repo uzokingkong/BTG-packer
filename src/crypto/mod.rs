@@ -34,6 +34,7 @@ pub mod chacha20_native;
 // T3-1 Phase D: Poly1305 (RFC 8439 §2.5) reference + boot-stub native verify blob.
 pub mod poly1305;
 pub mod poly1305_native;
+pub mod region_cipher;
 
 /// T3-1 Phase B: 부트 스텁/패커가 공유하는 crypto primitive 모드.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
