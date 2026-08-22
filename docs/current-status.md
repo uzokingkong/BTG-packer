@@ -143,14 +143,14 @@ continuation/sync pointer metadata는 `0x5000..0x5018`, return call stack은 str
 | P2-12 anchor 분산 | 4 instance, 4 integrity topology, ownership gate | RIP-relative runtime bundle materialization, N=20 signature gate |
 | P2-13 grammar | family operand/compact immediate/control token, super-op tag+descriptor-mask ABI | 완료; 추가 grammar는 선택적 hardening |
 | P2-14 state/lazy flags | u16 metadata, split GPR banks, temp spill/XMM/stack 분리, RSI/RDI lazy hot state, cross-family/native materialization | canonical bridge image zeroization은 P2-15에서 진행 |
-| Data lifetime | strict ASCII/UTF-16 + exact 4/8/16B constant read, global owner-aware scope | wider format, complex memory proof 및 unwind cleanup |
-| Release gate | 575 library tests, P2-13 20-seed grammar gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
+| Data lifetime | exact 4/8/16B direct read, global owner-aware scope, call/unwind 교차 참조 fail-closed 제외 | cleanup handler ABI 뒤 call-scoped object 재활성화, wider format/complex proof |
+| Release gate | 576 library tests, P2-13 20-seed grammar gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
 | Library API | 기본 CFG+crypto in-memory `pack/run_full` | CLI effective profile 전체를 노출하는 typed API |
 | Platform/PE matrix | 대표 Windows x64 PE, `.pdata`/reloc/IAT/resource 구조 검증 | 전체 ASLR/CFG/CET/TLS/compiler matrix 최신 재실행 |
 
 ## 미구현 또는 다음 단계
 
-- shared lifetime scope의 exception/unwind cleanup과 wider object proof.
+- call-scoped lifetime object의 language-specific exception/unwind cleanup과 wider object proof.
 - P2-15 native bridge canonical-image lifetime 축소와 oracle 감소.
 - 최신 전체 hostile corpus/20-seed release gate.
 - CLI와 동등한 full-profile library API 및 capability introspection.
@@ -165,14 +165,15 @@ btg-packer.exe -i corpus\o1.exe -o protected.exe `
   --verify-output --seed 31010
 ```
 
-- library tests: 575 passed, 0 failed.
+- library tests: 576 passed, 0 failed.
 - P2-13 uninformed grammar normalization: 20 seeds × 4 families, 허용률 ≤10% 통과.
 - family runtime instances: 4.
 - 최대 family instruction ownership: 37,117 / 130,685 = 28.40%.
 - cross-family routes: 513.
 - M7 chunks: 대표 측정 254~255 across 4 streams (빌드 시점의 lift 결과에 따라 변동).
 - BTGI descriptors: 12.
-- exact-width lifetime final protected objects: 54.
+- unwind-safe exact-width lifetime final protected objects: 9 (182 candidate / 116 strict-scope,
+  call 또는 cross-boundary object 107개 fail-closed 제외).
 - differential execution: exit 0, stdout 1,460B, stderr 0B.
 
 이 수치는 `corpus/o1.exe`, seed 31010의 측정값이며 모든 입력에 대한 보장은 아닙니다.

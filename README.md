@@ -10,7 +10,7 @@ whole-program multi-family Program-VM, QA·재현·진단 산출물을 하나의
 
 ## 현재 상태
 
-기준: `main` · 2026-08-22
+기준: `main` · 2026-08-23
 
 | 영역 | 상태 | 실제 구현 |
 |---|---|---|
@@ -24,10 +24,10 @@ whole-program multi-family Program-VM, QA·재현·진단 산출물을 하나의
 | Bytecode 보호 | 구현됨 | rolling-key stream, family별 ISA, M7 instruction-aligned chunk 암호화 |
 | Handler table | 구현됨 | per-opcode key, MBA key derivation, family별 integrity traversal |
 | Distributed integrity | 구현됨 | family별 code/table/bytecode 12개 BTGI descriptor와 boot verifier |
-| Data lifetime | 부분 구현 | ASCII/UTF-16 및 exact-width constant pool에 owner-aware scoped 보호 연결 |
+| Data lifetime | 부분 구현 | exact-width direct read에 owner-aware scope와 unwind-safe fail-closed 선별 연결 |
 | P2-13 grammar | 완료 | family operand/compact immediate/control token 및 독립 super-op grammar production 연결 |
 | P2-14 state/lazy flags | 핵심 완료 | split domains와 RSI/RDI hot lazy state, branch/native/HALT materialization 연결 |
-| Release gate | 부분 완료 | library 575/575 및 P2-13 20-seed grammar gate 통과; 전체 pack gate 재실행 필요 |
+| Release gate | 부분 완료 | library 576/576 및 P2-13 20-seed grammar gate 통과; 전체 pack gate 재실행 필요 |
 | QA/diagnostics | 구현됨 | compiler corpus, differential/multi-seed, manifest, ownership와 VM maps |
 
 완료/부분/계획의 상세 근거는 [현재 구현 상태](docs/current-status.md)를 기준으로
@@ -92,7 +92,7 @@ target\release\btg-packer.exe `
 ```
 
 `--verify-output`은 원본과 보호본의 exit code/stdout/stderr를 byte 단위로
-비교합니다. 현재 기록된 기준은 library 575/575, 대표 최대 조합 exit 0,
+비교합니다. 현재 기록된 기준은 library 576/576, 대표 최대 조합 exit 0,
 stdout 1,460B, stderr 0B입니다. 검증 범위와 재현 명령은
 [검증 기준](docs/verification.md)을 참고하세요.
 
@@ -129,7 +129,8 @@ Commercial 경로는 `--vm --vm-oep --vm-commercial`을 명시하세요.
 - P2-13 control grammar는 family별 compact direct/keyed/table-selector/continuation token과 super-op tag/descriptor-mask ABI까지 production 연결됐습니다.
 - P2-14 split state, temp spill window, register-resident lazy flag와 경계 물질화가
   연결됐습니다. 공유 lifetime 객체도 전역 owner/depth/atomic lock으로 동기화되며,
-  예외/unwind cleanup이 남아 있습니다.
+  현재는 native call/unwind를 가로지르지 않는 exact-width direct scope만 보호합니다.
+  호출을 가로지르는 객체를 다시 활성화하려면 language-specific cleanup handler가 필요합니다.
 - P2-15 native bridge oracle 감소는 미완료입니다.
 - 일부 TLS, unwind, panic, setjmp/longjmp, loader-critical 함수는 안전을 위해
   native로 유지됩니다.

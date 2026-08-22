@@ -149,7 +149,7 @@ pub fn analyze_referenced_literals(
 /// Exact-width, read-only RIP-relative loads only.  Excluding arithmetic RMW,
 /// XCHG/CMPXCHG and memory destinations keeps constant-pool encryption from
 /// changing writable/static state semantics.
-fn direct_constant_load_width(instruction: &Instruction) -> Option<u32> {
+pub(crate) fn direct_constant_load_width(instruction: &Instruction) -> Option<u32> {
     if !instruction.is_ip_rel_memory_operand()
         || instruction.op0_kind() != OpKind::Register
         || instruction.op1_kind() != OpKind::Memory
@@ -170,6 +170,25 @@ fn direct_constant_load_width(instruction: &Instruction) -> Option<u32> {
         return None;
     }
     Some(instruction.memory_size().size() as u32)
+}
+
+/// True only when one reference can be protected without keeping its lifetime
+/// scope active across a call or another unwind-capable control boundary.
+pub(crate) fn is_unwind_safe_direct_reference(
+    instruction: &Instruction,
+    object: &LiteralObject,
+    image_base: u64,
+) -> bool {
+    let Some(width) = direct_constant_load_width(instruction) else {
+        return false;
+    };
+    let target = instruction.ip_rel_memory_address();
+    let object_start = image_base.saturating_add(object.rva as u64);
+    let object_end = image_base.saturating_add(object.rva.saturating_add(object.len) as u64);
+    target >= object_start
+        && target
+            .checked_add(width as u64)
+            .is_some_and(|end| end <= object_end)
 }
 
 /// Selects the strict subset whose address is loaded directly into a Win64
@@ -550,6 +569,49 @@ mod tests {
         assert_eq!(objects[0].rva, data_rva);
         assert_eq!(objects[0].len, 8);
         assert_eq!(objects[0].references, vec![text_rva]);
+        assert!(is_unwind_safe_direct_reference(
+            &decoded,
+            &objects[0],
+            image_base
+        ));
+    }
+
+    #[test]
+    fn unwind_safe_scope_rejects_lea_call_argument_reference() {
+        let image_base = 0x1400_0000_0u64;
+        let text_rva = 0x1000u32;
+        let data_rva = 0x3000u32;
+        let mut lea = Instruction::with2(
+            Code::Lea_r64_m,
+            Register::RCX,
+            MemoryOperand::with_base_displ(Register::RIP, (image_base + data_rva as u64) as i64),
+        )
+        .unwrap();
+        lea.set_ip(image_base + text_rva as u64);
+        let encoded = BlockEncoder::encode(
+            64,
+            InstructionBlock::new(&[lea], image_base + text_rva as u64),
+            BlockEncoderOptions::NONE,
+        )
+        .unwrap()
+        .code_buffer;
+        let mut decoder = Decoder::with_ip(
+            64,
+            &encoded,
+            image_base + text_rva as u64,
+            DecoderOptions::NONE,
+        );
+        let decoded = decoder.decode();
+        let object = LiteralObject {
+            class: DataClass::Ascii,
+            rva: data_rva,
+            len: 8,
+            references: vec![text_rva],
+        };
+        assert_eq!(direct_constant_load_width(&decoded), None);
+        assert!(!is_unwind_safe_direct_reference(
+            &decoded, &object, image_base
+        ));
     }
 
     #[test]

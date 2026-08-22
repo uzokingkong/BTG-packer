@@ -6,9 +6,9 @@
 보존합니다. 구현 상태 판정은 [`docs/current-status.md`](docs/current-status.md)가
 단일 기준입니다.
 
-기준일: 2026-08-22
+기준일: 2026-08-23
 
-기준 구현 커밋: `94e5388`
+기준 구현 커밋: `c4b64c5` 이후 현재 변경
 
 진척도: 기능 구현 약 82%, release 완료도 약 75%
 
@@ -28,8 +28,13 @@
 
 ### 1. Data-lifetime exception/unwind cleanup
 
-- acquire 뒤 예외나 unwind가 발생해도 scope가 반드시 release되도록 cleanup 경로를
-  production bridge/unwind 계약에 연결한다.
+현재 완료된 1단계: native call 또는 cross-boundary 참조가 하나라도 있는 객체를 at-rest
+보호에서 제외하고, exact-width direct read만 scope로 허용하는 unwind-safe fail-closed gate를
+production 선별과 metadata sizing 양쪽에 연결했습니다. 따라서 cleanup handler가 없는 현재
+ABI에서는 활성 lifetime lock/plaintext가 native unwind 경계를 가로지르지 않습니다.
+
+- 호출을 가로지르는 객체까지 보호 범위를 다시 넓히려면 acquire 뒤 예외나 unwind에서도
+  release되는 language-specific cleanup 경로를 production bridge/unwind 계약에 연결한다.
 - nested scope, cross-family 전환, native exception을 각각 독립 fixture로 검증한다.
 - 복합 table access는 모든 참조와 폭이 증명되는 경우에만 활성화하고 나머지는
   fail-closed 제외한다.
@@ -70,10 +75,11 @@
 
 ## 현재 검증 기준
 
-- `cargo test --lib`: 575 passed, 0 failed.
+- `cargo test --lib`: 576 passed, 0 failed.
 - `corpus/o1.exe`, seed 31010 대표 최대 조합: exit 0, stdout 1,460B,
   stderr 0B 동치.
-- exact-width lifetime 적용 시 최종 보호 객체 54개.
+- unwind-safe exact-width lifetime 적용 시 최종 보호 객체 9개. 후보 182개/strict scope
+  116개 중 call 또는 cross-boundary 객체 107개를 fail-closed 제외했습니다.
 - 위 결과는 대표 기준이며 최신 전체 release matrix 통과를 의미하지 않습니다.
 
 ## 문서 갱신 규칙
