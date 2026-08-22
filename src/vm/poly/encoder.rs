@@ -66,7 +66,10 @@ impl PolymorphicEncoder {
         let encode_operand = |op: Option<MicroOperand>, spec: &VirtualIsaSpec| match op {
             Some(MicroOperand::VReg(r)) => (0x80 | spec.encode_reg(r), None),
             Some(MicroOperand::Temp(t)) => (0xC0 | (t & 0x07), None),
-            Some(MicroOperand::Imm64(v)) => (0x01, Some(v)),
+            Some(MicroOperand::Imm64(v)) => (
+                spec.immediate_marker(VirtualIsaSpec::immediate_width_for_value(v)),
+                Some(v),
+            ),
             Some(MicroOperand::Vsp) => (0x40, None),
             Some(MicroOperand::Vflags) => (0x41, None),
             _ => (0x00, None),
@@ -79,7 +82,12 @@ impl PolymorphicEncoder {
             self.push_encrypted(out, vip, operands[logical_slot]);
         }
         for value in [imm1, imm2].into_iter().flatten() {
-            for byte in (value ^ self.spec.operand_mask).to_le_bytes() {
+            let width = VirtualIsaSpec::immediate_width_for_value(value);
+            for byte in (value ^ self.spec.operand_mask)
+                .to_le_bytes()
+                .into_iter()
+                .take(width)
+            {
                 self.push_encrypted(out, vip, byte);
             }
         }
@@ -181,7 +189,10 @@ impl PolymorphicEncoder {
                     match op {
                         Some(MicroOperand::VReg(r)) => (0x80 | spec.encode_reg(r), None),
                         Some(MicroOperand::Temp(t)) => (0xC0 | (t & 0x07), None),
-                        Some(MicroOperand::Imm64(v)) => (0x01, Some(v)),
+                        Some(MicroOperand::Imm64(v)) => (
+                            spec.immediate_marker(VirtualIsaSpec::immediate_width_for_value(v)),
+                            Some(v),
+                        ),
                         Some(MicroOperand::Vsp) => (0x40, None),
                         Some(MicroOperand::Vflags) => (0x41, None),
                         _ => (0x00, None),
@@ -201,14 +212,22 @@ impl PolymorphicEncoder {
             // 3. Emit immediates
             if let Some(v1) = imm1 {
                 let enc = v1 ^ self.spec.operand_mask;
-                for b in enc.to_le_bytes() {
+                for b in enc
+                    .to_le_bytes()
+                    .into_iter()
+                    .take(VirtualIsaSpec::immediate_width_for_value(v1))
+                {
                     out.push(self.rolling.encrypt_byte(b, vip));
                     vip += 1;
                 }
             }
             if let Some(v2) = imm2 {
                 let enc = v2 ^ self.spec.operand_mask;
-                for b in enc.to_le_bytes() {
+                for b in enc
+                    .to_le_bytes()
+                    .into_iter()
+                    .take(VirtualIsaSpec::immediate_width_for_value(v2))
+                {
                     out.push(self.rolling.encrypt_byte(b, vip));
                     vip += 1;
                 }
@@ -536,6 +555,46 @@ mod tests {
                     "{wrong_family:?} parser recovered {family:?} grammar"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn family_compact_immediate_markers_cover_all_widths() {
+        let seed = 0x5032_2D31_332D_494D;
+        let values = [0x7Fu64, 0x1234, 0x1234_5678, 0x1122_3344_5566_7788];
+        let mut instrs = values
+            .into_iter()
+            .enumerate()
+            .map(|(reg, value)| {
+                MicroInstr::new(RiscOp::Mov)
+                    .with_dst(MicroOperand::VReg(reg as u8))
+                    .with_src1(MicroOperand::Imm64(value))
+            })
+            .collect::<Vec<_>>();
+        instrs.push(MicroInstr::new(RiscOp::Halt));
+        let program = RiscProgram::new(instrs);
+
+        for family in VmArchitectureFamily::ALL {
+            let mut encoder = PolymorphicEncoder::new_for_family(seed, family);
+            let stream = encoder.encode(&program).unwrap();
+            // Four records: opcode+3 descriptors+1/2/4/8 payload, plus Halt's 4B.
+            assert_eq!(stream.len(), 35);
+            let spec = VirtualIsaSpec::from_seed_and_family(seed, family);
+            assert_eq!(
+                values.map(VirtualIsaSpec::immediate_width_for_value),
+                [1, 2, 4, 8]
+            );
+            for width in [1, 2, 4, 8] {
+                assert_eq!(
+                    spec.immediate_width(spec.immediate_marker(width)),
+                    Some(width)
+                );
+            }
+            let mut decoder = PolymorphicDecoder::new_for_family(seed, family);
+            assert_eq!(
+                decoder.decode_full(&stream, false).unwrap().instrs,
+                program.instrs
+            );
         }
     }
 }

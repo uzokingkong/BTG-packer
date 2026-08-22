@@ -21,9 +21,9 @@ partition한 뒤 독립 bytecode/module/state/table과 native self-decoding runt
 | Handler table | 구현됨 | per-opcode key, MBA key derivation, family별 integrity traversal |
 | Distributed integrity | 구현됨 | family별 code/table/bytecode 12개 BTGI descriptor와 boot verifier |
 | Data lifetime | 부분 구현 | strict proof가 가능한 ASCII/UTF-16 literal을 사용 직전 복호화 후 재암호화 |
-| P2-13 grammar | 진행 중 | family별 operand 순서와 branch-target token 완료; compact immediate 예정 |
+| P2-13 grammar | 진행 중 | family별 operand 순서, branch-target token, 1/2/4/8B compact immediate 완료 |
 | P2-14 state/lazy flags | 계획 | family별 state는 독립이지만 canonical state의 추가 분할은 미완료 |
-| Release gate | 부분 완료 | library 564/564 및 대표 최대 조합 통과; 최신 20-seed 전체 재실행 필요 |
+| Release gate | 부분 완료 | library 565/565 및 대표 최대 조합 통과; 최신 20-seed 전체 재실행 필요 |
 
 완료/부분/계획의 상세 근거는 [현재 구현 상태](docs/current-status.md)를 기준으로
 합니다. 오래된 journal·audit 문서의 상태 문구는 당시 시점의 기록이며 현재 상태를
@@ -88,7 +88,7 @@ target\release\btg-packer.exe `
 ```
 
 `--verify-output`은 원본과 보호본의 exit code/stdout/stderr를 byte 단위로
-비교합니다. 현재 기록된 기준은 library 564/564, 대표 최대 조합 exit 0,
+비교합니다. 현재 기록된 기준은 library 565/565, 대표 최대 조합 exit 0,
 stdout 1,460B, stderr 0B입니다. 검증 범위와 재현 명령은
 [검증 기준](docs/verification.md)을 참고하세요.
 
@@ -117,7 +117,7 @@ stdout 1,460B, stderr 0B입니다. 검증 범위와 재현 명령은
 
 ## 알려진 한계
 
-- P2-13 compact immediate와 추가 variable-length grammar는 아직 구현 중입니다.
+- P2-13의 signed compact/control-flow 추가 variable-length grammar는 아직 구현 중입니다.
 - P2-14 canonical state splitting/lazy flags와 공유 lifetime 객체 동시성은 미완료입니다.
 - P2-15 native bridge oracle 감소는 미완료입니다.
 - 일부 TLS, unwind, panic, setjmp/longjmp, loader-critical 함수는 안전을 위해

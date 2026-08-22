@@ -39,6 +39,51 @@ const MEMORY_WIDTHS: [u8; 4] = [1, 2, 4, 8];
 const COUNTER_WIDTHS: [u8; 3] = [2, 4, 8];
 
 impl VirtualIsaSpec {
+    /// Family-local compact-immediate marker order for widths 1/2/4/8.
+    /// All markers stay in the otherwise-unused scalar descriptor range.
+    pub fn immediate_markers(&self) -> [u8; 4] {
+        match self.family {
+            VmArchitectureFamily::Stack => [0x01, 0x02, 0x03, 0x04],
+            VmArchitectureFamily::Register => [0x03, 0x01, 0x04, 0x02],
+            VmArchitectureFamily::MixedRisc => [0x04, 0x03, 0x02, 0x01],
+            VmArchitectureFamily::FusedCisc => [0x02, 0x04, 0x01, 0x03],
+        }
+    }
+
+    pub fn immediate_width_for_value(value: u64) -> usize {
+        if value <= u8::MAX as u64 {
+            1
+        } else if value <= u16::MAX as u64 {
+            2
+        } else if value <= u32::MAX as u64 {
+            4
+        } else {
+            8
+        }
+    }
+
+    pub fn immediate_marker(&self, width: usize) -> u8 {
+        let index = match width {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            _ => unreachable!(),
+        };
+        self.immediate_markers()[index]
+    }
+
+    pub fn immediate_width(&self, marker: u8) -> Option<usize> {
+        self.immediate_markers()
+            .iter()
+            .position(|&candidate| candidate == marker)
+            .map(|index| [1, 2, 4, 8][index])
+    }
+
+    pub fn is_immediate_marker(&self, marker: u8) -> bool {
+        self.immediate_width(marker).is_some()
+    }
+
     /// Physical order of the three operand descriptor bytes. The returned
     /// values are logical slots: 0=dst, 1=src1, 2=src2.
     pub fn operand_order(&self) -> [usize; 3] {

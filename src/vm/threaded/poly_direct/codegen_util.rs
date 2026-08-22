@@ -446,6 +446,47 @@ pub(crate) fn emit_read_imm8(
     store_m(b, slot, accum);
 }
 
+/// Read a compact immediate whose descriptor is stored in `marker_slot`.
+/// The operand-offset table carries its family-local decoded width (1/2/4/8).
+pub(crate) fn emit_read_compact_imm(
+    b: &mut CodeBuilder,
+    marker_slot: i32,
+    slot: i32,
+    sub_decrypt: usize,
+    mask: u64,
+    operand_offs: usize,
+) {
+    movzx8_m(b, Register::EAX, marker_slot);
+    let width_mem = MemoryOperand::with_base_index_scale_displ_size(
+        Register::R15,
+        Register::RAX,
+        1,
+        operand_offs as i64,
+        1,
+    );
+    b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, width_mem).unwrap());
+    store_m(b, DEC_CIN, Register::RAX);
+    b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RBX, Register::RBX).unwrap());
+    b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RBP, Register::RBP).unwrap());
+    let loop_start = b.len();
+    b.call(sub_decrypt);
+    b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::AL).unwrap());
+    b.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EBP).unwrap());
+    b.push(Instruction::with2(Code::Shl_rm64_CL, Register::RAX, Register::CL).unwrap());
+    b.push(Instruction::with2(Code::Or_rm64_r64, Register::RBX, Register::RAX).unwrap());
+    b.push(Instruction::with2(Code::Add_rm64_imm8, Register::RBP, 8).unwrap());
+    b.push(Instruction::with1(Code::Dec_rm64, m(DEC_CIN)).unwrap());
+    b.br(Code::Jne_rel32_64, loop_start);
+    movi(b, Register::RCX, mask);
+    b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RBX, Register::RCX).unwrap());
+    // Zero bits above the encoded width after applying the full operand mask.
+    movi(b, Register::RCX, 64);
+    b.push(Instruction::with2(Code::Sub_rm64_r64, Register::RCX, Register::RBP).unwrap());
+    b.push(Instruction::with2(Code::Shl_rm64_CL, Register::RBX, Register::CL).unwrap());
+    b.push(Instruction::with2(Code::Shr_rm64_CL, Register::RBX, Register::CL).unwrap());
+    store_m(b, slot, Register::RBX);
+}
+
 #[cfg(test)]
 mod code_builder_tests {
     use super::*;

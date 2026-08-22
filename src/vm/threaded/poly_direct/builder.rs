@@ -358,8 +358,8 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
                 }
             }
             _ => {
-                if raw == 0x01 {
-                    (0, K_IMM)
+                if let Some(width) = spec.immediate_width(raw) {
+                    (width as u8, K_IMM)
                 } else {
                     (0, K_NONE)
                 }
@@ -724,17 +724,19 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             b.call(sub_decrypt);
             store_decoded_al(&mut b, offset, salt);
         }
-        // imm1 if src1 == 0x01
+        // compact imm1 if src1 is one of the family-local markers
         movzx8_m(&mut b, Register::EAX, DEC_SRC1);
-        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 0x01).unwrap());
+        b.push(Instruction::with2(Code::Sub_rm32_imm32, Register::EAX, 1).unwrap());
+        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 3).unwrap());
         let after_imm1 = b.len() + 1;
-        b.jne(after_imm1);
-        emit_read_imm8(
+        b.br(Code::Ja_rel32_64, after_imm1);
+        emit_read_compact_imm(
             &mut b,
+            DEC_SRC1,
             DEC_IMM1,
             sub_decrypt,
             spec.operand_mask,
-            (seed >> 7) as u8,
+            layout.operand_offs_off,
         );
         let t1 = b.len();
         for &mut (bi, ref mut ti) in b.branches.iter_mut() {
@@ -744,15 +746,17 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         }
         // imm2 if src2 == 0x01
         movzx8_m(&mut b, Register::EAX, DEC_SRC2);
-        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 0x01).unwrap());
+        b.push(Instruction::with2(Code::Sub_rm32_imm32, Register::EAX, 1).unwrap());
+        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 3).unwrap());
         let after_imm2 = b.len() + 1;
-        b.jne(after_imm2);
-        emit_read_imm8(
+        b.br(Code::Ja_rel32_64, after_imm2);
+        emit_read_compact_imm(
             &mut b,
+            DEC_SRC2,
             DEC_IMM2,
             sub_decrypt,
             spec.operand_mask,
-            (seed >> 29) as u8,
+            layout.operand_offs_off,
         );
         let t2 = b.len();
         for &mut (bi, ref mut ti) in b.branches.iter_mut() {
@@ -1430,13 +1434,15 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RAX).unwrap());
         store_m(&mut b, DEC_CIN, Register::RAX);
         movzx8_m(&mut b, Register::EAX, DEC_SRC1);
-        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 0x01).unwrap());
+        b.push(Instruction::with2(Code::Sub_rm32_imm32, Register::EAX, 1).unwrap());
+        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 3).unwrap());
         let no_cin = b.len() + 1;
-        b.je(no_cin);
+        b.br(Code::Jbe_rel32_64, no_cin);
         movzx8_m(&mut b, Register::EAX, DEC_SRC2);
-        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 0x01).unwrap());
+        b.push(Instruction::with2(Code::Sub_rm32_imm32, Register::EAX, 1).unwrap());
+        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 3).unwrap());
         let no_cin2 = b.len() + 1;
-        b.je(no_cin2);
+        b.br(Code::Jbe_rel32_64, no_cin2);
         emit_read_imm8(
             &mut b,
             DEC_CIN,

@@ -116,47 +116,51 @@ impl PolymorphicInterpreter {
             }
             let [op_dst_raw, op_src1_raw, op_src2_raw] = operands;
 
-            // 3. Decrypt 8-byte immediates if present
-            let imm1 = if op_src1_raw == 0x01 {
+            // 3. Decrypt family-local compact immediates (1/2/4/8 bytes).
+            let read_immediate = |marker: u8, vip: &mut usize, rolling: &mut RollingKeyEngine| {
+                let width = self.spec.immediate_width(marker).unwrap_or(0);
                 let mut b = [0u8; 8];
-                for i in 0..8 {
-                    if vip < bytecode.len() {
-                        b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
-                        vip += 1;
+                for byte in b.iter_mut().take(width) {
+                    if *vip < bytecode.len() {
+                        *byte = rolling.decrypt_byte(bytecode[*vip], *vip as u64);
+                        *vip += 1;
                     }
                 }
-                u64::from_le_bytes(b) ^ self.spec.operand_mask
+                let mask = if width == 8 {
+                    u64::MAX
+                } else {
+                    (1u64 << (width * 8)) - 1
+                };
+                u64::from_le_bytes(b) ^ (self.spec.operand_mask & mask)
+            };
+            let imm1 = if self.spec.is_immediate_marker(op_src1_raw) {
+                read_immediate(op_src1_raw, &mut vip, &mut self.rolling)
             } else {
                 0
             };
 
-            let imm2 = if op_src2_raw == 0x01 {
-                let mut b = [0u8; 8];
-                for i in 0..8 {
-                    if vip < bytecode.len() {
-                        b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
-                        vip += 1;
-                    }
-                }
-                u64::from_le_bytes(b) ^ self.spec.operand_mask
+            let imm2 = if self.spec.is_immediate_marker(op_src2_raw) {
+                read_immediate(op_src2_raw, &mut vip, &mut self.rolling)
             } else {
                 0
             };
 
             // cin (AddWithCarry 이고 즉시 피연산자 없을 때 8B) — decoder와 동일 규칙.
-            let cin =
-                if op_src1_raw != 0x01 && op_src2_raw != 0x01 && risc_op == RiscOp::AddWithCarry {
-                    let mut b = [0u8; 8];
-                    for i in 0..8 {
-                        if vip < bytecode.len() {
-                            b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
-                            vip += 1;
-                        }
+            let cin = if !self.spec.is_immediate_marker(op_src1_raw)
+                && !self.spec.is_immediate_marker(op_src2_raw)
+                && risc_op == RiscOp::AddWithCarry
+            {
+                let mut b = [0u8; 8];
+                for i in 0..8 {
+                    if vip < bytecode.len() {
+                        b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
+                        vip += 1;
                     }
-                    u64::from_le_bytes(b) ^ self.spec.operand_mask
-                } else {
-                    0
-                };
+                }
+                u64::from_le_bytes(b) ^ self.spec.operand_mask
+            } else {
+                0
+            };
 
             // VirtualBranch 절대-인덱스 타깃 (src1 없음 → 8B 즉시값) — decoder와 동일 계약.
             // src1 은 `None`이면 0x00 으로 부호화되므로 `op_src1_raw == 0x00` 이 곧 "src1 없음".
@@ -200,7 +204,7 @@ impl PolymorphicInterpreter {
                         }
                     }
                     _ => {
-                        if raw == 0x01 {
+                        if spec.is_immediate_marker(raw) {
                             imm
                         } else {
                             0
@@ -1800,8 +1804,8 @@ impl PolymorphicInterpreter {
             }
             let [_op_dst, op_src1, op_src2] = operands;
 
-            let has_imm1 = op_src1 == 0x01;
-            let has_imm2 = op_src2 == 0x01;
+            let imm1_width = self.spec.immediate_width(op_src1);
+            let imm2_width = self.spec.immediate_width(op_src2);
             let take8 = |vip: &mut usize, rolling: &mut RollingKeyEngine, bytecode: &[u8]| {
                 for _ in 0..8 {
                     if *vip < bytecode.len() {
@@ -1810,13 +1814,23 @@ impl PolymorphicInterpreter {
                     }
                 }
             };
-            if has_imm1 {
-                take8(&mut vip, &mut rolling, bytecode);
+            if let Some(width) = imm1_width {
+                for _ in 0..width {
+                    if vip < bytecode.len() {
+                        let _ = rolling.decrypt_byte(bytecode[vip], vip as u64);
+                        vip += 1;
+                    }
+                }
             }
-            if has_imm2 {
-                take8(&mut vip, &mut rolling, bytecode);
+            if let Some(width) = imm2_width {
+                for _ in 0..width {
+                    if vip < bytecode.len() {
+                        let _ = rolling.decrypt_byte(bytecode[vip], vip as u64);
+                        vip += 1;
+                    }
+                }
             }
-            if risc_op == RiscOp::AddWithCarry && !has_imm1 && !has_imm2 {
+            if risc_op == RiscOp::AddWithCarry && imm1_width.is_none() && imm2_width.is_none() {
                 take8(&mut vip, &mut rolling, bytecode);
             }
             if matches!(risc_op, RiscOp::VirtualBranch { .. }) && op_src1 == 0x00 {

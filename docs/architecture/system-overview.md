@@ -63,8 +63,10 @@ branch는 local branch map fast path를 유지합니다.
 | MixedRisc | src2, dst, src1 | byte-swap/XOR token |
 | FusedCisc | src1, dst, src2 | add/rotate token |
 
-현재 ordinary immediate는 8-byte masked form입니다. 1/2/4/8-byte compact marker는
-다음 구현 단계이며 완료된 기능으로 간주하지 않습니다.
+ordinary unsigned immediate는 값에 맞는 최소 1/2/4/8-byte masked payload를 사용합니다.
+descriptor marker `0x01..0x04`의 width 의미는 family마다 순열화되며 encoder, static
+decoder, interpreter, native self-decoder가 같은 family-local 표를 소비합니다. 절대
+branch token과 AddWithCarry의 별도 carry payload는 기존 고정 8-byte ABI를 유지합니다.
 
 ## Runtime entry와 integrity
 
@@ -101,7 +103,7 @@ section 이름과 protection은 선택 profile과 PE builder 결과가 기준입
 
 ## 아직 남은 구조 작업
 
-- compact immediate와 추가 variable-length grammar;
+- signed compact와 추가 variable-length/control grammar;
 - RIP-relative runtime bundle materialization;
 - split state/lazy flags;
 - shared data-lifetime concurrency;

@@ -108,35 +108,40 @@ impl PolymorphicDecoder {
             }
             let [op_dst, op_src1, op_src2] = operands;
 
-            // 2. Immediates (src == Imm64 일 때 8B)
-            let imm1 = if op_src1 == 0x01 {
-                if vip + 8 > bytecode.len() {
-                    return Err(anyhow!(super::DecodeError::TruncatedImmediate { at: vip }));
-                }
-                let mut b = [0u8; 8];
-                for i in 0..8 {
-                    b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
-                    vip += 1;
-                }
-                u64::from_le_bytes(b) ^ self.spec.operand_mask
+            // 2. Family-local compact immediates (1/2/4/8 bytes).
+            let read_immediate =
+                |marker: u8, vip: &mut usize, rolling: &mut RollingKeyEngine| -> Result<u64> {
+                    let width = self.spec.immediate_width(marker).unwrap_or(0);
+                    if *vip + width > bytecode.len() {
+                        return Err(anyhow!(super::DecodeError::TruncatedImmediate { at: *vip }));
+                    }
+                    let mut b = [0u8; 8];
+                    for byte in b.iter_mut().take(width) {
+                        *byte = rolling.decrypt_byte(bytecode[*vip], *vip as u64);
+                        *vip += 1;
+                    }
+                    let mask = if width == 8 {
+                        u64::MAX
+                    } else {
+                        (1u64 << (width * 8)) - 1
+                    };
+                    Ok(u64::from_le_bytes(b) ^ (self.spec.operand_mask & mask))
+                };
+            let imm1 = if self.spec.is_immediate_marker(op_src1) {
+                read_immediate(op_src1, &mut vip, &mut self.rolling)?
             } else {
                 0
             };
-            let imm2 = if op_src2 == 0x01 {
-                if vip + 8 > bytecode.len() {
-                    return Err(anyhow!(super::DecodeError::TruncatedImmediate { at: vip }));
-                }
-                let mut b = [0u8; 8];
-                for i in 0..8 {
-                    b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
-                    vip += 1;
-                }
-                u64::from_le_bytes(b) ^ self.spec.operand_mask
+            let imm2 = if self.spec.is_immediate_marker(op_src2) {
+                read_immediate(op_src2, &mut vip, &mut self.rolling)?
             } else {
                 0
             };
             // cin (AddWithCarry 이고 즉시 피연산자 없을 때 8B) — 인터프리터와 동일 규칙.
-            let cin = if op_src1 != 0x01 && op_src2 != 0x01 && risc_op == RiscOp::AddWithCarry {
+            let cin = if !self.spec.is_immediate_marker(op_src1)
+                && !self.spec.is_immediate_marker(op_src2)
+                && risc_op == RiscOp::AddWithCarry
+            {
                 if vip + 8 > bytecode.len() {
                     return Err(anyhow!(super::DecodeError::TruncatedImmediate { at: vip }));
                 }
@@ -184,7 +189,7 @@ impl PolymorphicDecoder {
                         }
                     }
                     _ => {
-                        if raw == 0x01 {
+                        if self.spec.is_immediate_marker(raw) {
                             None // Imm64 은 decode_op 호출부에서 즉시값으로 대체
                         } else {
                             None
@@ -195,13 +200,15 @@ impl PolymorphicDecoder {
 
             let mut ins = MicroInstr::new(risc_op);
             ins.dst = decode_op(op_dst);
-            ins.src1 = match op_src1 {
-                0x01 => Some(MicroOperand::Imm64(imm1)),
-                _ => decode_op(op_src1),
+            ins.src1 = if self.spec.is_immediate_marker(op_src1) {
+                Some(MicroOperand::Imm64(imm1))
+            } else {
+                decode_op(op_src1)
             };
-            ins.src2 = match op_src2 {
-                0x01 => Some(MicroOperand::Imm64(imm2)),
-                _ => decode_op(op_src2),
+            ins.src2 = if self.spec.is_immediate_marker(op_src2) {
+                Some(MicroOperand::Imm64(imm2))
+            } else {
+                decode_op(op_src2)
             };
             // VirtualBranch 절대-인덱스 타깃이면 imm 을 타깃으로, 아니면 cin.
             ins.imm = if matches!(risc_op, RiscOp::VirtualBranch { .. }) && op_src1 == 0x00 {
