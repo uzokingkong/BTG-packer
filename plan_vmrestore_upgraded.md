@@ -8,7 +8,7 @@
 
 기준일: 2026-08-23
 
-기준 구현 커밋: `c4b64c5` 이후 현재 변경
+기준 구현 커밋: `dc77371` 이후 현재 변경
 
 진척도: 기능 구현 약 82%, release 완료도 약 75%
 
@@ -46,6 +46,8 @@ depth/owner/lock을 원자적으로 정리합니다. validator는 4개 bridge re
 
 ### 2. P2-11 handler synthesis 확대
 
+- 진행: MOV/NOR에 이어 width별 NOT도 single-NOT, XOR-all-ones, triple-NOT의
+  3개 실제 body recipe로 확대했다. wrapper 다양성과 실제 body recipe를 구분한다.
 - execution-weight 상위 80% opcode에 최소 3개 의미 동치 native body recipe를 둔다.
 - integer/shift/compare/load-store/SSE/control 순으로 micro-op decomposition, scratch
   allocation, MBA, instruction selection을 실제 handler body에 반영한다.
@@ -53,15 +55,18 @@ depth/owner/lock을 원자적으로 정리합니다. validator는 4개 bridge re
 
 ### 3. P2-12 runtime anchor 마무리
 
-- runtime base/state/table/bytecode bundle을 RIP-relative 또는 RVA-derived 방식으로
-  materialize한다.
-- 단일 signature로 여러 instance를 찾는 비율을 측정하는 N=20 scanner gate를 둔다.
+- 완료: entry의 state/table/bytecode/stack bundle과 lifetime cleanup state 참조를
+  RIP-relative rel32로 materialize하며, 네 anchor의 순서와 간격을 seed별로 바꾼다.
+- 완료: 생성 코드에 네 절대 VA가 없고 RIP target이 정확한지 디코더 회귀 검사를 둔다.
+- 완료: 디코드된 anchor register/order/gap signature의 N=20 최대 재사용률을 10%
+  이하로 강제하는 scanner gate를 둔다.
 - ASLR/CFG/CET 조합에서 4개 instance와 family별 integrity topology를 재검증한다.
 
 ### 4. P2-15 native bridge oracle 감소
 
+- 완료: native 복귀 직후 private frame의 state/bytecode/vstack/table/ret-IP/old-RSP/
+  target 슬롯을 원래 RSP 복원 전에 모두 zeroize하고 생성 코드 검사를 둔다.
 - 실제 live-in/live-out subset만 marshaling한다.
-- canonical bridge image는 필요한 순간에만 만들고 복귀 직후 zeroize한다.
 - instance별 bridge ABI/layout variant를 추가하고 sensitive region bridge-out 0을
   fail-closed gate로 유지한다.
 
@@ -74,7 +79,7 @@ depth/owner/lock을 원자적으로 정리합니다. validator는 4개 bridge re
 
 ## 현재 검증 기준
 
-- `cargo test --lib`: 578 passed, 0 failed.
+- `cargo test --lib -- --test-threads=1`: 580 passed, 0 failed.
 - `corpus/o1.exe`, seed 31010 대표 최대 조합: exit 0, stdout 1,460B,
   stderr 0B 동치.
 - cleanup-backed lifetime 적용 시 최종 보호 객체 54개. 후보 182개/strict scope 116개이며

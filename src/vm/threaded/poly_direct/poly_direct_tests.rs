@@ -24,6 +24,122 @@ fn install_operand_offsets(buf: &mut [u8], base: usize, offsets: &[u16]) {
     }
 }
 
+#[test]
+fn runtime_anchors_are_rip_relative_and_bridge_frame_is_zeroized() {
+    let seed = 0xA11C_40C5_2026_0823;
+    let code_base = 0x0000_0001_4001_0000;
+    let table_base = 0x0000_0001_4012_3000;
+    let bytecode_base = 0x0000_0001_4014_5000;
+    let state_base = 0x0000_0001_4018_7000;
+    let stack_base = 0x0000_0001_401D_F000;
+    let mut encoder = PolymorphicEncoder::new(seed);
+    let bytecode = encoder
+        .encode(&RiscProgram::new(vec![MicroInstr::new(RiscOp::Halt)]))
+        .unwrap();
+    let parts = build_self_decoding_parts(
+        &bytecode,
+        seed,
+        code_base,
+        table_base,
+        bytecode_base,
+        state_base,
+        stack_base,
+    )
+    .unwrap();
+
+    for anchor in [table_base, bytecode_base, state_base, stack_base] {
+        assert!(
+            !parts
+                .code
+                .windows(8)
+                .any(|window| window == anchor.to_le_bytes()),
+            "absolute runtime anchor {anchor:#x} survived in code"
+        );
+    }
+    let mut rip_targets = Vec::new();
+    let mut decoder = Decoder::with_ip(64, &parts.code, code_base, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let ins = decoder.decode();
+        if ins.code() == Code::Lea_r64_m && ins.memory_base() == Register::RIP {
+            rip_targets.push(ins.ip_rel_memory_address());
+        }
+    }
+    for anchor in [table_base, bytecode_base, state_base, stack_base] {
+        assert!(
+            rip_targets.contains(&anchor),
+            "missing RIP anchor {anchor:#x}"
+        );
+    }
+
+    let (bridge_start, bridge_end) = parts.native_bridge_range.unwrap();
+    let bridge = &parts.code[bridge_start..bridge_end];
+    let bridge_ip = code_base + bridge_start as u64;
+    let mut zero_offsets = std::collections::BTreeSet::new();
+    let mut decoder = Decoder::with_ip(64, bridge, bridge_ip, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let ins = decoder.decode();
+        let off = ins.memory_displacement64() as i64;
+        if ins.code() == Code::Mov_rm64_imm32
+            && ins.memory_base() == Register::RSP
+            && ins.immediate32() == 0
+            && (-0x48..=-0x18).contains(&off)
+        {
+            zero_offsets.insert(off);
+        }
+    }
+    assert_eq!(
+        zero_offsets,
+        [-0x48, -0x40, -0x38, -0x30, -0x28, -0x20, -0x18]
+            .into_iter()
+            .collect(),
+        "private bridge anchors were not all erased"
+    );
+}
+
+#[test]
+fn n20_runtime_anchor_signature_reuse_stays_below_ten_percent() {
+    let code_base = 0x0000_0001_4001_0000;
+    let anchors = [
+        0x0000_0001_4012_3000,
+        0x0000_0001_4014_5000,
+        0x0000_0001_4018_7000,
+        0x0000_0001_401D_F000,
+    ];
+    let mut signatures = std::collections::BTreeMap::<Vec<(u32, usize)>, usize>::new();
+    for seed in 1..=20u64 {
+        let mut encoder = PolymorphicEncoder::new(seed);
+        let bytecode = encoder
+            .encode(&RiscProgram::new(vec![MicroInstr::new(RiscOp::Halt)]))
+            .unwrap();
+        let parts = build_self_decoding_parts(
+            &bytecode, seed, code_base, anchors[0], anchors[1], anchors[2], anchors[3],
+        )
+        .unwrap();
+        let mut signature = Vec::new();
+        let mut ordinal = 0usize;
+        let mut decoder = Decoder::with_ip(64, &parts.code, code_base, DecoderOptions::NONE);
+        while decoder.can_decode() && signature.len() < 4 {
+            let ins = decoder.decode();
+            if ins.code() == Code::Lea_r64_m
+                && ins.memory_base() == Register::RIP
+                && anchors.contains(&ins.ip_rel_memory_address())
+            {
+                signature.push((ins.op0_register() as u32, ordinal));
+                ordinal = 0;
+            } else if !signature.is_empty() {
+                ordinal += 1;
+            }
+        }
+        assert_eq!(signature.len(), 4, "seed {seed} anchor signature truncated");
+        *signatures.entry(signature).or_default() += 1;
+    }
+    let max_reuse = signatures.values().copied().max().unwrap_or_default();
+    assert!(
+        max_reuse <= 2,
+        "one normalized runtime-anchor signature matched {max_reuse}/20 builds"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn lifetime_cleanup_handler_reencrypts_and_releases_owned_scope() {

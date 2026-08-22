@@ -327,7 +327,7 @@ mod tests {
         let bytecode = enc.encode(&prog).unwrap();
 
         // Sizing pass: code/table/bytecode lengths are VA-independent (all
-        // absolute references are fixed-size imm64/rel encodings), so build once
+        // runtime anchors use fixed-size RIP-rel32 encodings), so build once
         // with dummy VAs to learn lengths, then lay out and rebuild with real VAs.
         let dummy = build_program_vm_commercial(
             0,
@@ -390,26 +390,38 @@ mod tests {
             }
         }
 
-        // P0-5: dispatcher code 의 `mov r64, imm64` 절대 VA 슬롯이 이미지 범위
-        // [base, base+0x20000) 안에 존재해야 한다 — ASLR 재배치(.reloc) 대상.
-        // (module.code 는 arena 가 아닌 빌드 시점 VAs 를 즉시값으로 박는다.)
-        // entry stub: R8=bytecode_base, R13=stack_base, R15=table_base, RDX=state_base
-        // (code_va 는 arena.call 의 상대 점프로 진입하므로 imm64 로 박지 않는다.)
+        // P2-12: entry runtime anchors must be RIP-relative. No absolute
+        // mov-imm64 relocation slot may expose the table/bytecode/state bundle.
         let va_lo = (base) as u64;
         let va_hi = (base + 0x20000) as u64;
         let slots = crate::pe::reloc::scan_mov_imm64_slots(&module.code, va_lo, va_hi);
+        let mut rip_targets = Vec::new();
+        let mut decoder =
+            iced_x86::Decoder::with_ip(64, &module.code, code_va, iced_x86::DecoderOptions::NONE);
+        while decoder.can_decode() {
+            let ins = decoder.decode();
+            if ins.code() == iced_x86::Code::Lea_r64_m
+                && ins.memory_base() == iced_x86::Register::RIP
+            {
+                rip_targets.push(ins.ip_rel_memory_address());
+            }
+        }
         for (label, want) in [
             ("table_va", table_va),
             ("bytecode_va", bytecode_va),
             ("state_va", state_va),
         ] {
             assert!(
-                slots.iter().any(|&off| u64::from_le_bytes(
-                    module.code[off as usize..off as usize + 8].try_into().unwrap()
+                rip_targets.contains(&want),
+                "dispatcher must derive {label} ({want:#x}) through RIP-relative LEA"
+            );
+            assert!(
+                !slots.iter().any(|&off| u64::from_le_bytes(
+                    module.code[off as usize..off as usize + 8]
+                        .try_into()
+                        .unwrap()
                 ) == want),
-                "dispatcher must embed {label} (0x{want:X}) as a mov-imm64 relocatable slot ({} in-range slot(s): {:?})",
-                slots.len(),
-                slots
+                "dispatcher leaked {label} as mov-imm64"
             );
         }
 

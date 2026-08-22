@@ -92,8 +92,9 @@ fn emit_binary_chunk_lookup(
 ///
 /// `code_base` = where the assembled `code` is placed, `table_base` = handler
 /// table VA, `bytecode_base` = encrypted poly stream VA, `state_base` = VM state
-/// buffer VA, `stack_base` = virtual stack top VA. The `code` embeds these as
-/// absolute immediates in the entry stub.
+/// buffer VA, `stack_base` = virtual stack top VA. The entry stub materializes
+/// these through RIP-relative references, so the runtime bundle is not exposed
+/// as a run of four absolute pointer immediates.
 /// Backward-compatible 7-arg builder (no ip_map) — delegates to `_with` with None.
 pub fn build_self_decoding_parts(
     bytecode: &[u8],
@@ -441,6 +442,20 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
     }
 
     let mut b = CodeBuilder::new();
+
+    // Encode a module-local address without placing its absolute VA in the
+    // instruction stream. Production regions live in one PE image and are in
+    // rel32 range; BlockEncoder verifies that invariant at final placement.
+    let rip_anchor = |b: &mut CodeBuilder, reg: Register, target: u64| {
+        b.push(
+            Instruction::with2(
+                Code::Lea_r64_m,
+                reg,
+                MemoryOperand::with_base_displ(Register::RIP, target as i64),
+            )
+            .unwrap(),
+        );
+    };
 
     // The Win64 unwindable entry prologue must begin at module RVA 0.  Keeping
     // these pushes behind the old leading JMP made vm_entry_unwind_ops see a
@@ -1146,12 +1161,27 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
     {
         // The eight Win64 nonvolatile registers were saved by the RVA-0
         // prologue above. HALT restores them in reverse order.
-        movi(&mut b, Register::R8, bytecode_base);
+        // Seed-permute independent anchor materialization. Besides removing
+        // absolute pointers, this avoids one stable four-LEA entry signature.
+        let mut anchors = [
+            (Register::R8, bytecode_base),
+            (Register::R13, stack_base),
+            (Register::R15, table_base),
+            (Register::RDX, state_base),
+        ];
+        let mut anchor_mix = crate::vm::seed_lifecycle::derive_seed(seed, 0x414E_4348_4F52_5332);
+        for i in (1..anchors.len()).rev() {
+            anchors.swap(i, (anchor_mix as usize) % (i + 1));
+            anchor_mix = crate::vm::seed_lifecycle::derive_seed(anchor_mix, i as u64);
+        }
+        for (ordinal, (reg, target)) in anchors.into_iter().enumerate() {
+            rip_anchor(&mut b, reg, target);
+            if (anchor_mix >> (ordinal * 3)) & 1 != 0 {
+                b.push(Instruction::with(Code::Nopd));
+            }
+        }
         b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R12, Register::R12).unwrap());
-        movi(&mut b, Register::R13, stack_base);
         movi(&mut b, Register::R14, init_key);
-        movi(&mut b, Register::R15, table_base);
-        movi(&mut b, Register::RDX, state_base);
         // P2-14 hot state: RSI carries the deferred flag snapshot and RDI its
         // validity.  Every module entry starts canonical/clean.
         b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RDI, Register::RDI).unwrap());
@@ -2413,6 +2443,19 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
                 )
                 .unwrap(),
             );
+            // The dead private frame is now below the restored RSP. Immediate
+            // stores erase every anchor without borrowing a live guest/route
+            // register from the cross-family continuation ABI.
+            for off in [-0x48, -0x40, -0x38, -0x30, -0x28, -0x20, -0x18] {
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_rm64_imm32,
+                        MemoryOperand::with_base_displ_size(Register::RSP, off, 8),
+                        0,
+                    )
+                    .unwrap(),
+                );
+            }
 
             // 9. resume at ret_ip (RBP): branch-map lookup -> byte offset.
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::R15).unwrap());
@@ -3909,33 +3952,43 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
                 b.push(Instruction::with1(Code::Dec_rm64, Register::R10).unwrap())
             }
             (WidthAluOp::Not, width) => {
-                let native = synthesis_plan.is_none_or(|plan| {
-                    matches!(plan.recipe, crate::vm::handler_poly::SemanticRecipe::Native)
-                });
-                let code = match (native, width) {
-                    (true, 1) => Code::Not_rm8,
-                    (true, 2) => Code::Not_rm16,
-                    (true, 4) => Code::Not_rm32,
-                    (true, _) => Code::Not_rm64,
-                    (false, 1) => Code::Xor_rm8_imm8,
-                    (false, 2) => Code::Xor_rm16_imm16,
-                    (false, 4) => Code::Xor_rm32_imm32,
-                    (false, _) => Code::Xor_rm64_imm32,
-                };
                 let dst = match width {
                     1 => Register::R10L,
                     2 => Register::R10W,
                     4 => Register::R10D,
                     _ => Register::R10,
                 };
-                if native {
-                    b.push(Instruction::with1(code, dst).unwrap())
-                } else {
-                    // XOR with an all-one value is bitwise NOT. The selected
-                    // operand width preserves upper bits exactly like NOT; the
-                    // resulting host flags are deliberately not committed.
-                    b.push(Instruction::with2(code, dst, -1i32).unwrap())
-                }
+                let native_code = match width {
+                    1 => Code::Not_rm8,
+                    2 => Code::Not_rm16,
+                    4 => Code::Not_rm32,
+                    _ => Code::Not_rm64,
+                };
+                let xor_code = match width {
+                    1 => Code::Xor_rm8_imm8,
+                    2 => Code::Xor_rm16_imm16,
+                    4 => Code::Xor_rm32_imm32,
+                    _ => Code::Xor_rm64_imm32,
+                };
+                match synthesis_plan.as_ref().map(|plan| plan.recipe) {
+                    None | Some(crate::vm::handler_poly::SemanticRecipe::Native) => {
+                        b.push(Instruction::with1(native_code, dst).unwrap());
+                    }
+                    Some(crate::vm::handler_poly::SemanticRecipe::DeMorgan)
+                    | Some(crate::vm::handler_poly::SemanticRecipe::CarrySplit) => {
+                        // Width-matched XOR -1 preserves upper bits like NOT.
+                        b.push(Instruction::with2(xor_code, dst, -1i32).unwrap());
+                    }
+                    Some(crate::vm::handler_poly::SemanticRecipe::BooleanBasis)
+                    | Some(crate::vm::handler_poly::SemanticRecipe::MbaIdentity) => {
+                        // Three involutions are still NOT, but normalize to a
+                        // distinct semantic body rather than wrapper padding.
+                        for _ in 0..3 {
+                            b.push(Instruction::with1(native_code, dst).unwrap());
+                        }
+                    }
+                };
+                b.len()
             }
         };
         // 플래그: Add/Sub → 폭별 하드웨어 플래그(CF|PF|ZF|SF|OF). Inc/Dec → CF
@@ -5822,7 +5875,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
     ] {
         b.push(Instruction::with1(Code::Push_r64, reg).unwrap());
     }
-    movi(
+    rip_anchor(
         &mut b,
         Register::R12,
         state_base + crate::vm::data_lifetime::LIFETIME_SYNC_PTR_STATE_OFFSET as u64,

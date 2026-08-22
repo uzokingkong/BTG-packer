@@ -131,7 +131,8 @@ Commercial 경로는 `--vm --vm-oep --vm-commercial`을 명시하세요.
   연결됐습니다. 공유 lifetime 객체도 전역 owner/depth/atomic lock으로 동기화되며,
   native call scope는 bridge `UNW_FLAG_UHANDLER`가 unwind 시 현재 thread 소유 객체를
   재암호화하고 depth/owner/lock을 정리합니다. 증명되지 않은 복합 참조는 계속 제외합니다.
-- P2-15 native bridge oracle 감소는 미완료입니다.
+- P2-15 native bridge는 복귀 직후 private canonical frame을 zeroize합니다. 실제
+  live-in/live-out subset marshaling과 instance별 frame layout은 아직 미완료입니다.
 - 일부 TLS, unwind, panic, setjmp/longjmp, loader-critical 함수는 안전을 위해
   native로 유지됩니다.
 - at-rest 암호화와 relocation/ASLR 정책은 선택한 profile에 따라 제한됩니다.
