@@ -120,12 +120,9 @@ impl PolymorphicDecoder {
                         *byte = rolling.decrypt_byte(bytecode[*vip], *vip as u64);
                         *vip += 1;
                     }
-                    let mask = if width == 8 {
-                        u64::MAX
-                    } else {
-                        (1u64 << (width * 8)) - 1
-                    };
-                    Ok(u64::from_le_bytes(b) ^ (self.spec.operand_mask & mask))
+                    Ok(self
+                        .spec
+                        .decode_immediate_payload(marker, u64::from_le_bytes(b)))
                 };
             let imm1 = if self.spec.is_immediate_marker(op_src1) {
                 read_immediate(op_src1, &mut vip, &mut self.rolling)?

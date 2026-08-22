@@ -30,8 +30,8 @@
 - family별 operand descriptor 물리 순서가 다릅니다.
 - absolute branch target은 family별 identity, rotate/XOR, byte-swap/XOR,
   add/rotate token으로 표현합니다.
-- ordinary unsigned immediate는 값에 맞는 최소 1/2/4/8-byte payload를 사용하고,
-  네 family는 서로 다른 marker→width 순열을 사용합니다.
+- ordinary immediate는 값에 맞는 최소 unsigned/signed 1/2/4/8-byte payload를
+  사용하고, 네 family는 서로 다른 marker→width 순열을 사용합니다.
 - static decoder, interpreter, production native self-decoder가 같은 grammar를
   공유합니다.
 - M7은 각 family stream을 instruction boundary에 맞춘 독립 chunk로 보호합니다.
@@ -67,13 +67,13 @@
 |---|---|---|
 | P2-11 handler synthesis | full ISA target wrapper, 일부 실제 body recipe | execution-weight 80%에 3개 이상 body recipe |
 | P2-12 anchor 분산 | 4 instance, 4 integrity topology, ownership gate | RIP-relative runtime bundle materialization, N=20 signature gate |
-| P2-13 grammar | operand order, branch target token, compact immediate | signed compact와 추가 variable-length/control grammar |
+| P2-13 grammar | operand order, branch target token, unsigned/signed compact immediate | block-local/control variable-length grammar |
 | Data lifetime | strict single-owner ASCII/UTF-16 | 공유 객체 동시성, wider format/direct-memory cases |
 | Release gate | 565 library tests, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed 재실행 |
 
 ## 미구현 또는 다음 단계
 
-- P2-13 signed compact/control-flow 추가 variable-length grammar.
+- P2-13 block-local delta/table indirection/continuation control grammar.
 - P2-14 split state bank와 lazy flag producer token.
 - shared lifetime object의 thread-safe state/locking.
 - P2-15 native bridge canonical-image lifetime 축소와 oracle 감소.

@@ -483,7 +483,22 @@ pub(crate) fn emit_read_compact_imm(
     movi(b, Register::RCX, 64);
     b.push(Instruction::with2(Code::Sub_rm64_r64, Register::RCX, Register::RBP).unwrap());
     b.push(Instruction::with2(Code::Shl_rm64_CL, Register::RBX, Register::CL).unwrap());
+    movzx8_m(b, Register::EAX, marker_slot);
+    b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 5).unwrap());
+    let signed_edge = b.br(Code::Jae_rel32_64, usize::MAX - 1);
     b.push(Instruction::with2(Code::Shr_rm64_CL, Register::RBX, Register::CL).unwrap());
+    let done_edge = b.br(Code::Jmp_rel32_64, usize::MAX);
+    let signed = b.len();
+    b.push(Instruction::with2(Code::Sar_rm64_CL, Register::RBX, Register::CL).unwrap());
+    let done = b.len();
+    for (branch, target) in &mut b.branches {
+        if *branch == signed_edge {
+            *target = signed;
+        }
+        if *branch == done_edge {
+            *target = done;
+        }
+    }
     store_m(b, slot, Register::RBX);
 }
 

@@ -727,7 +727,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         // compact imm1 if src1 is one of the family-local markers
         movzx8_m(&mut b, Register::EAX, DEC_SRC1);
         b.push(Instruction::with2(Code::Sub_rm32_imm32, Register::EAX, 1).unwrap());
-        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 3).unwrap());
+        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 7).unwrap());
         let after_imm1 = b.len() + 1;
         b.br(Code::Ja_rel32_64, after_imm1);
         emit_read_compact_imm(
@@ -747,7 +747,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         // imm2 if src2 == 0x01
         movzx8_m(&mut b, Register::EAX, DEC_SRC2);
         b.push(Instruction::with2(Code::Sub_rm32_imm32, Register::EAX, 1).unwrap());
-        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 3).unwrap());
+        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 7).unwrap());
         let after_imm2 = b.len() + 1;
         b.br(Code::Ja_rel32_64, after_imm2);
         emit_read_compact_imm(
@@ -1435,12 +1435,12 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         store_m(&mut b, DEC_CIN, Register::RAX);
         movzx8_m(&mut b, Register::EAX, DEC_SRC1);
         b.push(Instruction::with2(Code::Sub_rm32_imm32, Register::EAX, 1).unwrap());
-        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 3).unwrap());
+        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 7).unwrap());
         let no_cin = b.len() + 1;
         b.br(Code::Jbe_rel32_64, no_cin);
         movzx8_m(&mut b, Register::EAX, DEC_SRC2);
         b.push(Instruction::with2(Code::Sub_rm32_imm32, Register::EAX, 1).unwrap());
-        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 3).unwrap());
+        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 7).unwrap());
         let no_cin2 = b.len() + 1;
         b.br(Code::Jbe_rel32_64, no_cin2);
         emit_read_imm8(

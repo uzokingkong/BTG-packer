@@ -66,10 +66,7 @@ impl PolymorphicEncoder {
         let encode_operand = |op: Option<MicroOperand>, spec: &VirtualIsaSpec| match op {
             Some(MicroOperand::VReg(r)) => (0x80 | spec.encode_reg(r), None),
             Some(MicroOperand::Temp(t)) => (0xC0 | (t & 0x07), None),
-            Some(MicroOperand::Imm64(v)) => (
-                spec.immediate_marker(VirtualIsaSpec::immediate_width_for_value(v)),
-                Some(v),
-            ),
+            Some(MicroOperand::Imm64(v)) => (spec.immediate_encoding(v).0, Some(v)),
             Some(MicroOperand::Vsp) => (0x40, None),
             Some(MicroOperand::Vflags) => (0x41, None),
             _ => (0x00, None),
@@ -82,7 +79,7 @@ impl PolymorphicEncoder {
             self.push_encrypted(out, vip, operands[logical_slot]);
         }
         for value in [imm1, imm2].into_iter().flatten() {
-            let width = VirtualIsaSpec::immediate_width_for_value(value);
+            let width = self.spec.immediate_encoding(value).1;
             for byte in (value ^ self.spec.operand_mask)
                 .to_le_bytes()
                 .into_iter()
@@ -189,10 +186,7 @@ impl PolymorphicEncoder {
                     match op {
                         Some(MicroOperand::VReg(r)) => (0x80 | spec.encode_reg(r), None),
                         Some(MicroOperand::Temp(t)) => (0xC0 | (t & 0x07), None),
-                        Some(MicroOperand::Imm64(v)) => (
-                            spec.immediate_marker(VirtualIsaSpec::immediate_width_for_value(v)),
-                            Some(v),
-                        ),
+                        Some(MicroOperand::Imm64(v)) => (spec.immediate_encoding(v).0, Some(v)),
                         Some(MicroOperand::Vsp) => (0x40, None),
                         Some(MicroOperand::Vflags) => (0x41, None),
                         _ => (0x00, None),
@@ -215,7 +209,7 @@ impl PolymorphicEncoder {
                 for b in enc
                     .to_le_bytes()
                     .into_iter()
-                    .take(VirtualIsaSpec::immediate_width_for_value(v1))
+                    .take(self.spec.immediate_encoding(v1).1)
                 {
                     out.push(self.rolling.encrypt_byte(b, vip));
                     vip += 1;
@@ -226,7 +220,7 @@ impl PolymorphicEncoder {
                 for b in enc
                     .to_le_bytes()
                     .into_iter()
-                    .take(VirtualIsaSpec::immediate_width_for_value(v2))
+                    .take(self.spec.immediate_encoding(v2).1)
                 {
                     out.push(self.rolling.encrypt_byte(b, vip));
                     vip += 1;
@@ -561,7 +555,15 @@ mod tests {
     #[test]
     fn family_compact_immediate_markers_cover_all_widths() {
         let seed = 0x5032_2D31_332D_494D;
-        let values = [0x7Fu64, 0x1234, 0x1234_5678, 0x1122_3344_5566_7788];
+        let values = [
+            0x7Fu64,
+            0x1234,
+            0x1234_5678,
+            0x1122_3344_5566_7788,
+            (-1i64) as u64,
+            (-129i64) as u64,
+            (-32_769i64) as u64,
+        ];
         let mut instrs = values
             .into_iter()
             .enumerate()
@@ -577,11 +579,15 @@ mod tests {
         for family in VmArchitectureFamily::ALL {
             let mut encoder = PolymorphicEncoder::new_for_family(seed, family);
             let stream = encoder.encode(&program).unwrap();
-            // Four records: opcode+3 descriptors+1/2/4/8 payload, plus Halt's 4B.
-            assert_eq!(stream.len(), 35);
+            // Seven records: 4B headers + U(1/2/4/8) + S(1/2/4), plus Halt's 4B.
+            assert_eq!(stream.len(), 54);
             let spec = VirtualIsaSpec::from_seed_and_family(seed, family);
             assert_eq!(
-                values.map(VirtualIsaSpec::immediate_width_for_value),
+                values[..4]
+                    .iter()
+                    .copied()
+                    .map(VirtualIsaSpec::immediate_width_for_value)
+                    .collect::<Vec<_>>(),
                 [1, 2, 4, 8]
             );
             for width in [1, 2, 4, 8] {
@@ -589,6 +595,16 @@ mod tests {
                     spec.immediate_width(spec.immediate_marker(width)),
                     Some(width)
                 );
+            }
+            for (value, width) in [
+                ((-1i64) as u64, 1usize),
+                ((-129i64) as u64, 2),
+                ((-32_769i64) as u64, 4),
+            ] {
+                let (marker, actual_width, signed) = spec.immediate_encoding(value);
+                assert!(signed);
+                assert_eq!(actual_width, width);
+                assert!(spec.is_signed_immediate_marker(marker));
             }
             let mut decoder = PolymorphicDecoder::new_for_family(seed, family);
             assert_eq!(

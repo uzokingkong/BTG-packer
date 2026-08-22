@@ -50,6 +50,10 @@ impl VirtualIsaSpec {
         }
     }
 
+    pub fn signed_immediate_markers(&self) -> [u8; 4] {
+        self.immediate_markers().map(|marker| marker + 4)
+    }
+
     pub fn immediate_width_for_value(value: u64) -> usize {
         if value <= u8::MAX as u64 {
             1
@@ -73,11 +77,67 @@ impl VirtualIsaSpec {
         self.immediate_markers()[index]
     }
 
+    pub fn signed_immediate_width_for_value(value: u64) -> Option<usize> {
+        let signed = value as i64;
+        if signed == signed as i8 as i64 {
+            Some(1)
+        } else if signed == signed as i16 as i64 {
+            Some(2)
+        } else if signed == signed as i32 as i64 {
+            Some(4)
+        } else {
+            None
+        }
+    }
+
+    /// Returns marker, payload width and whether decode must sign-extend.
+    pub fn immediate_encoding(&self, value: u64) -> (u8, usize, bool) {
+        let unsigned_width = Self::immediate_width_for_value(value);
+        if let Some(signed_width) = Self::signed_immediate_width_for_value(value) {
+            if signed_width < unsigned_width {
+                let index = match signed_width {
+                    1 => 0,
+                    2 => 1,
+                    4 => 2,
+                    _ => unreachable!(),
+                };
+                return (self.signed_immediate_markers()[index], signed_width, true);
+            }
+        }
+        (self.immediate_marker(unsigned_width), unsigned_width, false)
+    }
+
     pub fn immediate_width(&self, marker: u8) -> Option<usize> {
         self.immediate_markers()
             .iter()
             .position(|&candidate| candidate == marker)
             .map(|index| [1, 2, 4, 8][index])
+            .or_else(|| {
+                self.signed_immediate_markers()
+                    .iter()
+                    .position(|&candidate| candidate == marker)
+                    .map(|index| [1, 2, 4, 8][index])
+            })
+    }
+
+    pub fn is_signed_immediate_marker(&self, marker: u8) -> bool {
+        self.signed_immediate_markers().contains(&marker)
+    }
+
+    pub fn decode_immediate_payload(&self, marker: u8, payload: u64) -> u64 {
+        let width = self.immediate_width(marker).unwrap_or(8);
+        let bits = width * 8;
+        let decoded = payload
+            ^ if width == 8 {
+                self.operand_mask
+            } else {
+                self.operand_mask & ((1u64 << bits) - 1)
+            };
+        if self.is_signed_immediate_marker(marker) && width < 8 {
+            (((decoded << (64 - bits)) as i64) >> (64 - bits)) as u64
+        } else {
+            decoded
+        }
     }
 
     pub fn is_immediate_marker(&self, marker: u8) -> bool {

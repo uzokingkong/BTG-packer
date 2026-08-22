@@ -126,12 +126,8 @@ impl PolymorphicInterpreter {
                         *vip += 1;
                     }
                 }
-                let mask = if width == 8 {
-                    u64::MAX
-                } else {
-                    (1u64 << (width * 8)) - 1
-                };
-                u64::from_le_bytes(b) ^ (self.spec.operand_mask & mask)
+                self.spec
+                    .decode_immediate_payload(marker, u64::from_le_bytes(b))
             };
             let imm1 = if self.spec.is_immediate_marker(op_src1_raw) {
                 read_immediate(op_src1_raw, &mut vip, &mut self.rolling)
