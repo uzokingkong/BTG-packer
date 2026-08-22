@@ -338,42 +338,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
     let mba_a = table_key.wrapping_mul(C3).rotate_left(23) | 1;
     let mba_b = table_key.wrapping_sub(mba_a);
 
-    // operand offset / flag tables
-    let mut offs_tab = vec![0u8; 256];
-    let mut flags_tab = vec![K_NONE; 256];
-    for raw in 0u16..256 {
-        let raw = raw as u8;
-        let kind = raw & 0xC0;
-        let payload = raw & 0x3F;
-        let (off, flag) = match kind {
-            0x80 => {
-                let idx = spec.decode_reg(payload) as usize;
-                (state_disp(REGS_OFF + (idx as i32) * 8) as u8, K_REG)
-            }
-            0xC0 => (
-                state_disp(TEMPS_OFF + ((payload & 7) as i32) * 8) as u8,
-                K_REG,
-            ),
-            0x40 => {
-                if payload == 0x01 {
-                    (state_disp(FLAGS_OFF) as u8, K_REG)
-                } else {
-                    (state_disp(VSP_OFF) as u8, K_REG)
-                }
-            }
-            _ => {
-                if let Some(width) = spec.immediate_width(raw) {
-                    (width as u8, K_IMM)
-                } else if let Some(width) = spec.branch_target_width(raw) {
-                    (width as u8, K_NONE)
-                } else {
-                    (0, K_NONE)
-                }
-            }
-        };
-        offs_tab[raw as usize] = off;
-        flags_tab[raw as usize] = flag;
-    }
+    let (offs_tab, flags_tab) = super::metadata::build_operand_tables(&spec);
 
     // cond-codes table: decrypted cond byte -> canonical COND_* code (0xFF = unknown).
     // Built from the spec's reverse_branch_cond_map so native handlers can switch
@@ -965,11 +930,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         let om = MemoryOperand::with_base_index_scale_displ_size(
             Register::R15,
             Register::RAX,
-            1,
+            2,
             layout.operand_offs_off as i64,
             1,
         );
-        b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, om).unwrap());
+        b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::ECX, om).unwrap());
         b.push(
             Instruction::with2(
                 Code::Mov_r64_rm64,
@@ -1019,11 +984,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         let om = MemoryOperand::with_base_index_scale_displ_size(
             Register::R15,
             Register::RCX,
-            1,
+            2,
             layout.operand_offs_off as i64,
             1,
         );
-        b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, om).unwrap());
+        b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::ECX, om).unwrap());
         b.push(
             Instruction::with2(
                 Code::Mov_rm64_r64,

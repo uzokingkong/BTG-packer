@@ -7,7 +7,9 @@
 use anyhow::{anyhow, Result};
 
 const SLOT_SIZE: i32 = 8;
-const CORE_SLOTS: usize = 32;
+const BANK_SLOTS: usize = 16;
+const BANK1_BASE: i32 = 0x400;
+pub const SPLIT_STATE_SIZE: usize = 0x860;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmRuntimeLayout {
@@ -53,40 +55,47 @@ impl VmRuntimeLayout {
     }
 
     pub fn from_seed(seed: u64) -> Self {
-        let mut slots = [0usize; CORE_SLOTS];
-        for (i, slot) in slots.iter_mut().enumerate() {
-            *slot = i;
+        let mut bank0 = [0usize; BANK_SLOTS];
+        let mut bank1 = [0usize; BANK_SLOTS];
+        for i in 0..BANK_SLOTS {
+            bank0[i] = i;
+            bank1[i] = i;
         }
         let mut state = seed ^ 0xD1B5_4A32_D192_ED03;
-        for i in (1..CORE_SLOTS).rev() {
-            state ^= state >> 12;
-            state ^= state << 25;
-            state ^= state >> 27;
-            state = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
-            slots.swap(i, (state as usize) % (i + 1));
+        for bank in [&mut bank0, &mut bank1] {
+            for i in (1..BANK_SLOTS).rev() {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                state = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                bank.swap(i, (state as usize) % (i + 1));
+            }
         }
-        let off = |n: usize| (slots[n] as i32) * SLOT_SIZE;
+        let off0 = |n: usize| (bank0[n] as i32) * SLOT_SIZE;
+        let off1 = |n: usize| BANK1_BASE + (bank1[n] as i32) * SLOT_SIZE;
         let mut vregs = [0; 16];
         let mut temps = [0; 8];
-        for i in 0..16 {
-            vregs[i] = off(i);
-        }
         for i in 0..8 {
-            temps[i] = off(16 + i);
+            vregs[i] = off0(i);
+            vregs[8 + i] = off1(i);
+        }
+        for i in 0..4 {
+            temps[i] = off0(8 + i);
+            temps[4 + i] = off1(8 + i);
         }
         let layout = Self {
             vregs,
             temps,
-            flags: off(24),
-            vsp: off(25),
-            decode_operands: off(26),
-            imm1: off(27),
-            imm2: off(28),
-            carry_in: off(29),
-            fp_return: off(30),
-            xmm: 0x100,
+            flags: off1(12),
+            vsp: off0(12),
+            decode_operands: off1(13),
+            imm1: off0(13),
+            imm2: off1(14),
+            carry_in: off0(14),
+            fp_return: off1(15),
+            xmm: 0x800,
             xmm_slots: 6,
-            total_size: 0x160,
+            total_size: SPLIT_STATE_SIZE,
         };
         debug_assert!(layout.validate().is_ok());
         layout
@@ -110,15 +119,22 @@ impl VmRuntimeLayout {
         if offsets.len() != 31 {
             return Err(anyhow!("VM runtime layout contains overlapping core slots"));
         }
-        if offsets
-            .iter()
-            .any(|off| *off < 0 || *off % SLOT_SIZE != 0 || *off >= self.xmm)
-        {
+        if offsets.iter().any(|off| {
+            *off < 0
+                || *off % SLOT_SIZE != 0
+                || (*off as usize).saturating_add(SLOT_SIZE as usize) > self.total_size
+                || *off >= self.xmm
+        }) {
             return Err(anyhow!("VM runtime layout contains an invalid core offset"));
         }
         let xmm_end = self.xmm as usize + self.xmm_slots * 16;
         if self.xmm < 0 || self.xmm as usize % 16 != 0 || xmm_end > self.total_size {
             return Err(anyhow!("VM runtime XMM area is outside the state buffer"));
+        }
+        if self.total_size > u16::MAX as usize {
+            return Err(anyhow!(
+                "VM runtime layout exceeds the u16 operand-offset ABI"
+            ));
         }
         Ok(())
     }
@@ -141,6 +157,9 @@ mod tests {
         b.validate().unwrap();
         assert_ne!(a, b);
         assert_ne!(a.vregs, VmRuntimeLayout::legacy().vregs);
+        assert!(a.vregs.iter().any(|off| *off < BANK1_BASE));
+        assert!(a.vregs.iter().any(|off| *off >= BANK1_BASE));
+        assert!(a.flags >= BANK1_BASE);
     }
 
     #[test]

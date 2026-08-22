@@ -181,7 +181,9 @@ fn run_native_poly_direct_configured(
             buf[p..p + 8].copy_from_slice(&v.to_le_bytes());
         }
         let p = OFF_TABLE + metadata_layout.operand_offs_off;
-        buf[p..p + 256].copy_from_slice(&parts.offs_tab);
+        for (index, value) in parts.offs_tab.iter().copied().enumerate() {
+            buf[p + index * 2..p + index * 2 + 2].copy_from_slice(&value.to_le_bytes());
+        }
         let p = OFF_TABLE + metadata_layout.operand_flags_off;
         buf[p..p + 256].copy_from_slice(&parts.flags_tab);
         let p = OFF_TABLE + metadata_layout.cond_codes_off;

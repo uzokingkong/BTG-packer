@@ -18,6 +18,12 @@ use iced_x86::{
 };
 use std::collections::HashMap;
 
+fn install_operand_offsets(buf: &mut [u8], base: usize, offsets: &[u16]) {
+    for (index, value) in offsets.iter().copied().enumerate() {
+        buf[base + index * 2..base + index * 2 + 2].copy_from_slice(&value.to_le_bytes());
+    }
+}
+
 #[test]
 fn test_p2_9_chunk_lookup_hides_plain_boundaries_and_key_list() {
     use crate::vm::chunk_crypto::{chunk_key_from_module, module_key, BytecodeChunk};
@@ -1178,7 +1184,7 @@ fn test_poly_direct_compare_exchange_all_widths_matches_reference() {
                 buf[table_off + i * 8..table_off + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
             }
 
-            buf[OFF_OP_OFFS..OFF_OP_OFFS + 256].copy_from_slice(&parts.offs_tab);
+            install_operand_offsets(buf, OFF_OP_OFFS, &parts.offs_tab);
 
             buf[OFF_OP_FLAGS..OFF_OP_FLAGS + 256].copy_from_slice(&parts.flags_tab);
 
@@ -1405,7 +1411,7 @@ fn test_poly_direct_atomic_exchange_add_all_widths_matches_reference() {
             for (i, v) in parts.table.iter().enumerate() {
                 buf[table_off + i * 8..table_off + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
             }
-            buf[OFF_OP_OFFS..OFF_OP_OFFS + 256].copy_from_slice(&parts.offs_tab);
+            install_operand_offsets(buf, OFF_OP_OFFS, &parts.offs_tab);
             buf[OFF_OP_FLAGS..OFF_OP_FLAGS + 256].copy_from_slice(&parts.flags_tab);
             buf[bytecode_off..bytecode_off + bytecode.len()].copy_from_slice(&bytecode);
         }
@@ -1983,7 +1989,7 @@ fn test_native_bridge_fp_arg_and_return_matches_abi() {
                 for (i, v) in parts.table.iter().enumerate() {
                     buf[table_off + i * 8..table_off + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
                 }
-                buf[OFF_OP_OFFS..OFF_OP_OFFS + 256].copy_from_slice(&parts.offs_tab);
+                install_operand_offsets(buf, OFF_OP_OFFS, &parts.offs_tab);
                 buf[OFF_OP_FLAGS..OFF_OP_FLAGS + 256].copy_from_slice(&parts.flags_tab);
                 buf[OFF_COND_CODES..OFF_COND_CODES + 256].copy_from_slice(&parts.cond_codes);
                 buf[OFF_BRANCH_MAP..OFF_BRANCH_MAP + parts.branch_map.len()]

@@ -1,6 +1,7 @@
 pub mod builder;
 pub mod checksum;
 pub mod codegen_util;
+mod metadata;
 pub mod runner;
 pub mod types;
 

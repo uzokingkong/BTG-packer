@@ -4,6 +4,12 @@
 
 ## 진행 기록
 
+### 2026-08-22 — P2-14 production split-state ABI 1단계
+
+- operand-offset metadata를 `256 × u8`에서 `256 × u16 little-endian`으로 확대하고 jittered/legacy table layout, serializer, arena runner, native compact reader와 resolve/store helper를 모두 16-bit ABI로 전환했다. production validator는 register descriptor가 정렬돼 있고 runtime state 범위 안인지 fail-closed 검사한다.
+- production seeded layout은 GPR/temp를 `+0x000`/`+0x400` 두 memory bank에 강제로 분산하고 flags/decode scratch를 bank별로 나누며 XMM window는 `+0x800`, 전체 state는 `0x860`으로 이동했다. virtual stack base 계산과 PE state 초기화도 새 크기를 사용해 state/XMM/stack 충돌을 제거했다.
+- cross-family routing은 기존처럼 source/target layout의 개별 offset으로 GPR/flags/VSP/XMM을 marshal하므로 넓어진 bank를 그대로 지원한다. 관련 metadata 생성을 새 `poly_direct/metadata.rs`로 분리해 251KB `builder.rs`의 단계적 기능 분할도 시작했다. library 569/569와 대표 4-family production 실행 동치를 통과했다. 다음 P2-14 범위는 lazy flag producer/materialization이다.
+
 ### 2026-08-22 — 현재 기준선 갱신 (`main` 9931adb 이후)
 
 - 아래의 “미완료” 문구 중 이 항목보다 오래된 P2-9/P2-10/P2-11/P2-5 기록은 당시 단계의 역사적 스냅샷이며 현재 상태 판정으로 사용하지 않는다.

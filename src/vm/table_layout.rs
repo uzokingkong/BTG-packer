@@ -28,8 +28,8 @@ impl TableLayout {
         // Jitter 1: 16 ~ 143 bytes padding
         let pad1 = 16 + ((hash >> 8) & 0x7F) as usize;
         cursor += pad1;
-        let operand_offs_off = cursor; // 256 bytes
-        cursor += 256;
+        let operand_offs_off = cursor; // 256 x u16
+        cursor += 512;
 
         // Jitter 2: 16 ~ 143 bytes padding
         let pad2 = 16 + ((hash >> 20) & 0x7F) as usize;
@@ -66,9 +66,9 @@ impl TableLayout {
         Self {
             handler_table_off: 0x000,
             operand_offs_off: 0x800,
-            operand_flags_off: 0x900,
-            cond_codes_off: 0xA00,
-            branch_map_off: 0xB00,
+            operand_flags_off: 0xA00,
+            cond_codes_off: 0xB00,
+            branch_map_off: 0xC00,
             total_size: 0x1000,
         }
     }
@@ -89,7 +89,7 @@ mod tests {
 
         // Verification of no overlaps
         assert!(l1.handler_table_off + 2048 <= l1.operand_offs_off);
-        assert!(l1.operand_offs_off + 256 <= l1.operand_flags_off);
+        assert!(l1.operand_offs_off + 512 <= l1.operand_flags_off);
         assert!(l1.operand_flags_off + 256 <= l1.cond_codes_off);
         assert!(l1.cond_codes_off + 256 <= l1.branch_map_off);
     }

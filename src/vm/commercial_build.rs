@@ -10,7 +10,7 @@
 //
 //   code     = [self-decoding rolling-key dispatcher] (entry + subroutines +
 //              handlers + dispatch loop)
-//   table    = [256 x u64 handler table][256 x u8 operand-offset table]
+//   table    = [256 x u64 handler table][256 x u16 operand-offset table]
 //              [256 x u8 operand-kind table]  (0xA00 bytes)
 //   bytecode = polymorphic rolling-key bytecode (at-rest encrypted)
 //
@@ -39,7 +39,7 @@ use std::collections::HashMap;
 /// Commercial VM state buffer size (harness layout: REGS 0x80 + TEMPS 0x40 +
 /// FLAGS + VSP + padding = 0x100). Used to place the virtual stack top (R13)
 /// right after the state buffer for the embedded program VM.
-pub const COMMERCIAL_STATE_SIZE: u64 = 0x100;
+pub const COMMERCIAL_STATE_SIZE: u64 = crate::vm::threaded::runtime_layout::SPLIT_STATE_SIZE as u64;
 
 /// Virtual stack reserved below the state buffer (grows down from
 /// state_va + COMMERCIAL_STATE_SIZE + VIRTUAL_STACK_SIZE). Mirrors the harness
@@ -57,9 +57,9 @@ pub const VIRTUAL_STACK_SIZE: u64 = 0x2000;
 ///               저장 후 commercial ABI(R8=bytecode base, R12=VIP=0,
 ///               R13=virtual stack top, R14=rolling key, R15=handler table,
 ///               RDX=state)를 세팅하고 dispatch loop에 진입.
-/// * `table`   — [256 x u64 handler table][256 x u8 operand-offset][256 x u8
-///               operand-kind] = 0xA00 bytes. dispatcher가 R15-relative(+0x800,
-///               +0x900)로 operand 테이블을 읽는다.
+/// * `table`   — [256 x u64 handler table][256 x u16 operand-offset][256 x u8
+///               operand-kind] plus condition/branch metadata. The widened
+///               offset ABI addresses both P2-14 physical state banks.
 /// * `bytecode`— 폴리모픽 롤링키 바이트코드 (at-rest 암호화 대상).
 ///
 /// 상용 경로 실행 정합(부트 스텁이 state 버퍼에 entry GPR을 심고 이 엔트리로
@@ -239,7 +239,10 @@ pub fn build_program_vm_commercial_with_routes_for_family(
         let off = layout.handler_table_off + i * 8;
         table[off..off + 8].copy_from_slice(&v.to_le_bytes());
     }
-    table[layout.operand_offs_off..layout.operand_offs_off + 256].copy_from_slice(&parts.offs_tab);
+    for (index, value) in parts.offs_tab.iter().copied().enumerate() {
+        let off = layout.operand_offs_off + index * 2;
+        table[off..off + 2].copy_from_slice(&value.to_le_bytes());
+    }
     table[layout.operand_flags_off..layout.operand_flags_off + 256]
         .copy_from_slice(&parts.flags_tab);
     table[layout.cond_codes_off..layout.cond_codes_off + 256].copy_from_slice(&parts.cond_codes);
@@ -379,7 +382,7 @@ mod tests {
             buf[bytecode_off..bytecode_off + module.bytecode.len()]
                 .copy_from_slice(&module.bytecode);
             // init state buffer
-            buf[state_off..state_off + 0x100].fill(0);
+            buf[state_off..state_off + runtime_layout.total_size].fill(0);
             for (i, v) in init.iter().enumerate() {
                 let off = runtime_layout.vregs[i] as usize;
                 buf[state_off + off..state_off + off + 8].copy_from_slice(&v.to_le_bytes());

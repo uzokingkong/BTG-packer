@@ -54,7 +54,7 @@ pub struct SelfDecodingParts {
     /// Family-specific traversal grammar used by the entry integrity anchor.
     pub table_integrity_topology: super::checksum::TableIntegrityTopology,
     /// 256 x u8 operand-offset table (operand-encoding -> state offset).
-    pub offs_tab: Vec<u8>,
+    pub offs_tab: Vec<u16>,
     /// 256 x u8 operand-kind table (0=reg/temp/vsp/flags, 1=imm, 2=none).
     pub flags_tab: Vec<u8>,
     /// 256 x u8 cond-code table (decrypted cond byte -> canonical COND_* code, 0xFF invalid).
@@ -123,7 +123,7 @@ impl SelfDecodingParts {
             .checked_add(2048)
             .is_none_or(|v| v > l.operand_offs_off)
             || l.operand_offs_off
-                .checked_add(256)
+                .checked_add(512)
                 .is_none_or(|v| v > l.operand_flags_off)
             || l.operand_flags_off
                 .checked_add(256)
@@ -137,6 +137,16 @@ impl SelfDecodingParts {
 
         if self.branch_map.len() < 4 {
             return Err(anyhow!("commercial VM branch map is truncated"));
+        }
+        for (raw, (&offset, &kind)) in self.offs_tab.iter().zip(&self.flags_tab).enumerate() {
+            if kind == super::K_REG
+                && (offset as usize % 8 != 0
+                    || offset as usize + 8 > self.runtime_layout.total_size)
+            {
+                return Err(anyhow!(
+                    "commercial VM operand {raw:#04x} has invalid split-state offset {offset:#x}"
+                ));
+            }
         }
         let count = u32::from_le_bytes(self.branch_map[0..4].try_into().unwrap()) as usize;
         let expected = 4usize

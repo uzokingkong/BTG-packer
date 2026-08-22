@@ -22,8 +22,8 @@ partition한 뒤 독립 bytecode/module/state/table과 native self-decoding runt
 | Distributed integrity | 구현됨 | family별 code/table/bytecode 12개 BTGI descriptor와 boot verifier |
 | Data lifetime | 부분 구현 | strict proof가 가능한 ASCII/UTF-16 literal을 사용 직전 복호화 후 재암호화 |
 | P2-13 grammar | 완료 | family operand/compact immediate/control token 및 독립 super-op grammar production 연결 |
-| P2-14 state/lazy flags | 계획 | family별 state는 독립이지만 canonical state의 추가 분할은 미완료 |
-| Release gate | 부분 완료 | library 568/568 및 P2-13 20-seed grammar gate 통과; 전체 pack gate 재실행 필요 |
+| P2-14 state/lazy flags | 진행 중 | production split state bank/u16 operand offset 완료, lazy flags 미완료 |
+| Release gate | 부분 완료 | library 569/569 및 P2-13 20-seed grammar gate 통과; 전체 pack gate 재실행 필요 |
 
 완료/부분/계획의 상세 근거는 [현재 구현 상태](docs/current-status.md)를 기준으로
 합니다. 오래된 journal·audit 문서의 상태 문구는 당시 시점의 기록이며 현재 상태를

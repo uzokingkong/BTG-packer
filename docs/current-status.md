@@ -53,6 +53,17 @@
 - 일부 MOV/NOT/NOR handler는 seed/opcode에 따라 실제 의미 동치 body recipe가
   달라집니다.
 
+### Split state ABI (P2-14)
+
+- production `VmRuntimeLayout::from_seed`는 GPR과 temp를 `+0x000` 및 `+0x400`
+  두 bank에 분산하고 flags/decode scratch와 XMM window를 별도 범위에 둡니다.
+- operand-offset metadata는 `256 × u16 little-endian`이며 native resolver/store와
+  compact reader가 2배 index scale의 16-bit load를 사용합니다.
+- state allocation은 layout 전체 `0x860`을 예약하고 virtual stack은 그 뒤에서
+  시작하므로 두 state bank 및 `0x800` XMM window와 겹치지 않습니다.
+- cross-family router는 source/target의 독립 layout offset으로 GPR/flags/VSP/XMM을
+  변환하며 production validator가 모든 register descriptor의 정렬과 범위를 검사합니다.
+
 ### Distributed integrity
 
 - 4 family × handler code/table/bytecode = 최대 12개 region을 독립 sealing합니다.
@@ -75,12 +86,13 @@
 | P2-11 handler synthesis | full ISA target wrapper, 일부 실제 body recipe | execution-weight 80%에 3개 이상 body recipe |
 | P2-12 anchor 분산 | 4 instance, 4 integrity topology, ownership gate | RIP-relative runtime bundle materialization, N=20 signature gate |
 | P2-13 grammar | family operand/compact immediate/control token, super-op tag+descriptor-mask ABI | 완료 |
+| P2-14 state/lazy flags | u16 operand metadata, split memory bank, XMM/stack 분리, cross-family layout marshal | lazy condition producer/materialization |
 | Data lifetime | strict single-owner ASCII/UTF-16 | 공유 객체 동시성, wider format/direct-memory cases |
-| Release gate | 568 library tests, P2-13 20-seed grammar gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
+| Release gate | 569 library tests, P2-13 20-seed grammar gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
 
 ## 미구현 또는 다음 단계
 
-- P2-14 split state bank와 lazy flag producer token.
+- P2-14 lazy flag producer token과 native boundary materialization.
 - shared lifetime object의 thread-safe state/locking.
 - P2-15 native bridge canonical-image lifetime 축소와 oracle 감소.
 - 최신 전체 hostile corpus/20-seed release gate.

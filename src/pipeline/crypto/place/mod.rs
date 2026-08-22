@@ -1353,8 +1353,10 @@ pub(crate) fn place_boot_stub(
                 let call_stack_va = vm_prog_state_va
                     + state_delta as u64
                     + (MULTI_FAMILY_STATE_STRIDE - crate::vm::interp::CALL_STACK_SIZE) as u64;
-                btg.bytes[state_off..state_off + 0x268].fill(0);
-                btg.bytes[state_off + 0x5000..state_off + 0x5010].fill(0);
+                btg.bytes[state_off
+                    ..state_off + crate::vm::commercial_build::COMMERCIAL_STATE_SIZE as usize]
+                    .fill(0);
+                btg.bytes[state_off + 0x5000..state_off + 0x5018].fill(0);
                 if index == 0 {
                     btg.bytes[state_off + 0x5000..state_off + 0x5008]
                         .copy_from_slice(&(multi.entry_byte_offset as u64).to_le_bytes());
