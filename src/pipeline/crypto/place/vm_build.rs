@@ -14,6 +14,8 @@ pub(crate) struct MultiFamilyVmModule {
     pub module: vm::VmModule,
     pub families: Vec<vm::poly::VmArchitectureFamily>,
     pub state_offsets: Vec<usize>,
+    pub code_ranges: Vec<(usize, usize)>,
+    pub table_ranges: Vec<(usize, usize)>,
     pub bytecode_ranges: Vec<(usize, usize)>,
     pub native_bridge_ranges: Vec<(usize, usize)>,
     pub entry_byte_offset: usize,
@@ -190,12 +192,16 @@ pub(crate) fn build_multi_family_prog_mod(
     let mut code = Vec::with_capacity(code_total);
     let mut table = Vec::with_capacity(table_total);
     let mut bytecode = Vec::with_capacity(bytecode_cursor);
+    let mut code_ranges = Vec::with_capacity(built.len());
+    let mut table_ranges = Vec::with_capacity(built.len());
     let mut bytecode_ranges = Vec::with_capacity(built.len());
     let mut chunks = Vec::new();
     for module in &built {
+        code_ranges.push((code.len(), module.code.len()));
         code.extend_from_slice(&module.code);
     }
     for module in &built {
+        table_ranges.push((table.len(), module.table.len()));
         table.extend_from_slice(&module.table);
     }
     for (index, module) in built.iter().enumerate() {
@@ -221,6 +227,8 @@ pub(crate) fn build_multi_family_prog_mod(
         state_offsets: (0..modules.len())
             .map(|index| index * MULTI_FAMILY_STATE_STRIDE)
             .collect(),
+        code_ranges,
+        table_ranges,
         bytecode_ranges,
         native_bridge_ranges,
         entry_byte_offset,

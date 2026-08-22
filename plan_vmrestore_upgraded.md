@@ -32,6 +32,13 @@
 - 다중 jump-island wrapper 시도는 native 실행에서 `STATUS_ILLEGAL_INSTRUCTION` 회귀를 검출해 폐기했다. 검증된 기존 단일 wrapper를 유지하고 불안정 코드는 커밋하지 않았다.
 - 전체 library 559/559와 `corpus/o1.exe --vm --vm-oep --vm-commercial --m7 --m8 --integrity --verify-output --seed 31010` 최대 조합이 통과했다. production 결과는 4 family/255 M7 chunk, data-lifetime ciphertext 46개이며 실행 차등검증이 일치했다.
 
+### 2026-08-22 — Distributed integrity family descriptor production materialization
+
+- multi-family builder가 합친 module 안에서도 family별 code/table/bytecode 경계를 끝까지 보존한다. descriptor 생성기는 empty/OOB/overflow/overlap 범위를 fail-closed한다.
+- `--integrity` production placement가 M7 persistent bytecode layer 적용 직후, transient boot RC4 적용 직전에 실제 런타임 표현을 seal한다. 각 family의 handler code, handler table, VM bytecode에 독립 domain-derived keyed tag와 RVA/length 계약을 생성해 pipeline context에 보존한다.
+- `corpus/o1.exe` seed 31010 최대 조합에서 4 family × 3 region = 12 descriptor가 생성됐고 실행 차등검증이 통과했다. 전체 library는 신규 범위 회귀 테스트를 포함해 560/560 통과했다.
+- 이 단계는 production region/tag materialization까지다. 다음은 12 descriptor serialization과 boot/runtime consumer를 연결해 변조 시 실제 fail-closed/poison 경로를 실행하고 tamper corpus로 닫는다.
+
 ### 2026-08-22 — P2-10 실제 multi-family module/state/table 및 call/return routing 완료
 
 - production placer가 entry family를 첫 module로 정렬하고 4개 family의 code, handler/operand/condition/branch table, bytecode를 각각 독립 생성한다. mutable state, virtual stack, cross-family control slots, return-IP stack은 family마다 `0x8000` stride로 격리한다.

@@ -1239,6 +1239,11 @@ pub(crate) fn place_boot_stub(
     }
     // ── M6 Phase-2: 프로그램 VM 모듈 배치 (최종 VA로 재생성 후 복사) ──────────
     let mut vm_multi_family_chunks = Vec::new();
+    let mut vm_multi_family_regions: Option<(
+        Vec<(usize, usize)>,
+        Vec<(usize, usize)>,
+        Vec<(usize, usize)>,
+    )> = None;
     if let Some(m) = vm_prog_mod {
         let prva = dispatcher_va + vm_prog_off as u64;
         let multi_built = if vm_multi_family_active {
@@ -1305,6 +1310,11 @@ pub(crate) fn place_boot_stub(
         );
         btg.bytes[b..b + prmod.bytecode.len()].copy_from_slice(&prmod.bytecode);
         if let Some(multi) = &multi_built {
+            vm_multi_family_regions = Some((
+                multi.code_ranges.clone(),
+                multi.table_ranges.clone(),
+                multi.bytecode_ranges.clone(),
+            ));
             for (index, state_delta) in multi.state_offsets.iter().copied().enumerate() {
                 let state_off = (vm_prog_state_va - dispatcher_va) as usize + state_delta;
                 let call_stack_va = vm_prog_state_va
@@ -1387,6 +1397,51 @@ pub(crate) fn place_boot_stub(
             "[+] P1-4 Program-VM M7: outer encryption ACTIVE for {} chunk(s); runtime decoder unmasks fetched bytes only",
             ctx.vm_prog_chunks.len()
         );
+    }
+
+    // Distributed integrity is sealed after the persistent M7 layer is in its
+    // final runtime representation, but before the transient boot RC4 wrapper.
+    // The boot decrypt restores these exact bytes before Program-VM entry.
+    ctx.vm_integrity_descriptors.clear();
+    if integrity_effective {
+        if let Some((code_ranges, table_ranges, bytecode_ranges)) = &vm_multi_family_regions {
+            let code_total = code_ranges.iter().map(|(_, len)| *len).sum::<usize>();
+            let table_base = vm_prog_off + code_total;
+            let table_total = table_ranges.iter().map(|(_, len)| *len).sum::<usize>();
+            let bytecode_base = table_base + table_total;
+            let mut regions = Vec::with_capacity(code_ranges.len() * 3);
+            for &(offset, len) in code_ranges {
+                regions.push((
+                    vm::distributed_integrity::ProtectedRegionKind::HandlerCode,
+                    vm_prog_off + offset,
+                    len,
+                ));
+            }
+            for &(offset, len) in table_ranges {
+                regions.push((
+                    vm::distributed_integrity::ProtectedRegionKind::HandlerTable,
+                    table_base + offset,
+                    len,
+                ));
+            }
+            for &(offset, len) in bytecode_ranges {
+                regions.push((
+                    vm::distributed_integrity::ProtectedRegionKind::VmBytecode,
+                    bytecode_base + offset,
+                    len,
+                ));
+            }
+            ctx.vm_integrity_descriptors = vm::distributed_integrity::seal_region_set(
+                &btg.bytes,
+                &regions,
+                dispatcher_va - image_base,
+                ctx.poly_vm_seed,
+            )?;
+            println!(
+                "[+] Distributed integrity: sealed {} family-scoped code/table/bytecode descriptor(s)",
+                ctx.vm_integrity_descriptors.len()
+            );
+        }
     }
 
     // fresh RC4(seed_stored) 하나로 .text → bytecode 순 연속 암호화. 부트 스텁의

@@ -76,6 +76,50 @@ impl IntegrityDescriptor {
     }
 }
 
+/// Seal non-overlapping region slices from the exact image representation that
+/// will exist when runtime verification executes.
+pub fn seal_region_set(
+    image: &[u8],
+    regions: &[(ProtectedRegionKind, usize, usize)],
+    image_rva: u64,
+    build_key: u64,
+) -> anyhow::Result<Vec<IntegrityDescriptor>> {
+    let mut ordered = regions.to_vec();
+    ordered.sort_by_key(|(_, offset, _)| *offset);
+    let mut previous_end = 0usize;
+    let mut descriptors = Vec::with_capacity(ordered.len());
+    for (kind, offset, len) in ordered {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| anyhow::anyhow!("distributed integrity region overflow"))?;
+        if len == 0 || end > image.len() {
+            return Err(anyhow::anyhow!(
+                "distributed integrity {:?} region {}..{} outside image length {}",
+                kind,
+                offset,
+                end,
+                image.len()
+            ));
+        }
+        if !descriptors.is_empty() && offset < previous_end {
+            return Err(anyhow::anyhow!(
+                "distributed integrity region overlap at {}..{}",
+                offset,
+                end
+            ));
+        }
+        descriptors.push(IntegrityDescriptor::seal(
+            kind,
+            image_rva + offset as u64,
+            &image[offset..end],
+            build_key,
+            IntegrityFailurePolicy::FailClosed,
+        ));
+        previous_end = end;
+    }
+    Ok(descriptors)
+}
+
 fn keyed_tag(bytes: &[u8], key: u64) -> u64 {
     crate::crypto::mac::BtgKeyedMac::mac(&key.to_le_bytes(), bytes)
 }
@@ -148,5 +192,35 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn production_region_set_rejects_overlap_and_oob() {
+        let image = [0x5Au8; 96];
+        let valid = seal_region_set(
+            &image,
+            &[
+                (ProtectedRegionKind::HandlerCode, 0, 32),
+                (ProtectedRegionKind::HandlerTable, 32, 16),
+                (ProtectedRegionKind::VmBytecode, 48, 48),
+            ],
+            0x7000,
+            9,
+        )
+        .unwrap();
+        assert_eq!(valid.len(), 3);
+        assert!(seal_region_set(
+            &image,
+            &[
+                (ProtectedRegionKind::HandlerCode, 0, 40),
+                (ProtectedRegionKind::HandlerTable, 32, 16),
+            ],
+            0,
+            9,
+        )
+        .is_err());
+        assert!(
+            seal_region_set(&image, &[(ProtectedRegionKind::VmBytecode, 80, 32)], 0, 9,).is_err()
+        );
     }
 }
