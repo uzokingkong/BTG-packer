@@ -73,8 +73,8 @@ pub fn select_call_scoped_literals(
     image_base: u64,
     objects: &[LiteralObject],
 ) -> Vec<LiteralObject> {
-    let mut selected = std::collections::BTreeSet::new();
-    let mut pending = std::collections::HashMap::<Register, u32>::new();
+    let mut proven = std::collections::BTreeMap::<u32, std::collections::BTreeSet<u32>>::new();
+    let mut pending = std::collections::HashMap::<Register, (u32, u32)>::new();
     let mut decoder = Decoder::with_ip(
         64,
         text,
@@ -89,7 +89,9 @@ pub fn select_call_scoped_literals(
             FlowControl::Call | FlowControl::IndirectCall
         );
         if is_call {
-            selected.extend(pending.values().copied());
+            for &(object_rva, reference_rva) in pending.values() {
+                proven.entry(object_rva).or_default().insert(reference_rva);
+            }
             pending.clear();
             continue;
         }
@@ -120,13 +122,27 @@ pub fn select_call_scoped_literals(
                 .iter()
                 .find(|object| rva >= object.rva && rva < object.rva.saturating_add(object.len))
             {
-                pending.insert(dst, object.rva);
+                let Some(reference_rva) = instruction
+                    .ip()
+                    .checked_sub(image_base)
+                    .and_then(|value| u32::try_from(value).ok())
+                else {
+                    continue;
+                };
+                pending.insert(dst, (object.rva, reference_rva));
             }
         }
     }
     objects
         .iter()
-        .filter(|object| selected.contains(&object.rva))
+        .filter(|object| {
+            proven.get(&object.rva).is_some_and(|references| {
+                object
+                    .references
+                    .iter()
+                    .all(|reference| references.contains(reference))
+            })
+        })
         .cloned()
         .collect()
 }
