@@ -3456,7 +3456,7 @@ fn test_table_checksum_matches_builtin() {
             &bytecode, seed, 0x100000, 0x200000, 0x300000, 0x400000, 0x500000,
         )
         .unwrap();
-        let expect = table_checksum(&parts.table);
+        let expect = table_checksum_with_topology(&parts.table, parts.table_integrity_topology);
         assert_eq!(
             parts.table_checksum, expect,
             "seed {seed:#x}: checksum mismatch"
@@ -3466,6 +3466,18 @@ fn test_table_checksum_matches_builtin() {
             "seed {seed:#x}: placeholder not patched"
         );
     }
+}
+
+#[test]
+fn table_integrity_topology_is_distinct_per_family() {
+    use crate::vm::poly::VmArchitectureFamily;
+    use std::collections::HashSet;
+
+    let topologies: HashSet<_> = VmArchitectureFamily::ALL
+        .into_iter()
+        .map(TableIntegrityTopology::for_family)
+        .collect();
+    assert_eq!(topologies.len(), VmArchitectureFamily::ALL.len());
 }
 
 /// P6-3: per-opcode keys must be injective over the 256 possible opcode bytes so

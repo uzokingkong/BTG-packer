@@ -74,6 +74,38 @@ pub(crate) fn lift_program(
                 .iter()
                 .map(|partition| partition.regions.len())
                 .sum();
+            let family_op_counts: Vec<_> = partitions
+                .iter()
+                .map(|partition| {
+                    (
+                        partition.family,
+                        partition
+                            .regions
+                            .iter()
+                            .map(|range| range.end_op - range.start_op)
+                            .sum::<usize>(),
+                    )
+                })
+                .collect();
+            let partitioned_ops = family_op_counts
+                .iter()
+                .map(|(_, count)| *count)
+                .sum::<usize>();
+            let max_family_ops = family_op_counts
+                .iter()
+                .map(|(_, count)| *count)
+                .max()
+                .unwrap_or(0);
+            if partitioned_ops >= 1_000
+                && (partitions.len() < 3 || max_family_ops.saturating_mul(2) >= partitioned_ops)
+            {
+                return Err(anyhow::anyhow!(
+                    "P2-12 runtime-instance ownership gate failed: instances={} max_ops={}/{}",
+                    partitions.len(),
+                    max_family_ops,
+                    partitioned_ops
+                ));
+            }
             println!(
                 "[+] P2-10 family op partition: {} backend partition(s), {} function region(s), {} total RISC op(s)",
                 partitions.len(),
@@ -82,6 +114,14 @@ pub(crate) fn lift_program(
                     .iter()
                     .map(|range| range.end_op - range.start_op)
                     .sum::<usize>(),
+            );
+            println!(
+                "[+] P2-12 runtime anchor gate: {} independent instance(s), max instruction ownership {}/{} ({:.2}%), family integrity topologies={}",
+                partitions.len(),
+                max_family_ops,
+                partitioned_ops,
+                if partitioned_ops == 0 { 0.0 } else { max_family_ops as f64 * 100.0 / partitioned_ops as f64 },
+                partitions.len(),
             );
             let multi_family =
                 vm::multi_family::MultiFamilyProgramPlan::build(&lift.program, &plan, &partitions)

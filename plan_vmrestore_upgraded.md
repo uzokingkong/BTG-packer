@@ -11,8 +11,14 @@
 - P2-10은 4개 독립 code/handler-table/bytecode/state module, canonical cross-family CALL/tail-JUMP/return routing, family별 unwind range까지 production 배치 완료다.
 - P2-11은 canonical ISA와 super-op extension의 모든 최종 handler-table target에 seed/opcode-derived synthesis wrapper를 적용했다. 전체 ISA production reachability는 완료됐지만 handler 본체의 micro-op decomposition/MBA/register allocation/control split 다양성은 추가 강화 대상으로 유지한다.
 - P2-5는 helper-only 상태를 종료했다. PE literal reference graph와 strict `LEA literal → Win64 argument → call` proof를 production에 연결하고, VM 소유권까지 재검증된 45개 객체를 at-rest ciphertext로 저장한다. call 직전 RISC toggle로 복호화하고 복귀 직후 재암호화하며 flags를 복원한다. 일부 참조/native 참조/loader-critical 객체는 fail-closed 제외한다.
-- 최신 검증: library 562/562(아래 runtime verifier 회귀 포함), `corpus/o1.exe` 일반 및 `--m7 --m8 --integrity` 실행 동치 exit 0/stdout 1,460B/stderr 0B. 최신 data-lifetime/handler-body 변경 이후 20-seed/전체 hostile corpus는 다시 수행해야 한다.
-- 다음 구현 순서: (1) P2-12 runtime anchor 분산, (2) P2-13 grammar polymorphism, (3) P2-14 state splitting/lazy flags와 data-lifetime 동시성, (4) P2-15 bridge oracle 감소, (5) 최신 20-seed 및 hostile/tamper release gate 확대.
+- 최신 검증: library 563/563(P2-12 topology 회귀 포함), `corpus/o1.exe` 일반 및 `--m7 --m8 --integrity` 실행 동치 exit 0/stdout 1,460B/stderr 0B. 최신 data-lifetime/handler-body 변경 이후 20-seed/전체 hostile corpus는 다시 수행해야 한다.
+- 다음 구현 순서: (1) P2-13 grammar polymorphism, (2) P2-14 state splitting/lazy flags와 data-lifetime 동시성, (3) P2-15 bridge oracle 감소, (4) 최신 20-seed 및 hostile/tamper release gate 확대.
+
+### 2026-08-22 — P2-12 family별 runtime integrity anchor 분산
+
+- 네 architecture family의 handler-table 검증기를 `forward-single`, `reverse-single`, `forward-pair`, `reverse-pair`의 서로 다른 native traversal grammar로 분리했다. reverse family는 build-time checksum 순서도 역방향으로 계산하며, production validator가 각 module의 topology와 expected checksum lockstep을 확인한다.
+- 대형 production partition에는 최소 3개 instance 및 최대 단일 instance instruction ownership `<50%` fail-closed gate를 추가했다. 작은 단위 프로그램은 기존 단일/소수 instance fallback을 유지한다.
+- `corpus/o1.exe` seed 31010 최대 조합은 4개 독립 runtime instance와 4개 integrity topology를 생성했다. 최대 family ownership은 `37,117/130,685 = 28.40%`이며, 513개 cross-family route와 M7/BTGI runtime verifier를 함께 사용한 실행 차등검증이 exit 0/stdout 1,460B/stderr 0B로 통과했다.
 
 ### 2026-08-22 — P2-5 direct-access lifetime 확대
 

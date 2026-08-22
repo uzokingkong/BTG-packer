@@ -19,6 +19,25 @@ const CHUNK_LEAF_LABEL_BASE: usize = 0xD000_0000;
 const STATE_CROSS_FAMILY_ENTRY_VIP: i64 = 0x5000;
 const STATE_CROSS_FAMILY_RETURN_PTR: i64 = 0x5008;
 
+fn emit_table_integrity_mix(b: &mut CodeBuilder) {
+    b.push(
+        Instruction::with2(
+            Code::Mov_r64_rm64,
+            Register::R11,
+            MemoryOperand::with_base_index_scale_displ_size(Register::R15, Register::R9, 8, 0, 8),
+        )
+        .unwrap(),
+    );
+    b.push(Instruction::with2(Code::Add_rm64_r64, Register::R10, Register::R11).unwrap());
+    movi(b, Register::RCX, 0x0100_0000_01B3);
+    b.push(Instruction::with2(Code::Imul_r64_rm64, Register::R10, Register::RCX).unwrap());
+    b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::R10).unwrap());
+    b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::R11, 33).unwrap());
+    b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R10, Register::R11).unwrap());
+    movi(b, Register::RCX, 0xFF51_AFD7_ED55_8CCD);
+    b.push(Instruction::with2(Code::Imul_r64_rm64, Register::R10, Register::RCX).unwrap());
+}
+
 fn emit_masked_chunk_value(
     b: &mut CodeBuilder,
     descriptor_domain: u64,
@@ -1116,6 +1135,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
     // P6-3: index of the entry's checksum placeholder (`mov r11, imm64`) — patched
     // with the real table checksum after assembly (table VAs are only known then).
     let csum_placeholder_idx;
+    let table_integrity_topology = TableIntegrityTopology::for_family(family);
     {
         // The eight Win64 nonvolatile registers were saved by the RVA-0
         // prologue above. HALT restores them in reverse order.
@@ -1158,35 +1178,48 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         // 256 encrypted entries and compare with the build-time value. A patched /
         // restored table (e.g. a dumped-and-rewritten handler table) trips `ud2`.
         // R15 must be table_base (set above); clobbers RCX/R9/R10/R11/RAX only.
-        b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R9, Register::R9).unwrap());
         movi(&mut b, Register::R10, 0x811C9DC5);
-        let csum_loop = b.len();
-        {
-            b.push(
-                Instruction::with2(
-                    Code::Mov_r64_rm64,
-                    Register::R11,
-                    MemoryOperand::with_base_index_scale_displ_size(
-                        Register::R15,
-                        Register::R9,
-                        8,
-                        0,
-                        8,
-                    ),
-                )
-                .unwrap(),
-            );
-            b.push(Instruction::with2(Code::Add_rm64_r64, Register::R10, Register::R11).unwrap());
-            movi(&mut b, Register::RCX, 0x0100_0000_01B3);
-            b.push(Instruction::with2(Code::Imul_r64_rm64, Register::R10, Register::RCX).unwrap());
-            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::R10).unwrap());
-            b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::R11, 33).unwrap());
-            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R10, Register::R11).unwrap());
-            movi(&mut b, Register::RCX, 0xFF51_AFD7_ED55_8CCD);
-            b.push(Instruction::with2(Code::Imul_r64_rm64, Register::R10, Register::RCX).unwrap());
-            b.push(Instruction::with1(Code::Inc_rm64, Register::R9).unwrap());
-            b.push(Instruction::with2(Code::Cmp_rm64_imm32, Register::R9, 256).unwrap());
-            b.jne(csum_loop);
+        match table_integrity_topology {
+            TableIntegrityTopology::ForwardSingle => {
+                b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R9, Register::R9).unwrap());
+                let loop_start = b.len();
+                emit_table_integrity_mix(&mut b);
+                b.push(Instruction::with1(Code::Inc_rm64, Register::R9).unwrap());
+                b.push(Instruction::with2(Code::Cmp_rm64_imm32, Register::R9, 256).unwrap());
+                b.jne(loop_start);
+            }
+            TableIntegrityTopology::ReverseSingle => {
+                movi(&mut b, Register::R9, 256);
+                let loop_start = b.len();
+                b.push(Instruction::with1(Code::Dec_rm64, Register::R9).unwrap());
+                emit_table_integrity_mix(&mut b);
+                b.push(
+                    Instruction::with2(Code::Test_rm64_r64, Register::R9, Register::R9).unwrap(),
+                );
+                b.jne(loop_start);
+            }
+            TableIntegrityTopology::ForwardPair => {
+                b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R9, Register::R9).unwrap());
+                let loop_start = b.len();
+                emit_table_integrity_mix(&mut b);
+                b.push(Instruction::with1(Code::Inc_rm64, Register::R9).unwrap());
+                emit_table_integrity_mix(&mut b);
+                b.push(Instruction::with1(Code::Inc_rm64, Register::R9).unwrap());
+                b.push(Instruction::with2(Code::Cmp_rm64_imm32, Register::R9, 256).unwrap());
+                b.jne(loop_start);
+            }
+            TableIntegrityTopology::ReversePair => {
+                movi(&mut b, Register::R9, 256);
+                let loop_start = b.len();
+                b.push(Instruction::with1(Code::Dec_rm64, Register::R9).unwrap());
+                emit_table_integrity_mix(&mut b);
+                b.push(Instruction::with1(Code::Dec_rm64, Register::R9).unwrap());
+                emit_table_integrity_mix(&mut b);
+                b.push(
+                    Instruction::with2(Code::Test_rm64_r64, Register::R9, Register::R9).unwrap(),
+                );
+                b.jne(loop_start);
+            }
         }
         // placeholder expected checksum — patched below with the real value once the
         // (VA-dependent) encrypted table is built. mov r64, imm64 is fixed 10 bytes.
@@ -5578,7 +5611,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         table[byte as usize] = va_of(hidx) ^ per_op_key(table_key, byte);
     }
     // P6-3: 엔트리 스텁의 무결성 셀프체크를 위한 테이블 checksum.
-    let table_checksum = table_checksum(&table);
+    let table_checksum = table_checksum_with_topology(&table, table_integrity_topology);
 
     // P6-3: 위에서 임베드한 placeholder(`mov r11, imm64`, 10 bytes)의 imm64 를 실제
     // checksum 으로 패치. `ips[csum_placeholder_idx]` = 해당 명령의 IP. mov r64, imm64
@@ -5607,6 +5640,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         table,
         table_key,
         table_checksum,
+        table_integrity_topology,
         offs_tab,
         flags_tab,
         cond_codes,

@@ -51,6 +51,8 @@ pub struct SelfDecodingParts {
     /// P6-3: 테이블 무결성 셀프체크 값 (빌드 시 암호화된 256 항목 checksum). 엔트리
     /// 스텁이 매 VM 진입마다 재계산해 비교하며, 변조/복원된 테이블은 ud2로 실패한다.
     pub table_checksum: u64,
+    /// Family-specific traversal grammar used by the entry integrity anchor.
+    pub table_integrity_topology: super::checksum::TableIntegrityTopology,
     /// 256 x u8 operand-offset table (operand-encoding -> state offset).
     pub offs_tab: Vec<u8>,
     /// 256 x u8 operand-kind table (0=reg/temp/vsp/flags, 1=imm, 2=none).
@@ -80,7 +82,7 @@ impl SelfDecodingParts {
     /// structural invariants that otherwise turn generator drift into a packed
     /// executable which crashes only after launch.
     pub fn validate(&self, code_base: u64, bytecode_len: usize) -> Result<()> {
-        use super::checksum::{per_op_key, table_checksum};
+        use super::checksum::{per_op_key, table_checksum_with_topology};
 
         if self.code.is_empty() {
             return Err(anyhow!("commercial VM emitted empty code"));
@@ -98,7 +100,9 @@ impl SelfDecodingParts {
                 self.cond_codes.len()
             ));
         }
-        if table_checksum(&self.table) != self.table_checksum {
+        if table_checksum_with_topology(&self.table, self.table_integrity_topology)
+            != self.table_checksum
+        {
             return Err(anyhow!("commercial VM handler-table checksum mismatch"));
         }
 
