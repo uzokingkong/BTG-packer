@@ -34,6 +34,8 @@
   사용하고, 네 family는 서로 다른 marker→width 순열을 사용합니다.
 - static decoder, interpreter, production native self-decoder가 같은 grammar를
   공유합니다.
+- compact branch marker가 family ABI의 `0x10..0x13` domain을 벗어나면 static
+  decoder는 오류를 반환하고 production native handler는 `UD2`로 fail-closed합니다.
 - M7은 각 family stream을 instruction boundary에 맞춘 독립 chunk로 보호합니다.
 
 ### Handler runtime hardening

@@ -44,6 +44,12 @@
 - encoder/super-op encoder, static decoder, interpreter boundary scanner, production native branch handler가 marker를 소비하고 동일한 폭만큼 rolling-key를 전진한다. native handler는 compact payload를 canonical target index로 복원한 뒤 기존 branch-map/resync 경로를 그대로 사용한다.
 - 네 family 전 폭 marker roundtrip, 잘못된 marker fail-closed, forward/backward native branch, 전체 library 567개와 `corpus/o1.exe --m7 --m8 --integrity --verify-output` 실행 동치를 통과했다. 다음 control grammar는 block-local delta/table-indirection/continuation token이다.
 
+### 2026-08-22 — P2-13 native compact branch marker fail-closed
+
+- static decoder에만 있던 invalid marker 거부를 production native branch handler에도 연결했다. marker 복호화 직후 unsigned range check로 `0x10..0x13`만 허용하고 나머지는 payload 폭 table을 참조하기 전에 `UD2`로 종료한다. 따라서 width=0이 동적 reader loop에 들어가 underflow하거나 stream 경계를 벗어나는 경로가 없다.
+- family-local continuation token을 native branch-map key로 직접 쓰는 실험은 unit/ip-map fixture를 통과했지만 실제 `corpus/o1.exe` cross-family/super-op 조합에서 잘못된 target과 `0xC0000005`를 재현해 폐기했다. 해당 변경은 커밋에 포함하지 않았으며 canonical lookup 경로를 복원한 뒤 최대 production 실행 동치가 다시 통과했다.
+- 다음 token 설계는 단순 payload key가 아니라 origin identity, target-width domain, cross-family route identity를 함께 포함해야 한다. 그 전까지 현재 compact absolute marker ABI를 production 기준으로 유지한다.
+
 ### 2026-08-22 — P2-12 family별 runtime integrity anchor 분산
 
 - 네 architecture family의 handler-table 검증기를 `forward-single`, `reverse-single`, `forward-pair`, `reverse-pair`의 서로 다른 native traversal grammar로 분리했다. reverse family는 build-time checksum 순서도 역방향으로 계산하며, production validator가 각 module의 topology와 expected checksum lockstep을 확인한다.

@@ -1649,6 +1649,12 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         let abs_read = b.len();
         b.call(sub_decrypt);
         store_decoded_al(&mut b, DEC_SRC2, (seed >> 57) as u8);
+        movzx8_m(&mut b, Register::EAX, DEC_SRC2);
+        b.push(Instruction::with2(Code::Sub_rm32_imm32, Register::EAX, 0x10).unwrap());
+        b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 3).unwrap());
+        let valid_marker = b.len() + 2;
+        b.br(Code::Jbe_rel32_64, valid_marker);
+        b.push(Instruction::with(Code::Ud2));
         emit_read_compact_imm(
             &mut b,
             DEC_SRC2,
