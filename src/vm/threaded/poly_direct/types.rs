@@ -59,6 +59,8 @@ pub struct SelfDecodingParts {
     pub runtime_layout: crate::vm::threaded::VmRuntimeLayout,
     /// Actual build-selected dispatch control-flow topology.
     pub dispatcher_plan: crate::vm::dispatch_perm::DispatcherPlan,
+    /// P2-9 native chunk descriptor lookup grammar selected for this build.
+    pub chunk_lookup_topology: crate::vm::chunk_crypto::ChunkLookupTopology,
 }
 
 impl SelfDecodingParts {

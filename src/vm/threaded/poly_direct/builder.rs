@@ -12,6 +12,50 @@ use super::checksum::*;
 use super::codegen_util::*;
 use super::types::*;
 
+const CHUNK_LEAF_LABEL_BASE: usize = 0xD000_0000;
+
+fn emit_masked_chunk_value(
+    b: &mut CodeBuilder,
+    descriptor_domain: u64,
+    domain: u64,
+    index: usize,
+    value: u64,
+) {
+    let mask = crate::vm::seed_lifecycle::derive_seed(descriptor_domain, domain ^ index as u64);
+    movi(b, Register::R11, value ^ mask);
+    movi(b, Register::R10, mask);
+    b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R11, Register::R10).unwrap());
+}
+
+fn emit_binary_chunk_lookup(
+    b: &mut CodeBuilder,
+    chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
+    descriptor_domain: u64,
+    lo: usize,
+    hi: usize,
+    internal_label: &mut usize,
+) {
+    if lo == hi {
+        b.br(Code::Jmp_rel32_64, CHUNK_LEAF_LABEL_BASE + lo);
+        return;
+    }
+    let mid = lo + (hi - lo) / 2;
+    let end = chunks[mid].offset.saturating_add(chunks[mid].len) as u64;
+    emit_masked_chunk_value(b, descriptor_domain, 0x424F_554E_4441_5259, mid, end);
+    b.push(Instruction::with2(Code::Cmp_r64_rm64, Register::R12, Register::R11).unwrap());
+    let left_sentinel = 0xC000_0000usize + *internal_label;
+    *internal_label += 1;
+    b.br(Code::Jb_rel32_64, left_sentinel);
+    emit_binary_chunk_lookup(b, chunks, descriptor_domain, mid + 1, hi, internal_label);
+    let left = b.len();
+    for &mut (_, ref mut target) in b.branches.iter_mut() {
+        if *target == left_sentinel {
+            *target = left;
+        }
+    }
+    emit_binary_chunk_lookup(b, chunks, descriptor_domain, lo, mid, internal_label);
+}
+
 /// P3 (G1): build the self-decoding rolling-key dispatcher machine code and its
 /// handler/operand tables, parameterized by the VAs the caller will place them
 /// at. This is the *verified* commercial execution engine (T1-4): the native
@@ -176,12 +220,46 @@ pub fn build_self_decoding_parts_with_superops_and_chunks(
     superop_metadata: Option<&SuperOpBuildMetadata>,
     chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
 ) -> Result<SelfDecodingParts> {
+    build_self_decoding_parts_with_superops_and_chunks_for_family(
+        bytecode,
+        seed,
+        crate::vm::poly::VmArchitectureFamily::for_build(seed),
+        code_base,
+        table_base,
+        bytecode_base,
+        state_base,
+        stack_base,
+        ip_map,
+        layout,
+        runtime_layout,
+        superops,
+        superop_metadata,
+        chunks,
+    )
+}
+
+pub fn build_self_decoding_parts_with_superops_and_chunks_for_family(
+    bytecode: &[u8],
+    seed: u64,
+    family: crate::vm::poly::VmArchitectureFamily,
+    code_base: u64,
+    table_base: u64,
+    bytecode_base: u64,
+    state_base: u64,
+    stack_base: u64,
+    ip_map: Option<&HashMap<u64, usize>>,
+    layout: TableLayout,
+    runtime_layout: VmRuntimeLayout,
+    superops: &[AssignedSuperOp],
+    superop_metadata: Option<&SuperOpBuildMetadata>,
+    chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
+) -> Result<SelfDecodingParts> {
     // P1 migration: every state access now passes through the runtime-layout
     // translator. Keep the legacy contract until the embed/bridge initializers
     // consume the same layout value, then production can switch to `from_seed`.
     runtime_layout.validate()?;
     let _runtime_layout_guard = install_runtime_layout(&runtime_layout);
-    let spec = VirtualIsaSpec::from_seed(seed);
+    let spec = VirtualIsaSpec::from_seed_and_family(seed, family);
     let init_key = seed.wrapping_mul(C1) ^ 0x517CC1B727220A95;
     // P6-1: handler 테이블 마스터 키 — dispatch loop 코드와 테이블 build 시 동일
     // 파생식을 사용한다 (seed→init_key→master 결정적). P6-3 부터 이 값은
@@ -414,21 +492,51 @@ pub fn build_self_decoding_parts_with_superops_and_chunks(
                 seed,
                 0x5032_2D39_2D44_4553, // "P2-9-DES"
             );
-            for (index, chunk) in chunks.iter().enumerate() {
-                let end = chunk.offset.saturating_add(chunk.len);
-                let boundary_mask = crate::vm::seed_lifecycle::derive_seed(
-                    descriptor_domain,
-                    0x424F_554E_4441_5259u64 ^ index as u64,
-                );
-                movi(&mut b, Register::R11, (end as u64) ^ boundary_mask);
-                movi(&mut b, Register::R10, boundary_mask);
-                b.push(
-                    Instruction::with2(Code::Xor_rm64_r64, Register::R11, Register::R10).unwrap(),
-                );
-                b.push(
-                    Instruction::with2(Code::Cmp_r64_rm64, Register::R12, Register::R11).unwrap(),
-                );
-                b.br(Code::Jb_rel32_64, 0xD000_0000usize + index);
+            match crate::vm::chunk_crypto::ChunkLookupTopology::from_seed(seed) {
+                crate::vm::chunk_crypto::ChunkLookupTopology::ForwardEnds => {
+                    for (index, chunk) in chunks.iter().enumerate() {
+                        let end = chunk.offset.saturating_add(chunk.len) as u64;
+                        emit_masked_chunk_value(
+                            &mut b,
+                            descriptor_domain,
+                            0x424F_554E_4441_5259,
+                            index,
+                            end,
+                        );
+                        b.push(
+                            Instruction::with2(Code::Cmp_r64_rm64, Register::R12, Register::R11)
+                                .unwrap(),
+                        );
+                        b.br(Code::Jb_rel32_64, CHUNK_LEAF_LABEL_BASE + index);
+                    }
+                }
+                crate::vm::chunk_crypto::ChunkLookupTopology::ReverseStarts => {
+                    for (index, chunk) in chunks.iter().enumerate().rev() {
+                        emit_masked_chunk_value(
+                            &mut b,
+                            descriptor_domain,
+                            0x4F46_4653_4554_2D31,
+                            index,
+                            chunk.offset as u64,
+                        );
+                        b.push(
+                            Instruction::with2(Code::Cmp_r64_rm64, Register::R12, Register::R11)
+                                .unwrap(),
+                        );
+                        b.br(Code::Jae_rel32_64, CHUNK_LEAF_LABEL_BASE + index);
+                    }
+                }
+                crate::vm::chunk_crypto::ChunkLookupTopology::BinaryEnds => {
+                    let mut internal_label = 0usize;
+                    emit_binary_chunk_lookup(
+                        &mut b,
+                        chunks,
+                        descriptor_domain,
+                        0,
+                        chunks.len() - 1,
+                        &mut internal_label,
+                    );
+                }
             }
             b.push(Instruction::with(Code::Ud2));
             let chunk_module_key = crate::vm::chunk_crypto::module_key(seed);
@@ -446,7 +554,7 @@ pub fn build_self_decoding_parts_with_superops_and_chunks(
                 );
                 b.br(Code::Jmp_rel32_64, 0xE100_0000);
                 for &mut (_, ref mut target) in b.branches.iter_mut() {
-                    if *target == 0xD000_0000usize + index {
+                    if *target == CHUNK_LEAF_LABEL_BASE + index {
                         *target = label;
                     }
                 }
@@ -2740,6 +2848,11 @@ pub fn build_self_decoding_parts_with_superops_and_chunks(
         b.push(Instruction::with1(Code::Pop_r64, Register::R11).unwrap());
         // Restore guest flags so count==0 preserves them exactly.
         mov_m(b, Register::RAX, FLAGS_OFF);
+        // AF is architecturally undefined for SHLD when count != 0. Preserve
+        // the guest value explicitly so host-CPU leakage cannot make native,
+        // reference, and poly executions diverge.
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::RAX).unwrap());
+        b.push(Instruction::with2(Code::And_rm64_imm32, Register::R9, 0x10).unwrap());
         b.push(Instruction::with1(Code::Push_r64, Register::RAX).unwrap());
         b.push(Instruction::with(Code::Popfq));
         match width {
@@ -2774,6 +2887,8 @@ pub fn build_self_decoding_parts_with_superops_and_chunks(
         b.push(Instruction::with(Code::Pushfq));
         b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
         b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, FLAG_MASK as i32).unwrap());
+        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, !0x10i32).unwrap());
+        b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::R9).unwrap());
         store_m(b, FLAGS_OFF, Register::RAX);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
         b.call(sub_store);
@@ -5155,6 +5270,7 @@ pub fn build_self_decoding_parts_with_superops_and_chunks(
         layout,
         runtime_layout,
         dispatcher_plan,
+        chunk_lookup_topology: crate::vm::chunk_crypto::ChunkLookupTopology::from_seed(seed),
     };
     parts.validate(code_base, bytecode.len())?;
     Ok(parts)

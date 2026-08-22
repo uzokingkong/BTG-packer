@@ -129,6 +129,9 @@ pub struct ProgramLiftCommercial {
     pub program: RiscProgram,
     /// 원본 entry 블록 start_va (VM 프로그램의 논리적 시작).
     pub entry_va: u64,
+    /// Stable .pdata function start containing the entry block (or entry VA
+    /// when no unwind function describes it).
+    pub entry_function_id: u64,
     /// true = 프로그램 entry 블록이 제외(네이티브 유지)되어 부트 스텁이
     /// clean native entry를 쓴다.
     pub entry_native: bool,
@@ -145,6 +148,11 @@ pub struct ProgramLiftCommercial {
     /// CFG에 관측된 .pdata 함수 수 / 그중 완전 VM 소유 함수 수.
     pub total_functions: usize,
     pub virtualized_functions: usize,
+    /// Stable source VAs of fully VM-owned functions. Production family
+    /// assignment consumes these IDs; traversal order is never used.
+    pub virtualized_function_ids: Vec<u64>,
+    /// Contiguous RISC micro-op ownership ranges for VM-owned functions.
+    pub function_op_ranges: Vec<crate::vm::poly::FunctionOpRange>,
     pub hot_path_profiled: bool,
     pub hot_vm_weight: u64,
     pub hot_total_weight: u64,
@@ -259,6 +267,7 @@ pub fn lift_program_cfg_commercial(
         return Ok(ProgramLiftCommercial {
             program: RiscProgram::new(Vec::new()),
             entry_va: entry_point_va,
+            entry_function_id: entry_point_va,
             entry_native: false,
             blocks: 0,
             virtualized_blocks: 0,
@@ -267,6 +276,8 @@ pub fn lift_program_cfg_commercial(
             virtualized_instructions: 0,
             total_functions: 0,
             virtualized_functions: 0,
+            virtualized_function_ids: Vec::new(),
+            function_op_ranges: Vec::new(),
             hot_path_profiled: false,
             hot_vm_weight: 0,
             hot_total_weight: 0,
@@ -505,6 +516,7 @@ pub fn lift_program_cfg_commercial(
     let mut native_blocks = 0usize;
     let mut total_inst = 0usize;
     let mut virtualized_inst = 0usize;
+    let mut raw_function_op_ranges: Vec<crate::vm::poly::FunctionOpRange> = Vec::new();
     for bb in &blocks {
         let real: Vec<Instruction> = bb
             .instructions
@@ -538,6 +550,16 @@ pub fn lift_program_cfg_commercial(
             }
             let block_ops = lifter.desynth.instrs.len();
             instrs.extend(lifter.desynth.instrs);
+            if let Some((function_id, _)) = all_function_ranges
+                .iter()
+                .find(|(start, end)| *start <= bb.start_va && bb.start_va < *end)
+            {
+                raw_function_op_ranges.push(crate::vm::poly::FunctionOpRange {
+                    function_id: *function_id,
+                    start_op: base,
+                    end_op: base + block_ops,
+                });
+            }
             virtualized += 1;
             virtualized_inst += real.len();
             // P3 (G1): 상용 엔진 리프트 매핑 기록 — 원본 VA → RISC micro-op 인덱스
@@ -712,7 +734,7 @@ pub fn lift_program_cfg_commercial(
                 .any(|bb| *s <= bb.start_va && bb.start_va < *e)
         })
         .collect();
-    let virtualized_functions = observed_functions
+    let virtualized_function_ids: Vec<u64> = observed_functions
         .iter()
         .filter(|(s, e)| {
             blocks.iter().any(|bb| {
@@ -721,7 +743,29 @@ pub fn lift_program_cfg_commercial(
                 *s <= bb.start_va && bb.start_va < *e && excluded_blocks.contains(&bb.start_va)
             })
         })
-        .count();
+        .map(|(start, _)| *start)
+        .collect();
+    let virtualized_functions = virtualized_function_ids.len();
+    raw_function_op_ranges.sort_by_key(|range| (range.function_id, range.start_op));
+    let mut function_op_ranges: Vec<crate::vm::poly::FunctionOpRange> = Vec::new();
+    for range in raw_function_op_ranges {
+        if !virtualized_function_ids.contains(&range.function_id) {
+            continue;
+        }
+        if let Some(last) = function_op_ranges.last_mut() {
+            if last.function_id == range.function_id && last.end_op == range.start_op {
+                last.end_op = range.end_op;
+                continue;
+            }
+        }
+        function_op_ranges.push(range);
+    }
+    function_op_ranges.sort_by_key(|range| range.start_op);
+    let entry_function_id = observed_functions
+        .iter()
+        .find(|(start, end)| *start <= entry_point_va && entry_point_va < *end)
+        .map(|(start, _)| *start)
+        .unwrap_or(entry_point_va);
     let instruction_ratio = if total_inst == 0 {
         0.0
     } else {
@@ -855,6 +899,7 @@ pub fn lift_program_cfg_commercial(
     Ok(ProgramLiftCommercial {
         program,
         entry_va: entry_block,
+        entry_function_id,
         entry_native: excluded_blocks.contains(&entry_block),
         blocks: blocks.len(),
         virtualized_blocks: virtualized,
@@ -863,6 +908,8 @@ pub fn lift_program_cfg_commercial(
         virtualized_instructions: virtualized_inst,
         total_functions: observed_functions.len(),
         virtualized_functions,
+        virtualized_function_ids,
+        function_op_ranges,
         hot_path_profiled: hot_profile.is_some(),
         hot_vm_weight: hot_vm,
         hot_total_weight: hot_total,

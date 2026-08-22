@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use super::builder::{
     build_self_decoding_parts_with_layouts, build_self_decoding_parts_with_superops,
+    build_self_decoding_parts_with_superops_and_chunks,
 };
 use super::codegen_util::*;
 use crate::vm::table_layout::TableLayout;
@@ -51,6 +52,7 @@ pub fn run_native_poly_direct_with_layout(
         runtime_layout,
         &[],
         None,
+        &[],
     )
 }
 
@@ -73,6 +75,35 @@ pub fn run_native_poly_direct_superops(
         runtime_layout,
         superops,
         Some(metadata),
+        &[],
+    )
+}
+
+/// Execute the production outer-chunk cipher path. The rolling-polymorphic
+/// stream is wrapped exactly as the pack pipeline wraps it, while the native
+/// fetch helper unmasks only the byte currently held in registers.
+pub fn run_native_poly_direct_chunks(
+    bytecode: &[u8],
+    seed: u64,
+    init_regs: &[u64; 16],
+    chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
+) -> Result<RiscEvalState> {
+    let mut wrapped = bytecode.to_vec();
+    for chunk in chunks {
+        let start = chunk.offset as usize;
+        let end = start + chunk.len as usize;
+        crate::vm::chunk_crypto::crypt_chunk(&mut wrapped[start..end], chunk.key);
+    }
+    run_native_poly_direct_configured(
+        &wrapped,
+        bytecode,
+        seed,
+        init_regs,
+        None,
+        VmRuntimeLayout::legacy(),
+        &[],
+        None,
+        chunks,
     )
 }
 
@@ -85,6 +116,7 @@ fn run_native_poly_direct_configured(
     runtime_layout: VmRuntimeLayout,
     superops: &[AssignedSuperOp],
     superop_metadata: Option<&SuperOpBuildMetadata>,
+    chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
 ) -> Result<RiscEvalState> {
     let mut arena = Arena::new(ARENA_SIZE)?;
     let code_base = (arena.base + OFF_CODE) as u64;
@@ -92,7 +124,23 @@ fn run_native_poly_direct_configured(
     let table_base = (arena.base + OFF_TABLE) as u64;
     let bytecode_base = (arena.base + OFF_BYTECODE) as u64;
     let stack_base = (arena.base + OFF_STACK_BASE) as u64;
-    let parts = if superops.is_empty() {
+    let parts = if !chunks.is_empty() {
+        build_self_decoding_parts_with_superops_and_chunks(
+            metadata_bytecode,
+            seed,
+            code_base,
+            table_base,
+            bytecode_base,
+            state_base,
+            stack_base,
+            ip_map,
+            TableLayout::legacy(),
+            runtime_layout,
+            superops,
+            superop_metadata,
+            chunks,
+        )?
+    } else if superops.is_empty() {
         build_self_decoding_parts_with_layouts(
             metadata_bytecode,
             seed,

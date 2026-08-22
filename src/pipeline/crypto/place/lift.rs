@@ -21,6 +21,8 @@ pub(crate) fn lift_program(
     Option<vm::threaded::PreparedSuperOpProgram>,
     Option<crate::pipeline::VmCoverageMetrics>,
     Vec<vm::chunk_crypto::BytecodeChunk>,
+    Option<vm::poly::ProductionFamilyPlan>,
+    Option<Vec<vm::poly::FamilyOpPartition>>,
 )> {
     // P3 (G1): 상용 프로그램 리프트의 ip_map (source-IP -> micro-op index) — the
     // VirtualBranch native handler uses it to resolve branch targets to bytecode
@@ -29,6 +31,8 @@ pub(crate) fn lift_program(
     let mut vm_prog_superops: Option<vm::threaded::PreparedSuperOpProgram> = None;
     let mut vm_coverage = None;
     let mut vm_prog_chunks = Vec::new();
+    let mut vm_family_plan = None;
+    let mut vm_family_partitions = None;
 
     let (vm_prog_bytecode, vm_oep_native_entry, oep_va): (Vec<u8>, bool, u64) = if vm_oep_effective
     {
@@ -43,6 +47,37 @@ pub(crate) fn lift_program(
                 image_base,
             )?;
             vm_prog_ip_map = lift.program.ip_map().cloned();
+            let plan = vm::poly::ProductionFamilyPlan::new(
+                ctx.poly_vm_seed,
+                lift.entry_function_id,
+                &lift.virtualized_function_ids,
+            );
+            println!(
+                "[+] P2-10 production family plan: {} VM-owned function(s), {} represented family/families, {} cross-family bridge requirement(s), entry={:?}",
+                plan.assignments.len(),
+                plan.represented_families().len(),
+                plan.cross_family_bridge_count(),
+                plan.entry_family,
+            );
+            let entry_family = plan.entry_family;
+            let partitions = plan
+                .partition_regions(&lift.function_op_ranges, lift.program.instrs.len())
+                .map_err(anyhow::Error::msg)?;
+            let partitioned_functions: usize = partitions
+                .iter()
+                .map(|partition| partition.regions.len())
+                .sum();
+            println!(
+                "[+] P2-10 family op partition: {} backend partition(s), {} function region(s), {} total RISC op(s)",
+                partitions.len(),
+                partitioned_functions,
+                lift.function_op_ranges
+                    .iter()
+                    .map(|range| range.end_op - range.start_op)
+                    .sum::<usize>(),
+            );
+            vm_family_partitions = Some(partitions);
+            vm_family_plan = Some(plan);
             vm_coverage = Some(crate::pipeline::VmCoverageMetrics {
                 vm_blocks: lift.virtualized_blocks,
                 total_blocks: lift.blocks,
@@ -55,10 +90,12 @@ pub(crate) fn lift_program(
                 hot_total_weight: lift.hot_total_weight,
                 sensitive_regions: lift.sensitive_regions,
             });
-            let prepared = vm::threaded::SuperOperatorSynthesizer::prepare_commercial_program(
-                &lift.program,
-                ctx.poly_vm_seed,
-            )?;
+            let prepared =
+                vm::threaded::SuperOperatorSynthesizer::prepare_commercial_program_for_family(
+                    &lift.program,
+                    ctx.poly_vm_seed,
+                    entry_family,
+                )?;
             if let Some(ref p) = prepared {
                 let fused_occurrences: usize = p
                     .assigned
@@ -86,7 +123,10 @@ pub(crate) fn lift_program(
             let (bc, offsets) = if let Some(ref p) = prepared {
                 (p.bytecode.clone(), p.metadata.original_byte_offsets.clone())
             } else {
-                let mut enc = crate::vm::poly::PolymorphicEncoder::new(ctx.poly_vm_seed);
+                let mut enc = crate::vm::poly::PolymorphicEncoder::new_for_family(
+                    ctx.poly_vm_seed,
+                    entry_family,
+                );
                 enc.encode_with_offsets(&lift.program)?
             };
             if ctx.m7 {
@@ -148,5 +188,7 @@ pub(crate) fn lift_program(
         vm_prog_superops,
         vm_coverage,
         vm_prog_chunks,
+        vm_family_plan,
+        vm_family_partitions,
     ))
 }

@@ -428,6 +428,18 @@ impl SuperOperatorSynthesizer {
         program: &crate::vm::risc::RiscProgram,
         seed: u64,
     ) -> anyhow::Result<Option<PreparedSuperOpProgram>> {
+        Self::prepare_commercial_program_for_family(
+            program,
+            seed,
+            crate::vm::poly::VmArchitectureFamily::for_build(seed),
+        )
+    }
+
+    pub fn prepare_commercial_program_for_family(
+        program: &crate::vm::risc::RiscProgram,
+        seed: u64,
+        family: crate::vm::poly::VmArchitectureFamily,
+    ) -> anyhow::Result<Option<PreparedSuperOpProgram>> {
         let mut protected = HashSet::new();
         if let Some(ip_map) = program.ip_map() {
             protected.extend(ip_map.values().copied());
@@ -459,10 +471,10 @@ impl SuperOperatorSynthesizer {
         if plans.is_empty() {
             return Ok(None);
         }
-        let spec = VirtualIsaSpec::from_seed(seed);
+        let spec = VirtualIsaSpec::from_seed_and_family(seed, family);
         let assigned = Self::assign_extension_opcodes(&spec, &plans, seed)?;
         let rewrite = Self::rewrite_stream(&program.instrs, &assigned)?;
-        let mut encoder = PolymorphicEncoder::new(seed);
+        let mut encoder = PolymorphicEncoder::new_for_family(seed, family);
         let (bytecode, rewritten_offsets) = encoder.encode_superop_rewrite(&rewrite)?;
         let metadata = SuperOpBuildMetadata::from_rewrite(
             program.clone(),

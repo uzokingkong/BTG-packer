@@ -10,6 +10,31 @@ pub const DEFAULT_CHUNK_BYTES: usize = 4096;
 const MODULE_DOMAIN: u64 = 0x4254_472D_5056_4D37; // "BTG-PVM7"
 const CHUNK_DOMAIN: u64 = 0x4348_554E_4B2D_4B31; // "CHUNK-K1"
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ChunkLookupTopology {
+    ForwardEnds,
+    ReverseStarts,
+    BinaryEnds,
+}
+
+impl ChunkLookupTopology {
+    pub fn from_seed(build_seed: u64) -> Self {
+        match derive_seed(build_seed, 0x5032_2D39_2D54_4F50) % 3 {
+            0 => Self::ForwardEnds,
+            1 => Self::ReverseStarts,
+            _ => Self::BinaryEnds,
+        }
+    }
+
+    pub const fn normalized_signature(self) -> u64 {
+        match self {
+            Self::ForwardEnds => 0x4657_442D_454E_4453,
+            Self::ReverseStarts => 0x5245_562D_5354_4152,
+            Self::BinaryEnds => 0x4249_4E2D_454E_4453,
+        }
+    }
+}
+
 pub fn module_key(build_seed: u64) -> u64 {
     derive_seed(build_seed, MODULE_DOMAIN)
 }
@@ -138,5 +163,26 @@ mod tests {
         for (index, chunk) in chunks.iter().enumerate() {
             assert_eq!(chunk.key, chunk_key_from_module(module, index as u64));
         }
+    }
+
+    #[test]
+    fn n20_lookup_topology_does_not_collapse_to_one_template() {
+        use std::collections::BTreeMap;
+
+        let mut counts = BTreeMap::new();
+        for seed in 1..=20 {
+            *counts
+                .entry(ChunkLookupTopology::from_seed(seed).normalized_signature())
+                .or_insert(0usize) += 1;
+        }
+        assert_eq!(
+            counts.len(),
+            3,
+            "N=20 did not exercise all lookup topologies"
+        );
+        assert!(
+            counts.values().copied().max().unwrap_or_default() < 10,
+            "one normalized lookup template dominates N=20: {counts:?}"
+        );
     }
 }

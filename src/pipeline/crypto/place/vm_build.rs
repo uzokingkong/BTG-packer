@@ -55,17 +55,19 @@ pub(crate) fn build_prog_vm_mod(
     ip_map: Option<&std::collections::HashMap<u64, usize>>,
     superops: Option<&vm::threaded::PreparedSuperOpProgram>,
     chunks: &[vm::chunk_crypto::BytecodeChunk],
+    family: Option<vm::poly::VmArchitectureFamily>,
     m8_mod: bool,
     rng: &mut impl RngCore,
 ) -> anyhow::Result<vm::VmModule> {
     if vm_commercial {
-        vm::commercial_build::build_program_vm_commercial_with_superops_and_chunks(
+        vm::commercial_build::build_program_vm_commercial_with_superops_and_chunks_for_family(
             code_va,
             table_va,
             bytecode_va,
             bc,
             state_va,
             vm_commercial_seed,
+            family.unwrap_or_else(|| vm::poly::VmArchitectureFamily::for_build(vm_commercial_seed)),
             ip_map,
             superops,
             chunks,

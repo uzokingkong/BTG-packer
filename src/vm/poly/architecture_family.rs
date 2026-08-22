@@ -155,6 +155,107 @@ pub struct FunctionFamilyAssignment {
     pub incoming_bridge: Option<CrossVmBridge>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductionFamilyPlan {
+    pub entry_function: u64,
+    pub entry_family: VmArchitectureFamily,
+    pub assignments: Vec<FunctionFamilyAssignment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FunctionOpRange {
+    pub function_id: u64,
+    pub start_op: usize,
+    pub end_op: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FamilyOpPartition {
+    pub family: VmArchitectureFamily,
+    pub regions: Vec<FunctionOpRange>,
+}
+
+impl ProductionFamilyPlan {
+    pub fn new(seed: u64, entry_function: u64, function_ids: &[u64]) -> Self {
+        let mut ids = function_ids.to_vec();
+        if entry_function != 0 && !ids.contains(&entry_function) {
+            ids.push(entry_function);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Self {
+            entry_function,
+            entry_family: VmArchitectureFamily::for_function(seed, entry_function),
+            assignments: assign_function_families(seed, entry_function, &ids),
+        }
+    }
+
+    pub fn represented_families(&self) -> BTreeSet<VmArchitectureFamily> {
+        represented_families(&self.assignments)
+    }
+
+    pub fn cross_family_bridge_count(&self) -> usize {
+        self.assignments
+            .iter()
+            .filter(|assignment| assignment.incoming_bridge.is_some())
+            .count()
+    }
+
+    pub fn assignment_for(&self, function_id: u64) -> Option<&FunctionFamilyAssignment> {
+        self.assignments
+            .iter()
+            .find(|assignment| assignment.function_id == function_id)
+    }
+
+    pub fn partition_regions(
+        &self,
+        ranges: &[FunctionOpRange],
+        program_len: usize,
+    ) -> Result<Vec<FamilyOpPartition>, String> {
+        let mut sorted = ranges.to_vec();
+        sorted.sort_by_key(|range| (range.start_op, range.end_op));
+        let mut previous_end = 0usize;
+        for range in &sorted {
+            if range.start_op >= range.end_op || range.end_op > program_len {
+                return Err(format!(
+                    "invalid function op range {:#x}: {}..{} / {}",
+                    range.function_id, range.start_op, range.end_op, program_len
+                ));
+            }
+            if range.start_op < previous_end {
+                return Err(format!(
+                    "overlapping function op range at {:#x}: {} < {}",
+                    range.function_id, range.start_op, previous_end
+                ));
+            }
+            if self.assignment_for(range.function_id).is_none() {
+                return Err(format!(
+                    "function op range has no family assignment: {:#x}",
+                    range.function_id
+                ));
+            }
+            previous_end = range.end_op;
+        }
+
+        let mut partitions = Vec::new();
+        for family in VmArchitectureFamily::ALL {
+            let regions: Vec<_> = sorted
+                .iter()
+                .copied()
+                .filter(|range| {
+                    self.assignment_for(range.function_id)
+                        .map(|assignment| assignment.family == family)
+                        .unwrap_or(false)
+                })
+                .collect();
+            if !regions.is_empty() {
+                partitions.push(FamilyOpPartition { family, regions });
+            }
+        }
+        Ok(partitions)
+    }
+}
+
 /// Deterministically assigns functions and materializes bridge requirements.
 pub fn assign_function_families(
     seed: u64,
@@ -284,5 +385,51 @@ mod tests {
             streams.insert(stream);
         }
         assert_eq!(streams.len(), VmArchitectureFamily::ALL.len());
+    }
+
+    #[test]
+    fn production_plan_is_function_stable_and_bridges_only_cross_family() {
+        let functions: Vec<u64> = (0..64).map(|n| 0x1400_001000 + n * 0x80).collect();
+        let plan = ProductionFamilyPlan::new(0xA11C_E551, functions[0], &functions);
+        assert_eq!(plan.assignments.len(), functions.len());
+        assert!(plan.represented_families().len() >= 3);
+        assert_eq!(
+            plan.assignment_for(plan.entry_function).unwrap().family,
+            plan.entry_family
+        );
+        for assignment in &plan.assignments {
+            assert_eq!(
+                assignment.incoming_bridge.is_some(),
+                assignment.family != plan.entry_family,
+                "same-family edge emitted a bridge for {:#x}",
+                assignment.function_id
+            );
+        }
+    }
+
+    #[test]
+    fn production_partition_groups_ranges_without_overlap() {
+        let functions = [0x1000, 0x1100, 0x1200, 0x1300];
+        let plan = ProductionFamilyPlan::new(0x5151_AAAA, functions[0], &functions);
+        let ranges: Vec<_> = functions
+            .iter()
+            .enumerate()
+            .map(|(index, function_id)| FunctionOpRange {
+                function_id: *function_id,
+                start_op: 1 + index * 10,
+                end_op: 1 + (index + 1) * 10,
+            })
+            .collect();
+        let partitions = plan.partition_regions(&ranges, 41).unwrap();
+        assert_eq!(
+            partitions
+                .iter()
+                .map(|part| part.regions.len())
+                .sum::<usize>(),
+            ranges.len()
+        );
+        let mut overlap = ranges.clone();
+        overlap[1].start_op = overlap[0].end_op - 1;
+        assert!(plan.partition_regions(&overlap, 41).is_err());
     }
 }

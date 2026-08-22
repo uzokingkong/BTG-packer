@@ -72,9 +72,13 @@ pub(crate) fn place_boot_stub(
         vm_prog_superops,
         vm_coverage,
         vm_prog_chunks,
+        vm_family_plan,
+        vm_family_partitions,
     ) = lift_program(ctx, image_base, vm_oep_effective, vm_commercial)?;
     ctx.vm_coverage = vm_coverage;
     ctx.vm_prog_chunks = vm_prog_chunks;
+    ctx.vm_family_plan = vm_family_plan;
+    ctx.vm_family_partitions = vm_family_partitions;
 
     let btg = ctx
         .btg_section_data
@@ -316,6 +320,7 @@ pub(crate) fn place_boot_stub(
             vm_prog_ip_map.as_ref(),
             vm_prog_superops.as_ref(),
             &ctx.vm_prog_chunks,
+            ctx.vm_family_plan.as_ref().map(|plan| plan.entry_family),
             m8_mod,
             rng,
         )?;
@@ -1147,6 +1152,7 @@ pub(crate) fn place_boot_stub(
             vm_prog_ip_map.as_ref(),
             vm_prog_superops.as_ref(),
             &ctx.vm_prog_chunks,
+            ctx.vm_family_plan.as_ref().map(|plan| plan.entry_family),
             m8_mod,
             rng,
         )?;

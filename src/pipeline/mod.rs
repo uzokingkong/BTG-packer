@@ -161,6 +161,10 @@ pub struct PipelineContext {
     pub vm_coverage: Option<VmCoverageMetrics>,
     /// P1-4: instruction-aligned Program-VM bytecode chunks for M7 runtime.
     pub vm_prog_chunks: Vec<crate::vm::chunk_crypto::BytecodeChunk>,
+    /// P2-10 function-stable production family ownership plan.
+    pub vm_family_plan: Option<crate::vm::poly::ProductionFamilyPlan>,
+    /// P2-10 validated function micro-op partitions grouped by backend family.
+    pub vm_family_partitions: Option<Vec<crate::vm::poly::FamilyOpPartition>>,
     pub vm_prog_bytecode_rva: u32,
     pub vm_prog_bytecode_len: u32,
     pub vm_prog_runtime_cipher_hash: Option<String>,
@@ -253,6 +257,8 @@ impl PipelineContext {
             vm_prog_native_bridge: None,
             vm_coverage: None,
             vm_prog_chunks: Vec::new(),
+            vm_family_plan: None,
+            vm_family_partitions: None,
             vm_prog_bytecode_rva: 0,
             vm_prog_bytecode_len: 0,
             vm_prog_runtime_cipher_hash: None,

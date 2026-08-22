@@ -13,8 +13,9 @@ pub mod rolling_key;
 pub mod state_machine;
 
 pub use architecture_family::{
-    architecture_signature, assign_function_families, CrossVmBridge, DispatchTopology, FlagModel,
-    FunctionFamilyAssignment, VmArchitectureFamily, VmCallConvention, VmFamilyProfile,
+    architecture_signature, assign_function_families, CrossVmBridge, DispatchTopology,
+    FamilyOpPartition, FlagModel, FunctionFamilyAssignment, FunctionOpRange, ProductionFamilyPlan,
+    VmArchitectureFamily, VmCallConvention, VmFamilyProfile,
 };
 pub use decode_error::DecodeError;
 pub use decoder::PolymorphicDecoder;

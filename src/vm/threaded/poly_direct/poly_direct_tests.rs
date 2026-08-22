@@ -83,6 +83,51 @@ fn test_p2_9_chunk_lookup_hides_plain_boundaries_and_key_list() {
 }
 
 #[test]
+fn test_p2_9_all_lookup_topologies_execute_outer_chunks_like_reference() {
+    use crate::vm::chunk_crypto::{plan_chunks, ChunkLookupTopology};
+    use std::collections::BTreeMap;
+
+    let prog = RiscProgram::new(vec![
+        MicroInstr::new(RiscOp::Mov)
+            .with_dst(MicroOperand::VReg(0))
+            .with_src1(MicroOperand::Imm64(0x1234_5678_9ABC_DEF0)),
+        MicroInstr::new(RiscOp::AddWithCarry)
+            .with_dst(MicroOperand::VReg(1))
+            .with_src1(MicroOperand::VReg(0))
+            .with_src2(MicroOperand::Imm64(0x1020_3040))
+            .with_imm(0),
+        MicroInstr::new(RiscOp::Nor)
+            .with_dst(MicroOperand::VReg(2))
+            .with_src1(MicroOperand::VReg(1))
+            .with_src2(MicroOperand::Imm64(0x55AA_55AA_55AA_55AA)),
+        MicroInstr::new(RiscOp::Halt),
+    ]);
+    let reference = prog.eval_state(&[0u64; 16]);
+    let mut seeds = BTreeMap::new();
+    for seed in 1..=100u64 {
+        seeds
+            .entry(ChunkLookupTopology::from_seed(seed))
+            .or_insert(seed);
+        if seeds.len() == 3 {
+            break;
+        }
+    }
+    assert_eq!(seeds.len(), 3);
+
+    for (topology, seed) in seeds {
+        let mut encoder = PolymorphicEncoder::new(seed);
+        let (bytecode, offsets) = encoder.encode_with_offsets(&prog).unwrap();
+        let max_chunk = (bytecode.len() / 3).max(1);
+        let chunks = plan_chunks(bytecode.len(), &offsets, seed, max_chunk);
+        assert!(chunks.len() >= 2, "fixture did not split for {topology:?}");
+        let native = run_native_poly_direct_chunks(&bytecode, seed, &[0u64; 16], &chunks).unwrap();
+        assert_eq!(native.regs, reference.regs, "topology {topology:?}");
+        assert_eq!(native.temps, reference.temps, "topology {topology:?}");
+        assert_eq!(native.flags, reference.flags, "topology {topology:?}");
+    }
+}
+
+#[test]
 fn test_superop_extension_handler_is_registered_in_production_table() {
     use crate::vm::table_layout::TableLayout;
     use crate::vm::threaded::{

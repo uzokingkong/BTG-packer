@@ -31,7 +31,10 @@
 // ==============================================================================
 
 use crate::vm::table_layout::TableLayout;
-use crate::vm::threaded::poly_direct::build_self_decoding_parts_with_superops_and_chunks;
+use crate::vm::threaded::poly_direct::{
+    build_self_decoding_parts_with_superops_and_chunks,
+    build_self_decoding_parts_with_superops_and_chunks_for_family,
+};
 use crate::vm::threaded::{PreparedSuperOpProgram, VmRuntimeLayout};
 use crate::vm::VmModule;
 use anyhow::Result;
@@ -121,6 +124,32 @@ pub fn build_program_vm_commercial_with_superops_and_chunks(
     prepared: Option<&PreparedSuperOpProgram>,
     chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
 ) -> Result<VmModule> {
+    build_program_vm_commercial_with_superops_and_chunks_for_family(
+        code_va,
+        table_va,
+        bytecode_va,
+        bytecode,
+        state_va,
+        seed,
+        crate::vm::poly::VmArchitectureFamily::for_build(seed),
+        ip_map,
+        prepared,
+        chunks,
+    )
+}
+
+pub fn build_program_vm_commercial_with_superops_and_chunks_for_family(
+    code_va: u64,
+    table_va: u64,
+    bytecode_va: u64,
+    bytecode: Vec<u8>,
+    state_va: u64,
+    seed: u64,
+    family: crate::vm::poly::VmArchitectureFamily,
+    ip_map: Option<&HashMap<u64, usize>>,
+    prepared: Option<&PreparedSuperOpProgram>,
+    chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
+) -> Result<VmModule> {
     // Virtual stack top: right after the state buffer (COMMERCIAL_STATE_SIZE),
     // growing down into the reserved VIRTUAL_STACK_SIZE region. Keeps the
     // dispatcher's R13-based push/pop isolated from both state and bytecode.
@@ -138,9 +167,10 @@ pub fn build_program_vm_commercial_with_superops_and_chunks(
         }
     }
     let parts = if let Some(prepared) = prepared {
-        build_self_decoding_parts_with_superops_and_chunks(
+        build_self_decoding_parts_with_superops_and_chunks_for_family(
             &bytecode,
             seed,
+            family,
             code_va,
             table_va,
             bytecode_va,
@@ -154,9 +184,10 @@ pub fn build_program_vm_commercial_with_superops_and_chunks(
             chunks,
         )?
     } else {
-        build_self_decoding_parts_with_superops_and_chunks(
+        build_self_decoding_parts_with_superops_and_chunks_for_family(
             &bytecode,
             seed,
+            family,
             code_va,
             table_va,
             bytecode_va,

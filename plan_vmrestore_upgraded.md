@@ -4,6 +4,33 @@
 
 ## 진행 기록
 
+### 2026-08-22 — P2-10 function micro-op family partition 완료
+
+- commercial RISC lift가 각 완전 VM 소유 `.pdata` 함수에 대해 stable function start VA와 contiguous `[start_op,end_op)` ownership range를 생성한다. synthetic entry branch와 `.pdata` 밖의 orphan block은 함수 소유 범위에 거짓 포함하지 않는다.
+- `ProductionFamilyPlan::partition_regions`가 함수 range를 Stack/Register/MixedRisc/FusedCisc backend별로 그룹화한다. invalid/OOB/overlap range와 family assignment가 없는 range는 typed build error로 거부한다.
+- partition 결과를 `PipelineContext.vm_family_partitions`에 저장해 sizing/final placement 이후 단계가 같은 immutable ownership 계약을 소비할 수 있게 했다.
+- unit gate에서 모든 함수 range가 정확히 한 family partition에 속하고 overlap mutation이 거부됨을 검증했다. 전체 library는 553/553 통과했다.
+- `corpus/o1.exe` seed 31010 production 실측: VM 소유 621함수, 4 family, 4 backend partition, 621 function region, 총 97,909 RISC op를 분할했다. 189-chunk M7 구조 검증과 differential 실행은 exit 0/stdout 1,460B/stderr 0B로 통과했다. SHA-256 `4728f4467f46dbe136e5ea807aaa3ad0959830cc3aa579ed4e00aba4ce825db5`.
+- 이 단계는 다음 multi-module emitter의 입력 계약을 완료한 것이다. 아직 단일 entry-family module만 PE에 배치되므로 binary hash는 직전 단계와 동일하다. 다음은 각 partition을 독립 bytecode/module/state/table로 materialize하고 cross-family call/return routing을 연결한다.
+
+### 2026-08-22 — SHLD correctness 종료 및 P2-10 production family wiring 1차
+
+- SHLD count>0에서 architecturally undefined인 AF를 host `pushfq` 결과에서 그대로 VM flags에 저장하던 비결정성을 제거했다. native handler가 SHLD 전 guest AF를 별도로 보존하고 실행 후 정의된 flag mask에 다시 합성하므로 reference/poly/native가 일치한다.
+- 전체 library 회귀는 552/552로 복구됐다.
+- commercial lift가 완전 VM 소유 `.pdata` 함수의 stable start VA 목록과 entry function id를 산출한다. `ProductionFamilyPlan`은 traversal order가 아니라 이 ID로 함수별 Stack/Register/MixedRisc/FusedCisc assignment와 cross-family bridge 요구를 생성하고 pipeline context에 보존한다.
+- entry 함수에 실제 배정된 family가 production `PolymorphicEncoder`, super-op extension opcode allocation, `VirtualIsaSpec`, native decoder/handler table에서 동일하게 소비되도록 end-to-end 연결했다. 즉 build-level `for_build(seed)` 고정 경로 대신 ownership에서 유도된 entry-family backend가 실제 실행된다.
+- `corpus/o1.exe` seed 31010 실측에서 VM 소유 함수 621개가 4 family로 분포했고 cross-family bridge 요구 474개, entry family MixedRisc가 보고됐다. 189-chunk M7 최대 Program-VM 구조 검증 및 differential 실행은 exit 0/stdout 1,460B/stderr 0B로 통과했다. SHA-256은 `4728f4467f46dbe136e5ea807aaa3ad0959830cc3aa579ed4e00aba4ce825db5`다.
+- 주의: 이번 단계는 함수 ownership→family planning과 **entry-family 실행 backend**의 production wiring까지다. 하나의 EXE 안에서 여러 family module을 동시에 실행하고 474개 cross-family edge에 canonical bridge를 emit하는 단계는 아직 남아 있으므로 P2-10 전체 완료로 판정하지 않는다. 다음 구현은 function micro-op ranges partition → family별 독립 module/state/table → cross-family call/return routing 순서다.
+
+### 2026-08-22 — P2-9 M7 chunk metadata/key 노출 제거 완료
+
+- `ChunkLookupTopology::{ForwardEnds, ReverseStarts, BinaryEnds}`를 추가하고 build seed로 실제 native fetch CFG를 선택한다. forward는 masked end scan, reverse는 masked start scan, binary는 masked end decision tree를 사용해 하나의 선형 `sub_decrypt` template으로 수렴하지 않는다.
+- 모든 topology가 boundary/start를 seed-domain mask로 register에서만 복원한다. `cmp VIP, imm32`는 생성하지 않으며 leaf에서는 chunk index와 masked start만 복원하고 공통 out-of-line tail에서 module secret + chunk domain + index로 operational key를 파생한다.
+- `SelfDecodingParts.chunk_lookup_topology`에 실제 선택 결과를 남기고, host native runner에 pack pipeline과 동일하게 outer chunk encryption을 적용하는 실행 경로를 추가했다.
+- N=20 gate에서 세 normalized topology가 모두 출현하고 단일 template이 10/20 이상을 점유하지 않음을 확인한다. 세 topology 각각에 대해 multi-instruction stream을 2개 이상 chunk로 나눠 reference evaluator와 native register/temp/flags 동치를 검증했다.
+- 실제 `corpus/o1.exe`를 189개 instruction-aligned chunk로 최대 Program-VM 조합(`--vm --vm-oep --vm-commercial --m7 --m8 --integrity`) 패킹했다. 구조 검증과 differential 실행이 통과했으며 exit 0, stdout 1,460B, stderr 0B가 원본과 일치했다. SHA-256은 `12e4903c243babc4ded33f90c9bd7f40a652d74b0d61a1ebe10163e9bdf02e17`이다.
+- 전체 library는 550/551이며 유일한 실패는 기존 SHLD AF flags 불일치다. P2-9 완료 기준(raw per-chunk key 0, `cmp VIP, imm` boundary oracle 제거, N=20 topology 비수렴, active-register-only differential 유지)을 충족했다. 다음 우선순위는 P2-10 실제 per-function/per-region multi-VM production wiring이다.
+
 ### 2026-08-22 — P2-9 chunk boundary/key 정적 oracle 제거 1차
 
 - Program-VM `sub_decrypt`의 `cmp VIP, imm32` O(N) 경계 ladder를 제거하고, build seed에서 독립 파생한 mask로 chunk end/start descriptor를 각각 인코딩하도록 변경했다. 런타임은 descriptor를 register에서만 복원해 비교하므로 단순 VIP-immediate scanner로 평문 chunk map을 열거할 수 없다.
