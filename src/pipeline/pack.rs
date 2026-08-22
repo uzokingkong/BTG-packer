@@ -57,6 +57,10 @@ pub fn run_full(
 
     let obf = obf_level.clamp(1, 3) as usize;
     let mut ctx = PipelineContext::new(info, dispatcher_va, dispatcher_rva, obf);
+    debug_assert!(
+        ctx.custom_cipher && ctx.crypto_mode == crate::crypto::CryptoMode::C1,
+        "programmatic pack entrypoint must inherit the non-RC4 crypto baseline"
+    );
     // P3-1 (결정적 빌드): --seed가 주어지면 ctx.rng를 단일 시드 RNG로 고정.
     // 셔플/mba_constant/crypto 시드/폴리 시드/레이아웃 패드가 모두 이 RNG에서
     // 파생되므로, 같은 input+seed+config → 같은 output.
@@ -103,6 +107,15 @@ pub fn run_full(
 mod tests {
     use super::*;
     use crate::manifest::sha256_hex;
+
+    #[test]
+    fn programmatic_context_defaults_to_non_rc4_cipher() {
+        let input = crate::pe::generate_dummy_target_pe().expect("generate dummy PE");
+        let info = TargetPeInfo::parse(&input).expect("parse");
+        let ctx = PipelineContext::new(info, 0x1400_2000, 0x2000, 2);
+        assert!(ctx.custom_cipher);
+        assert_eq!(ctx.crypto_mode, crate::crypto::CryptoMode::C1);
+    }
 
     /// P3-1 (상용 3-1): 동일 seed → 바이트 동일 output. 같은 input + seed +
     /// config로 run_full을 두 번 호출하면 산출 PE 바이트가 완전히 같아야 한다.
