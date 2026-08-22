@@ -164,7 +164,8 @@ impl PolymorphicDecoder {
                         b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
                         vip += 1;
                     }
-                    u64::from_le_bytes(b) ^ self.spec.operand_mask
+                    self.spec
+                        .decode_branch_target(u64::from_le_bytes(b) ^ self.spec.operand_mask)
                 } else {
                     0
                 };

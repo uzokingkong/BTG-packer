@@ -1644,6 +1644,38 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             spec.operand_mask,
             (seed >> 57) as u8,
         );
+        if family != crate::vm::poly::VmArchitectureFamily::Stack {
+            mov_m(&mut b, Register::RAX, DEC_IMM1);
+            let target_key = spec.branch_target_key();
+            match family {
+                crate::vm::poly::VmArchitectureFamily::Register => {
+                    movi(&mut b, Register::RCX, target_key);
+                    b.push(
+                        Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RCX)
+                            .unwrap(),
+                    );
+                    b.push(Instruction::with2(Code::Ror_rm64_imm8, Register::RAX, 17).unwrap());
+                }
+                crate::vm::poly::VmArchitectureFamily::MixedRisc => {
+                    movi(&mut b, Register::RCX, target_key);
+                    b.push(
+                        Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RCX)
+                            .unwrap(),
+                    );
+                    b.push(Instruction::with1(Code::Bswap_r64, Register::RAX).unwrap());
+                }
+                crate::vm::poly::VmArchitectureFamily::FusedCisc => {
+                    b.push(Instruction::with2(Code::Ror_rm64_imm8, Register::RAX, 29).unwrap());
+                    movi(&mut b, Register::RCX, target_key);
+                    b.push(
+                        Instruction::with2(Code::Sub_rm64_r64, Register::RAX, Register::RCX)
+                            .unwrap(),
+                    );
+                }
+                crate::vm::poly::VmArchitectureFamily::Stack => unreachable!(),
+            }
+            store_m(&mut b, DEC_IMM1, Register::RAX);
+        }
         let after_all = b.len();
         // evaluate the condition (AL = taken).
         b.call(sub_eval_cond);

@@ -169,7 +169,8 @@ impl PolymorphicInterpreter {
                             vip += 1;
                         }
                     }
-                    u64::from_le_bytes(b) ^ self.spec.operand_mask
+                    self.spec
+                        .decode_branch_target(u64::from_le_bytes(b) ^ self.spec.operand_mask)
                 } else {
                     0
                 };

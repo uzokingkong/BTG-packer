@@ -84,7 +84,7 @@ impl PolymorphicEncoder {
             }
         }
         let trailing = if matches!(ins.op, RiscOp::VirtualBranch { .. }) && ins.src1.is_none() {
-            Some(ins.imm)
+            Some(self.spec.encode_branch_target(ins.imm))
         } else if ins.op == RiscOp::AddWithCarry && imm1.is_none() && imm2.is_none() {
             Some(ins.imm)
         } else {
@@ -218,7 +218,7 @@ impl PolymorphicEncoder {
             let is_abs_branch =
                 matches!(ins.op, RiscOp::VirtualBranch { .. }) && ins.src1.is_none();
             if is_abs_branch {
-                let enc = ins.imm ^ self.spec.operand_mask;
+                let enc = self.spec.encode_branch_target(ins.imm) ^ self.spec.operand_mask;
                 for b in enc.to_le_bytes() {
                     out.push(self.rolling.encrypt_byte(b, vip));
                     vip += 1;
@@ -507,6 +507,10 @@ mod tests {
                 .with_dst(MicroOperand::VReg(4))
                 .with_src1(MicroOperand::VReg(3))
                 .with_src2(MicroOperand::Temp(2)),
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::NotZero,
+            })
+            .with_imm(4),
             MicroInstr::new(RiscOp::Halt),
         ]);
 
@@ -517,6 +521,7 @@ mod tests {
             let mut decoder = PolymorphicDecoder::new_for_family(domain_seed, family);
             let recovered = decoder.decode_full(&stream, false).unwrap();
             assert_eq!(recovered.instrs.len(), program.instrs.len());
+            assert_eq!(recovered.instrs, program.instrs);
             assert_eq!(offsets.len(), program.instrs.len());
 
             for wrong_family in VmArchitectureFamily::ALL {

@@ -20,6 +20,12 @@
 - production encoder와 super-op body encoder, 정적 decoder, interpreter, native self-decoder가 동일한 family grammar 계약을 소비한다. native decoder는 물리 순서로 fetch한 descriptor를 canonical scratch slot에 재배치하므로 handler 의미와 cross-family bridge ABI는 유지된다.
 - 각 family stream의 정상 roundtrip과 다른 세 family parser의 복원 실패를 전수 검사하는 회귀를 추가했다. `corpus/o1.exe` 최대 조합은 4 family/513 route/255 M7 chunk/12 BTGI descriptor를 유지하며 실행 차등검증을 통과했다. 다음 P2-13 범위는 compact immediate와 branch target 표현 분리다.
 
+### 2026-08-22 — P2-13 family별 branch-target token grammar
+
+- absolute `VirtualBranch` target의 canonical 8-byte instruction index 표현을 family별 token으로 분리했다. Stack은 identity, Register는 rotate/XOR, MixedRisc는 byte-swap/XOR, FusedCisc는 add/rotate 표현을 사용하며 키는 family ISA domain과 operand mask에서 파생한다.
+- encoder/super-op encoder, 정적 decoder, interpreter, native branch handler가 같은 변환을 적용한다. native handler는 stream token을 읽은 직후 canonical branch-map lookup 값으로만 순간 복원하며 동적-register target 경로는 기존 계약을 유지한다.
+- family grammar 격리 회귀에 absolute conditional branch를 포함시켜 올바른 family만 원래 target을 복원함을 확인했다. `corpus/o1.exe` 4-family 최대 조합의 513개 cross-family route 및 실행 차등검증도 통과했다. 다음 P2-13 구현은 1/2/4/8-byte compact immediate marker ABI다.
+
 ### 2026-08-22 — P2-12 family별 runtime integrity anchor 분산
 
 - 네 architecture family의 handler-table 검증기를 `forward-single`, `reverse-single`, `forward-pair`, `reverse-pair`의 서로 다른 native traversal grammar로 분리했다. reverse family는 build-time checksum 순서도 역방향으로 계산하며, production validator가 각 module의 topology와 expected checksum lockstep을 확인한다.

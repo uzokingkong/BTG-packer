@@ -50,6 +50,31 @@ impl VirtualIsaSpec {
         }
     }
 
+    pub fn branch_target_key(&self) -> u64 {
+        self.operand_mask.rotate_left(11) ^ self.family_profile.isa_domain ^ 0xB7E1_5162_8AED_2A6B
+    }
+
+    /// Family-local representation of an absolute branch instruction index.
+    pub fn encode_branch_target(&self, target: u64) -> u64 {
+        let key = self.branch_target_key();
+        match self.family {
+            VmArchitectureFamily::Stack => target,
+            VmArchitectureFamily::Register => target.rotate_left(17) ^ key,
+            VmArchitectureFamily::MixedRisc => target.swap_bytes() ^ key,
+            VmArchitectureFamily::FusedCisc => target.wrapping_add(key).rotate_left(29),
+        }
+    }
+
+    pub fn decode_branch_target(&self, encoded: u64) -> u64 {
+        let key = self.branch_target_key();
+        match self.family {
+            VmArchitectureFamily::Stack => encoded,
+            VmArchitectureFamily::Register => (encoded ^ key).rotate_right(17),
+            VmArchitectureFamily::MixedRisc => (encoded ^ key).swap_bytes(),
+            VmArchitectureFamily::FusedCisc => encoded.rotate_right(29).wrapping_sub(key),
+        }
+    }
+
     pub fn from_seed(seed: u64) -> Self {
         Self::from_seed_and_family(seed, VmArchitectureFamily::for_build(seed))
     }
