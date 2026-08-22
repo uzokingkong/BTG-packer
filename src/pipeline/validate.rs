@@ -595,6 +595,64 @@ pub(crate) fn validate_function_ownership(ctx: &PipelineContext, out: &[u8]) -> 
         ctx.vm_prog_rva,
         ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total)
     );
+    if !ctx.vm_prog_native_bridges.is_empty() {
+        let handler = ctx.vm_prog_lifetime_cleanup_handler_rva;
+        let vm_end = ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total);
+        if handler < ctx.vm_prog_rva || handler >= vm_end {
+            bail!(
+                "lifetime cleanup handler RVA 0x{handler:X} outside Program-VM 0x{:X}..0x{vm_end:X}",
+                ctx.vm_prog_rva
+            );
+        }
+        let pe = PE::parse(out).map_err(|e| anyhow!("validate: output PE re-parse failed: {e}"))?;
+        let sections = collect_sections(&pe);
+        let pdata = sections
+            .iter()
+            .find(|section| section.name == ".pdata")
+            .ok_or_else(|| anyhow!("native bridges require .pdata"))?;
+        let pdata_start = pdata.raw_ptr as usize;
+        let pdata_end = pdata_start
+            .saturating_add(pdata.raw_size as usize)
+            .min(out.len());
+        let rva_bytes = |rva: u32, len: usize| -> Result<&[u8]> {
+            let section = sections
+                .iter()
+                .find(|section| section.contains_rva(rva))
+                .ok_or_else(|| anyhow!("RVA 0x{rva:X} outside sections"))?;
+            let offset = section.raw_ptr as usize + (rva - section.rva) as usize;
+            out.get(offset..offset.saturating_add(len))
+                .ok_or_else(|| anyhow!("RVA 0x{rva:X} truncated"))
+        };
+        for &(start, _) in &ctx.vm_prog_native_bridges {
+            let begin = ctx.vm_prog_rva.saturating_add(start);
+            let record = out[pdata_start..pdata_end]
+                .chunks_exact(12)
+                .find(|record| u32::from_le_bytes(record[0..4].try_into().unwrap()) == begin)
+                .ok_or_else(|| anyhow!("native bridge 0x{begin:X} missing RUNTIME_FUNCTION"))?;
+            let unwind_rva = u32::from_le_bytes(record[8..12].try_into().unwrap());
+            let header = rva_bytes(unwind_rva, 4)?;
+            if header[0] & 0x18 != 0x10 {
+                bail!("native bridge 0x{begin:X} lacks UNW_FLAG_UHANDLER");
+            }
+            let handler_offset = (4 + header[2] as usize * 2 + 3) & !3;
+            let raw_handler = rva_bytes(unwind_rva, handler_offset + 4)?;
+            let recorded = u32::from_le_bytes(
+                raw_handler[handler_offset..handler_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            if recorded != handler {
+                bail!(
+                    "native bridge 0x{begin:X} cleanup handler drift: 0x{recorded:X} != 0x{handler:X}"
+                );
+            }
+        }
+        println!(
+            "[VALIDATE] OK  {} native bridge UHANDLER record(s) → lifetime cleanup RVA 0x{:X}",
+            ctx.vm_prog_native_bridges.len(),
+            handler
+        );
+    }
     Ok(())
 }
 

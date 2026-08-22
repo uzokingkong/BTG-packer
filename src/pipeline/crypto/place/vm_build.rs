@@ -18,6 +18,7 @@ pub(crate) struct MultiFamilyVmModule {
     pub table_ranges: Vec<(usize, usize)>,
     pub bytecode_ranges: Vec<(usize, usize)>,
     pub native_bridge_ranges: Vec<(usize, usize)>,
+    pub lifetime_cleanup_handler_offset: Option<usize>,
     pub entry_byte_offset: usize,
     pub chunks: Vec<(usize, vm::chunk_crypto::BytecodeChunk)>,
     pub lifetime_sync: crate::vm::data_lifetime::LifetimeSyncTable,
@@ -30,10 +31,16 @@ pub(crate) fn build_multi_family_prog_mod(
     code_va: u64,
     state_va: u64,
     enable_m7: bool,
+    image_base: u64,
+    lifetime_key: u64,
     lifetime_objects: &[crate::vm::data_lifetime::LiteralObject],
 ) -> anyhow::Result<MultiFamilyVmModule> {
-    let lifetime_sync =
-        crate::vm::data_lifetime::LifetimeSyncTable::build(state_va, lifetime_objects)?;
+    let lifetime_sync = crate::vm::data_lifetime::LifetimeSyncTable::build(
+        state_va,
+        image_base,
+        lifetime_key,
+        lifetime_objects,
+    )?;
     lifetime_sync.validate_stride(MULTI_FAMILY_STATE_STRIDE)?;
     let mut modules: Vec<_> = materialized.modules.iter().collect();
     modules.sort_by_key(|module| (module.family != entry_family, module.family as u8));
@@ -136,6 +143,7 @@ pub(crate) fn build_multi_family_prog_mod(
 
     let mut built = Vec::with_capacity(modules.len());
     let mut native_bridge_ranges = Vec::new();
+    let mut lifetime_cleanup_handler_offset = None;
     for (index, module) in modules.iter().enumerate() {
         let mut routes = materialized
             .route_table
@@ -191,6 +199,11 @@ pub(crate) fn build_multi_family_prog_mod(
         if let Some((start, end)) = built_module.native_bridge_range {
             native_bridge_ranges.push((code_offsets[index] + start, code_offsets[index] + end));
         }
+        if lifetime_cleanup_handler_offset.is_none() {
+            lifetime_cleanup_handler_offset = built_module
+                .lifetime_cleanup_handler_offset
+                .map(|offset| code_offsets[index] + offset);
+        }
         built.push(built_module);
     }
 
@@ -227,6 +240,7 @@ pub(crate) fn build_multi_family_prog_mod(
             bytecode,
             handler_offsets: Vec::new(),
             native_bridge_range: native_bridge_ranges.first().copied(),
+            lifetime_cleanup_handler_offset,
         },
         families: modules.iter().map(|module| module.family).collect(),
         state_offsets: (0..modules.len())
@@ -236,6 +250,7 @@ pub(crate) fn build_multi_family_prog_mod(
         table_ranges,
         bytecode_ranges,
         native_bridge_ranges,
+        lifetime_cleanup_handler_offset,
         entry_byte_offset,
         chunks,
         lifetime_sync,

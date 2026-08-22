@@ -24,6 +24,75 @@ fn install_operand_offsets(buf: &mut [u8], base: usize, offsets: &[u16]) {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn lifetime_cleanup_handler_reencrypts_and_releases_owned_scope() {
+    let mut arena = Arena::new(0x50000).unwrap();
+    let code_off = 0x1000usize;
+    let table_off = 0x12000usize;
+    let bytecode_off = 0x16000usize;
+    let state_off = 0x20000usize;
+    let object_off = 0x38000usize;
+    let seed = 0xA17E_71FE_C1EA_4E55;
+    let object_rva = 0x3450u32;
+    let plaintext = b"cleanup-scope";
+    let mut encoder = PolymorphicEncoder::new(seed);
+    let bytecode = encoder
+        .encode(&RiscProgram::new(vec![MicroInstr::new(RiscOp::Halt)]))
+        .unwrap();
+    let parts = build_self_decoding_parts(
+        &bytecode,
+        seed,
+        (arena.base + code_off) as u64,
+        (arena.base + table_off) as u64,
+        (arena.base + bytecode_off) as u64,
+        (arena.base + state_off) as u64,
+        (arena.base + 0x4F000) as u64,
+    )
+    .unwrap();
+    let cleanup = parts
+        .lifetime_cleanup_handler_offset
+        .expect("generated cleanup handler");
+
+    // Tiny leaf helper: mov rax,gs:[0x48]; ret.
+    let owner_stub = [0x65, 0x48, 0x8B, 0x04, 0x25, 0x48, 0, 0, 0, 0xC3];
+    arena.bytes()[0..owner_stub.len()].copy_from_slice(&owner_stub);
+    let owner = arena.call_u64(0);
+    let sync_off = state_off + crate::vm::data_lifetime::LIFETIME_SYNC_TABLE_OFFSET as usize;
+    let sync_va = (arena.base + sync_off) as u64;
+    let object_va = (arena.base + object_off) as u64;
+    let ptr_slot = state_off + crate::vm::data_lifetime::LIFETIME_SYNC_PTR_STATE_OFFSET;
+    let count_slot = state_off + crate::vm::data_lifetime::LIFETIME_SYNC_COUNT_STATE_OFFSET;
+    arena.bytes()[ptr_slot..ptr_slot + 8].copy_from_slice(&sync_va.to_le_bytes());
+    arena.bytes()[count_slot..count_slot + 8].copy_from_slice(&1u64.to_le_bytes());
+    arena.bytes()[sync_off..sync_off + 4].copy_from_slice(&1u32.to_le_bytes());
+    arena.bytes()[sync_off + 4..sync_off + 8].copy_from_slice(&2u32.to_le_bytes());
+    arena.bytes()[sync_off + 8..sync_off + 16].copy_from_slice(&owner.to_le_bytes());
+    arena.bytes()[sync_off + 16..sync_off + 24].copy_from_slice(&object_va.to_le_bytes());
+    arena.bytes()[sync_off + 24..sync_off + 28]
+        .copy_from_slice(&(plaintext.len() as u32).to_le_bytes());
+    let object_key =
+        crate::vm::seed_lifecycle::derive_seed(seed, 0x5343_4F50_4544_4154 ^ object_rva as u64);
+    arena.bytes()[sync_off + 32..sync_off + 40].copy_from_slice(&object_key.to_le_bytes());
+    arena.bytes()[object_off..object_off + plaintext.len()].copy_from_slice(plaintext);
+    arena.bytes()[code_off..code_off + parts.code.len()].copy_from_slice(&parts.code);
+
+    arena.call(code_off + cleanup);
+
+    let expected: Vec<u8> = plaintext
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| {
+            byte ^ crate::vm::data_lifetime::scoped_mask_byte(seed, object_rva, index as u32)
+        })
+        .collect();
+    assert_eq!(
+        &arena.bytes()[object_off..object_off + plaintext.len()],
+        expected.as_slice()
+    );
+    assert_eq!(&arena.bytes()[sync_off..sync_off + 16], &[0u8; 16]);
+}
+
 #[test]
 fn test_p2_9_chunk_lookup_hides_plain_boundaries_and_key_list() {
     use crate::vm::chunk_crypto::{chunk_key_from_module, module_key, BytecodeChunk};

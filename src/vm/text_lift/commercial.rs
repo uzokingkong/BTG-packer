@@ -562,15 +562,10 @@ pub fn lift_program_cfg_commercial(
     // 2nd pass: 포함(비제외) 블록을 실제로 RISC lift해 프로그램 + ip_map 구성.
     let mut instrs: Vec<MicroInstr> = Vec::new();
     let mut ip_map: HashMap<u64, usize> = HashMap::new();
-    // Exception/unwind safety: a scoped object may not remain acquired across
-    // a native call. The current native-call RUNTIME_FUNCTION restores the
-    // bridge frame, but has no language-specific cleanup handler capable of
-    // re-encrypting an object and releasing its owner/depth entry when a callee
-    // unwinds. Therefore production lifetime protection is fail-closed to pure
-    // exact-width RIP-relative reads whose acquire/toggle/use/toggle/release
-    // sequence stays inside one VM instruction. LEA->call candidates remain in
-    // the reference graph for a future cleanup-handler ABI, but are not sealed
-    // at rest today.
+    // Exception/unwind safety: exact-width reads finish inside one VM
+    // instruction. LEA->call scopes are also eligible because every native-call
+    // RUNTIME_FUNCTION now carries a language-specific UHANDLER which restores
+    // ciphertext and releases every lifetime entry owned by the unwinding TEB.
     let eligible_lifetime_objects: Vec<_> = lifetime_objects
         .iter()
         .filter(|object| {
@@ -579,12 +574,30 @@ pub fn lift_program_cfg_commercial(
                 blocks.iter().any(|block| {
                     !excluded_blocks.contains(&block.start_va)
                         && block.instructions.iter().any(|instruction| {
-                            instruction.ip() == va
-                                && crate::vm::data_lifetime::is_unwind_safe_direct_reference(
-                                    instruction,
-                                    object,
-                                    image_base,
+                            if instruction.ip() != va {
+                                return false;
+                            }
+                            if crate::vm::data_lifetime::is_unwind_safe_direct_reference(
+                                instruction,
+                                object,
+                                image_base,
+                            ) {
+                                return true;
+                            }
+                            let destination = instruction.op0_register().full_register();
+                            instruction.code() == Code::Lea_r64_m
+                                && instruction.is_ip_rel_memory_operand()
+                                && matches!(
+                                    destination,
+                                    Register::RCX | Register::RDX | Register::R8 | Register::R9
                                 )
+                                && {
+                                    let target = instruction.ip_rel_memory_address();
+                                    target >= image_base + object.rva as u64
+                                        && target
+                                            < image_base
+                                                + object.rva.saturating_add(object.len) as u64
+                                }
                         })
                 })
             })
@@ -596,7 +609,7 @@ pub fn lift_program_cfg_commercial(
         .saturating_sub(eligible_lifetime_objects.len());
     if unwind_unsafe_lifetime_objects != 0 {
         println!(
-            "[+] P2-14 lifetime unwind gate: excluded {} call/cross-boundary object(s); only exact-width direct scopes may be sealed",
+            "[+] P2-14 lifetime unwind gate: excluded {} unproven cross-boundary object(s); exact-width and cleanup-backed call scopes may be sealed",
             unwind_unsafe_lifetime_objects
         );
     }

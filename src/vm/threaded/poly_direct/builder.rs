@@ -4954,11 +4954,23 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             Instruction::with2(
                 Code::Mov_r64_rm64,
                 Register::R10,
-                MemoryOperand::with_base_displ_size(Register::RDX, 0x5010, 8),
+                MemoryOperand::with_base_displ_size(
+                    Register::RDX,
+                    crate::vm::data_lifetime::LIFETIME_SYNC_PTR_STATE_OFFSET as i64,
+                    8,
+                ),
             )
             .unwrap(),
         );
-        b.push(Instruction::with2(Code::Shl_rm64_imm8, Register::RCX, 4).unwrap());
+        b.push(
+            Instruction::with3(
+                Code::Imul_r64_rm64_imm32,
+                Register::RCX,
+                Register::RCX,
+                crate::vm::data_lifetime::LIFETIME_SYNC_ENTRY_SIZE as i32,
+            )
+            .unwrap(),
+        );
         b.push(Instruction::with2(Code::Add_rm64_r64, Register::R10, Register::RCX).unwrap());
         b.push(
             Instruction::with2(
@@ -5032,11 +5044,23 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             Instruction::with2(
                 Code::Mov_r64_rm64,
                 Register::R10,
-                MemoryOperand::with_base_displ_size(Register::RDX, 0x5010, 8),
+                MemoryOperand::with_base_displ_size(
+                    Register::RDX,
+                    crate::vm::data_lifetime::LIFETIME_SYNC_PTR_STATE_OFFSET as i64,
+                    8,
+                ),
             )
             .unwrap(),
         );
-        b.push(Instruction::with2(Code::Shl_rm64_imm8, Register::RCX, 4).unwrap());
+        b.push(
+            Instruction::with3(
+                Code::Imul_r64_rm64_imm32,
+                Register::RCX,
+                Register::RCX,
+                crate::vm::data_lifetime::LIFETIME_SYNC_ENTRY_SIZE as i32,
+            )
+            .unwrap(),
+        );
         b.push(Instruction::with2(Code::Add_rm64_r64, Register::R10, Register::RCX).unwrap());
         b.push(
             Instruction::with2(
@@ -5779,6 +5803,196 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         extension_handlers.insert(opcode, wrapper);
     }
 
+    // P2-14 call-scoped lifetime unwind cleanup. Windows invokes this as the
+    // UNW_FLAG_UHANDLER language-specific handler for each native-call bridge
+    // frame during phase-2 unwind. It is deliberately self-contained: no call,
+    // allocation, VM dispatcher state, or potentially unwound callee is used.
+    // Every entry owned by the current TEB thread is re-encrypted exactly once,
+    // then depth/owner/lock are cleared before unwind continues.
+    let lifetime_cleanup_handler = b.len();
+    for reg in [
+        Register::RBX,
+        Register::RBP,
+        Register::RSI,
+        Register::RDI,
+        Register::R12,
+        Register::R13,
+        Register::R14,
+        Register::R15,
+    ] {
+        b.push(Instruction::with1(Code::Push_r64, reg).unwrap());
+    }
+    movi(
+        &mut b,
+        Register::R12,
+        state_base + crate::vm::data_lifetime::LIFETIME_SYNC_PTR_STATE_OFFSET as u64,
+    );
+    b.push(
+        Instruction::with2(
+            Code::Mov_r64_rm64,
+            Register::R13,
+            MemoryOperand::with_base_displ_size(Register::R12, 8, 8),
+        )
+        .unwrap(),
+    );
+    b.push(
+        Instruction::with2(
+            Code::Mov_r64_rm64,
+            Register::R12,
+            MemoryOperand::with_base(Register::R12),
+        )
+        .unwrap(),
+    );
+    b.push(
+        Instruction::with2(
+            Code::Mov_r64_rm64,
+            Register::R14,
+            MemoryOperand::with_base_displ_bcst_seg(Register::None, 0x48, false, Register::GS),
+        )
+        .unwrap(),
+    );
+    let cleanup_entry_loop = b.len();
+    b.push(Instruction::with2(Code::Test_rm64_r64, Register::R13, Register::R13).unwrap());
+    let cleanup_done_edge = b.br(Code::Je_rel32_64, usize::MAX);
+    b.push(
+        Instruction::with2(
+            Code::Cmp_rm64_r64,
+            MemoryOperand::with_base_displ(Register::R12, 8),
+            Register::R14,
+        )
+        .unwrap(),
+    );
+    let cleanup_next_owner_edge = b.br(Code::Jne_rel32_64, usize::MAX);
+    b.push(
+        Instruction::with2(
+            Code::Cmp_rm32_imm32,
+            MemoryOperand::with_base_displ(Register::R12, 4),
+            0,
+        )
+        .unwrap(),
+    );
+    let cleanup_next_depth_edge = b.br(Code::Je_rel32_64, usize::MAX);
+    b.push(
+        Instruction::with2(
+            Code::Mov_r64_rm64,
+            Register::R15,
+            MemoryOperand::with_base_displ(Register::R12, 16),
+        )
+        .unwrap(),
+    );
+    b.push(
+        Instruction::with2(
+            Code::Mov_r32_rm32,
+            Register::EBX,
+            MemoryOperand::with_base_displ(Register::R12, 24),
+        )
+        .unwrap(),
+    );
+    b.push(Instruction::with2(Code::Xor_rm32_r32, Register::ESI, Register::ESI).unwrap());
+    let cleanup_byte_loop = b.len();
+    b.push(Instruction::with2(Code::Cmp_r32_rm32, Register::ESI, Register::EBX).unwrap());
+    let cleanup_object_done_edge = b.br(Code::Jae_rel32_64, usize::MAX);
+    b.push(
+        Instruction::with2(
+            Code::Mov_r64_rm64,
+            Register::RAX,
+            MemoryOperand::with_base_displ(Register::R12, 32),
+        )
+        .unwrap(),
+    );
+    b.push(Instruction::with2(Code::Mov_r32_rm32, Register::EDX, Register::ESI).unwrap());
+    b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 3).unwrap());
+    b.push(Instruction::with2(Code::Rol_rm64_imm8, Register::RDX, 17).unwrap());
+    b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RDX).unwrap());
+    movi(&mut b, Register::RDX, 0x517C_C1B7_2722_0A95);
+    b.push(Instruction::with2(Code::Imul_r64_rm64, Register::RAX, Register::RDX).unwrap());
+    b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap());
+    b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 31).unwrap());
+    b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RDX).unwrap());
+    movi(&mut b, Register::RDX, 0x4A55_816D_97C6_D67B);
+    b.push(Instruction::with2(Code::Imul_r64_rm64, Register::RAX, Register::RDX).unwrap());
+    b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap());
+    b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 27).unwrap());
+    b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RDX).unwrap());
+    b.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::ESI).unwrap());
+    b.push(Instruction::with2(Code::And_rm32_imm32, Register::ECX, 7).unwrap());
+    b.push(Instruction::with2(Code::Shl_rm32_imm8, Register::ECX, 3).unwrap());
+    b.push(Instruction::with2(Code::Shr_rm64_CL, Register::RAX, Register::CL).unwrap());
+    b.push(
+        Instruction::with2(
+            Code::Xor_rm8_r8,
+            MemoryOperand::with_base_index(Register::R15, Register::RSI),
+            Register::AL,
+        )
+        .unwrap(),
+    );
+    b.push(Instruction::with1(Code::Inc_rm32, Register::ESI).unwrap());
+    b.br(Code::Jmp_rel32_64, cleanup_byte_loop);
+    let cleanup_object_done = b.len();
+    b.push(
+        Instruction::with2(
+            Code::Mov_rm32_imm32,
+            MemoryOperand::with_base_displ(Register::R12, 4),
+            0,
+        )
+        .unwrap(),
+    );
+    b.push(
+        Instruction::with2(
+            Code::Mov_rm64_imm32,
+            MemoryOperand::with_base_displ(Register::R12, 8),
+            0,
+        )
+        .unwrap(),
+    );
+    b.push(Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::EAX).unwrap());
+    b.push(
+        Instruction::with2(
+            Code::Xchg_rm32_r32,
+            MemoryOperand::with_base(Register::R12),
+            Register::EAX,
+        )
+        .unwrap(),
+    );
+    let cleanup_next = b.len();
+    b.push(
+        Instruction::with2(
+            Code::Add_rm64_imm8,
+            Register::R12,
+            crate::vm::data_lifetime::LIFETIME_SYNC_ENTRY_SIZE as i32,
+        )
+        .unwrap(),
+    );
+    b.push(Instruction::with1(Code::Dec_rm64, Register::R13).unwrap());
+    b.br(Code::Jmp_rel32_64, cleanup_entry_loop);
+    let cleanup_done = b.len();
+    for reg in [
+        Register::R15,
+        Register::R14,
+        Register::R13,
+        Register::R12,
+        Register::RDI,
+        Register::RSI,
+        Register::RBP,
+        Register::RBX,
+    ] {
+        b.push(Instruction::with1(Code::Pop_r64, reg).unwrap());
+    }
+    b.push(Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::EAX).unwrap());
+    b.push(Instruction::with(Code::Retnq));
+    for (edge, target) in [
+        (cleanup_done_edge, cleanup_done),
+        (cleanup_next_owner_edge, cleanup_next),
+        (cleanup_next_depth_edge, cleanup_next),
+        (cleanup_object_done_edge, cleanup_object_done),
+    ] {
+        for (branch, branch_target) in &mut b.branches {
+            if *branch == edge {
+                *branch_target = target;
+            }
+        }
+    }
+
     // P3: distribute identical handler `jmp dispatch` tails over seed-derived,
     // semantics-neutral tail islands before final branch layout.
     let diversified_tails = b.diversify_direct_tails(dispatch, seed);
@@ -5876,6 +6090,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             (ips[native_bridge_instr_begin] - code_base) as usize,
             (ips[native_bridge_instr_end] - code_base) as usize,
         )),
+        lifetime_cleanup_handler_offset: Some((ips[lifetime_cleanup_handler] - code_base) as usize),
         table,
         table_key,
         table_checksum,

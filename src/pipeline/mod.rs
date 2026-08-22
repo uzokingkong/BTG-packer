@@ -158,6 +158,9 @@ pub struct PipelineContext {
     /// Code-relative VM→native bridge range requiring its private-frame unwind.
     pub vm_prog_native_bridge: Option<(u32, u32)>,
     pub vm_prog_native_bridges: Vec<(u32, u32)>,
+    /// RVA of the generated UNW_FLAG_UHANDLER cleanup routine used by every
+    /// commercial VM native-call bridge.
+    pub vm_prog_lifetime_cleanup_handler_rva: u32,
     /// P1-3: commercial Program-VM ownership metrics persisted to the manifest.
     pub vm_coverage: Option<VmCoverageMetrics>,
     /// P1-4: instruction-aligned Program-VM bytecode chunks for M7 runtime.
@@ -267,6 +270,7 @@ impl PipelineContext {
             vm_prog_total: 0,
             vm_prog_native_bridge: None,
             vm_prog_native_bridges: Vec::new(),
+            vm_prog_lifetime_cleanup_handler_rva: 0,
             vm_coverage: None,
             vm_prog_chunks: Vec::new(),
             vm_family_plan: None,

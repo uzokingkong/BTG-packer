@@ -82,6 +82,7 @@ pub struct VmModule {
     pub handler_offsets: Vec<usize>,
     /// Optional code-relative range requiring bridge-specific unwind metadata.
     pub native_bridge_range: Option<(usize, usize)>,
+    pub lifetime_cleanup_handler_offset: Option<usize>,
 }
 
 impl VmModule {
@@ -114,6 +115,7 @@ pub fn build_vm_module(
         bytecode,
         handler_offsets: vmc.handler_offsets.clone(),
         native_bridge_range: None,
+        lifetime_cleanup_handler_offset: None,
     })
 }
 
@@ -166,6 +168,7 @@ pub fn build_vm_module_mba(
         bytecode,
         handler_offsets: vmc.handler_offsets.clone(),
         native_bridge_range: None,
+        lifetime_cleanup_handler_offset: None,
     })
 }
 
@@ -266,6 +269,7 @@ pub fn build_vm_module_obf(
         bytecode: obf_bytecode,
         handler_offsets: vmc.handler_offsets,
         native_bridge_range: None,
+        lifetime_cleanup_handler_offset: None,
     })
 }
 

@@ -125,8 +125,9 @@ profile에 따라 다음 계층을 조합합니다.
 - immutable RX / mutable RW memory transition;
 - boot CRC/multisite integrity;
 - commercial family code/table/bytecode의 BTGI distributed integrity;
-- Program-VM M7 instruction chunks와 object-level data lifetime. Lifetime은 현재 모든 참조가
-  exact-width direct read이고 native call/unwind 경계를 넘지 않는 객체만 fail-closed로 활성화합니다.
+- Program-VM M7 instruction chunks와 object-level data lifetime. Exact-width direct scope와
+  증명된 LEA→call scope를 활성화하며, native bridge의 `UNW_FLAG_UHANDLER`가 unwind 중
+  현재 TEB owner의 객체를 재암호화하고 depth/owner/lock을 해제합니다.
 
 Boot stub은 anti-debug, base/key setup, decrypt, integrity, IAT, memory transition과 선택된
 entry transfer를 profile별로 합성합니다. 따라서 모든 빌드의 section 이름이나 boot 순서가
@@ -153,7 +154,7 @@ runtime functions를 보존하면서 dispatcher/VM bridge range의 unwind metada
 
 - 불완전한 function/object ownership은 native 또는 unprotected로 남깁니다.
 - descriptor OOB/overlap/overflow/capacity와 profile hard error는 pack을 실패시킵니다.
-- P2-11 handler recipe coverage, P2-12 anchor signature, call-scoped lifetime cleanup handler,
+- P2-11 handler recipe coverage, P2-12 anchor signature, wider lifetime reference proof,
   P2-15 bridge oracle 감소와 최신 release matrix가 남아 있습니다.
 
 전체 파일별 책임은 [전체 소스 지도](source-map.md), 현재 완료 판정은

@@ -16,14 +16,19 @@ pub struct LiteralObject {
 /// Shared production ABI for lifetime synchronization.  The table lives in
 /// the entry-family state stride so every VM family and OS thread addresses
 /// the same atomic words instead of accidentally using family-local locks.
-pub const LIFETIME_SYNC_TABLE_OFFSET: u64 = 0x4000;
-pub const LIFETIME_SYNC_ENTRY_SIZE: usize = 16;
+pub const LIFETIME_SYNC_TABLE_OFFSET: u64 = 0x2000;
+pub const LIFETIME_SYNC_ENTRY_SIZE: usize = 48;
 pub const LIFETIME_SYNC_CAPACITY: usize = 256;
 pub const LIFETIME_SYNC_TABLE_SIZE: usize = LIFETIME_SYNC_ENTRY_SIZE * LIFETIME_SYNC_CAPACITY;
+pub const LIFETIME_SYNC_PTR_STATE_OFFSET: usize = 0x5020;
+pub const LIFETIME_SYNC_COUNT_STATE_OFFSET: usize = 0x5028;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifetimeSyncEntry {
     pub object_rva: u32,
+    pub object_len: u32,
+    pub object_va: u64,
+    pub object_key: u64,
     pub lock_va: u64,
     pub refcount_va: u64,
     pub owner_va: u64,
@@ -36,25 +41,34 @@ pub struct LifetimeSyncTable {
 }
 
 impl LifetimeSyncTable {
-    pub fn build(entry_state_va: u64, objects: &[LiteralObject]) -> anyhow::Result<Self> {
-        let mut rvas: Vec<_> = objects.iter().map(|object| object.rva).collect();
-        rvas.sort_unstable();
-        rvas.dedup();
-        if rvas.len() > LIFETIME_SYNC_CAPACITY {
+    pub fn build(
+        entry_state_va: u64,
+        image_base: u64,
+        build_key: u64,
+        objects: &[LiteralObject],
+    ) -> anyhow::Result<Self> {
+        let mut unique = std::collections::BTreeMap::new();
+        for object in objects {
+            unique.entry(object.rva).or_insert(object);
+        }
+        if unique.len() > LIFETIME_SYNC_CAPACITY {
             anyhow::bail!(
                 "data-lifetime sync table capacity exceeded: {} > {}",
-                rvas.len(),
+                unique.len(),
                 LIFETIME_SYNC_CAPACITY
             );
         }
         let base_va = entry_state_va
             .checked_add(LIFETIME_SYNC_TABLE_OFFSET)
             .ok_or_else(|| anyhow::anyhow!("data-lifetime sync table VA overflow"))?;
-        let entries = rvas
+        let entries = unique
             .into_iter()
             .enumerate()
-            .map(|(index, object_rva)| LifetimeSyncEntry {
+            .map(|(index, (object_rva, object))| LifetimeSyncEntry {
                 object_rva,
+                object_len: object.len,
+                object_va: image_base + object_rva as u64,
+                object_key: derive_seed(build_key, 0x5343_4F50_4544_4154 ^ object_rva as u64),
                 lock_va: base_va + (index * LIFETIME_SYNC_ENTRY_SIZE) as u64,
                 refcount_va: base_va + (index * LIFETIME_SYNC_ENTRY_SIZE + 4) as u64,
                 owner_va: base_va + (index * LIFETIME_SYNC_ENTRY_SIZE + 8) as u64,
@@ -700,13 +714,14 @@ mod tests {
                 references: vec![0x1200],
             },
         ];
-        let table = LifetimeSyncTable::build(0x1400_8000_0, &objects).unwrap();
+        let table = LifetimeSyncTable::build(0x1400_8000_0, 0x1400_0000_0, 7, &objects).unwrap();
         table.validate_stride(0x8000).unwrap();
         assert_eq!(table.entries[0].object_rva, 0x3000);
-        assert_eq!(table.entries[0].lock_va, 0x1400_8400_0);
-        assert_eq!(table.entries[0].refcount_va, 0x1400_8400_4);
-        assert_eq!(table.entries[0].owner_va, 0x1400_8400_8);
-        assert_eq!(table.entries[1].lock_va, table.entries[0].lock_va + 16);
+        assert_eq!(table.entries[0].lock_va, 0x1400_8200_0);
+        assert_eq!(table.entries[0].refcount_va, 0x1400_8200_4);
+        assert_eq!(table.entries[0].owner_va, 0x1400_8200_8);
+        assert_eq!(table.entries[0].object_va, 0x1400_0300_0);
+        assert_eq!(table.entries[1].lock_va, table.entries[0].lock_va + 48);
     }
 
     #[test]
@@ -719,7 +734,7 @@ mod tests {
                 references: vec![0x1000],
             })
             .collect();
-        assert!(LifetimeSyncTable::build(0x1400_0000_0, &objects).is_err());
+        assert!(LifetimeSyncTable::build(0x1400_0000_0, 0x1400_0000_0, 7, &objects).is_err());
     }
 
     #[test]

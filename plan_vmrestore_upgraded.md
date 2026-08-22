@@ -28,14 +28,13 @@
 
 ### 1. Data-lifetime exception/unwind cleanup
 
-현재 완료된 1단계: native call 또는 cross-boundary 참조가 하나라도 있는 객체를 at-rest
-보호에서 제외하고, exact-width direct read만 scope로 허용하는 unwind-safe fail-closed gate를
-production 선별과 metadata sizing 양쪽에 연결했습니다. 따라서 cleanup handler가 없는 현재
-ABI에서는 활성 lifetime lock/plaintext가 native unwind 경계를 가로지르지 않습니다.
+완료: sync entry를 48바이트 cleanup descriptor(lock/depth/owner/object VA/len/key)로
+확장하고, 모든 family native-call RUNTIME_FUNCTION에 `UNW_FLAG_UHANDLER`와 생성 handler
+RVA를 연결했습니다. handler는 현재 TEB owner의 활성 객체를 동일 mask로 재암호화한 뒤
+depth/owner/lock을 원자적으로 정리합니다. validator는 4개 bridge record의 flag와 RVA를
+출력 PE에서 다시 검사합니다.
 
-- 호출을 가로지르는 객체까지 보호 범위를 다시 넓히려면 acquire 뒤 예외나 unwind에서도
-  release되는 language-specific cleanup 경로를 production bridge/unwind 계약에 연결한다.
-- nested scope, cross-family 전환, native exception을 각각 독립 fixture로 검증한다.
+- nested/cross-family/native exception corpus를 release matrix에서 계속 확대한다.
 - 복합 table access는 모든 참조와 폭이 증명되는 경우에만 활성화하고 나머지는
   fail-closed 제외한다.
 
@@ -75,11 +74,12 @@ ABI에서는 활성 lifetime lock/plaintext가 native unwind 경계를 가로지
 
 ## 현재 검증 기준
 
-- `cargo test --lib`: 576 passed, 0 failed.
+- `cargo test --lib`: 578 passed, 0 failed.
 - `corpus/o1.exe`, seed 31010 대표 최대 조합: exit 0, stdout 1,460B,
   stderr 0B 동치.
-- unwind-safe exact-width lifetime 적용 시 최종 보호 객체 9개. 후보 182개/strict scope
-  116개 중 call 또는 cross-boundary 객체 107개를 fail-closed 제외했습니다.
+- cleanup-backed lifetime 적용 시 최종 보호 객체 54개. 후보 182개/strict scope 116개이며
+  최종 all-reference proof에서 미증명 cross-boundary 객체 54개를 제외했습니다.
+- 4개 native bridge UHANDLER → cleanup RVA `0xAFB03`, structural/execution differential 통과.
 - 위 결과는 대표 기준이며 최신 전체 release matrix 통과를 의미하지 않습니다.
 
 ## 문서 갱신 규칙

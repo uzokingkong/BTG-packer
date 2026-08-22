@@ -391,6 +391,8 @@ pub(crate) fn place_boot_stub(
             0,
             0,
             ctx.m7,
+            image_base,
+            ctx.poly_vm_seed,
             &ctx.vm_data_lifetime_objects,
         )?)
     } else {
@@ -639,6 +641,18 @@ pub(crate) fn place_boot_stub(
             .collect()
     } else {
         ctx.vm_prog_native_bridge.into_iter().collect()
+    };
+    ctx.vm_prog_lifetime_cleanup_handler_rva = if let Some(multi) = &vm_multi_family_sizing {
+        multi
+            .lifetime_cleanup_handler_offset
+            .map(|offset| ctx.vm_prog_rva.saturating_add(offset as u32))
+            .unwrap_or(0)
+    } else {
+        vm_prog_mod
+            .as_ref()
+            .and_then(|module| module.lifetime_cleanup_handler_offset)
+            .map(|offset| ctx.vm_prog_rva.saturating_add(offset as u32))
+            .unwrap_or(0)
     };
 
     // ── M6 Phase-2.3: at-rest 암호화 대상 확정 ──────────────────────────────
@@ -1288,6 +1302,8 @@ pub(crate) fn place_boot_stub(
                 prva,
                 vm_prog_state_va,
                 ctx.m7,
+                image_base,
+                ctx.poly_vm_seed,
                 &ctx.vm_data_lifetime_objects,
             )?)
         } else {
@@ -1358,14 +1374,32 @@ pub(crate) fn place_boot_stub(
                 btg.bytes[state_off
                     ..state_off + crate::vm::commercial_build::COMMERCIAL_STATE_SIZE as usize]
                     .fill(0);
-                btg.bytes[state_off + 0x5000..state_off + 0x5018].fill(0);
-                btg.bytes[state_off + 0x5010..state_off + 0x5018]
+                btg.bytes[state_off + 0x5000..state_off + 0x5030].fill(0);
+                let sync_ptr_off =
+                    state_off + crate::vm::data_lifetime::LIFETIME_SYNC_PTR_STATE_OFFSET;
+                btg.bytes[sync_ptr_off..sync_ptr_off + 8]
                     .copy_from_slice(&multi.lifetime_sync.base_va.to_le_bytes());
+                let sync_count_off =
+                    state_off + crate::vm::data_lifetime::LIFETIME_SYNC_COUNT_STATE_OFFSET;
+                btg.bytes[sync_count_off..sync_count_off + 8]
+                    .copy_from_slice(&(multi.lifetime_sync.entries.len() as u64).to_le_bytes());
                 if index == 0 {
                     let sync_start =
                         state_off + crate::vm::data_lifetime::LIFETIME_SYNC_TABLE_OFFSET as usize;
                     let sync_end = sync_start + crate::vm::data_lifetime::LIFETIME_SYNC_TABLE_SIZE;
                     btg.bytes[sync_start..sync_end].fill(0);
+                    for (entry_index, entry) in multi.lifetime_sync.entries.iter().enumerate() {
+                        let entry_off = sync_start
+                            + entry_index * crate::vm::data_lifetime::LIFETIME_SYNC_ENTRY_SIZE;
+                        btg.bytes[entry_off + 16..entry_off + 24]
+                            .copy_from_slice(&entry.object_va.to_le_bytes());
+                        btg.bytes[entry_off + 24..entry_off + 28]
+                            .copy_from_slice(&entry.object_len.to_le_bytes());
+                        btg.bytes[entry_off + 28..entry_off + 32]
+                            .copy_from_slice(&entry.object_rva.to_le_bytes());
+                        btg.bytes[entry_off + 32..entry_off + 40]
+                            .copy_from_slice(&entry.object_key.to_le_bytes());
+                    }
                     let expected_sync_va =
                         vm_prog_state_va + crate::vm::data_lifetime::LIFETIME_SYNC_TABLE_OFFSET;
                     if multi.lifetime_sync.base_va != expected_sync_va {

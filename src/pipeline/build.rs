@@ -160,6 +160,7 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
             ctx.vm_prog_total,
             vm_prog_unwind.as_ref().map(|v| v.as_slice()),
             &ctx.vm_prog_native_bridges,
+            ctx.vm_prog_lifetime_cleanup_handler_rva,
         );
     }
 
@@ -516,9 +517,10 @@ fn build_vm_entry_unwind_info(size_of_prolog: u8, ops: &[(u8, VmEntryOp)]) -> Ve
     info
 }
 
-fn build_native_call_bridge_unwind_info() -> Vec<u8> {
+fn build_native_call_bridge_unwind_info(cleanup_handler_rva: u32) -> Vec<u8> {
     let code_off = 0x20u8;
-    let mut info = vec![UNWIND_VERSION, code_off, 10, 0];
+    // UNW_FLAG_UHANDLER occupies flag bit 1, shifted above Version in byte 0.
+    let mut info = vec![UNWIND_VERSION | 0x10, code_off, 10, 0];
     info.extend_from_slice(&[code_off, UWOP_ALLOC_LARGE, 0x17, 0x00]);
     for reg in [5u8, 3, 6, 7, 15, 14, 13, 12] {
         info.extend_from_slice(&[code_off, (reg << 4) | UWOP_PUSH_NONVOL]);
@@ -526,6 +528,7 @@ fn build_native_call_bridge_unwind_info() -> Vec<u8> {
     while info.len() % 4 != 0 {
         info.push(0);
     }
+    info.extend_from_slice(&cleanup_handler_rva.to_le_bytes());
     info
 }
 
@@ -603,6 +606,7 @@ fn update_pdata_seh(
     vm_prog_total: u32,
     vm_prog_unwind: Option<&[u8]>,
     vm_native_bridges: &[(u32, u32)],
+    vm_lifetime_cleanup_handler_rva: u32,
 ) {
     if let Some(pdata_sec) = relayed_sections.iter_mut().find(|s| s.name == ".pdata") {
         // ?癒?궚 `.text`??域밸챶?嚥?鈺곕똻???랁???쇱뵠?怨뺥닏 野껋럥以?癒?퐣 ??쎈뻬???嚥??袁? 癰귣똻???뺣뼄.
@@ -670,7 +674,11 @@ fn update_pdata_seh(
                 .collect();
             native_bridge_ranges.sort_unstable();
             if !native_bridge_ranges.is_empty() {
-                native_bridge_unwind = build_native_call_bridge_unwind_info();
+                if vm_lifetime_cleanup_handler_rva == 0 {
+                    println!("[!] P2-14 lifetime cleanup handler missing; native bridge unwind remains unavailable");
+                }
+                native_bridge_unwind =
+                    build_native_call_bridge_unwind_info(vm_lifetime_cleanup_handler_rva);
                 let mut cursor = vm_begin;
                 for (bridge_begin, bridge_end) in &native_bridge_ranges {
                     for (begin, end) in [(cursor, *bridge_begin), (*bridge_begin, *bridge_end)] {
@@ -834,6 +842,7 @@ mod tests {
             0,
             None,
             &[],
+            0,
         );
 
         // ?癒?궚 2 + ?됰슢?곻쭪? 1 = 3揶?RUNTIME_FUNCTION (36 獄쏅뗄??? + UNWIND_INFO(8) = 44.
@@ -900,6 +909,7 @@ mod tests {
             0,
             None,
             &[],
+            0,
         );
 
         // 獄쏄퀣肉?24 獄쏅뗄???2 ?酉?껆뵳? + UNWIND_INFO (4 ??삳쐭 + 5*2 ?꾨뗀諭?= 14 ??16) = 40.
@@ -975,6 +985,7 @@ mod tests {
             0,
             None,
             &[],
+            0,
         );
 
         let pdata = &sections[0].bytes;
@@ -1170,5 +1181,18 @@ mod tests {
         // 첫(가장 큰 offset) 코드 = PUSH_NONVOL r12 (마지막 실행된 push).
         assert_eq!(info[4], offsets[0], "first code = max offset");
         assert_eq!(info[5], (12 << 4) | UWOP_PUSH_NONVOL, "PUSH_NONVOL r12");
+    }
+
+    #[test]
+    fn native_call_unwind_info_carries_lifetime_termination_handler() {
+        let handler_rva = 0x5A70u32;
+        let info = build_native_call_bridge_unwind_info(handler_rva);
+        assert_eq!(info[0] & 0x07, UNWIND_VERSION);
+        assert_eq!(info[0] & 0x18, 0x10, "UNW_FLAG_UHANDLER only");
+        assert_eq!(info[2], 10, "bridge unwind-code slots");
+        assert_eq!(
+            u32::from_le_bytes(info[info.len() - 4..].try_into().unwrap()),
+            handler_rva
+        );
     }
 }

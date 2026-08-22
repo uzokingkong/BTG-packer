@@ -125,15 +125,18 @@ continuation/sync pointer metadata는 `0x5000..0x5018`, return call stack은 str
 - 문자열 외에는 register destination의 순수 MOV 계열 RIP-relative 4/8/16-byte read만
   `ConstantPool`로 추가합니다. RMW/XCHG/memory destination과 폭이 모호한 접근은 제외하고,
   해당 단일 instruction 앞뒤에서 동일 owner-aware scope로 toggle합니다.
-- entry-family state의 `+0x4000..+0x5000`에는 RVA 정렬된 16-byte
-  `(atomic lock u32, depth u32, owner thread-id u64)` 항목 최대 256개를 위한 전역 sync table을 둡니다.
+- entry-family state의 `+0x2000..+0x5000`에는 RVA 정렬된 48-byte
+  `(atomic lock, depth, owner, object VA, length/RVA, object key)` cleanup descriptor
+  최대 256개를 위한 전역 sync table을 둡니다.
   모든 family가 같은 절대 VA를 사용하도록 table ownership은 entry state에만 있으며,
   validator가 `+0x5000` continuation metadata와 `+0x6000` call stack 충돌을 차단합니다.
 - lifetime scope 앞뒤에는 canonical `LifetimeAcquire/LifetimeRelease` op를 삽입합니다.
-  모든 family handler는 state `+0x5010`의 공통 table pointer를 읽고 acquire에서
+  모든 family handler는 state `+0x5020`의 공통 table pointer와 `+0x5028` count를 읽고 acquire에서
   `lock cmpxchg` spin을 수행합니다. 같은 `GS:[0x48]` thread owner의 중첩 acquire는
   atomic depth만 증가시키고 release는 owner/depth를 검증해 마지막 scope에서만 owner와
   lock을 해제합니다. 잘못된 owner/underflow는 trap으로 fail-closed하며 virtual GPR/FLAGS를 보존합니다.
+- native-call bridge의 UHANDLER는 phase-2 unwind에서 `GS:[0x48]` owner가 일치하는
+  활성 descriptor만 순회해 객체를 재암호화하고 sync word를 0으로 복구합니다.
 
 ## 부분 구현
 
@@ -143,14 +146,14 @@ continuation/sync pointer metadata는 `0x5000..0x5018`, return call stack은 str
 | P2-12 anchor 분산 | 4 instance, 4 integrity topology, ownership gate | RIP-relative runtime bundle materialization, N=20 signature gate |
 | P2-13 grammar | family operand/compact immediate/control token, super-op tag+descriptor-mask ABI | 완료; 추가 grammar는 선택적 hardening |
 | P2-14 state/lazy flags | u16 metadata, split GPR banks, temp spill/XMM/stack 분리, RSI/RDI lazy hot state, cross-family/native materialization | canonical bridge image zeroization은 P2-15에서 진행 |
-| Data lifetime | exact 4/8/16B direct read, global owner-aware scope, call/unwind 교차 참조 fail-closed 제외 | cleanup handler ABI 뒤 call-scoped object 재활성화, wider format/complex proof |
-| Release gate | 576 library tests, P2-13 20-seed grammar gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
+| Data lifetime | exact 4/8/16B direct read와 LEA→call scope, global owner-aware sync, bridge UHANDLER cleanup | wider format와 복합 table/memory proof |
+| Release gate | 578 library tests, P2-13 20-seed grammar gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
 | Library API | 기본 CFG+crypto in-memory `pack/run_full` | CLI effective profile 전체를 노출하는 typed API |
 | Platform/PE matrix | 대표 Windows x64 PE, `.pdata`/reloc/IAT/resource 구조 검증 | 전체 ASLR/CFG/CET/TLS/compiler matrix 최신 재실행 |
 
 ## 미구현 또는 다음 단계
 
-- call-scoped lifetime object의 language-specific exception/unwind cleanup과 wider object proof.
+- data-lifetime wider object/table reference proof와 실제 exception corpus 확대.
 - P2-15 native bridge canonical-image lifetime 축소와 oracle 감소.
 - 최신 전체 hostile corpus/20-seed release gate.
 - CLI와 동등한 full-profile library API 및 capability introspection.
@@ -165,15 +168,16 @@ btg-packer.exe -i corpus\o1.exe -o protected.exe `
   --verify-output --seed 31010
 ```
 
-- library tests: 576 passed, 0 failed.
+- library tests: 578 passed, 0 failed.
 - P2-13 uninformed grammar normalization: 20 seeds × 4 families, 허용률 ≤10% 통과.
 - family runtime instances: 4.
 - 최대 family instruction ownership: 37,117 / 130,685 = 28.40%.
 - cross-family routes: 513.
 - M7 chunks: 대표 측정 254~255 across 4 streams (빌드 시점의 lift 결과에 따라 변동).
 - BTGI descriptors: 12.
-- unwind-safe exact-width lifetime final protected objects: 9 (182 candidate / 116 strict-scope,
-  call 또는 cross-boundary object 107개 fail-closed 제외).
+- cleanup-backed lifetime final protected objects: 54 (182 candidate / 116 strict-scope,
+  최종 all-reference proof에서 미증명 cross-boundary 객체 54개 제외).
+- native bridge lifetime cleanup: 4 UHANDLER records → cleanup RVA `0xAFB03`.
 - differential execution: exit 0, stdout 1,460B, stderr 0B.
 
 이 수치는 `corpus/o1.exe`, seed 31010의 측정값이며 모든 입력에 대한 보장은 아닙니다.

@@ -256,6 +256,7 @@ pub fn build_program_vm_commercial_with_routes_for_family(
         bytecode,
         handler_offsets: Vec::new(),
         native_bridge_range: parts.native_bridge_range,
+        lifetime_cleanup_handler_offset: parts.lifetime_cleanup_handler_offset,
     })
 }
 

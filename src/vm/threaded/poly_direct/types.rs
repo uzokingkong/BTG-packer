@@ -40,6 +40,9 @@ pub struct SelfDecodingParts {
     /// return RIP lands here require the bridge's private stack allocation in
     /// addition to the module-entry nonvolatile saves.
     pub native_bridge_range: Option<(usize, usize)>,
+    /// Language-specific x64 unwind handler which re-encrypts and releases
+    /// call-scoped lifetime objects owned by the unwinding OS thread.
+    pub lifetime_cleanup_handler_offset: Option<usize>,
     /// 256 x u64 handler table (decrypted opcode byte -> handler VA).
     pub table: Vec<u64>,
     /// P6-1: handler 테이블 마스터 키 (시드 유래). P6-3 부터 단일 XOR 상수가 아니라
