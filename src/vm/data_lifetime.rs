@@ -1,7 +1,7 @@
 //! Object-granular encrypted data with decrypt/use/re-encrypt lifetime control.
 
 use crate::vm::seed_lifecycle::derive_seed;
-use iced_x86::{Decoder, DecoderOptions, Instruction};
+use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Instruction, Register};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiteralObject {
@@ -62,6 +62,73 @@ pub fn analyze_referenced_literals(
         object.references.dedup();
     }
     candidates
+}
+
+/// Selects the strict subset whose address is loaded directly into a Win64
+/// argument register and reaches a call in the same straight-line region.
+/// Any control-flow boundary or overwrite of that register kills the proof.
+pub fn select_call_scoped_literals(
+    text: &[u8],
+    text_rva: u32,
+    image_base: u64,
+    objects: &[LiteralObject],
+) -> Vec<LiteralObject> {
+    let mut selected = std::collections::BTreeSet::new();
+    let mut pending = std::collections::HashMap::<Register, u32>::new();
+    let mut decoder = Decoder::with_ip(
+        64,
+        text,
+        image_base.saturating_add(text_rva as u64),
+        DecoderOptions::NONE,
+    );
+    let mut instruction = Instruction::default();
+    while decoder.can_decode() {
+        decoder.decode_out(&mut instruction);
+        let is_call = matches!(
+            instruction.flow_control(),
+            FlowControl::Call | FlowControl::IndirectCall
+        );
+        if is_call {
+            selected.extend(pending.values().copied());
+            pending.clear();
+            continue;
+        }
+        if !matches!(instruction.flow_control(), FlowControl::Next) {
+            pending.clear();
+            continue;
+        }
+        let destination = instruction.op0_register();
+        if destination != Register::None {
+            pending.remove(&destination.full_register());
+        }
+        if instruction.code() == Code::Lea_r64_m && instruction.is_ip_rel_memory_operand() {
+            let dst = instruction.op0_register().full_register();
+            if !matches!(
+                dst,
+                Register::RCX | Register::RDX | Register::R8 | Register::R9
+            ) {
+                continue;
+            }
+            let target = instruction.ip_rel_memory_address();
+            let Some(rva) = target
+                .checked_sub(image_base)
+                .and_then(|v| u32::try_from(v).ok())
+            else {
+                continue;
+            };
+            if let Some(object) = objects
+                .iter()
+                .find(|object| rva >= object.rva && rva < object.rva.saturating_add(object.len))
+            {
+                pending.insert(dst, object.rva);
+            }
+        }
+    }
+    objects
+        .iter()
+        .filter(|object| selected.contains(&object.rva))
+        .cloned()
+        .collect()
 }
 
 fn scan_literal_objects(data: &[u8], data_rva: u32) -> Vec<LiteralObject> {
@@ -239,5 +306,37 @@ mod tests {
         assert_eq!(objects[0].rva, data_rva);
         assert_eq!(objects[0].len, 15);
         assert_eq!(objects[0].references, vec![text_rva]);
+    }
+
+    #[test]
+    fn call_scope_requires_unclobbered_argument_in_straight_line_code() {
+        let base = 0x1400_0000_0u64;
+        let text_rva = 0x1000;
+        let object = LiteralObject {
+            class: DataClass::Ascii,
+            rva: 0x3000,
+            len: 8,
+            references: vec![text_rva],
+        };
+        let instructions = [
+            Instruction::with2(
+                Code::Lea_r64_m,
+                Register::RCX,
+                MemoryOperand::with_base_displ(Register::RIP, (base + 0x3000) as i64),
+            )
+            .unwrap(),
+            Instruction::with_branch(Code::Call_rel32_64, base + 0x2000).unwrap(),
+        ];
+        let code = BlockEncoder::encode(
+            64,
+            InstructionBlock::new(&instructions, base + text_rva as u64),
+            BlockEncoderOptions::NONE,
+        )
+        .unwrap()
+        .code_buffer;
+        assert_eq!(
+            select_call_scoped_literals(&code, text_rva, base, &[object]).len(),
+            1
+        );
     }
 }

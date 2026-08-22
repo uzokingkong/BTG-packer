@@ -186,10 +186,19 @@ pub(crate) fn gather_runs(
         });
         objects.sort_by_key(|object| object.rva);
         objects.dedup_by_key(|object| object.rva);
+        let candidate_count = objects.len();
+        let candidate_references: usize =
+            objects.iter().map(|object| object.references.len()).sum();
+        objects = crate::vm::data_lifetime::select_call_scoped_literals(
+            &ctx.target_info.text_bytes,
+            ctx.target_info.text_rva,
+            image_base,
+            &objects,
+        );
         let references: usize = objects.iter().map(|object| object.references.len()).sum();
         println!(
-            "[+] P2-5 data-lifetime graph: {} referenced literal object(s), {} proven RIP-relative use site(s)",
-            objects.len(), references
+            "[+] P2-5 data-lifetime graph: {candidate_count} candidate object(s)/{candidate_references} reference(s), {} strict LEA-to-call scope object(s)/{} reference(s)",
+            objects.len(), references,
         );
         ctx.vm_data_lifetime_objects = objects;
     } else {
