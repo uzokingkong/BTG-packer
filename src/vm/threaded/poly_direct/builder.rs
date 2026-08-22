@@ -2573,7 +2573,31 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         movzx8_m(&mut b, Register::EAX, DEC_SRC1);
         mov_m(&mut b, Register::R11, DEC_IMM1);
         b.call(sub_resolve);
-        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RAX).unwrap());
+        let mov_plan = crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+            seed,
+            spec.opcode_for(RiscOp::Mov).unwrap_or_default(),
+        );
+        match mov_plan.recipe {
+            crate::vm::handler_poly::SemanticRecipe::Native => {
+                b.push(
+                    Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RAX).unwrap(),
+                );
+            }
+            crate::vm::handler_poly::SemanticRecipe::DeMorgan
+            | crate::vm::handler_poly::SemanticRecipe::CarrySplit => {
+                // Two involutions preserve the resolved value. Host flags are
+                // dead here; MOV's guest flags live in the VM state and remain
+                // untouched.
+                b.push(Instruction::with1(Code::Not_rm64, Register::RAX).unwrap());
+                b.push(Instruction::with1(Code::Not_rm64, Register::RAX).unwrap());
+            }
+            crate::vm::handler_poly::SemanticRecipe::BooleanBasis
+            | crate::vm::handler_poly::SemanticRecipe::MbaIdentity => {
+                let mask = (mov_plan.context_key | 1) as i32;
+                b.push(Instruction::with2(Code::Xor_rm64_imm32, Register::RAX, mask).unwrap());
+                b.push(Instruction::with2(Code::Xor_rm64_imm32, Register::RAX, mask).unwrap());
+            }
+        }
         b.call(sub_store);
         b.jmp(dispatch);
     }
@@ -3688,6 +3712,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         dispatch: usize,
         op: WidthAluOp,
         width: u8,
+        synthesis_plan: Option<crate::vm::handler_poly::HandlerSynthesisPlan>,
     ) {
         b.call(sub_dec_ops);
         // src1 -> R10
@@ -3787,17 +3812,34 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             (WidthAluOp::Dec, _) => {
                 b.push(Instruction::with1(Code::Dec_rm64, Register::R10).unwrap())
             }
-            (WidthAluOp::Not, 1) => {
-                b.push(Instruction::with1(Code::Not_rm8, Register::R10L).unwrap())
-            }
-            (WidthAluOp::Not, 2) => {
-                b.push(Instruction::with1(Code::Not_rm16, Register::R10W).unwrap())
-            }
-            (WidthAluOp::Not, 4) => {
-                b.push(Instruction::with1(Code::Not_rm32, Register::R10D).unwrap())
-            }
-            (WidthAluOp::Not, _) => {
-                b.push(Instruction::with1(Code::Not_rm64, Register::R10).unwrap())
+            (WidthAluOp::Not, width) => {
+                let native = synthesis_plan.is_none_or(|plan| {
+                    matches!(plan.recipe, crate::vm::handler_poly::SemanticRecipe::Native)
+                });
+                let code = match (native, width) {
+                    (true, 1) => Code::Not_rm8,
+                    (true, 2) => Code::Not_rm16,
+                    (true, 4) => Code::Not_rm32,
+                    (true, _) => Code::Not_rm64,
+                    (false, 1) => Code::Xor_rm8_imm8,
+                    (false, 2) => Code::Xor_rm16_imm16,
+                    (false, 4) => Code::Xor_rm32_imm32,
+                    (false, _) => Code::Xor_rm64_imm32,
+                };
+                let dst = match width {
+                    1 => Register::R10L,
+                    2 => Register::R10W,
+                    4 => Register::R10D,
+                    _ => Register::R10,
+                };
+                if native {
+                    b.push(Instruction::with1(code, dst).unwrap())
+                } else {
+                    // XOR with an all-one value is bitwise NOT. The selected
+                    // operand width preserves upper bits exactly like NOT; the
+                    // resulting host flags are deliberately not committed.
+                    b.push(Instruction::with2(code, dst, -1i32).unwrap())
+                }
             }
         };
         // 플래그: Add/Sub → 폭별 하드웨어 플래그(CF|PF|ZF|SF|OF). Inc/Dec → CF
@@ -4624,6 +4666,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             dispatch,
             WidthAluOp::Add,
             *w,
+            None,
         );
         subw_h[wi] = b.len();
         emit_width_alu_handler(
@@ -4634,6 +4677,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             dispatch,
             WidthAluOp::Sub,
             *w,
+            None,
         );
         adcw_h[wi] = b.len();
         emit_width_alu_handler(
@@ -4644,6 +4688,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             dispatch,
             WidthAluOp::Adc,
             *w,
+            None,
         );
         sbbw_h[wi] = b.len();
         emit_width_alu_handler(
@@ -4654,6 +4699,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             dispatch,
             WidthAluOp::Sbb,
             *w,
+            None,
         );
         incw_h[wi] = b.len();
         emit_width_alu_handler(
@@ -4664,6 +4710,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             dispatch,
             WidthAluOp::Inc,
             *w,
+            None,
         );
         decw_h[wi] = b.len();
         emit_width_alu_handler(
@@ -4674,6 +4721,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             dispatch,
             WidthAluOp::Dec,
             *w,
+            None,
         );
         notw_h[wi] = b.len();
         emit_width_alu_handler(
@@ -4684,6 +4732,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             dispatch,
             WidthAluOp::Not,
             *w,
+            Some(crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+                seed,
+                spec.opcode_for(RiscOp::Not { width: *w })
+                    .unwrap_or_default(),
+            )),
         );
         rolw_h[wi] = b.len();
         emit_rotate_left_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, *w);

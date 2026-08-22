@@ -4,14 +4,14 @@
 
 ## 진행 기록
 
-### 2026-08-22 — 현재 기준선 갱신 (`main` bb7dfaf)
+### 2026-08-22 — 현재 기준선 갱신 (`main` 9931adb 이후)
 
 - 아래의 “미완료” 문구 중 이 항목보다 오래된 P2-9/P2-10/P2-11/P2-5 기록은 당시 단계의 역사적 스냅샷이며 현재 상태 판정으로 사용하지 않는다.
 - P2-9는 family별 active-register-only M7으로 확대됐다. `corpus/o1.exe`, seed 31010 최대 조합에서 4개 family stream과 254개 독립 instruction-aligned chunk가 생성되고 실행 동치가 통과했다.
 - P2-10은 4개 독립 code/handler-table/bytecode/state module, canonical cross-family CALL/tail-JUMP/return routing, family별 unwind range까지 production 배치 완료다.
 - P2-11은 canonical ISA와 super-op extension의 모든 최종 handler-table target에 seed/opcode-derived synthesis wrapper를 적용했다. 전체 ISA production reachability는 완료됐지만 handler 본체의 micro-op decomposition/MBA/register allocation/control split 다양성은 추가 강화 대상으로 유지한다.
 - P2-5는 helper-only 상태를 종료했다. PE literal reference graph와 strict `LEA literal → Win64 argument → call` proof를 production에 연결하고, VM 소유권까지 재검증된 45개 객체를 at-rest ciphertext로 저장한다. call 직전 RISC toggle로 복호화하고 복귀 직후 재암호화하며 flags를 복원한다. 일부 참조/native 참조/loader-critical 객체는 fail-closed 제외한다.
-- 최신 검증: library 557/557, `corpus/o1.exe` 일반 및 `--m7 --m8 --integrity` 실행 동치 exit 0/stdout 1,460B/stderr 0B. 최신 data-lifetime 변경 이후 20-seed/전체 hostile corpus는 다시 수행해야 한다.
+- 최신 검증: library 559/559, `corpus/o1.exe` 일반 및 `--m7 --m8 --integrity` 실행 동치 exit 0/stdout 1,460B/stderr 0B. 최신 data-lifetime/handler-body 변경 이후 20-seed/전체 hostile corpus는 다시 수행해야 한다.
 - 다음 구현 순서: (1) data-lifetime 직접 메모리·wide/format·동시성 확대, (2) P2-11 handler 본체 synthesis 강화, (3) distributed integrity production descriptor/runtime wiring, (4) P2-12 runtime anchor 분산, P2-13 grammar polymorphism, P2-14 state splitting/lazy flags, P2-15 bridge oracle 감소, (5) 최신 20-seed 및 hostile/tamper release gate.
 
 ### 2026-08-22 — P2-5 direct-access lifetime 확대
@@ -24,6 +24,13 @@
 - byte-oriented NUL scanner가 UTF-16LE를 한 글자씩 분절하던 결함을 제거했다. wide literal을 ASCII보다 먼저 검사하고 2-byte terminator까지 단일 객체로 reference graph에 등록한다.
 - `corpus/o1.exe`에서 후보 객체 170→172, strict scope 객체 104→106으로 증가했다. 추가 wide 객체는 최종 VM 소유권 gate에서 제외되어 활성 ciphertext 객체는 46개로 유지됐고 최대 조합 실행 동치는 통과했다.
 - 동일 객체를 여러 thread/family가 동시에 toggle하는 race는 전역 lock/state storage가 필요하므로 P2-14 shared-state splitting과 함께 닫는다. lock 없는 공유 `.rdata` mutation을 억지로 활성화하지 않는다.
+
+### 2026-08-22 — P2-11 실제 handler 본문 synthesis 확대
+
+- 기존 NOR 본문 등가식 선택에 더해 `MOV`와 `NOT{8,16,32,64}`가 build seed/opcode별 실제 의미 동치 명령열을 선택한다. MOV는 native self-move, 이중 NOT, seed-mask 이중 XOR 중 하나를 사용하고 NOT은 native NOT 또는 폭별 all-one XOR을 사용한다.
+- 모든 변형은 guest flag state를 갱신하지 않으며, 폭별 NOT의 상위 비트 보존 계약도 유지한다. 단순 NOP 수 변화가 아니라 production handler의 도달 가능한 본문 바이트와 instruction grammar가 실제로 달라진다.
+- 다중 jump-island wrapper 시도는 native 실행에서 `STATUS_ILLEGAL_INSTRUCTION` 회귀를 검출해 폐기했다. 검증된 기존 단일 wrapper를 유지하고 불안정 코드는 커밋하지 않았다.
+- 전체 library 559/559와 `corpus/o1.exe --vm --vm-oep --vm-commercial --m7 --m8 --integrity --verify-output --seed 31010` 최대 조합이 통과했다. production 결과는 4 family/255 M7 chunk, data-lifetime ciphertext 46개이며 실행 차등검증이 일치했다.
 
 ### 2026-08-22 — P2-10 실제 multi-family module/state/table 및 call/return routing 완료
 
