@@ -20,7 +20,7 @@ partition한 뒤 독립 bytecode/module/state/table과 native self-decoding runt
 | Bytecode 보호 | 구현됨 | rolling-key stream, family별 ISA, M7 instruction-aligned chunk 암호화 |
 | Handler table | 구현됨 | per-opcode key, MBA key derivation, family별 integrity traversal |
 | Distributed integrity | 구현됨 | family별 code/table/bytecode 12개 BTGI descriptor와 boot verifier |
-| Data lifetime | 부분 구현 | strict scoped toggle과 global atomic acquire/release production 연결 |
+| Data lifetime | 부분 구현 | global owner-aware atomic lock/depth와 scoped decrypt/re-encrypt 연결 |
 | P2-13 grammar | 완료 | family operand/compact immediate/control token 및 독립 super-op grammar production 연결 |
 | P2-14 state/lazy flags | 부분 완료 | split domains와 RSI/RDI hot lazy state, branch/native/HALT materialization 연결 |
 | Release gate | 부분 완료 | library 574/574 및 P2-13 20-seed grammar gate 통과; 전체 pack gate 재실행 필요 |

@@ -4958,14 +4958,25 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             )
             .unwrap(),
         );
+        b.push(Instruction::with2(Code::Shl_rm64_imm8, Register::RCX, 4).unwrap());
+        b.push(Instruction::with2(Code::Add_rm64_r64, Register::R10, Register::RCX).unwrap());
         b.push(
             Instruction::with2(
-                Code::Lea_r64_m,
-                Register::R10,
-                MemoryOperand::with_base_index_scale(Register::R10, Register::RCX, 8),
+                Code::Mov_r64_rm64,
+                Register::R9,
+                MemoryOperand::with_base_displ_bcst_seg(Register::None, 0x48, false, Register::GS),
             )
             .unwrap(),
         );
+        b.push(
+            Instruction::with2(
+                Code::Cmp_rm64_r64,
+                MemoryOperand::with_base_displ(Register::R10, 8),
+                Register::R9,
+            )
+            .unwrap(),
+        );
+        let reentrant_edge = b.br(Code::Je_rel32_64, usize::MAX);
         let spin = b.len();
         b.push(Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::EAX).unwrap());
         b.push(Instruction::with2(Code::Mov_r32_imm32, Register::R11D, 1).unwrap());
@@ -4978,7 +4989,37 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         cas.set_has_lock_prefix(true);
         b.push(cas);
         b.br(Code::Jne_rel32_64, spin);
+        b.push(
+            Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_displ(Register::R10, 8),
+                Register::R9,
+            )
+            .unwrap(),
+        );
+        b.push(
+            Instruction::with2(
+                Code::Mov_rm32_imm32,
+                MemoryOperand::with_base_displ(Register::R10, 4),
+                1,
+            )
+            .unwrap(),
+        );
         b.jmp(dispatch);
+        let reentrant = b.len();
+        let mut inc = Instruction::with1(
+            Code::Inc_rm32,
+            MemoryOperand::with_base_displ(Register::R10, 4),
+        )
+        .unwrap();
+        inc.set_has_lock_prefix(true);
+        b.push(inc);
+        b.jmp(dispatch);
+        for (branch, target) in &mut b.branches {
+            if *branch == reentrant_edge {
+                *target = reentrant;
+            }
+        }
     }
     let h_lifetime_release = b.len();
     {
@@ -4995,19 +5036,56 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             )
             .unwrap(),
         );
+        b.push(Instruction::with2(Code::Shl_rm64_imm8, Register::RCX, 4).unwrap());
+        b.push(Instruction::with2(Code::Add_rm64_r64, Register::R10, Register::RCX).unwrap());
         b.push(
             Instruction::with2(
-                Code::Lea_r64_m,
-                Register::R10,
-                MemoryOperand::with_base_index_scale(Register::R10, Register::RCX, 8),
+                Code::Mov_r64_rm64,
+                Register::R9,
+                MemoryOperand::with_base_displ_bcst_seg(Register::None, 0x48, false, Register::GS),
             )
             .unwrap(),
         );
         b.push(
             Instruction::with2(
-                Code::Mov_rm32_imm32,
-                MemoryOperand::with_base(Register::R10),
+                Code::Cmp_rm64_r64,
+                MemoryOperand::with_base_displ(Register::R10, 8),
+                Register::R9,
+            )
+            .unwrap(),
+        );
+        b.br(Code::Jne_rel32_64, h_trap);
+        b.push(
+            Instruction::with2(
+                Code::Cmp_rm32_imm32,
+                MemoryOperand::with_base_displ(Register::R10, 4),
                 0,
+            )
+            .unwrap(),
+        );
+        b.br(Code::Je_rel32_64, h_trap);
+        let mut dec = Instruction::with1(
+            Code::Dec_rm32,
+            MemoryOperand::with_base_displ(Register::R10, 4),
+        )
+        .unwrap();
+        dec.set_has_lock_prefix(true);
+        b.push(dec);
+        b.br(Code::Jne_rel32_64, dispatch);
+        b.push(
+            Instruction::with2(
+                Code::Mov_rm64_imm32,
+                MemoryOperand::with_base_displ(Register::R10, 8),
+                0,
+            )
+            .unwrap(),
+        );
+        b.push(Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::EAX).unwrap());
+        b.push(
+            Instruction::with2(
+                Code::Xchg_rm32_r32,
+                MemoryOperand::with_base(Register::R10),
+                Register::EAX,
             )
             .unwrap(),
         );

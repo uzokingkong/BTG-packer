@@ -86,14 +86,15 @@
   객체를 at-rest ciphertext로 저장합니다.
 - call 또는 direct access 직전에 decrypt하고 사용 직후 re-encrypt합니다.
 - proof가 불완전하거나 native/loader가 공유하는 객체는 보호 대상에서 제외합니다.
-- entry-family state의 `+0x4000..+0x5000`에는 RVA 정렬된 8-byte
-  `(atomic lock u32, refcount u32)` 항목 최대 512개를 위한 전역 sync table을 둡니다.
+- entry-family state의 `+0x4000..+0x5000`에는 RVA 정렬된 16-byte
+  `(atomic lock u32, depth u32, owner thread-id u64)` 항목 최대 256개를 위한 전역 sync table을 둡니다.
   모든 family가 같은 절대 VA를 사용하도록 table ownership은 entry state에만 있으며,
   validator가 `+0x5000` continuation metadata와 `+0x6000` call stack 충돌을 차단합니다.
 - lifetime scope 앞뒤에는 canonical `LifetimeAcquire/LifetimeRelease` op를 삽입합니다.
   모든 family handler는 state `+0x5010`의 공통 table pointer를 읽고 acquire에서
-  `lock cmpxchg` spin, release에서 lock word clear를 수행하며 virtual GPR/FLAGS를
-  보존합니다. refcount word는 후속 재진입/중첩 protocol용으로 예약돼 있습니다.
+  `lock cmpxchg` spin을 수행합니다. 같은 `GS:[0x48]` thread owner의 중첩 acquire는
+  atomic depth만 증가시키고 release는 owner/depth를 검증해 마지막 scope에서만 owner와
+  lock을 해제합니다. 잘못된 owner/underflow는 trap으로 fail-closed하며 virtual GPR/FLAGS를 보존합니다.
 
 ## 부분 구현
 
@@ -103,12 +104,12 @@
 | P2-12 anchor 분산 | 4 instance, 4 integrity topology, ownership gate | RIP-relative runtime bundle materialization, N=20 signature gate |
 | P2-13 grammar | family operand/compact immediate/control token, super-op tag+descriptor-mask ABI | 완료 |
 | P2-14 state/lazy flags | u16 metadata, split GPR banks, temp spill/XMM/stack 분리, RSI/RDI lazy hot state, cross-family/native materialization | shared lifetime 동시성 및 추가 hot-state 후보 |
-| Data lifetime | strict ASCII/UTF-16 scope, global table relocation, atomic acquire/release | owner-aware 재진입/refcount, wider format/direct-memory cases |
+| Data lifetime | strict ASCII/UTF-16 scope, global relocation, owner-aware atomic 재진입/depth | wider format/direct-memory 및 unwind cleanup cases |
 | Release gate | 574 library tests, P2-13 20-seed grammar gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
 
 ## 미구현 또는 다음 단계
 
-- shared lifetime object의 owner-aware 재진입/refcount protocol.
+- shared lifetime scope의 exception/unwind cleanup과 wider object proof.
 - shared lifetime object의 thread-safe state/locking.
 - P2-15 native bridge canonical-image lifetime 축소와 oracle 감소.
 - 최신 전체 hostile corpus/20-seed release gate.

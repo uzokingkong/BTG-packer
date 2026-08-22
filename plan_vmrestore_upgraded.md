@@ -4,11 +4,17 @@
 
 ## 진행 기록
 
+### 2026-08-22 — shared lifetime owner-aware 재진입/depth protocol
+
+- sync entry를 16바이트 `(lock u32, depth u32, owner thread-id u64)`로 확대하고 동일 4KB table에서 capacity를 256개로 조정했다. Windows x64 TEB `GS:[0x48]`의 thread ID가 owner token이다.
+- acquire는 owner가 현재 thread면 atomic depth만 증가하고, 다른 owner면 CAS lock을 획득한 뒤 owner/depth=1을 게시한다. release는 owner 일치와 depth>0을 fail-closed 검증하고 atomic decrement 결과가 0일 때만 owner를 지운 뒤 `xchg`로 lock을 해제한다.
+- iced-x86의 강제 displacement-size 오류를 실제 production build에서 발견해 자동 displacement 선택으로 수정했다. 46-object 최대 조합 pack/실행동치와 기존 574개 library 회귀를 통과했다. 다음 lifetime 범위는 native exception/unwind 시 scope cleanup 및 wider object proof다.
+
 ### 2026-08-22 — shared lifetime atomic acquire/release production 연결
 
 - canonical ISA에 `LifetimeAcquire/LifetimeRelease`를 추가하고 strict direct/call scope의 decrypt toggle 전과 re-encrypt 후에 균형 삽입했다. operand는 pre-lift candidate RVA 정렬에서 얻은 결정적 global-table index다.
 - 모든 family state `+0x5010`에 entry-family sync-table의 동일 절대 VA를 relocation한다. native acquire handler는 `lock cmpxchg` spin으로 32-bit lock word를 획득하고 release handler가 clear하며, 두 handler 모두 virtual GPR/FLAGS를 변경하지 않는다. interpreter/reference는 경쟁자가 없는 단일-thread 의미에서 no-op이다.
-- 46개 lifetime 객체가 활성인 `corpus/o1.exe` 최대 조합에서 pack/구조검증/실행동치(exit 0, stdout 1,460B, stderr 0B)를 통과했다. library 기준은 신규 balanced-scope 검사를 포함해 574개다. 4-byte refcount는 owner-aware 재진입과 중첩 scope 확장을 위해 예약 상태다.
+- 46개 lifetime 객체가 활성인 `corpus/o1.exe` 최대 조합에서 pack/구조검증/실행동치(exit 0, stdout 1,460B, stderr 0B)를 통과했다. library 기준은 신규 balanced-scope 검사를 포함해 574개다. 당시 예약했던 refcount는 후속 owner-aware 단계에서 depth로 활성화했다.
 
 ### 2026-08-22 — shared lifetime global sync-table ABI 배치
 
