@@ -63,6 +63,12 @@
   시작하므로 두 state bank 및 `0x800` XMM window와 겹치지 않습니다.
 - cross-family router는 source/target의 독립 layout offset으로 GPR/flags/VSP/XMM을
   변환하며 production validator가 모든 register descriptor의 정렬과 범위를 검사합니다.
+- 일반 산술/논리 producer는 status snapshot을 별도 lazy slot과 validity token에 보관합니다.
+  다음 producer는 분기 없는 `CMOVNE`로 최신 snapshot의 비상태 비트를 계승하며,
+  condition 평가, VM→native bridge, HALT에서 canonical flags로 materialize합니다.
+- canonical FLAGS를 직접 쓰는 specialized producer는 validity token을 중앙에서 즉시
+  무효화합니다. token byte는 packed decode qword의 예약 상위 절반에 고정되고 validator가
+  이 ABI와 state/XMM 경계를 fail-closed 검사합니다.
 
 ### Distributed integrity
 
@@ -86,13 +92,13 @@
 | P2-11 handler synthesis | full ISA target wrapper, 일부 실제 body recipe | execution-weight 80%에 3개 이상 body recipe |
 | P2-12 anchor 분산 | 4 instance, 4 integrity topology, ownership gate | RIP-relative runtime bundle materialization, N=20 signature gate |
 | P2-13 grammar | family operand/compact immediate/control token, super-op tag+descriptor-mask ABI | 완료 |
-| P2-14 state/lazy flags | u16 operand metadata, split memory bank, XMM/stack 분리, cross-family layout marshal | lazy condition producer/materialization |
+| P2-14 state/lazy flags | u16 operand metadata, split bank, XMM/stack 분리, cross-family marshal, lazy producer와 branch/native/HALT materialization | register-resident/stack-window state 확대 |
 | Data lifetime | strict single-owner ASCII/UTF-16 | 공유 객체 동시성, wider format/direct-memory cases |
-| Release gate | 569 library tests, P2-13 20-seed grammar gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
+| Release gate | 570 library tests, P2-13 20-seed grammar gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
 
 ## 미구현 또는 다음 단계
 
-- P2-14 lazy flag producer token과 native boundary materialization.
+- P2-14 register-resident/stack-window state domain 확대.
 - shared lifetime object의 thread-safe state/locking.
 - P2-15 native bridge canonical-image lifetime 축소와 oracle 감소.
 - 최신 전체 hostile corpus/20-seed release gate.

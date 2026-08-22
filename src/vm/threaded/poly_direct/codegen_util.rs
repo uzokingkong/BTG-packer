@@ -43,6 +43,8 @@ pub(crate) const STATE_END: i32 = 0x100;
 /// 것에서 regs[0] 로 동기화할지 결정한다. DEC_* (0xD0..0xEF) 와 겹치지 않는
 /// 여유 영역 0xF0..0xFF 사용.
 pub(crate) const FP_RET_OFF: i32 = 0x0F0;
+pub(crate) const LAZY_FLAGS_OFF: i32 = 0x0F8;
+pub(crate) const LAZY_VALID_OFF: i32 = 0x0D4;
 /// P1-8: Win64 FP/vector ABI — 네이티브 브릿지가 VM 상태의 XMM 슬롯에서
 /// XMM0-5 로 물질화/동기화한다 (state_base + XMM_OFF, 6 × 16B). 로더가 이
 /// 슬롯에 FP 인자를 심으면 (lifter/ABI 분석 — 후속) 브릿지가 ABI-정확하게
@@ -87,6 +89,8 @@ pub(crate) fn state_disp(logical: i32) -> i32 {
             0x0E0 => l.imm2,
             0x0E8 => l.carry_in,
             0x0F0 => l.fp_return,
+            0x0F8 => l.lazy_flags,
+            0x0D4 => l.lazy_valid,
             0x100..=0x15F => l.xmm + (logical - 0x100),
             _ => logical,
         }
@@ -379,6 +383,9 @@ pub(crate) fn mov_m(b: &mut CodeBuilder, r: Register, disp: i32) {
 }
 pub(crate) fn store_m(b: &mut CodeBuilder, disp: i32, r: Register) {
     b.push(Instruction::with2(Code::Mov_rm64_r64, m(disp), r).unwrap());
+    if disp == FLAGS_OFF {
+        b.push(Instruction::with2(Code::Mov_rm8_imm8, m8(LAZY_VALID_OFF), 0).unwrap());
+    }
 }
 pub(crate) fn movzx8_m(b: &mut CodeBuilder, r: Register, disp: i32) {
     b.push(Instruction::with2(Code::Movzx_r32_rm8, r, m8(disp)).unwrap());

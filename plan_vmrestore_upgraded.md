@@ -4,6 +4,12 @@
 
 ## 진행 기록
 
+### 2026-08-22 — P2-14 lazy flag producer 및 경계 materialization
+
+- 일반 산술/논리 flag producer는 canonical flags를 매번 쓰지 않고 전용 snapshot slot과 1-byte validity token을 갱신한다. 연속 producer는 branch-free `CMOVNE` 선택으로 최신 token의 비상태 비트를 계승해 super-op handler 복제 규칙도 유지한다.
+- condition 평가와 VM→native/cross-family bridge, HALT는 token이 유효할 때만 canonical flags를 materialize한다. specialized producer가 canonical flags를 직접 쓰면 공통 store helper가 오래된 token을 즉시 무효화하므로 이전 snapshot이 새 결과를 덮어쓰지 않는다.
+- validity token은 packed decode qword의 사용하지 않는 상위 절반에 고정했으며 validator가 이 ABI와 state/XMM 범위를 검사한다. forward/reverse branch, super-op rewritten branch, seeded layout, Win64 FP native bridge를 포함한 library 570/570을 통과했다. P2-14의 다음 범위는 register-resident/stack-window state domain 확대와 shared lifetime 동시성이다.
+
 ### 2026-08-22 — P2-14 production split-state ABI 1단계
 
 - operand-offset metadata를 `256 × u8`에서 `256 × u16 little-endian`으로 확대하고 jittered/legacy table layout, serializer, arena runner, native compact reader와 resolve/store helper를 모두 16-bit ABI로 전환했다. production validator는 register descriptor가 정렬돼 있고 runtime state 범위 안인지 fail-closed 검사한다.
@@ -1328,7 +1334,7 @@ seed-jittered offset은 유효하지만 한 VM state base를 알아내면 같은
 **수정**
 
 - family/instance마다 state 일부를 register-resident, stack-window, split memory bank로 분할한다.
-- flags는 가능한 op에서 즉시 canonical RFLAGS로 저장하지 않고 lazy condition token/producer state로 유지하다 branch/native boundary에서 materialize한다.
+- flags는 일반 산술/논리 op에서 lazy producer snapshot/token으로 유지하고 condition/native/HALT 경계에서 materialize한다. specialized canonical writer는 stale token을 즉시 무효화한다. (완료)
 - return stack, guest data stack, canonical bridge image를 서로 다른 state domain으로 분리한다.
 - cross-VM bridge에서만 canonical image를 순간 생성하고 bridge 종료 즉시 zeroize한다.
 
