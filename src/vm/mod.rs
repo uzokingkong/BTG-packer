@@ -39,6 +39,7 @@ pub mod ksa;
 pub mod lifter;
 pub mod mapper;
 pub mod mem_model;
+pub mod multi_family;
 pub mod nested;
 pub mod ownership_verifier;
 pub mod poly;

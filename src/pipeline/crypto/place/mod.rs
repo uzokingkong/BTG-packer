@@ -74,11 +74,13 @@ pub(crate) fn place_boot_stub(
         vm_prog_chunks,
         vm_family_plan,
         vm_family_partitions,
+        vm_multi_family,
     ) = lift_program(ctx, image_base, vm_oep_effective, vm_commercial)?;
     ctx.vm_coverage = vm_coverage;
     ctx.vm_prog_chunks = vm_prog_chunks;
     ctx.vm_family_plan = vm_family_plan;
     ctx.vm_family_partitions = vm_family_partitions;
+    ctx.vm_multi_family = vm_multi_family;
 
     let btg = ctx
         .btg_section_data

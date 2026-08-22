@@ -23,6 +23,7 @@ pub(crate) fn lift_program(
     Vec<vm::chunk_crypto::BytecodeChunk>,
     Option<vm::poly::ProductionFamilyPlan>,
     Option<Vec<vm::poly::FamilyOpPartition>>,
+    Option<vm::multi_family::MaterializedMultiFamilyProgram>,
 )> {
     // P3 (G1): 상용 프로그램 리프트의 ip_map (source-IP -> micro-op index) — the
     // VirtualBranch native handler uses it to resolve branch targets to bytecode
@@ -33,6 +34,7 @@ pub(crate) fn lift_program(
     let mut vm_prog_chunks = Vec::new();
     let mut vm_family_plan = None;
     let mut vm_family_partitions = None;
+    let mut vm_multi_family = None;
 
     let (vm_prog_bytecode, vm_oep_native_entry, oep_va): (Vec<u8>, bool, u64) = if vm_oep_effective
     {
@@ -76,6 +78,18 @@ pub(crate) fn lift_program(
                     .map(|range| range.end_op - range.start_op)
                     .sum::<usize>(),
             );
+            let multi_family =
+                vm::multi_family::MultiFamilyProgramPlan::build(&lift.program, &plan, &partitions)
+                    .map_err(anyhow::Error::msg)?;
+            let materialized = multi_family
+                .materialize(ctx.poly_vm_seed)
+                .map_err(anyhow::Error::msg)?;
+            println!(
+                "[+] P2-10 multi-family materialization: {} independent bytecode module(s), {} canonical cross-family route(s)",
+                materialized.modules.len(),
+                materialized.route_table.len(),
+            );
+            vm_multi_family = Some(materialized);
             vm_family_partitions = Some(partitions);
             vm_family_plan = Some(plan);
             vm_coverage = Some(crate::pipeline::VmCoverageMetrics {
@@ -190,5 +204,6 @@ pub(crate) fn lift_program(
         vm_prog_chunks,
         vm_family_plan,
         vm_family_partitions,
+        vm_multi_family,
     ))
 }

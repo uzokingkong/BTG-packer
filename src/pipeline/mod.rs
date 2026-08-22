@@ -165,6 +165,8 @@ pub struct PipelineContext {
     pub vm_family_plan: Option<crate::vm::poly::ProductionFamilyPlan>,
     /// P2-10 validated function micro-op partitions grouped by backend family.
     pub vm_family_partitions: Option<Vec<crate::vm::poly::FamilyOpPartition>>,
+    /// P2-10 independently encoded family streams and canonical cross-family routes.
+    pub vm_multi_family: Option<crate::vm::multi_family::MaterializedMultiFamilyProgram>,
     pub vm_prog_bytecode_rva: u32,
     pub vm_prog_bytecode_len: u32,
     pub vm_prog_runtime_cipher_hash: Option<String>,
@@ -259,6 +261,7 @@ impl PipelineContext {
             vm_prog_chunks: Vec::new(),
             vm_family_plan: None,
             vm_family_partitions: None,
+            vm_multi_family: None,
             vm_prog_bytecode_rva: 0,
             vm_prog_bytecode_len: 0,
             vm_prog_runtime_cipher_hash: None,

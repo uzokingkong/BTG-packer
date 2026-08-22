@@ -4,6 +4,14 @@
 
 ## 진행 기록
 
+### 2026-08-22 — P2-10 independent bytecode 및 canonical route table materialization
+
+- `MultiFamilyProgramPlan`이 검증된 function-op partition을 family별 독립 `RiscProgram`/로컬 `ip_map`으로 절단한다. 중복 op ownership과 누락된 source/target ownership은 fail-closed한다.
+- 각 partition은 family 분리 domain seed로 독립 polymorphic bytecode와 instruction-offset table을 생성한다. pipeline context에는 기존 ownership partition과 별도로 materialized module 입력을 보존한다.
+- cross-family direct edge는 source/target family, source local op, target local entry op, call resume local op을 가진 canonical route table로 확정한다. 같은-family edge는 route table에 들어가지 않는다.
+- 신규 materialization/route 회귀 테스트를 포함한 전체 library 테스트는 554/554 통과했다.
+- 아직 완료되지 않은 부분: PE placer가 각 materialized 입력을 실제 독립 code/handler-table/state 영역으로 배치하고, native dispatcher가 route table을 소비하여 state 전환 및 call/return을 수행해야 한다. 현재 실행 산출물은 기존 entry-family module을 유지하므로 P2-10 전체 완료로 판정하지 않는다.
+
 ### 2026-08-22 — P2-10 function micro-op family partition 완료
 
 - commercial RISC lift가 각 완전 VM 소유 `.pdata` 함수에 대해 stable function start VA와 contiguous `[start_op,end_op)` ownership range를 생성한다. synthetic entry branch와 `.pdata` 밖의 orphan block은 함수 소유 범위에 거짓 포함하지 않는다.
