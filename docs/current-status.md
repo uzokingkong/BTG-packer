@@ -142,12 +142,12 @@ continuation/sync pointer metadata는 `0x5000..0x5018`, return call stack은 str
 
 | 항목 | 완료된 범위 | 남은 범위 |
 |---|---|---|
-| P2-11 handler synthesis | full ISA target wrapper, MOV/NOR/NOT 3-way 실제 body recipe | execution-weight 80%에 3개 이상 body recipe |
+| P2-11 handler synthesis | full ISA target wrapper, MOV/NOR/NOT·shift·load/store·width integer 실제 body recipe, 대표 10-op N=20 body-shape gate | execution profile 계측으로 80% 기준 확정, SSE/control 확대 |
 | P2-12 anchor 분산 | 4 instance, 4 integrity topology, RIP-relative seed-permuted runtime bundle, absolute-anchor regression, N=20 signature ≤10% gate | ASLR/CFG/CET 재검증 |
 | P2-13 grammar | family operand/compact immediate/control token, super-op tag+descriptor-mask ABI | 완료; 추가 grammar는 선택적 hardening |
 | P2-14 state/lazy flags | u16 metadata, split GPR banks, temp spill/XMM/stack 분리, RSI/RDI lazy hot state, cross-family/native materialization | 완료된 bridge private-frame zeroization 이후 live-set 축소는 P2-15에서 진행 |
 | Data lifetime | exact 4/8/16B direct read와 LEA→call scope, global owner-aware sync, bridge UHANDLER cleanup | wider format와 복합 table/memory proof |
-| Release gate | 580 library tests, P2-13 grammar 및 P2-12 anchor 20-seed gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
+| Release gate | 581 library tests, P2-13 grammar/P2-12 anchor/P2-11 actual-body 20-seed gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
 | Library API | 기본 CFG+crypto in-memory `pack/run_full` | CLI effective profile 전체를 노출하는 typed API |
 | Platform/PE matrix | 대표 Windows x64 PE, `.pdata`/reloc/IAT/resource 구조 검증 | 전체 ASLR/CFG/CET/TLS/compiler matrix 최신 재실행 |
 

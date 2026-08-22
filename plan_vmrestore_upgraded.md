@@ -46,8 +46,10 @@ depth/owner/lock을 원자적으로 정리합니다. validator는 4개 bridge re
 
 ### 2. P2-11 handler synthesis 확대
 
-- 진행: MOV/NOR에 이어 width별 NOT도 single-NOT, XOR-all-ones, triple-NOT의
-  3개 실제 body recipe로 확대했다. wrapper 다양성과 실제 body recipe를 구분한다.
+- 진행: MOV/NOR/NOT에 더해 SHL/SHR/SAR, 1/2/4/8-byte load/store 및
+  Add/Sub/ADC/SBB/Inc/Dec 전 폭에 실제 seed별 identity decomposition을 연결했다.
+  N=20에서 대표 고빈도 10개 op의 최종 handler-table target을 따라가 실제 body
+  machine-code shape가 각각 3종 이상인지 검사한다.
 - execution-weight 상위 80% opcode에 최소 3개 의미 동치 native body recipe를 둔다.
 - integer/shift/compare/load-store/SSE/control 순으로 micro-op decomposition, scratch
   allocation, MBA, instruction selection을 실제 handler body에 반영한다.
@@ -65,7 +67,8 @@ depth/owner/lock을 원자적으로 정리합니다. validator는 4개 bridge re
 ### 4. P2-15 native bridge oracle 감소
 
 - 완료: native 복귀 직후 private frame의 state/bytecode/vstack/table/ret-IP/old-RSP/
-  target 슬롯을 원래 RSP 복원 전에 모두 zeroize하고 생성 코드 검사를 둔다.
+  target 슬롯을 RSP 복원 직후 음수 오프셋 immediate store로 모두 zeroize하고 생성
+  코드 검사를 둔다. cross-family live register는 빌리지 않는다.
 - 실제 live-in/live-out subset만 marshaling한다.
 - instance별 bridge ABI/layout variant를 추가하고 sensitive region bridge-out 0을
   fail-closed gate로 유지한다.
@@ -79,7 +82,7 @@ depth/owner/lock을 원자적으로 정리합니다. validator는 4개 bridge re
 
 ## 현재 검증 기준
 
-- `cargo test --lib -- --test-threads=1`: 580 passed, 0 failed.
+- `cargo test --lib -- --test-threads=1`: 581 passed, 0 failed.
 - `corpus/o1.exe`, seed 31010 대표 최대 조합: exit 0, stdout 1,460B,
   stderr 0B 동치.
 - cleanup-backed lifetime 적용 시 최종 보호 객체 54개. 후보 182개/strict scope 116개이며

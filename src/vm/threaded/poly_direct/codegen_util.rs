@@ -14,15 +14,15 @@ use iced_x86::{
 use std::cell::RefCell;
 // ── arena layout ─────────────────────────────────────────────────────────────
 pub(crate) const OFF_CODE: usize = 0x1000; // entry + dispatch + handlers + helpers
-pub(crate) const OFF_TABLE: usize = 0x8000; // handler table: decrypted opcode byte -> handler VA (256 x u64)
-pub(crate) const OFF_OP_OFFS: usize = 0x8800; // operand-encoding -> state offset (256 x u16)
-pub(crate) const OFF_OP_FLAGS: usize = 0x8A00; // operand-encoding -> kind flag (256 x u8): 0=reg/temp/vsp/flags,1=imm,2=none
-pub(crate) const OFF_COND_CODES: usize = 0x8B00; // decrypted cond byte -> canonical COND_* code (256 x u8)
-pub(crate) const OFF_BRANCH_MAP: usize = 0x8C00; // branch-resolution table: u32 count + count x (u64 target_value, u64 byte_offset)
-pub(crate) const OFF_BYTECODE: usize = 0x9000; // encrypted polymorphic stream (copied)
-pub(crate) const OFF_STATE: usize = 0xA000; // VM state buffer
-pub(crate) const OFF_STACK_BASE: usize = 0xE000; // virtual stack (grows down)
-pub(crate) const ARENA_SIZE: usize = 0x40000;
+pub(crate) const OFF_TABLE: usize = 0x12000; // handler table: decrypted opcode byte -> handler VA (256 x u64)
+pub(crate) const OFF_OP_OFFS: usize = 0x12800; // operand-encoding -> state offset (256 x u16)
+pub(crate) const OFF_OP_FLAGS: usize = 0x12A00; // operand-encoding -> kind flag (256 x u8): 0=reg/temp/vsp/flags,1=imm,2=none
+pub(crate) const OFF_COND_CODES: usize = 0x12B00; // decrypted cond byte -> canonical COND_* code (256 x u8)
+pub(crate) const OFF_BRANCH_MAP: usize = 0x12C00; // branch-resolution table: u32 count + count x (u64 target_value, u64 byte_offset)
+pub(crate) const OFF_BYTECODE: usize = 0x14000; // encrypted polymorphic stream (copied)
+pub(crate) const OFF_STATE: usize = 0x18000; // VM state buffer
+pub(crate) const OFF_STACK_BASE: usize = 0x28000; // virtual stack (grows down)
+pub(crate) const ARENA_SIZE: usize = 0x60000;
 
 // state buffer offsets (relative to state_base, held in RDX)
 pub(crate) const REGS_OFF: i32 = 0x000;

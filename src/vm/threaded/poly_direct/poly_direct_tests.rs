@@ -140,6 +140,74 @@ fn n20_runtime_anchor_signature_reuse_stays_below_ten_percent() {
     );
 }
 
+#[test]
+fn n20_high_frequency_handlers_have_three_real_body_shapes() {
+    use std::collections::{HashMap, HashSet};
+
+    let code_base = 0x0000_0001_4001_0000;
+    let selected = [
+        RiscOp::Mov,
+        RiscOp::Nor,
+        RiscOp::ShiftRight,
+        RiscOp::ShiftLeft,
+        RiscOp::ArithmeticShiftRight,
+        RiscOp::MemoryRead { width: 8 },
+        RiscOp::MemoryWrite { width: 8 },
+        RiscOp::Add { width: 8 },
+        RiscOp::SubWithBorrow { width: 8 },
+        RiscOp::Not { width: 8 },
+    ];
+    let mut shapes: HashMap<RiscOp, HashSet<Vec<u32>>> = HashMap::new();
+    for seed in 1..=20u64 {
+        let spec = VirtualIsaSpec::from_seed(seed);
+        let mut encoder = PolymorphicEncoder::new(seed);
+        let bytecode = encoder
+            .encode(&RiscProgram::new(vec![MicroInstr::new(RiscOp::Halt)]))
+            .unwrap();
+        let parts = build_self_decoding_parts(
+            &bytecode,
+            seed,
+            code_base,
+            0x0000_0001_4012_3000,
+            0x0000_0001_4014_5000,
+            0x0000_0001_4018_7000,
+            0x0000_0001_401D_F000,
+        )
+        .unwrap();
+        for op in selected {
+            let opcode = spec.opcode_for(op).unwrap();
+            let wrapper = parts.table[opcode as usize] ^ per_op_key(parts.table_key, opcode);
+            let wrapper_off = (wrapper - code_base) as usize;
+            let mut decoder = Decoder::with_ip(
+                64,
+                &parts.code[wrapper_off..],
+                wrapper,
+                DecoderOptions::NONE,
+            );
+            let body = loop {
+                let ins = decoder.decode();
+                assert!(!ins.is_invalid(), "seed {seed} {op:?}: invalid wrapper");
+                if ins.flow_control() == iced_x86::FlowControl::UnconditionalBranch {
+                    break ins.near_branch_target();
+                }
+            };
+            let body_off = (body - code_base) as usize;
+            let mut decoder =
+                Decoder::with_ip(64, &parts.code[body_off..], body, DecoderOptions::NONE);
+            let mut signature = Vec::new();
+            while decoder.can_decode() && signature.len() < 64 {
+                let ins = decoder.decode();
+                signature.push(ins.code() as u32);
+            }
+            shapes.entry(op).or_default().insert(signature);
+        }
+    }
+    for op in selected {
+        let count = shapes.get(&op).map_or(0, HashSet::len);
+        assert!(count >= 3, "{op:?} emitted only {count} real body shape(s)");
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn lifetime_cleanup_handler_reencrypts_and_releases_owned_scope() {

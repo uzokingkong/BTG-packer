@@ -1146,6 +1146,40 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         store_m(b, FLAGS_OFF, Register::RAX);
     }
 
+    // Seed-selected identity decompositions used inside semantic handler bodies.
+    // Callers place these before the flag-producing instruction (or in a
+    // flag-transparent handler), so the intermediate host flags are dead.
+    fn emit_synth_identity(
+        b: &mut CodeBuilder,
+        reg: Register,
+        plan: &crate::vm::handler_poly::HandlerSynthesisPlan,
+    ) {
+        use crate::vm::handler_poly::SemanticRecipe;
+        match plan.recipe {
+            SemanticRecipe::Native => {
+                b.push(Instruction::with2(Code::Mov_r64_rm64, reg, reg).unwrap());
+            }
+            SemanticRecipe::DeMorgan => {
+                b.push(Instruction::with1(Code::Not_rm64, reg).unwrap());
+                b.push(Instruction::with1(Code::Not_rm64, reg).unwrap());
+            }
+            SemanticRecipe::BooleanBasis => {
+                let mask = (plan.context_key | 1) as i32;
+                b.push(Instruction::with2(Code::Xor_rm64_imm32, reg, mask).unwrap());
+                b.push(Instruction::with2(Code::Xor_rm64_imm32, reg, mask).unwrap());
+            }
+            SemanticRecipe::CarrySplit => {
+                let delta = ((plan.context_key as u32) | 1) as i32;
+                b.push(Instruction::with2(Code::Add_rm64_imm32, reg, delta).unwrap());
+                b.push(Instruction::with2(Code::Sub_rm64_imm32, reg, delta).unwrap());
+            }
+            SemanticRecipe::MbaIdentity => {
+                b.push(Instruction::with1(Code::Neg_rm64, reg).unwrap());
+                b.push(Instruction::with1(Code::Neg_rm64, reg).unwrap());
+            }
+        }
+    }
+
     // entry
     let entry = b.len();
     // Patch the leading jump (start_jmp) to transfer control to entry.
@@ -1556,6 +1590,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         mov_m(&mut b, Register::R11, DEC_IMM2);
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
+        let plan = crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+            seed,
+            spec.opcode_for(RiscOp::ShiftRight).unwrap_or_default(),
+        );
+        emit_synth_identity(&mut b, Register::R10, &plan);
         b.push(Instruction::with2(Code::And_rm64_imm32, Register::R11, 63).unwrap());
         b.push(Instruction::with2(Code::Test_rm64_r64, Register::R11, Register::R11).unwrap());
         let skip0 = b.len() + 1;
@@ -1586,6 +1625,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         mov_m(&mut b, Register::R11, DEC_IMM2);
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
+        let plan = crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+            seed,
+            spec.opcode_for(RiscOp::ShiftLeft).unwrap_or_default(),
+        );
+        emit_synth_identity(&mut b, Register::R10, &plan);
         b.push(Instruction::with2(Code::And_rm64_imm32, Register::R11, 63).unwrap());
         b.push(Instruction::with2(Code::Test_rm64_r64, Register::R11, Register::R11).unwrap());
         let skip0 = b.len() + 1;
@@ -2753,6 +2797,12 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         mov_m(&mut b, Register::R11, DEC_IMM2);
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
+        let plan = crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+            seed,
+            spec.opcode_for(RiscOp::ArithmeticShiftRight)
+                .unwrap_or_default(),
+        );
+        emit_synth_identity(&mut b, Register::R10, &plan);
         b.push(Instruction::with2(Code::And_rm64_imm32, Register::R11, 63).unwrap());
         b.push(Instruction::with2(Code::Test_rm64_r64, Register::R11, Register::R11).unwrap());
         let skip0 = b.len() + 1;
@@ -2858,6 +2908,12 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
         translate_xmm_addr(&mut b);
+        let plan = crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+            seed,
+            spec.opcode_for(RiscOp::MemoryRead { width: 8 })
+                .unwrap_or_default(),
+        );
+        emit_synth_identity(&mut b, Register::R10, &plan);
         let m = MemoryOperand::with_base(Register::R10);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m).unwrap());
         b.call(sub_store);
@@ -2871,6 +2927,12 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
         translate_xmm_addr(&mut b);
+        let plan = crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+            seed,
+            spec.opcode_for(RiscOp::MemoryRead { width: 4 })
+                .unwrap_or_default(),
+        );
+        emit_synth_identity(&mut b, Register::R10, &plan);
         let m = MemoryOperand::with_base(Register::R10);
         // Writing R10D zero-extends into R10 (x86-64 semantics).
         b.push(Instruction::with2(Code::Mov_r32_rm32, Register::R10D, m).unwrap());
@@ -2886,6 +2948,12 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
         translate_xmm_addr(&mut b);
+        let plan = crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+            seed,
+            spec.opcode_for(RiscOp::MemoryRead { width: 2 })
+                .unwrap_or_default(),
+        );
+        emit_synth_identity(&mut b, Register::R10, &plan);
         let m = MemoryOperand::with_base(Register::R10);
         b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::EAX, m).unwrap());
         b.call(sub_store);
@@ -2899,6 +2967,12 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
         translate_xmm_addr(&mut b);
+        let plan = crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+            seed,
+            spec.opcode_for(RiscOp::MemoryRead { width: 1 })
+                .unwrap_or_default(),
+        );
+        emit_synth_identity(&mut b, Register::R10, &plan);
         let m = MemoryOperand::with_base(Register::R10);
         b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, m).unwrap());
         b.call(sub_store);
@@ -2918,6 +2992,13 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
         translate_xmm_addr(&mut b);
+        let plan = crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+            seed,
+            spec.opcode_for(RiscOp::MemoryWrite { width: 8 })
+                .unwrap_or_default(),
+        );
+        emit_synth_identity(&mut b, Register::R10, &plan);
+        emit_synth_identity(&mut b, Register::R11, &plan);
         trace_memory_write(&mut b);
         let m = MemoryOperand::with_base(Register::R10);
         b.push(Instruction::with2(Code::Mov_rm64_r64, m, Register::R11).unwrap());
@@ -2935,6 +3016,13 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
         translate_xmm_addr(&mut b);
+        let plan = crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+            seed,
+            spec.opcode_for(RiscOp::MemoryWrite { width: 4 })
+                .unwrap_or_default(),
+        );
+        emit_synth_identity(&mut b, Register::R10, &plan);
+        emit_synth_identity(&mut b, Register::R11, &plan);
         trace_memory_write(&mut b);
         let m = MemoryOperand::with_base(Register::R10);
         b.push(Instruction::with2(Code::Mov_rm32_r32, m, Register::R11D).unwrap());
@@ -2952,6 +3040,13 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
         translate_xmm_addr(&mut b);
+        let plan = crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+            seed,
+            spec.opcode_for(RiscOp::MemoryWrite { width: 2 })
+                .unwrap_or_default(),
+        );
+        emit_synth_identity(&mut b, Register::R10, &plan);
+        emit_synth_identity(&mut b, Register::R11, &plan);
         trace_memory_write(&mut b);
         let m = MemoryOperand::with_base(Register::R10);
         b.push(Instruction::with2(Code::Mov_rm16_r16, m, Register::R11W).unwrap());
@@ -2969,6 +3064,13 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
         translate_xmm_addr(&mut b);
+        let plan = crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+            seed,
+            spec.opcode_for(RiscOp::MemoryWrite { width: 1 })
+                .unwrap_or_default(),
+        );
+        emit_synth_identity(&mut b, Register::R10, &plan);
+        emit_synth_identity(&mut b, Register::R11, &plan);
         trace_memory_write(&mut b);
         let m = MemoryOperand::with_base(Register::R10);
         b.push(Instruction::with2(Code::Mov_rm8_r8, m, Register::R11L).unwrap());
@@ -3868,6 +3970,15 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             mov_m(b, Register::R11, DEC_IMM2);
             b.call(sub_resolve);
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
+        }
+        if let Some(plan) = synthesis_plan.as_ref() {
+            emit_synth_identity(b, Register::R10, plan);
+            if matches!(
+                op,
+                WidthAluOp::Add | WidthAluOp::Sub | WidthAluOp::Adc | WidthAluOp::Sbb
+            ) {
+                emit_synth_identity(b, Register::R11, plan);
+            }
         }
         // ADC/SBB consume the guest CF. Operand resolution calls clobber host
         // flags, so restore only CF from the guest flag word immediately before
@@ -4815,7 +4926,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             dispatch,
             WidthAluOp::Add,
             *w,
-            None,
+            Some(crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+                seed,
+                spec.opcode_for(RiscOp::Add { width: *w })
+                    .unwrap_or_default(),
+            )),
         );
         subw_h[wi] = b.len();
         emit_width_alu_handler(
@@ -4826,7 +4941,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             dispatch,
             WidthAluOp::Sub,
             *w,
-            None,
+            Some(crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+                seed,
+                spec.opcode_for(RiscOp::SubWithBorrow { width: *w })
+                    .unwrap_or_default(),
+            )),
         );
         adcw_h[wi] = b.len();
         emit_width_alu_handler(
@@ -4837,7 +4956,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             dispatch,
             WidthAluOp::Adc,
             *w,
-            None,
+            Some(crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+                seed,
+                spec.opcode_for(RiscOp::Adc { width: *w })
+                    .unwrap_or_default(),
+            )),
         );
         sbbw_h[wi] = b.len();
         emit_width_alu_handler(
@@ -4848,7 +4971,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             dispatch,
             WidthAluOp::Sbb,
             *w,
-            None,
+            Some(crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+                seed,
+                spec.opcode_for(RiscOp::Sbb { width: *w })
+                    .unwrap_or_default(),
+            )),
         );
         incw_h[wi] = b.len();
         emit_width_alu_handler(
@@ -4859,7 +4986,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             dispatch,
             WidthAluOp::Inc,
             *w,
-            None,
+            Some(crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+                seed,
+                spec.opcode_for(RiscOp::Inc { width: *w })
+                    .unwrap_or_default(),
+            )),
         );
         decw_h[wi] = b.len();
         emit_width_alu_handler(
@@ -4870,7 +5001,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             dispatch,
             WidthAluOp::Dec,
             *w,
-            None,
+            Some(crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+                seed,
+                spec.opcode_for(RiscOp::Dec { width: *w })
+                    .unwrap_or_default(),
+            )),
         );
         notw_h[wi] = b.len();
         emit_width_alu_handler(

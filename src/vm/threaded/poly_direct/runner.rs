@@ -171,6 +171,11 @@ fn run_native_poly_direct_configured(
     };
     let state_layout = &parts.runtime_layout;
     let metadata_layout = parts.layout;
+    anyhow::ensure!(
+        OFF_CODE + parts.code.len() <= OFF_TABLE,
+        "native test arena code/table overlap: code_end={:#x} table={OFF_TABLE:#x}",
+        OFF_CODE + parts.code.len()
+    );
 
     // Copy into arena.
     {
