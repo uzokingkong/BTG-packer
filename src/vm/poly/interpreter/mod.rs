@@ -109,12 +109,12 @@ impl PolymorphicInterpreter {
             if vip + 3 > bytecode.len() {
                 break;
             }
-            let op_dst_raw = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
-            vip += 1;
-            let op_src1_raw = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
-            vip += 1;
-            let op_src2_raw = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
-            vip += 1;
+            let mut operands = [0u8; 3];
+            for logical_slot in self.spec.operand_order() {
+                operands[logical_slot] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
+                vip += 1;
+            }
+            let [op_dst_raw, op_src1_raw, op_src2_raw] = operands;
 
             // 3. Decrypt 8-byte immediates if present
             let imm1 = if op_src1_raw == 0x01 {
@@ -1792,12 +1792,12 @@ impl PolymorphicInterpreter {
             if vip + 3 > bytecode.len() {
                 break;
             }
-            let op_dst = rolling.decrypt_byte(bytecode[vip], vip as u64);
-            vip += 1;
-            let op_src1 = rolling.decrypt_byte(bytecode[vip], vip as u64);
-            vip += 1;
-            let op_src2 = rolling.decrypt_byte(bytecode[vip], vip as u64);
-            vip += 1;
+            let mut operands = [0u8; 3];
+            for logical_slot in self.spec.operand_order() {
+                operands[logical_slot] = rolling.decrypt_byte(bytecode[vip], vip as u64);
+                vip += 1;
+            }
+            let [_op_dst, op_src1, op_src2] = operands;
 
             let has_imm1 = op_src1 == 0x01;
             let has_imm2 = op_src2 == 0x01;

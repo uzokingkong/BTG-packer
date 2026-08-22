@@ -101,12 +101,12 @@ impl PolymorphicDecoder {
             if vip + 3 > bytecode.len() {
                 return Err(anyhow!(super::DecodeError::TruncatedOperand { at: vip }));
             }
-            let op_dst = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
-            vip += 1;
-            let op_src1 = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
-            vip += 1;
-            let op_src2 = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
-            vip += 1;
+            let mut operands = [0u8; 3];
+            for logical_slot in self.spec.operand_order() {
+                operands[logical_slot] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
+                vip += 1;
+            }
+            let [op_dst, op_src1, op_src2] = operands;
 
             // 2. Immediates (src == Imm64 일 때 8B)
             let imm1 = if op_src1 == 0x01 {

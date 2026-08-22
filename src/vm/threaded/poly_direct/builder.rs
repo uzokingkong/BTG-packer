@@ -714,12 +714,16 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
     // out: DEC_DST/SRC1/SRC2/IMM1/IMM2/CIN filled
     let sub_dec_ops = b.len();
     {
-        b.call(sub_decrypt);
-        store_decoded_al(&mut b, DEC_DST, (seed >> 3) as u8);
-        b.call(sub_decrypt);
-        store_decoded_al(&mut b, DEC_SRC1, (seed >> 19) as u8);
-        b.call(sub_decrypt);
-        store_decoded_al(&mut b, DEC_SRC2, (seed >> 37) as u8);
+        for logical_slot in spec.operand_order() {
+            let (offset, salt) = match logical_slot {
+                0 => (DEC_DST, (seed >> 3) as u8),
+                1 => (DEC_SRC1, (seed >> 19) as u8),
+                2 => (DEC_SRC2, (seed >> 37) as u8),
+                _ => unreachable!(),
+            };
+            b.call(sub_decrypt);
+            store_decoded_al(&mut b, offset, salt);
+        }
         // imm1 if src1 == 0x01
         movzx8_m(&mut b, Register::EAX, DEC_SRC1);
         b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 0x01).unwrap());

@@ -74,9 +74,10 @@ impl PolymorphicEncoder {
         let (dst, _) = encode_operand(ins.dst, &self.spec);
         let (src1, imm1) = encode_operand(ins.src1, &self.spec);
         let (src2, imm2) = encode_operand(ins.src2, &self.spec);
-        self.push_encrypted(out, vip, dst);
-        self.push_encrypted(out, vip, src1);
-        self.push_encrypted(out, vip, src2);
+        let operands = [dst, src1, src2];
+        for logical_slot in self.spec.operand_order() {
+            self.push_encrypted(out, vip, operands[logical_slot]);
+        }
         for value in [imm1, imm2].into_iter().flatten() {
             for byte in (value ^ self.spec.operand_mask).to_le_bytes() {
                 self.push_encrypted(out, vip, byte);
@@ -191,12 +192,11 @@ impl PolymorphicEncoder {
             let (op_src1, imm1) = encode_operand(ins.src1, &self.spec);
             let (op_src2, imm2) = encode_operand(ins.src2, &self.spec);
 
-            out.push(self.rolling.encrypt_byte(op_dst, vip));
-            vip += 1;
-            out.push(self.rolling.encrypt_byte(op_src1, vip));
-            vip += 1;
-            out.push(self.rolling.encrypt_byte(op_src2, vip));
-            vip += 1;
+            let operands = [op_dst, op_src1, op_src2];
+            for logical_slot in self.spec.operand_order() {
+                out.push(self.rolling.encrypt_byte(operands[logical_slot], vip));
+                vip += 1;
+            }
 
             // 3. Emit immediates
             if let Some(v1) = imm1 {
@@ -494,6 +494,44 @@ mod tests {
         assert_eq!(offsets.len(), 2);
         let mut rolling = RollingKeyEngine::new(seed);
         assert_eq!(rolling.decrypt_byte(fused_bytes[0], 0), extension_opcode);
+    }
+
+    #[test]
+    fn family_operand_grammars_roundtrip_and_reject_cross_family_parsers() {
+        let seed = 0x5032_2D31_332D_4752;
+        let program = RiscProgram::new(vec![
+            MicroInstr::new(RiscOp::Mov)
+                .with_dst(MicroOperand::VReg(3))
+                .with_src1(MicroOperand::Imm64(0x1122_3344_5566_7788)),
+            MicroInstr::new(RiscOp::Nor)
+                .with_dst(MicroOperand::VReg(4))
+                .with_src1(MicroOperand::VReg(3))
+                .with_src2(MicroOperand::Temp(2)),
+            MicroInstr::new(RiscOp::Halt),
+        ]);
+
+        for family in VmArchitectureFamily::ALL {
+            let domain_seed = seed ^ family.profile().isa_domain;
+            let mut encoder = PolymorphicEncoder::new_for_family(domain_seed, family);
+            let (stream, offsets) = encoder.encode_with_offsets(&program).unwrap();
+            let mut decoder = PolymorphicDecoder::new_for_family(domain_seed, family);
+            let recovered = decoder.decode_full(&stream, false).unwrap();
+            assert_eq!(recovered.instrs.len(), program.instrs.len());
+            assert_eq!(offsets.len(), program.instrs.len());
+
+            for wrong_family in VmArchitectureFamily::ALL {
+                if wrong_family == family {
+                    continue;
+                }
+                let mut wrong = PolymorphicDecoder::new_for_family(domain_seed, wrong_family);
+                let incorrectly_recovered = wrong.decode_full(&stream, false);
+                assert!(
+                    incorrectly_recovered.is_err()
+                        || incorrectly_recovered.unwrap().instrs != program.instrs,
+                    "{wrong_family:?} parser recovered {family:?} grammar"
+                );
+            }
+        }
     }
 }
 

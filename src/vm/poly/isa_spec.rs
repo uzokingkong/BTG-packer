@@ -39,6 +39,17 @@ const MEMORY_WIDTHS: [u8; 4] = [1, 2, 4, 8];
 const COUNTER_WIDTHS: [u8; 3] = [2, 4, 8];
 
 impl VirtualIsaSpec {
+    /// Physical order of the three operand descriptor bytes. The returned
+    /// values are logical slots: 0=dst, 1=src1, 2=src2.
+    pub fn operand_order(&self) -> [usize; 3] {
+        match self.family {
+            VmArchitectureFamily::Stack => [0, 1, 2],
+            VmArchitectureFamily::Register => [1, 2, 0],
+            VmArchitectureFamily::MixedRisc => [2, 0, 1],
+            VmArchitectureFamily::FusedCisc => [1, 0, 2],
+        }
+    }
+
     pub fn from_seed(seed: u64) -> Self {
         Self::from_seed_and_family(seed, VmArchitectureFamily::for_build(seed))
     }

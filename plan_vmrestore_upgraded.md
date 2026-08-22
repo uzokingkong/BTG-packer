@@ -11,8 +11,14 @@
 - P2-10은 4개 독립 code/handler-table/bytecode/state module, canonical cross-family CALL/tail-JUMP/return routing, family별 unwind range까지 production 배치 완료다.
 - P2-11은 canonical ISA와 super-op extension의 모든 최종 handler-table target에 seed/opcode-derived synthesis wrapper를 적용했다. 전체 ISA production reachability는 완료됐지만 handler 본체의 micro-op decomposition/MBA/register allocation/control split 다양성은 추가 강화 대상으로 유지한다.
 - P2-5는 helper-only 상태를 종료했다. PE literal reference graph와 strict `LEA literal → Win64 argument → call` proof를 production에 연결하고, VM 소유권까지 재검증된 45개 객체를 at-rest ciphertext로 저장한다. call 직전 RISC toggle로 복호화하고 복귀 직후 재암호화하며 flags를 복원한다. 일부 참조/native 참조/loader-critical 객체는 fail-closed 제외한다.
-- 최신 검증: library 563/563(P2-12 topology 회귀 포함), `corpus/o1.exe` 일반 및 `--m7 --m8 --integrity` 실행 동치 exit 0/stdout 1,460B/stderr 0B. 최신 data-lifetime/handler-body 변경 이후 20-seed/전체 hostile corpus는 다시 수행해야 한다.
-- 다음 구현 순서: (1) P2-13 grammar polymorphism, (2) P2-14 state splitting/lazy flags와 data-lifetime 동시성, (3) P2-15 bridge oracle 감소, (4) 최신 20-seed 및 hostile/tamper release gate 확대.
+- 최신 검증: library 564/564(P2-13 family grammar 격리 회귀 포함), `corpus/o1.exe` 일반 및 `--m7 --m8 --integrity` 실행 동치 exit 0/stdout 1,460B/stderr 0B. 최신 data-lifetime/handler-body 변경 이후 20-seed/전체 hostile corpus는 다시 수행해야 한다.
+- 다음 구현 순서: (1) P2-13 compact immediate/branch target grammar 확대, (2) P2-14 state splitting/lazy flags와 data-lifetime 동시성, (3) P2-15 bridge oracle 감소, (4) 최신 20-seed 및 hostile/tamper release gate 확대.
+
+### 2026-08-22 — P2-13 family별 operand record grammar 분리
+
+- canonical `dst → src1 → src2` descriptor 순서를 family별 물리 grammar로 분리했다. Stack은 `dst/src1/src2`, Register는 `src1/src2/dst`, MixedRisc는 `src2/dst/src1`, FusedCisc는 `src1/dst/src2` 순서로 암호화 스트림을 생성한다.
+- production encoder와 super-op body encoder, 정적 decoder, interpreter, native self-decoder가 동일한 family grammar 계약을 소비한다. native decoder는 물리 순서로 fetch한 descriptor를 canonical scratch slot에 재배치하므로 handler 의미와 cross-family bridge ABI는 유지된다.
+- 각 family stream의 정상 roundtrip과 다른 세 family parser의 복원 실패를 전수 검사하는 회귀를 추가했다. `corpus/o1.exe` 최대 조합은 4 family/513 route/255 M7 chunk/12 BTGI descriptor를 유지하며 실행 차등검증을 통과했다. 다음 P2-13 범위는 compact immediate와 branch target 표현 분리다.
 
 ### 2026-08-22 — P2-12 family별 runtime integrity anchor 분산
 
