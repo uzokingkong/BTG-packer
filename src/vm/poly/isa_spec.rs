@@ -184,20 +184,37 @@ impl VirtualIsaSpec {
 
     pub fn encode_compact_branch_target(&self, target: u64) -> (u8, u64, usize) {
         let width = Self::immediate_width_for_value(target);
-        (self.branch_target_marker(width), target, width)
+        let bits = width * 8;
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let key = self.branch_target_key() & mask;
+        let token = match self.family {
+            VmArchitectureFamily::Stack => target,
+            VmArchitectureFamily::Register => target ^ key,
+            VmArchitectureFamily::MixedRisc => target ^ mask,
+            VmArchitectureFamily::FusedCisc => target.wrapping_add(key) & mask,
+        };
+        (self.branch_target_marker(width), token, width)
     }
 
     pub fn decode_compact_branch_target(&self, marker: u8, token: u64) -> Option<u64> {
         let width = self.branch_target_width(marker)?;
         let bits = width * 8;
-        Some(
-            token
-                & if bits == 64 {
-                    u64::MAX
-                } else {
-                    (1u64 << bits) - 1
-                },
-        )
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let key = self.branch_target_key() & mask;
+        Some(match self.family {
+            VmArchitectureFamily::Stack => token & mask,
+            VmArchitectureFamily::Register => (token ^ key) & mask,
+            VmArchitectureFamily::MixedRisc => (token ^ mask) & mask,
+            VmArchitectureFamily::FusedCisc => token.wrapping_sub(key) & mask,
+        })
     }
 
     /// Family-local representation of an absolute branch instruction index.

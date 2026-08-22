@@ -36,6 +36,11 @@
   공유합니다.
 - compact branch marker가 family ABI의 `0x10..0x13` domain을 벗어나면 static
   decoder는 오류를 반환하고 production native handler는 `UD2`로 fail-closed합니다.
+- branch payload는 Stack direct index, Register keyed selector, MixedRisc
+  complemented table selector, FusedCisc continuation token으로 family별 변환됩니다.
+- fused super-op은 build/opcode-local tag와 descriptor mask를 갖는 독립 grammar를
+  사용합니다. native extension entry는 tag 불일치 시 operand fetch 전에 `UD2`로
+  종료하고 dispatch는 transient mask를 매 opcode마다 초기화합니다.
 - M7은 각 family stream을 instruction boundary에 맞춘 독립 chunk로 보호합니다.
 
 ### Handler runtime hardening
@@ -69,13 +74,12 @@
 |---|---|---|
 | P2-11 handler synthesis | full ISA target wrapper, 일부 실제 body recipe | execution-weight 80%에 3개 이상 body recipe |
 | P2-12 anchor 분산 | 4 instance, 4 integrity topology, ownership gate | RIP-relative runtime bundle materialization, N=20 signature gate |
-| P2-13 grammar | operand order, compact immediate/absolute branch marker ABI | block-local delta/table-indirection/continuation grammar |
+| P2-13 grammar | family operand/compact immediate/control token, super-op tag+descriptor-mask ABI | 완료 |
 | Data lifetime | strict single-owner ASCII/UTF-16 | 공유 객체 동시성, wider format/direct-memory cases |
 | Release gate | 568 library tests, P2-13 20-seed grammar gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
 
 ## 미구현 또는 다음 단계
 
-- P2-13 block-local delta/table indirection/continuation control grammar.
 - P2-14 split state bank와 lazy flag producer token.
 - shared lifetime object의 thread-safe state/locking.
 - P2-15 native bridge canonical-image lifetime 축소와 oracle 감소.

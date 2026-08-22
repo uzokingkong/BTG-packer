@@ -51,10 +51,16 @@ impl PolymorphicEncoder {
         *vip += 1;
     }
 
-    /// Encode the part of an instruction following its opcode. Super-op bodies
-    /// use exactly this canonical record, allowing their native handlers to
-    /// reuse the normal operand decoder without embedding nested opcodes.
-    fn encode_operand_record(&mut self, ins: &MicroInstr, out: &mut Vec<u8>, vip: &mut u64) {
+    /// Encode the part of an instruction following its opcode. Primitive items
+    /// use mask zero; fused bodies select a build-local descriptor grammar while
+    /// retaining the shared semantic operand decoder.
+    fn encode_operand_record_with_grammar(
+        &mut self,
+        ins: &MicroInstr,
+        out: &mut Vec<u8>,
+        vip: &mut u64,
+        descriptor_mask: u8,
+    ) {
         match ins.op {
             RiscOp::VirtualBranch { cond }
             | RiscOp::Setcc { cond }
@@ -76,7 +82,7 @@ impl PolymorphicEncoder {
         let (src2, imm2) = encode_operand(ins.src2, &self.spec);
         let operands = [dst, src1, src2];
         for logical_slot in self.spec.operand_order() {
-            self.push_encrypted(out, vip, operands[logical_slot]);
+            self.push_encrypted(out, vip, operands[logical_slot] ^ descriptor_mask);
         }
         for value in [imm1, imm2].into_iter().flatten() {
             let width = self.spec.immediate_encoding(value).1;
@@ -106,9 +112,26 @@ impl PolymorphicEncoder {
         }
     }
 
-    /// Encode a build-local super-op stream. A fused item emits one extension
-    /// opcode followed by each body's canonical operand record; primitive items
-    /// retain the ordinary opcode+record format.
+    fn encode_operand_record(&mut self, ins: &MicroInstr, out: &mut Vec<u8>, vip: &mut u64) {
+        self.encode_operand_record_with_grammar(ins, out, vip, 0);
+    }
+
+    /// Build-local super-op grammar envelope. The tag rejects accidental or
+    /// hostile parsing as a canonical record; the non-zero descriptor mask
+    /// gives fused bodies their own operand grammar without changing payload
+    /// immediates or the primitive semantic handlers.
+    pub(crate) fn superop_grammar(seed: u64, opcode: u8) -> (u8, u8) {
+        let mixed = seed.rotate_left(23)
+            ^ (opcode as u64).wrapping_mul(0x9E37_79B1_85EB_CA87)
+            ^ 0x5032_3133_5355_504F;
+        let tag = (mixed ^ (mixed >> 29) ^ (mixed >> 47)) as u8;
+        let mask = ((mixed >> 8) as u8 | 1) & 0x3f;
+        (tag, mask)
+    }
+
+    /// Encode a build-local super-op stream. A fused item emits an extension
+    /// opcode, grammar tag, and masked body records; primitive items retain the
+    /// ordinary opcode+record format.
     pub fn encode_superop_rewrite(
         &mut self,
         rewrite: &SuperOpRewrite,
@@ -136,8 +159,15 @@ impl PolymorphicEncoder {
                         ));
                     }
                     self.push_encrypted(&mut out, &mut vip, *opcode);
+                    let (tag, descriptor_mask) = Self::superop_grammar(self.spec.seed, *opcode);
+                    self.push_encrypted(&mut out, &mut vip, tag);
                     for ins in body {
-                        self.encode_operand_record(ins, &mut out, &mut vip);
+                        self.encode_operand_record_with_grammar(
+                            ins,
+                            &mut out,
+                            &mut vip,
+                            descriptor_mask,
+                        );
                     }
                 }
             }
@@ -510,10 +540,18 @@ mod tests {
             .unwrap();
         let mut fused = PolymorphicEncoder::new(seed);
         let (fused_bytes, offsets) = fused.encode_superop_rewrite(&rewrite).unwrap();
-        assert_eq!(fused_bytes.len() + 1, normal_bytes.len());
+        // The removed second opcode is replaced by the fused grammar tag. The
+        // descriptor bytes themselves use a build/opcode-local masked grammar.
+        assert_eq!(fused_bytes.len(), normal_bytes.len());
         assert_eq!(offsets.len(), 2);
         let mut rolling = RollingKeyEngine::new(seed);
         assert_eq!(rolling.decrypt_byte(fused_bytes[0], 0), extension_opcode);
+        let (tag, mask) = PolymorphicEncoder::superop_grammar(seed, extension_opcode);
+        assert_ne!(mask, 0);
+        assert_eq!(rolling.decrypt_byte(fused_bytes[1], 1), tag);
+        let first_descriptor = rolling.decrypt_byte(fused_bytes[2], 2);
+        let canonical = [0xC0, spec.encode_reg(1) | 0x80, spec.encode_reg(2) | 0x80];
+        assert_eq!(first_descriptor ^ mask, canonical[spec.operand_order()[0]]);
     }
 
     #[test]

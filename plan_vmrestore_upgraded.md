@@ -11,8 +11,14 @@
 - P2-10은 4개 독립 code/handler-table/bytecode/state module, canonical cross-family CALL/tail-JUMP/return routing, family별 unwind range까지 production 배치 완료다.
 - P2-11은 canonical ISA와 super-op extension의 모든 최종 handler-table target에 seed/opcode-derived synthesis wrapper를 적용했다. 전체 ISA production reachability는 완료됐지만 handler 본체의 micro-op decomposition/MBA/register allocation/control split 다양성은 추가 강화 대상으로 유지한다.
 - P2-5는 helper-only 상태를 종료했다. PE literal reference graph와 strict `LEA literal → Win64 argument → call` proof를 production에 연결하고, VM 소유권까지 재검증된 45개 객체를 at-rest ciphertext로 저장한다. call 직전 RISC toggle로 복호화하고 복귀 직후 재암호화하며 flags를 복원한다. 일부 참조/native 참조/loader-critical 객체는 fail-closed 제외한다.
-- 최신 검증: library 568/568(P2-13 compact control target/malformed marker/20-seed grammar gate 포함), `corpus/o1.exe` 일반 및 `--m7 --m8 --integrity` 실행 동치 exit 0/stdout 1,460B/stderr 0B. 최신 data-lifetime/handler-body 변경 이후 20-seed pack+execute/전체 hostile corpus는 다시 수행해야 한다.
-- 다음 구현 순서: (1) P2-13 block-local/control grammar 확대, (2) P2-14 state splitting/lazy flags와 data-lifetime 동시성, (3) P2-15 bridge oracle 감소, (4) 최신 20-seed 및 hostile/tamper release gate 확대.
+- 최신 검증: library 568/568(P2-13 family control token/super-op grammar/compact malformed marker/20-seed grammar gate 포함), `corpus/o1.exe --m7 --m8 --integrity --verify-output` 실행 동치 exit 0/stdout 1,460B/stderr 0B. 최신 전체 hostile corpus와 20-seed pack+execute는 release 단계에서 다시 수행해야 한다.
+- 다음 구현 순서: (1) P2-14 state splitting/lazy flags와 data-lifetime 동시성, (2) P2-15 bridge oracle 감소, (3) 최신 20-seed 및 hostile/tamper release gate 확대. P2-13 control/operand grammar의 production 범위는 완료 상태다.
+
+### 2026-08-22 — P2-13 control grammar 및 super-op 독립 grammar 완료
+
+- compact absolute branch payload를 family별 가역 control token으로 분리했다. Stack은 direct compact index, Register는 width-local keyed selector, MixedRisc는 width-local complemented table selector, FusedCisc는 modular continuation token을 사용한다. encoder/static decoder/interpreter/native handler가 같은 계약을 사용하고 native는 canonical 복원 후 검증된 branch-map/cross-family route만 사용한다.
+- super-op은 `extension opcode → build/opcode-local grammar tag → descriptor-masked fused records` 형식이다. extension entry가 rolling-key로 tag를 검증한 뒤에만 transient descriptor grammar를 활성화하며, 불일치는 operand fetch 전에 `UD2`로 fail-closed한다. dispatch는 transient mask를 매 opcode마다 0으로 지워 primitive 및 cross-family continuation으로 상태가 새지 않는다.
+- super-op chain/rewritten branch offset, 네 family branch token 전 폭, malformed compact marker와 uninformed 20-seed gate를 포함한 library 568/568이 통과했다. 실제 `corpus/o1.exe` 4-family 최대 조합도 exit 0/stdout 1,460B/stderr 0B 실행 동치를 통과했다.
 
 ### 2026-08-22 — P2-13 family별 operand record grammar 분리
 

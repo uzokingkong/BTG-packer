@@ -18,6 +18,10 @@ const CHUNK_LEAF_LABEL_BASE: usize = 0xD000_0000;
 /// module; ordinary boot entry observes zero.
 const STATE_CROSS_FAMILY_ENTRY_VIP: i64 = 0x5000;
 const STATE_CROSS_FAMILY_RETURN_PTR: i64 = 0x5008;
+/// Transient build-local descriptor grammar selected by a super-op envelope.
+/// Dispatch clears it before every opcode; an extension entry arms it only
+/// after validating its encrypted grammar tag.
+const STATE_SUPEROP_DESCRIPTOR_MASK: i64 = 0x5010;
 
 fn emit_table_integrity_mix(b: &mut CodeBuilder) {
     b.push(
@@ -724,6 +728,14 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
                 _ => unreachable!(),
             };
             b.call(sub_decrypt);
+            b.push(
+                Instruction::with2(
+                    Code::Xor_r8_rm8,
+                    Register::AL,
+                    MemoryOperand::with_base_displ(Register::RDX, STATE_SUPEROP_DESCRIPTOR_MASK),
+                )
+                .unwrap(),
+            );
             store_decoded_al(&mut b, offset, salt);
         }
         // compact imm1 if src1 is one of the family-local markers
@@ -1253,6 +1265,14 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
     // dispatch loop
     let dispatch = b.len();
     {
+        b.push(
+            Instruction::with2(
+                Code::Mov_rm8_imm8,
+                MemoryOperand::with_base_displ(Register::RDX, STATE_SUPEROP_DESCRIPTOR_MASK),
+                0,
+            )
+            .unwrap(),
+        );
         b.call(sub_decrypt);
         b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::AL).unwrap());
         // P6-3: keep the decrypted opcode byte in R9 — it drives the per-opcode
@@ -1664,6 +1684,34 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             layout.operand_offs_off,
             false,
         );
+        if family != crate::vm::poly::VmArchitectureFamily::Stack {
+            mov_m(&mut b, Register::RAX, DEC_IMM1);
+            match family {
+                crate::vm::poly::VmArchitectureFamily::Register => {
+                    movi(&mut b, Register::RCX, spec.branch_target_key());
+                    b.push(
+                        Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RCX)
+                            .unwrap(),
+                    );
+                }
+                crate::vm::poly::VmArchitectureFamily::MixedRisc => {
+                    b.push(Instruction::with1(Code::Not_rm64, Register::RAX).unwrap());
+                }
+                crate::vm::poly::VmArchitectureFamily::FusedCisc => {
+                    movi(&mut b, Register::RCX, spec.branch_target_key());
+                    b.push(
+                        Instruction::with2(Code::Sub_rm64_r64, Register::RAX, Register::RCX)
+                            .unwrap(),
+                    );
+                }
+                crate::vm::poly::VmArchitectureFamily::Stack => unreachable!(),
+            }
+            movi(&mut b, Register::RCX, 64);
+            b.push(Instruction::with2(Code::Sub_rm64_r64, Register::RCX, Register::RBP).unwrap());
+            b.push(Instruction::with2(Code::Shl_rm64_CL, Register::RAX, Register::CL).unwrap());
+            b.push(Instruction::with2(Code::Shr_rm64_CL, Register::RAX, Register::CL).unwrap());
+            store_m(&mut b, DEC_IMM1, Register::RAX);
+        }
         let after_all = b.len();
         // evaluate the condition (AL = taken).
         b.call(sub_eval_cond);
@@ -5518,7 +5566,28 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
                     .ok_or_else(|| anyhow!("P5 cannot determine handler boundary for {:?}", op))?;
                 ranges.push((start, end));
             }
-            let entry = b.clone_handler_chain(&ranges, dispatch)?;
+            let body_entry = b.clone_handler_chain(&ranges, dispatch)?;
+            let entry = b.len();
+            let (tag, descriptor_mask) = PolymorphicEncoder::superop_grammar(seed, assigned.opcode);
+            b.call(sub_decrypt);
+            b.push(Instruction::with2(Code::Cmp_rm8_imm8, Register::AL, tag as i32).unwrap());
+            let valid_edge = b.br(Code::Je_rel32_64, usize::MAX);
+            b.push(Instruction::with(Code::Ud2));
+            let valid = b.len();
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm8_imm8,
+                    MemoryOperand::with_base_displ(Register::RDX, STATE_SUPEROP_DESCRIPTOR_MASK),
+                    descriptor_mask as i32,
+                )
+                .unwrap(),
+            );
+            b.jmp(body_entry);
+            for (branch, target) in &mut b.branches {
+                if *branch == valid_edge {
+                    *target = valid;
+                }
+            }
             extension_handlers.insert(assigned.opcode, entry);
         }
     }
