@@ -5169,7 +5169,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         true,
     );
 
-    let handlers: std::collections::HashMap<RiscOp, usize> = {
+    let mut handlers: std::collections::HashMap<RiscOp, usize> = {
         use std::collections::HashMap;
         let mut h = HashMap::new();
         h.insert(RiscOp::Nor, h_nor);
@@ -5411,6 +5411,47 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             let entry = b.clone_handler_chain(&ranges, dispatch)?;
             extension_handlers.insert(assigned.opcode, entry);
         }
+    }
+
+    // P2 handler synthesis production widening: every canonical ISA table
+    // entry receives a seed/opcode-derived reachable wrapper CFG. Primitive
+    // bodies remain frozen for super-op cloning above; only final table targets
+    // are replaced, so semantic behavior and primitive boundaries are unchanged.
+    let mut canonical_wrappers: Vec<(u8, RiscOp, usize)> = spec
+        .opcode_map
+        .iter()
+        .filter_map(|(op, byte)| handlers.get(op).copied().map(|body| (*byte, *op, body)))
+        .collect();
+    canonical_wrappers.sort_by_key(|(byte, _, _)| *byte);
+    for (byte, op, body) in canonical_wrappers {
+        let plan = crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(seed, byte);
+        let wrapper = b.len();
+        let nop_count = 1
+            + ((plan.context_key ^ plan.dead_state_slots as u64 ^ plan.control_splits as u64) & 3)
+                as usize;
+        for _ in 0..nop_count {
+            b.push(Instruction::with(Code::Nopd));
+        }
+        b.jmp(body);
+        handlers.insert(op, wrapper);
+    }
+
+    let mut extension_wrapper_inputs: Vec<_> = extension_handlers
+        .iter()
+        .map(|(op, body)| (*op, *body))
+        .collect();
+    extension_wrapper_inputs.sort_by_key(|(op, _)| *op);
+    for (opcode, body) in extension_wrapper_inputs {
+        let plan = crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(seed, opcode);
+        let wrapper = b.len();
+        let nop_count = 1
+            + ((plan.context_key ^ plan.dead_state_slots as u64 ^ plan.control_splits as u64) & 3)
+                as usize;
+        for _ in 0..nop_count {
+            b.push(Instruction::with(Code::Nopd));
+        }
+        b.jmp(body);
+        extension_handlers.insert(opcode, wrapper);
     }
 
     // P3: distribute identical handler `jmp dispatch` tails over seed-derived,

@@ -833,7 +833,7 @@ mod tests {
             0,
             0,
             None,
-            None,
+            &[],
         );
 
         // ?癒?궚 2 + ?됰슢?곻쭪? 1 = 3揶?RUNTIME_FUNCTION (36 獄쏅뗄??? + UNWIND_INFO(8) = 44.
@@ -899,7 +899,7 @@ mod tests {
             0,
             0,
             None,
-            None,
+            &[],
         );
 
         // 獄쏄퀣肉?24 獄쏅뗄???2 ?酉?껆뵳? + UNWIND_INFO (4 ??삳쐭 + 5*2 ?꾨뗀諭?= 14 ??16) = 40.
@@ -974,7 +974,7 @@ mod tests {
             0,
             0,
             None,
-            None,
+            &[],
         );
 
         let pdata = &sections[0].bytes;

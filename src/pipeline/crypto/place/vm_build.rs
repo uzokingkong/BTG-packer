@@ -17,6 +17,7 @@ pub(crate) struct MultiFamilyVmModule {
     pub bytecode_ranges: Vec<(usize, usize)>,
     pub native_bridge_ranges: Vec<(usize, usize)>,
     pub entry_byte_offset: usize,
+    pub chunks: Vec<(usize, vm::chunk_crypto::BytecodeChunk)>,
 }
 
 pub(crate) fn build_multi_family_prog_mod(
@@ -25,6 +26,7 @@ pub(crate) fn build_multi_family_prog_mod(
     entry_va: u64,
     code_va: u64,
     state_va: u64,
+    enable_m7: bool,
 ) -> anyhow::Result<MultiFamilyVmModule> {
     let mut modules: Vec<_> = materialized.modules.iter().collect();
     modules.sort_by_key(|module| (module.family != entry_family, module.family as u8));
@@ -42,6 +44,21 @@ pub(crate) fn build_multi_family_prog_mod(
         .copied()
         .ok_or_else(|| anyhow::anyhow!("entry VA {entry_va:#x} is absent from entry family"))?;
     let entry_byte_offset = entry_module.instruction_offsets[entry_local_op];
+    let chunk_plans: Vec<Vec<vm::chunk_crypto::BytecodeChunk>> = modules
+        .iter()
+        .map(|module| {
+            if enable_m7 {
+                vm::chunk_crypto::plan_chunks(
+                    module.bytecode.len(),
+                    &module.instruction_offsets,
+                    module.module_domain,
+                    vm::chunk_crypto::DEFAULT_CHUNK_BYTES,
+                )
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
 
     let dummy_routes = |source_family| {
         materialized
@@ -67,7 +84,7 @@ pub(crate) fn build_multi_family_prog_mod(
     };
 
     let mut sized = Vec::with_capacity(modules.len());
-    for module in &modules {
+    for (module_index, module) in modules.iter().enumerate() {
         let mut routes = dummy_routes(module.family);
         if routes.is_empty() {
             routes.push(vm::threaded::poly_direct::NativeCrossFamilyRoute {
@@ -90,7 +107,7 @@ pub(crate) fn build_multi_family_prog_mod(
                 module.family,
                 Some(&module.ip_map),
                 None,
-                &[],
+                &chunk_plans[module_index],
                 &routes,
             )?,
         );
@@ -153,7 +170,7 @@ pub(crate) fn build_multi_family_prog_mod(
                 module.family,
                 Some(&module.ip_map),
                 None,
-                &[],
+                &chunk_plans[index],
                 &routes,
             )?;
         if built_module.code.len() != sized[index].code.len()
@@ -174,16 +191,23 @@ pub(crate) fn build_multi_family_prog_mod(
     let mut table = Vec::with_capacity(table_total);
     let mut bytecode = Vec::with_capacity(bytecode_cursor);
     let mut bytecode_ranges = Vec::with_capacity(built.len());
+    let mut chunks = Vec::new();
     for module in &built {
         code.extend_from_slice(&module.code);
     }
     for module in &built {
         table.extend_from_slice(&module.table);
     }
-    for module in &built {
+    for (index, module) in built.iter().enumerate() {
         let start = bytecode.len();
         bytecode.extend_from_slice(&module.bytecode);
         bytecode_ranges.push((start, module.bytecode.len()));
+        chunks.extend(
+            chunk_plans[index]
+                .iter()
+                .cloned()
+                .map(|chunk| (start, chunk)),
+        );
     }
     Ok(MultiFamilyVmModule {
         module: vm::VmModule {
@@ -200,6 +224,7 @@ pub(crate) fn build_multi_family_prog_mod(
         bytecode_ranges,
         native_bridge_ranges,
         entry_byte_offset,
+        chunks,
     })
 }
 

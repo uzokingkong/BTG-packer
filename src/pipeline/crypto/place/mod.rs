@@ -343,6 +343,7 @@ pub(crate) fn place_boot_stub(
             plan.entry_function,
             0,
             0,
+            ctx.m7,
         )?)
     } else {
         None
@@ -1194,6 +1195,7 @@ pub(crate) fn place_boot_stub(
         );
     }
     // ── M6 Phase-2: 프로그램 VM 모듈 배치 (최종 VA로 재생성 후 복사) ──────────
+    let mut vm_multi_family_chunks = Vec::new();
     if let Some(m) = vm_prog_mod {
         let prva = dispatcher_va + vm_prog_off as u64;
         let multi_built = if vm_multi_family_active {
@@ -1203,11 +1205,13 @@ pub(crate) fn place_boot_stub(
                 ctx.vm_family_plan.as_ref().unwrap().entry_function,
                 prva,
                 vm_prog_state_va,
+                ctx.m7,
             )?)
         } else {
             None
         };
         let prmod = if let Some(multi) = &multi_built {
+            vm_multi_family_chunks = multi.chunks.clone();
             multi.module.clone()
         } else {
             let plain_bc = vm_prog_plain_bc
@@ -1292,6 +1296,31 @@ pub(crate) fn place_boot_stub(
     }
 
     // ── M6 Phase-2.3: at-rest 암호화 적용 ───────────────────────────────────
+    if ctx.m7 && !vm_multi_family_chunks.is_empty() && vm_prog_bc_len > 0 {
+        for (module_bytecode_start, chunk) in &vm_multi_family_chunks {
+            let start = vm_prog_bc_off + module_bytecode_start + chunk.offset as usize;
+            let end = start + chunk.len as usize;
+            if end > btg.bytes.len() {
+                return Err(anyhow::anyhow!(
+                    "P2-10 family M7 chunk encryption OOB: {}..{} > {}",
+                    start,
+                    end,
+                    btg.bytes.len()
+                ));
+            }
+            vm::chunk_crypto::crypt_chunk(&mut btg.bytes[start..end], chunk.key);
+        }
+        let runtime_cipher = &btg.bytes[vm_prog_bc_off..vm_prog_bc_off + vm_prog_bc_len as usize];
+        ctx.vm_prog_runtime_cipher_hash = Some(crate::manifest::sha256_hex(runtime_cipher));
+        println!(
+            "[+] P2-10 family M7: {} independent instruction-aligned chunk(s) encrypted across {} family stream(s)",
+            vm_multi_family_chunks.len(),
+            vm_multi_family_sizing
+                .as_ref()
+                .map(|multi| multi.families.len())
+                .unwrap_or(0),
+        );
+    }
     // P1-4 M7 outer layer. The boot RC4 below wraps these bytes for at-rest
     // transport and removes only that wrapper at startup; the per-chunk layer
     // remains in memory and is unmasked byte-by-byte by the Program-VM decoder.
