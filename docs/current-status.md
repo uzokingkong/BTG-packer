@@ -71,7 +71,7 @@
 | P2-12 anchor 분산 | 4 instance, 4 integrity topology, ownership gate | RIP-relative runtime bundle materialization, N=20 signature gate |
 | P2-13 grammar | operand order, compact immediate/absolute branch marker ABI | block-local delta/table-indirection/continuation grammar |
 | Data lifetime | strict single-owner ASCII/UTF-16 | 공유 객체 동시성, wider format/direct-memory cases |
-| Release gate | 567 library tests, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed 재실행 |
+| Release gate | 568 library tests, P2-13 20-seed grammar gate, 대표 production/tamper | 최신 전체 hostile corpus와 20-seed pack+execute 재실행 |
 
 ## 미구현 또는 다음 단계
 
@@ -91,7 +91,8 @@ btg-packer.exe -i corpus\o1.exe -o protected.exe `
   --verify-output --seed 31010
 ```
 
-- library tests: 567 passed, 0 failed.
+- library tests: 568 passed, 0 failed.
+- P2-13 uninformed grammar normalization: 20 seeds × 4 families, 허용률 ≤10% 통과.
 - family runtime instances: 4.
 - 최대 family instruction ownership: 37,117 / 130,685 = 28.40%.
 - cross-family routes: 513.

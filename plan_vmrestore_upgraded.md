@@ -11,7 +11,7 @@
 - P2-10은 4개 독립 code/handler-table/bytecode/state module, canonical cross-family CALL/tail-JUMP/return routing, family별 unwind range까지 production 배치 완료다.
 - P2-11은 canonical ISA와 super-op extension의 모든 최종 handler-table target에 seed/opcode-derived synthesis wrapper를 적용했다. 전체 ISA production reachability는 완료됐지만 handler 본체의 micro-op decomposition/MBA/register allocation/control split 다양성은 추가 강화 대상으로 유지한다.
 - P2-5는 helper-only 상태를 종료했다. PE literal reference graph와 strict `LEA literal → Win64 argument → call` proof를 production에 연결하고, VM 소유권까지 재검증된 45개 객체를 at-rest ciphertext로 저장한다. call 직전 RISC toggle로 복호화하고 복귀 직후 재암호화하며 flags를 복원한다. 일부 참조/native 참조/loader-critical 객체는 fail-closed 제외한다.
-- 최신 검증: library 567/567(P2-13 compact control target/malformed marker 회귀 포함), `corpus/o1.exe` 일반 및 `--m7 --m8 --integrity` 실행 동치 exit 0/stdout 1,460B/stderr 0B. 최신 data-lifetime/handler-body 변경 이후 20-seed/전체 hostile corpus는 다시 수행해야 한다.
+- 최신 검증: library 568/568(P2-13 compact control target/malformed marker/20-seed grammar gate 포함), `corpus/o1.exe` 일반 및 `--m7 --m8 --integrity` 실행 동치 exit 0/stdout 1,460B/stderr 0B. 최신 data-lifetime/handler-body 변경 이후 20-seed pack+execute/전체 hostile corpus는 다시 수행해야 한다.
 - 다음 구현 순서: (1) P2-13 block-local/control grammar 확대, (2) P2-14 state splitting/lazy flags와 data-lifetime 동시성, (3) P2-15 bridge oracle 감소, (4) 최신 20-seed 및 hostile/tamper release gate 확대.
 
 ### 2026-08-22 — P2-13 family별 operand record grammar 분리
@@ -49,6 +49,12 @@
 - static decoder에만 있던 invalid marker 거부를 production native branch handler에도 연결했다. marker 복호화 직후 unsigned range check로 `0x10..0x13`만 허용하고 나머지는 payload 폭 table을 참조하기 전에 `UD2`로 종료한다. 따라서 width=0이 동적 reader loop에 들어가 underflow하거나 stream 경계를 벗어나는 경로가 없다.
 - family-local continuation token을 native branch-map key로 직접 쓰는 실험은 unit/ip-map fixture를 통과했지만 실제 `corpus/o1.exe` cross-family/super-op 조합에서 잘못된 target과 `0xC0000005`를 재현해 폐기했다. 해당 변경은 커밋에 포함하지 않았으며 canonical lookup 경로를 복원한 뒤 최대 production 실행 동치가 다시 통과했다.
 - 다음 token 설계는 단순 payload key가 아니라 origin identity, target-width domain, cross-family route identity를 함께 포함해야 한다. 그 전까지 현재 compact absolute marker ABI를 production 기준으로 유지한다.
+
+### 2026-08-22 — P2-13 20-seed uninformed grammar red-team gate
+
+- operand order, unsigned/signed compact immediate, compact branch marker, condition byte를 함께 포함한 동일 RISC fixture를 20 seed × 4 family = 80개 stream으로 생성한다. 공격자 모델은 한 baseline build/Stack parser만 학습하고 seed/family metadata 없이 나머지 stream을 decode한다.
+- exact instruction sequence까지 정상화한 비율이 10%를 넘으면 release test를 실패시킨다. 현재 gate는 기준을 통과하며 단순 opcode/descriptor parser 재사용으로 다른 build/family boundary와 operand를 복구하지 못함을 고정한다.
+- 이 gate는 빠른 library grammar gate이며 실제 20-seed pack+execute gate를 대체하지 않는다. 최신 전체 pack+execute와 hostile corpus는 별도 release 단계로 남는다.
 
 ### 2026-08-22 — P2-12 family별 runtime integrity anchor 분산
 
