@@ -79,6 +79,11 @@ pub fn sub_bytes(words: &mut [u32; crate::crypto::state::STATE_WORDS]) {
     let sb = sbox();
     for w in words.iter_mut() {
         let b = w.to_le_bytes();
-        *w = u32::from_le_bytes([sb[b[0] as usize], sb[b[1] as usize], sb[b[2] as usize], sb[b[3] as usize]]);
+        *w = u32::from_le_bytes([
+            sb[b[0] as usize],
+            sb[b[1] as usize],
+            sb[b[2] as usize],
+            sb[b[3] as usize],
+        ]);
     }
 }

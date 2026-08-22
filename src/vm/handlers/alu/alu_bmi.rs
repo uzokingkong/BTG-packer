@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // BTG v3 - VM Handler Codegen: BMI1/2 (Group B) - split from alu.rs
 // ==============================================================================
 // LZCNT/POPCNT/BLSR/BLSMSK/BLSI/ANDN register-register handlers.
@@ -16,7 +16,12 @@ fn cap_flags_zf_cf() -> Vec<Instruction> {
     vec![
         Instruction::with(Code::Pushfq),
         Instruction::with1(Code::Pop_r64, Register::R11).unwrap(),
-        Instruction::with2(Code::And_rm64_imm32, Register::R11, (F_CF | F_ZF) as u32 as i32).unwrap(),
+        Instruction::with2(
+            Code::And_rm64_imm32,
+            Register::R11,
+            (F_CF | F_ZF) as u32 as i32,
+        )
+        .unwrap(),
         Instruction::with2(Code::Mov_rm64_r64, state_flags_mem(), Register::R11).unwrap(),
     ]
 }
@@ -55,17 +60,28 @@ pub(crate) fn emit_lzcnt(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         (OP_LZCNT_R64, Code::Lzcnt_r64_rm64, true),
     ] {
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
         ];
         if is64 {
-            body.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RDX)).unwrap());
+            body.push(
+                Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RDX)).unwrap(),
+            );
             body.push(Instruction::with2(code, Register::RAX, Register::RAX).unwrap());
         } else {
-            body.push(Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RDX)).unwrap());
+            body.push(
+                Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RDX)).unwrap(),
+            );
             body.push(Instruction::with2(code, Register::EAX, Register::EAX).unwrap());
         }
-        body.push(Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap());
+        body.push(
+            Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(),
+        );
         body.extend(cap_flags_zf_cf());
         body.push(Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap());
         hdr(seq, op, body);
@@ -79,17 +95,28 @@ pub(crate) fn emit_popcnt(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         (OP_POPCNT_R64, Code::Popcnt_r64_rm64, true),
     ] {
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
         ];
         if is64 {
-            body.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RDX)).unwrap());
+            body.push(
+                Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RDX)).unwrap(),
+            );
             body.push(Instruction::with2(code, Register::RAX, Register::RAX).unwrap());
         } else {
-            body.push(Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RDX)).unwrap());
+            body.push(
+                Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RDX)).unwrap(),
+            );
             body.push(Instruction::with2(code, Register::EAX, Register::EAX).unwrap());
         }
-        body.push(Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap());
+        body.push(
+            Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(),
+        );
         body.extend(cap_flags_zf_cf());
         body.push(Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap());
         hdr(seq, op, body);
@@ -105,12 +132,25 @@ pub(crate) fn emit_blsr(seq: &mut Vec<(Instruction, Option<Cl>)>) {
             (Code::Mov_r32_rm32, Register::EAX, Register::R11D)
         };
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(mv, sreg, vreg(Register::RDX)).unwrap(),
             Instruction::with2(mv, lreg, vreg(Register::RDX)).unwrap(),
-            if is64 { Instruction::with2(Code::Sub_rm64_imm8, lreg, 1).unwrap() } else { Instruction::with2(Code::Sub_rm32_imm8, lreg, 1).unwrap() },
-            if is64 { Instruction::with2(Code::And_rm64_r64, sreg, lreg).unwrap() } else { Instruction::with2(Code::And_rm32_r32, sreg, lreg).unwrap() },
+            if is64 {
+                Instruction::with2(Code::Sub_rm64_imm8, lreg, 1).unwrap()
+            } else {
+                Instruction::with2(Code::Sub_rm32_imm8, lreg, 1).unwrap()
+            },
+            if is64 {
+                Instruction::with2(Code::And_rm64_r64, sreg, lreg).unwrap()
+            } else {
+                Instruction::with2(Code::And_rm32_r32, sreg, lreg).unwrap()
+            },
             // EAX writes zero-extend into RAX; store the full 64-bit slot.
             Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(),
         ];
@@ -129,12 +169,25 @@ pub(crate) fn emit_blsmsk(seq: &mut Vec<(Instruction, Option<Cl>)>) {
             (Code::Mov_r32_rm32, Register::EAX, Register::R11D)
         };
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(mv, sreg, vreg(Register::RDX)).unwrap(),
             Instruction::with2(mv, lreg, vreg(Register::RDX)).unwrap(),
-            if is64 { Instruction::with2(Code::Sub_rm64_imm8, lreg, 1).unwrap() } else { Instruction::with2(Code::Sub_rm32_imm8, lreg, 1).unwrap() },
-            if is64 { Instruction::with2(Code::Xor_rm64_r64, sreg, lreg).unwrap() } else { Instruction::with2(Code::Xor_rm32_r32, sreg, lreg).unwrap() },
+            if is64 {
+                Instruction::with2(Code::Sub_rm64_imm8, lreg, 1).unwrap()
+            } else {
+                Instruction::with2(Code::Sub_rm32_imm8, lreg, 1).unwrap()
+            },
+            if is64 {
+                Instruction::with2(Code::Xor_rm64_r64, sreg, lreg).unwrap()
+            } else {
+                Instruction::with2(Code::Xor_rm32_r32, sreg, lreg).unwrap()
+            },
             // EAX writes zero-extend into RAX; store the full 64-bit slot.
             Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(),
         ];
@@ -153,12 +206,25 @@ pub(crate) fn emit_blsi(seq: &mut Vec<(Instruction, Option<Cl>)>) {
             (Code::Mov_r32_rm32, Register::EAX, Register::R11D)
         };
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(mv, sreg, vreg(Register::RDX)).unwrap(),
             Instruction::with2(mv, lreg, vreg(Register::RDX)).unwrap(),
-            if is64 { Instruction::with1(Code::Neg_rm64, lreg).unwrap() } else { Instruction::with1(Code::Neg_rm32, lreg).unwrap() },
-            if is64 { Instruction::with2(Code::And_rm64_r64, sreg, lreg).unwrap() } else { Instruction::with2(Code::And_rm32_r32, sreg, lreg).unwrap() },
+            if is64 {
+                Instruction::with1(Code::Neg_rm64, lreg).unwrap()
+            } else {
+                Instruction::with1(Code::Neg_rm32, lreg).unwrap()
+            },
+            if is64 {
+                Instruction::with2(Code::And_rm64_r64, sreg, lreg).unwrap()
+            } else {
+                Instruction::with2(Code::And_rm32_r32, sreg, lreg).unwrap()
+            },
             // EAX writes zero-extend into RAX; store the full 64-bit slot.
             Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(),
         ];
@@ -174,12 +240,29 @@ pub(crate) fn emit_blsi(seq: &mut Vec<(Instruction, Option<Cl>)>) {
 pub(crate) fn emit_andn(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     for (op, is64) in [(OP_ANDN_R_R32, false), (OP_ANDN_R_R64, true)] {
         let (mv, s1, s2, notc, andc) = if is64 {
-            (Code::Mov_r64_rm64, Register::R11, Register::RAX, Code::Not_rm64, Code::And_rm64_r64)
+            (
+                Code::Mov_r64_rm64,
+                Register::R11,
+                Register::RAX,
+                Code::Not_rm64,
+                Code::And_rm64_r64,
+            )
         } else {
-            (Code::Mov_r32_rm32, Register::R11D, Register::EAX, Code::Not_rm32, Code::And_rm32_r32)
+            (
+                Code::Mov_r32_rm32,
+                Register::R11D,
+                Register::EAX,
+                Code::Not_rm32,
+                Code::And_rm32_r32,
+            )
         };
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::ESI, m(Register::R9, 2)).unwrap(),
             // src1 -> s1

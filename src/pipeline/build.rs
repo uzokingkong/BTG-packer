@@ -2,7 +2,7 @@
 // BTG Pipeline - Build: PE Synthesis & Output
 // ==============================================================================
 
-use crate::dispatcher::{UNWIND_ALLOC8, dispatcher_unwind_codes};
+use crate::dispatcher::{dispatcher_unwind_codes, UNWIND_ALLOC8};
 use crate::pe::builder::{DataDirectory, PeMultiSectionBuilder, SectionData};
 use crate::pe::parser::RuntimeFunction;
 use crate::pe::reloc::build_reloc_directory;
@@ -44,7 +44,10 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     // idx=4 Security, idx=5 .reloc, idx=6 Debug ??볤탢
     for idx in &[4usize, 5, 6, 11] {
         if clean_data_dirs.len() > *idx {
-            clean_data_dirs[*idx] = DataDirectory { virtual_address: 0, size: 0 };
+            clean_data_dirs[*idx] = DataDirectory {
+                virtual_address: 0,
+                size: 0,
+            };
         }
     }
     // v4: --rsrc-register ???귐딅꺖???遺얠젂?怨뺚봺??????源낅쭆 ?紐꺿봺嚥??대Ŋ猿?
@@ -65,7 +68,8 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     // ???? DLL Characteristics: DYNAMIC_BASE(0x0040), HIGH_ENTROPY_VA(0x0020), GUARD_CF(0x4000) ??볤탢 ????
     // P0-⑦: relocation-aware 경로가 확정되기 전까지는 기존대로 ASLR/CFG 비트를 스트립한
     // 값을 쓰고, 아래에서 preserve_aslr_bits가 켜지면 원본 ASLR 비트를 복원한다.
-    let clean_dll_characteristics = ctx.target_info.dll_characteristics & !(0x0020 | 0x0040 | 0x4000);
+    let clean_dll_characteristics =
+        ctx.target_info.dll_characteristics & !(0x0020 | 0x0040 | 0x4000);
 
     // ???? ??ν뒄???諭??癒?퐣 .pdata SEH ???뵠???????????????????????????????????????????????????????????????????????
     // ?癒?궚 `.text`??TLS ?꾩뮆媛? VM native bridge, 域밸챶?곫?entry_native 野껋럥以?癒?퐣 ?④쑴??
@@ -81,19 +85,35 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     // prologue?? ??釉?紐낆넅 ?遺용뮞??μ퓗??16-?紐꾨뻻 prologue ????野껉퍒?????깊뒄??? ??낅뮉 ??됯맒
     // ??곷???????롢걵??unwind ????롢걵??RSP ??0xC0000005 野껋럥以???癒?뵥????????덈뼄.)
     let mut relayed_sections = ctx.patched_sections.clone();
+    // Pillar 1: Sanitize sensitive metadata, source paths, and PDB signatures from data sections
+    let stripped = crate::pipeline::rdata_strip::RdataMetadataStripper::sanitize_sections(
+        &mut relayed_sections,
+        ctx.poly_vm_seed,
+    );
+    if stripped > 0 {
+        println!(
+            "[+] Stealth: Sanitized {} plaintext metadata/path references from PE sections",
+            stripped
+        );
+    }
+
     // ?됰슢?곻쭪? leaf 揶쎛 ?뚣끇苡??롫뮉 ?遺용뮞??μ퓗 癰귣챷猿?.textb ?諭????쎈늄??0x20)??prologue ??
     // ?遺욱맜??쀫퉸 UNWIND_INFO ????밴쉐??뺣뼄. `.textb` ??patched_sections ????얩?
     // `btg_section_data` ????됱몵沃샕嚥???由????덈뮉??(relayed_sections ?癒?퐣 筌≪뼚?앾쭖?
     // bridge_unwind 揶쎛 None ???됰슢?곻쭪? leaf 揶쎛 ?袁⑥뵭??롫뮉 ???).
-    let bridge_unwind: Option<(u8, Vec<(u8, u8)>)> = ctx
-        .btg_section_data
-        .as_ref()
-        .map(|sec| {
-            let end = (0x20 + boot_area_len as usize).min(sec.bytes.len());
-            let disp = if end > 0x20 { &sec.bytes[0x20..end] } else { &[] };
-            let (codes, prolog_len) = dispatcher_unwind_codes(disp);
-            (prolog_len, codes.iter().map(|c| (c.offset, c.reg)).collect())
-        });
+    let bridge_unwind: Option<(u8, Vec<(u8, u8)>)> = ctx.btg_section_data.as_ref().map(|sec| {
+        let end = (0x20 + boot_area_len as usize).min(sec.bytes.len());
+        let disp = if end > 0x20 {
+            &sec.bytes[0x20..end]
+        } else {
+            &[]
+        };
+        let (codes, prolog_len) = dispatcher_unwind_codes(disp);
+        (
+            prolog_len,
+            codes.iter().map(|c| (c.offset, c.reg)).collect(),
+        )
+    });
     // P4 (전체 SEH 가상화): whole-program VM 모듈 영역의 브리지 UNWIND_INFO.
     // Program VM은 부트 스텁이 tail-jmp로 진입하므로, VM 내부에서 예외가 나면
     // OS unwinder가 걷는 유일한 .textb 프레임이 **Program VM 엔트리 프레임**이다.
@@ -139,6 +159,7 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
             ctx.vm_prog_rva,
             ctx.vm_prog_total,
             vm_prog_unwind.as_ref().map(|v| v.as_slice()),
+            ctx.vm_prog_native_bridge,
         );
     }
 
@@ -176,7 +197,11 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
         // 최종 섹션 배치를 builder 로직과 동일하게 계산한다.
         let sec_align = ctx.target_info.section_alignment;
         let align_sec = |v: u32| -> u32 {
-            if sec_align == 0 { 0x1000 } else { (v + sec_align - 1) & !(sec_align - 1) }
+            if sec_align == 0 {
+                0x1000
+            } else {
+                (v + sec_align - 1) & !(sec_align - 1)
+            }
         };
         let max_existing_va = relayed_sections
             .iter()
@@ -191,7 +216,8 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
         } else {
             btg_section.virtual_address
         };
-        let btg_end = btg_va + align_sec(btg_section.virtual_size.max(btg_section.bytes.len() as u32));
+        let btg_end =
+            btg_va + align_sec(btg_section.virtual_size.max(btg_section.bytes.len() as u32));
         let payload_end = match &ctx.payload_section_data {
             Some(p) => {
                 let p_va = align_sec(btg_end);
@@ -206,15 +232,15 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
         // 단순한 보수 범위: .textb 코드 블록 영역 전체(first_block_offset에서
         // btg_section 끝까지). 실제 암호화 눁이가 code_len보다 작으면
         // 일부 평문이 남아도 안전: 위양성(false-skip)이 암호문-skip만 못하는
-        // false-include보다 항상 안전하다 (reloc 빠지면 VM이 장로드되고, 
+        // false-include보다 항상 안전하다 (reloc 빠지면 VM이 장로드되고,
         // reloc 두면 boot stub이 2회 체이닝 후 컴파일 복호화하므로 대부분
         // OK임).
         let mut encrypted_rva_ranges: Vec<(u32, u32)> = Vec::new();
         if ctx.at_rest_encrypted {
             // .textb 코드 블록 영역 (dispatcher부터 코드 끝까지)
             let code_block_rva = ctx.dispatcher_rva + ctx.first_block_offset as u32;
-            let code_block_len = (btg_section.bytes.len() as u32)
-                .saturating_sub(ctx.first_block_offset as u32);
+            let code_block_len =
+                (btg_section.bytes.len() as u32).saturating_sub(ctx.first_block_offset as u32);
             if code_block_len > 0 {
                 encrypted_rva_ranges.push((code_block_rva, code_block_len));
             }
@@ -269,25 +295,25 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
         );
 
         if let Some(mut ro) = reloc {
-                let reloc_va = align_sec(payload_end);
-                ro.section.virtual_address = reloc_va;
-                if clean_data_dirs.len() > 5 {
-                    clean_data_dirs[5] = DataDirectory {
-                        virtual_address: reloc_va,
-                        size: ro.directory.size,
-                    };
-                }
-                preserve_aslr_bits = true;
-                // builder가 .reloc 섹션을 btg/payload 뒤에 배치하도록 전달한다
-                // (relayed_sections에 추가하지 않음 — .textb 위치가 밀리면 안 됨).
-                reloc_section = Some(ro.section);
-                println!(
+            let reloc_va = align_sec(payload_end);
+            ro.section.virtual_address = reloc_va;
+            if clean_data_dirs.len() > 5 {
+                clean_data_dirs[5] = DataDirectory {
+                    virtual_address: reloc_va,
+                    size: ro.directory.size,
+                };
+            }
+            preserve_aslr_bits = true;
+            // builder가 .reloc 섹션을 btg/payload 뒤에 배치하도록 전달한다
+            // (relayed_sections에 추가하지 않음 — .textb 위치가 밀리면 안 됨).
+            reloc_section = Some(ro.section);
+            println!(
                     "[+] P0-⑦ relocation-aware: .reloc dir @0x{:X} ({}B, {} slot(s)) — DYNAMIC_BASE/HIGH_ENTROPY_VA preserved",
                     reloc_va, ro.directory.size, ro.directory.size / 2
                 );
-            } else {
-                println!("[!] P0-⑦ relocation-aware: no image-relative pointers found in injected sections; ASLR bits kept stripped");
-            }
+        } else {
+            println!("[!] P0-⑦ relocation-aware: no image-relative pointers found in injected sections; ASLR bits kept stripped");
+        }
     }
 
     let multi_builder = PeMultiSectionBuilder::new(
@@ -323,14 +349,29 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     if let Some(path) = output_path {
         fs::write(path, &output_pe_bytes)?;
         println!("==================================================================");
-        println!("[SUCCESS] Synthesized Protected BTG PE Binary Written to: {}", path.display());
-        println!("[INFO] Size of Output Protected Binary: {} bytes", output_pe_bytes.len());
-        println!("[INFO] Protected Entry Point (OEP) RVA: 0x{:X}", entry_point_rva);
+        println!(
+            "[SUCCESS] Synthesized Protected BTG PE Binary Written to: {}",
+            path.display()
+        );
+        println!(
+            "[INFO] Size of Output Protected Binary: {} bytes",
+            output_pe_bytes.len()
+        );
+        println!(
+            "[INFO] Protected Entry Point (OEP) RVA: 0x{:X}",
+            entry_point_rva
+        );
         println!("==================================================================");
     } else {
         println!("==================================================================");
-        println!("[SUCCESS] Synthesized Protected BTG PE Binary (in-memory, {} bytes)", output_pe_bytes.len());
-        println!("[INFO] Protected Entry Point (OEP) RVA: 0x{:X}", entry_point_rva);
+        println!(
+            "[SUCCESS] Synthesized Protected BTG PE Binary (in-memory, {} bytes)",
+            output_pe_bytes.len()
+        );
+        println!(
+            "[INFO] Protected Entry Point (OEP) RVA: 0x{:X}",
+            entry_point_rva
+        );
         println!("==================================================================");
     }
 
@@ -441,7 +482,11 @@ fn build_vm_entry_unwind_info(size_of_prolog: u8, ops: &[(u8, VmEntryOp)]) -> Ve
         let mut body = match op {
             VmEntryOp::Alloc(size) if *size > 0x80 => {
                 let frame = (*size / 8) as u16;
-                vec![(0 << 4) | UWOP_ALLOC_LARGE, (frame & 0xFF) as u8, (frame >> 8) as u8]
+                vec![
+                    (0 << 4) | UWOP_ALLOC_LARGE,
+                    (frame & 0xFF) as u8,
+                    (frame >> 8) as u8,
+                ]
             }
             VmEntryOp::Alloc(size) => {
                 let sm = ((*size / 8).saturating_sub(1)) as u8;
@@ -464,6 +509,19 @@ fn build_vm_entry_unwind_info(size_of_prolog: u8, ops: &[(u8, VmEntryOp)]) -> Ve
     info.push(0); // FrameRegister=0, FrameRegisterOffset=0
     for (_, code) in &entries {
         info.extend_from_slice(code);
+    }
+    while info.len() % 4 != 0 {
+        info.push(0);
+    }
+    info
+}
+
+fn build_native_call_bridge_unwind_info() -> Vec<u8> {
+    let code_off = 0x20u8;
+    let mut info = vec![UNWIND_VERSION, code_off, 10, 0];
+    info.extend_from_slice(&[code_off, UWOP_ALLOC_LARGE, 0x17, 0x00]);
+    for reg in [5u8, 3, 6, 7, 15, 14, 13, 12] {
+        info.extend_from_slice(&[code_off, (reg << 4) | UWOP_PUSH_NONVOL]);
     }
     while info.len() % 4 != 0 {
         info.push(0);
@@ -544,15 +602,13 @@ fn update_pdata_seh(
     vm_prog_rva: u32,
     vm_prog_total: u32,
     vm_prog_unwind: Option<&[u8]>,
+    vm_native_bridge: Option<(u32, u32)>,
 ) {
     if let Some(pdata_sec) = relayed_sections.iter_mut().find(|s| s.name == ".pdata") {
         // ?癒?궚 `.text`??域밸챶?嚥?鈺곕똻???랁???쇱뵠?怨뺥닏 野껋럥以?癒?퐣 ??쎈뻬???嚥??袁? 癰귣똻???뺣뼄.
         let mut rf_list: Vec<RuntimeFunction> = original_pdata_entries
             .iter()
-            .filter(|rf| {
-                rf.begin_address > 0
-                    && rf.end_address > rf.begin_address
-            })
+            .filter(|rf| rf.begin_address > 0 && rf.end_address > rf.begin_address)
             .copied()
             .collect();
 
@@ -580,8 +636,11 @@ fn update_pdata_seh(
         // 엔트리 UNWIND_INFO로 결정적으로 프레임을 걷게 한다. (VM 안의 모든 코드는
         // 하나의 엔트리 프레임 안에서 실행되므로 단일 UNWIND_INFO가 정확하다.)
         let mut vm_unwind: Vec<u8> = Vec::new();
+        let mut native_bridge_unwind: Vec<u8> = Vec::new();
         let mut vm_begin = 0u32;
         let mut vm_end = 0u32;
+        let mut native_bridge_begin = 0u32;
+        let mut native_bridge_end = 0u32;
         if vm_prog_rva > 0 && vm_prog_total > 0 {
             vm_begin = vm_prog_rva;
             vm_end = vm_prog_rva.saturating_add(vm_prog_total);
@@ -604,8 +663,26 @@ fn update_pdata_seh(
                     vm_begin, vm_end, vm_prog_total
                 );
             }
-            // Register the RUNTIME_FUNCTION regardless of unwind-info availability.
-            if !rf_list.iter().any(|rf| rf.begin_address == vm_begin) {
+            if let Some((rel_begin, rel_end)) =
+                vm_native_bridge.filter(|(s, e)| s < e && *e <= vm_prog_total)
+            {
+                native_bridge_begin = vm_begin + rel_begin;
+                native_bridge_end = vm_begin + rel_end;
+                native_bridge_unwind = build_native_call_bridge_unwind_info();
+                for (begin, end) in [
+                    (vm_begin, native_bridge_begin),
+                    (native_bridge_begin, native_bridge_end),
+                    (native_bridge_end, vm_end),
+                ] {
+                    if begin < end {
+                        rf_list.push(RuntimeFunction {
+                            begin_address: begin,
+                            end_address: end,
+                            unwind_info_address: 0,
+                        });
+                    }
+                }
+            } else if !rf_list.iter().any(|rf| rf.begin_address == vm_begin) {
                 rf_list.push(RuntimeFunction {
                     begin_address: vm_begin,
                     end_address: vm_end,
@@ -633,14 +710,22 @@ fn update_pdata_seh(
         if vm_begin > 0 && !vm_unwind.is_empty() {
             let vm_unwind_rva = unwind_rva + unwind_info.len() as u32;
             for rf in rf_list.iter_mut() {
-                if rf.begin_address == vm_begin {
+                if rf.begin_address == vm_begin || rf.begin_address == native_bridge_end {
                     rf.unwind_info_address = vm_unwind_rva;
+                }
+            }
+        }
+        if native_bridge_begin > 0 {
+            let native_unwind_rva = unwind_rva + unwind_info.len() as u32 + vm_unwind.len() as u32;
+            for rf in rf_list.iter_mut() {
+                if rf.begin_address == native_bridge_begin {
+                    rf.unwind_info_address = native_unwind_rva;
                 }
             }
         }
 
         let mut pdata_bytes = Vec::with_capacity(
-            array_len as usize + unwind_info.len() + vm_unwind.len(),
+            array_len as usize + unwind_info.len() + vm_unwind.len() + native_bridge_unwind.len(),
         );
         for rf in &rf_list {
             pdata_bytes.extend_from_slice(&rf.begin_address.to_le_bytes());
@@ -649,6 +734,7 @@ fn update_pdata_seh(
         }
         pdata_bytes.extend_from_slice(&unwind_info);
         pdata_bytes.extend_from_slice(&vm_unwind);
+        pdata_bytes.extend_from_slice(&native_bridge_unwind);
 
         pdata_sec.bytes = pdata_bytes.clone();
         // Exception Directory ??由?= RUNTIME_FUNCTION 獄쏄퀣肉댐쭕?(嚥≪뮆?묈첎? size/12 嚥?
@@ -685,7 +771,7 @@ fn update_pdata_seh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatcher::{UNWIND_ALLOC8, build_dispatcher, build_dispatcher_reencrypt};
+    use crate::dispatcher::{build_dispatcher, build_dispatcher_reencrypt, UNWIND_ALLOC8};
 
     #[test]
     fn pdata_rebuild_preserves_native_entries_and_adds_bridge_leaf() {
@@ -729,6 +815,7 @@ mod tests {
             0,
             0,
             None,
+            None,
         );
 
         // ?癒?궚 2 + ?됰슢?곻쭪? 1 = 3揶?RUNTIME_FUNCTION (36 獄쏅뗄??? + UNWIND_INFO(8) = 44.
@@ -738,8 +825,7 @@ mod tests {
         assert_eq!(directories[3].size, 36);
         assert_eq!(sections[0].virtual_size, 36);
 
-        let words: Vec<u32> = sections[0]
-            .bytes[..36]
+        let words: Vec<u32> = sections[0].bytes[..36]
             .chunks_exact(4)
             .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -747,11 +833,7 @@ mod tests {
         // unwind=0x4000+36=0x4024.
         assert_eq!(
             words,
-            vec![
-                0x1000, 0x1100, 0x3000,
-                0x1200, 0x1300, 0x3010,
-                0x5020, 0x5080, 0x4024,
-            ]
+            vec![0x1000, 0x1100, 0x3000, 0x1200, 0x1300, 0x3010, 0x5020, 0x5080, 0x4024,]
         );
     }
 
@@ -779,13 +861,16 @@ mod tests {
 
         // ??? ?遺용뮞??μ퓗 prologue (pushfq; push rax; push rcx; push r10; push r11)??
         // ??밴쉐??UNWIND_CODE ???袁? 8獄쏅뗄?????쎄문 op (pushfq/??롮뻣??GPR).
-        let bridge_unwind = (0x07u8, vec![
-            (0x00u8, UNWIND_ALLOC8), // pushfq
-            (0x01u8, UNWIND_ALLOC8), // push rax
-            (0x02u8, UNWIND_ALLOC8), // push rcx
-            (0x03u8, UNWIND_ALLOC8), // push r10
-            (0x05u8, UNWIND_ALLOC8), // push r11
-        ]);
+        let bridge_unwind = (
+            0x07u8,
+            vec![
+                (0x00u8, UNWIND_ALLOC8), // pushfq
+                (0x01u8, UNWIND_ALLOC8), // push rax
+                (0x02u8, UNWIND_ALLOC8), // push rcx
+                (0x03u8, UNWIND_ALLOC8), // push r10
+                (0x05u8, UNWIND_ALLOC8), // push r11
+            ],
+        );
         update_pdata_seh(
             &mut sections,
             &mut directories,
@@ -795,6 +880,7 @@ mod tests {
             Some(&bridge_unwind),
             0,
             0,
+            None,
             None,
         );
 
@@ -850,13 +936,16 @@ mod tests {
             16
         ];
 
-        let bridge_unwind = (0x07u8, vec![
-            (0x00u8, UNWIND_ALLOC8),
-            (0x01u8, UNWIND_ALLOC8),
-            (0x02u8, UNWIND_ALLOC8),
-            (0x03u8, UNWIND_ALLOC8),
-            (0x05u8, UNWIND_ALLOC8),
-        ]);
+        let bridge_unwind = (
+            0x07u8,
+            vec![
+                (0x00u8, UNWIND_ALLOC8),
+                (0x01u8, UNWIND_ALLOC8),
+                (0x02u8, UNWIND_ALLOC8),
+                (0x03u8, UNWIND_ALLOC8),
+                (0x05u8, UNWIND_ALLOC8),
+            ],
+        );
         update_pdata_seh(
             &mut sections,
             &mut directories,
@@ -866,6 +955,7 @@ mod tests {
             Some(&bridge_unwind),
             0,
             0,
+            None,
             None,
         );
 
@@ -883,17 +973,26 @@ mod tests {
             let begin = u32::from_le_bytes(pdata[i * 12..i * 12 + 4].try_into().unwrap());
             let end = u32::from_le_bytes(pdata[i * 12 + 4..i * 12 + 8].try_into().unwrap());
             let unwind = u32::from_le_bytes(pdata[i * 12 + 8..i * 12 + 12].try_into().unwrap());
-            assert!(begin < end, "entry {}: begin 0x{:X} < end 0x{:X}", i, begin, end);
-            assert_eq!(unwind % 4, 0, "entry {}: unwind 0x{:X} not DWORD aligned", i, unwind);
+            assert!(
+                begin < end,
+                "entry {}: begin 0x{:X} < end 0x{:X}",
+                i,
+                begin,
+                end
+            );
+            assert_eq!(
+                unwind % 4,
+                0,
+                "entry {}: unwind 0x{:X} not DWORD aligned",
+                i,
+                unwind
+            );
         }
 
         // ?됰슢?곻쭪?(?怨뺚봺揶쎛 ?곕떽??? ?酉?껆뵳???UNWIND_INFO 揶쎛 .pdata ?諭?????(獄쏄퀣肉???
         // DWORD ?類ｌ졊 ?袁⑺뒄)??揶쎛?귐딇룖????뺣뼄. ?癒?궚 ?酉?껆뵳????癒?궚 .text/.rdata ??
         // UNWIND_INFO ??揶쎛?귐뗪텕沃샕嚥?.pdata 獄쏅쉼??????덈뼄 (?類ㅺ맒).
-        let bridge = pdata
-            .chunks_exact(12)
-            .nth(num_entries - 1)
-            .unwrap();
+        let bridge = pdata.chunks_exact(12).nth(num_entries - 1).unwrap();
         let bridge_begin = u32::from_le_bytes(bridge[0..4].try_into().unwrap());
         assert_eq!(bridge_begin, 0x5020); // ?遺용뮞??μ퓗 = dispatcher_rva + 0x20
         let bridge_unwind = u32::from_le_bytes(bridge[8..12].try_into().unwrap());
@@ -935,12 +1034,24 @@ mod tests {
     #[test]
     fn bridge_unwind_info_matches_real_dispatcher_prologue() {
         for (code, name) in [
-            (build_dispatcher(0x140001000, 0x80, 16, false, 0xCAFEBABE, false, 0, 2), "plain"),
-            (build_dispatcher(0x140001000, 0x80, 16, true, 0xCAFEBABE, false, 0, 2), "plain+trace"),
-            (build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false).unwrap(), "reencrypt"),
+            (
+                build_dispatcher(0x140001000, 0x80, 16, false, 0xCAFEBABE, false, 0, 2),
+                "plain",
+            ),
+            (
+                build_dispatcher(0x140001000, 0x80, 16, true, 0xCAFEBABE, false, 0, 2),
+                "plain+trace",
+            ),
+            (
+                build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false).unwrap(),
+                "reencrypt",
+            ),
         ] {
             let (codes, prolog_len) = crate::dispatcher::dispatcher_unwind_codes(&code);
-            let unwind = build_bridge_unwind_info(prolog_len, &codes.iter().map(|c| (c.offset, c.reg)).collect::<Vec<_>>());
+            let unwind = build_bridge_unwind_info(
+                prolog_len,
+                &codes.iter().map(|c| (c.offset, c.reg)).collect::<Vec<_>>(),
+            );
             // ??삳쐭
             assert_eq!(unwind[0] & 0x07, UNWIND_VERSION, "{name}");
             assert_eq!(unwind[1], prolog_len, "{name}: SizeOfProlog");
@@ -948,7 +1059,11 @@ mod tests {
             assert_eq!(unwind[3], 0, "{name}: frame reg");
             // ?꾨뗀諭뜹첎? prologue 疫뀀챷?좂몴??λ뜃???? ??낅뮉??
             for c in &codes {
-                assert!((c.offset as u16) < prolog_len as u16, "{name}: code off {}", c.offset);
+                assert!(
+                    (c.offset as u16) < prolog_len as u16,
+                    "{name}: code off {}",
+                    c.offset
+                );
             }
             // DWORD ?類ｌ졊
             assert_eq!(unwind.len() % 4, 0, "{name}");
@@ -975,13 +1090,19 @@ mod tests {
         .unwrap();
         let code = &vmc.code;
         // Program-VM 엔트리 프로로그: sub rsp,0xA0; cld; movdqu xmm6..15; 15 push.
-        assert_eq!(code[0], 0x48, "prologue starts with a REX.W prefix (48 ...)");
+        assert_eq!(
+            code[0], 0x48,
+            "prologue starts with a REX.W prefix (48 ...)"
+        );
         assert_eq!(code[1], 0x81, "sub rsp, imm32 (81 /5)");
         let (ops, prolog_len) = vm_entry_unwind_ops(code);
         assert!(prolog_len > 0, "decoder found a prologue");
         assert_eq!(ops.len(), 16, "1 alloc + 15 pushes");
         // 첫 op는 0xA0(=160B) ALLOC, 마지막 4 op는 callee-saved r12..r15 push.
-        assert!(matches!(ops[0].1, VmEntryOp::Alloc(0xA0)), "first op is sub rsp,0xA0");
+        assert!(
+            matches!(ops[0].1, VmEntryOp::Alloc(0xA0)),
+            "first op is sub rsp,0xA0"
+        );
         let nonvol: Vec<u8> = ops
             .iter()
             .filter_map(|(_, o)| match o {
@@ -989,7 +1110,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(nonvol, vec![3, 5, 6, 7, 15, 14, 13, 12], "nonvolatile pushes in order");
+        assert_eq!(
+            nonvol,
+            vec![3, 5, 6, 7, 15, 14, 13, 12],
+            "nonvolatile pushes in order"
+        );
         for (off, _) in &ops {
             assert!(*off < prolog_len, "code offset {off} within prologue");
         }
@@ -1019,7 +1144,10 @@ mod tests {
         assert_eq!(offsets.len(), n);
         let mut sorted_desc = offsets.clone();
         sorted_desc.sort_unstable_by(|a, b| b.cmp(a));
-        assert_eq!(offsets, sorted_desc, "UNWIND_CODE offsets descending (PE/COFF spec)");
+        assert_eq!(
+            offsets, sorted_desc,
+            "UNWIND_CODE offsets descending (PE/COFF spec)"
+        );
         assert!(alloc_large_ok, "ALLOC_LARGE frame size 160/8=20 found");
         // 첫(가장 큰 offset) 코드 = PUSH_NONVOL r12 (마지막 실행된 push).
         assert_eq!(info[4], offsets[0], "first code = max offset");

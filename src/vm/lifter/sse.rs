@@ -16,7 +16,11 @@ use iced_x86::{Instruction, OpKind};
 pub(super) fn lift_sse(b: &mut BytecodeBuilder, inst: &Instruction, kind: u8) -> Result<()> {
     use iced_x86::Code::*;
     let xmm_idx = |reg: iced_x86::Register| -> u8 {
-        if reg == iced_x86::Register::None { 0 } else { reg.number() as u8 }
+        if reg == iced_x86::Register::None {
+            0
+        } else {
+            reg.number() as u8
+        }
     };
     match kind {
         0 => {
@@ -24,7 +28,12 @@ pub(super) fn lift_sse(b: &mut BytecodeBuilder, inst: &Instruction, kind: u8) ->
             if inst.op1_kind() == OpKind::Register {
                 let src_xmm = xmm_idx(inst.op1_register());
                 // PXOR is bit-identical to XORPS for the 128-bit register file.
-                if matches!(inst.code(), iced_x86::Code::Xorps_xmm_xmmm128 | iced_x86::Code::Xorpd_xmm_xmmm128 | iced_x86::Code::Pxor_xmm_xmmm128) {
+                if matches!(
+                    inst.code(),
+                    iced_x86::Code::Xorps_xmm_xmmm128
+                        | iced_x86::Code::Xorpd_xmm_xmmm128
+                        | iced_x86::Code::Pxor_xmm_xmmm128
+                ) {
                     b.xorps_xmm(xmm, src_xmm);
                 } else {
                     b.unpcklpd_xmm(xmm, src_xmm);
@@ -76,10 +85,18 @@ pub(super) fn lift_sse(b: &mut BytecodeBuilder, inst: &Instruction, kind: u8) ->
 pub(super) fn lift_unpcklps(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     use iced_x86::OpKind;
     let xmm = inst.op0_register();
-    let dst = if xmm == iced_x86::Register::None { 0 } else { xmm.number() as u8 };
+    let dst = if xmm == iced_x86::Register::None {
+        0
+    } else {
+        xmm.number() as u8
+    };
     if inst.op1_kind() == OpKind::Register {
         let src = inst.op1_register();
-        let src_i = if src == iced_x86::Register::None { 0 } else { src.number() as u8 };
+        let src_i = if src == iced_x86::Register::None {
+            0
+        } else {
+            src.number() as u8
+        };
         b.unpcklps_xmm(dst, src_i);
     } else {
         let addr = mem_emit(b, inst, 1)?;
@@ -93,11 +110,19 @@ pub(super) fn lift_unpcklps(b: &mut BytecodeBuilder, inst: &Instruction) -> Resu
 pub(super) fn lift_sseshuffle(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     use iced_x86::Code::*;
     let xmm = inst.op0_register();
-    let xmm_i = if xmm == iced_x86::Register::None { 0 } else { xmm.number() as u8 };
+    let xmm_i = if xmm == iced_x86::Register::None {
+        0
+    } else {
+        xmm.number() as u8
+    };
     let imm = inst.immediate8();
     if inst.op1_kind() == OpKind::Register {
         let src = inst.op1_register();
-        let src_i = if src == iced_x86::Register::None { 0 } else { src.number() as u8 };
+        let src_i = if src == iced_x86::Register::None {
+            0
+        } else {
+            src.number() as u8
+        };
         match inst.code() {
             Pshuflw_xmm_xmmm128_imm8 => b.pshuflw_xmm(xmm_i, src_i, imm),
             Pshufhw_xmm_xmmm128_imm8 => b.pshufhw_xmm(xmm_i, src_i, imm),
@@ -118,15 +143,22 @@ pub(super) fn lift_sseshuffle(b: &mut BytecodeBuilder, inst: &Instruction) -> Re
 /// PSRLLQ / PSRLQ by imm8.
 pub(super) fn lift_sseshift_imm8(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     let xmm = inst.op0_register();
-    let xmm_i = if xmm == iced_x86::Register::None { 0 } else { xmm.number() as u8 };
+    let xmm_i = if xmm == iced_x86::Register::None {
+        0
+    } else {
+        xmm.number() as u8
+    };
     let imm = inst.immediate8();
     match inst.code() {
         iced_x86::Code::Psrlq_xmm_imm8 => b.psrlq_xmm_imm8(xmm_i, imm),
         iced_x86::Code::Psllq_xmm_imm8 => b.psllq_xmm_imm8(xmm_i, imm),
-        _ => return Err(crate::error::VmCompilerError::UnsupportedInstruction {
-            instruction: inst.to_string(),
-            code: format!("{:?}", inst.code()),
-        }.into()),
+        _ => {
+            return Err(crate::error::VmCompilerError::UnsupportedInstruction {
+                instruction: inst.to_string(),
+                code: format!("{:?}", inst.code()),
+            }
+            .into())
+        }
     }
     Ok(())
 }
@@ -169,7 +201,11 @@ pub(super) fn lift_tzcnt(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<
 
 /// XMM register index helper (None -> 0, matching the other lifts here).
 fn xidx(reg: iced_x86::Register) -> u8 {
-    if reg == iced_x86::Register::None { 0 } else { reg.number() as u8 }
+    if reg == iced_x86::Register::None {
+        0
+    } else {
+        reg.number() as u8
+    }
 }
 
 /// Load a m32/m64 scalar FP source into scratch XMM15 (via a GPR for m32 so
@@ -199,7 +235,12 @@ pub(super) fn lift_sse_fp(b: &mut BytecodeBuilder, inst: &Instruction) -> Result
         Mulsd_xmm_xmmm64 => (OP_MULSD_XMM, true),
         Divss_xmm_xmmm32 => (OP_DIVSS_XMM, false),
         Divsd_xmm_xmmm64 => (OP_DIVSD_XMM, true),
-        _ => return Err(anyhow::anyhow!("lifter: unsupported SSE FP op {:?}", inst.code())),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "lifter: unsupported SSE FP op {:?}",
+                inst.code()
+            ))
+        }
     };
     let src = if inst.op1_kind() == OpKind::Register {
         xidx(inst.op1_register())
@@ -282,15 +323,28 @@ pub(super) fn lift_cvt(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()
                 b.movsd_xmm_mem(15, addr);
                 15
             };
-            b.cvt_fp_fp(if ss2sd { OP_CVTSS2SD_XMM } else { OP_CVTSD2SS_XMM }, dst, src);
+            b.cvt_fp_fp(
+                if ss2sd {
+                    OP_CVTSS2SD_XMM
+                } else {
+                    OP_CVTSD2SS_XMM
+                },
+                dst,
+                src,
+            );
         }
         // float -> int
-        Cvttss2si_r32_xmmm32 | Cvttss2si_r64_xmmm32
-        | Cvttsd2si_r32_xmmm64 | Cvttsd2si_r64_xmmm64
-        | Cvtss2si_r32_xmmm32 | Cvtss2si_r64_xmmm32
+        Cvttss2si_r32_xmmm32 | Cvttss2si_r64_xmmm32 | Cvttsd2si_r32_xmmm64
+        | Cvttsd2si_r64_xmmm64 | Cvtss2si_r32_xmmm32 | Cvtss2si_r64_xmmm32
         | Cvtsd2si_r32_xmmm64 | Cvtsd2si_r64_xmmm64 => {
             let dst = super::vreg(dst0)?;
-            let is_ss = matches!(inst.code(), Cvttss2si_r32_xmmm32 | Cvttss2si_r64_xmmm32 | Cvtss2si_r32_xmmm32 | Cvtss2si_r64_xmmm32);
+            let is_ss = matches!(
+                inst.code(),
+                Cvttss2si_r32_xmmm32
+                    | Cvttss2si_r64_xmmm32
+                    | Cvtss2si_r32_xmmm32
+                    | Cvtss2si_r64_xmmm32
+            );
             let src = if inst.op1_kind() == OpKind::Register {
                 xidx(inst.op1_register())
             } else {
@@ -309,7 +363,12 @@ pub(super) fn lift_cvt(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()
                 b.shift64_r_imm8(OP_SAR64_R_IMM8, dst, 32);
             }
         }
-        _ => return Err(anyhow::anyhow!("lifter: unsupported CVT op {:?}", inst.code())),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "lifter: unsupported CVT op {:?}",
+                inst.code()
+            ))
+        }
     }
     Ok(())
 }
@@ -334,7 +393,12 @@ pub(super) fn lift_pext_pins(b: &mut BytecodeBuilder, inst: &Instruction) -> Res
             };
             b.pinsrd_xmm(dst, s, inst.immediate8());
         }
-        _ => return Err(anyhow::anyhow!("lifter: unsupported PEXTR/PINSR op {:?}", inst.code())),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "lifter: unsupported PEXTR/PINSR op {:?}",
+                inst.code()
+            ))
+        }
     }
     Ok(())
 }

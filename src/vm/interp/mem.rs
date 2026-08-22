@@ -6,7 +6,9 @@
 // addressing-mode loads/stores (v24 _A suffix), and the address-computation
 // ops (LEA / SET_RIP / LEA_RIP / LEA_GS).
 
-use super::state::{VmError, STATE_RIP, STATE_SEG_GS, mem_get, mem_put, ptr_slot, set_vreg64, vreg64};
+use super::state::{
+    mem_get, mem_put, ptr_slot, set_vreg64, vreg64, VmError, STATE_RIP, STATE_SEG_GS,
+};
 use crate::vm::bytecode::*;
 
 /// Execute one memory / addressing opcode. `ip` points at the first operand
@@ -43,7 +45,8 @@ pub(crate) fn exec(
             *mem.get_mut(addr).ok_or(VmError::OobMem)? = byte;
             Ok(ip)
         }
-        OP_MOVZX_R_MEM16 | OP_MOVZX_R_MEM32 | OP_MOVSX_R_MEM8 | OP_MOVSX_R_MEM16 | OP_MOV_R_MEM64 => {
+        OP_MOVZX_R_MEM16 | OP_MOVZX_R_MEM32 | OP_MOVSX_R_MEM8 | OP_MOVSX_R_MEM16
+        | OP_MOV_R_MEM64 => {
             let dst = code[ip] as usize;
             let slot = code[ip + 1] as usize;
             let idx = code[ip + 2] as usize;
@@ -60,12 +63,19 @@ pub(crate) fn exec(
                     let v = mem_get(mem, addr, 4).ok_or(VmError::OobMem)?;
                     u32::from_le_bytes(v[..4].try_into().unwrap()) as u64
                 }
-                OP_MOVSX_R_MEM8 => mem_get(mem, addr, 1).ok_or(VmError::OobMem)?[0] as i8 as i64 as u64,
+                OP_MOVSX_R_MEM8 => {
+                    mem_get(mem, addr, 1).ok_or(VmError::OobMem)?[0] as i8 as i64 as u64
+                }
                 OP_MOVSX_R_MEM16 => {
                     let v = mem_get(mem, addr, 2).ok_or(VmError::OobMem)?;
                     i16::from_le_bytes(v[..2].try_into().unwrap()) as i64 as u64
                 }
-                _ => u64::from_le_bytes(mem_get(mem, addr, 8).ok_or(VmError::OobMem)?.try_into().unwrap()),
+                _ => u64::from_le_bytes(
+                    mem_get(mem, addr, 8)
+                        .ok_or(VmError::OobMem)?
+                        .try_into()
+                        .unwrap(),
+                ),
             };
             set_vreg64(state, dst, val)?;
             Ok(ip)
@@ -123,7 +133,8 @@ pub(crate) fn exec(
             set_vreg64(state, dst, gs.wrapping_add(disp))?;
             Ok(ip)
         }
-        OP_MOVZX_R_MEM8_A | OP_MOVZX_R_MEM16_A | OP_MOVZX_R_MEM32_A | OP_MOVSX_R_MEM8_A | OP_MOVSX_R_MEM16_A | OP_MOV_R_MEM64_A => {
+        OP_MOVZX_R_MEM8_A | OP_MOVZX_R_MEM16_A | OP_MOVZX_R_MEM32_A | OP_MOVSX_R_MEM8_A
+        | OP_MOVSX_R_MEM16_A | OP_MOV_R_MEM64_A => {
             let dst = code[ip] as usize;
             let addr = vreg64(state, code[ip + 1] as usize)? as usize;
             let ip = ip + 2;
@@ -137,12 +148,19 @@ pub(crate) fn exec(
                     let v = mem_get(mem, addr, 4).ok_or(VmError::OobMem)?;
                     u32::from_le_bytes(v[..4].try_into().unwrap()) as u64
                 }
-                OP_MOVSX_R_MEM8_A => mem_get(mem, addr, 1).ok_or(VmError::OobMem)?[0] as i8 as i64 as u64,
+                OP_MOVSX_R_MEM8_A => {
+                    mem_get(mem, addr, 1).ok_or(VmError::OobMem)?[0] as i8 as i64 as u64
+                }
                 OP_MOVSX_R_MEM16_A => {
                     let v = mem_get(mem, addr, 2).ok_or(VmError::OobMem)?;
                     i16::from_le_bytes(v[..2].try_into().unwrap()) as i64 as u64
                 }
-                _ => u64::from_le_bytes(mem_get(mem, addr, 8).ok_or(VmError::OobMem)?.try_into().unwrap()),
+                _ => u64::from_le_bytes(
+                    mem_get(mem, addr, 8)
+                        .ok_or(VmError::OobMem)?
+                        .try_into()
+                        .unwrap(),
+                ),
             };
             set_vreg64(state, dst, val)?;
             Ok(ip)

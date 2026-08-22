@@ -15,9 +15,7 @@ pub struct RiscDesynthesizer {
 
 impl RiscDesynthesizer {
     pub fn new() -> Self {
-        Self {
-            instrs: Vec::new(),
-        }
+        Self { instrs: Vec::new() }
     }
 
     /// NOT(x) -> NOR(x, x)
@@ -162,16 +160,14 @@ impl RiscDesynthesizer {
 
     /// PUSH(val)
     pub fn emit_push(&mut self, val: MicroOperand) {
-        self.instrs.push(
-            MicroInstr::new(RiscOp::VirtualPush).with_src1(val),
-        );
+        self.instrs
+            .push(MicroInstr::new(RiscOp::VirtualPush).with_src1(val));
     }
 
     /// POP(dst)
     pub fn emit_pop(&mut self, dst: MicroOperand) {
-        self.instrs.push(
-            MicroInstr::new(RiscOp::VirtualPop).with_dst(dst),
-        );
+        self.instrs
+            .push(MicroInstr::new(RiscOp::VirtualPop).with_dst(dst));
     }
 
     /// JMP(target)

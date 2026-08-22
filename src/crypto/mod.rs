@@ -47,7 +47,9 @@ pub enum CryptoMode {
 }
 
 pub use mac::BtgKeyedMac;
-pub use provider::{chain_encrypt, chain_encrypt_with, BlockCryptoMeta, CryptoError, CryptoProvider};
+pub use provider::{
+    chain_encrypt, chain_encrypt_with, BlockCryptoMeta, CryptoError, CryptoProvider,
+};
 pub use state::{BtgCipher, BtgState};
 
 #[cfg(test)]

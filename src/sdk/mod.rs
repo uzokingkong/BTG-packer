@@ -9,7 +9,7 @@ pub mod selective;
 pub use llvm_interface::{
     LlvmIngestionInterface, LlvmSynthesizer, LlvmVirtualFunction, PolyConsumptionRuntime,
 };
-pub use markers::{MarkerScanner, SIG_VM_END, SIG_VM_START, VmMarkerRegion};
+pub use markers::{MarkerScanner, VmMarkerRegion, SIG_VM_END, SIG_VM_START};
 pub use selective::SelectiveVirtualizer;
 
 #[cfg(test)]

@@ -13,13 +13,25 @@ pub(crate) fn lift_program(
     image_base: u64,
     vm_oep_effective: bool,
     vm_commercial: bool,
-) -> Result<(Vec<u8>, bool, u64, Option<std::collections::HashMap<u64, usize>>)> {
+) -> Result<(
+    Vec<u8>,
+    bool,
+    u64,
+    Option<std::collections::HashMap<u64, usize>>,
+    Option<vm::threaded::PreparedSuperOpProgram>,
+    Option<crate::pipeline::VmCoverageMetrics>,
+    Vec<vm::chunk_crypto::BytecodeChunk>,
+)> {
     // P3 (G1): 상용 프로그램 리프트의 ip_map (source-IP -> micro-op index) — the
     // VirtualBranch native handler uses it to resolve branch targets to bytecode
     // byte offsets. Populated in the lift below and passed to build_prog_vm_mod.
     let mut vm_prog_ip_map: Option<std::collections::HashMap<u64, usize>> = None;
+    let mut vm_prog_superops: Option<vm::threaded::PreparedSuperOpProgram> = None;
+    let mut vm_coverage = None;
+    let mut vm_prog_chunks = Vec::new();
 
-    let (vm_prog_bytecode, vm_oep_native_entry, oep_va): (Vec<u8>, bool, u64) = if vm_oep_effective {
+    let (vm_prog_bytecode, vm_oep_native_entry, oep_va): (Vec<u8>, bool, u64) = if vm_oep_effective
+    {
         let base_va = image_base + ctx.target_info.text_rva as u64;
         let ep_va = image_base + ctx.target_info.entry_point_rva as u64;
         let (prog_bytecode, entry_native): (Vec<u8>, bool) = if vm_commercial {
@@ -31,10 +43,68 @@ pub(crate) fn lift_program(
                 image_base,
             )?;
             vm_prog_ip_map = lift.program.ip_map().cloned();
-            let mut enc = crate::vm::poly::PolymorphicEncoder::new(ctx.poly_vm_seed);
-            // P3 (G1): 상용 리프트 매핑 — commercial.rs가 lift 시점에 기록한 RISC
-            // 엔트리에 per-micro-op 폴리 바이트코드 오프셋을 채운다 (--map/--sym-map).
-            let (bc, offsets) = enc.encode_with_offsets(&lift.program)?;
+            vm_coverage = Some(crate::pipeline::VmCoverageMetrics {
+                vm_blocks: lift.virtualized_blocks,
+                total_blocks: lift.blocks,
+                vm_instructions: lift.virtualized_instructions,
+                total_instructions: lift.total_instructions,
+                vm_functions: lift.virtualized_functions,
+                total_functions: lift.total_functions,
+                hot_path_profiled: lift.hot_path_profiled,
+                hot_vm_weight: lift.hot_vm_weight,
+                hot_total_weight: lift.hot_total_weight,
+                sensitive_regions: lift.sensitive_regions,
+            });
+            let prepared = vm::threaded::SuperOperatorSynthesizer::prepare_commercial_program(
+                &lift.program,
+                ctx.poly_vm_seed,
+            )?;
+            if let Some(ref p) = prepared {
+                let fused_occurrences: usize = p
+                    .assigned
+                    .iter()
+                    .map(|superop| superop.plan.occurrences.len())
+                    .sum();
+                let dispatch_savings: usize = p
+                    .assigned
+                    .iter()
+                    .map(|superop| superop.plan.candidate.estimated_dispatch_savings)
+                    .sum();
+                println!(
+                    "[+] --vm-commercial P5: selected {} build-local super-op(s), fused {} occurrence(s), removed {} dispatch(es) ({} -> {} stream instructions)",
+                    p.assigned.len(),
+                    fused_occurrences,
+                    dispatch_savings,
+                    lift.program.instrs.len(),
+                    p.rewritten_offsets.len(),
+                );
+            } else {
+                println!(
+                    "[+] --vm-commercial P5: no profitable super-op sequence; using primitive polymorphic stream"
+                );
+            }
+            let (bc, offsets) = if let Some(ref p) = prepared {
+                (p.bytecode.clone(), p.metadata.original_byte_offsets.clone())
+            } else {
+                let mut enc = crate::vm::poly::PolymorphicEncoder::new(ctx.poly_vm_seed);
+                enc.encode_with_offsets(&lift.program)?
+            };
+            if ctx.m7 {
+                vm_prog_chunks = vm::chunk_crypto::plan_chunks(
+                    bc.len(),
+                    &offsets,
+                    ctx.poly_vm_seed,
+                    vm::chunk_crypto::DEFAULT_CHUNK_BYTES,
+                );
+                println!(
+                    "[+] P1-4 Program-VM M7: planned {} instruction-aligned bytecode chunk(s), max {}B",
+                    vm_prog_chunks.len(),
+                    vm::chunk_crypto::DEFAULT_CHUNK_BYTES
+                );
+            }
+            vm_prog_superops = prepared;
+            // P3/P5 mapping: offsets always correspond to original micro-op
+            // indices, even when multiple fused body members share one offset.
             if crate::vm::mapper::active() {
                 crate::vm::mapper::fill_risc_poly_offsets(&offsets);
             }
@@ -70,5 +140,13 @@ pub(crate) fn lift_program(
         (Vec::new(), false, 0)
     };
 
-    Ok((vm_prog_bytecode, vm_oep_native_entry, oep_va, vm_prog_ip_map))
+    Ok((
+        vm_prog_bytecode,
+        vm_oep_native_entry,
+        oep_va,
+        vm_prog_ip_map,
+        vm_prog_superops,
+        vm_coverage,
+        vm_prog_chunks,
+    ))
 }

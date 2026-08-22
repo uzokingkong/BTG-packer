@@ -5,7 +5,7 @@
 // Covers JMP/JB/JCC (rel8) and JMP/JCC (rel32). HALT is handled directly in
 // mod.rs (it terminates the interpret loop), not here.
 
-use super::state::{VmError, flags_of};
+use super::state::{flags_of, VmError};
 use crate::vm::bytecode::*;
 use crate::vm::flags;
 

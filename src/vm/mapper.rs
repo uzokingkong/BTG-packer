@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // BTG v42 - VM Bytecode Mapper (debugging aid)
 // ==============================================================================
 //
@@ -175,12 +175,7 @@ pub fn set_dispatcher_mode(mode: &str) {
 /// `bc_offset` is the VM bytecode offset at which this instruction's
 /// translation begins (the caller must pass `builder.bytes.len()` captured
 /// *before* emitting the instruction's bytecode).
-pub fn record(
-    bc_offset: usize,
-    inst: &Instruction,
-    src_va: u64,
-    kind: &'static str,
-) {
+pub fn record(bc_offset: usize, inst: &Instruction, src_va: u64, kind: &'static str) {
     SLOT.with(|s| {
         if let Some(m) = s.borrow_mut().as_mut() {
             m.entries.push(MapEntry {
@@ -333,7 +328,9 @@ pub fn render(m: &VmMapper) -> String {
         ));
     }
     out.push_str("; ----- promoted mapping (original VA -> protected VA -> block -> vm type -> handler -> crypto region) -----\n");
-    out.push_str("; format: src_va protected_va block vm_type handler crypto_region bc_offset disasm\n");
+    out.push_str(
+        "; format: src_va protected_va block vm_type handler crypto_region bc_offset disasm\n",
+    );
     for e in &m.entries {
         let block_id = m
             .blocks
@@ -368,7 +365,9 @@ pub fn render(m: &VmMapper) -> String {
             "0x{:X} {} {} {} {} {} 0x{:X} {}\n",
             e.src_va,
             pva,
-            block_id.map(|b| format!("#{}", b)).unwrap_or_else(|| "-".to_string()),
+            block_id
+                .map(|b| format!("#{}", b))
+                .unwrap_or_else(|| "-".to_string()),
             e.kind,
             handler,
             region,
@@ -436,7 +435,10 @@ pub fn render_sym(m: &VmMapper, funcs: &[(u64, u64)], image_base: u64) -> String
         while bi + 1 < m.blocks.len() && e.bc_offset >= m.blocks[bi + 1].bc_start {
             bi += 1;
         }
-        let bid = if bi < m.blocks.len() && e.bc_offset >= m.blocks[bi].bc_start && e.bc_offset < m.blocks[bi].bc_end {
+        let bid = if bi < m.blocks.len()
+            && e.bc_offset >= m.blocks[bi].bc_start
+            && e.bc_offset < m.blocks[bi].bc_end
+        {
             m.blocks[bi].id
         } else {
             u32::MAX

@@ -1,4 +1,6 @@
-use iced_x86::{BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, MemoryOperand, Register};
+use iced_x86::{
+    BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, MemoryOperand, Register,
+};
 
 // ==============================================================================
 // v8 (Phase 0.3) ????븐슜裕??關????⑤베吏?"???덈뺄 ??????筌뤿굞?? ??븐슜裕??關??
@@ -151,7 +153,10 @@ pub fn build_dispatcher_reencrypt(
         Instruction::with2(Code::Cmp_rm64_imm32, Register::R10, num_blocks as i32)?,
         None,
     );
-    push_seq(Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 0)?, None);
+    push_seq(
+        Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 0)?,
+        None,
+    );
     push_seq(
         Instruction::with2(Code::Cmovae_r64_rm64, Register::R10, Register::RCX)?,
         None,
@@ -185,8 +190,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Lea_r32_m,
             Register::EAX,
             mem_idx(Register::R10, Register::R11, 1),
-        )
-        ?,
+        )?,
         Some(L::DecTarget),
     ); // eax = seed + target (mod 2^32)
     push_seq(
@@ -201,23 +205,27 @@ pub fn build_dispatcher_reencrypt(
         Instruction::with2(Code::Mov_r32_rm32, Register::R13D, Register::R10D)?,
         None,
     ); // r13 = target id
-    // ---- v14: thread/re-entrancy-safe dispatch state machine (decrypt-once) ----
-    // v8~v13 "dispatch-time decrypt + return-time re-encrypt" raced when two
-    // execution contexts (threads / re-entrant callbacks) dispatched the same
-    // block concurrently: in-place RC4 double-crypt left the block in ciphertext
-    // state while executing -> 0xC0000005 (0xC18DE class). v14 removes the
-    // re-encrypt step and uses the length-table entry as the block state:
-    //   - entry == 0xFFFFFFFE : another context is decrypting -> spin
-    //   - entry ^ key == 0     : plaintext / already decrypted -> skip
-    //   - else (encrypted)     : lock cmpxchg(entry -> 0xFFFFFFFE) claims the
-    //     decrypt; the winner RC4-decrypts then writes entry = key (plaintext
-    //     marker). The block stays plaintext forever after first execution.
+       // ---- v14: thread/re-entrancy-safe dispatch state machine (decrypt-once) ----
+       // v8~v13 "dispatch-time decrypt + return-time re-encrypt" raced when two
+       // execution contexts (threads / re-entrant callbacks) dispatched the same
+       // block concurrently: in-place RC4 double-crypt left the block in ciphertext
+       // state while executing -> 0xC0000005 (0xC18DE class). v14 removes the
+       // re-encrypt step and uses the length-table entry as the block state:
+       //   - entry == 0xFFFFFFFE : another context is decrypting -> spin
+       //   - entry ^ key == 0     : plaintext / already decrypted -> skip
+       //   - else (encrypted)     : lock cmpxchg(entry -> 0xFFFFFFFE) claims the
+       //     decrypt; the winner RC4-decrypts then writes entry = key (plaintext
+       //     marker). The block stays plaintext forever after first execution.
     push_seq(
         Instruction::with2(Code::Lea_r64_m, Register::RSI, rip_va(length_table_va))?,
         None,
     ); // rsi = length table base (block state)
     push_seq(
-        Instruction::with2(Code::Mov_r32_rm32, Register::EAX, mem_idx(Register::RSI, Register::R13, 4))?,
+        Instruction::with2(
+            Code::Mov_r32_rm32,
+            Register::EAX,
+            mem_idx(Register::RSI, Register::R13, 4),
+        )?,
         Some(L::ClaimSpin),
     ); // eax = entry
     push_seq(
@@ -252,15 +260,14 @@ pub fn build_dispatcher_reencrypt(
         Code::Cmpxchg_rm32_r32,
         mem_idx(Register::RSI, Register::R13, 4),
         Register::R8D,
-    )
-    ?;
+    )?;
     cas.set_has_lock_prefix(true);
     push_seq(cas, None); // lock cmpxchg [rsi+r13*4], r8d ; expected = eax (entry)
     push_seq(
         Instruction::with_branch(Code::Jne_rel32_64, 0)?,
         Some(L::ClaimSpin),
     ); // claim lost -> retry
-    // claim won: eax = original entry, edx = len -> RC4 decrypt
+       // claim won: eax = original entry, edx = len -> RC4 decrypt
     push_seq(
         Instruction::with_branch(Code::Call_rel32_64, 0)?,
         Some(L::BlockCrypt),
@@ -275,7 +282,11 @@ pub fn build_dispatcher_reencrypt(
         None,
     );
     push_seq(
-        Instruction::with2(Code::Mov_rm32_r32, mem_idx(Register::RSI, Register::R13, 4), Register::EAX)?,
+        Instruction::with2(
+            Code::Mov_rm32_r32,
+            mem_idx(Register::RSI, Register::R13, 4),
+            Register::EAX,
+        )?,
         None,
     );
 
@@ -295,8 +306,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Mov_r32_rm32,
             Register::ECX,
             mem_idx(Register::RAX, Register::R10, 4),
-        )
-        ?,
+        )?,
         None,
     );
     push_seq(
@@ -304,8 +314,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Lea_r32_m,
             Register::EAX,
             mem_idx(Register::R10, Register::R11, 1),
-        )
-        ?,
+        )?,
         None,
     );
     push_seq(
@@ -377,7 +386,10 @@ pub fn build_dispatcher_reencrypt(
         Instruction::with2(Code::Lea_r64_m, Register::RCX, mem(Register::RSP, 0x180))?,
         None,
     );
-    push_seq(Instruction::with2(Code::Mov_r32_imm32, Register::R8D, 64)?, None);
+    push_seq(
+        Instruction::with2(Code::Mov_r32_imm32, Register::R8D, 64)?,
+        None,
+    );
     // key256 = key4 64???꾩룇瑗??(??貫臾?Rc4::new(&key4)??key[i%4]?? ???됰뎄)
     push_seq(
         Instruction::with2(Code::Mov_rm32_r32, mem(Register::RCX, 0), Register::EAX)?,
@@ -402,8 +414,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Mov_r32_rm32,
             Register::ECX,
             mem_idx(Register::RAX, Register::R13, 4),
-        )
-        ?,
+        )?,
         None,
     );
     push_seq(
@@ -422,7 +433,7 @@ pub fn build_dispatcher_reencrypt(
         Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RAX)?,
         None,
     ); // block base
-    // KSA(key256, sbox)
+       // KSA(key256, sbox)
     push_seq(
         Instruction::with2(Code::Lea_r64_m, Register::RCX, mem(Register::RSP, 0x180))?,
         None,
@@ -460,8 +471,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Mov_rm8_r8,
             mem_idx(Register::RBX, Register::RSI, 1),
             Register::SIL,
-        )
-        ?,
+        )?,
         Some(L::KsaInit),
     ); // S[i] = i
     push_seq(Instruction::with1(Code::Inc_rm32, Register::ESI)?, None);
@@ -486,8 +496,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Movzx_r32_rm8,
             Register::EAX,
             mem_idx(Register::RBX, Register::RSI, 1),
-        )
-        ?,
+        )?,
         Some(L::KsaLoop),
     );
     push_seq(
@@ -499,8 +508,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Movzx_r32_rm8,
             Register::EAX,
             mem_idx(Register::RCX, Register::RSI, 1),
-        )
-        ?,
+        )?,
         None,
     );
     push_seq(
@@ -516,8 +524,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Movzx_r32_rm8,
             Register::EAX,
             mem_idx(Register::RBX, Register::RSI, 1),
-        )
-        ?,
+        )?,
         None,
     );
     push_seq(
@@ -525,8 +532,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Movzx_r32_rm8,
             Register::R8D,
             mem_idx(Register::RBX, Register::RDI, 1),
-        )
-        ?,
+        )?,
         None,
     );
     push_seq(
@@ -534,8 +540,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Mov_rm8_r8,
             mem_idx(Register::RBX, Register::RDI, 1),
             Register::AL,
-        )
-        ?,
+        )?,
         None,
     );
     push_seq(
@@ -543,8 +548,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Mov_rm8_r8,
             mem_idx(Register::RBX, Register::RSI, 1),
             Register::R8L,
-        )
-        ?,
+        )?,
         None,
     );
     push_seq(Instruction::with1(Code::Inc_rm32, Register::ESI)?, None);
@@ -567,7 +571,10 @@ pub fn build_dispatcher_reencrypt(
         Instruction::with_branch(Code::Je_rel32_64, 0)?,
         Some(L::PrgaDone),
     );
-    push_seq(Instruction::with1(Code::Inc_rm32, Register::ESI)?, Some(L::PrgaLoop));
+    push_seq(
+        Instruction::with1(Code::Inc_rm32, Register::ESI)?,
+        Some(L::PrgaLoop),
+    );
     push_seq(
         Instruction::with2(Code::And_rm32_imm32, Register::ESI, 0xFF)?,
         None,
@@ -577,8 +584,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Movzx_r32_rm8,
             Register::EAX,
             mem_idx(Register::RBX, Register::RSI, 1),
-        )
-        ?,
+        )?,
         None,
     );
     push_seq(
@@ -594,8 +600,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Movzx_r32_rm8,
             Register::R8D,
             mem_idx(Register::RBX, Register::RSI, 1),
-        )
-        ?,
+        )?,
         None,
     );
     push_seq(
@@ -603,8 +608,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Movzx_r32_rm8,
             Register::R9D,
             mem_idx(Register::RBX, Register::RDI, 1),
-        )
-        ?,
+        )?,
         None,
     );
     push_seq(
@@ -612,8 +616,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Mov_rm8_r8,
             mem_idx(Register::RBX, Register::RDI, 1),
             Register::R8L,
-        )
-        ?,
+        )?,
         None,
     );
     push_seq(
@@ -621,8 +624,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Mov_rm8_r8,
             mem_idx(Register::RBX, Register::RSI, 1),
             Register::R9L,
-        )
-        ?,
+        )?,
         None,
     );
     push_seq(
@@ -642,8 +644,7 @@ pub fn build_dispatcher_reencrypt(
             Code::Movzx_r32_rm8,
             Register::EAX,
             mem_idx(Register::RBX, Register::RAX, 1),
-        )
-        ?,
+        )?,
         None,
     );
     push_seq(
@@ -679,16 +680,17 @@ pub fn build_dispatcher_reencrypt(
     for (inst, lbl) in seq.iter_mut() {
         if let Some(l) = lbl {
             if is_branch(inst.code()) {
-                let target = *label_ips
-                    .get(&l)
-                    .ok_or_else(|| anyhow::anyhow!("reencrypt dispatcher: unresolved label {l:?}"))?;
+                let target = *label_ips.get(&l).ok_or_else(|| {
+                    anyhow::anyhow!("reencrypt dispatcher: unresolved label {l:?}")
+                })?;
                 *inst = Instruction::with_branch(inst.code(), target)?;
             }
         }
     }
     let insts: Vec<Instruction> = seq.into_iter().map(|(i, _)| i).collect();
     let block = InstructionBlock::new(&insts, disp_base_va);
-    let enc = BlockEncoder::encode(64, block, enc_opts).map_err(|e| anyhow::anyhow!("reencrypt dispatcher BlockEncoder failed: {e}"))?;
+    let enc = BlockEncoder::encode(64, block, enc_opts)
+        .map_err(|e| anyhow::anyhow!("reencrypt dispatcher BlockEncoder failed: {e}"))?;
     let code = enc.code_buffer;
     let expected = (ip - disp_base_va) as usize;
     if code.len() != expected {

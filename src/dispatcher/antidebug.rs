@@ -86,29 +86,33 @@ impl AntiDebugPolicy {
 /// - Trap: Ud2로 SIGILL 발생 (기본, sensitive)
 /// - Hang: `jmp $` 무한 루프 (research/툴 고정)
 /// - Warn: fail-open — 정상 경로로 계속 (consumer/diagnostic, 검사는 위험 신호)
-pub fn build_anti_debug_shellcode(ad_va: u64, dispatcher_va: u64, policy: AntiDebugPolicy) -> Vec<u8> {
+pub fn build_anti_debug_shellcode(
+    ad_va: u64,
+    dispatcher_va: u64,
+    policy: AntiDebugPolicy,
+) -> Vec<u8> {
     let mut b = Vec::with_capacity(ANTI_DEBUG_SIZE);
     // ── PEB.BeingDebugged 검사 ──────────────────────────────────────────────
     b.extend_from_slice(&[
         0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00, // mov rax, gs:[0x60] (PEB)
-        0x0F, 0xB6, 0x40, 0x02,                               // movzx eax, byte [rax+2]
-        0x85, 0xC0,                                           // test eax, eax
-        0x75, 0x35,                                           // jnz +0x35 → ud2 @0x46
+        0x0F, 0xB6, 0x40, 0x02, // movzx eax, byte [rax+2]
+        0x85, 0xC0, // test eax, eax
+        0x75, 0x35, // jnz +0x35 → ud2 @0x46
     ]);
     // ── PEB.NtGlobalFlag 검사 ───────────────────────────────────────────────
     b.extend_from_slice(&[
         0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00, // mov rax, gs:[0x60]
-        0x8B, 0x80, 0xBC, 0x00, 0x00, 0x00,                   // mov eax, [rax+0xBC]
-        0x25, 0x70, 0x00, 0x00, 0x00,                         // and eax, 0x70
-        0x75, 0x1F,                                           // jnz +0x1F → ud2 @0x46
+        0x8B, 0x80, 0xBC, 0x00, 0x00, 0x00, // mov eax, [rax+0xBC]
+        0x25, 0x70, 0x00, 0x00, 0x00, // and eax, 0x70
+        0x75, 0x1F, // jnz +0x1F → ud2 @0x46
     ]);
     // ── ProcessHeap.Flags 검사 ───────────────────────────────────────────────
     b.extend_from_slice(&[
         0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00, // mov rax, gs:[0x60]
-        0x48, 0x8B, 0x40, 0x30,                               // mov rax, [rax+0x30] (ProcessHeap)
-        0x8B, 0x80, 0x70, 0x00, 0x00, 0x00,                   // mov eax, [rax+0x70] (Heap.Flags)
-        0x25, 0x70, 0x00, 0x00, 0x00,                         // and eax, 0x70
-        0x75, 0x05,                                           // jnz +0x05 → ud2 @0x46
+        0x48, 0x8B, 0x40, 0x30, // mov rax, [rax+0x30] (ProcessHeap)
+        0x8B, 0x80, 0x70, 0x00, 0x00, 0x00, // mov eax, [rax+0x70] (Heap.Flags)
+        0x25, 0x70, 0x00, 0x00, 0x00, // and eax, 0x70
+        0x75, 0x05, // jnz +0x05 → ud2 @0x46
     ]);
     // ── 정상 경로: 디스패처로 점프 (rel32) ──────────────────────────────────
     let jmp_off = b.len() as u64; // 0x41
@@ -138,7 +142,11 @@ pub fn build_anti_debug_shellcode(ad_va: u64, dispatcher_va: u64, policy: AntiDe
             b.extend_from_slice(&[0x90, 0x90]);
         }
     }
-    debug_assert_eq!(b.len(), ANTI_DEBUG_SIZE, "anti-debug shellcode layout drift");
+    debug_assert_eq!(
+        b.len(),
+        ANTI_DEBUG_SIZE,
+        "anti-debug shellcode layout drift"
+    );
     b
 }
 
@@ -152,14 +160,18 @@ mod tests {
     #[test]
     fn test_anti_debug_size() {
         let code = build_anti_debug_shellcode(0x140001000, 0x140000020, AntiDebugPolicy::Trap);
-        assert_eq!(code.len(), ANTI_DEBUG_SIZE, "Anti-debug code must be exactly 72 bytes");
+        assert_eq!(
+            code.len(),
+            ANTI_DEBUG_SIZE,
+            "Anti-debug code must be exactly 72 bytes"
+        );
     }
 
     #[test]
     fn test_anti_debug_contains_ud2() {
         let code = build_anti_debug_shellcode(0x140001000, 0x140000020, AntiDebugPolicy::Trap);
         // 마지막 2바이트는 ud2 (0x0F 0x0B)
-        assert_eq!(&code[code.len()-2..], &[0x0F, 0x0B]);
+        assert_eq!(&code[code.len() - 2..], &[0x0F, 0x0B]);
     }
 
     #[test]
@@ -191,8 +203,11 @@ mod tests {
             assert_eq!(target, 0x46, "jnz @0x{:X} must target ud2 @0x46", off);
         }
         // PEB 접근이 gs:[0x60] 기반인지 (gs:[0x30] 버그 회귀 방지)
-        assert!(code.windows(9).any(|w| w == [0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]),
-            "all PEB reads must use gs:[0x60]");
+        assert!(
+            code.windows(9)
+                .any(|w| w == [0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]),
+            "all PEB reads must use gs:[0x60]"
+        );
         // ProcessHeap는 [PEB+0x30] 경유 (mov rax,[rax+0x30])
         assert!(code.windows(4).any(|w| w == [0x48, 0x8B, 0x40, 0x30]));
     }
@@ -223,7 +238,11 @@ mod tests {
         for off in [0x0Fusize, 0x25, 0x3F] {
             let rel = code[off + 1] as i8 as i64;
             let target = off as i64 + 2 + rel;
-            assert_eq!(target, 0x41, "jnz @0x{:X} must redirect to normal path @0x41", off);
+            assert_eq!(
+                target, 0x41,
+                "jnz @0x{:X} must redirect to normal path @0x41",
+                off
+            );
         }
         // 0x41의 jmp rel32는 여전히 디스패처를 가리켜야 한다.
         let disp = i32::from_le_bytes(code[0x42..0x46].try_into().unwrap()) as i64;
@@ -238,7 +257,11 @@ mod tests {
     fn test_anti_debug_poison_policy() {
         let code = build_anti_debug_shellcode(0x140001000, 0x140002000, AntiDebugPolicy::Poison);
         assert_eq!(code.len(), ANTI_DEBUG_SIZE);
-        assert_eq!(&code[0x46..0x48], &[0xEB, 0xF9], "poison slot must be jmp -7 to 0x41");
+        assert_eq!(
+            &code[0x46..0x48],
+            &[0xEB, 0xF9],
+            "poison slot must be jmp -7 to 0x41"
+        );
     }
 
     /// readccc §4.5: 모든 정책에서 정상 경로(디스패처 점프)는 동일하게 유지되어야 한다.
@@ -246,12 +269,20 @@ mod tests {
     fn test_anti_debug_policies_share_normal_path() {
         let ad_va = 0x140001000u64;
         let disp_va = 0x140002000u64;
-        for policy in [AntiDebugPolicy::Trap, AntiDebugPolicy::Hang, AntiDebugPolicy::Warn, AntiDebugPolicy::Poison] {
+        for policy in [
+            AntiDebugPolicy::Trap,
+            AntiDebugPolicy::Hang,
+            AntiDebugPolicy::Warn,
+            AntiDebugPolicy::Poison,
+        ] {
             let code = build_anti_debug_shellcode(ad_va, disp_va, policy);
             assert_eq!(code.len(), ANTI_DEBUG_SIZE);
             let disp = i32::from_le_bytes(code[0x42..0x46].try_into().unwrap()) as i64;
             let target = (ad_va as i64) + 0x41 + 5 + disp;
-            assert_eq!(target as u64, disp_va, "normal path must land on dispatcher");
+            assert_eq!(
+                target as u64, disp_va,
+                "normal path must land on dispatcher"
+            );
         }
     }
 

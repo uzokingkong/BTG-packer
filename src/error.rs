@@ -49,7 +49,10 @@ pub enum VmCompilerError {
     UnsupportedInstruction { instruction: String, code: String },
 
     #[error("Reserved scratch register collision with '{register}' in instruction: {instruction}")]
-    ScratchRegisterCollision { register: String, instruction: String },
+    ScratchRegisterCollision {
+        register: String,
+        instruction: String,
+    },
 
     #[error("Jump displacement overflow for label {label}: offset = {disp}")]
     JumpDisplacementOverflow { label: u32, disp: i64 },
@@ -77,8 +80,14 @@ pub enum ObfuscationError {
 /// Stage 5: Protection Pipeline & Crypto Errors.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum PipelineError {
-    #[error("Section overflow: block {block_id} would overflow at offset {offset} (max: {max_size})")]
-    SectionOverflow { block_id: u32, offset: usize, max_size: usize },
+    #[error(
+        "Section overflow: block {block_id} would overflow at offset {offset} (max: {max_size})"
+    )]
+    SectionOverflow {
+        block_id: u32,
+        offset: usize,
+        max_size: usize,
+    },
 
     #[error("Re-encryption payload build failed: {0}")]
     ReencryptionPayloadFailed(String),
@@ -137,12 +146,16 @@ mod tests {
     #[test]
     fn test_error_display_formatting() {
         let err: BtgError = PeError::InvalidEntryPoint(0x140001000).into();
-        assert_eq!(err.to_string(), "PE Error: Invalid Entry Point RVA 0x140001000");
+        assert_eq!(
+            err.to_string(),
+            "PE Error: Invalid Entry Point RVA 0x140001000"
+        );
 
         let vm_err: BtgError = VmCompilerError::ScratchRegisterCollision {
             register: "R15".to_string(),
             instruction: "mov r15, rax".to_string(),
-        }.into();
+        }
+        .into();
         assert_eq!(
             vm_err.to_string(),
             "VM Compiler Error: Reserved scratch register collision with 'R15' in instruction: mov r15, rax"
@@ -152,7 +165,8 @@ mod tests {
             block_id: 42,
             offset: 0x2000,
             max_size: 0x1000,
-        }.into();
+        }
+        .into();
         assert_eq!(
             pipe_err.to_string(),
             "Pipeline Error: Section overflow: block 42 would overflow at offset 8192 (max: 4096)"

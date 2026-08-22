@@ -30,7 +30,9 @@
 // into the state buffer at `state_va` and calls the module entry).
 // ==============================================================================
 
-use crate::vm::threaded::poly_direct::build_self_decoding_parts_with;
+use crate::vm::table_layout::TableLayout;
+use crate::vm::threaded::poly_direct::build_self_decoding_parts_with_superops_and_chunks;
+use crate::vm::threaded::{PreparedSuperOpProgram, VmRuntimeLayout};
 use crate::vm::VmModule;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -73,46 +75,128 @@ pub fn build_program_vm_commercial(
     seed: u64,
     ip_map: Option<&HashMap<u64, usize>>,
 ) -> Result<VmModule> {
-    // Virtual stack top: right after the state buffer (COMMERCIAL_STATE_SIZE),
-    // growing down into the reserved VIRTUAL_STACK_SIZE region. Keeps the
-    // dispatcher's R13-based push/pop isolated from both state and bytecode.
-    let stack_base = state_va.wrapping_add(COMMERCIAL_STATE_SIZE).wrapping_add(VIRTUAL_STACK_SIZE);
-
-    let parts = build_self_decoding_parts_with(
-        &bytecode,
-        seed,
+    build_program_vm_commercial_with_superops(
         code_va,
         table_va,
         bytecode_va,
+        bytecode,
         state_va,
-        stack_base,
+        seed,
         ip_map,
-    )?;
+        None,
+    )
+}
 
-    // ── table blob: [256x8 handler][256x8 op-offset][256 op-kind][256 cond-code][branch_map] ──
-    // The dispatcher reads operand tables relative to R15 (handler table base):
-    //   sub_resolve / sub_store use [R15 + (OFF_OP_OFFS - OFF_TABLE)] = +0x800
-    //   and [R15 + (OFF_OP_FLAGS - OFF_TABLE)] = +0x900.
-    //   sub_dec_ops_cond uses [R15 + (OFF_COND_CODES - OFF_TABLE)] = +0xA00.
-    //   h_branch's branch-map base uses [R15 + (OFF_BRANCH_MAP - OFF_TABLE)] = +0xB00.
-    // So the embedded table must place op-offset at table_va+0x800, op-kind at
-    // table_va+0x900, cond-code at table_va+0xA00 and the branch map at
-    // table_va+0xB00 (the whole-program commercial lift resolves VirtualBranch
-    // targets through ip_map -> bytecode byte offsets; without it the branch
-    // handler scans past the map -> AV).
-    let mut table = Vec::with_capacity(0xB00 + parts.branch_map.len());
-    for v in &parts.table {
-        table.extend_from_slice(&v.to_le_bytes());
+pub fn build_program_vm_commercial_with_superops(
+    code_va: u64,
+    table_va: u64,
+    bytecode_va: u64,
+    bytecode: Vec<u8>,
+    state_va: u64,
+    seed: u64,
+    ip_map: Option<&HashMap<u64, usize>>,
+    prepared: Option<&PreparedSuperOpProgram>,
+) -> Result<VmModule> {
+    build_program_vm_commercial_with_superops_and_chunks(
+        code_va,
+        table_va,
+        bytecode_va,
+        bytecode,
+        state_va,
+        seed,
+        ip_map,
+        prepared,
+        &[],
+    )
+}
+
+pub fn build_program_vm_commercial_with_superops_and_chunks(
+    code_va: u64,
+    table_va: u64,
+    bytecode_va: u64,
+    bytecode: Vec<u8>,
+    state_va: u64,
+    seed: u64,
+    ip_map: Option<&HashMap<u64, usize>>,
+    prepared: Option<&PreparedSuperOpProgram>,
+    chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
+) -> Result<VmModule> {
+    // Virtual stack top: right after the state buffer (COMMERCIAL_STATE_SIZE),
+    // growing down into the reserved VIRTUAL_STACK_SIZE region. Keeps the
+    // dispatcher's R13-based push/pop isolated from both state and bytecode.
+    let stack_base = state_va
+        .wrapping_add(COMMERCIAL_STATE_SIZE)
+        .wrapping_add(VIRTUAL_STACK_SIZE);
+
+    let layout = TableLayout::from_seed(seed);
+    let runtime_layout = VmRuntimeLayout::from_seed(seed);
+    if let Some(prepared) = prepared {
+        if prepared.bytecode != bytecode {
+            return Err(anyhow::anyhow!(
+                "P5 prepared bytecode differs from commercial module input"
+            ));
+        }
     }
-    debug_assert_eq!(table.len(), 0x800, "handler table must be 0x800 bytes");
-    table.extend_from_slice(&parts.offs_tab); // at +0x800
-    table.extend_from_slice(&parts.flags_tab); // at +0x900
-    table.extend_from_slice(&parts.cond_codes); // at +0xA00
-    debug_assert_eq!(table.len(), 0xB00, "module table blob must be 0xB00 bytes");
-    table.extend_from_slice(&parts.branch_map); // at +0xB00 (VirtualBranch resolution)
+    let parts = if let Some(prepared) = prepared {
+        build_self_decoding_parts_with_superops_and_chunks(
+            &bytecode,
+            seed,
+            code_va,
+            table_va,
+            bytecode_va,
+            state_va,
+            stack_base,
+            ip_map,
+            layout,
+            runtime_layout,
+            &prepared.assigned,
+            Some(&prepared.metadata),
+            chunks,
+        )?
+    } else {
+        build_self_decoding_parts_with_superops_and_chunks(
+            &bytecode,
+            seed,
+            code_va,
+            table_va,
+            bytecode_va,
+            state_va,
+            stack_base,
+            ip_map,
+            layout,
+            runtime_layout,
+            &[],
+            None,
+            chunks,
+        )?
+    };
+
+    // ── table blob: seed-jittered handler / operand / condition / branch maps ──
+    // The generated dispatcher uses the same `layout` values relative to R15.
+    // Layout is therefore part of the build ABI, not a fixed file signature.
+    let table_len = layout
+        .total_size
+        .max(layout.branch_map_off.saturating_add(parts.branch_map.len()));
+    let mut table = vec![0u8; table_len];
+    for (i, v) in parts.table.iter().enumerate() {
+        let off = layout.handler_table_off + i * 8;
+        table[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    table[layout.operand_offs_off..layout.operand_offs_off + 256].copy_from_slice(&parts.offs_tab);
+    table[layout.operand_flags_off..layout.operand_flags_off + 256]
+        .copy_from_slice(&parts.flags_tab);
+    table[layout.cond_codes_off..layout.cond_codes_off + 256].copy_from_slice(&parts.cond_codes);
+    table[layout.branch_map_off..layout.branch_map_off + parts.branch_map.len()]
+        .copy_from_slice(&parts.branch_map);
 
     // 상용(poly) 모듈은 bytecode handler 테이블을 쓰지 않으므로 handler_offsets 없음.
-    Ok(VmModule { code: parts.code, table, bytecode, handler_offsets: Vec::new() })
+    Ok(VmModule {
+        code: parts.code,
+        table,
+        bytecode,
+        handler_offsets: Vec::new(),
+        native_bridge_range: parts.native_bridge_range,
+    })
 }
 
 #[cfg(test)]
@@ -121,12 +205,6 @@ mod tests {
     use crate::vm::arena::Arena;
     use crate::vm::poly::PolymorphicEncoder;
     use crate::vm::risc::{MicroInstr, MicroOperand, RiscDesynthesizer, RiscOp};
-
-    // State buffer offsets (harness layout, mirrors poly_direct).
-    const REGS_OFF: usize = 0x000;
-    const TEMPS_OFF: usize = 0x080;
-    const FLAGS_OFF: usize = 0x0C0;
-    const VSP_OFF: usize = 0x0C8;
 
     /// P3 (G1): the module produced by `build_program_vm_commercial` — its
     /// self-decoding rolling-key dispatcher code — when embedded at the VAs it
@@ -138,8 +216,16 @@ mod tests {
         //   R0 = 0x200 ; R1 = 5 ; R2 = R0 >> R1 ; R3 = R0 << 2 ; R4 = R0 - R1
         //   push R3 ; push R0 ; pop R4 ; R5 = ~(R2|R1) ; flags = 0x8C1 ; Halt
         let mut d = RiscDesynthesizer::new();
-        d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x200), MicroOperand::Imm64(0));
-        d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(5), MicroOperand::Imm64(0));
+        d.emit_add(
+            MicroOperand::VReg(0),
+            MicroOperand::Imm64(0x200),
+            MicroOperand::Imm64(0),
+        );
+        d.emit_add(
+            MicroOperand::VReg(1),
+            MicroOperand::Imm64(5),
+            MicroOperand::Imm64(0),
+        );
         d.instrs.push(
             MicroInstr::new(RiscOp::ShiftRight)
                 .with_dst(MicroOperand::VReg(2))
@@ -152,7 +238,11 @@ mod tests {
                 .with_src1(MicroOperand::VReg(0))
                 .with_src2(MicroOperand::Imm64(2)),
         );
-        d.emit_sub(MicroOperand::VReg(4), MicroOperand::VReg(0), MicroOperand::VReg(1));
+        d.emit_sub(
+            MicroOperand::VReg(4),
+            MicroOperand::VReg(0),
+            MicroOperand::VReg(1),
+        );
         d.emit_push(MicroOperand::VReg(3));
         d.emit_push(MicroOperand::VReg(0));
         d.emit_pop(MicroOperand::VReg(4));
@@ -162,7 +252,8 @@ mod tests {
                 .with_src1(MicroOperand::VReg(2))
                 .with_src2(MicroOperand::VReg(1)),
         );
-        d.instrs.push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Imm64(0x8C1)));
+        d.instrs
+            .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Imm64(0x8C1)));
         d.instrs.push(MicroInstr::new(RiscOp::Halt));
         let prog = crate::vm::risc::RiscProgram::new(d.instrs);
 
@@ -170,20 +261,33 @@ mod tests {
         let ref_st = prog.eval_state(&init);
 
         let seed = 0x1122334455667788u64;
+        let runtime_layout = VmRuntimeLayout::from_seed(seed);
         let mut enc = PolymorphicEncoder::new(seed);
         let bytecode = enc.encode(&prog).unwrap();
 
         // Sizing pass: code/table/bytecode lengths are VA-independent (all
         // absolute references are fixed-size imm64/rel encodings), so build once
         // with dummy VAs to learn lengths, then lay out and rebuild with real VAs.
-        let dummy = build_program_vm_commercial(0, 0x100000, 0x200000, bytecode.clone(), 0x300000, seed, None)
-            .expect("commercial module sizing");
+        let dummy = build_program_vm_commercial(
+            0,
+            0x100000,
+            0x200000,
+            bytecode.clone(),
+            0x300000,
+            seed,
+            None,
+        )
+        .expect("commercial module sizing");
         let code_len = dummy.code.len();
         let table_len = dummy.table.len();
-        // table blob = 0xB00 (handlers/offs/flags/cond-codes) + branch_map
-        // (u32 count + entries); the linear block has no VirtualBranch so the
-        // map is just the 4-byte zero count.
-        assert_eq!(table_len, 0xB00 + 4, "table blob must be 0xB00 + branch_map");
+        // The commercial metadata ABI is seed-jittered.  A linear block's
+        // branch map has only its 4-byte count, so the reserved layout size
+        // remains the table size.
+        assert_eq!(
+            table_len,
+            TableLayout::from_seed(seed).total_size,
+            "table blob must honor the seed layout"
+        );
 
         // Real layout inside the arena (matching place.rs: [code][table][bytecode][state]).
         let code_off = 0x1000usize;
@@ -200,7 +304,13 @@ mod tests {
         let state_va = (base + state_off) as u64;
 
         let module = build_program_vm_commercial(
-            code_va, table_va, bytecode_va, bytecode.clone(), state_va, seed, None,
+            code_va,
+            table_va,
+            bytecode_va,
+            bytecode.clone(),
+            state_va,
+            seed,
+            None,
         )
         .expect("commercial module build");
 
@@ -214,8 +324,8 @@ mod tests {
             // init state buffer
             buf[state_off..state_off + 0x100].fill(0);
             for (i, v) in init.iter().enumerate() {
-                buf[state_off + REGS_OFF + i * 8..state_off + REGS_OFF + i * 8 + 8]
-                    .copy_from_slice(&v.to_le_bytes());
+                let off = runtime_layout.vregs[i] as usize;
+                buf[state_off + off..state_off + off + 8].copy_from_slice(&v.to_le_bytes());
             }
         }
 
@@ -248,31 +358,44 @@ mod tests {
         let s = state_off;
         let mut nat = crate::vm::risc::RiscEvalState::default();
         for i in 0..16 {
-            nat.regs[i] =
-                u64::from_le_bytes(buf[s + REGS_OFF + i * 8..s + REGS_OFF + i * 8 + 8]
-                    .try_into()
-                    .unwrap());
+            let off = runtime_layout.vregs[i] as usize;
+            nat.regs[i] = u64::from_le_bytes(buf[s + off..s + off + 8].try_into().unwrap());
         }
         for i in 0..8 {
-            nat.temps[i] =
-                u64::from_le_bytes(buf[s + TEMPS_OFF + i * 8..s + TEMPS_OFF + i * 8 + 8]
-                    .try_into()
-                    .unwrap());
+            let off = runtime_layout.temps[i] as usize;
+            nat.temps[i] = u64::from_le_bytes(buf[s + off..s + off + 8].try_into().unwrap());
         }
-        nat.flags =
-            u64::from_le_bytes(buf[s + FLAGS_OFF..s + FLAGS_OFF + 8].try_into().unwrap());
-        nat.vsp = u64::from_le_bytes(buf[s + VSP_OFF..s + VSP_OFF + 8].try_into().unwrap());
+        let flags_off = runtime_layout.flags as usize;
+        let vsp_off = runtime_layout.vsp as usize;
+        nat.flags = u64::from_le_bytes(buf[s + flags_off..s + flags_off + 8].try_into().unwrap());
+        nat.vsp = u64::from_le_bytes(buf[s + vsp_off..s + vsp_off + 8].try_into().unwrap());
 
-        assert_eq!(nat.regs, ref_st.regs, "regs mismatch (embedded module vs eval_state)");
+        assert_eq!(
+            nat.regs, ref_st.regs,
+            "regs mismatch (embedded module vs eval_state)"
+        );
         assert_eq!(nat.temps, ref_st.temps, "temps mismatch");
-        assert_eq!(nat.flags, ref_st.flags, "flags mismatch (nat={:#x} ref={:#x})", nat.flags, ref_st.flags);
-        assert_eq!(nat.vsp, ref_st.vsp, "vsp mismatch (nat={:#x} ref={:#x})", nat.vsp, ref_st.vsp);
+        assert_eq!(
+            nat.flags, ref_st.flags,
+            "flags mismatch (nat={:#x} ref={:#x})",
+            nat.flags, ref_st.flags
+        );
+        assert_eq!(
+            nat.vsp, ref_st.vsp,
+            "vsp mismatch (nat={:#x} ref={:#x})",
+            nat.vsp, ref_st.vsp
+        );
         // stack recovery
-        let pending = if (nat.vsp as i64) < 0 { (-(nat.vsp as i64) as u64) / 8 } else { 0 };
+        let pending = if (nat.vsp as i64) < 0 {
+            (-(nat.vsp as i64) as u64) / 8
+        } else {
+            0
+        };
         assert!(
             pending < 4096,
             "vsp look corrupted: nat.vsp={:#x} (pending={}) — module did not complete correctly",
-            nat.vsp, pending
+            nat.vsp,
+            pending
         );
         for k in 0..pending as usize {
             let off = stack_off - (k + 1) * 8;
@@ -281,5 +404,38 @@ mod tests {
         }
         assert_eq!(nat.stack, ref_st.stack, "stack mismatch");
     }
-}
 
+    #[test]
+    fn commercial_module_uses_seed_jittered_metadata_layout() {
+        let seed = 0xA17C_4B29_8E61_D305u64;
+        let layout = TableLayout::from_seed(seed);
+        assert_ne!(
+            layout.operand_offs_off,
+            TableLayout::legacy().operand_offs_off
+        );
+        assert_ne!(
+            layout.operand_flags_off,
+            TableLayout::legacy().operand_flags_off
+        );
+        assert_ne!(layout.cond_codes_off, TableLayout::legacy().cond_codes_off);
+
+        let prog = crate::vm::risc::RiscProgram::new(vec![MicroInstr::new(RiscOp::Halt)]);
+        let mut encoder = PolymorphicEncoder::new(seed);
+        let bytecode = encoder.encode(&prog).expect("encode halt program");
+        let module = build_program_vm_commercial(
+            0x1400_1000,
+            0x1400_8000,
+            0x1400_A000,
+            bytecode,
+            0x1400_B000,
+            seed,
+            None,
+        )
+        .expect("build commercial module");
+
+        assert_eq!(module.table.len(), layout.total_size);
+        // Operand byte 0x01 represents an immediate.  Its kind must be stored
+        // at the generated location, not the legacy +0x900 signature.
+        assert_eq!(module.table[layout.operand_flags_off + 1], 1);
+    }
+}

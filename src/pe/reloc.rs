@@ -102,7 +102,16 @@ pub fn build_reloc_directory(
             if in_encrypted(slot_rva) {
                 continue;
             }
-            let v = u64::from_le_bytes([sec.bytes[i * 8], sec.bytes[i * 8 + 1], sec.bytes[i * 8 + 2], sec.bytes[i * 8 + 3], sec.bytes[i * 8 + 4], sec.bytes[i * 8 + 5], sec.bytes[i * 8 + 6], sec.bytes[i * 8 + 7]]);
+            let v = u64::from_le_bytes([
+                sec.bytes[i * 8],
+                sec.bytes[i * 8 + 1],
+                sec.bytes[i * 8 + 2],
+                sec.bytes[i * 8 + 3],
+                sec.bytes[i * 8 + 4],
+                sec.bytes[i * 8 + 5],
+                sec.bytes[i * 8 + 6],
+                sec.bytes[i * 8 + 7],
+            ]);
             if v < va_lo || v >= va_hi {
                 continue;
             }
@@ -164,7 +173,10 @@ pub fn build_reloc_directory(
     };
     Some(RelocOutput {
         section,
-        directory: DataDirectory { virtual_address: 0, size },
+        directory: DataDirectory {
+            virtual_address: 0,
+            size,
+        },
     })
 }
 
@@ -199,7 +211,7 @@ mod tests {
         let block = &out.section.bytes;
         assert_eq!(u32::from_le_bytes(block[0..4].try_into().unwrap()), 0x1000); // page
         assert_eq!(u32::from_le_bytes(block[4..8].try_into().unwrap()), 12); // block size
-        // entry0: offset 0x10, DIR64
+                                                                             // entry0: offset 0x10, DIR64
         let e0 = u16::from_le_bytes(block[8..10].try_into().unwrap());
         assert_eq!(e0 >> 12, IMAGE_REL_BASED_DIR64);
         assert_eq!(e0 & 0xFFF, 0x10);
@@ -266,7 +278,7 @@ mod tests {
         b[0x02] = 0x49; // REX.W+R.B (mov r8, imm64)
         b[0x03] = 0xB8;
         b[0x04..0x0C].copy_from_slice(&(ib + 0x4000).to_le_bytes()); // 이미지 내부 VA
-        // 별도 mov r10, imm64 (4D B8) — 파생 키 (이미지 밖) → 제외.
+                                                                     // 별도 mov r10, imm64 (4D B8) — 파생 키 (이미지 밖) → 제외.
         b[0x0C] = 0x4D;
         b[0x0D] = 0xB8;
         b[0x0E..0x16].copy_from_slice(&0xDEAD_BEEF_CAFE_F000u64.to_le_bytes());
@@ -277,7 +289,11 @@ mod tests {
         assert_eq!(out.directory.size, 12); // 1 entry + DWORD pad
         let e0 = u16::from_le_bytes(block[8..10].try_into().unwrap());
         assert_eq!(e0 >> 12, IMAGE_REL_BASED_DIR64);
-        assert_eq!(e0 & 0xFFF, 0x04, "imm64 slot at instruction offset+2 (not 8-aligned)");
+        assert_eq!(
+            e0 & 0xFFF,
+            0x04,
+            "imm64 slot at instruction offset+2 (not 8-aligned)"
+        );
         let pad = u16::from_le_bytes(block[10..12].try_into().unwrap());
         assert_eq!(pad >> 12, 0, "pad entry is ABSOLUTE");
     }
@@ -292,7 +308,10 @@ mod tests {
         let mut b = vec![0u8; 0x20];
         b[0x00..0x08].copy_from_slice(&(ib + 0x1000).to_le_bytes()); // plain data (8-aligned)
         let slots = scan_mov_imm64_slots(&b, ib, ib + 0x200000);
-        assert!(slots.is_empty(), "plain data must not be caught as mov-imm64");
+        assert!(
+            slots.is_empty(),
+            "plain data must not be caught as mov-imm64"
+        );
         // 반대로 실제 명령어 패턴(REX.W + 0xB8 + imm64 in range)은 정확히 offset+2.
         let mut c = vec![0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0]; // mov rax, imm64
         c[2..10].copy_from_slice(&(ib + 0x2000).to_le_bytes());

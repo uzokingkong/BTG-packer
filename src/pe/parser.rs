@@ -2,7 +2,6 @@
 // BTG (Bidirectional Trigger Graph) - PE Parser & Section Relayer
 // ==============================================================================
 
-
 use crate::pe::builder::{DataDirectory, SectionData};
 use anyhow::{Context, Result};
 use goblin::pe::PE;
@@ -46,6 +45,44 @@ impl TargetPeInfo {
     pub fn parse(pe_bytes: &[u8]) -> Result<Self> {
         let pe = PE::parse(pe_bytes).context("Failed to parse target binary as PE32+")?;
 
+        const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
+        const IMAGE_FILE_DLL: u16 = 0x2000;
+        const PE32_PLUS_MAGIC: u16 = 0x20B;
+        if pe.header.coff_header.machine != IMAGE_FILE_MACHINE_AMD64 {
+            return Err(anyhow::anyhow!(
+                "unsupported PE machine 0x{:04X}: BTG currently accepts AMD64 (0x8664) only",
+                pe.header.coff_header.machine
+            ));
+        }
+        if pe.header.coff_header.characteristics & IMAGE_FILE_DLL != 0 {
+            return Err(anyhow::anyhow!(
+                "unsupported PE image type: DLL inputs require a DLL-preserving build path"
+            ));
+        }
+        if pe.header.coff_header.size_of_optional_header < 240 {
+            return Err(anyhow::anyhow!(
+                "invalid AMD64 optional-header size {}: expected at least 240 bytes",
+                pe.header.coff_header.size_of_optional_header
+            ));
+        }
+        let optional = pe
+            .header
+            .optional_header
+            .as_ref()
+            .context("AMD64 input is missing its PE32+ optional header")?;
+        if optional.standard_fields.magic != PE32_PLUS_MAGIC {
+            return Err(anyhow::anyhow!(
+                "unsupported optional-header magic 0x{:04X}: expected PE32+ (0x20B)",
+                optional.standard_fields.magic
+            ));
+        }
+        if pe.header.coff_header.number_of_sections == 0 || pe.sections.len() > 96 {
+            return Err(anyhow::anyhow!(
+                "unsupported PE section count {}",
+                pe.header.coff_header.number_of_sections
+            ));
+        }
+
         // BTG marker section names produced by our own pass4_section.rs. A binary
         // that already contains one of these is a previously BTG-packed binary.
         const BTG_SECTIONS: [&str; 2] = [".textb", ".btg"];
@@ -66,8 +103,7 @@ impl TargetPeInfo {
         let entry_rva = pe.entry as u32;
         let text_rva_for_ep = text_sec.virtual_address;
         let text_vsize_for_ep = text_sec.virtual_size as u64;
-        let ep_in_text =
-            (entry_rva as u64) >= text_rva_for_ep as u64
+        let ep_in_text = (entry_rva as u64) >= text_rva_for_ep as u64
             && (entry_rva as u64) < (text_rva_for_ep as u64 + text_vsize_for_ep);
 
         // Re-packing an already BTG-packed binary is fundamentally unsupported:
@@ -138,7 +174,13 @@ impl TargetPeInfo {
             let f_align = opt.windows_fields.file_alignment as u32;
             let sec_align = opt.windows_fields.section_alignment as u32;
 
-            let mut dirs = vec![DataDirectory { virtual_address: 0, size: 0 }; 16];
+            let mut dirs = vec![
+                DataDirectory {
+                    virtual_address: 0,
+                    size: 0
+                };
+                16
+            ];
             for (idx, dir_opt) in opt.data_directories.data_directories.iter().enumerate() {
                 if idx < 16 {
                     // idx=3: Exception Directory (.pdata) — cleared because .pdata entries reference
@@ -150,7 +192,10 @@ impl TargetPeInfo {
                     // Note: idx=10 (LoadConfig) MUST BE PRESERVED so OS loader populates __security_cookie
                     //       and Control Flow Guard (CFG) function pointers like __guard_check_icall_fptr.
                     if idx == 4 || idx == 5 {
-                        dirs[idx] = DataDirectory { virtual_address: 0, size: 0 };
+                        dirs[idx] = DataDirectory {
+                            virtual_address: 0,
+                            size: 0,
+                        };
                     } else if let Some((_, d)) = dir_opt {
                         dirs[idx] = DataDirectory {
                             virtual_address: d.virtual_address,
@@ -159,9 +204,37 @@ impl TargetPeInfo {
                     }
                 }
             }
-            (sub, orig_dll_char, dll_char, s_res, s_com, h_res, h_com, f_align, sec_align, dirs)
+            (
+                sub,
+                orig_dll_char,
+                dll_char,
+                s_res,
+                s_com,
+                h_res,
+                h_com,
+                f_align,
+                sec_align,
+                dirs,
+            )
         } else {
-            (3, 0x8120, 0x8120, 0x100000, 0x1000, 0x100000, 0x1000, 0x200, 0x1000, vec![DataDirectory { virtual_address: 0, size: 0 }; 16])
+            (
+                3,
+                0x8120,
+                0x8120,
+                0x100000,
+                0x1000,
+                0x100000,
+                0x1000,
+                0x200,
+                0x1000,
+                vec![
+                    DataDirectory {
+                        virtual_address: 0,
+                        size: 0
+                    };
+                    16
+                ],
+            )
         };
 
         let mut relayed_sections = Vec::new();
@@ -202,7 +275,11 @@ impl TargetPeInfo {
 
         // Extract original .pdata RUNTIME_FUNCTION entries
         let mut original_pdata_entries = Vec::new();
-        if let Some(pdata_sec) = pe.sections.iter().find(|s| s.name().unwrap_or("").starts_with(".pdata")) {
+        if let Some(pdata_sec) = pe
+            .sections
+            .iter()
+            .find(|s| s.name().unwrap_or("").starts_with(".pdata"))
+        {
             let p_raw = pdata_sec.pointer_to_raw_data as usize;
             let p_size = pdata_sec.size_of_raw_data as usize;
             let p_end = match p_raw.checked_add(p_size) {
@@ -278,15 +355,15 @@ mod tests {
         // COFF file header at 0x84: machine x64, 1 section
         b[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
         b[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // number_of_sections
-        b[0x8C..0x8E].copy_from_slice(&0x0Eu16.to_le_bytes()); // size of optional header (PE32+ = 240)
-        // Optional header at 0x8E
+        b[0x8C..0x8E].copy_from_slice(&240u16.to_le_bytes()); // size of optional header
+                                                              // Optional header at 0x8E
         b[0x8E..0x90].copy_from_slice(&0x20Bu16.to_le_bytes()); // magic PE32+
         b[0x9E..0xA2].copy_from_slice(&0x1000u32.to_le_bytes()); // AddressOfEntryPoint (inside .text)
         b[0xA2..0xA6].copy_from_slice(&0x1000u32.to_le_bytes()); // BaseOfCode
         b[0xA6..0xAE].copy_from_slice(&0x140000000u64.to_le_bytes()); // ImageBase
         b[0xAE..0xB2].copy_from_slice(&0x1000u32.to_le_bytes()); // SectionAlignment
         b[0xB2..0xB6].copy_from_slice(&0x200u32.to_le_bytes()); // FileAlignment
-        // Section table at 0x8E + 240 = 0x17E
+                                                                // Section table at 0x8E + 240 = 0x17E
         let sec = 0x17Eusize;
         b[sec..sec + 8].copy_from_slice(b".text\0\0\0");
         b[sec + 8..sec + 12].copy_from_slice(&0x1000u32.to_le_bytes()); // VirtualSize
@@ -332,5 +409,22 @@ mod tests {
             Ok(Err(_)) => { /* rejected */ }
             Err(_) => panic!("truncated input caused a panic"),
         }
+    }
+
+    #[test]
+    fn x86_pe32_is_rejected_before_rewrite() {
+        let mut pe = hostile_pe(0x400, 0x200, 0x1000);
+        pe[0x84..0x86].copy_from_slice(&0x014Cu16.to_le_bytes());
+        pe[0x8E..0x90].copy_from_slice(&0x10Bu16.to_le_bytes());
+        let err = TargetPeInfo::parse(&pe).unwrap_err().to_string();
+        assert!(err.contains("AMD64"), "{err}");
+    }
+
+    #[test]
+    fn dll_input_is_explicitly_rejected() {
+        let mut pe = hostile_pe(0x400, 0x200, 0x1000);
+        pe[0x96..0x98].copy_from_slice(&0x2022u16.to_le_bytes());
+        let err = TargetPeInfo::parse(&pe).unwrap_err().to_string();
+        assert!(err.contains("DLL"), "{err}");
     }
 }

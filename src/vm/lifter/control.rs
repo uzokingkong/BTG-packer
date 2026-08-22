@@ -12,7 +12,7 @@ use super::arith::{inst_imm, is_imm8_op};
 use super::mem::mem_emit;
 use super::{reg_bits, vreg, SCRATCH, SCRATCH2};
 use crate::vm::bytecode::*;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use iced_x86::{Instruction, OpKind};
 
 /// Map an iced ConditionCode to our VM cond code.
@@ -62,11 +62,18 @@ pub(super) fn lift_cmovcc(b: &mut BytecodeBuilder, inst: &Instruction) -> Result
     b.jcc8(neg, skip);
     if inst.op1_kind() == OpKind::Register {
         let src = vreg(inst.op1_register())?;
-        if reg_bits(inst.op0_register()) == 64 { b.mov_r_r64(dst, src); } else { b.mov_r_r(dst, src); }
+        if reg_bits(inst.op0_register()) == 64 {
+            b.mov_r_r64(dst, src);
+        } else {
+            b.mov_r_r(dst, src);
+        }
     } else {
         let addr = mem_emit(b, inst, 1)?;
         let sz = reg_bits(inst.op0_register());
-        let load = match sz { 32 => OP_MOVZX_R_MEM32_A, _ => OP_MOV_R_MEM64_A };
+        let load = match sz {
+            32 => OP_MOVZX_R_MEM32_A,
+            _ => OP_MOV_R_MEM64_A,
+        };
         b.mem_load_a(load, dst, addr);
     }
     b.mark_label(skip);
@@ -77,7 +84,10 @@ pub(super) fn lift_cmovcc(b: &mut BytecodeBuilder, inst: &Instruction) -> Result
 /// SBB.
 pub(super) fn lift_sbb(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     if inst.op0_kind() == iced_x86::OpKind::Memory {
-        return Err(anyhow!("lift_sbb: memory destination unsupported ({}), keep native", inst));
+        return Err(anyhow!(
+            "lift_sbb: memory destination unsupported ({}), keep native",
+            inst
+        ));
     }
     let dst = vreg(inst.op0_register())?;
     let is64 = reg_bits(inst.op0_register()) == 64;
@@ -86,23 +96,44 @@ pub(super) fn lift_sbb(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()
     } else {
         let is8 = is_imm8_op(inst.code());
         let imm = inst_imm(inst, is8) as u64;
-        if is64 { b.mov_r_imm64(SCRATCH2, imm); } else { b.mov_r_imm32(SCRATCH2, imm as u32); }
+        if is64 {
+            b.mov_r_imm64(SCRATCH2, imm);
+        } else {
+            b.mov_r_imm32(SCRATCH2, imm as u32);
+        }
         SCRATCH2
     };
-    if is64 { b.mov_r_r64(SCRATCH, dst); } else { b.mov_r_r(SCRATCH, dst); }
+    if is64 {
+        b.mov_r_r64(SCRATCH, dst);
+    } else {
+        b.mov_r_r(SCRATCH, dst);
+    }
     let has_carry = b.new_label();
     let done = b.new_label();
     b.jcc8(COND_JB, has_carry);
-    if is64 { b.binop_r_r64(OP_SUB_R_R64, SCRATCH, src_vreg); }
-    else { b.binop_r_r(OP_SUB_R_R, SCRATCH, src_vreg); }
+    if is64 {
+        b.binop_r_r64(OP_SUB_R_R64, SCRATCH, src_vreg);
+    } else {
+        b.binop_r_r(OP_SUB_R_R, SCRATCH, src_vreg);
+    }
     b.jmp8(done);
     b.mark_label(has_carry);
-    if is64 { b.binop_r_r64(OP_SUB_R_R64, SCRATCH, src_vreg); }
-    else { b.binop_r_r(OP_SUB_R_R, SCRATCH, src_vreg); }
-    if is64 { b.binop_r_imm64(OP_ADD_R_IMM64, SCRATCH, 0xFFFF_FFFF); }
-    else { b.binop_r_imm32(OP_ADD_R_IMM32, SCRATCH, 0xFFFF_FFFF); }
+    if is64 {
+        b.binop_r_r64(OP_SUB_R_R64, SCRATCH, src_vreg);
+    } else {
+        b.binop_r_r(OP_SUB_R_R, SCRATCH, src_vreg);
+    }
+    if is64 {
+        b.binop_r_imm64(OP_ADD_R_IMM64, SCRATCH, 0xFFFF_FFFF);
+    } else {
+        b.binop_r_imm32(OP_ADD_R_IMM32, SCRATCH, 0xFFFF_FFFF);
+    }
     b.mark_label(done);
-    if is64 { b.mov_r_r64(dst, SCRATCH); } else { b.mov_r_r(dst, SCRATCH); }
+    if is64 {
+        b.mov_r_r64(dst, SCRATCH);
+    } else {
+        b.mov_r_r(dst, SCRATCH);
+    }
     Ok(())
 }
 
@@ -111,25 +142,39 @@ pub(super) fn lift_adc(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()
     use iced_x86::Code::*;
     let code = inst.code();
     let name = format!("{:?}", code);
-    let wbits = if name.contains("rm8_") || name.contains("r8_rm8") || name.contains("AL_") { 8 }
-        else if name.contains("rm16_") || name.contains("r16_rm16") || name.contains("AX_") { 16 }
-        else if name.contains("rm64_") || name.contains("r64_rm64") || name.contains("RAX_") { 64 }
-        else { 32 };
+    let wbits = if name.contains("rm8_") || name.contains("r8_rm8") || name.contains("AL_") {
+        8
+    } else if name.contains("rm16_") || name.contains("r16_rm16") || name.contains("AX_") {
+        16
+    } else if name.contains("rm64_") || name.contains("r64_rm64") || name.contains("RAX_") {
+        64
+    } else {
+        32
+    };
     let (load, store, addop, mov_wide) = match wbits {
         8 => (OP_MOVZX_R_MEM8_A, OP_MOV_MEM8_A, OP_ADD_R_R, false),
         16 => (OP_MOVZX_R_MEM16_A, OP_MOV_MEM16_A, OP_ADD_R_R, false),
         64 => (OP_MOV_R_MEM64_A, OP_MOV_MEM64_A, OP_ADD_R_R64, true),
         _ => (OP_MOVZX_R_MEM32_A, OP_MOV_MEM32_A, OP_ADD_R_R, false),
     };
-    let mask: u32 = match wbits { 8 => 0xFF, 16 => 0xFFFF, _ => 0xFFFF_FFFF };
+    let mask: u32 = match wbits {
+        8 => 0xFF,
+        16 => 0xFFFF,
+        _ => 0xFFFF_FFFF,
+    };
     let src: u8 = if inst.op1_kind() == OpKind::Register {
         vreg(inst.op1_register())?
     } else {
         let is8 = is_imm8_op(code);
         let imm = inst_imm(inst, is8) as u64;
-        if wbits == 64 { b.mov_r_imm64(SCRATCH2, imm); }
-        else { b.mov_r_imm32(SCRATCH2, imm as u32); }
-        if wbits == 8 || wbits == 16 { b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH2, mask); }
+        if wbits == 64 {
+            b.mov_r_imm64(SCRATCH2, imm);
+        } else {
+            b.mov_r_imm32(SCRATCH2, imm as u32);
+        }
+        if wbits == 8 || wbits == 16 {
+            b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH2, mask);
+        }
         SCRATCH2
     };
 
@@ -140,31 +185,67 @@ pub(super) fn lift_adc(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()
         let has_carry = b.new_label();
         let done = b.new_label();
         b.jcc8(COND_JB, has_carry);
-        if mov_wide { b.binop_r_r64(addop, val, src); } else { b.binop_r_r(addop, val, src); }
+        if mov_wide {
+            b.binop_r_r64(addop, val, src);
+        } else {
+            b.binop_r_r(addop, val, src);
+        }
         b.jmp8(done);
         b.mark_label(has_carry);
-        if mov_wide { b.binop_r_r64(addop, val, src); } else { b.binop_r_r(addop, val, src); }
-        if wbits == 64 { b.binop_r_imm64(OP_ADD_R_IMM64, val, 1); }
-        else { b.binop_r_imm32(OP_ADD_R_IMM32, val, 1); }
+        if mov_wide {
+            b.binop_r_r64(addop, val, src);
+        } else {
+            b.binop_r_r(addop, val, src);
+        }
+        if wbits == 64 {
+            b.binop_r_imm64(OP_ADD_R_IMM64, val, 1);
+        } else {
+            b.binop_r_imm32(OP_ADD_R_IMM32, val, 1);
+        }
         b.mark_label(done);
-        if wbits == 8 || wbits == 16 { b.binop_r_imm32(OP_AND_R_IMM32, val, mask); }
+        if wbits == 8 || wbits == 16 {
+            b.binop_r_imm32(OP_AND_R_IMM32, val, mask);
+        }
         b.mem_store_a(store, addr, val);
     } else {
         let dst = vreg(inst.op0_register())?;
-        if mov_wide { b.mov_r_r64(SCRATCH, dst); } else { b.mov_r_r(SCRATCH, dst); }
+        if mov_wide {
+            b.mov_r_r64(SCRATCH, dst);
+        } else {
+            b.mov_r_r(SCRATCH, dst);
+        }
         let has_carry = b.new_label();
         let done = b.new_label();
         b.jcc8(COND_JB, has_carry);
-        if mov_wide { b.binop_r_r64(addop, SCRATCH, src); } else { b.binop_r_r(addop, SCRATCH, src); }
+        if mov_wide {
+            b.binop_r_r64(addop, SCRATCH, src);
+        } else {
+            b.binop_r_r(addop, SCRATCH, src);
+        }
         b.jmp8(done);
         b.mark_label(has_carry);
-        if mov_wide { b.binop_r_r64(addop, SCRATCH, src); } else { b.binop_r_r(addop, SCRATCH, src); }
-        if wbits == 64 { b.binop_r_imm64(OP_ADD_R_IMM64, SCRATCH, 1); }
-        else { b.binop_r_imm32(OP_ADD_R_IMM32, SCRATCH, 1); }
+        if mov_wide {
+            b.binop_r_r64(addop, SCRATCH, src);
+        } else {
+            b.binop_r_r(addop, SCRATCH, src);
+        }
+        if wbits == 64 {
+            b.binop_r_imm64(OP_ADD_R_IMM64, SCRATCH, 1);
+        } else {
+            b.binop_r_imm32(OP_ADD_R_IMM32, SCRATCH, 1);
+        }
         b.mark_label(done);
-        if wbits == 8 || wbits == 16 { b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH, mask); }
-        if mov_wide { b.mov_r_r64(dst, SCRATCH); } else { b.mov_r_r(dst, SCRATCH); }
-        if wbits == 8 || wbits == 16 { b.binop_r_imm32(OP_AND_R_IMM32, dst, mask); }
+        if wbits == 8 || wbits == 16 {
+            b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH, mask);
+        }
+        if mov_wide {
+            b.mov_r_r64(dst, SCRATCH);
+        } else {
+            b.mov_r_r(dst, SCRATCH);
+        }
+        if wbits == 8 || wbits == 16 {
+            b.binop_r_imm32(OP_AND_R_IMM32, dst, mask);
+        }
     }
     Ok(())
 }
@@ -206,9 +287,15 @@ pub(super) fn lift_cmp(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()
                 b.binop_r_r64(OP_SUB_R_R64, SCRATCH, SCRATCH2);
             } else {
                 let width = reg_bits(inst.op0_register());
-                let mask = match width { 8 => 0xFFu32, 16 => 0xFFFFu32, _ => 0xFFFF_FFFFu32 };
+                let mask = match width {
+                    8 => 0xFFu32,
+                    16 => 0xFFFFu32,
+                    _ => 0xFFFF_FFFFu32,
+                };
                 b.mov_r_r(SCRATCH, r);
-                if mask != 0xFFFF_FFFF { b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH, mask); }
+                if mask != 0xFFFF_FFFF {
+                    b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH, mask);
+                }
                 b.mov_r_imm32(SCRATCH2, imm as u32);
                 b.binop_r_r(OP_SUB_R_R, SCRATCH, SCRATCH2);
             }
@@ -220,21 +307,34 @@ pub(super) fn lift_cmp(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()
             Cmp_rm16_imm8 | Cmp_rm16_imm16 | Cmp_rm16_r16 => 16,
             _ => 32,
         };
-        if matches!(code, Cmp_rm64_imm8 | Cmp_rm64_imm32) { sz = 64; }
-        let load = match sz { 8 => OP_MOVZX_R_MEM8_A, 16 => OP_MOVZX_R_MEM16_A, 32 => OP_MOVZX_R_MEM32_A, _ => OP_MOV_R_MEM64_A };
+        if matches!(code, Cmp_rm64_imm8 | Cmp_rm64_imm32) {
+            sz = 64;
+        }
+        let load = match sz {
+            8 => OP_MOVZX_R_MEM8_A,
+            16 => OP_MOVZX_R_MEM16_A,
+            32 => OP_MOVZX_R_MEM32_A,
+            _ => OP_MOV_R_MEM64_A,
+        };
         b.mem_load_a(load, SCRATCH, addr);
         if inst.op1_kind() == OpKind::Register {
             let s = vreg(inst.op1_register())?;
-            if sz == 64 { b.binop_r_r64(OP_SUB_R_R64, SCRATCH, s); }
-            else {
+            if sz == 64 {
+                b.binop_r_r64(OP_SUB_R_R64, SCRATCH, s);
+            } else {
                 b.mov_r_r(SCRATCH2, s);
                 b.binop_r_r(OP_SUB_R_R, SCRATCH, SCRATCH2);
             }
         } else {
             let is8 = is_imm8_op(code);
             let imm = inst_imm(inst, is8);
-            if sz == 64 { b.mov_r_imm64(SCRATCH2, imm as u64); b.binop_r_r64(OP_SUB_R_R64, SCRATCH, SCRATCH2); }
-            else { b.mov_r_imm32(SCRATCH2, imm as u32); b.binop_r_r(OP_SUB_R_R, SCRATCH, SCRATCH2); }
+            if sz == 64 {
+                b.mov_r_imm64(SCRATCH2, imm as u64);
+                b.binop_r_r64(OP_SUB_R_R64, SCRATCH, SCRATCH2);
+            } else {
+                b.mov_r_imm32(SCRATCH2, imm as u32);
+                b.binop_r_r(OP_SUB_R_R, SCRATCH, SCRATCH2);
+            }
         }
     } else {
         return Err(anyhow!("lifter: unsupported cmp operand {}", inst));
@@ -251,7 +351,11 @@ pub(super) fn lift_test(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
     if inst.op0_kind() == OpKind::Register {
         let r = vreg(inst.op0_register())?;
         let width = reg_bits(inst.op0_register());
-        let mask = match width { 8 => 0xFFu32, 16 => 0xFFFFu32, _ => 0xFFFF_FFFFu32 };
+        let mask = match width {
+            8 => 0xFFu32,
+            16 => 0xFFFFu32,
+            _ => 0xFFFF_FFFFu32,
+        };
         if inst.op1_kind() == OpKind::Register {
             let s = vreg(inst.op1_register())?;
             if width == 64 {
@@ -259,7 +363,9 @@ pub(super) fn lift_test(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
                 b.binop_r_r64(OP_AND_R_R64, SCRATCH, s);
             } else {
                 b.mov_r_r(SCRATCH, r);
-                if mask != 0xFFFF_FFFF { b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH, mask); }
+                if mask != 0xFFFF_FFFF {
+                    b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH, mask);
+                }
                 b.binop_r_r(OP_AND_R_R, SCRATCH, SCRATCH);
             }
         } else {
@@ -270,7 +376,9 @@ pub(super) fn lift_test(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
                 b.binop_r_r64(OP_AND_R_R64, SCRATCH, SCRATCH2);
             } else {
                 b.mov_r_r(SCRATCH, r);
-                if mask != 0xFFFF_FFFF { b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH, mask); }
+                if mask != 0xFFFF_FFFF {
+                    b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH, mask);
+                }
                 b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH, imm as u32);
             }
         }
@@ -295,10 +403,15 @@ pub(super) fn lift_xchg(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
     use iced_x86::Code::*;
     let mem_op: Option<u32> = (0..inst.op_count()).find(|&i| inst.op_kind(i) == OpKind::Memory);
     let name = format!("{:?}", inst.code());
-    let wbits = if name.contains("rm8_") || name.contains("r8_rm8") { 8 }
-        else if name.contains("rm16_") || name.contains("r16_rm16") { 16 }
-        else if name.contains("rm64_") || name.contains("r64_RAX") { 64 }
-        else { 32 };
+    let wbits = if name.contains("rm8_") || name.contains("r8_rm8") {
+        8
+    } else if name.contains("rm16_") || name.contains("r16_rm16") {
+        16
+    } else if name.contains("rm64_") || name.contains("r64_RAX") {
+        64
+    } else {
+        32
+    };
     let is64 = wbits == 64;
     if let Some(mi) = mem_op {
         let addr = mem_emit(b, inst, mi)?;
@@ -337,10 +450,15 @@ pub(super) fn lift_cmpxchg(b: &mut BytecodeBuilder, inst: &Instruction) -> Resul
     use iced_x86::Code::*;
     let code = inst.code();
     let name = format!("{:?}", code);
-    let wbits = if name.contains("rm8_") { 8 }
-        else if name.contains("rm16_") { 16 }
-        else if name.contains("rm64_") { 64 }
-        else { 32 };
+    let wbits = if name.contains("rm8_") {
+        8
+    } else if name.contains("rm16_") {
+        16
+    } else if name.contains("rm64_") {
+        64
+    } else {
+        32
+    };
     let mov_wide = matches!(wbits, 64);
     let rax = 0u8;
     let src = vreg(inst.op1_register())?;
@@ -367,11 +485,19 @@ pub(super) fn lift_cmpxchg(b: &mut BytecodeBuilder, inst: &Instruction) -> Resul
             b.binop_r_r(OP_SUB_R_R, SCRATCH, SCRATCH2);
         }
         b.jcc8(COND_JNE, not_equal);
-        if mov_wide { b.mov_r_r64(dst, src); } else { b.mov_r_r(dst, src); }
+        if mov_wide {
+            b.mov_r_r64(dst, src);
+        } else {
+            b.mov_r_r(dst, src);
+        }
         let done = b.new_label();
         b.jmp8(done);
         b.mark_label(not_equal);
-        if mov_wide { b.mov_r_r64(rax, SCRATCH); } else { b.mov_r_r(rax, SCRATCH); }
+        if mov_wide {
+            b.mov_r_r64(rax, SCRATCH);
+        } else {
+            b.mov_r_r(rax, SCRATCH);
+        }
         b.mark_label(done);
     }
     Ok(())
@@ -382,15 +508,24 @@ pub(super) fn lift_xadd(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
     use iced_x86::Code::*;
     let code = inst.code();
     let name = format!("{:?}", code);
-    let wbits = if name.contains("rm8_") || name.contains("r8_rm8") { 8 }
-        else if name.contains("rm16_") || name.contains("r16_rm16") { 16 }
-        else if name.contains("rm64_") || name.contains("r64_rm64") { 64 }
-        else { 32 };
+    let wbits = if name.contains("rm8_") || name.contains("r8_rm8") {
+        8
+    } else if name.contains("rm16_") || name.contains("r16_rm16") {
+        16
+    } else if name.contains("rm64_") || name.contains("r64_rm64") {
+        64
+    } else {
+        32
+    };
     let (addop, mov_wide) = match wbits {
         64 => (OP_ADD_R_R64, true),
         _ => (OP_ADD_R_R, false),
     };
-    let mask: u32 = match wbits { 8 => 0xFF, 16 => 0xFFFF, _ => 0xFFFF_FFFF };
+    let mask: u32 = match wbits {
+        8 => 0xFF,
+        16 => 0xFFFF,
+        _ => 0xFFFF_FFFF,
+    };
     let src = vreg(inst.op1_register())?;
     if inst.op0_kind() == OpKind::Memory {
         let addr = mem_emit(b, inst, 0)?;
@@ -403,15 +538,36 @@ pub(super) fn lift_xadd(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
         b.mem_xadd_a(xop, addr, src);
     } else {
         let dst = vreg(inst.op0_register())?;
-        if mov_wide { b.mov_r_r64(SCRATCH, dst); } else { b.mov_r_r(SCRATCH, dst); }
+        if mov_wide {
+            b.mov_r_r64(SCRATCH, dst);
+        } else {
+            b.mov_r_r(SCRATCH, dst);
+        }
         b.mov_r_r(SCRATCH2, SCRATCH);
-        if wbits == 64 { b.binop_r_r64(addop, SCRATCH2, src); }
-        else { b.binop_r_r(addop, SCRATCH2, src); }
-        if wbits == 8 || wbits == 16 { b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH2, mask); }
-        if mov_wide { b.mov_r_r64(dst, SCRATCH2); } else { b.mov_r_r(dst, SCRATCH2); }
-        if wbits == 8 || wbits == 16 { b.binop_r_imm32(OP_AND_R_IMM32, dst, mask); }
-        if mov_wide { b.mov_r_r64(src, SCRATCH); } else { b.mov_r_r(src, SCRATCH); }
-        if wbits == 8 || wbits == 16 { b.binop_r_imm32(OP_AND_R_IMM32, src, mask); }
+        if wbits == 64 {
+            b.binop_r_r64(addop, SCRATCH2, src);
+        } else {
+            b.binop_r_r(addop, SCRATCH2, src);
+        }
+        if wbits == 8 || wbits == 16 {
+            b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH2, mask);
+        }
+        if mov_wide {
+            b.mov_r_r64(dst, SCRATCH2);
+        } else {
+            b.mov_r_r(dst, SCRATCH2);
+        }
+        if wbits == 8 || wbits == 16 {
+            b.binop_r_imm32(OP_AND_R_IMM32, dst, mask);
+        }
+        if mov_wide {
+            b.mov_r_r64(src, SCRATCH);
+        } else {
+            b.mov_r_r(src, SCRATCH);
+        }
+        if wbits == 8 || wbits == 16 {
+            b.binop_r_imm32(OP_AND_R_IMM32, src, mask);
+        }
     }
     Ok(())
 }

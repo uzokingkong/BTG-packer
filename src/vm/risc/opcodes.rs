@@ -25,6 +25,11 @@ pub enum RiscOp {
     /// 64비트 비트 쉬프트 (좌측)
     ShiftLeft,
 
+    /// x86 ROL at operand width. src2 is the runtime count; count==0 preserves flags.
+    RotateLeft {
+        width: u8,
+    },
+
     /// 가상 스택 푸시: VSP -= 8; [VSP] = val
     VirtualPush,
 
@@ -32,13 +37,19 @@ pub enum RiscOp {
     VirtualPop,
 
     /// 가상 메모리 로드: dest = [addr] (1, 2, 4, 8 bytes)
-    MemoryRead { width: u8 },
+    MemoryRead {
+        width: u8,
+    },
 
     /// 가상 메모리 스토어: [addr] = src (1, 2, 4, 8 bytes)
-    MemoryWrite { width: u8 },
+    MemoryWrite {
+        width: u8,
+    },
 
     /// 가상 조건부/무조건 브랜치: if (cond_flag) VIP = target
-    VirtualBranch { cond: BranchCondition },
+    VirtualBranch {
+        cond: BranchCondition,
+    },
 
     /// 네이티브 API 및 런타임 콜 브릿지
     NativeCallBridge,
@@ -63,6 +74,9 @@ pub enum RiscOp {
     /// VM 실행 종료 및 네이티브 컨텍스트 복귀
     Halt,
 
+    /// Architecturally guaranteed invalid instruction (x86 UD2).
+    Trap,
+
     /// x86 RET — 가상 스택에서 복귀 주소를 pop 해 VM 내부(ip_map) 타깃이면
     /// 그쪽으로 분기하고, ip_map 에 없으면(빈 스택/네이티브 복귀 주소) **Halt** 로
     /// 종료해 네이티브 호출자에게 돌아간다.
@@ -84,39 +98,68 @@ pub enum RiscOp {
     // desynth의 AddWithCarry(+~b+1)로는 x86 SUB/NEG의 borrow-CF를 재현할 수 없다
     // (a<b일 때 CF=1). 분기(JB/JAE 등)가 플래그를 소비하므로 실질 버그다.
     // 각 op는 x86 폭(1/2/4/8)의 플래그 경계(bit 7/15/31/63)로 계산한다.
-
     /// x86 SUB/CMP — dst = src1 - src2. CF=borrow(a<b), OF/AF/SF/ZF/PF 정확.
-    SubWithBorrow { width: u8 },
+    SubWithBorrow {
+        width: u8,
+    },
 
     /// x86 ADD — dst = src1 + src2. 폭별(bit 7/15/31/63) CF/OF/AF/SF/ZF/PF 정확.
-    Add { width: u8 },
+    Add {
+        width: u8,
+    },
+
+    /// x86 ADC — dst = src1 + src2 + incoming CF, width-specific status flags.
+    Adc {
+        width: u8,
+    },
+
+    /// x86 SBB — dst = src1 - src2 - incoming CF, CF is borrow-out.
+    Sbb {
+        width: u8,
+    },
 
     /// x86 INC — dst = src1 + 1. CF **보존**, OF=res==MIN, AF/ZF/SF/PF 갱신.
-    Inc { width: u8 },
+    Inc {
+        width: u8,
+    },
 
     /// x86 DEC — dst = src1 - 1. CF **보존**, OF=res==MAX, AF/ZF/SF/PF 갱신.
-    Dec { width: u8 },
+    Dec {
+        width: u8,
+    },
 
     /// x86 NOT — dst = ~src1. **플래그 변경 없음** (x86 NOT은 RFLAGS 불변).
-    Not { width: u8 },
+    Not {
+        width: u8,
+    },
 
     // ── P2: 정수/비트/제어 복합 연산 (x86 hard-to-decompose) ─────────────────────
-
     /// 1-피연산자 MUL/IMUL (RDX:RAX = RAX * r/m, 폭별).
     /// `dst` = low, `regs[2]`(RDX) = high(폭 ≥ 2), 폭 1 은 AX(=AL + AH) 를 dst 로.
     /// CF = OF = overflow (unsigned: high != 0; signed: high != sign-extend(low)).
-    Multiply { signed: bool, width: u8 },
+    Multiply {
+        signed: bool,
+        width: u8,
+    },
 
     /// 2/3-피연산자 IMUL (dst = low(src1 * src2), RDX 미기록).
     /// CF = OF = overflow. 폭은 `width`(2/4/8).
-    MultiplyLow { signed: bool, width: u8 },
+    MultiplyLow {
+        signed: bool,
+        width: u8,
+    },
 
     /// DIV/IDIV — 피제수 = RDX:RAX(폭별), 제수 = src1, 몫 → dst(RAX), 나머지 → RDX.
     /// 폭 1 은 AL=몫, AH=나머지, 결과를 AX(dst) 로.
-    Divide { signed: bool, width: u8 },
+    Divide {
+        signed: bool,
+        width: u8,
+    },
 
     /// BSWAP (폭 4/8) — 바이트 순서 반전.
-    BSwap { width: u8 },
+    BSwap {
+        width: u8,
+    },
 
     /// BSF — src == 0 이면 ZF=1·dst=0, 아니면 ZF=0·dst=최하위 세트 비트 인덱스.
     BitScanForward,
@@ -125,23 +168,33 @@ pub enum RiscOp {
     BitScanReverse,
 
     /// TZCNT — dst = ctz(src); src == 0 이면 dst=폭·CF=1·ZF=1.
-    CountTrailingZeros { width: u8 },
+    CountTrailingZeros {
+        width: u8,
+    },
 
     /// LZCNT — dst = clz(src, 폭 한정); src == 0 이면 dst=폭·CF=1·ZF=1.
-    CountLeadingZeros { width: u8 },
+    CountLeadingZeros {
+        width: u8,
+    },
 
     /// POPCNT — dst = popcount(src); CF=OF=0, ZF/SF/PF 는 결과 기준.
     PopCount,
 
     /// SETcc — dst(8비트) = 조건 ? 1 : 0. (조건은 branch_cond_map 으로 부호화)
-    Setcc { cond: BranchCondition },
+    Setcc {
+        cond: BranchCondition,
+    },
 
     /// CMOVcc — dst = 조건 ? src1 : dst. (조건은 branch_cond_map 으로 부호화)
-    ConditionalMove { cond: BranchCondition },
+    ConditionalMove {
+        cond: BranchCondition,
+    },
 
     /// CMPXCHG — `[src1] == RAX` 이면 `[src1] = src2`·ZF=1, 아니면 `RAX = [src1]`·ZF=0.
     /// (누산기 RAX = regs[0], 폭별 마스크. 폭 8 이면 RAX 전체.)
-    CompareExchange { width: u8 },
+    CompareExchange {
+        width: u8,
+    },
 
     /// P0-4: 원자적 XCHG — `dst`(레지스터) ↔ `[src1]`(메모리) 교환.
     ///
@@ -151,23 +204,45 @@ pub enum RiscOp {
     /// 이 op 는 메모리 상호 교환을 단일 원자로 모델링한다: `old = [src1]; [src1] =
     /// dst; dst = old`. 플래그 불변 (x86 XCHG 는 RFLAGS 무변경). 레지스터↔레지스터
     /// XCHG 는 원자성이 불필요하므로 lifter 는 기존대로 Mov 3개로 분해한다.
-    AtomicExchange { width: u8 },
+    AtomicExchange {
+        width: u8,
+    },
 
     /// P0-4: 원자적 XADD — `[src1] += src2`, `dst` = 이전 `[src1]`.
     ///
     /// x86 `LOCK XADD [mem], reg` 는 원자 RMW 이며 flags 는 덧셈 기준이다.
     /// `old = [src1]; new = old + src2 (폭별 플래그); [src1] = new; dst = old`.
     /// 레지스터 형태(XADD r/m, r) 는 원자성이 불필요하지만 동일 op 로 표현한다.
-    AtomicAdd { width: u8 },
+    AtomicAdd {
+        width: u8,
+    },
 
     // P2: SSE/FPU scalar
-    FloatAdd { width: u8 },
-    FloatSub { width: u8 },
-    FloatMul { width: u8 },
-    FloatDiv { width: u8 },
-    IntToFloat { src_bits: u8, dst_bits: u8 },
-    FloatToInt { src_bits: u8, dst_bits: u8, truncate: bool },
-    FloatToFloat { src_bits: u8, dst_bits: u8 },
+    FloatAdd {
+        width: u8,
+    },
+    FloatSub {
+        width: u8,
+    },
+    FloatMul {
+        width: u8,
+    },
+    FloatDiv {
+        width: u8,
+    },
+    IntToFloat {
+        src_bits: u8,
+        dst_bits: u8,
+    },
+    FloatToInt {
+        src_bits: u8,
+        dst_bits: u8,
+        truncate: bool,
+    },
+    FloatToFloat {
+        src_bits: u8,
+        dst_bits: u8,
+    },
 
     /// F1: 네이티브 브릿지 FP 리턴 힌트 — `width`(0=정수/무시, 4=f32, 8=f64).
     ///
@@ -176,7 +251,9 @@ pub enum RiscOp {
     /// 어느 것에서 regs[0] 로 동기화할지 결정한다. 참조 `eval_state` 와 폴리
     /// 인터프리터, 그리고 블록 단위 하네스에서는 no-op(네이티브 브릿지가 없는
     /// 경로) — FP 리턴 값은 XMM 슬롯/레지스터로만 전달되므로 가상 상태 불변.
-    SetNativeFpReturn { width: u8 },
+    SetNativeFpReturn {
+        width: u8,
+    },
 
     // ── P1 (보고서 ②): packed SSE — XMM 슬롯(16바이트 가상 메모리) 기반 ────────
     // XMM 슬롯은 XMM_SLOT_BASE + idx*16 의 16바이트 가상 메모리로 모델링된다.
@@ -188,17 +265,22 @@ pub enum RiscOp {
     // `is_encodable`에는 **등록하지 않는다** (상용 `--vm-commercial`은 이런 함수를
     // 네이티브로 유지 — XMM_SLOT_BASE 는 네이티브 arena에 매핑되지 않으므로
     // 폴리 인코딩/네이티브 실행을 허용하면 조용히 틀린다).
-
     /// MOVDQA/MOVDQU/MOVUPS/MOVAPS — 16바이트 슬롯 복사. src1 = 원본 슬롯/메모리
     /// 주소, dst = 대상 슬롯 주소. (메모리 로드/스토어는 lifter 가 2× 8바이트
     /// MemoryRead/MemoryWrite 로 분해한다.)
     PackedMove,
 
     /// PADDB(1,16)/PADDW(2,8)/PADDD(4,4)/PADDQ(8,2) — 요소 단위 가산(폭 랩).
-    PackedAdd { elem_width: u8, lanes: u8 },
+    PackedAdd {
+        elem_width: u8,
+        lanes: u8,
+    },
 
     /// PSUBB/PSUBW/PSUBD/PSUBQ — 요소 단위 감산(폭 랩).
-    PackedSub { elem_width: u8, lanes: u8 },
+    PackedSub {
+        elem_width: u8,
+        lanes: u8,
+    },
 
     /// PXOR — 16바이트 배타적 논리합 (요소 폭 무관 비트열).
     PackedXor,
@@ -213,7 +295,50 @@ pub enum RiscOp {
     PackedAndNot,
 
     /// PCMPEQB/W/D/Q — 요소 단위 등가: 같은 요소 = 전-1, 다르면 0.
-    PackedCmpEq { elem_width: u8, lanes: u8 },
+    PackedCmpEq {
+        elem_width: u8,
+        lanes: u8,
+    },
+
+    /// PCMPGTB/W/D/Q — signed 요소 비교: src1 > src2이면 전-1, 아니면 0.
+    PackedCmpGt {
+        elem_width: u8,
+        lanes: u8,
+    },
+
+    /// PUNPCKL/HBW/WD/DQ/QDQ — 선택한 입력 half의 요소를 교대로 배치.
+    PackedUnpack {
+        elem_width: u8,
+        high: bool,
+    },
+
+    /// PSRLQ xmm, imm8 — 두 64-bit lane을 독립적으로 논리 우측 shift.
+    PackedShiftRightQ,
+
+    /// PSHUFD / PSHUFLW. src2의 low imm8이 2-bit lane selector 4개를 담는다.
+    PackedShuffle {
+        low_words: bool,
+    },
+
+    /// SHLD: dst = (dst << count) | (src >> (bits-count)).
+    DoubleShiftLeft {
+        width: u8,
+    },
+
+    /// BT/BTR/BTS. modify: 0=test, 1=reset, 2=set.
+    BitTest {
+        width: u8,
+        modify: u8,
+        memory: bool,
+    },
+    PackedMovMaskBytes,
+    PackedMovMaskPs,
+    PackedInsertWord,
+    CpuId,
+    XGetBv,
+    ReadSegmentBase {
+        gs: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -232,13 +357,13 @@ pub enum BranchCondition {
     GreaterOrEqual,
     LessOrEqual,
     // unsigned comparisons (precise, not just CF)
-    Above,          // JA: CF=0 && ZF=0
-    AboveOrEqual,   // JAE: CF=0
-    Below,          // JB: CF=1
-    BelowOrEqual,   // JBE: CF=1 || ZF=1
+    Above,        // JA: CF=0 && ZF=0
+    AboveOrEqual, // JAE: CF=0
+    Below,        // JB: CF=1
+    BelowOrEqual, // JBE: CF=1 || ZF=1
     // parity
-    Parity,         // JP
-    NotParity,      // JNP
+    Parity,    // JP
+    NotParity, // JNP
     // counter-based (Jcxz/Jecxz/Jrcxz): width in bytes (2/4/8). reg[1](RCX) low bytes == 0
     CounterZero(u8),
 }

@@ -37,7 +37,10 @@ pub fn export_debug_layout_log(
         dispatcher_rva,
         image_base + dispatcher_rva as u64
     ));
-    log_str.push_str(&format!("Total Trigger Blocks: {}\n\n", layout.shuffled_blocks.len()));
+    log_str.push_str(&format!(
+        "Total Trigger Blocks: {}\n\n",
+        layout.shuffled_blocks.len()
+    ));
 
     log_str.push_str("------------------------------------------------------------------\n");
     log_str.push_str(" BLOCK LAYOUT MAP (Physical Offset -> Relocated VA -> Assembly)\n");
@@ -66,7 +69,10 @@ pub fn export_debug_layout_log(
     }
 
     fs::write(&log_path, &log_str)?;
-    println!("[+] Generated Diagnostic Layout Map Log File: {}", log_path.display());
+    println!(
+        "[+] Generated Diagnostic Layout Map Log File: {}",
+        log_path.display()
+    );
     Ok(())
 }
 
@@ -96,7 +102,9 @@ pub fn verify_overlapped_disassembly(
 
         println!(
             "    [Block {:02}] Phys Offset: 0x{:04X} | Entries: {}",
-            block.id, phys_offset, block.entries.len()
+            block.id,
+            phys_offset,
+            block.entries.len()
         );
 
         println!("  [Entry 0 (+0 Offset): Normal Forward Flow]");

@@ -2,10 +2,23 @@
 // BTG (Bidirectional Trigger Graph) - Precision RIP-Relative Fixup Engine
 // ==============================================================================
 
-
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use iced_x86::{Instruction, OpKind, Register};
 use std::collections::HashMap;
+use thiserror::Error;
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RipFixupError {
+    #[error(
+        "RIP-relative displacement overflow: instruction=0x{real_ip:X}, next=0x{next_ip:X}, target=0x{target_va:X}, displacement={displacement}"
+    )]
+    DisplacementOverflow {
+        real_ip: u64,
+        next_ip: u64,
+        target_va: u64,
+        displacement: i128,
+    },
+}
 
 #[derive(Debug, Clone)]
 pub struct RipFixupEntry {
@@ -34,7 +47,7 @@ impl RelocationContext {
         if inst_index > self.instruction_offsets.len() {
             return Err(anyhow!("Instruction index {} out of bounds", inst_index));
         }
-        
+
         let mut ip = self.block_base_va;
         for i in 0..inst_index {
             ip += self.instruction_offsets[i] as u64;
@@ -74,18 +87,23 @@ impl RipFixupEngine {
     /// iced BlockEncoder는 분기(JMP/CALL/Jcc) 만 auto-fixup하고,
     /// RIP-relative 메모리 operand는 raw displacement를 그대로 인코딩함.
     /// 따라서 올바른 disp32를 직접 계산하여 set_memory_displacement64()에 저장해야 함.
-    pub fn process_fixup(inst: &mut Instruction, real_ip: u64, target_va: u64) -> Result<()> {
+    pub fn process_fixup(
+        inst: &mut Instruction,
+        real_ip: u64,
+        target_va: u64,
+    ) -> std::result::Result<(), RipFixupError> {
         if inst.memory_base() == Register::RIP {
             let next_ip = real_ip + inst.len() as u64;
-            let new_disp = target_va as i64 - next_ip as i64;
+            let new_disp = target_va as i128 - next_ip as i128;
 
             // 32-bit Signed Integer Bounds Validation (-2GB to +2GB)
-            if new_disp < i32::MIN as i64 || new_disp > i32::MAX as i64 {
-                log::error!(
-                    "[RIP Fixup] OVERFLOW SKIP: disp={} RealIP=0x{:X} NextIP=0x{:X} Target=0x{:X}.",
-                    new_disp, real_ip, next_ip, target_va
-                );
-                return Ok(());
+            if new_disp < i32::MIN as i128 || new_disp > i32::MAX as i128 {
+                return Err(RipFixupError::DisplacementOverflow {
+                    real_ip,
+                    next_ip,
+                    target_va,
+                    displacement: new_disp,
+                });
             }
 
             // iced-x86 BlockEncoder 원리:
@@ -97,13 +115,13 @@ impl RipFixupEngine {
 
             log::trace!(
                 "[RIP Fixup OK] RealIP=0x{:X} NextIP=0x{:X} Target=0x{:X}",
-                real_ip, next_ip, target_va
+                real_ip,
+                next_ip,
+                target_va
             );
         }
         Ok(())
     }
-
-
 }
 
 #[cfg(test)]
@@ -116,7 +134,7 @@ mod tests {
         let mut ctx = RelocationContext::new(0x1000);
         ctx.add_instruction_offset(5);
         ctx.add_instruction_offset(3);
-        
+
         assert_eq!(ctx.calculate_exact_ip(0).unwrap(), 0x1000);
         assert_eq!(ctx.calculate_exact_ip(1).unwrap(), 0x1005);
         assert_eq!(ctx.calculate_exact_ip(2).unwrap(), 0x1008);
@@ -132,9 +150,10 @@ mod tests {
     #[test]
     fn test_scan_instruction_with_rip() {
         let bytes = b"\x48\x8D\x05\x00\x10\x00\x00"; // lea rax, [rip+0x1000]
-        let mut decoder = iced_x86::Decoder::with_ip(64, bytes, 0x1000, iced_x86::DecoderOptions::NONE);
+        let mut decoder =
+            iced_x86::Decoder::with_ip(64, bytes, 0x1000, iced_x86::DecoderOptions::NONE);
         let inst = decoder.decode();
-        
+
         let fixup = RipFixupEngine::scan_instruction(&inst).unwrap();
         assert_eq!(fixup.original_ip, 0x1000);
         assert_eq!(fixup.target_va, 0x2007);
@@ -146,7 +165,7 @@ mod tests {
         inst.set_code(Code::Lea_r64_m);
         inst.set_memory_base(Register::RIP);
         inst.set_len(7);
-        
+
         let result = RipFixupEngine::process_fixup(&mut inst, 0x1000, 0x2000);
         assert!(result.is_ok());
         assert_eq!(inst.memory_displacement64(), 0x2000);
@@ -158,10 +177,40 @@ mod tests {
         inst.set_code(Code::Lea_r64_m);
         inst.set_memory_base(Register::RIP);
         inst.set_len(7);
-        
+
         // Target is > 2GB away
         let target = 0x1000 + (i32::MAX as u64) + 0x1000;
         let result = RipFixupEngine::process_fixup(&mut inst, 0x1000, target);
-        assert!(result.is_ok());
+        assert!(matches!(
+            result,
+            Err(RipFixupError::DisplacementOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn test_process_fixup_signed_disp32_boundaries() {
+        let real_ip = 0x1_0000_0000u64;
+        let next_ip = real_ip + 7;
+        for displacement in [i32::MIN as i64, i32::MAX as i64] {
+            let mut inst = Instruction::default();
+            inst.set_code(Code::Lea_r64_m);
+            inst.set_memory_base(Register::RIP);
+            inst.set_len(7);
+            let target = (next_ip as i128 + displacement as i128) as u64;
+            assert!(RipFixupEngine::process_fixup(&mut inst, real_ip, target).is_ok());
+            assert_eq!(inst.memory_displacement64(), target);
+        }
+
+        for displacement in [i32::MIN as i64 - 1, i32::MAX as i64 + 1] {
+            let mut inst = Instruction::default();
+            inst.set_code(Code::Lea_r64_m);
+            inst.set_memory_base(Register::RIP);
+            inst.set_len(7);
+            let target = (next_ip as i128 + displacement as i128) as u64;
+            assert!(matches!(
+                RipFixupEngine::process_fixup(&mut inst, real_ip, target),
+                Err(RipFixupError::DisplacementOverflow { .. })
+            ));
+        }
     }
 }

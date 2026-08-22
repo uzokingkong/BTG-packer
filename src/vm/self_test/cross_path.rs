@@ -17,9 +17,9 @@
 // RISC 가 의도적으로 모델하지 않는 부분이 있으면 여기서 드러나고, 그 drift 를
 // semantic core 작업으로 정리한다.
 
-use anyhow::{anyhow, Result};
 use crate::vm::bytecode::{BytecodeBuilder, FLAG_MASK};
 use crate::vm::{interp, risc};
+use anyhow::{anyhow, Result};
 use iced_x86::{Code, Instruction, Register};
 use rand::SeedableRng;
 
@@ -64,7 +64,11 @@ fn st_vregs(st: &[u8]) -> [u64; 16] {
 }
 
 fn st_flags(st: &[u8]) -> u64 {
-    u64::from_le_bytes(st[interp::STATE_FLAGS..interp::STATE_FLAGS + 8].try_into().unwrap())
+    u64::from_le_bytes(
+        st[interp::STATE_FLAGS..interp::STATE_FLAGS + 8]
+            .try_into()
+            .unwrap(),
+    )
 }
 
 /// Cross-path differential: bytecode path must equal the RISC path (both from
@@ -99,25 +103,82 @@ pub(crate) fn run_cross_path_test() -> Result<()> {
 
     // (name, instruction) — core ops supported by both lifters.
     let cases: Vec<(&str, Instruction)> = vec![
-        ("add rax,rbx", Instruction::with2(Code::Add_r64_rm64, Register::RAX, Register::RBX).unwrap()),
-        ("sub rax,rbx", Instruction::with2(Code::Sub_r64_rm64, Register::RAX, Register::RBX).unwrap()),
-        ("xor rax,rbx", Instruction::with2(Code::Xor_r64_rm64, Register::RAX, Register::RBX).unwrap()),
-        ("and rax,rbx", Instruction::with2(Code::And_r64_rm64, Register::RAX, Register::RBX).unwrap()),
-        ("or rax,rbx", Instruction::with2(Code::Or_r64_rm64, Register::RAX, Register::RBX).unwrap()),
-        ("add eax,ebx", Instruction::with2(Code::Add_r32_rm32, Register::EAX, Register::EBX).unwrap()),
-        ("sub eax,ebx", Instruction::with2(Code::Sub_r32_rm32, Register::EAX, Register::EBX).unwrap()),
-        ("inc rax", Instruction::with1(Code::Inc_rm64, Register::RAX).unwrap()),
-        ("dec rax", Instruction::with1(Code::Dec_rm64, Register::RAX).unwrap()),
-        ("neg rax", Instruction::with1(Code::Neg_rm64, Register::RAX).unwrap()),
-        ("not rax", Instruction::with1(Code::Not_rm64, Register::RAX).unwrap()),
-        ("shl rax,cl", Instruction::with2(Code::Shl_rm64_CL, Register::RAX, Register::CL).unwrap()),
-        ("shr rax,cl", Instruction::with2(Code::Shr_rm64_CL, Register::RAX, Register::CL).unwrap()),
-        ("sar rax,cl", Instruction::with2(Code::Sar_rm64_CL, Register::RAX, Register::CL).unwrap()),
-        ("bswap rax", Instruction::with1(Code::Bswap_r64, Register::RAX).unwrap()),
-        ("cmp rax,rbx", Instruction::with2(Code::Cmp_r64_rm64, Register::RAX, Register::RBX).unwrap()),
-        ("test rax,rbx", Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RBX).unwrap()),
-        ("bsr rax,rbx", Instruction::with2(Code::Bsr_r64_rm64, Register::RAX, Register::RBX).unwrap()),
-        ("bsf rax,rbx", Instruction::with2(Code::Bsf_r64_rm64, Register::RAX, Register::RBX).unwrap()),
+        (
+            "add rax,rbx",
+            Instruction::with2(Code::Add_r64_rm64, Register::RAX, Register::RBX).unwrap(),
+        ),
+        (
+            "sub rax,rbx",
+            Instruction::with2(Code::Sub_r64_rm64, Register::RAX, Register::RBX).unwrap(),
+        ),
+        (
+            "xor rax,rbx",
+            Instruction::with2(Code::Xor_r64_rm64, Register::RAX, Register::RBX).unwrap(),
+        ),
+        (
+            "and rax,rbx",
+            Instruction::with2(Code::And_r64_rm64, Register::RAX, Register::RBX).unwrap(),
+        ),
+        (
+            "or rax,rbx",
+            Instruction::with2(Code::Or_r64_rm64, Register::RAX, Register::RBX).unwrap(),
+        ),
+        (
+            "add eax,ebx",
+            Instruction::with2(Code::Add_r32_rm32, Register::EAX, Register::EBX).unwrap(),
+        ),
+        (
+            "sub eax,ebx",
+            Instruction::with2(Code::Sub_r32_rm32, Register::EAX, Register::EBX).unwrap(),
+        ),
+        (
+            "inc rax",
+            Instruction::with1(Code::Inc_rm64, Register::RAX).unwrap(),
+        ),
+        (
+            "dec rax",
+            Instruction::with1(Code::Dec_rm64, Register::RAX).unwrap(),
+        ),
+        (
+            "neg rax",
+            Instruction::with1(Code::Neg_rm64, Register::RAX).unwrap(),
+        ),
+        (
+            "not rax",
+            Instruction::with1(Code::Not_rm64, Register::RAX).unwrap(),
+        ),
+        (
+            "shl rax,cl",
+            Instruction::with2(Code::Shl_rm64_CL, Register::RAX, Register::CL).unwrap(),
+        ),
+        (
+            "shr rax,cl",
+            Instruction::with2(Code::Shr_rm64_CL, Register::RAX, Register::CL).unwrap(),
+        ),
+        (
+            "sar rax,cl",
+            Instruction::with2(Code::Sar_rm64_CL, Register::RAX, Register::CL).unwrap(),
+        ),
+        (
+            "bswap rax",
+            Instruction::with1(Code::Bswap_r64, Register::RAX).unwrap(),
+        ),
+        (
+            "cmp rax,rbx",
+            Instruction::with2(Code::Cmp_r64_rm64, Register::RAX, Register::RBX).unwrap(),
+        ),
+        (
+            "test rax,rbx",
+            Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RBX).unwrap(),
+        ),
+        (
+            "bsr rax,rbx",
+            Instruction::with2(Code::Bsr_r64_rm64, Register::RAX, Register::RBX).unwrap(),
+        ),
+        (
+            "bsf rax,rbx",
+            Instruction::with2(Code::Bsf_r64_rm64, Register::RAX, Register::RBX).unwrap(),
+        ),
     ];
 
     let mut reg_bad: Vec<String> = Vec::new();
@@ -201,7 +262,7 @@ mod tests {
     /// 변하지 않는다 — 실제 실행은 [28] M8 MBA 테스트가 end-to-end로 검증한다.
     #[test]
     fn handler_layout_randomized_per_mba_build() {
-        use crate::vm::handlers::{EntryMode, validate_vm_code};
+        use crate::vm::handlers::{validate_vm_code, EntryMode};
         // a small program exercising a few opcodes
         let mut bc = BytecodeBuilder::new();
         bc.mov_r_imm64(3, 0x1234_5678_9ABC_DEF0);
@@ -248,7 +309,11 @@ mod tests {
 
         // non-obfuscated (plain) reference handler bodies for each op.
         let plain = crate::vm::build_vm_module(
-            0x14000_1000, 0x14000_9000, 0x14000_A000, prog.clone(), EntryMode::Ksa,
+            0x14000_1000,
+            0x14000_9000,
+            0x14000_A000,
+            prog.clone(),
+            EntryMode::Ksa,
         )
         .expect("build plain vm");
 
@@ -256,12 +321,18 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
         for trial in 0..100 {
             let m = crate::vm::build_vm_module_mba(
-                0x14000_1000, 0x14000_9000, 0x14000_A000, prog.clone(), EntryMode::Ksa, &mut rng,
+                0x14000_1000,
+                0x14000_9000,
+                0x14000_A000,
+                prog.clone(),
+                EntryMode::Ksa,
+                &mut rng,
             )
             .expect("build mba vm");
             for op in 1..crate::vm::bytecode::NUM_OPS {
                 let off = m.handler_offsets[op];
-                let mut dec = Decoder::with_ip(64, &m.code, 0x14000_1000 + off as u64, DecoderOptions::NONE);
+                let mut dec =
+                    Decoder::with_ip(64, &m.code, 0x14000_1000 + off as u64, DecoderOptions::NONE);
                 let inst = dec.decode();
                 let is_bad = inst.is_invalid()
                     || inst.code() == iced_x86::Code::Ud2
@@ -271,7 +342,12 @@ mod tests {
                 // 바이트 단위로 일치해야 한다 (다른 핸들러로 치환되면 크래시).
                 let poff = plain.handler_offsets[op];
                 let pdec = {
-                    let mut d = Decoder::with_ip(64, &plain.code, 0x14000_1000 + poff as u64, DecoderOptions::NONE);
+                    let mut d = Decoder::with_ip(
+                        64,
+                        &plain.code,
+                        0x14000_1000 + poff as u64,
+                        DecoderOptions::NONE,
+                    );
                     d.decode()
                 };
                 let body_mismatch = inst.code() != pdec.code()
@@ -287,6 +363,10 @@ mod tests {
                 }
             }
         }
-        assert!(bad.is_empty(), "obfuscated handler_offsets point into wrong code:\n  {}", bad.join("\n  "));
+        assert!(
+            bad.is_empty(),
+            "obfuscated handler_offsets point into wrong code:\n  {}",
+            bad.join("\n  ")
+        );
     }
 }

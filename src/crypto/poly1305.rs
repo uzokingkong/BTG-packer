@@ -291,8 +291,7 @@ pub const RFC8439_POLY1305_KEY: [u8; 32] = [
     0x85, 0xd6, 0xbe, 0x78, 0x57, 0x55, 0x6d, 0x33, 0x7f, 0x44, 0x52, 0xfe, 0x42, 0xd5, 0x06, 0xa8,
     0x01, 0x03, 0x80, 0x8a, 0xfb, 0x0d, 0xb2, 0xfd, 0x4a, 0xbf, 0xf6, 0xaf, 0x41, 0x49, 0xf5, 0x1b,
 ];
-pub const RFC8439_POLY1305_MSG: &[u8] =
-    b"Cryptographic Forum Research Group";
+pub const RFC8439_POLY1305_MSG: &[u8] = b"Cryptographic Forum Research Group";
 pub const RFC8439_POLY1305_TAG: [u8; 16] = [
     0xa8, 0x06, 0x1d, 0xc1, 0x30, 0x51, 0x36, 0xc6, 0xc2, 0x2b, 0x8b, 0xaf, 0x0c, 0x01, 0x27, 0xa9,
 ];
@@ -311,7 +310,9 @@ mod tests {
     fn poly1305_differential_vs_rustcrypto() {
         use poly1305::universal_hash::KeyInit;
         for len in [0usize, 1, 16, 17, 32, 63, 64, 65, 100, 256, 1024] {
-            let msg: Vec<u8> = (0..len).map(|i| ((i as u32 * 131 + 7) % 251) as u8).collect();
+            let msg: Vec<u8> = (0..len)
+                .map(|i| ((i as u32 * 131 + 7) % 251) as u8)
+                .collect();
             let key = RFC8439_POLY1305_KEY;
             let rc = <poly1305::Poly1305 as KeyInit>::new_from_slice(&key).unwrap();
             let rc_tag = rc.compute_unpadded(&msg).as_slice().to_vec();
@@ -336,6 +337,10 @@ mod tests {
         poly1305_blocks(&mut st, &msg[..80], false);
         poly1305_blocks(&mut st, &msg[80..], true);
         let chunked = poly1305_finish(&st);
-        assert_eq!(chunked.to_vec(), single.to_vec(), "chunked processing must equal single-shot");
+        assert_eq!(
+            chunked.to_vec(),
+            single.to_vec(),
+            "chunked processing must equal single-shot"
+        );
     }
 }

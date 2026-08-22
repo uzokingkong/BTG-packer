@@ -2,8 +2,8 @@
 // Boot-stub block encoding: measure instruction IPs, resolve branch labels, encode.
 // ==============================================================================
 
-use super::ANTI_DEBUG_BLOCK_LEN;
 use super::bootstub::{BootStubCtx, Label};
+use super::ANTI_DEBUG_BLOCK_LEN;
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Instruction, InstructionBlock};
 
 fn measure_inst(inst: &Instruction, ip: u64, opts: u32) -> usize {
@@ -13,7 +13,11 @@ fn measure_inst(inst: &Instruction, ip: u64, opts: u32) -> usize {
         Ok(res) => res.code_buffer.len(),
         Err(_) => {
             // fallback: iced가 측정에 실패하면 명령어 자체 len() 사용
-            if inst.len() > 0 { inst.len() } else { 5 }
+            if inst.len() > 0 {
+                inst.len()
+            } else {
+                5
+            }
         }
     }
 }
@@ -35,7 +39,10 @@ fn is_branch_code(code: iced_x86::Code) -> bool {
     )
 }
 
-pub(crate) fn encode_rc4_block(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn encode_rc4_block(
+    seq: &mut Vec<(Instruction, Option<Label>)>,
+    stub: &BootStubCtx,
+) -> anyhow::Result<Vec<u8>> {
     // 모든 경로에서 분기 최적화(rel8 축소)를 끄고 측정/최종 인코딩을 일치시킨다.
     // (rel8로 측정했다가 최종 레이아웃에서 rel32로 늘어나면 길이 검증이 깨진다.
     //  v6: IAT/mem 블록의 근거리 `je`가 rel8로 축소돼 4바이트 불일치를 일으켰음)
@@ -43,7 +50,12 @@ pub(crate) fn encode_rc4_block(seq: &mut Vec<(Instruction, Option<Label>)>, stub
 
     // ── 2. IP 배치 (각 명령을 개별 인코딩해 정확한 길이 측정) ──────────────────
     // anti-debug 블록은 고정 길이이며 rc4 코드는 그 뒤에서 시작한다.
-    let rc4_start_va = stub.boot_va + if stub.anti_debug { ANTI_DEBUG_BLOCK_LEN as u64 } else { 0 };
+    let rc4_start_va = stub.boot_va
+        + if stub.anti_debug {
+            ANTI_DEBUG_BLOCK_LEN as u64
+        } else {
+            0
+        };
     let mut ip = rc4_start_va;
     let mut label_ips: std::collections::HashMap<Label, u64> = std::collections::HashMap::new();
 
@@ -91,5 +103,4 @@ pub(crate) fn encode_rc4_block(seq: &mut Vec<(Instruction, Option<Label>)>, stub
         );
     }
     Ok(code)
-
 }

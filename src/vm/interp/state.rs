@@ -49,29 +49,29 @@ pub const STATE_VREGS: usize = 0x000;
 /// (STATE_FLAGS at offset 0x100) or past the state buffer.
 pub const NREG: usize = 20;
 pub const STATE_FLAGS: usize = 0x100;
-pub const STATE_SP: usize = 0x108;      // M3: stack pointer (offset from stack base)
+pub const STATE_SP: usize = 0x108; // M3: stack pointer (offset from stack base)
 pub const STATE_PTR_SBOX: usize = 0x110;
 pub const STATE_PTR_SEED: usize = 0x118;
 pub const STATE_PTR_BUF: usize = 0x120;
 pub const STATE_PTR_RUNS: usize = 0x128;
 pub const STATE_PTR_STACK: usize = 0x130; // M3: stack base pointer
-pub const STATE_RIP: usize = 0x138;       // v24: base VA of current lifted instruction (RIP-rel)
-pub const STATE_XMM: usize = 0x140;       // v29: XMM register file (16 regs x 16 bytes = 0x100)
-pub const STATE_SEG_GS: usize = 0x240;    // v43: GS segment base (= TEB). M6 Phase-2 PEB/TEB 접근.
-// ── Two-stack model (v13.4e): the VM keeps the *architectural* program stack on
-//    vreg[4] (RSP) and a SEPARATE VM bytecode return-IP stack here. CALL/RET no
-//    longer conflate the bytecode IP with the program's observed return address:
-//    CALL stores the program's original return VA on [v4] (RSP) and the bytecode
-//    return IP on this dedicated stack; RET pops the bytecode IP for control flow
-//    and advances v4 past the return VA. STATE_SP/STATE_PTR_STACK (0x108/0x130)
-//    are legacy M3 slots no longer used by call/ret/push/pop.
-pub const STATE_CALL_SP: usize = 0x248;          // VM bytecode return-IP stack offset (from base)
-pub const STATE_PTR_CALL_STACK: usize = 0x250;   // VM bytecode return-IP stack base
-// Dedicated bytecode return-IP stack buffer lives OUTSIDE the state buffer (the
-// boot stub reserves CALL_STACK_SIZE right after it and points STATE_PTR_CALL_STACK
-// at STATE_CALL_STACK_BUF). Kept out of STATE_SIZE so the small KSA/PRGA VMs (which
-// never call) don't balloon their state buffer.
-pub const CALL_STACK_SIZE: usize = 0x2000;       // 8 KiB = 1024 nested calls
+pub const STATE_RIP: usize = 0x138; // v24: base VA of current lifted instruction (RIP-rel)
+pub const STATE_XMM: usize = 0x140; // v29: XMM register file (16 regs x 16 bytes = 0x100)
+pub const STATE_SEG_GS: usize = 0x240; // v43: GS segment base (= TEB). M6 Phase-2 PEB/TEB 접근.
+                                       // ── Two-stack model (v13.4e): the VM keeps the *architectural* program stack on
+                                       //    vreg[4] (RSP) and a SEPARATE VM bytecode return-IP stack here. CALL/RET no
+                                       //    longer conflate the bytecode IP with the program's observed return address:
+                                       //    CALL stores the program's original return VA on [v4] (RSP) and the bytecode
+                                       //    return IP on this dedicated stack; RET pops the bytecode IP for control flow
+                                       //    and advances v4 past the return VA. STATE_SP/STATE_PTR_STACK (0x108/0x130)
+                                       //    are legacy M3 slots no longer used by call/ret/push/pop.
+pub const STATE_CALL_SP: usize = 0x248; // VM bytecode return-IP stack offset (from base)
+pub const STATE_PTR_CALL_STACK: usize = 0x250; // VM bytecode return-IP stack base
+                                               // Dedicated bytecode return-IP stack buffer lives OUTSIDE the state buffer (the
+                                               // boot stub reserves CALL_STACK_SIZE right after it and points STATE_PTR_CALL_STACK
+                                               // at STATE_CALL_STACK_BUF). Kept out of STATE_SIZE so the small KSA/PRGA VMs (which
+                                               // never call) don't balloon their state buffer.
+pub const CALL_STACK_SIZE: usize = 0x2000; // 8 KiB = 1024 nested calls
 pub const STATE_SIZE: usize = 0x258;
 /// Offset from the VM state base where the dedicated return-IP stack buffer begins.
 pub const STATE_CALL_STACK_BUF: usize = STATE_SIZE;
@@ -190,7 +190,11 @@ pub(crate) fn ptr_slot(state: &[u8], slot: usize) -> Result<usize, VmError> {
 /// matching real x86. See the fix note in handlers.rs (vreg4-as-single-stack).
 #[inline]
 pub(crate) fn sp_of(state: &[u8]) -> u64 {
-    u64::from_le_bytes(state[STATE_VREGS + 4 * 8..STATE_VREGS + 4 * 8 + 8].try_into().unwrap())
+    u64::from_le_bytes(
+        state[STATE_VREGS + 4 * 8..STATE_VREGS + 4 * 8 + 8]
+            .try_into()
+            .unwrap(),
+    )
 }
 
 /// Write the VM stack pointer (vreg[4]).
@@ -217,7 +221,11 @@ pub(crate) fn set_call_sp(state: &mut [u8], csp: u64) {
 /// given offset: STATE_PTR_CALL_STACK (base) + csp.
 #[inline]
 pub(crate) fn call_stack_addr(state: &[u8], csp: u64) -> usize {
-    let base = u64::from_le_bytes(state[STATE_PTR_CALL_STACK..STATE_PTR_CALL_STACK + 8].try_into().unwrap());
+    let base = u64::from_le_bytes(
+        state[STATE_PTR_CALL_STACK..STATE_PTR_CALL_STACK + 8]
+            .try_into()
+            .unwrap(),
+    );
     base.wrapping_add(csp) as usize
 }
 

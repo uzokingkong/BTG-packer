@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // BTG v3 - VM Handler Codegen: ALU arithmetic family - split from alu.rs
 // ==============================================================================
 // XOR/ADD/IMUL/SUB/AND/OR reg-reg & imm32/imm64, ROL/ROR, INC/DEC, CMP, TEST,
@@ -21,7 +21,12 @@ pub(crate) fn emit_alu_rr(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         (OP_AND_R_R, Code::And_rm32_r32, 2),
     ] {
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RCX)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EDX, vreg(Register::RDX)).unwrap(),
@@ -47,7 +52,12 @@ pub(crate) fn emit_alu_imm32(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         (OP_ADD_R_IMM32, Code::Add_rm32_r32, 1),
     ] {
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RCX)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(code, Register::EAX, Register::EDX).unwrap(),
@@ -69,7 +79,12 @@ pub(crate) fn emit_rol_r_imm8(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_ROL_R_IMM8,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::R11D, Register::ECX).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RCX)).unwrap(),
@@ -87,7 +102,12 @@ pub(crate) fn emit_ror_r_imm8(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_ROR_R_IMM8,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::R11D, Register::ECX).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RCX)).unwrap(),
@@ -108,7 +128,12 @@ pub(crate) fn emit_inc_dec(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         (OP_DEC_R64, Code::Dec_rm64),
     ] {
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with1(code, vreg(Register::RCX)).unwrap(),
         ];
         body.extend(cap_flags_incdec());
@@ -120,7 +145,12 @@ pub(crate) fn emit_inc_dec(seq: &mut Vec<(Instruction, Option<Cl>)>) {
 // ?? 0x0E CMP r,imm32  (op, r, imm32) ??sets full flags ????????????????????
 pub(crate) fn emit_cmp_r_imm32(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     let mut body = vec![
-        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(
+            Code::Movzx_r32_rm8,
+            Register::ECX,
+            MemoryOperand::with_base(Register::R9),
+        )
+        .unwrap(),
         Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RCX)).unwrap(),
         Instruction::with2(Code::Mov_r32_rm32, Register::EDX, m(Register::R9, 1)).unwrap(),
         Instruction::with2(Code::Cmp_rm32_r32, Register::EAX, Register::EDX).unwrap(),
@@ -140,7 +170,12 @@ pub(crate) fn emit_alu_rr64(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         (OP_IMUL_R_R64, Code::Imul_r64_rm64, 3),
     ] {
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RCX)).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RDX, vreg(Register::RDX)).unwrap(),
@@ -166,7 +201,12 @@ pub(crate) fn emit_alu_imm64(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         (OP_AND_R_IMM64, Code::And_rm64_r64, 2),
     ] {
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RCX)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(Code::Movsxd_r64_rm32, Register::RDX, Register::EDX).unwrap(),
@@ -187,7 +227,12 @@ pub(crate) fn emit_alu_imm64(seq: &mut Vec<(Instruction, Option<Cl>)>) {
 pub(crate) fn emit_test(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     {
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::EAX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RAX)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EDX, vreg(Register::RDX)).unwrap(),
@@ -199,7 +244,12 @@ pub(crate) fn emit_test(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     }
     {
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::EAX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RAX)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(Code::Test_rm32_r32, Register::EAX, Register::EDX).unwrap(),
@@ -219,7 +269,12 @@ pub(crate) fn emit_or_rr(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     ] {
         let mut body = if !is64 {
             vec![
-                Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+                Instruction::with2(
+                    Code::Movzx_r32_rm8,
+                    Register::ECX,
+                    MemoryOperand::with_base(Register::R9),
+                )
+                .unwrap(),
                 Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
                 Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RCX)).unwrap(),
                 Instruction::with2(Code::Mov_r32_rm32, Register::EDX, vreg(Register::RDX)).unwrap(),
@@ -228,7 +283,12 @@ pub(crate) fn emit_or_rr(seq: &mut Vec<(Instruction, Option<Cl>)>) {
             ]
         } else {
             vec![
-                Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+                Instruction::with2(
+                    Code::Movzx_r32_rm8,
+                    Register::ECX,
+                    MemoryOperand::with_base(Register::R9),
+                )
+                .unwrap(),
                 Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
                 Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RCX)).unwrap(),
                 Instruction::with2(Code::Mov_r64_rm64, Register::RDX, vreg(Register::RDX)).unwrap(),
@@ -250,7 +310,12 @@ pub(crate) fn emit_or_imm(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     ] {
         let mut body = if !is64 {
             vec![
-                Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+                Instruction::with2(
+                    Code::Movzx_r32_rm8,
+                    Register::ECX,
+                    MemoryOperand::with_base(Register::R9),
+                )
+                .unwrap(),
                 Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RCX)).unwrap(),
                 Instruction::with2(Code::Mov_r32_rm32, Register::EDX, m(Register::R9, 1)).unwrap(),
                 Instruction::with2(code, Register::EAX, Register::EDX).unwrap(),
@@ -258,7 +323,12 @@ pub(crate) fn emit_or_imm(seq: &mut Vec<(Instruction, Option<Cl>)>) {
             ]
         } else {
             vec![
-                Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+                Instruction::with2(
+                    Code::Movzx_r32_rm8,
+                    Register::ECX,
+                    MemoryOperand::with_base(Register::R9),
+                )
+                .unwrap(),
                 Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RCX)).unwrap(),
                 Instruction::with2(Code::Mov_r32_rm32, Register::EDX, m(Register::R9, 1)).unwrap(),
                 Instruction::with2(Code::Movsxd_r64_rm32, Register::RDX, Register::EDX).unwrap(),
@@ -278,9 +348,12 @@ pub(crate) fn emit_neg(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         (OP_NEG_R, Code::Neg_rm32, false),
         (OP_NEG_R64, Code::Neg_rm64, true),
     ] {
-        let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
-        ];
+        let mut body = vec![Instruction::with2(
+            Code::Movzx_r32_rm8,
+            Register::ECX,
+            MemoryOperand::with_base(Register::R9),
+        )
+        .unwrap()];
         if !is64 {
             body.push(Instruction::with1(code, vreg(Register::RCX)).unwrap());
         } else {
@@ -298,7 +371,12 @@ pub(crate) fn emit_not(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         (OP_NOT_R64, Code::Not_rm64, true),
     ] {
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with1(code, vreg(Register::RCX)).unwrap(),
         ];
         // NOT does not modify flags: no cap_flags.
@@ -313,12 +391,27 @@ pub(crate) fn emit_alu_sub8_sub16(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         (OP_SUB_R_R16, Code::Sub_rm16_r16, 16),
     ] {
         let (dst_reg, src_reg, zmn, zsrc) = if w == 8 {
-            (Register::AL, Register::DL, Code::Movzx_r32_rm8, Register::AL)
+            (
+                Register::AL,
+                Register::DL,
+                Code::Movzx_r32_rm8,
+                Register::AL,
+            )
         } else {
-            (Register::AX, Register::DX, Code::Movzx_r32_rm16, Register::AX)
+            (
+                Register::AX,
+                Register::DX,
+                Code::Movzx_r32_rm16,
+                Register::AX,
+            )
         };
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RCX)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EDX, vreg(Register::RDX)).unwrap(),

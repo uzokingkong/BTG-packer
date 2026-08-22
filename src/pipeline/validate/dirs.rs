@@ -20,9 +20,9 @@
 // hard failure는 Err를 반환해 validate::run이 빌드 실패로 전파한다.
 // ==============================================================================
 
-use super::{SectionInfo, section_for_rva};
+use super::{section_for_rva, SectionInfo};
 use crate::pipeline::PipelineContext;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use goblin::pe::PE;
 
 /// IMAGE_IMPORT_DESCRIPTOR 크기 (20 bytes)
@@ -39,8 +39,22 @@ const SIZEOF_RELOC_BLOCK: usize = 8;
 const SIZEOF_TLS_DIR64: usize = 40;
 /// 데이터 디렉터리 이름 (가독성)
 const DIR_NAMES: [&str; 16] = [
-    "export", "import", "resource", "exception", "security", "reloc", "debug", "arch",
-    "globalptr", "tls", "load_config", "bound_import", "iat", "delay_import", "clr", "reserved",
+    "export",
+    "import",
+    "resource",
+    "exception",
+    "security",
+    "reloc",
+    "debug",
+    "arch",
+    "globalptr",
+    "tls",
+    "load_config",
+    "bound_import",
+    "iat",
+    "delay_import",
+    "clr",
+    "reserved",
 ];
 
 /// RVA → 파일 오프셋 (섹션 raw 매핑). 실패 시 None.
@@ -65,14 +79,14 @@ impl<'a> Reader<'a> {
         Self { buf }
     }
     fn u32(&self, off: usize) -> Option<u32> {
-        self.buf.get(off..off + 4).map(|b| {
-            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-        })
+        self.buf
+            .get(off..off + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
     fn u64(&self, off: usize) -> Option<u64> {
-        self.buf.get(off..off + 8).map(|b| {
-            u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-        })
+        self.buf
+            .get(off..off + 8)
+            .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
     }
     fn slice(&self, off: usize, len: usize) -> Option<&[u8]> {
         self.buf.get(off..off + len)
@@ -92,9 +106,8 @@ fn dir_backed(out: &[u8], sections: &[SectionInfo], rva: u32, size: u32) -> Opti
 
 /// export(0): IMAGE_EXPORT_DIRECTORY 구조 검증.
 fn validate_export(out: &[u8], sections: &[SectionInfo], rva: u32, size: u32) -> Result<usize> {
-    let off = dir_backed(out, sections, rva, size).ok_or_else(|| {
-        anyhow!("export dir @0x{rva:X} size 0x{size:X} not file-backed")
-    })?;
+    let off = dir_backed(out, sections, rva, size)
+        .ok_or_else(|| anyhow!("export dir @0x{rva:X} size 0x{size:X} not file-backed"))?;
     if (size as usize) < SIZEOF_EXPORT_DIR {
         bail!("export dir size 0x{size:X} < 40-byte header");
     }
@@ -145,11 +158,12 @@ fn validate_export(out: &[u8], sections: &[SectionInfo], rva: u32, size: u32) ->
 
 /// import(1): IMAGE_IMPORT_DESCRIPTOR 체인 재파싱.
 fn validate_import(out: &[u8], sections: &[SectionInfo], rva: u32, size: u32) -> Result<usize> {
-    let off = dir_backed(out, sections, rva, size).ok_or_else(|| {
-        anyhow!("import dir @0x{rva:X} size 0x{size:X} not file-backed")
-    })?;
+    let off = dir_backed(out, sections, rva, size)
+        .ok_or_else(|| anyhow!("import dir @0x{rva:X} size 0x{size:X} not file-backed"))?;
     let r = Reader::new(out);
-    let max_entries = (size as usize).checked_div(SIZEOF_IMPORT_DESCRIPTOR).unwrap_or(0);
+    let max_entries = (size as usize)
+        .checked_div(SIZEOF_IMPORT_DESCRIPTOR)
+        .unwrap_or(0);
     let mut count = 0usize;
     for i in 0..max_entries {
         let e = off + i * SIZEOF_IMPORT_DESCRIPTOR;
@@ -164,8 +178,9 @@ fn validate_import(out: &[u8], sections: &[SectionInfo], rva: u32, size: u32) ->
             bail!("import chain too long (loop?)");
         }
         if name_rva != 0 {
-            let no = rva_to_file_off(sections, name_rva)
-                .ok_or_else(|| anyhow!("import[{count}] DLL name @0x{name_rva:X} outside sections"))?;
+            let no = rva_to_file_off(sections, name_rva).ok_or_else(|| {
+                anyhow!("import[{count}] DLL name @0x{name_rva:X} outside sections")
+            })?;
             if no + 5 > out.len() {
                 bail!("import[{count}] DLL name @0x{name_rva:X} beyond file");
             }
@@ -185,10 +200,11 @@ fn validate_import(out: &[u8], sections: &[SectionInfo], rva: u32, size: u32) ->
 
 /// exception(3): RUNTIME_FUNCTION(.pdata) 배열 검증.
 fn validate_exception(out: &[u8], sections: &[SectionInfo], rva: u32, size: u32) -> Result<usize> {
-    let off = dir_backed(out, sections, rva, size).ok_or_else(|| {
-        anyhow!("exception dir @0x{rva:X} size 0x{size:X} not file-backed")
-    })?;
-    let n = (size as usize).checked_div(SIZEOF_RUNTIME_FUNCTION).unwrap_or(0);
+    let off = dir_backed(out, sections, rva, size)
+        .ok_or_else(|| anyhow!("exception dir @0x{rva:X} size 0x{size:X} not file-backed"))?;
+    let n = (size as usize)
+        .checked_div(SIZEOF_RUNTIME_FUNCTION)
+        .unwrap_or(0);
     if n == 0 && size != 0 {
         bail!("exception dir size 0x{size:X} not multiple of 12");
     }
@@ -209,9 +225,8 @@ fn validate_exception(out: &[u8], sections: &[SectionInfo], rva: u32, size: u32)
 
 /// reloc(5): IMAGE_BASE_RELOCATION 블록 체인 검증.
 fn validate_reloc(out: &[u8], sections: &[SectionInfo], rva: u32, size: u32) -> Result<usize> {
-    let off = dir_backed(out, sections, rva, size).ok_or_else(|| {
-        anyhow!("reloc dir @0x{rva:X} size 0x{size:X} not file-backed")
-    })?;
+    let off = dir_backed(out, sections, rva, size)
+        .ok_or_else(|| anyhow!("reloc dir @0x{rva:X} size 0x{size:X} not file-backed"))?;
     let r = Reader::new(out);
     let mut cur = off;
     let end = off + size as usize;
@@ -229,16 +244,19 @@ fn validate_reloc(out: &[u8], sections: &[SectionInfo], rva: u32, size: u32) -> 
         blocks += 1;
         cur += sz;
     }
-    println!("[VALIDATE] dir[5] reloc: {blocks} base-relocation blocks (packer-stripped → likely 0)");
+    println!(
+        "[VALIDATE] dir[5] reloc: {blocks} base-relocation blocks (packer-stripped → likely 0)"
+    );
     Ok(blocks)
 }
 
 /// debug(6): IMAGE_DEBUG_DIRECTORY 배열 검증.
 fn validate_debug(out: &[u8], sections: &[SectionInfo], rva: u32, size: u32) -> Result<usize> {
-    let off = dir_backed(out, sections, rva, size).ok_or_else(|| {
-        anyhow!("debug dir @0x{rva:X} size 0x{size:X} not file-backed")
-    })?;
-    let n = (size as usize).checked_div(SIZEOF_DEBUG_DIRECTORY).unwrap_or(0);
+    let off = dir_backed(out, sections, rva, size)
+        .ok_or_else(|| anyhow!("debug dir @0x{rva:X} size 0x{size:X} not file-backed"))?;
+    let n = (size as usize)
+        .checked_div(SIZEOF_DEBUG_DIRECTORY)
+        .unwrap_or(0);
     if n == 0 && size != 0 {
         bail!("debug dir size 0x{size:X} not multiple of 28");
     }
@@ -257,9 +275,8 @@ fn validate_debug(out: &[u8], sections: &[SectionInfo], rva: u32, size: u32) -> 
 
 /// tls(9): IMAGE_TLS_DIRECTORY64 검증.
 fn validate_tls(out: &[u8], sections: &[SectionInfo], rva: u32, size: u32) -> Result<usize> {
-    let off = dir_backed(out, sections, rva, size).ok_or_else(|| {
-        anyhow!("tls dir @0x{rva:X} size 0x{size:X} not file-backed")
-    })?;
+    let off = dir_backed(out, sections, rva, size)
+        .ok_or_else(|| anyhow!("tls dir @0x{rva:X} size 0x{size:X} not file-backed"))?;
     if (size as usize) < SIZEOF_TLS_DIR64 {
         bail!("tls dir size 0x{size:X} < 40 (PE32+)");
     }
@@ -283,9 +300,8 @@ fn validate_load_config(
     rva: u32,
     size: u32,
 ) -> Result<usize> {
-    let off = dir_backed(out, sections, rva, size).ok_or_else(|| {
-        anyhow!("load_config dir @0x{rva:X} size 0x{size:X} not file-backed")
-    })?;
+    let off = dir_backed(out, sections, rva, size)
+        .ok_or_else(|| anyhow!("load_config dir @0x{rva:X} size 0x{size:X} not file-backed"))?;
     let r = Reader::new(out);
     let mut checked = 0usize;
     for (_label, field_off, is_va) in [
@@ -340,7 +356,9 @@ pub fn validate_all_directories(
         .as_ref()
         .ok_or_else(|| anyhow!("validate dirs: missing optional header"))?;
     for (idx, dd_opt) in oh.data_directories.data_directories.iter().enumerate() {
-        let Some((_, dd)) = dd_opt.as_ref() else { continue };
+        let Some((_, dd)) = dd_opt.as_ref() else {
+            continue;
+        };
         if dd.virtual_address == 0 {
             continue;
         }
@@ -407,8 +425,10 @@ pub fn report_pe_diff(orig_bytes: &[u8], out_pe: &PE, out: &[u8]) -> Result<()> 
     );
 
     println!("[VALIDATE] sections:");
-    let orig_names: std::collections::HashSet<&str> =
-        orig_sections.iter().map(|(n, _, _, _)| n.as_str()).collect();
+    let orig_names: std::collections::HashSet<&str> = orig_sections
+        .iter()
+        .map(|(n, _, _, _)| n.as_str())
+        .collect();
     let out_names: std::collections::HashSet<&str> =
         out_sections.iter().map(|(n, _, _, _)| n.as_str()).collect();
     for (n, rva, vs, raw) in &out_sections {
@@ -417,15 +437,11 @@ pub fn report_pe_diff(orig_bytes: &[u8], out_pe: &PE, out: &[u8]) -> Result<()> 
         } else {
             ""
         };
-        println!(
-            "[VALIDATE]   + {n:<8} rva=0x{rva:X} vsize=0x{vs:X} raw=0x{raw:X}{marker}"
-        );
+        println!("[VALIDATE]   + {n:<8} rva=0x{rva:X} vsize=0x{vs:X} raw=0x{raw:X}{marker}");
     }
     for (n, rva, vs, raw) in &orig_sections {
         if !out_names.contains(n.as_str()) {
-            println!(
-                "[VALIDATE]   - {n:<8} rva=0x{rva:X} vsize=0x{vs:X} raw=0x{raw:X} [DROPPED]"
-            );
+            println!("[VALIDATE]   - {n:<8} rva=0x{rva:X} vsize=0x{vs:X} raw=0x{raw:X} [DROPPED]");
         }
     }
 
@@ -445,18 +461,20 @@ pub fn report_pe_diff(orig_bytes: &[u8], out_pe: &PE, out: &[u8]) -> Result<()> 
         .cloned()
         .unwrap_or_default();
     for idx in 0..16 {
-        let o = orig_dirs[idx].map(|(_, d)| d).unwrap_or(
-            goblin::pe::data_directories::DataDirectory {
-                virtual_address: 0,
-                size: 0,
-            },
-        );
-        let p = out_dirs[idx].map(|(_, d)| d).unwrap_or(
-            goblin::pe::data_directories::DataDirectory {
-                virtual_address: 0,
-                size: 0,
-            },
-        );
+        let o =
+            orig_dirs[idx]
+                .map(|(_, d)| d)
+                .unwrap_or(goblin::pe::data_directories::DataDirectory {
+                    virtual_address: 0,
+                    size: 0,
+                });
+        let p =
+            out_dirs[idx]
+                .map(|(_, d)| d)
+                .unwrap_or(goblin::pe::data_directories::DataDirectory {
+                    virtual_address: 0,
+                    size: 0,
+                });
         let name = DIR_NAMES.get(idx).copied().unwrap_or("?");
         if o.virtual_address == 0 && p.virtual_address == 0 {
             continue;

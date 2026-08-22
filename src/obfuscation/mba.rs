@@ -12,9 +12,9 @@
 //   모든 MBA 표현식은 원본 값과 수학적으로 동일함을 assert로 검증한다.
 // ==============================================================================
 
-use std::collections::HashMap;
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, Register};
 use rand::Rng;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct MbaPolynomial {
@@ -37,8 +37,8 @@ pub enum BooleanOp {
     Nand,
     Nor,
     Xnor,
-    AndNot,  // (a & ~b)
-    OrNot,   // (a | ~b)
+    AndNot, // (a & ~b)
+    OrNot,  // (a | ~b)
 }
 
 impl MbaPolynomial {
@@ -62,11 +62,7 @@ impl MbaPolynomial {
     pub fn generate(value: u32, complexity: usize) -> Self {
         let mut polynomial = MbaPolynomial {
             terms: Vec::new(),
-            variables: vec![
-                "x".to_string(),
-                "y".to_string(),
-                "z".to_string(),
-            ],
+            variables: vec!["x".to_string(), "y".to_string(), "z".to_string()],
         };
 
         match complexity {
@@ -161,27 +157,63 @@ impl MbaPolynomial {
         match kind {
             // A: (a&v) ^ (a&~v) ^ a = 0
             0 => {
-                self.terms.push(MbaTerm { coefficient: a, operations: vec![BooleanOp::And] });
-                self.terms.push(MbaTerm { coefficient: a, operations: vec![BooleanOp::AndNot] });
-                self.terms.push(MbaTerm { coefficient: a, operations: vec![] });
+                self.terms.push(MbaTerm {
+                    coefficient: a,
+                    operations: vec![BooleanOp::And],
+                });
+                self.terms.push(MbaTerm {
+                    coefficient: a,
+                    operations: vec![BooleanOp::AndNot],
+                });
+                self.terms.push(MbaTerm {
+                    coefficient: a,
+                    operations: vec![],
+                });
             }
             // E: (a|v) ^ (a|~v) ^ ~a = 0
             1 => {
-                self.terms.push(MbaTerm { coefficient: a, operations: vec![BooleanOp::Or] });
-                self.terms.push(MbaTerm { coefficient: a, operations: vec![BooleanOp::OrNot] });
-                self.terms.push(MbaTerm { coefficient: !a, operations: vec![] });
+                self.terms.push(MbaTerm {
+                    coefficient: a,
+                    operations: vec![BooleanOp::Or],
+                });
+                self.terms.push(MbaTerm {
+                    coefficient: a,
+                    operations: vec![BooleanOp::OrNot],
+                });
+                self.terms.push(MbaTerm {
+                    coefficient: !a,
+                    operations: vec![],
+                });
             }
             // F: ~(a&v) ^ (a&~v) ^ ~a = 0   (NAND 경유)
             2 => {
-                self.terms.push(MbaTerm { coefficient: a, operations: vec![BooleanOp::Nand] });
-                self.terms.push(MbaTerm { coefficient: a, operations: vec![BooleanOp::AndNot] });
-                self.terms.push(MbaTerm { coefficient: !a, operations: vec![] });
+                self.terms.push(MbaTerm {
+                    coefficient: a,
+                    operations: vec![BooleanOp::Nand],
+                });
+                self.terms.push(MbaTerm {
+                    coefficient: a,
+                    operations: vec![BooleanOp::AndNot],
+                });
+                self.terms.push(MbaTerm {
+                    coefficient: !a,
+                    operations: vec![],
+                });
             }
             // G: ~(a|v) ^ (a|~v) ^ a = 0   (NOR 경유)
             _ => {
-                self.terms.push(MbaTerm { coefficient: a, operations: vec![BooleanOp::Nor] });
-                self.terms.push(MbaTerm { coefficient: a, operations: vec![BooleanOp::OrNot] });
-                self.terms.push(MbaTerm { coefficient: a, operations: vec![] });
+                self.terms.push(MbaTerm {
+                    coefficient: a,
+                    operations: vec![BooleanOp::Nor],
+                });
+                self.terms.push(MbaTerm {
+                    coefficient: a,
+                    operations: vec![BooleanOp::OrNot],
+                });
+                self.terms.push(MbaTerm {
+                    coefficient: a,
+                    operations: vec![],
+                });
             }
         }
     }
@@ -244,8 +276,6 @@ impl MbaPolynomial {
             );
         }
     }
-
-
 }
 
 mod codegen;

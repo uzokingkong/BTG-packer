@@ -11,9 +11,9 @@
 //       elimination, self-mov peephole) preserve execution semantics
 //       (interp(orig) == interp(optimized)) while shrinking the stream.
 
-use anyhow::{Result, anyhow};
 use crate::vm::bytecode::{BytecodeBuilder, COND_JE, OP_ADD_R_IMM64};
 use crate::vm::{interp, lifter::ir};
+use anyhow::{anyhow, Result};
 
 use super::util::{interp_state, vreg};
 
@@ -83,14 +83,17 @@ pub(crate) fn run_ir_test() -> Result<()> {
             for i in 0..22u8 {
                 b.mov_r_imm64(6, i as u64);
             }
-            b.mov_r_imm32(5, 0xEE);   // fall-through marker
+            b.mov_r_imm32(5, 0xEE); // fall-through marker
             b.jmp8(end);
             b.mark_label(far);
-            b.mov_r_imm32(5, 7);      // taken marker
+            b.mov_r_imm32(5, 7); // taken marker
             b.mark_label(end);
             b.halt();
         });
-        assert_eq!(noop, legacy, "[A2] rel8 widening must match the legacy path");
+        assert_eq!(
+            noop, legacy,
+            "[A2] rel8 widening must match the legacy path"
+        );
         // v1=0 -> test sets ZF=1 -> jcc JE widened branch TAKEN -> v5=7, v6=0
         let r1 = run(&legacy, &[0u64; 20]);
         assert_eq!(r1[5], 7, "[A2] widened jcc taken");
@@ -121,7 +124,12 @@ pub(crate) fn run_ir_test() -> Result<()> {
             b.binop_r_imm64(OP_ADD_R_IMM64, 7, 1);
             b.halt();
         });
-        assert!(opt.len() < legacy.len(), "[B] optimized stream must shrink ({} !< {})", opt.len(), legacy.len());
+        assert!(
+            opt.len() < legacy.len(),
+            "[B] optimized stream must shrink ({} !< {})",
+            opt.len(),
+            legacy.len()
+        );
         let r_legacy = run(&legacy, &[0u64; 20]);
         let r_opt = run(&opt, &[0u64; 20]);
         assert_eq!(r_legacy, r_opt, "[B] interp(legacy) != interp(optimized)");

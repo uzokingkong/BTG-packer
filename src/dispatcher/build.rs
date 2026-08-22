@@ -7,8 +7,7 @@
 // ==============================================================================
 
 use iced_x86::{
-    BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock,
-    MemoryOperand, Register,
+    BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, MemoryOperand, Register,
 };
 
 // ── v13.4d diag: dispatcher ring-buffer 상수 ───────────────────────────────────
@@ -98,7 +97,8 @@ fn emit_mba_key_schedule(instructions: &mut Vec<Instruction>, level: usize, mba_
         }
         if lvl == 3 {
             // K = (...) ^ C + (id & seed) — r11 은 아직 (id & seed) 보유.
-            if let Ok(inst) = Instruction::with2(Code::Add_rm32_r32, Register::EAX, Register::R11D) {
+            if let Ok(inst) = Instruction::with2(Code::Add_rm32_r32, Register::EAX, Register::R11D)
+            {
                 instructions.push(inst);
             }
         }
@@ -195,7 +195,11 @@ pub fn build_dispatcher(
         if let Ok(inst) = Instruction::with2(Code::Add_rm32_imm32, Register::EAX, 1) {
             instructions.push(inst);
         }
-        if let Ok(inst) = Instruction::with2(Code::And_rm32_imm32, Register::EAX, (RING_ENTRIES - 1) as i32) {
+        if let Ok(inst) = Instruction::with2(
+            Code::And_rm32_imm32,
+            Register::EAX,
+            (RING_ENTRIES - 1) as i32,
+        ) {
             instructions.push(inst); // wrap
         }
         if let Ok(inst) = Instruction::with2(
@@ -251,10 +255,18 @@ pub fn build_dispatcher(
     }
 
     // 14-17. GPR 복원
-    if let Ok(inst) = Instruction::with1(Code::Pop_r64, Register::R11) { instructions.push(inst); }
-    if let Ok(inst) = Instruction::with1(Code::Pop_r64, Register::R10) { instructions.push(inst); }
-    if let Ok(inst) = Instruction::with1(Code::Pop_r64, Register::RCX) { instructions.push(inst); }
-    if let Ok(inst) = Instruction::with1(Code::Pop_r64, Register::RAX) { instructions.push(inst); }
+    if let Ok(inst) = Instruction::with1(Code::Pop_r64, Register::R11) {
+        instructions.push(inst);
+    }
+    if let Ok(inst) = Instruction::with1(Code::Pop_r64, Register::R10) {
+        instructions.push(inst);
+    }
+    if let Ok(inst) = Instruction::with1(Code::Pop_r64, Register::RCX) {
+        instructions.push(inst);
+    }
+    if let Ok(inst) = Instruction::with1(Code::Pop_r64, Register::RAX) {
+        instructions.push(inst);
+    }
 
     // 18. popfq  (저장된 EFLAGS 복원)
     instructions.push(Instruction::with(Code::Popfq));
@@ -283,31 +295,80 @@ fn build_dispatcher_static(table_offset: usize, num_blocks: usize) -> Vec<u8> {
     let num_blocks_le = (num_blocks as i32).to_le_bytes();
 
     vec![
-        0x9C,                                                         // pushfq
-        0x50,                                                         // push rax
-        0x51,                                                         // push rcx
-        0x41, 0x52,                                                   // push r10
-        0x41, 0x53,                                                   // push r11
-        0x4C, 0x8B, 0x54, 0x24, 0x30,                                // mov r10, [rsp+0x30]
-        0x49, 0x81, 0xFA,                                             // cmp r10, imm32
-            num_blocks_le[0], num_blocks_le[1], num_blocks_le[2], num_blocks_le[3],
-        0xB9, 0x00, 0x00, 0x00, 0x00,                                 // mov ecx, 0
-        0x4C, 0x0F, 0x43, 0xD1,                                       // cmovae r10, rcx
-        0x4C, 0x8B, 0x5C, 0x24, 0x28,                                // mov r11, [rsp+0x28]
-        0x48, 0x8D, 0x05, table_displ[0], table_displ[1],
-            table_displ[2], table_displ[3],                           // lea rax, [rip+table_displ]
-        0x42, 0x8B, 0x0C, 0x90,                                       // mov ecx, [rax+r10*4]
-        0x44, 0x31, 0xD9,                                             // xor ecx, r11d
-        0x48, 0x8D, 0x05, 0xAA, 0xFF, 0xFF, 0xFF,                    // lea rax, [rip-0x56]
-        0x48, 0x01, 0xC8,                                             // add rax, rcx
-        0x48, 0x89, 0x44, 0x24, 0x30,                                 // mov [rsp+0x30], rax
-        0x41, 0x5B,                                                   // pop r11
-        0x41, 0x5A,                                                   // pop r10
-        0x59,                                                         // pop rcx
-        0x58,                                                         // pop rax
-        0x9D,                                                         // popfq
-        0x48, 0x8D, 0x64, 0x24, 0x08,                                // lea rsp, [rsp+8]
-        0xC3,                                                         // ret
+        0x9C, // pushfq
+        0x50, // push rax
+        0x51, // push rcx
+        0x41,
+        0x52, // push r10
+        0x41,
+        0x53, // push r11
+        0x4C,
+        0x8B,
+        0x54,
+        0x24,
+        0x30, // mov r10, [rsp+0x30]
+        0x49,
+        0x81,
+        0xFA, // cmp r10, imm32
+        num_blocks_le[0],
+        num_blocks_le[1],
+        num_blocks_le[2],
+        num_blocks_le[3],
+        0xB9,
+        0x00,
+        0x00,
+        0x00,
+        0x00, // mov ecx, 0
+        0x4C,
+        0x0F,
+        0x43,
+        0xD1, // cmovae r10, rcx
+        0x4C,
+        0x8B,
+        0x5C,
+        0x24,
+        0x28, // mov r11, [rsp+0x28]
+        0x48,
+        0x8D,
+        0x05,
+        table_displ[0],
+        table_displ[1],
+        table_displ[2],
+        table_displ[3], // lea rax, [rip+table_displ]
+        0x42,
+        0x8B,
+        0x0C,
+        0x90, // mov ecx, [rax+r10*4]
+        0x44,
+        0x31,
+        0xD9, // xor ecx, r11d
+        0x48,
+        0x8D,
+        0x05,
+        0xAA,
+        0xFF,
+        0xFF,
+        0xFF, // lea rax, [rip-0x56]
+        0x48,
+        0x01,
+        0xC8, // add rax, rcx
+        0x48,
+        0x89,
+        0x44,
+        0x24,
+        0x30, // mov [rsp+0x30], rax
+        0x41,
+        0x5B, // pop r11
+        0x41,
+        0x5A, // pop r10
+        0x59, // pop rcx
+        0x58, // pop rax
+        0x9D, // popfq
+        0x48,
+        0x8D,
+        0x64,
+        0x24,
+        0x08, // lea rsp, [rsp+8]
+        0xC3, // ret
     ]
 }
-

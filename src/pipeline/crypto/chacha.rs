@@ -24,9 +24,7 @@
 // ==============================================================================
 
 use anyhow::Result;
-use chacha20poly1305::{
-    ChaCha20Poly1305, AeadInPlace, KeyInit,
-};
+use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, KeyInit};
 use sha2::{Digest, Sha256};
 
 /// T3-1: ChaCha20-Poly1305 암호화 결과.
@@ -126,7 +124,9 @@ pub fn cha_decrypt(
     let mut buf = ciphertext.to_vec();
     cipher
         .decrypt_in_place_detached(nonce_ga, aad, &mut buf, tag_ga)
-        .map_err(|_| anyhow::anyhow!("T3-1: ChaCha20-Poly1305 tag verification FAILED — ciphertext tampered"))?;
+        .map_err(|_| {
+            anyhow::anyhow!("T3-1: ChaCha20-Poly1305 tag verification FAILED — ciphertext tampered")
+        })?;
 
     Ok(buf)
 }
@@ -146,7 +146,10 @@ pub fn cha_pack(result: &ChaEncryptResult) -> Vec<u8> {
 /// T3-1: `cha_pack` 역연산 — [nonce(12B)][tag(16B)][ciphertext] → 복호화.
 pub fn cha_unpack_decrypt(packed: &[u8], seed: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     if packed.len() < 28 {
-        anyhow::bail!("T3-1: packed ChaCha20 blob too short ({} < 28)", packed.len());
+        anyhow::bail!(
+            "T3-1: packed ChaCha20 blob too short ({} < 28)",
+            packed.len()
+        );
     }
     let (key, _) = derive_chacha_key_nonce(seed);
     let mut nonce = [0u8; 12];
@@ -193,11 +196,24 @@ mod tests {
         let aad = b"btg-section-textb";
 
         let result = cha_encrypt(plaintext, &seed, aad).expect("encrypt must succeed");
-        assert_eq!(result.ciphertext.len(), plaintext.len(), "ciphertext same length as plaintext");
-        assert_ne!(result.ciphertext, plaintext, "ciphertext must differ from plaintext");
+        assert_eq!(
+            result.ciphertext.len(),
+            plaintext.len(),
+            "ciphertext same length as plaintext"
+        );
+        assert_ne!(
+            result.ciphertext, plaintext,
+            "ciphertext must differ from plaintext"
+        );
 
-        let decrypted = cha_decrypt(&result.ciphertext, &result.tag, &result.nonce, &result.key, aad)
-            .expect("decrypt must succeed");
+        let decrypted = cha_decrypt(
+            &result.ciphertext,
+            &result.tag,
+            &result.nonce,
+            &result.key,
+            aad,
+        )
+        .expect("decrypt must succeed");
         assert_eq!(decrypted, plaintext, "decrypted must equal original");
     }
 
@@ -212,7 +228,13 @@ mod tests {
         let mut bad_tag = result.tag;
         bad_tag[0] ^= 0xFF; // 태그 1바이트 반전
 
-        let res = cha_decrypt(&result.ciphertext, &bad_tag, &result.nonce, &result.key, aad);
+        let res = cha_decrypt(
+            &result.ciphertext,
+            &bad_tag,
+            &result.nonce,
+            &result.key,
+            aad,
+        );
         assert!(res.is_err(), "tampered tag must cause decrypt failure");
     }
 
@@ -252,10 +274,16 @@ mod tests {
         let seed = make_seed();
         let plaintext = b"aad binding test";
         let aad_correct = b"correct-aad";
-        let aad_wrong   = b"wrong-aad";
+        let aad_wrong = b"wrong-aad";
 
         let result = cha_encrypt(plaintext, &seed, aad_correct).expect("encrypt");
-        let res = cha_decrypt(&result.ciphertext, &result.tag, &result.nonce, &result.key, aad_wrong);
+        let res = cha_decrypt(
+            &result.ciphertext,
+            &result.tag,
+            &result.nonce,
+            &result.key,
+            aad_wrong,
+        );
         assert!(res.is_err(), "wrong AAD must cause auth failure");
     }
 

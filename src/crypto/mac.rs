@@ -50,7 +50,11 @@ impl BtgKeyedMac {
             h1 = h1.rotate_left(23).wrapping_mul(PHI).wrapping_add(h0);
             h0 = h0.rotate_left(17) ^ h1;
         }
-        Self { h0, h1, processed: 0 }
+        Self {
+            h0,
+            h1,
+            processed: 0,
+        }
     }
 
     /// 데이터를 MAC 상태에 흡수 (증분 사용 가능 — `update(a); update(b)` 는
@@ -62,7 +66,11 @@ impl BtgKeyedMac {
                 .wrapping_mul(PHI)
                 .wrapping_add(self.h0.rotate_left((i & 63) as u32))
                 .wrapping_add(i.wrapping_mul(0x9E37_79B9));
-            self.h1 = self.h1.rotate_left(17).wrapping_mul(PHI).wrapping_add(self.h0);
+            self.h1 = self
+                .h1
+                .rotate_left(17)
+                .wrapping_mul(PHI)
+                .wrapping_add(self.h0);
             self.h0 = self.h0.rotate_left(31) ^ self.h1;
         }
         self.processed = self.processed.wrapping_add(data.len() as u64);
@@ -154,6 +162,10 @@ mod tests {
         for chunk in both.chunks(3) {
             m3.update(chunk);
         }
-        assert_eq!(m3.finish(), single, "byte-chunked update must equal single update");
+        assert_eq!(
+            m3.finish(),
+            single,
+            "byte-chunked update must equal single update"
+        );
     }
 }

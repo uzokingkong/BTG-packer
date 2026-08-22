@@ -109,8 +109,10 @@ impl BytecodeBuilder {
             OP_JCC8 => (rel_off, 3, rel_off - 2, OP_JCC32, rel_off, None),
             other => panic!("vm bytecode: cannot widen branch opcode 0x{:02X}", other),
         };
-        self.bytes
-            .splice(splice_at..splice_at, std::iter::repeat(0u8).take(splice_len));
+        self.bytes.splice(
+            splice_at..splice_at,
+            std::iter::repeat(0u8).take(splice_len),
+        );
         self.bytes[op_pos] = new_op;
         if let Some(c) = cond {
             self.bytes[rel_off] = c;
@@ -200,11 +202,13 @@ impl BytecodeBuilder {
     }
 
     pub fn movzx_r_mem8(&mut self, dst: u8, memslot: u8, idx: u8) {
-        self.bytes.extend_from_slice(&[OP_MOVZX_R_MEM8, dst, memslot, idx]);
+        self.bytes
+            .extend_from_slice(&[OP_MOVZX_R_MEM8, dst, memslot, idx]);
     }
 
     pub fn mov_mem8_r(&mut self, memslot: u8, idx: u8, src: u8) {
-        self.bytes.extend_from_slice(&[OP_MOV_MEM8_R, memslot, idx, src]);
+        self.bytes
+            .extend_from_slice(&[OP_MOV_MEM8_R, memslot, idx, src]);
     }
 
     pub fn jmp8(&mut self, label: u32) {
@@ -322,7 +326,8 @@ impl BytecodeBuilder {
 
     /// LEA: vreg[dst] = vreg[base] + (idx==ADDR_NO_INDEX?0 : vreg[idx]*scale) + sext(disp32).
     pub fn lea(&mut self, dst: u8, base: u8, idx: u8, scale_enc: u8, disp: i32) {
-        self.bytes.extend_from_slice(&[OP_LEA, dst, base, idx, scale_enc]);
+        self.bytes
+            .extend_from_slice(&[OP_LEA, dst, base, idx, scale_enc]);
         self.bytes.extend_from_slice(&disp.to_le_bytes());
     }
 
@@ -451,11 +456,13 @@ impl BytecodeBuilder {
     }
     /// movups xmm, [addr] (16 bytes).
     pub fn movups_xmm_mem(&mut self, xmm: u8, addr: u8) {
-        self.bytes.extend_from_slice(&[OP_MOVUPS_XMM_MEM, xmm, addr]);
+        self.bytes
+            .extend_from_slice(&[OP_MOVUPS_XMM_MEM, xmm, addr]);
     }
     /// movups [addr], xmm (16 bytes).
     pub fn movups_mem_xmm(&mut self, addr: u8, xmm: u8) {
-        self.bytes.extend_from_slice(&[OP_MOVUPS_MEM_XMM, addr, xmm]);
+        self.bytes
+            .extend_from_slice(&[OP_MOVUPS_MEM_XMM, addr, xmm]);
     }
     /// unpcklpd xmm[dst], xmm[src].
     pub fn unpcklpd_xmm(&mut self, dst: u8, src: u8) {
@@ -473,15 +480,18 @@ impl BytecodeBuilder {
     }
     /// pshuflw xmm[dst] = shuffle(src words, imm) (low 4 words; high quad copied).
     pub fn pshuflw_xmm(&mut self, dst: u8, src: u8, imm: u8) {
-        self.bytes.extend_from_slice(&[OP_PSHUFLW_XMM, dst, src, imm]);
+        self.bytes
+            .extend_from_slice(&[OP_PSHUFLW_XMM, dst, src, imm]);
     }
     /// pshufhw xmm[dst] = shuffle(src words, imm) (high 4 words; low quad copied).
     pub fn pshufhw_xmm(&mut self, dst: u8, src: u8, imm: u8) {
-        self.bytes.extend_from_slice(&[OP_PSHUFHW_XMM, dst, src, imm]);
+        self.bytes
+            .extend_from_slice(&[OP_PSHUFHW_XMM, dst, src, imm]);
     }
     /// pshufd xmm[dst] = shuffle(src dwords, imm) (all 4 dwords).
     pub fn pshufd_xmm(&mut self, dst: u8, src: u8, imm: u8) {
-        self.bytes.extend_from_slice(&[OP_PSHUFD_XMM, dst, src, imm]);
+        self.bytes
+            .extend_from_slice(&[OP_PSHUFD_XMM, dst, src, imm]);
     }
     /// bsr: vreg[dst] = index of most significant set bit of vreg[src]; ZF set if src==0.
     pub fn bsr_r(&mut self, op: u8, dst: u8, src: u8) {
@@ -493,11 +503,13 @@ impl BytecodeBuilder {
     }
     /// movq xmm[src] -> vreg[dst] (low 64 bits).
     pub fn movq_xmm_gpr(&mut self, dst_gpr: u8, src_xmm: u8) {
-        self.bytes.extend_from_slice(&[OP_MOVQ_XMM_GPR, dst_gpr, src_xmm]);
+        self.bytes
+            .extend_from_slice(&[OP_MOVQ_XMM_GPR, dst_gpr, src_xmm]);
     }
     /// movq vreg[src] -> xmm[dst] (low 64 bits, high zeroed).
     pub fn movq_gpr_xmm(&mut self, dst_xmm: u8, src_gpr: u8) {
-        self.bytes.extend_from_slice(&[OP_MOVQ_GPR_XMM, dst_xmm, src_gpr]);
+        self.bytes
+            .extend_from_slice(&[OP_MOVQ_GPR_XMM, dst_xmm, src_gpr]);
     }
     /// psrlq xmm[dst] >>= imm8 (two 64-bit lanes, logical shift right).
     pub fn psrlq_xmm_imm8(&mut self, dst: u8, imm: u8) {
@@ -509,7 +521,8 @@ impl BytecodeBuilder {
     }
     /// pinsrw xmm[dst], vreg[src], lane_imm8: insert low 16 bits of src into word lane (imm & 7).
     pub fn pinsrw_xmm(&mut self, dst_xmm: u8, src: u8, lane: u8) {
-        self.bytes.extend_from_slice(&[OP_PINSRW_XMM, dst_xmm, src, lane]);
+        self.bytes
+            .extend_from_slice(&[OP_PINSRW_XMM, dst_xmm, src, lane]);
     }
     /// cpuid: run native CPUID (leaf=vreg0, subleaf=vreg2 -> EAX/EBX/ECX/EDX = vreg0..3).
     pub fn cpuid(&mut self) {
@@ -577,11 +590,13 @@ impl BytecodeBuilder {
     }
     /// pextrd: vreg[dst_gpr] = xmm[src].dword[imm & 3] (zero-extended).
     pub fn pextrd_xmm(&mut self, dst_gpr: u8, src_xmm: u8, imm: u8) {
-        self.bytes.extend_from_slice(&[OP_PEXTRD_XMM, dst_gpr, src_xmm, imm]);
+        self.bytes
+            .extend_from_slice(&[OP_PEXTRD_XMM, dst_gpr, src_xmm, imm]);
     }
     /// pinsrd: xmm[dst].dword[imm & 3] = vreg[src_gpr].low32 (others kept).
     pub fn pinsrd_xmm(&mut self, dst_xmm: u8, src_gpr: u8, imm: u8) {
-        self.bytes.extend_from_slice(&[OP_PINSRD_XMM, dst_xmm, src_gpr, imm]);
+        self.bytes
+            .extend_from_slice(&[OP_PINSRD_XMM, dst_xmm, src_gpr, imm]);
     }
 
     // ── v55: LOCK-prefixed atomic INC/DEC (refcounts) ─────────────────────────
@@ -658,7 +673,13 @@ impl BytecodeBuilder {
     /// IR pipeline (`lifter::ir`): raw bytes (branch rel fields are still 0),
     /// the `(rel_off, label, width)` branch-fixup list, and label->offset map.
     /// Appends the self-terminating HALT first (same rule as `finish`).
-    pub fn into_parts(mut self) -> (Vec<u8>, Vec<(usize, u32, u8)>, std::collections::HashMap<u32, usize>) {
+    pub fn into_parts(
+        mut self,
+    ) -> (
+        Vec<u8>,
+        Vec<(usize, u32, u8)>,
+        std::collections::HashMap<u32, usize>,
+    ) {
         if self.bytes.last().copied() != Some(OP_HALT) {
             self.bytes.push(OP_HALT);
         }

@@ -1,15 +1,16 @@
-
 // ==============================================================================
 // BTG (Bidirectional Trigger Graph) - Security Framework & QA Pipeline
 // ==============================================================================
 
+mod qa_runner;
+
 use btg_packer::cli::CliArgs;
+use btg_packer::debug;
 use btg_packer::error;
-use btg_packer::pe::{self, TargetPeInfo, generate_dummy_target_pe};
+use btg_packer::pe::{self, generate_dummy_target_pe, TargetPeInfo};
 use btg_packer::pipeline::{self, PipelineContext};
 use btg_packer::qa::QaBenchmarkRunner;
 use btg_packer::vm;
-use btg_packer::debug;
 use clap::Parser;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
@@ -31,6 +32,10 @@ impl Drop for LogFlushGuard {
 fn main() -> error::Result<()> {
     let args = CliArgs::parse();
 
+    if args.verify_seeds > 0 {
+        return btg_packer::multi_seed::run(&args).map_err(error::BtgError::Anyhow);
+    }
+
     // ── P1: feature resolver 리팩터링 — RequestedConfig → ResolvedConfig ─────────
     // CLI 플래그의 정책 결정(--full 확장 · vm-oep/reencrypt/mem-harden 상충 해소 ·
     // crypto gate · m7/m8 파생)을 main.rs 인라인에서 `protection_profile::resolve`
@@ -46,6 +51,13 @@ fn main() -> error::Result<()> {
     // 하드 에러 (정책 위반 → 조기 종료) — resolve 가 수집한 내용을 Err 로 승격.
     for e in &profile.errors {
         return Err(error::BtgError::Anyhow(anyhow::anyhow!("{}", e.message())));
+    }
+    if args.strict_profile && !profile.warnings.is_empty() {
+        return Err(error::BtgError::Anyhow(anyhow::anyhow!(
+            "--strict-profile rejected {} protection downgrade(s): {}",
+            profile.warnings.len(),
+            profile.warnings.join("; ")
+        )));
     }
 
     // ── v9: --full — 최대 보호 스택을 단일 플래그로 켠다 ─────────────────────────
@@ -63,19 +75,16 @@ fn main() -> error::Result<()> {
     let integrity = cfg.integrity;
     let payload_relocate = cfg.payload_relocate;
     let rsrc_register = cfg.rsrc_register;
-    // FIX(v14 --vm-oep + --full): --iat-hide(--full이 켬)는 네이티브 디스패치용 IAT
-    // 은닉/재구성이므로, 원본 프로그램 전체를 VM으로 lift해 데이터·import 포인터를
-    // 평문으로 직접 읽는 --vm-oep와 양립하지 않는다. 게다가 TLS callback이 있는 PE
-    // (Rust/CRT 대상)에선 iat-hide가 하드-에러로 실패한다. --vm-oep가 우선한다.
+    // P1-6: VM-OEP native-call sites and native-owned startup thunks share the
+    // resolver-populated slots, so IAT hiding remains effective with Program-VM.
     let iat_hide = cfg.iat_hide;
     // FIX(v12.2): --dispatcher-reencrypt(런타임 블록 단위 복호화)는 .textb 블록
     // 영역에 대한 쓰기 권한이 계속 필요하다. --mem-harden(RX 전환)과 동시 적용하면
     // 디스패처의 첫 in-place 복호화가 RX 페이지에 쓰다 0xC0000005 크래시
     // (fault @ dispatcher block_crypt PRGA `xor [rcx],al`). 재암호화가 우선이며
     // mem-harden의 RX 전환은 생략한다.
-    // FIX(v14 --vm-oep + --full): --mem-harden(.textb → RX 전환)은 프로그램 VM
-    // 런타임과도 양립하지 않는다 (lift된 프로그램 실행 중 .textb 쓰기 → 0xC0000005).
-    // --vm-oep가 우선해 mem-harden도 끈다.
+    // P1-5: Program-VM bytecode remains ciphertext and mutable state has its own
+    // ownership; the generated code region can therefore be sealed RX.
     let mem_harden = cfg.mem_harden;
     let obf_level = cfg.obf_level;
 
@@ -122,7 +131,10 @@ fn main() -> error::Result<()> {
     if args.text_vm {
         let input_path = args.input;
         if !input_path.exists() {
-            println!("[!] Input file not found. Generating default test payload: {}", input_path.display());
+            println!(
+                "[!] Input file not found. Generating default test payload: {}",
+                input_path.display()
+            );
             let dummy_bytes = generate_dummy_target_pe()?;
             std::fs::write(&input_path, &dummy_bytes)?;
         }
@@ -138,12 +150,22 @@ fn main() -> error::Result<()> {
             info.image_base,
         )?;
         println!("==================================================================");
-        println!(" [M6] 원본 .text → VM lift 커버리지 리포트 ({} bytes .text)", info.text_bytes.len());
+        println!(
+            " [M6] 원본 .text → VM lift 커버리지 리포트 ({} bytes .text)",
+            info.text_bytes.len()
+        );
         println!("==================================================================");
         println!("  기본 블록:            {}", report.total_blocks);
         println!("  총 명령:              {}", report.total_instructions);
-        println!("  lift 가능 명령:       {} ({:.2}%)", report.liftable_instructions, report.coverage() * 100.0);
-        println!("  lift 불가 명령:       {}", report.unsupported_instructions);
+        println!(
+            "  lift 가능 명령:       {} ({:.2}%)",
+            report.liftable_instructions,
+            report.coverage() * 100.0
+        );
+        println!(
+            "  lift 불가 명령:       {}",
+            report.unsupported_instructions
+        );
         println!("  완전 lift 가능 블록:  {}", report.fully_liftable_blocks);
         println!("  lift 바이트코드 총량: {} bytes", report.bytecode_total);
         if !report.unsupported.is_empty() {
@@ -165,7 +187,10 @@ fn main() -> error::Result<()> {
     if args.text_vm_oep {
         let input_path = args.input;
         if !input_path.exists() {
-            println!("[!] Input file not found. Generating default test payload: {}", input_path.display());
+            println!(
+                "[!] Input file not found. Generating default test payload: {}",
+                input_path.display()
+            );
             let dummy_bytes = generate_dummy_target_pe()?;
             std::fs::write(&input_path, &dummy_bytes)?;
         }
@@ -187,8 +212,15 @@ fn main() -> error::Result<()> {
         println!("  entry block VA:      0x{:X}", lift.entry_va);
         println!("  CFG 블록 수:         {}", lift.blocks);
         println!("  총 명령:             {}", lift.total_instructions);
-        println!("  lift 불가 명령:      {} ({:.2}%)", lift.unsupported.len(), lift.coverage() * 100.0);
-        println!("  단일 VM 프로그램:    {} bytes bytecode", lift.bytecode.len());
+        println!(
+            "  lift 불가 명령:      {} ({:.2}%)",
+            lift.unsupported.len(),
+            lift.coverage() * 100.0
+        );
+        println!(
+            "  단일 VM 프로그램:    {} bytes bytecode",
+            lift.bytecode.len()
+        );
         if !lift.bytecode.is_empty() {
             println!("\n  첫 32B bytecode:");
             let mut line = String::from("    ");
@@ -204,7 +236,13 @@ fn main() -> error::Result<()> {
             let sections: Vec<(String, u32, u32)> = info
                 .relayed_sections
                 .iter()
-                .map(|s| (s.name.clone(), s.virtual_address, s.virtual_size.max(s.bytes.len() as u32)))
+                .map(|s| {
+                    (
+                        s.name.clone(),
+                        s.virtual_address,
+                        s.virtual_size.max(s.bytes.len() as u32),
+                    )
+                })
                 .collect();
             let mem = vm::mem_model::model_from_pe(
                 info.image_base,
@@ -231,7 +269,10 @@ fn main() -> error::Result<()> {
             let vm_size_est = 0x2000 + 0x2000 + lift.bytecode.len() + vm::interp::STATE_SIZE;
             println!("  ── 프로그램 VM 모듈 (M6 Phase-2) ──");
             println!("    bytecode: {} bytes", lift.bytecode.len());
-            println!("    state:    {} bytes (STATE_SIZE)", vm::interp::STATE_SIZE);
+            println!(
+                "    state:    {} bytes (STATE_SIZE)",
+                vm::interp::STATE_SIZE
+            );
             println!("    code+table estimate: ~0x4000 bytes");
             println!("    embedded module estimate: {} bytes", vm_size_est);
             println!("    (빌드 스텁이 이 VM 프로그램을 디스패치 — OEP→VM entry 실행 코어)");
@@ -245,16 +286,24 @@ fn main() -> error::Result<()> {
         // P0-1: QA 실행 전 실전 코퍼스 자동 생성 (없는 프로파일만 빌드).
         let built = btg_packer::qa::QaBenchmarkRunner::build_corpus()?;
         if !built.is_empty() {
-            println!("[+] P0-1 QA corpus: generated {} variant(s): {}", built.len(), built.join(", "));
+            println!(
+                "[+] P0-1 QA corpus: generated {} variant(s): {}",
+                built.len(),
+                built.join(", ")
+            );
         }
-        run_qa_suite()?;
+        qa_runner::run_qa_suite(args.qa_commercial)?;
         return Ok(());
     }
 
     // ── P0-1: 실전 컴파일러 코퍼스 생성 전용 모드 ──────────────────────────────────
     if args.qa_gen_corpus {
         let built = btg_packer::qa::QaBenchmarkRunner::build_corpus()?;
-        let status = if built.is_empty() { "all up-to-date".to_string() } else { built.join(", ") };
+        let status = if built.is_empty() {
+            "all up-to-date".to_string()
+        } else {
+            built.join(", ")
+        };
         println!(
             "[+] P0-1 QA corpus: {} variant(s) under ./corpus ({})",
             btg_packer::qa::CORPUS_PROFILES.len(),
@@ -278,7 +327,9 @@ fn main() -> error::Result<()> {
         );
     }
     if !crypto_enabled && args.chained_crypto {
-        eprintln!("[!] --chained-crypto requires the crypto layer; ignoring (use without --no-crypto)");
+        eprintln!(
+            "[!] --chained-crypto requires the crypto layer; ignoring (use without --no-crypto)"
+        );
     }
     if !crypto_enabled && integrity {
         eprintln!("[!] --integrity requires the crypto layer; ignoring (use without --no-crypto)");
@@ -325,35 +376,52 @@ fn main() -> error::Result<()> {
     // v3-composite: VM 가상화 (KSA 키 스케줄 → 바이트코드 + 핸들러)
     let vm_enabled = cfg.vm_enabled;
     if vm_enabled {
-        println!("[+] Composite VM: ENABLED (boot-stub RC4 KSA executed via generated VM handlers)");
+        println!(
+            "[+] Composite VM: ENABLED (boot-stub RC4 KSA executed via generated VM handlers)"
+        );
     }
 
     // ── 입력 PE 로드 ──────────────────────────────────────────────────────────────
     let input_path = args.input;
     if !input_path.exists() {
-        println!("[!] Input file not found. Generating default test payload: {}", input_path.display());
+        println!(
+            "[!] Input file not found. Generating default test payload: {}",
+            input_path.display()
+        );
         let dummy_bytes = generate_dummy_target_pe()?;
         fs::write(&input_path, &dummy_bytes)?;
     }
 
     let input_pe_bytes = fs::read(&input_path)?;
-    println!("[+] Target PE Loaded: {} ({} bytes)", input_path.display(), input_pe_bytes.len());
+    println!(
+        "[+] Target PE Loaded: {} ({} bytes)",
+        input_path.display(),
+        input_pe_bytes.len()
+    );
 
     // ── PE 파싱 ──────────────────────────────────────────────────────────────────
     let target_info = TargetPeInfo::parse(&input_pe_bytes)?;
     println!("[+] Target ImageBase:  0x{:X}", target_info.image_base);
     println!("[+] Target .text RVA:  0x{:X}", target_info.text_rva);
     println!("[+] Target Subsystem:  {}", target_info.subsystem);
-    println!("[+] Relayed {} original PE sections.", target_info.relayed_sections.len());
+    println!(
+        "[+] Relayed {} original PE sections.",
+        target_info.relayed_sections.len()
+    );
 
     // ── Dispatcher RVA 동적 계산 (원본 섹션 끝 이후) ──────────────────────────────
-    let section_alignment = if target_info.section_alignment == 0 { 0x1000 } else { target_info.section_alignment };
+    let section_alignment = if target_info.section_alignment == 0 {
+        0x1000
+    } else {
+        target_info.section_alignment
+    };
     let dispatcher_rva: u32 = target_info
         .relayed_sections
         .iter()
         .map(|s| {
             s.virtual_address
-                + ((s.virtual_size.max(s.bytes.len() as u32) + section_alignment - 1) / section_alignment)
+                + ((s.virtual_size.max(s.bytes.len() as u32) + section_alignment - 1)
+                    / section_alignment)
                     * section_alignment
         })
         .max()
@@ -370,7 +438,10 @@ fn main() -> error::Result<()> {
     // config → 같은 output (재현·디버깅·상용 배포용).
     if let Some(seed) = args.seed {
         ctx.rng = StdRng::seed_from_u64(seed);
-        println!("[+] P3-1 Deterministic build: RNG seeded 0x{:016X} (--seed)", seed);
+        println!(
+            "[+] P3-1 Deterministic build: RNG seeded 0x{:016X} (--seed)",
+            seed
+        );
     }
     // v5: 안티디버그 여부 기록 (validate의 부트 스텁 프롤로그 검사가 사용)
     ctx.anti_debug = anti_debug || args.trace_blocks;
@@ -423,7 +494,17 @@ fn main() -> error::Result<()> {
         ctx.poly_vm_seed = poly_seed;
         ctx.poly_vm_seed_masked =
             poly_seed ^ 0xA7B3C5D1E9F20486u64.wrapping_mul(ctx.mba_constant as u64);
-        let _ = pipeline::selective_vm::SelectiveVmPass::run(&mut ctx, poly_seed);
+        if ctx.vm_oep && ctx.vm_commercial {
+            let marked = btg_packer::sdk::MarkerScanner::scan_markers(&ctx.target_info.text_bytes);
+            if !marked.is_empty() {
+                println!(
+                    "[+] SDK markers: {} region(s) delegated to commercial Program-VM 100% ownership gate",
+                    marked.len()
+                );
+            }
+        } else {
+            let _ = pipeline::selective_vm::SelectiveVmPass::run(&mut ctx, poly_seed);
+        }
     }
 
     // ── Pass 1: CFG 추출 + MicroSlicer ────────────────────────────────────────────
@@ -474,8 +555,10 @@ fn main() -> error::Result<()> {
     // 그 앞에서 켠 뒤 빌드 후 <output>.map 으로 덤프한다.
     if args.map || args.sym_map {
         vm::mapper::begin("pack");
-        println!("[+] M9 VM Bytecode Mapper: ENABLED (will write <output>.map{})",
-            if args.sym_map { " + .sym" } else { "" });
+        println!(
+            "[+] M9 VM Bytecode Mapper: ENABLED (will write <output>.map{})",
+            if args.sym_map { " + .sym" } else { "" }
+        );
     }
 
     // v61: --dispatcher-reencrypt OR --m7 (둘 다 per-block) — ctx.reencrypt를
@@ -493,7 +576,6 @@ fn main() -> error::Result<()> {
         args.chained_crypto,
         reencrypt_effective,
     )?;
-
 
     // ── v4: RT_RCDATA 정식 리소스 등록 (--payload-relocate 필요) ─────────────
     if rsrc_register {
@@ -518,17 +600,50 @@ fn main() -> error::Result<()> {
 
     // ── v5: 자체검증 — 출력 PE를 다시 파싱해 구조적 불변식 검증 ──────────────────
     pipeline::validate::run(&ctx, &output_pe_bytes)?;
+    let verification_report = if args.verify_output {
+        match btg_packer::differential::verify_equivalent(
+            &input_path,
+            &output_path,
+            std::time::Duration::from_secs(args.verify_timeout_secs.max(1)),
+        ) {
+            Ok(report) => {
+                println!(
+                    "[VERIFY] OK original/protected execution equivalent: exit={}, stdout={}B, stderr={}B",
+                    report.original.exit_code,
+                    report.original.stdout.len(),
+                    report.original.stderr.len()
+                );
+                Some(report)
+            }
+            Err(verify_error) => {
+                let isolated = btg_packer::differential::isolate_failed_output(&output_path)
+                    .map_err(error::BtgError::Anyhow)?;
+                return Err(error::BtgError::Anyhow(anyhow::anyhow!(
+                    "{}; failed output isolated as {}",
+                    verify_error,
+                    isolated.display()
+                )));
+            }
+        }
+    } else {
+        None
+    };
     // WS2.1: emit the function-ownership ↔ .pdata mapping CSV on program-VM paths.
     if let Some(own_csv) = pipeline::validate::ownership_csv(&ctx, &output_pe_bytes)? {
         let mut own_path = output_path.clone();
         own_path.set_extension(format!(
             "{}.ownership.csv",
-            output_path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| "out".into())
+            output_path
+                .extension()
+                .map(|e| e.to_string_lossy().to_string())
+                .unwrap_or_else(|| "out".into())
         ));
         std::fs::write(&own_path, own_csv)?;
-        println!("[+] WS2.1 function-ownership map written: {}", own_path.display());
+        println!(
+            "[+] WS2.1 function-ownership map written: {}",
+            own_path.display()
+        );
     }
-
 
     // ── 상용 3-2: Build Manifest — 패킹 로그 + <output>.manifest ─────────────
     // input/output SHA-256 + 결정적 build_id + vm/crypto 버전 + 적용 feature
@@ -561,38 +676,45 @@ fn main() -> error::Result<()> {
         // resolve()가 mem_harden/reencrypt/vm-oep 상충을 이미 해소했으므로
         // cfg 값 그대로 사용한다. mem_harden이 유효하면 부트 스텁이 복호화+
         // 무결성 검증 후 .textb를 RX로 전환(rx-after-verify)한다.
-        let mut wx_contract = "rwx-at-rest".to_string();
-        if cfg.mem_harden {
-            wx_contract.push_str(",rx-after-verify");
-        }
+        let mut wx_contract = if cfg.mem_harden {
+            "transient-rw-to-rx,rx-after-verify,rw-state".to_string()
+        } else {
+            "rwx-at-rest".to_string()
+        };
         if payload_relocate {
             wx_contract.push_str(",code-data-split");
         }
         if ctx.at_rest_encrypted {
             wx_contract.push_str(",at-rest-ciphertext");
         }
-        let manifest = btg_packer::manifest::BuildManifest::new(
-            args.seed,
-            flags,
-            input_hash,
-            output_hash,
-        )
-        // P3-2/readccc §6.1: capability manifest — effective crypto primitive,
-        // at-rest encryption, ASLR trade-off, integrity, coverage, anti-debug
-        // policy, W^X memory contract.
-        .with_capabilities(
-            match cfg.crypto_mode {
-                btg_packer::crypto::CryptoMode::Rc4 => "rc4",
-                btg_packer::crypto::CryptoMode::C1 => "c1",
-                btg_packer::crypto::CryptoMode::ChaCha20 => "chacha20",
-            },
-            ctx.at_rest_encrypted,
-            !ctx.at_rest_encrypted,
-            integrity,
-            args.crypto_coverage,
-            anti_debug_policy.as_str(),
-            &wx_contract,
-        );
+        let manifest =
+            btg_packer::manifest::BuildManifest::new(args.seed, flags, input_hash, output_hash)
+                // P3-2/readccc §6.1: capability manifest — effective crypto primitive,
+                // at-rest encryption, ASLR trade-off, integrity, coverage, anti-debug
+                // policy, W^X memory contract.
+                .with_capabilities(
+                    match cfg.crypto_mode {
+                        btg_packer::crypto::CryptoMode::Rc4 => "rc4",
+                        btg_packer::crypto::CryptoMode::C1 => "c1",
+                        btg_packer::crypto::CryptoMode::ChaCha20 => "chacha20",
+                    },
+                    ctx.at_rest_encrypted,
+                    !ctx.at_rest_encrypted,
+                    integrity,
+                    args.crypto_coverage,
+                    anti_debug_policy.as_str(),
+                    &wx_contract,
+                )
+                .with_execution_verification(args.verify_output, verification_report.as_ref())
+                .with_vm_ownership(
+                    ctx.vm_coverage.as_ref(),
+                    ctx.vm_prog_rva,
+                    ctx.vm_prog_native_bridge,
+                    &ctx.vm_prog_chunks,
+                    ctx.vm_prog_bytecode_rva,
+                    ctx.vm_prog_bytecode_len,
+                    ctx.vm_prog_runtime_cipher_hash.as_deref(),
+                );
         println!("[+] Build manifest (P3-2):");
         for line in manifest.render().lines() {
             println!("      {}", line);
@@ -609,11 +731,17 @@ fn main() -> error::Result<()> {
                 .map(|e| format!("{}.btgmanifest", e.to_string_lossy()))
                 .unwrap_or_else(|| "btgmanifest".to_string()),
         );
-        manifest
-            .write_manifest(&manifest_path)
-            .map_err(|e| error::BtgError::Anyhow(anyhow::anyhow!(
-                "P3-2: failed to write build manifest {}: {}", manifest_path.display(), e)))?;
-        println!("[+] P3-2 Build manifest written: {}", manifest_path.display());
+        manifest.write_manifest(&manifest_path).map_err(|e| {
+            error::BtgError::Anyhow(anyhow::anyhow!(
+                "P3-2: failed to write build manifest {}: {}",
+                manifest_path.display(),
+                e
+            ))
+        })?;
+        println!(
+            "[+] P3-2 Build manifest written: {}",
+            manifest_path.display()
+        );
     }
 
     // ── v42 (M9) / v50 (M10): VM 매퍼 덤프 ─────────────────────────────
@@ -624,49 +752,95 @@ fn main() -> error::Result<()> {
         if let Some(m) = vm::mapper::take() {
             if args.map {
                 let mut map_path = output_path.clone();
-                map_path.set_extension(
-                    format!("{}.map", output_path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| String::from("out"))),
+                map_path.set_extension(format!(
+                    "{}.map",
+                    output_path
+                        .extension()
+                        .map(|e| e.to_string_lossy().to_string())
+                        .unwrap_or_else(|| String::from("out"))
+                ));
+                let n = vm::mapper::write_map_to(&m, &map_path).map_err(|e| {
+                    error::BtgError::Anyhow(anyhow::anyhow!(
+                        "M9: failed to write VM map {}: {}",
+                        map_path.display(),
+                        e
+                    ))
+                })?;
+                println!(
+                    "[+] M9 VM map written: {} ({} entries)",
+                    map_path.display(),
+                    n
                 );
-                let n = vm::mapper::write_map_to(&m, &map_path)
-                    .map_err(|e| error::BtgError::Anyhow(anyhow::anyhow!(
-                        "M9: failed to write VM map {}: {}", map_path.display(), e)))?;
-                println!("[+] M9 VM map written: {} ({} entries)", map_path.display(), n);
             }
             if args.sym_map {
                 let mut sym_path = output_path.clone();
-                sym_path.set_extension(
-                    format!("{}.sym", output_path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| String::from("out"))),
-                );
+                sym_path.set_extension(format!(
+                    "{}.sym",
+                    output_path
+                        .extension()
+                        .map(|e| e.to_string_lossy().to_string())
+                        .unwrap_or_else(|| String::from("out"))
+                ));
                 // .pdata 함수 테이블 (relayed_sections 에서)
                 let mut funcs: Vec<(u64, u64)> = Vec::new();
-                if let Some(pd) = ctx.target_info.relayed_sections.iter().find(|s| s.name == ".pdata") {
+                if let Some(pd) = ctx
+                    .target_info
+                    .relayed_sections
+                    .iter()
+                    .find(|s| s.name == ".pdata")
+                {
                     for chunk in pd.bytes.chunks_exact(12) {
-                        if chunk.len() < 12 { break; }
+                        if chunk.len() < 12 {
+                            break;
+                        }
                         let s0 = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                         let e0 = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
                         if s0 > 0 && e0 > s0 {
-                            funcs.push((ctx.target_info.image_base + s0 as u64,
-                                        ctx.target_info.image_base + e0 as u64));
+                            funcs.push((
+                                ctx.target_info.image_base + s0 as u64,
+                                ctx.target_info.image_base + e0 as u64,
+                            ));
                         }
                     }
                     funcs.sort();
                 }
                 let n = vm::mapper::write_sym_to(&m, &sym_path, &funcs, ctx.target_info.image_base)
-                    .map_err(|e| error::BtgError::Anyhow(anyhow::anyhow!(
-                        "M10: failed to write VM symbol map {}: {}", sym_path.display(), e)))?;
-                println!("[+] M10 VM symbol map written: {} ({} blocks)", sym_path.display(), n);
+                    .map_err(|e| {
+                        error::BtgError::Anyhow(anyhow::anyhow!(
+                            "M10: failed to write VM symbol map {}: {}",
+                            sym_path.display(),
+                            e
+                        ))
+                    })?;
+                println!(
+                    "[+] M10 VM symbol map written: {} ({} blocks)",
+                    sym_path.display(),
+                    n
+                );
             }
             // P3 (G1): 상용 RISC lift의 micro-op 단위 매핑 CSV
             // (원본 VA → RISC micro-op 인덱스 → 폴리 바이트코드 오프셋).
             if !m.risc_entries.is_empty() {
                 let mut csv_path = output_path.clone();
-                csv_path.set_extension(
-                    format!("{}.riscmap.csv", output_path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| String::from("out"))),
+                csv_path.set_extension(format!(
+                    "{}.riscmap.csv",
+                    output_path
+                        .extension()
+                        .map(|e| e.to_string_lossy().to_string())
+                        .unwrap_or_else(|| String::from("out"))
+                ));
+                let n = vm::mapper::write_risc_csv_to(&m, &csv_path).map_err(|e| {
+                    error::BtgError::Anyhow(anyhow::anyhow!(
+                        "P3: failed to write commercial RISC map CSV {}: {}",
+                        csv_path.display(),
+                        e
+                    ))
+                })?;
+                println!(
+                    "[+] P3 commercial RISC map CSV written: {} ({} micro-ops)",
+                    csv_path.display(),
+                    n
                 );
-                let n = vm::mapper::write_risc_csv_to(&m, &csv_path)
-                    .map_err(|e| error::BtgError::Anyhow(anyhow::anyhow!(
-                        "P3: failed to write commercial RISC map CSV {}: {}", csv_path.display(), e)))?;
-                println!("[+] P3 commercial RISC map CSV written: {} ({} micro-ops)", csv_path.display(), n);
             }
         } else {
             println!("[!] M9/M10: mapper enabled but no bytecode was lifted (nothing to map)");
@@ -689,41 +863,5 @@ fn main() -> error::Result<()> {
         ctx.layout()?,
     )?;
 
-    Ok(())
-}
-
-fn run_qa_suite() -> error::Result<()> {
-    println!("==================================================================");
-    println!(" [QA BENCHMARK SUITE] Running Multi-Compiler PE Compatibility Suite ");
-    println!("==================================================================");
-
-    let current_exe = env::current_exe()?;
-    let targets = QaBenchmarkRunner::discover_targets();
-    println!("[+] Discovered {} PE benchmark targets.", targets.len());
-
-    println!("\n---------------------------------------------------------------------------------------------");
-    println!(" Target Name              | Compiler Environment | Orig Size | Packed Size | Sections | Exec ");
-    println!("---------------------------------------------------------------------------------------------");
-
-    for target in &targets {
-        if let Ok(res) = QaBenchmarkRunner::run_benchmark_test(target, &current_exe) {
-            // stdout 으로 출력 (env_logger 가 120자에서 로그를 잘라 PASS/FAIL 이
-            // 사라지는 문제 방지).
-            println!(
-                " {:<24} | {:<20} | {:<9} | {:<11} | {:<8} | {}",
-                res.target_name,
-                res.compiler,
-                res.original_size,
-                res.packed_size,
-                res.relayed_sections_count,
-                if res.execution_success { "PASS [OK]" } else { "FAIL" }
-            );
-            if !res.execution_success {
-                println!("      → {}", res.exec_detail);
-            }
-        }
-    }
-    println!("---------------------------------------------------------------------------------------------\n");
-    println!("[SUCCESS] QA Benchmark Testing Suite Completed.");
     Ok(())
 }

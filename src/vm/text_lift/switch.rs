@@ -1,5 +1,3 @@
-
-
 // ==============================================================================
 // C-1 fix (switch jump-table resolution):  resolve `Jmp_rm64` jump-table
 // terminators in the original program so they dispatch *inside the VM*
@@ -12,7 +10,12 @@
 use iced_x86::{Code, Decoder, DecoderOptions, OpKind, Register};
 
 /// Read `len` bytes from the original image at absolute VA `va`.
-fn read_image(relayed: &[crate::pe::builder::SectionData], image_base: u64, va: u64, len: usize) -> Option<Vec<u8>> {
+fn read_image(
+    relayed: &[crate::pe::builder::SectionData],
+    image_base: u64,
+    va: u64,
+    len: usize,
+) -> Option<Vec<u8>> {
     for s in relayed {
         let start = image_base + s.virtual_address as u64;
         if va >= start && va + len as u64 <= start + s.bytes.len() as u64 {
@@ -62,11 +65,17 @@ pub fn resolve_switch_cases(
     let mut last_def: [Option<usize>; 16] = [None; 16];
     let mut out = Vec::new();
     fn reg_idx(r: Register) -> Option<usize> {
-        if r.is_gpr() { Some(r.full_register().number() as usize) } else { None }
+        if r.is_gpr() {
+            Some(r.full_register().number() as usize)
+        } else {
+            None
+        }
     }
     for (i, inst) in insts.iter().enumerate() {
         if inst.code() == Code::Jmp_rm64 {
-            resolve_one(&insts, &last_def, i, &mut out, relayed, image_base, base_va, text_end);
+            resolve_one(
+                &insts, &last_def, i, &mut out, relayed, image_base, base_va, text_end,
+            );
         }
         if inst.op0_kind() == OpKind::Register {
             if let Some(ri) = reg_idx(inst.op0_register()) {
@@ -89,7 +98,11 @@ fn resolve_one(
     text_end: u64,
 ) {
     fn reg_idx(r: Register) -> Option<usize> {
-        if r.is_gpr() { Some(r.full_register().number() as usize) } else { None }
+        if r.is_gpr() {
+            Some(r.full_register().number() as usize)
+        } else {
+            None
+        }
     }
     let inst = &insts[i];
     let jmp_va = inst.ip();
@@ -100,8 +113,14 @@ fn resolve_one(
     let mut relative = false;
 
     if inst.op0_kind() == OpKind::Memory {
-        idx_reg = if inst.memory_index() != Register::None { inst.memory_index() } else { inst.memory_base() };
-        if idx_reg == Register::None { return; }
+        idx_reg = if inst.memory_index() != Register::None {
+            inst.memory_index()
+        } else {
+            inst.memory_base()
+        };
+        if idx_reg == Register::None {
+            return;
+        }
         scale = inst.memory_index_scale();
         table = if inst.is_ip_rel_memory_operand() {
             Some(inst.memory_displacement64())
@@ -118,7 +137,10 @@ fn resolve_one(
     } else if inst.op0_kind() == OpKind::Register {
         let tgt_reg = inst.op0_register();
         let ti = reg_idx(tgt_reg).unwrap_or(0);
-        let mut li = match last_def[ti] { Some(li) => li, None => return };
+        let mut li = match last_def[ti] {
+            Some(li) => li,
+            None => return,
+        };
         // If the last def of the jmp target is an `add rT,rX` (the relative jump-table
         // idiom `...movsxd rT,[rB+rI*4]; add rT,rB; jmp rT`), the load is one step back.
         let ld0 = &insts[li];
@@ -127,15 +149,28 @@ fn resolve_one(
             && ld0.op0_register() == tgt_reg
         {
             relative = true;
-            if li == 0 { return; }
+            if li == 0 {
+                return;
+            }
             li -= 1;
         }
         let ld = &insts[li];
-        let is_load = matches!(ld.code(), Code::Movsxd_r64_rm32 | Code::Mov_r64_rm64 | Code::Mov_r32_rm32);
-        if !is_load || ld.op1_kind() != OpKind::Memory { return; }
+        let is_load = matches!(
+            ld.code(),
+            Code::Movsxd_r64_rm32 | Code::Mov_r64_rm64 | Code::Mov_r32_rm32
+        );
+        if !is_load || ld.op1_kind() != OpKind::Memory {
+            return;
+        }
         relative = relative || matches!(ld.code(), Code::Movsxd_r64_rm32);
-        idx_reg = if ld.memory_index() != Register::None { ld.memory_index() } else { ld.memory_base() };
-        if idx_reg == Register::None { return; }
+        idx_reg = if ld.memory_index() != Register::None {
+            ld.memory_index()
+        } else {
+            ld.memory_base()
+        };
+        if idx_reg == Register::None {
+            return;
+        }
         scale = ld.memory_index_scale();
         // key the switch on the LOAD (index is still valid here); the jmp rT then
         // falls through to the native bridge only for the "no case matched" default.
@@ -156,25 +191,38 @@ fn resolve_one(
         return;
     }
 
-    let table = match table { Some(t) => t, None => return };
-    if scale != 4 && scale != 8 { return; }
-    let Ok(idx_vreg) = crate::vm::lifter::vreg(idx_reg) else { return };
+    let table = match table {
+        Some(t) => t,
+        None => return,
+    };
+    if scale != 4 && scale != 8 {
+        return;
+    }
+    let Ok(idx_vreg) = crate::vm::lifter::vreg(idx_reg) else {
+        return;
+    };
     let mut cases = Vec::new();
     let mut idx = 0i64;
     loop {
         let entry_va = table.wrapping_add((idx as u64).wrapping_mul(scale as u64));
         let target = if relative {
-            read_u32(relayed, image_base, entry_va).map(|v| table.wrapping_add((v as i32 as i64) as u64))
+            read_u32(relayed, image_base, entry_va)
+                .map(|v| table.wrapping_add((v as i32 as i64) as u64))
         } else if scale == 8 {
             read_u64(relayed, image_base, entry_va)
         } else {
             read_u32(relayed, image_base, entry_va).map(|v| v as u64)
         };
         match target {
-            Some(t) if t >= base_va && t < text_end => { cases.push((idx, t)); idx += 1; }
+            Some(t) if t >= base_va && t < text_end => {
+                cases.push((idx, t));
+                idx += 1;
+            }
             _ => break,
         }
-        if idx > 4096 { break; }
+        if idx > 4096 {
+            break;
+        }
     }
     if !cases.is_empty() {
         out.push((key_va, idx_vreg, cases));

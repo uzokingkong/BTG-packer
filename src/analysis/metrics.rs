@@ -48,7 +48,10 @@ impl MetricsAnalyzer {
         edges: CfgEdgeCounts,
     ) -> ObfuscationMetrics {
         let total_trigger_blocks = trigger_blocks.len();
-        let overlapped_blocks = trigger_blocks.iter().filter(|b| b.entries.len() > 1).count();
+        let overlapped_blocks = trigger_blocks
+            .iter()
+            .filter(|b| b.entries.len() > 1)
+            .count();
 
         let overlap_density = if total_trigger_blocks > 0 {
             (overlapped_blocks as f64 / total_trigger_blocks as f64) * 100.0

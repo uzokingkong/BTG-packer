@@ -1,4 +1,6 @@
-use iced_x86::{BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, MemoryOperand, Register};
+use iced_x86::{
+    BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, MemoryOperand, Register,
+};
 
 // ==============================================================================
 // v61 (--custom-cipher + --m7) ??BTG-C1 per-block on-demand ????癲ル슢?뤸뤃?????됰Ŋ?좂뜏?????
@@ -97,16 +99,44 @@ pub fn build_dispatcher_m7_c1(
     // key4@[rsp+0x100] 嚥싳쉶瑗ц짆堉샕??: call C1Init ??????濚??筌??節꾪렭?????影??낟????call c1_blob.
     macro_rules! emit_c1_crypt {
         () => {{
-            seq.push((Instruction::with_branch(Code::Call_rel32_64, 0)?, Some(L::C1Init)));
-            seq.push((Instruction::with2(Code::Lea_r64_m, Register::RAX, rip_va(target_table_va))?, None));
-            seq.push((Instruction::with2(Code::Mov_r32_rm32, Register::ECX, mem_idx(Register::RAX, Register::R13, 4))?, None));
-            seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::ECX, mem(Register::RSP, 0x100))?, None));
-            seq.push((Instruction::with2(Code::Lea_r64_m, Register::RAX, rip_va(section_base_va))?, None));
-            seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::RCX)?, None));
-            seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::RAX)?, None)); // buf
-            // edx(=len)??C1Init/??影??낟????????⑤슢????(C1Init?? eax/ecx/rdi??????
+            seq.push((
+                Instruction::with_branch(Code::Call_rel32_64, 0)?,
+                Some(L::C1Init),
+            ));
+            seq.push((
+                Instruction::with2(Code::Lea_r64_m, Register::RAX, rip_va(target_table_va))?,
+                None,
+            ));
+            seq.push((
+                Instruction::with2(
+                    Code::Mov_r32_rm32,
+                    Register::ECX,
+                    mem_idx(Register::RAX, Register::R13, 4),
+                )?,
+                None,
+            ));
+            seq.push((
+                Instruction::with2(Code::Xor_r32_rm32, Register::ECX, mem(Register::RSP, 0x100))?,
+                None,
+            ));
+            seq.push((
+                Instruction::with2(Code::Lea_r64_m, Register::RAX, rip_va(section_base_va))?,
+                None,
+            ));
+            seq.push((
+                Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::RCX)?,
+                None,
+            ));
+            seq.push((
+                Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::RAX)?,
+                None,
+            )); // buf
+                // edx(=len)??C1Init/??影??낟????????⑤슢????(C1Init?? eax/ecx/rdi??????
             c1_blob_call_idxs.push(seq.len());
-            seq.push((Instruction::with_branch(Code::Call_rel32_64, c1_blob_va)?, None));
+            seq.push((
+                Instruction::with_branch(Code::Call_rel32_64, c1_blob_va)?,
+                None,
+            ));
         }};
     }
 
@@ -136,143 +166,494 @@ pub fn build_dispatcher_m7_c1(
     }
 
     // ???? 2. ?癲ル슢?????汝??吏??좉텣?+ ?筌??????嚥▲굧????????????????????????????????????????????????????????????????????????????????????????????????????
-    push_seq!(Instruction::with2(Code::Mov_r64_rm64, Register::R10, mem(Register::RSP, 0x80))?, None); // target
-    push_seq!(Instruction::with2(Code::Mov_r64_rm64, Register::R11, mem(Register::RSP, 0x78))?, None); // seed
-    push_seq!(Instruction::with2(Code::Mov_r32_rm32, Register::R12D, mem(Register::RSP, 0x88))?, None); // current
-    push_seq!(Instruction::with2(Code::Cmp_rm64_imm32, Register::R10, num_blocks as i32)?, None);
-    push_seq!(Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 0)?, None);
-    push_seq!(Instruction::with2(Code::Cmovae_r64_rm64, Register::R10, Register::RCX)?, None);
-    push_seq!(Instruction::with2(Code::Cmp_rm32_imm32, Register::R12D, num_blocks as i32)?, None);
-    push_seq!(Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 0xFFFF_FFFFu32)?, None);
-    push_seq!(Instruction::with2(Code::Cmovae_r32_rm32, Register::R12D, Register::ECX)?, None);
+    push_seq!(
+        Instruction::with2(Code::Mov_r64_rm64, Register::R10, mem(Register::RSP, 0x80))?,
+        None
+    ); // target
+    push_seq!(
+        Instruction::with2(Code::Mov_r64_rm64, Register::R11, mem(Register::RSP, 0x78))?,
+        None
+    ); // seed
+    push_seq!(
+        Instruction::with2(Code::Mov_r32_rm32, Register::R12D, mem(Register::RSP, 0x88))?,
+        None
+    ); // current
+    push_seq!(
+        Instruction::with2(Code::Cmp_rm64_imm32, Register::R10, num_blocks as i32)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 0)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Cmovae_r64_rm64, Register::R10, Register::RCX)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Cmp_rm32_imm32, Register::R12D, num_blocks as i32)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 0xFFFF_FFFFu32)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Cmovae_r32_rm32, Register::R12D, Register::ECX)?,
+        None
+    );
 
     // ???? 3. ????ㅼ뒩??????깅굳????ㅿ폍筌?+ ???????筌??節꾪렭???+ target key4 ????????????????????????????????????????????????????
-    push_seq!(Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, WORKSPACE)?, None);
-    push_seq!(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::RSP)?, None);
-    push_seq!(Instruction::with2(Code::Lea_r64_m, Register::RSI, rip_va(length_table_va))?, None);
-    push_seq!(Instruction::with2(Code::Lea_r64_m, Register::RDI, rip_va(state_table_va))?, None);
-    push_seq!(Instruction::with2(Code::Lea_r32_m, Register::EAX, mem_idx(Register::R10, Register::R11, 1))?, None);
-    push_seq!(Instruction::with2(Code::Xor_rm32_imm32, Register::EAX, mba_constant)?, None);
-    push_seq!(Instruction::with2(Code::Mov_rm32_r32, mem(Register::RSP, 0x100), Register::EAX)?, None);
+    push_seq!(
+        Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, WORKSPACE)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::RSP)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Lea_r64_m, Register::RSI, rip_va(length_table_va))?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Lea_r64_m, Register::RDI, rip_va(state_table_va))?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(
+            Code::Lea_r32_m,
+            Register::EAX,
+            mem_idx(Register::R10, Register::R11, 1)
+        )?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Xor_rm32_imm32, Register::EAX, mba_constant)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_rm32_r32, mem(Register::RSP, 0x100), Register::EAX)?,
+        None
+    );
 
     // ???? 5. ENTER target: plaintext ?癲ル슢캉??????claim/refcount ????븐뻤???亦껋꼦維쀦뤃????????????????????????????
-    push_seq!(Instruction::with2(Code::Mov_r32_rm32, Register::EAX, mem_idx(Register::RSI, Register::R10, 4))?, None);
-    push_seq!(Instruction::with2(Code::Xor_r32_rm32, Register::EAX, mem(Register::RSP, 0x100))?, None);
-    push_seq!(Instruction::with2(Code::Test_rm32_r32, Register::EAX, Register::EAX)?, None);
-    push_seq!(Instruction::with_branch(Code::Je_rel32_64, 0)?, Some(L::EnterReady)); // plaintext
-    push_seq!(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, mem_idx(Register::RDI, Register::R10, 4))?, Some(L::EnterLoop));
-    push_seq!(Instruction::with2(Code::Cmp_rm32_imm32, Register::ECX, CLAIM)?, None);
-    push_seq!(Instruction::with_branch(Code::Je_rel32_64, 0)?, Some(L::EnterLoop)); // spin
-    push_seq!(Instruction::with2(Code::Cmp_rm32_imm32, Register::ECX, ENC)?, None);
-    push_seq!(Instruction::with_branch(Code::Jne_rel32_64, 0)?, Some(L::EnterDecrypted));
-    push_seq!(Instruction::with2(Code::Mov_r32_imm32, Register::EAX, ENC)?, None);
-    push_seq!(Instruction::with2(Code::Mov_r32_imm32, Register::R8D, CLAIM)?, None);
-    let mut cas = Instruction::with2(Code::Cmpxchg_rm32_r32, mem_idx(Register::RDI, Register::R10, 4), Register::R8D)?;
+    push_seq!(
+        Instruction::with2(
+            Code::Mov_r32_rm32,
+            Register::EAX,
+            mem_idx(Register::RSI, Register::R10, 4)
+        )?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Xor_r32_rm32, Register::EAX, mem(Register::RSP, 0x100))?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Test_rm32_r32, Register::EAX, Register::EAX)?,
+        None
+    );
+    push_seq!(
+        Instruction::with_branch(Code::Je_rel32_64, 0)?,
+        Some(L::EnterReady)
+    ); // plaintext
+    push_seq!(
+        Instruction::with2(
+            Code::Mov_r32_rm32,
+            Register::ECX,
+            mem_idx(Register::RDI, Register::R10, 4)
+        )?,
+        Some(L::EnterLoop)
+    );
+    push_seq!(
+        Instruction::with2(Code::Cmp_rm32_imm32, Register::ECX, CLAIM)?,
+        None
+    );
+    push_seq!(
+        Instruction::with_branch(Code::Je_rel32_64, 0)?,
+        Some(L::EnterLoop)
+    ); // spin
+    push_seq!(
+        Instruction::with2(Code::Cmp_rm32_imm32, Register::ECX, ENC)?,
+        None
+    );
+    push_seq!(
+        Instruction::with_branch(Code::Jne_rel32_64, 0)?,
+        Some(L::EnterDecrypted)
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_r32_imm32, Register::EAX, ENC)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_r32_imm32, Register::R8D, CLAIM)?,
+        None
+    );
+    let mut cas = Instruction::with2(
+        Code::Cmpxchg_rm32_r32,
+        mem_idx(Register::RDI, Register::R10, 4),
+        Register::R8D,
+    )?;
     cas.set_has_lock_prefix(true);
     push_seq!(cas, None);
-    push_seq!(Instruction::with_branch(Code::Jne_rel32_64, 0)?, Some(L::EnterLoop)); // lost ??spin
-    // claim won ??C1 decrypt target
-    push_seq!(Instruction::with2(Code::Mov_r32_rm32, Register::R13D, Register::R10D)?, None);
-    push_seq!(Instruction::with2(Code::Mov_r32_rm32, Register::EAX, mem_idx(Register::RSI, Register::R13, 4))?, None);
-    push_seq!(Instruction::with2(Code::Xor_r32_rm32, Register::EAX, mem(Register::RSP, 0x100))?, None);
-    push_seq!(Instruction::with2(Code::Mov_r32_rm32, Register::EDX, Register::EAX)?, None); // len
+    push_seq!(
+        Instruction::with_branch(Code::Jne_rel32_64, 0)?,
+        Some(L::EnterLoop)
+    ); // lost ??spin
+       // claim won ??C1 decrypt target
+    push_seq!(
+        Instruction::with2(Code::Mov_r32_rm32, Register::R13D, Register::R10D)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(
+            Code::Mov_r32_rm32,
+            Register::EAX,
+            mem_idx(Register::RSI, Register::R13, 4)
+        )?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Xor_r32_rm32, Register::EAX, mem(Register::RSP, 0x100))?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_r32_rm32, Register::EDX, Register::EAX)?,
+        None
+    ); // len
     emit_c1_crypt!();
-    push_seq!(Instruction::with2(Code::Lea_r64_m, Register::RSI, rip_va(length_table_va))?, None);
-    push_seq!(Instruction::with2(Code::Lea_r64_m, Register::RDI, rip_va(state_table_va))?, None);
-    push_seq!(Instruction::with2(Code::Mov_rm32_imm32, mem_idx(Register::RDI, Register::R10, 4), 1)?, None);
-    push_seq!(Instruction::with_branch(Code::Jmp_rel32_64, 0)?, Some(L::EnterReady));
+    push_seq!(
+        Instruction::with2(Code::Lea_r64_m, Register::RSI, rip_va(length_table_va))?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Lea_r64_m, Register::RDI, rip_va(state_table_va))?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(
+            Code::Mov_rm32_imm32,
+            mem_idx(Register::RDI, Register::R10, 4),
+            1
+        )?,
+        None
+    );
+    push_seq!(
+        Instruction::with_branch(Code::Jmp_rel32_64, 0)?,
+        Some(L::EnterReady)
+    );
     // EnterDecrypted: st == 0 ??cmpxchg(0->1)
-    push_seq!(Instruction::with2(Code::Test_rm32_r32, Register::ECX, Register::ECX)?, Some(L::EnterDecrypted));
-    push_seq!(Instruction::with_branch(Code::Jne_rel32_64, 0)?, Some(L::EnterInc));
-    push_seq!(Instruction::with2(Code::Xor_r32_rm32, Register::EAX, Register::EAX)?, None);
-    push_seq!(Instruction::with2(Code::Mov_r32_imm32, Register::R8D, 1)?, None);
-    let mut cas2 = Instruction::with2(Code::Cmpxchg_rm32_r32, mem_idx(Register::RDI, Register::R10, 4), Register::R8D)?;
+    push_seq!(
+        Instruction::with2(Code::Test_rm32_r32, Register::ECX, Register::ECX)?,
+        Some(L::EnterDecrypted)
+    );
+    push_seq!(
+        Instruction::with_branch(Code::Jne_rel32_64, 0)?,
+        Some(L::EnterInc)
+    );
+    push_seq!(
+        Instruction::with2(Code::Xor_r32_rm32, Register::EAX, Register::EAX)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_r32_imm32, Register::R8D, 1)?,
+        None
+    );
+    let mut cas2 = Instruction::with2(
+        Code::Cmpxchg_rm32_r32,
+        mem_idx(Register::RDI, Register::R10, 4),
+        Register::R8D,
+    )?;
     cas2.set_has_lock_prefix(true);
     push_seq!(cas2, None);
-    push_seq!(Instruction::with_branch(Code::Jne_rel32_64, 0)?, Some(L::EnterLoop));
-    push_seq!(Instruction::with_branch(Code::Jmp_rel32_64, 0)?, Some(L::EnterReady));
-    let mut inc_inst = Instruction::with1(Code::Inc_rm32, mem_idx(Register::RDI, Register::R10, 4))?;
+    push_seq!(
+        Instruction::with_branch(Code::Jne_rel32_64, 0)?,
+        Some(L::EnterLoop)
+    );
+    push_seq!(
+        Instruction::with_branch(Code::Jmp_rel32_64, 0)?,
+        Some(L::EnterReady)
+    );
+    let mut inc_inst =
+        Instruction::with1(Code::Inc_rm32, mem_idx(Register::RDI, Register::R10, 4))?;
     inc_inst.set_has_lock_prefix(true);
     push_seq!(inc_inst, Some(L::EnterInc));
-    push_seq!(Instruction::with_branch(Code::Jmp_rel32_64, 0)?, Some(L::EnterReady));
+    push_seq!(
+        Instruction::with_branch(Code::Jmp_rel32_64, 0)?,
+        Some(L::EnterReady)
+    );
 
     // ???? 6. EXIT current: refcount ??醫딆┫???+ ?꿔꺂????????????????됱뎽 C1 ????癲ル슢?뤸뤃??????????????????????????
-    push_seq!(Instruction::with2(Code::Cmp_rm32_imm32, Register::R12D, 0xFFFF_FFFFu32)?, Some(L::EnterReady));
-    push_seq!(Instruction::with_branch(Code::Je_rel32_64, 0)?, Some(L::ExitDone)); // sentinel
-    // key4_current = (seed_for(C, current) + current) ^ C
-    push_seq!(Instruction::with2(Code::Mov_r32_imm32, Register::EAX, mba_constant)?, None);
-    push_seq!(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R12D)?, None);
-    push_seq!(Instruction::with3(Code::Imul_r32_rm32_imm32, Register::ECX, Register::ECX, 0x9E37_79B9u32 as i32)?, None);
-    push_seq!(Instruction::with2(Code::Add_rm32_r32, Register::EAX, Register::ECX)?, None);
-    push_seq!(Instruction::with2(Code::Rol_rm32_imm8, Register::EAX, 13)?, None);
-    push_seq!(Instruction::with2(Code::Mov_r32_imm32, Register::EDX, mba_constant)?, None);
-    push_seq!(Instruction::with2(Code::Ror_rm32_imm8, Register::EDX, 7)?, None);
-    push_seq!(Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::EDX)?, None);
-    push_seq!(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R12D)?, None);
-    push_seq!(Instruction::with2(Code::Rol_rm32_imm8, Register::ECX, 5)?, None);
-    push_seq!(Instruction::with3(Code::Imul_r32_rm32_imm32, Register::ECX, Register::ECX, 0x85EB_CA6Bu32 as i32)?, None);
-    push_seq!(Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::ECX)?, None); // seed_for
-    push_seq!(Instruction::with2(Code::Add_rm32_r32, Register::EAX, Register::R12D)?, None); // + current
-    push_seq!(Instruction::with2(Code::Xor_rm32_imm32, Register::EAX, mba_constant)?, None); // ^ C
-    push_seq!(Instruction::with2(Code::Mov_rm32_r32, mem(Register::RSP, 0x100), Register::EAX)?, None);
+    push_seq!(
+        Instruction::with2(Code::Cmp_rm32_imm32, Register::R12D, 0xFFFF_FFFFu32)?,
+        Some(L::EnterReady)
+    );
+    push_seq!(
+        Instruction::with_branch(Code::Je_rel32_64, 0)?,
+        Some(L::ExitDone)
+    ); // sentinel
+       // key4_current = (seed_for(C, current) + current) ^ C
+    push_seq!(
+        Instruction::with2(Code::Mov_r32_imm32, Register::EAX, mba_constant)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R12D)?,
+        None
+    );
+    push_seq!(
+        Instruction::with3(
+            Code::Imul_r32_rm32_imm32,
+            Register::ECX,
+            Register::ECX,
+            0x9E37_79B9u32 as i32
+        )?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Add_rm32_r32, Register::EAX, Register::ECX)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Rol_rm32_imm8, Register::EAX, 13)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_r32_imm32, Register::EDX, mba_constant)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Ror_rm32_imm8, Register::EDX, 7)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::EDX)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R12D)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Rol_rm32_imm8, Register::ECX, 5)?,
+        None
+    );
+    push_seq!(
+        Instruction::with3(
+            Code::Imul_r32_rm32_imm32,
+            Register::ECX,
+            Register::ECX,
+            0x85EB_CA6Bu32 as i32
+        )?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::ECX)?,
+        None
+    ); // seed_for
+    push_seq!(
+        Instruction::with2(Code::Add_rm32_r32, Register::EAX, Register::R12D)?,
+        None
+    ); // + current
+    push_seq!(
+        Instruction::with2(Code::Xor_rm32_imm32, Register::EAX, mba_constant)?,
+        None
+    ); // ^ C
+    push_seq!(
+        Instruction::with2(Code::Mov_rm32_r32, mem(Register::RSP, 0x100), Register::EAX)?,
+        None
+    );
     // plaintext(current) ?癲ル슢캉????
-    push_seq!(Instruction::with2(Code::Mov_r32_rm32, Register::EAX, mem_idx(Register::RSI, Register::R12, 4))?, None);
-    push_seq!(Instruction::with2(Code::Xor_r32_rm32, Register::EAX, mem(Register::RSP, 0x100))?, None);
-    push_seq!(Instruction::with2(Code::Test_rm32_r32, Register::EAX, Register::EAX)?, None);
-    push_seq!(Instruction::with_branch(Code::Je_rel32_64, 0)?, Some(L::ExitDone)); // call-target
-    let mut dec_inst = Instruction::with1(Code::Dec_rm32, mem_idx(Register::RDI, Register::R12, 4))?;
+    push_seq!(
+        Instruction::with2(
+            Code::Mov_r32_rm32,
+            Register::EAX,
+            mem_idx(Register::RSI, Register::R12, 4)
+        )?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Xor_r32_rm32, Register::EAX, mem(Register::RSP, 0x100))?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Test_rm32_r32, Register::EAX, Register::EAX)?,
+        None
+    );
+    push_seq!(
+        Instruction::with_branch(Code::Je_rel32_64, 0)?,
+        Some(L::ExitDone)
+    ); // call-target
+    let mut dec_inst =
+        Instruction::with1(Code::Dec_rm32, mem_idx(Register::RDI, Register::R12, 4))?;
     dec_inst.set_has_lock_prefix(true);
     push_seq!(dec_inst, None);
-    push_seq!(Instruction::with_branch(Code::Jne_rel32_64, 0)?, Some(L::ExitDone)); // refcount>0
-    push_seq!(Instruction::with2(Code::Xor_r32_rm32, Register::EAX, Register::EAX)?, None);
-    push_seq!(Instruction::with2(Code::Mov_r32_imm32, Register::R8D, CLAIM)?, None);
-    let mut cas3 = Instruction::with2(Code::Cmpxchg_rm32_r32, mem_idx(Register::RDI, Register::R12, 4), Register::R8D)?;
+    push_seq!(
+        Instruction::with_branch(Code::Jne_rel32_64, 0)?,
+        Some(L::ExitDone)
+    ); // refcount>0
+    push_seq!(
+        Instruction::with2(Code::Xor_r32_rm32, Register::EAX, Register::EAX)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_r32_imm32, Register::R8D, CLAIM)?,
+        None
+    );
+    let mut cas3 = Instruction::with2(
+        Code::Cmpxchg_rm32_r32,
+        mem_idx(Register::RDI, Register::R12, 4),
+        Register::R8D,
+    )?;
     cas3.set_has_lock_prefix(true);
     push_seq!(cas3, None);
-    push_seq!(Instruction::with_branch(Code::Jne_rel32_64, 0)?, Some(L::ExitDone)); // someone re-entered
-    // claim won ??C1 ????癲ル슢?뤸뤃??(r13=current)
-    push_seq!(Instruction::with2(Code::Mov_r32_rm32, Register::R13D, Register::R12D)?, Some(L::Reencrypt));
-    push_seq!(Instruction::with2(Code::Mov_r32_rm32, Register::EAX, mem_idx(Register::RSI, Register::R13, 4))?, None);
-    push_seq!(Instruction::with2(Code::Xor_r32_rm32, Register::EAX, mem(Register::RSP, 0x100))?, None);
-    push_seq!(Instruction::with2(Code::Mov_r32_rm32, Register::EDX, Register::EAX)?, None); // len
+    push_seq!(
+        Instruction::with_branch(Code::Jne_rel32_64, 0)?,
+        Some(L::ExitDone)
+    ); // someone re-entered
+       // claim won ??C1 ????癲ル슢?뤸뤃??(r13=current)
+    push_seq!(
+        Instruction::with2(Code::Mov_r32_rm32, Register::R13D, Register::R12D)?,
+        Some(L::Reencrypt)
+    );
+    push_seq!(
+        Instruction::with2(
+            Code::Mov_r32_rm32,
+            Register::EAX,
+            mem_idx(Register::RSI, Register::R13, 4)
+        )?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Xor_r32_rm32, Register::EAX, mem(Register::RSP, 0x100))?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_r32_rm32, Register::EDX, Register::EAX)?,
+        None
+    ); // len
     emit_c1_crypt!();
-    push_seq!(Instruction::with2(Code::Lea_r64_m, Register::RDI, rip_va(state_table_va))?, None);
-    push_seq!(Instruction::with2(Code::Mov_rm32_imm32, mem_idx(Register::RDI, Register::R12, 4), ENC)?, None);
-    push_seq!(Instruction::with_branch(Code::Jmp_rel32_64, 0)?, Some(L::ExitDone));
+    push_seq!(
+        Instruction::with2(Code::Lea_r64_m, Register::RDI, rip_va(state_table_va))?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(
+            Code::Mov_rm32_imm32,
+            mem_idx(Register::RDI, Register::R12, 4),
+            ENC
+        )?,
+        None
+    );
+    push_seq!(
+        Instruction::with_branch(Code::Jmp_rel32_64, 0)?,
+        Some(L::ExitDone)
+    );
 
     // ???? 7. ????ㅼ뒩??????깅굳????ㅿ폍筌?????ㅼ굣??+ ??沃섃뫂????????????됰Ŋ?좂뜏??濚????????????????????????????????????????????????????????????
-    push_seq!(Instruction::with2(Code::Add_rm64_imm32, Register::RSP, WORKSPACE)?, Some(L::ExitDone));
-    push_seq!(Instruction::with2(Code::Lea_r64_m, Register::RAX, rip_va(target_table_va))?, None);
-    push_seq!(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, mem_idx(Register::RAX, Register::R10, 4))?, None);
-    push_seq!(Instruction::with2(Code::Lea_r32_m, Register::EAX, mem_idx(Register::R10, Register::R11, 1))?, None);
-    push_seq!(Instruction::with2(Code::Xor_rm32_imm32, Register::EAX, mba_constant)?, None);
-    push_seq!(Instruction::with2(Code::Xor_rm32_r32, Register::ECX, Register::EAX)?, None);
-    push_seq!(Instruction::with2(Code::Lea_r64_m, Register::RAX, rip_va(section_base_va))?, None);
-    push_seq!(Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::RCX)?, None);
-    push_seq!(Instruction::with2(Code::Mov_rm64_r64, mem(Register::RSP, 0x88), Register::RAX)?, None);
+    push_seq!(
+        Instruction::with2(Code::Add_rm64_imm32, Register::RSP, WORKSPACE)?,
+        Some(L::ExitDone)
+    );
+    push_seq!(
+        Instruction::with2(Code::Lea_r64_m, Register::RAX, rip_va(target_table_va))?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(
+            Code::Mov_r32_rm32,
+            Register::ECX,
+            mem_idx(Register::RAX, Register::R10, 4)
+        )?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(
+            Code::Lea_r32_m,
+            Register::EAX,
+            mem_idx(Register::R10, Register::R11, 1)
+        )?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Xor_rm32_imm32, Register::EAX, mba_constant)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Xor_rm32_r32, Register::ECX, Register::EAX)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Lea_r64_m, Register::RAX, rip_va(section_base_va))?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::RCX)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_rm64_r64, mem(Register::RSP, 0x88), Register::RAX)?,
+        None
+    );
 
     // ???? 8. ??⑤슢?뽫뵓??+ ??沃섃뫂???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
     for r in [
-        Register::R15, Register::R14, Register::R13, Register::R12, Register::R11, Register::R10,
-        Register::R9, Register::R8, Register::RDI, Register::RSI, Register::RBX, Register::RDX,
-        Register::RCX, Register::RAX,
+        Register::R15,
+        Register::R14,
+        Register::R13,
+        Register::R12,
+        Register::R11,
+        Register::R10,
+        Register::R9,
+        Register::R8,
+        Register::RDI,
+        Register::RSI,
+        Register::RBX,
+        Register::RDX,
+        Register::RCX,
+        Register::RAX,
     ] {
         push_seq!(Instruction::with1(Code::Pop_r64, r)?, None);
     }
     push_seq!(Instruction::with(Code::Popfq), None);
-    push_seq!(Instruction::with2(Code::Lea_r64_m, Register::RSP, mem(Register::RSP, 0x10))?, None);
+    push_seq!(
+        Instruction::with2(Code::Lea_r64_m, Register::RSP, mem(Register::RSP, 0x10))?,
+        None
+    );
     push_seq!(Instruction::with(Code::Retnq), None);
 
     // ???? C1Init: key4@[rsp+0x108] ??c1_state_va ????븐뻤???潁??용끏???????????????????????????????????????????????
-    push_seq!(Instruction::with2(Code::Mov_r64_imm64, Register::RDI, c1_state_va)?, Some(L::C1Init));
-    push_seq!(Instruction::with2(Code::Mov_r32_rm32, Register::EAX, mem(Register::RSP, 0x108))?, None); // key4
+    push_seq!(
+        Instruction::with2(Code::Mov_r64_imm64, Register::RDI, c1_state_va)?,
+        Some(L::C1Init)
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_r32_rm32, Register::EAX, mem(Register::RSP, 0x108))?,
+        None
+    ); // key4
     for i in 0..8u32 {
-        push_seq!(Instruction::with2(Code::Mov_rm32_r32, mem(Register::RDI, i * 4), Register::EAX)?, None);
+        push_seq!(
+            Instruction::with2(Code::Mov_rm32_r32, mem(Register::RDI, i * 4), Register::EAX)?,
+            None
+        );
     }
-    push_seq!(Instruction::with2(Code::Xor_r32_rm32, Register::EAX, Register::EAX)?, None);
-    push_seq!(Instruction::with2(Code::Mov_rm64_r64, mem(Register::RDI, 0x20), Register::RAX)?, None);
-    push_seq!(Instruction::with2(Code::Mov_rm32_r32, mem(Register::RDI, 0x28), Register::EAX)?, None);
-    push_seq!(Instruction::with2(Code::Mov_rm32_imm32, mem(Register::RDI, 0x70), 0x40u32)?, None);
+    push_seq!(
+        Instruction::with2(Code::Xor_r32_rm32, Register::EAX, Register::EAX)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_rm64_r64, mem(Register::RDI, 0x20), Register::RAX)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_rm32_r32, mem(Register::RDI, 0x28), Register::EAX)?,
+        None
+    );
+    push_seq!(
+        Instruction::with2(Code::Mov_rm32_imm32, mem(Register::RDI, 0x70), 0x40u32)?,
+        None
+    );
     push_seq!(Instruction::with(Code::Retnq), None);
 
     // ???? ?癲ル슢???몄춹??(measure ??c1_blob_va ?癲ル슢캉?????label resolve ??batch encode) ??????????
@@ -294,7 +675,10 @@ pub fn build_dispatcher_m7_c1(
     }
     c1_blob_va = ip; // main ??ш끽維?????= blob ??嶺뚮??ｆ뤃?
     for &idx in &c1_blob_call_idxs {
-        seq[idx] = (Instruction::with_branch(Code::Call_rel32_64, c1_blob_va)?, None);
+        seq[idx] = (
+            Instruction::with_branch(Code::Call_rel32_64, c1_blob_va)?,
+            None,
+        );
     }
     for (inst, lbl) in seq.iter_mut() {
         if let Some(l) = lbl {
@@ -308,7 +692,8 @@ pub fn build_dispatcher_m7_c1(
     }
     let insts: Vec<Instruction> = seq.into_iter().map(|(i, _)| i).collect();
     let block = InstructionBlock::new(&insts, disp_base_va);
-    let enc = BlockEncoder::encode(64, block, enc_opts).map_err(|e| anyhow::anyhow!("m7-c1 dispatcher BlockEncoder failed: {e}"))?;
+    let enc = BlockEncoder::encode(64, block, enc_opts)
+        .map_err(|e| anyhow::anyhow!("m7-c1 dispatcher BlockEncoder failed: {e}"))?;
     let mut code = enc.code_buffer;
     let expected = (ip - disp_base_va) as usize;
     if code.len() != expected {

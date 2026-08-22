@@ -1,0 +1,1802 @@
+1m 15s 동안 처리함
+
+분석해봤어. 이번 ZIP은 단순한 “VM 흉내” 수준은 이미 지났고, RISC de-synthesis → polymorphic bytecode → rolling-key self-decoding → native handler execution → PE/crypto boot layer까지 갖춘 꽤 큰 보호 프레임워크야. Rust 소스만 약 76,118줄이고 VM 계층만 해도 legacy VM / RISC VM / poly VM / threaded VM / poly-direct commercial VM이 병존한다.
+
+다만 중요한 결론은 이거야.
+
+현재 --vm-commercial의 실제 production 실행경로만 놓고 보면, 기능 수는 상당하지만 아직 “Themida급 상용 VM 아키텍처”라고 부르기는 어렵다.
+
+가장 큰 이유는 암호화 강도가 아니라 VM의 메타구조와 실행 skeleton이 한 샘플을 분석하면 너무 많이 드러나는 구조이기 때문이다.
+
+공개적으로 확인 가능한 Themida/Code Virtualizer의 현재 버전은 2026년 8월 11일 기준 3.2.6.0이고, Oreans는 같은 VM 종류를 두 번 사용해도 register 위치, handlers, opcode table 등이 달라지며, 더 나아가 TIGER/LION 같은 VM들은 서로 다른 VM architecture라고 설명한다. 최신 버전에서도 VM register randomization과 VM instruction reordering을 계속 강화하고 있다.
+
+───
+
+1. 현재 BTG 전체 구조를 먼저 보면
+
+실제 코드는 대략 이렇게 나뉜다.
+
+PE input
+│
+├─ PE parser / relocation / pdata / resources
+│
+├─ CFG extraction
+│ ├─ block slicing
+│ ├─ shuffle
+│ ├─ jump-table resolution
+│ └─ function ownership
+│
+├─ x86-64 lifter
+│ │
+│ └─ RISC micro-op IR
+│
+├─ semantic transform
+│
+├─ polymorphic ISA generator
+│ ├─ opcode permutation
+│ ├─ operand register permutation
+│ ├─ branch-condition permutation
+│ └─ operand masking
+│
+├─ rolling-key encoder
+│
+├─ commercial poly-direct engine
+│ │
+│ ├─ byte decrypt
+│ ├─ operand decoder
+│ ├─ dispatcher
+│ ├─ handler table
+│ ├─ branch-map
+│ ├─ native handlers
+│ └─ VM ↔ native bridge
+│
+├─ crypto layer
+│ ├─ RC4
+│ ├─ C1
+│ ├─ ChaCha20
+│ ├─ Poly1305
+│ ├─ integrity
+│ └─ per-block encryption
+│
+└─ PE reconstruction / boot stub
+
+이 정도면 예전에 봤던 네 미니 VM하고는 급이 다르다.
+
+───
+
+2. 현재 가장 좋은 부분 — RISC intermediate layer
+
+src/vm/risc/
+
+여기가 프로젝트에서 가장 중요한 발전점 중 하나다.
+
+예전 식이면:
+
+x86 ADD → VM_ADD
+x86 XOR → VM_XOR
+x86 MOV → VM_MOV
+
+이라 원본 ISA와 VM ISA가 거의 1:1이었다.
+
+현재는:
+
+x86 instruction
+↓
+RiscLifter
+↓
+RISC micro operations
+↓
+polymorphic ISA
+
+구조다.
+
+RiscOp에는 단순 ALU 외에도 상당히 많은 semantic이 있다.
+
+예를 들어:
+
+Nor
+AddWithCarry
+Add
+SubWithBorrow
+
+ShiftLeft
+ShiftRight
+ArithmeticShiftRight
+
+MemoryRead
+MemoryWrite
+
+VirtualPush
+VirtualPop
+
+Multiply
+MultiplyLow
+Divide
+
+CompareExchange
+AtomicExchange
+AtomicAdd
+
+BSwap
+BitScanForward
+BitScanReverse
+TZCNT
+LZCNT
+POPCNT
+
+VirtualBranch
+VirtualRet
+
+Setcc
+ConditionalMove
+
+FP conversion
+FP arithmetic
+
+등.
+
+따라서 지금은
+
+add rax,rbx
+
+가 반드시
+
+VM_ADD
+
+로 번역될 필요가 없다.
+
+예를 들어 RISC de-synthesis를 통해
+
+NOR
+NOR
+ADD-with-carry
+
+같은 조합으로 내려갈 수 있다.
+
+이건 실제 VM protector 방향과 맞다.
+
+───
+
+3. 그런데 첫 번째 핵심 약점: 결국 ISA skeleton은 하나다
+
+여기가 Themida와 가장 크게 갈리는 부분이다.
+
+현재 VirtualIsaSpec::from_seed(seed)가 하는 핵심은 대체로:
+
+semantic operation set
+↓
+opcode IDs shuffle
+
+virtual registers
+↓
+encoding permutation
+
+branch conditions
+↓
+encoding permutation
+
+이다.
+
+즉 build A:
+
+0x23 → NOR
+0x94 → ADD
+0x61 → MOV
+
+build B:
+
+0xA1 → NOR
+0x11 → ADD
+0xD7 → MOV
+
+식으로 달라진다.
+
+좋다.
+
+하지만 역분석자 입장에서는 결국 둘 다:
+
+same RiscOp universe
+same operand model
+same state model
+same handler semantics
+same decode architecture
+
+이다.
+
+즉 현재 polymorphism은 주로
+
+encoding polymorphism
+
+이다.
+
+Themida/Code Virtualizer가 공개적으로 강조하는 건 훨씬 강한 개념이다.
+
+Oreans 설명상 동일 TIGER VM 내에서도 매 build마다 registers, instruction handlers, opcode table 등이 변하고, TIGER와 LION 같은 서로 다른 VM은 아예 architecture 자체가 별개라고 한다.
+
+현재 BTG는 사실상:
+
+BTG-RISC architecture
+├─ seed A encoding
+├─ seed B encoding
+├─ seed C encoding
+└─ seed D encoding
+
+이다.
+
+Themida 쪽 공개 모델은 개념적으로:
+
+Architecture A
+├─ CPU A1
+└─ CPU A2
+
+Architecture B
+├─ CPU B1
+└─ CPU B2
+
+Architecture C
+└─ CPU C1
+
+에 더 가깝다.
+
+이 차이가 엄청 크다.
+
+───
+
+4. 가장 치명적인 부분: production dispatcher가 아직 중앙집중형이다
+
+src/vm/threaded/poly_direct/builder.rs:685~
+
+실제 상용경로 dispatcher:
+
+sub_decrypt()
+↓
+AL = opcode
+↓
+R9 = opcode
+↓
+RAX = table[opcode]
+↓
+derive table master key
+↓
+derive K(opcode)
+↓
+RAX ^= K(opcode)
+↓
+jmp RAX
+
+실제 코드도 본질적으로:
+
+call sub_decrypt
+movzx eax, al
+
+mov r9, rax
+
+mov rax, [r15 + rax*8]
+
+... derive master ...
+
+... derive K(op) ...
+
+xor rax, rcx
+jmp rax
+
+이다.
+
+이건 보호는 되어 있지만 VM analyst에게 매우 강력한 anchor다.
+
+분석자가 한 번만 찾으면:
+
+R8 = bytecode base
+R12 = VIP
+R14 = rolling key
+R15 = handler-table base
+RDX = VM context
+
+를 잡을 가능성이 높다.
+
+그러면 이후 분석이 갑자기 쉬워진다.
+
+───
+
+5. 재미있는 점: 이 문제를 고치려고 만든 코드가 이미 있다
+
+src/vm/threaded/micro_dispatcher.rs
+
+주석부터:
+
+Eradicates the monolithic central dispatch loop
+
+이라고 적혀 있다.
+
+여기에는 이미:
+
+DirectThreadedTail
+FragmentedSubtable
+MbaComputedBranch
+StackPushRetTail
+
+네 가지 dispatch strategy가 구현되어 있다.
+
+문제는 production poly_direct 엔진에 제대로 합쳐져 있지 않다는 것이다.
+
+즉 설계상:
+
+handler A
+↓
+micro-dispatch A
+
+handler B
+↓
+micro-dispatch B
+
+handler C
+↓
+micro-dispatch C
+
+가 되어야 하는데 실제 commercial 경로는 대부분:
+
+handler A ─┐
+handler B ─┼─→ central dispatch
+handler C ─┘
+
+로 다시 모인다.
+
+따라서 다음 major revision에서 가장 먼저 손댈 후보가 이 부분이다.
+
+───
+
+6. 더 중요한 발견: StateMachineDecoder가 실질적으로 production에 안 들어간다
+
+src/vm/poly/state_machine.rs
+
+이 클래스는 꽤 좋은 아이디어다.
+
+real opcode =
+F(raw opcode, execution state)
+
+형태다.
+
+즉 동일:
+
+raw 0x52
+
+라도
+
+state A → ADD
+state B → XOR
+state C → MOV
+
+가 가능하다.
+
+이건 정적인
+
+opcode → handler
+
+관계를 없애는 데 상당히 효과적이다.
+
+하지만 usage를 전체 소스에서 추적해 보니:
+
+StateMachineDecoder
+├─ state_machine.rs
+├─ tests
+└─ re-export
+
+정도다.
+
+poly_direct native commercial runtime에서는 사용되지 않는다.
+
+즉 코드에는 있지만 현재 실제 VM 보호강도에는 거의 기여하지 않는다.
+
+이걸 production path에 넣는 게 굉장히 중요하다.
+
+───
+
+7. ContextOffsetScrambler도 같은 문제
+
+src/vm/threaded/reg_permutation.rs
+
+좋은 구현이 있다.
+
+VM context를:
+
+V0 = +0x00
+V1 = +0x08
+...
+TEMP = +0x80
+FLAGS = +0xC0
+
+처럼 고정하지 않고 seed마다 슬롯을 shuffle한다.
+
+그런데 실제 poly_direct commercial runtime에서는:
+
+codegen_util.rs
+
+REGS_OFF = 0x000
+TEMPS_OFF = 0x080
+FLAGS_OFF = 0x0C0
+VSP_OFF = 0x0C8
+
+DEC_DST = 0x0D0
+DEC_SRC1 = 0x0D1
+DEC_SRC2 = 0x0D2
+
+DEC_IMM1 = 0x0D8
+DEC_IMM2 = 0x0E0
+
+가 여전히 고정이다.
+
+즉 analyst가 memory trace를 조금만 보면:
+
+[state + 00]
+[state + 08]
+[state + 10]
+...
+
+패턴을 통해 context를 복구할 수 있다.
+
+ContextOffsetScrambler 자체는 있지만 실제 production runtime은 이 이점을 못 받고 있다.
+
+───
+
+8. 이것은 꽤 큰 약점이다
+
+현재 VM에서 build마다 바뀌는 것은:
+
+요소 현재
+
+Opcode ID 좋음
+virtual register encoding 좋음
+branch cond encoding 좋음
+table layout 일부 좋음
+handler pointer key 좋음
+bytecode encryption 좋음
+VM context layout 거의 고정
+VIP role 고정
+rolling-key role 고정
+table-base role 고정
+dispatcher architecture 고정
+handler semantic architecture 대체로 고정
+
+그래서 반복 분석에 취약해진다.
+
+───
+
+9. 현재 commercial ABI가 너무 명확하다
+
+commercial_build.rs 주석 자체가 현재 runtime ABI를 그대로 설명한다.
+
+R8 = bytecode base
+R12 = VIP
+R13 = virtual stack
+R14 = rolling key
+R15 = handler table
+RDX = state
+
+이게 생성된 최종 바이너리에서도 안정적으로 유지된다면 역분석자 입장에서는 큰 선물이다.
+
+한 샘플 분석 후 다음 샘플에서도:
+
+find R15 table access
+find [R8+R12]
+find R14 update
+
+를 찾으면 된다.
+
+Themida 최신 release notes에서조차 VM register randomization을 계속 강화하고 있다고 명시하는 이유가 이 부분이다.
+
+───
+
+10. RegisterAssignment는 있는데 production ABI에는 충분히 반영되지 않는다
+
+RegisterAssignment::from_seed_and_block()
+
+이건 원래 아주 좋은 방향이다.
+
+개념적으로:
+
+block 1:
+VIP = R9
+KEY = R14
+TABLE = RBX
+
+block 2:
+VIP = R11
+KEY = R8
+TABLE = R13
+
+block 3:
+VIP = RSI
+KEY = RCX
+TABLE = R10
+
+처럼 만들어야 한다.
+
+게다가:
+
+emit_transition()
+
+까지 구현되어 있다.
+
+즉 블록 사이 register permutation 전환기도 이미 존재한다.
+
+그런데 실제 production commercial dispatcher의 핵심은 여전히:
+
+R8/R12/R13/R14/R15/RDX
+
+라는 안정적인 ABI를 사용한다.
+
+이 코드를 제대로 연결하면 공격 난도가 꽤 크게 오른다.
+
+───
+
+11. Handler table concealment는 꽤 잘 되어 있다
+
+이건 예전 버전보다 상당히 좋아졌다.
+
+예전 보호기에서 흔한 약점:
+
+handler_table[i] ^= master_key
+
+라면 하나의 handler pointer만 알아도:
+
+master_key
+
+를 구해서 테이블 전체를 풀 수 있다.
+
+현재는:
+
+K(op) =
+op*C1
+^ op<<17
+^ C4
+^ master
+
+를 사용한다.
+
+그래서:
+
+table[0] ^ K(0)
+table[1] ^ K(1)
+table[2] ^ K(2)
+...
+
+이다.
+
+게다가 unused slot:
+
+→ UD2 trap handler
+
+이다.
+
+그리고 encrypted table 자체 checksum 검사도 있다.
+
+이 부분은 괜찮다.
+
+───
+
+12. 다만 이것도 근본적인 방어는 아니다
+
+공격자는 table을 정적으로 풀 필요가 없다.
+
+dispatcher에서:
+
+xor rax, rcx
+jmp rax
+
+직전에 breakpoint/DBI를 잡으면:
+
+opcode
+resolved handler
+
+를 그대로 수집할 수 있다.
+
+즉:
+
+table encryption
+
+은 static analysis 비용을 늘려주지만
+
+runtime semantic extraction
+
+을 막지는 못한다.
+
+상용 VM에서 더 중요한 건:
+
+handler address를 숨기는 것보다 “handler 하나의 의미를 독립적으로 정의하기 어렵게 만드는 것”
+
+이다.
+
+───
+
+13. 현재 handler 의미는 아직 너무 순수하다
+
+poly_direct/builder.rs의 각 handler를 보면 상당수가 이런 구조다.
+
+decode operands
+↓
+resolve src1
+↓
+resolve src2
+↓
+native operation
+↓
+update flags
+↓
+store dst
+↓
+dispatch
+
+예를 들어 NOR:
+
+not r10
+not r11
+and r10,r11
+test r10,r10
+...
+
+ADD도 비슷하다.
+
+즉 analyst가 handler trace 몇 번 보면:
+
+H_17 = ADD
+H_31 = SHIFT
+H_55 = LOAD
+
+semantic label을 붙일 수 있다.
+
+opcode가 매 build 바뀌어도:
+
+handler semantic classifier
+
+를 만들 수 있다.
+
+───
+
+14. 그래서 진짜 필요한 건 Handler synthesis다
+
+현재:
+
+ADD handler template
+NOR handler template
+LOAD handler template
+
+를 seed마다 약간 바꾸는 것보다
+
+아예 동일 ADD가 build마다:
+
+build A:
+ADD
+
+build B:
+NEG + SUB
+
+build C:
+MBA expansion
+
+build D:
+flag helper + split arithmetic
+
+build E:
+temporary virtual registers + fused semantic
+
+형태가 되어야 한다.
+
+즉
+
+opcode polymorphism
+
+보다 한 단계 높은:
+
+semantic implementation polymorphism
+
+이 필요하다.
+
+───
+
+15. inline_mba와 semantic obfuscation이 그래서 중요하다
+
+좋은 소식은 기반이 이미 있다.
+
+vm/semantic_obf.rs
+vm/threaded/inline_mba.rs
+vm/handlers/fused.rs
+vm/threaded/super_ops.rs
+
+가 있다.
+
+그러나 production commercial backend의 전체 handler generation을 이 시스템이 지배하는 구조는 아니다.
+
+지금은 느낌상:
+
+commercial engine
+• 일부 semantic hardening
+
+이다.
+
+목표는 반대로:
+
+semantic synthesis engine
+↓
+produces commercial VM
+
+가 되어야 한다.
+
+───
+
+16. Super-operator도 production에서 더 적극적으로 써야 한다
+
+SuperOperatorSynthesizer가 이미 있다.
+
+예:
+
+POP
+ADD
+PUSH
+
+를 하나의:
+
+SUPER_POP_ADD_PUSH
+
+로 만든다.
+
+이건 매우 좋은 방향이다.
+
+왜냐하면 analyst가 기대하는:
+
+virtual instruction == 작은 semantic unit
+
+이라는 가정을 깨기 때문이다.
+
+더 강하게 가면:
+
+A+B+C
+
+뿐 아니라
+
+A+B
+B+C
+A+B+C
+B+C+D
+
+처럼 프로그램 문맥 기반으로 자동 생성되는 temporary super-op가 필요하다.
+
+그러면 특정 binary 전용 opcode가 생긴다.
+
+───
+
+17. 현재 가장 큰 architecture gap을 한 문장으로 표현하면
+
+현재:
+
+randomized instruction encoding
+on top of
+stable VM architecture
+
+다.
+
+상용급으로 갈수록 목표는:
+
+randomized VM architecture
++
+randomized instruction encoding
++
+randomized execution topology
+
+가 되어야 한다.
+
+───
+
+18. Bytecode rolling key는 상당히 발전했다
+
+rolling_key.rs
+
+예전 단순:
+
+byte ^= key & 0xff
+key = LCG(key)
+
+형태가 아니다.
+
+현재는:
+
+64-bit key
+↓
+position dependent rotations
+↓
+64-bit multiplication
+↓
+folding
+↓
+keystream byte
+
+그리고 state evolution도:
+
+previous key
+• plaintext byte
+• VIP
+• multiply
+• rotate
+
+에 의존한다.
+
+좋다.
+
+특히 plaintext feedback 때문에 bytecode 중간에서 decode를 시작하려면 현재 key state를 알아야 한다.
+
+───
+
+19. 하지만 rolling key에 과대평가하면 안 된다
+
+역분석자가 native sub_decrypt를 lift하면:
+
+DecryptByte(cipher, key, vip)
+StepKey(plain,key,vip)
+
+를 그대로 복제할 수 있다.
+
+그러면 전체 bytecode decoder를 만든다.
+
+즉 cryptographic complexity를 계속 올리는 것보다:
+
+key evolution
++
+VM execution state
++
+branch history
++
+semantic results
+
+를 결합하는 편이 더 의미 있다.
+
+여기서 아까 발견한 미사용 StateMachineDecoder가 중요해진다.
+
+───
+
+20. 이상적인 방향
+
+현재:
+
+K[n+1] = F(K[n], plaintext, VIP)
+
+이다.
+
+더 강한 설계의 개념은:
+
+VM_state[n+1] =
+F(
+VM_state[n],
+executed semantic class,
+selected runtime state,
+control-flow edge
+)
+
+처럼 decode state와 execution state가 서로 얽히는 구조다.
+
+다만 이건 안정성과 random-access branch를 크게 어렵게 하므로 가장 나중에 넣어야 한다.
+
+───
+
+21. 현재 branch map도 분석자에게 메타정보를 준다
+
+현재 commercial builder는 bytecode를 다시 decode/re-encode해서:
+
+source target → bytecode offset
+
+branch resolution map을 생성한다.
+
+개념:
+
+count
+[target, bytecode offset]
+[target, bytecode offset]
+[target, bytecode offset]
+...
+
+이다.
+
+layout 자체는 jitter되지만 구조는 안정적이다.
+
+역분석자가 이 영역을 찾으면:
+
+virtual CFG
+
+복원에 큰 도움을 받는다.
+
+따라서 branch_map은 현재 꽤 큰 metadata oracle이다.
+
+───
+
+22. 이건 table layout jitter만으로 부족하다
+
+현재 TableLayout::from_seed()는:
+
+handler table
+padding
+operand offsets
+padding
+operand flags
+padding
+conditions
+padding
+branch map
+
+순서는 그대로이고 offset만 흔든다.
+
+즉:
+
+A → B → C → D → E
+
+구조가 고정이다.
+
+진짜 metadata polymorphism이면:
+
+build A:
+handlers → cond → junk → branch → operands
+
+build B:
+branch → junk → handlers → flags → cond
+
+build C:
+split-handlers-A → operands → split-handlers-B ...
+
+처럼 table type 순서와 representation 자체가 바뀌는 방향이 더 강하다.
+
+───
+
+23. handler table 자체도 256 × 8이라는 footprint가 남는다
+
+현재 handler table:
+
+256 qword
+
+이다.
+
+주소가 암호화돼 있어도:
+
+2048-byte dense array
+
+라는 형식은 식별 가능하다.
+
+TableLayout에서도:
+
+handler_table_off = 0;
+cursor = 2048;
+
+이다.
+
+이건 signature가 될 수 있다.
+
+───
+
+24. 상용급에서는 table-less VM variant도 가치가 있다
+
+항상:
+
+handler = table[opcode]
+
+를 사용하지 말고 architecture family에 따라:
+
+direct threaded
+
+computed handler
+
+fragmented lookup
+
+multi-level table
+
+handler ID → resolver → target
+
+inline next-handler continuation
+
+같은 실행구조를 섞는 방향이 좋다.
+
+이미 MicroDispatcher에 그 기반 아이디어가 있다.
+
+───
+
+25. Native bridge는 상당히 많이 발전했다
+
+여기 생각보다 코드가 많다.
+
+특히 poly_direct의 native bridge 부분에서:
+
+VM registers → native registers
+stack arguments
+callee saved registers
+XMM argument handling
+integer return
+FP return
+VM state restoration
+
+을 처리하려는 코드가 있다.
+
+예전에 반복적으로 문제가 있었던 VM ↔ native ABI 경계를 상당히 의식해서 구현했다는 게 보인다.
+
+이건 실제 protector에서는 매우 중요하다.
+
+───
+
+26. 하지만 여전히 full virtualization coverage가 아니다
+
+text_lift/commercial.rs가 명시적으로:
+
+RISC-unliftable
+or
+poly-unencodable
+→ entire function stays native
+
+정책을 쓴다.
+
+안정성 관점에서는 아주 올바른 결정이다.
+
+하지만 보호강도 관점에서는 공격자가:
+
+VM ↔ native boundary
+
+를 이용해 구조를 이해할 수 있다.
+
+특히 native 함수가 자주 섞이면:
+
+virtualized region
+→ bridge
+→ recognizable compiler output
+→ bridge
+→ VM
+
+패턴이 생긴다.
+
+───
+
+27. FP와 특수 instruction이 바로 이 문제를 만든 흔적도 보인다
+
+소스에:
+
+Float scalar operations
+REP/string
+SEH
+panic/unwind
+setjmp
+TLS
+indirect branches
+
+등을 별도로 처리한 흔적이 굉장히 많다.
+
+이건 나쁜 게 아니라 오히려 실제 protector 개발에서 필연적인 단계다.
+
+Themida도 최신 changelog에서 최근까지:
+
+REP string opcode virtualization 개선
+x64 exception handling 개선
+relocation processing 개선
+entry point virtualization 개선
+
+등을 계속 수정하고 있다. 즉 이런 호환성 문제는 상용 제품도 끝없이 다루는 영역이다.
+
+───
+
+28. SEH / unwind는 아직 중요한 Tier-0 영역이다
+
+현재:
+
+text_lift/exclusions/seh.rs
+panic_unwind.rs
+setjmp.rs
+tls_guard.rs
+
+처럼 제외 시스템이 있다.
+
+이는 안정성은 높여주지만 VM coverage를 낮춘다.
+
+특히 x64 Windows는:
+
+.pdata
+UNWIND_INFO
+SEH
+stack unwind
+C++ EH
+Rust panic
+
+가 VM과 충돌하기 쉽다.
+
+Themida급으로 가려면 단순히 “SEH 함수 제외”를 줄이는 것보다 VM 자체가 unwind semantics를 제대로 소유하는 구조가 필요하다.
+
+이게 진짜 어려운 Tier 0다.
+
+───
+
+29. 현재 anti-debug는 상용 제품 대비 얕다
+
+dispatcher/antidebug.rs
+
+실제 검사:
+
+PEB.BeingDebugged
+PEB.NtGlobalFlag
+ProcessHeap.Flags
+
+세 개다.
+
+72-byte 고정 shellcode이기도 하다.
+
+정확히 말하면 이건 기본적인 anti-debug bootstrap이지 Themida류의 anti-analysis subsystem과 비교할 수준은 아니다.
+
+Oreans 공식 비교표 자체가 Themida에 anti-debug, monitor detection, multiple startup protection checks 등이 별도 기능으로 들어간다고 명시한다.
+
+여기는 단순히 검사를 더 많이 추가하는 문제라기보다, 보호 시스템 본체와 anti-analysis 계층을 분리해서 설계하는 게 중요하다.
+
+───
+
+30. 72바이트 고정 shellcode는 signature 문제도 있다
+
+주석에:
+
+ANTI_DEBUG_SIZE = 72
+
+이고 instruction sequence도 고정이다.
+
+따라서 build마다 달라도:
+
+GS:[60]
+BeingDebugged
+NtGlobalFlag
+ProcessHeap
+
+sequence가 거의 그대로 나온다.
+
+상용 protector를 목표로 한다면 이 부분은 “더 공격적인 anti-debug”가 아니라 고정 signature를 만들지 않는 build-time code generation 관점에서 개선하는 편이 적절하다.
+
+───
+
+31. Crypto subsystem은 생각보다 잘 갖춰져 있다
+
+여기는 꽤 크다.
+
+crypto/chacha20.rs
+chacha20_native.rs
+poly1305.rs
+poly1305_native.rs
+key_schedule.rs
+provider.rs
+nonlinear.rs
+permutation.rs
+
+pipeline/crypto/
+bootstub
+cipher
+encode
+integrity
+memharden
+perblock
+
+가 있다.
+
+Themida 공식 기능표에서도 whole-application encryption, runtime strings, integrity protection 등이 virtualization과 별도 보호계층으로 존재한다.
+
+즉 BTG 방향도 맞다.
+
+───
+
+32. 그런데 VM 보안과 파일 암호화 보안을 분리해서 평가해야 한다
+
+아무리:
+
+ChaCha20
+Poly1305
+integrity
+encrypted descriptors
+encrypted bytecode
+
+를 잘 넣어도 VM이 실행되면 결국:
+
+bytecode semantics
+handler semantics
+VM state
+
+가 runtime에 존재한다.
+
+그래서 protector 난이도의 핵심은:
+
+암호 알고리즘 강도
+
+가 아니라
+
+runtime semantic reconstruction cost
+
+다.
+
+이 관점에서는 아직 개선 여지가 크다.
+
+───
+
+33. region descriptor encryption도 암호학적 보안보다는 concealment다
+
+embed_hardening.rs:
+
+bytes[i] ^= key_bytes[i % 8].wrapping_add(i as u8)
+
+이다.
+
+이건 cryptographic encryption이라기보다는 metadata obfuscation이다.
+
+descriptor concealment 용도로는 괜찮다.
+
+하지만 source의 다른 ChaCha/Poly1305 계층과 같은 의미의 보안이라고 생각하면 안 된다.
+
+───
+
+34. seed_lifecycle도 좋은 방향이지만 master dependency가 있다
+
+현재:
+
+VmDomainKey
++
+RegionSalt
+↓
+derive_seed()
+↓
+PolySeed
+
+이다.
+
+좋다.
+
+즉 각 region이 같은 seed를 직접 갖지 않는다.
+
+그러나 결국 한 process 내에서:
+
+master/domain key → all VM configuration
+
+관계가 너무 강하면 master derivation을 찾은 뒤 여러 metadata가 연쇄적으로 드러날 수 있다.
+
+따라서 architecture configuration을 모두 하나의 seed tree에 매달기보다는 domain separation을 더 엄격히 하는 게 좋다.
+
+예:
+
+K_opcode
+K_context
+K_dispatch
+K_handler_codegen
+K_branch
+K_metadata
+
+를 논리적으로 별도 domain으로 관리하는 식이다.
+
+───
+
+35. 현재 DispatchPermutation도 구현은 좋지만 production impact를 따져야 한다
+
+dispatch_perm.rs
+
+이건:
+
+opcode → handler slot
+
+을 seed 기반 permutation으로 바꾼다.
+
+하지만 commercial poly ISA 자체도 opcode randomization을 하고 있다.
+
+따라서 이 계층을 단순히 하나 더 넣는다고 분석 난도가 선형적으로 올라가지는 않는다.
+
+더 필요한 건:
+
+opcode ID randomization
+
+보다
+
+dispatch architecture randomization
+
+이다.
+
+───
+
+36. Nested VM도 구현 흔적은 있지만 실제 상용 engine에서는 아직 약하다
+
+vm/nested.rs
+
+VmCallBridge
+
+라는 좋은 abstraction이 있다.
+
+개념적으로:
+
+VM A
+↓
+snapshot state
+↓
+VM B
+↓
+restore
+↓
+VM A
+
+가 가능하다.
+
+하지만 native commercial handler 쪽에서 VmCallBridge의 완전한 nested-runtime execution은 제한적이고, 일부 경로는 no-op/bridge semantics에 머문다.
+
+즉 진짜:
+
+VM architecture A
+invoking
+VM architecture B
+
+는 아직 production 핵심이 아니다.
+
+───
+
+37. Themida와 비교하면 이게 중요하다
+
+Oreans는 여러 VM architecture를 선택할 수 있고, 같은 application에 여러 CPU/VM을 사용할 수 있다고 설명한다. 같은 architecture라도 CPU마다 registers/handlers/opcode table이 달라진다.
+
+현재 BTG는:
+
+multiple VM implementations exist in source
+
+는 맞다.
+
+하지만 최종 protected binary에서:
+
+multiple truly independent architectures
+
+가 적극적으로 섞이는 구조와는 다르다.
+
+───
+
+38. 내 기준으로 현재 수준을 점수화하면
+
+영역 현재 평가 상용급 목표
+
+x86-64 lifting 7.5/10 9
+RISC de-synthesis 8/10 9
+opcode polymorphism 8/10 9
+operand encoding 7.5/10 9
+rolling-key bytecode 8/10 9
+handler-table concealment 8/10 9
+handler semantic polymorphism 5.5/10 9
+dispatcher polymorphism 4.5/10 9
+context polymorphism 4/10 9
+VM architecture diversity 3.5/10 10
+super-op generation 5/10 9
+nested VM 4/10 8
+metadata concealment 6.5/10 9
+VM/native ABI 7/10 9
+SEH/unwind coverage 5.5/10 9
+PE compatibility 7/10 9.5
+anti-debug/analysis layer 3.5/10 8
+integrity / crypto 8/10 9
+testing infrastructure 8/10 10
+
+전체적으로 대략:
+
+연구용 고급 VM protector: 7/10 정도
+
+Themida류 mature commercial protector 대비: 5~6/10 정도
+
+라고 본다.
+
+단, “5점짜리 코드”라는 뜻이 아니다.
+
+이미 상당히 큰 프레임워크지만 상용 protector에서 가장 어려운 후반 30~40%가 남아 있다는 의미다.
+
+───
+
+39. 가장 먼저 고쳐야 하는 P0
+
+우선순위 변경 이유
+
+P0-1 production dispatcher decentralization 중앙 dispatcher가 최대 분석 anchor
+P0-2 production context offset randomization 현재 state layout이 너무 안정적
+P0-3 block별 VM-role register permutation R8/R12/R14/R15 fingerprint 제거
+P0-4 StateMachineDecoder 실제 runtime 통합 opcode→handler 정적 관계 약화
+P0-5 branch metadata representation 개선 현재 branch map이 CFG oracle
+P0-6 commercial backend handler-gap CI 강제 semantic silent failure 절대 방지
+
+내가 하나만 고른다면 P0-1이다.
+
+───
+
+40. P0 적용 후 목표 구조
+
+현재:
+
+CENTRAL DISPATCH
+/ | 
+ ADD MOV LOAD
+| | |
++-------+-------+
+|
+CENTRAL DISPATCH
+
+목표:
+
+┌──── handler A ──────────┐
+│ ▼
+bytecode → micro-D1 → handler B → micro-D2
+│
+▼
+handler C
+│
+micro-D3
+│
+┌────────┴───────┐
+▼ ▼
+handler D handler E
+
+즉 “dispatcher”라는 특정 지점 자체가 없어져야 한다.
+
+───
+
+41. 그 다음 P1은 context polymorphism
+
+현재:
+
+RDX = context
+
++000 V0
++008 V1
+...
++080 temp
++C0 flags
++C8 VSP
++D0 decoder state
+
+목표:
+
+build A:
++18 V7
++40 flags
++A8 V0
++E0 temp3
+
+build B:
++08 temp2
++50 V0
++B0 flags
++F8 V11
+
+그리고 가능하면 block group마다 context projection도 달라지는 구조가 더 강하다.
+
+이미 ContextOffsetScrambler 구현이 있으므로 처음부터 새로 만들 필요는 없다.
+
+───
+
+42. P2가 진짜 상용급으로 넘어가는 단계다
+
+바로 architecture generator다.
+
+현재 하나의:
+
+RiscOp architecture
+
+에 대한 polymorphism이다.
+
+다음에는 최소 3개 family를 만드는 편이 좋다.
+
+Stack VM
+
+Register VM
+
+Accumulator / mixed VM
+
+예를 들어 같은:
+
+rax = rbx + rcx
+
+가
+
+Stack VM:
+PUSH RBX
+PUSH RCX
+ADD
+POP RAX
+
+또는:
+
+Register VM:
+ADD V1,V2,V3
+
+또는:
+
+Accumulator:
+LOADACC V2
+ACCADD V3
+STOREACC V1
+
+로 내려가야 한다.
+
+이게 진짜 architectural polymorphism이다.
+
+───
+
+43. P3는 per-region architecture selection
+
+그 다음:
+
+function A
+→ Stack VM
+
+function B
+→ RISC VM
+
+function C
+→ Accumulator VM
+
+function D
+→ native mutation
+
+function E
+→ RISC VM #2
+
+처럼 한다.
+
+그러면 analyst가 한 VM lifter를 만들어도 전체 binary가 안 풀린다.
+
+Oreans가 여러 독립 VM architecture를 강조하는 이유와 같은 방향이다.
+
+───
+
+44. 그 다음 handler generator가 필요하다
+
+architecture뿐 아니라 handler implementation도 만들어야 한다.
+
+개념:
+
+Semantic ADD
+│
+├─ Template A: ADD
+├─ Template B: SUB/NEG
+├─ Template C: MBA
+├─ Template D: split helper
+├─ Template E: temp-state
+└─ Template F: fused with next op
+
+그리고 build seed로 하나를 고른다.
+
+더 발전하면 handler 자체를 fixed template에서 꺼내는 게 아니라:
+
+semantic IR
+↓
+rewrite rules
+↓
+equivalent expression graph
+↓
+register allocation
+↓
+native code
+
+로 생성한다.
+
+이 단계부터 상당히 상용 VM스럽다.
+
+───
+
+45. SuperOperatorSynthesizer도 자동화 범위를 넓혀야 한다
+
+현재 몇 개 fixed pattern에 가깝다.
+
+다음 목표:
+
+frequency analysis
+↓
+find hot VM-op sequences
+↓
+generate temporary super-ops
+↓
+rewrite bytecode
+↓
+generate handler
+
+즉 특정 프로그램마다:
+
+SUPER_19
+SUPER_84
+SUPER_A2
+
+의 의미 자체가 달라지는 것이다.
+
+이러면 universal handler classifier 제작이 훨씬 어려워진다.
+
+───
+
+46. RISC layer 자체도 build별로 바뀌어야 한다
+
+현재 가장 큰 장점인 RISC IR가 동시에 fingerprint가 될 수 있다.
+
+예:
+
+Nor
+AddWithCarry
+Shift
+...
+
+의 semantic vocabulary가 항상 같기 때문이다.
+
+따라서 architecture generator 이후에는:
+
+VM A:
+NAND-based
+
+VM B:
+NOR-based
+
+VM C:
+XOR/ADD-based
+
+VM D:
+stack arithmetic
+
+같이 primitive basis 자체를 바꿀 수 있다.
+
+이게 꽤 강력하다.
+
+───
+
+47. 분석자 관점에서 현재 가장 빠른 공격 경로도 보인다
+
+현재 샘플을 받는다면 나는 굳이 7만 줄 전체를 복원하려 하지 않을 거다.
+
+대략:
+
+find commercial entry
+↓
+identify R8/R12/R14/R15/RDX
+↓
+find sub_decrypt
+↓
+port rolling-key decoder
+↓
+locate central dispatch
+↓
+instrument resolved opcode→handler
+↓
+classify handlers
+↓
+parse operand metadata
+↓
+recover branch_map
+↓
+build VM IR
+↓
+lift back to simplified pseudocode
+
+순으로 간다.
+
+즉 지금 보호기 공격의 핵심은 **“한 번 구조를 찾은 뒤 자동화하기 좋다”**는 것이다.
+
+이걸 깨는 것이 다음 버전의 목표가 되어야 한다.
+
+───
+
+48. 반대로 잘한 부분도 분명하다
+
+예전처럼:
+
+opcode → plaintext handler
+
+가 아니고,
+
+현재는 이미:
+
+x86
+→ CFG
+→ RISC
+→ polymorphic opcode
+→ encrypted operands
+→ rolling-key stream
+→ per-op encrypted handler table
+→ self-decoding native runtime
+
+까지 왔다.
+
+그리고:
+
+differential tests
+native/poly interpreter comparison
+ABI tests
+flags tests
+SSE tests
+string-op tests
+CFG tests
+branch tests
+fuzz tests
+
+가 굉장히 많다.
+
+보호기에서는 이것이 아주 중요하다.
+
+보호가 강해질수록 가장 큰 적이 analyst가 아니라 자기 자신의 semantic bug가 되기 때문이다.
+
+───
+
+49. 오히려 지금부터는 기능 추가보다 검증이 더 중요하다
+
+특히:
+
+CALL
+RET
+indirect CALL
+tail call
+switch
+SEH
+Rust panic
+TLS
+REP instructions
+atomics
+XMM ABI
+variadic call
+stack arguments
+large stack frame
+stack probes
+CFG/CET
+ASLR/relocations
+DLL entry
+multithread
+exceptions inside VM
+
+조합 테스트가 중요하다.
+
+Themida가 수십 년 개발된 제품인데도 2026년 changelog에서 exception handling, relocation, virtualization return address, instruction reordering, VM registers 같은 부분을 계속 개선하고 있는 것도 이 계층의 난도를 보여준다.
+
+───
+
+50. 내가 다음 버전을 만든다면 로드맵은 이렇게 잡겠다
+
+단계 핵심 변경 체감 상승
+
+V1 production micro-dispatch 통합 매우 큼
+V2 block별 VM register permutation 매우 큼
+V3 actual context scrambling 큼
+V4 runtime state-dependent opcode 매우 큼
+V5 metadata/branch map representation polymorphism 중~큼
+V6 automatic super-op generation 매우 큼
+V7 handler semantic synthesis 매우 큼
+V8 VM architecture generator #2 결정적
+V9 per-function/per-region VM selection 결정적
+V10 native/SEH coverage 확대 + massive differential QA 상용 안정성
+
+───
+
+최종 판단
+
+이 프로젝트의 문제는 기능이 부족해서가 아니다.
+
+오히려 지금 이미 기능은 아주 많다.
+
+진짜 문제는:
+
+StateMachineDecoder
+ContextOffsetScrambler
+MicroDispatcher
+SuperOperatorSynthesizer
+Nested VM
+RegisterAssignment
+
+같이 상용급으로 가기 위한 핵심 아이디어들이 소스에는 있는데 production poly_direct commercial path의 중심 구조를 실제로 바꾸지 못하고 있다는 것이다.
+
+현재 production 핵심은 여전히:
+
+stable VM ABI
+↓
+self-decrypt
+↓
+central dispatcher
+↓
+256-entry table
+↓
+fairly semantic-pure handlers
+↓
+central dispatcher
+
+이다.
+
+그래서 다음 버전에서 새 암호 알고리즘 하나 더 넣거나 anti-debug check를 늘리는 것보다,
+
+① 중앙 dispatcher 제거
+② VM-role 레지스터를 block마다 바꾸기
+③ context layout 실제 랜덤화
+④ StateMachineDecoder production 통합
+⑤ handler semantics 자체를 build마다 합성
+⑥ 서로 다른 VM architecture 최소 2~3개 생성
+
+이 여섯 개가 훨씬 중요하다.
+
+이것까지 들어가면 더 이상 **“잘 만든 polymorphic RISC VM protector”**가 아니라, 실제로 “architecture-polymorphic VM protector” 쪽으로 넘어가고, 그 지점부터 Themida/Code Virtualizer와 비교할 때 훨씬 의미 있는 경쟁 구조가 된다.

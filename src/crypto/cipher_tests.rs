@@ -17,7 +17,11 @@ use std::collections::HashSet;
 fn sbox_is_bijective() {
     let sb = nonlinear::sbox();
     let set: HashSet<u8> = sb.iter().copied().collect();
-    assert_eq!(set.len(), 256, "S-box must be a bijection (256 distinct values)");
+    assert_eq!(
+        set.len(),
+        256,
+        "S-box must be a bijection (256 distinct values)"
+    );
 }
 
 #[test]
@@ -30,7 +34,10 @@ fn permutation_is_bijective() {
     for &i in &[0usize, 4, 8, 12] {
         new_cols.insert(p[i] % 4);
     }
-    assert!(new_cols.len() >= 2, "permutation must scatter a column across columns");
+    assert!(
+        new_cols.len() >= 2,
+        "permutation must scatter a column across columns"
+    );
 }
 
 #[test]
@@ -82,7 +89,11 @@ fn keystream_differs_by_counter() {
     let mut out = [0u8; 128];
     c.crypt(&mut out);
     // first 64B block and second 64B block (different counter) must differ
-    assert_ne!(&out[..64], &out[64..], "consecutive keystream blocks must differ");
+    assert_ne!(
+        &out[..64],
+        &out[64..],
+        "consecutive keystream blocks must differ"
+    );
 }
 
 #[test]
@@ -162,13 +173,21 @@ fn native_keystream_matches_reference() {
 
     let code = native::emit_keystream_block();
     let sbox = super::nonlinear::sbox();
-    let key = [0x13u8, 0x57, 0x9A, 0xE4, 0x28, 0x6B, 0xD3, 0x0F, 0x91, 0x4C, 0xE7, 0x52, 0xBA, 0x39, 0x86, 0xD1, 0x05, 0xEF, 0x77, 0x20, 0xCB, 0x58, 0x43, 0xF6, 0x2E, 0xAD, 0x64, 0x91, 0x3C, 0xF5, 0x08, 0x1B];
+    let key = [
+        0x13u8, 0x57, 0x9A, 0xE4, 0x28, 0x6B, 0xD3, 0x0F, 0x91, 0x4C, 0xE7, 0x52, 0xBA, 0x39, 0x86,
+        0xD1, 0x05, 0xEF, 0x77, 0x20, 0xCB, 0x58, 0x43, 0xF6, 0x2E, 0xAD, 0x64, 0x91, 0x3C, 0xF5,
+        0x08, 0x1B,
+    ];
     // code / sbox / key / out must not overlap (fully-unrolled 16-round code is ~30KB).
     let code_off = 0x0000;
     let sbox_off = 0x9000;
     let key_off = 0x9100;
     let out_off = 0x9200;
-    assert!(code.len() <= sbox_off, "native code ({}B) overlaps sbox", code.len());
+    assert!(
+        code.len() <= sbox_off,
+        "native code ({}B) overlaps sbox",
+        code.len()
+    );
 
     let mut arena = Arena::new(0x40000).unwrap();
     {
@@ -192,8 +211,7 @@ fn native_keystream_matches_reference() {
         native_out.copy_from_slice(&arena.bytes()[out_off..out_off + 64]);
         let ref_out = BtgState::absorb(&key, ctr, nonce).to_keystream_bytes();
         assert_eq!(
-            native_out,
-            ref_out,
+            native_out, ref_out,
             "native keystream block must match reference (ctr={})",
             ctr
         );
@@ -223,7 +241,11 @@ fn native_stateful_crypt_blob_multi_call_matches_reference() {
     let state_va = (arena.base + state_off) as u64;
     let sbox_va = (arena.base + sbox_off) as u64;
     let code = native::emit_btg_crypt_blob(state_va, sbox_va);
-    assert!(code.len() <= sbox_off, "crypt blob ({}B) overlaps sbox", code.len());
+    assert!(
+        code.len() <= sbox_off,
+        "crypt blob ({}B) overlaps sbox",
+        code.len()
+    );
     {
         let b = arena.bytes();
         b[blob_off..blob_off + code.len()].copy_from_slice(&code);
@@ -233,9 +255,9 @@ fn native_stateful_crypt_blob_multi_call_matches_reference() {
     // 부트 스텁 emit_c1_init과 동일한 상태 초기화:
     //   key[32]@+0x00, ctr=0@+0x20, nonce@+0x28, ks_off=0x40@+0x70
     let key = [
-        0x13u8, 0x57, 0x9A, 0xE4, 0x28, 0x6B, 0xD3, 0x0F, 0x91, 0x4C, 0xE7, 0x52, 0xBA, 0x39,
-        0x86, 0xD1, 0x05, 0xEF, 0x77, 0x20, 0xCB, 0x58, 0x43, 0xF6, 0x2E, 0xAD, 0x64, 0x91,
-        0x3C, 0xF5, 0x08, 0x1B,
+        0x13u8, 0x57, 0x9A, 0xE4, 0x28, 0x6B, 0xD3, 0x0F, 0x91, 0x4C, 0xE7, 0x52, 0xBA, 0x39, 0x86,
+        0xD1, 0x05, 0xEF, 0x77, 0x20, 0xCB, 0x58, 0x43, 0xF6, 0x2E, 0xAD, 0x64, 0x91, 0x3C, 0xF5,
+        0x08, 0x1B,
     ];
     let nonce = 0x5A6B_7C8Du32;
     {
@@ -275,8 +297,14 @@ fn native_stateful_crypt_blob_multi_call_matches_reference() {
     c.crypt(&mut ref_ks1);
     c.crypt(&mut ref_ks2);
 
-    assert_eq!(native_ks1, ref_ks1, "crypt blob call 1 must match reference keystream");
-    assert_eq!(native_ks2, ref_ks2, "crypt blob call 2 (continuation) must match reference keystream");
+    assert_eq!(
+        native_ks1, ref_ks1,
+        "crypt blob call 1 must match reference keystream"
+    );
+    assert_eq!(
+        native_ks2, ref_ks2,
+        "crypt blob call 2 (continuation) must match reference keystream"
+    );
 
     // 암호화 후 버퍼가 원본(0)과 달라야 하고, 두 호출이 연속 키스트림이어야 한다.
     assert_ne!(native_ks1, vec![0u8; len1], "keystream must be non-zero");
@@ -300,7 +328,11 @@ fn c1_per_block_packer_native_equivalence() {
     let state_va = (arena.base + state_off) as u64;
     let sbox_va = (arena.base + sbox_off) as u64;
     let code = native::emit_btg_crypt_blob(state_va, sbox_va);
-    assert!(code.len() <= sbox_off, "crypt blob ({}B) overlaps sbox", code.len());
+    assert!(
+        code.len() <= sbox_off,
+        "crypt blob ({}B) overlaps sbox",
+        code.len()
+    );
     {
         let b = arena.bytes();
         b[blob_off..blob_off + code.len()].copy_from_slice(&code);
@@ -308,7 +340,11 @@ fn c1_per_block_packer_native_equivalence() {
     }
 
     // 여러 키/길이 케이스 (64B 경계 + 다양한 블록 길이)
-    for (key4, len) in [(0x12345678u32, 29usize), (0xDEADBEEF, 64), (0xA5A5_5A5A, 130)] {
+    for (key4, len) in [
+        (0x12345678u32, 29usize),
+        (0xDEADBEEF, 64),
+        (0xA5A5_5A5A, 130),
+    ] {
         // 패커: repeat4(key4) → BtgCipher
         let key32 = {
             let mut k = [0u8; 32];
@@ -317,7 +353,9 @@ fn c1_per_block_packer_native_equivalence() {
             }
             k
         };
-        let mut plain: Vec<u8> = (0..len).map(|i| ((i as u32 * 131 + key4) % 251) as u8).collect();
+        let mut plain: Vec<u8> = (0..len)
+            .map(|i| ((i as u32 * 131 + key4) % 251) as u8)
+            .collect();
         let orig = plain.clone();
         let mut enc = BtgCipher::new(&key32, 0);
         enc.crypt(&mut plain); // → ciphertext (파일 상태)
@@ -340,5 +378,3 @@ fn c1_per_block_packer_native_equivalence() {
         );
     }
 }
-
-

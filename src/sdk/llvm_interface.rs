@@ -47,9 +47,7 @@ impl LlvmSynthesizer {
             return Err(anyhow!("empty operand"));
         }
         if let Some(rest) = s.strip_prefix('%') {
-            let idx: u8 = rest
-                .parse()
-                .map_err(|_| anyhow!("invalid SSA reg `{s}`"))?;
+            let idx: u8 = rest.parse().map_err(|_| anyhow!("invalid SSA reg `{s}`"))?;
             Ok(MicroOperand::VReg(idx))
         } else {
             let v: u64 = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
@@ -220,7 +218,12 @@ impl PolyConsumptionRuntime {
                 expected.instrs.len()
             ));
         }
-        for (i, (d, e)) in decoded.instrs.iter().zip(expected.instrs.iter()).enumerate() {
+        for (i, (d, e)) in decoded
+            .instrs
+            .iter()
+            .zip(expected.instrs.iter())
+            .enumerate()
+        {
             if d != e {
                 return Err(anyhow!(
                     "consumption op-list mismatch at #{i}: decoded {d:?} vs expected {e:?}"
@@ -264,11 +267,7 @@ impl PolyConsumptionRuntime {
 
     /// 바이트코드를 소비(복호화)하고, 여러 입력 벡터에 대해 원본 프로그램과
     /// 실행 결과가 일치하는지 검증한다.
-    pub fn verify_execution(
-        bytecode: &[u8],
-        seed: u64,
-        expected: &RiscProgram,
-    ) -> Result<()> {
+    pub fn verify_execution(bytecode: &[u8], seed: u64, expected: &RiscProgram) -> Result<()> {
         let decoded = Self::decode(bytecode, seed)?;
         Self::assert_op_list_eq(&decoded, expected)?;
 
@@ -276,7 +275,24 @@ impl PolyConsumptionRuntime {
             [0u64; 16],
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             [0x1122_3344_5566_7788u64; 16],
-            [0xDEAD_BEEF_CAFE_F00Du64, 0x0123_4567_89AB_CDEF, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+            [
+                0xDEAD_BEEF_CAFE_F00Du64,
+                0x0123_4567_89AB_CDEF,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+            ],
         ];
         for (i, init) in input_vectors.iter().enumerate() {
             let d = decoded.eval_state(init);
@@ -287,11 +303,7 @@ impl PolyConsumptionRuntime {
     }
 
     /// SDK 마커 리전의 (bytecode, seed) 를 소비·검증한다.
-    pub fn verify_region(
-        bytecode: &[u8],
-        seed: u64,
-        expected_prog: &RiscProgram,
-    ) -> Result<()> {
+    pub fn verify_region(bytecode: &[u8], seed: u64, expected_prog: &RiscProgram) -> Result<()> {
         Self::verify_execution(bytecode, seed, expected_prog)
     }
 }
@@ -346,7 +358,11 @@ mod tests {
     /// IR 파서가 단항 연산(not/neg)을 처리한다.
     #[test]
     fn test_ir_parser_unary_ops() {
-        let prog = LlvmIngestionInterface::synthesize_ir("u", "%0 = not i64 %1\n%2 = neg i64 %3\nret i64 %0").unwrap();
+        let prog = LlvmIngestionInterface::synthesize_ir(
+            "u",
+            "%0 = not i64 %1\n%2 = neg i64 %3\nret i64 %0",
+        )
+        .unwrap();
         assert!(prog.instrs.iter().any(|i| i.op == RiscOp::Nor));
         assert!(prog.instrs.iter().any(|i| i.op == RiscOp::AddWithCarry));
     }
@@ -366,4 +382,3 @@ mod tests {
         assert_eq!(prog.instrs.len(), vf.body.len());
     }
 }
-

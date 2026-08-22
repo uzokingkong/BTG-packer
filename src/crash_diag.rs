@@ -70,7 +70,13 @@ pub fn diagnose(
         .find(|b| bc_offset >= b.bc_start && bc_offset <= b.bc_end);
     let block_id = block.map(|b| b.id).unwrap_or(u32::MAX);
     let vm_region = block
-        .map(|b| if b.native { "native".to_string() } else { "vm-bytecode".to_string() })
+        .map(|b| {
+            if b.native {
+                "native".to_string()
+            } else {
+                "vm-bytecode".to_string()
+            }
+        })
         .unwrap_or_else(|| "vm-bytecode".to_string());
     let handler_id = block.map(|b| b.handler_id).unwrap_or(0);
     let crypto_region = block
@@ -151,12 +157,25 @@ mod tests {
         end_block(0x040, 0x140001007);
         let m = take().expect("map present");
 
-        let cs = diagnose(&m, 0x140008000 + 0x2C, 0x140000000, 0x140008000, "entry_block=3 mode=reencrypt")
-            .expect("diagnose");
+        let cs = diagnose(
+            &m,
+            0x140008000 + 0x2C,
+            0x140000000,
+            0x140008000,
+            "entry_block=3 mode=reencrypt",
+        )
+        .expect("diagnose");
         assert_eq!(cs.vm_region, "vm-bytecode");
         assert_eq!(cs.block_id, 0);
-        assert_eq!(cs.original_va, 0x140001003, "resolves to containing original VA");
-        assert!(cs.instruction.contains("add rax,1"), "instruction: {}", cs.instruction);
+        assert_eq!(
+            cs.original_va, 0x140001003,
+            "resolves to containing original VA"
+        );
+        assert!(
+            cs.instruction.contains("add rax,1"),
+            "instruction: {}",
+            cs.instruction
+        );
         assert_eq!(cs.handler_id, 0x3C, "handler id from block");
         assert_eq!(cs.crypto_region, "program-vm");
         assert_eq!(cs.protected_va, 0x14000802C);

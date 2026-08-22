@@ -2,7 +2,7 @@
 // BTG v21 - VM Interpreter: register / immediate moves
 // ==============================================================================
 
-use super::state::{VmError, flags_of, set_vreg64, vreg32, vreg64};
+use super::state::{flags_of, set_vreg64, vreg32, vreg64, VmError};
 use crate::vm::bytecode::*;
 
 /// Execute one pure register/immediate move opcode.

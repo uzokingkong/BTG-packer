@@ -27,12 +27,32 @@ pub fn generate_dummy_target_pe() -> Result<Vec<u8>> {
 
     // --- Block 0: Prologue & Initialization ---
     instructions.push(Instruction::with1(Code::Push_r64, Register::RBP)?);
-    instructions.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBP, Register::RSP)?);
-    instructions.push(Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, 0x20u32)?);
+    instructions.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::RBP,
+        Register::RSP,
+    )?);
+    instructions.push(Instruction::with2(
+        Code::Sub_rm64_imm32,
+        Register::RSP,
+        0x20u32,
+    )?);
 
-    instructions.push(Instruction::with2(Code::Mov_r32_imm32, Register::EAX, 0x100u32)?);
-    instructions.push(Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 0x5u32)?);
-    instructions.push(Instruction::with2(Code::Mov_r32_imm32, Register::EDX, 0x200u32)?);
+    instructions.push(Instruction::with2(
+        Code::Mov_r32_imm32,
+        Register::EAX,
+        0x100u32,
+    )?);
+    instructions.push(Instruction::with2(
+        Code::Mov_r32_imm32,
+        Register::ECX,
+        0x5u32,
+    )?);
+    instructions.push(Instruction::with2(
+        Code::Mov_r32_imm32,
+        Register::EDX,
+        0x200u32,
+    )?);
 
     // RIP-relative instruction: lea r8, [rip + 0x1000] (targets data RVA 0x2000)
     // IP-의존 disp32는 1-pass 후 실제 IP로 재계산된다.
@@ -41,29 +61,57 @@ pub fn generate_dummy_target_pe() -> Result<Vec<u8>> {
     instructions.push(Instruction::with2(Code::Lea_r64_m, Register::R8, mem_op)?);
 
     // --- Block 1: Arithmetic & Decision Tree ---
-    instructions.push(Instruction::with2(Code::Add_rm32_r32, Register::EAX, Register::EDX)?);
-    instructions.push(Instruction::with2(Code::Sub_rm32_imm32, Register::EAX, 0x10u32)?);
-    instructions.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 0x150u32)?);
+    instructions.push(Instruction::with2(
+        Code::Add_rm32_r32,
+        Register::EAX,
+        Register::EDX,
+    )?);
+    instructions.push(Instruction::with2(
+        Code::Sub_rm32_imm32,
+        Register::EAX,
+        0x10u32,
+    )?);
+    instructions.push(Instruction::with2(
+        Code::Cmp_rm32_imm32,
+        Register::EAX,
+        0x150u32,
+    )?);
 
     // 분기 타깃 인덱스 기록 (실제 IP는 1-pass 후 결정)
     let jg_idx = instructions.len();
     instructions.push(Instruction::with_branch(Code::Jg_rel32_64, text_va)?);
 
     // --- Fallthrough Path (Condition False: EAX <= 0x150) ---
-    instructions.push(Instruction::with2(Code::Xor_rm32_imm32, Register::EDX, 0x55u32)?);
+    instructions.push(Instruction::with2(
+        Code::Xor_rm32_imm32,
+        Register::EDX,
+        0x55u32,
+    )?);
     let jmp_idx = instructions.len();
     instructions.push(Instruction::with_branch(Code::Jmp_rel32_64, text_va)?);
 
     // --- Branch Taken Path (Condition True: EAX > 0x150) ---
     let add_greater_idx = instructions.len();
-    instructions.push(Instruction::with2(Code::Add_rm32_imm32, Register::EAX, 0x1000u32)?);
+    instructions.push(Instruction::with2(
+        Code::Add_rm32_imm32,
+        Register::EAX,
+        0x1000u32,
+    )?);
 
     // --- Common Continuation & Epilogue ---
     let continue_idx = instructions.len();
     instructions.push(Instruction::with1(Code::Dec_rm32, Register::ECX)?);
-    instructions.push(Instruction::with2(Code::Add_rm32_imm32, Register::EAX, 0x7777u32)?);
+    instructions.push(Instruction::with2(
+        Code::Add_rm32_imm32,
+        Register::EAX,
+        0x7777u32,
+    )?);
 
-    instructions.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSP, Register::RBP)?);
+    instructions.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::RSP,
+        Register::RBP,
+    )?);
     instructions.push(Instruction::with1(Code::Pop_r64, Register::RBP)?);
     instructions.push(Instruction::with(Code::Retnq));
 
@@ -86,7 +134,11 @@ pub fn generate_dummy_target_pe() -> Result<Vec<u8>> {
         let len = match BlockEncoder::encode(64, blk, BlockEncoderOptions::NONE) {
             Ok(r) => r.code_buffer.len(),
             Err(_) => {
-                if m.len() > 0 { m.len() } else { 5 }
+                if m.len() > 0 {
+                    m.len()
+                } else {
+                    5
+                }
             }
         };
         ip += len as u64;

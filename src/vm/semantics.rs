@@ -176,9 +176,8 @@ pub fn flag_contract(op: u8) -> (u64, u64) {
     use crate::vm::bytecode::*;
     let all = FLAG_MASK;
     match op {
-        OP_ADD_R_R | OP_ADD_R_IMM32 | OP_ADD_R_R64 | OP_ADD_R_IMM64
-        | OP_SUB_R_R | OP_SUB_R_R64 | OP_CMP_R_IMM32
-        | OP_XADD_MEM8_A | OP_XADD_MEM16_A | OP_XADD_MEM32_A | OP_XADD_MEM64_A => {
+        OP_ADD_R_R | OP_ADD_R_IMM32 | OP_ADD_R_R64 | OP_ADD_R_IMM64 | OP_SUB_R_R | OP_SUB_R_R64
+        | OP_CMP_R_IMM32 | OP_XADD_MEM8_A | OP_XADD_MEM16_A | OP_XADD_MEM32_A | OP_XADD_MEM64_A => {
             (F_CF | F_PF | F_AF | F_ZF | F_SF | F_OF, 0) // full arithmetic set
         }
         // P0-⑤: MUL/IMUL define CF/OF (upper-half overflow) — written here;
@@ -187,15 +186,15 @@ pub fn flag_contract(op: u8) -> (u64, u64) {
         // (no written bits). Matches the RISC reference (mul_wide/mul_low set
         // CF/OF via set_cf_of; div_wide leaves flags untouched) and the native
         // handler capture (cap_flags_cf_of), so every path agrees.
-        OP_MUL_R_R32 | OP_MUL_R_R64 | OP_MUL_R_R8 | OP_MUL_R_R16
-        | OP_IMUL1_R_R32 | OP_IMUL1_R_R64 | OP_IMUL1_R_R8 | OP_IMUL1_R_R16
-        | OP_IMUL_R_R | OP_IMUL_R_R64 => (F_CF | F_OF, FLAG_MASK & !(F_CF | F_OF)),
-        OP_DIV_R_R32 | OP_DIV_R_R64 | OP_DIV_R_R8 | OP_DIV_R_R16
-        | OP_IDIV_R_R32 | OP_IDIV_R_R64 | OP_IDIV_R_R8 | OP_IDIV_R_R16 => (0, 0),
-        OP_AND_R_R | OP_AND_R_IMM32 | OP_AND_R_R64 | OP_AND_R_IMM64
-        | OP_XOR_R_R | OP_XOR_R_IMM32 | OP_XOR_R_R64 | OP_XOR_R_IMM64
-        | OP_OR_R_R | OP_OR_R_R64 | OP_OR_R_IMM32 | OP_OR_R_IMM64
-        | OP_TEST_R_R32 | OP_TEST_R_IMM32 => {
+        OP_MUL_R_R32 | OP_MUL_R_R64 | OP_MUL_R_R8 | OP_MUL_R_R16 | OP_IMUL1_R_R32
+        | OP_IMUL1_R_R64 | OP_IMUL1_R_R8 | OP_IMUL1_R_R16 | OP_IMUL_R_R | OP_IMUL_R_R64 => {
+            (F_CF | F_OF, FLAG_MASK & !(F_CF | F_OF))
+        }
+        OP_DIV_R_R32 | OP_DIV_R_R64 | OP_DIV_R_R8 | OP_DIV_R_R16 | OP_IDIV_R_R32
+        | OP_IDIV_R_R64 | OP_IDIV_R_R8 | OP_IDIV_R_R16 => (0, 0),
+        OP_AND_R_R | OP_AND_R_IMM32 | OP_AND_R_R64 | OP_AND_R_IMM64 | OP_XOR_R_R
+        | OP_XOR_R_IMM32 | OP_XOR_R_R64 | OP_XOR_R_IMM64 | OP_OR_R_R | OP_OR_R_R64
+        | OP_OR_R_IMM32 | OP_OR_R_IMM64 | OP_TEST_R_R32 | OP_TEST_R_IMM32 => {
             (F_PF | F_ZF | F_SF, 0) // logical: CF/OF/AF cleared
         }
         // SHLD/SHRD (count>0): CF = last bit shifted out of dst; SF/ZF/PF from
@@ -204,15 +203,14 @@ pub fn flag_contract(op: u8) -> (u64, u64) {
         | OP_SHLD64_R_R_IMM8 | OP_SHLD64_R_R_CL | OP_SHRD64_R_R_IMM8 | OP_SHRD64_R_R_CL => {
             (F_CF | F_PF | F_ZF | F_SF, 0)
         }
-        OP_SHL_R_IMM8 | OP_SHR_R_IMM8 | OP_SAR_R_IMM8
-        | OP_SHL_R_CL | OP_SHR_R_CL | OP_SAR_R_CL
-        | OP_SHL64_R_IMM8 | OP_SHR64_R_IMM8 | OP_SAR64_R_IMM8
-        | OP_SHL64_R_CL | OP_SHR64_R_CL | OP_SAR64_R_CL => {
+        OP_SHL_R_IMM8 | OP_SHR_R_IMM8 | OP_SAR_R_IMM8 | OP_SHL_R_CL | OP_SHR_R_CL | OP_SAR_R_CL
+        | OP_SHL64_R_IMM8 | OP_SHR64_R_IMM8 | OP_SAR64_R_IMM8 | OP_SHL64_R_CL | OP_SHR64_R_CL
+        | OP_SAR64_R_CL => {
             (F_CF | F_PF | F_ZF | F_SF, 0) // OF/AF defined 0
         }
-        OP_INC_R | OP_DEC_R | OP_INC_R64 | OP_DEC_R64 | OP_LOCK_INC_MEM8_A | OP_LOCK_INC_MEM16_A
-        | OP_LOCK_INC_MEM32_A | OP_LOCK_INC_MEM64_A
-        | OP_LOCK_DEC_MEM8_A | OP_LOCK_DEC_MEM16_A | OP_LOCK_DEC_MEM32_A | OP_LOCK_DEC_MEM64_A => {
+        OP_INC_R | OP_DEC_R | OP_INC_R64 | OP_DEC_R64 | OP_LOCK_INC_MEM8_A
+        | OP_LOCK_INC_MEM16_A | OP_LOCK_INC_MEM32_A | OP_LOCK_INC_MEM64_A | OP_LOCK_DEC_MEM8_A
+        | OP_LOCK_DEC_MEM16_A | OP_LOCK_DEC_MEM32_A | OP_LOCK_DEC_MEM64_A => {
             (F_PF | F_AF | F_ZF | F_SF | F_OF, F_CF) // CF preserved
         }
         // CMPXCHG writes only ZF; the other status flags pass through untouched.
@@ -224,8 +222,9 @@ pub fn flag_contract(op: u8) -> (u64, u64) {
         OP_TZCNT_R32 => (F_CF | F_ZF, 0),
         OP_LZCNT_R32 | OP_LZCNT_R64 => (F_CF | F_ZF, 0),
         OP_POPCNT_R32 | OP_POPCNT_R64 => (F_ZF, 0),
-        OP_BLSR_R32 | OP_BLSR_R64 | OP_BLSMSK_R32 | OP_BLSMSK_R64
-        | OP_BLSI_R32 | OP_BLSI_R64 => (F_ZF, 0), // SF/OF/CF cleared by SDM
+        OP_BLSR_R32 | OP_BLSR_R64 | OP_BLSMSK_R32 | OP_BLSMSK_R64 | OP_BLSI_R32 | OP_BLSI_R64 => {
+            (F_ZF, 0)
+        } // SF/OF/CF cleared by SDM
         OP_ANDN_R_R32 | OP_ANDN_R_R64 => (F_ZF | F_SF, 0),
         _ => (0, 0),
     }
@@ -282,10 +281,20 @@ mod tests {
         let (r, f) = probe_popcnt32(0);
         assert_eq!(r, 0);
         assert_eq!(m(f) & F_ZF, F_ZF, "popcnt32(0) ZF got 0x{:X}", m(f));
-        assert_eq!(m(f) & (F_CF | F_SF | F_OF), 0, "popcnt32(0) CF/SF/OF got 0x{:X}", m(f));
+        assert_eq!(
+            m(f) & (F_CF | F_SF | F_OF),
+            0,
+            "popcnt32(0) CF/SF/OF got 0x{:X}",
+            m(f)
+        );
         let (r, f) = probe_popcnt32(0xFFFF_FFFF);
         assert_eq!(r, 32);
-        assert_eq!(m(f) & (F_CF | F_ZF | F_SF | F_OF), 0, "popcnt32(~0) flags got 0x{:X}", m(f));
+        assert_eq!(
+            m(f) & (F_CF | F_ZF | F_SF | F_OF),
+            0,
+            "popcnt32(~0) flags got 0x{:X}",
+            m(f)
+        );
         let (r, f) = probe_popcnt64(0xFFFF_FFFF_FFFF_FFFF);
         assert_eq!(r, 64);
         assert_eq!(m(f) & (F_CF | F_ZF | F_SF | F_OF), 0);
@@ -313,12 +322,33 @@ mod tests {
         // (written, preserved) must be disjoint, within FLAG_MASK, and the
         // union must cover the modelled status flags for the written group.
         let ops = [
-            OP_ADD_R_R, OP_SUB_R_R, OP_XOR_R_R, OP_AND_R_R, OP_OR_R_R,
-            OP_TEST_R_R32, OP_CMP_R_IMM32, OP_INC_R, OP_DEC_R, OP_NEG_R,
-            OP_SHL_R_IMM8, OP_SHL_R_CL, OP_SHL64_R_IMM8, OP_SHLD_R_R_IMM8,
-            OP_BSR_R32, OP_BSF_R64, OP_TZCNT_R32, OP_LZCNT_R64, OP_POPCNT_R32,
-            OP_BLSR_R64, OP_ANDN_R_R32, OP_CMPXCHG_MEM32_A, OP_XADD_MEM64_A,
-            OP_LOCK_INC_MEM8_A, OP_MUL_R_R32, OP_DIV_R_R64, OP_IMUL_R_R,
+            OP_ADD_R_R,
+            OP_SUB_R_R,
+            OP_XOR_R_R,
+            OP_AND_R_R,
+            OP_OR_R_R,
+            OP_TEST_R_R32,
+            OP_CMP_R_IMM32,
+            OP_INC_R,
+            OP_DEC_R,
+            OP_NEG_R,
+            OP_SHL_R_IMM8,
+            OP_SHL_R_CL,
+            OP_SHL64_R_IMM8,
+            OP_SHLD_R_R_IMM8,
+            OP_BSR_R32,
+            OP_BSF_R64,
+            OP_TZCNT_R32,
+            OP_LZCNT_R64,
+            OP_POPCNT_R32,
+            OP_BLSR_R64,
+            OP_ANDN_R_R32,
+            OP_CMPXCHG_MEM32_A,
+            OP_XADD_MEM64_A,
+            OP_LOCK_INC_MEM8_A,
+            OP_MUL_R_R32,
+            OP_DIV_R_R64,
+            OP_IMUL_R_R,
         ];
         for op in ops {
             let (written, preserved) = flag_contract(op);
@@ -327,15 +357,24 @@ mod tests {
                 0,
                 "flag_contract(0x{op:02X}): written 0x{written:X} overlaps preserved 0x{preserved:X}"
             );
-            assert_eq!(written | preserved, (written | preserved) & FLAG_MASK,
-                "flag_contract(0x{op:02X}): bits outside FLAG_MASK");
+            assert_eq!(
+                written | preserved,
+                (written | preserved) & FLAG_MASK,
+                "flag_contract(0x{op:02X}): bits outside FLAG_MASK"
+            );
         }
         // Spot-check representative contracts.
         assert_eq!(flag_contract(OP_ADD_R_R).0, FLAG_MASK);
         assert_eq!(flag_contract(OP_TZCNT_R32).0, F_CF | F_ZF);
         assert_eq!(flag_contract(OP_BSR_R32).0, F_ZF);
-        assert_eq!(flag_contract(OP_MUL_R_R32), (F_CF | F_OF, FLAG_MASK & !(F_CF | F_OF)));
-        assert_eq!(flag_contract(OP_IMUL_R_R), (F_CF | F_OF, FLAG_MASK & !(F_CF | F_OF)));
+        assert_eq!(
+            flag_contract(OP_MUL_R_R32),
+            (F_CF | F_OF, FLAG_MASK & !(F_CF | F_OF))
+        );
+        assert_eq!(
+            flag_contract(OP_IMUL_R_R),
+            (F_CF | F_OF, FLAG_MASK & !(F_CF | F_OF))
+        );
         // DIV/IDIV leave ALL flags undefined on x86 → pass through (flagless).
         assert_eq!(flag_contract(OP_DIV_R_R64), (0, 0));
         assert_eq!(flag_contract(OP_CMPXCHG_MEM32_A), (F_ZF, FLAG_MASK & !F_ZF));

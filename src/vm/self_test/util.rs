@@ -7,10 +7,10 @@
 // so a new opcode group is verified in interp == native lock-step. Modeled on
 // the [31] atomic XCHG/XADD test's native-execution setup.
 
-use anyhow::Result;
 use crate::vm::arena::Arena;
 use crate::vm::encode::encode_trampoline;
 use crate::vm::{build_vm_module, handlers, interp};
+use anyhow::Result;
 
 /// Execute `prog` through the native VM (EntryMode::Ksa). `data` is copied to
 /// the native data arena at `data_off` (absolute VA = vdata + data_off, where
@@ -36,7 +36,13 @@ pub fn run_native(
         arena.base + 0x8000,
         arena.base + 0x9000,
     );
-    let module = build_vm_module(vc as u64, vt as u64, vb as u64, prog.to_vec(), handlers::EntryMode::Ksa)?;
+    let module = build_vm_module(
+        vc as u64,
+        vt as u64,
+        vb as u64,
+        prog.to_vec(),
+        handlers::EntryMode::Ksa,
+    )?;
     handlers::validate_vm_code(&module.code)?;
     let tramp = encode_trampoline(vs as u64, vdata as u64, vdata as u64, vc as u64, vtr as u64)?;
     let vbase = arena.base as u64;
@@ -75,7 +81,13 @@ pub fn run_native_with_data(
         arena.base + 0x8000,
         arena.base + 0x9000,
     );
-    let module = build_vm_module(vc as u64, vt as u64, vb as u64, prog.to_vec(), handlers::EntryMode::Ksa)?;
+    let module = build_vm_module(
+        vc as u64,
+        vt as u64,
+        vb as u64,
+        prog.to_vec(),
+        handlers::EntryMode::Ksa,
+    )?;
     handlers::validate_vm_code(&module.code)?;
     let tramp = encode_trampoline(vs as u64, vdata as u64, vdata as u64, vc as u64, vtr as u64)?;
     let vbase = arena.base as u64;

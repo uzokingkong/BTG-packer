@@ -6,12 +6,11 @@
 // bodies are byte-identical to the pre-split monolith; only imports and module
 // wiring changed.
 
-use anyhow::{Result, anyhow};
+use crate::vm::arena::Arena;
+use crate::vm::build_vm_module;
+use crate::vm::encode::encode_trampoline;
 use crate::vm::{handlers, interp};
-use crate::vm::{build_vm_module};
-use crate::vm::arena::{Arena};
-use crate::vm::encode::{encode_trampoline};
-
+use anyhow::{anyhow, Result};
 
 /// M2 follow-up self-test: addressing modes. Cross-checks the Rust interpreter
 /// against the native x86-64 handlers for:
@@ -91,26 +90,41 @@ pub(crate) fn run_m2_addr_test() -> Result<()> {
     // Interpreter: base v0 = 0 (offset into mem), STATE_RIP = 0x1000
     let mut st = vec![0u8; interp::STATE_SIZE];
     let mut mem = vec![0u8; 0x2000];
-    st[interp::STATE_VREGS + 0 * 8..interp::STATE_VREGS + 1 * 8].copy_from_slice(&0u64.to_le_bytes());
-    st[interp::STATE_PTR_STACK..interp::STATE_PTR_STACK + 8].copy_from_slice(&0x1000u64.to_le_bytes());
+    st[interp::STATE_VREGS + 0 * 8..interp::STATE_VREGS + 1 * 8]
+        .copy_from_slice(&0u64.to_le_bytes());
+    st[interp::STATE_PTR_STACK..interp::STATE_PTR_STACK + 8]
+        .copy_from_slice(&0x1000u64.to_le_bytes());
     st[interp::STATE_SP..interp::STATE_SP + 8].copy_from_slice(&0x1000u64.to_le_bytes());
     st[interp::STATE_RIP..interp::STATE_RIP + 8].copy_from_slice(&0xFF0u64.to_le_bytes());
     // place a known u64 at mem[0x1000]
     mem[0x1000..0x1008].copy_from_slice(&0xDEAD_BEEF_CAFE_F00Du64.to_le_bytes());
-    interp::interpret(&mut st, &mut mem, &prog).map_err(|e| anyhow!("M2 addr interp failed: {:?}", e))?;
+    interp::interpret(&mut st, &mut mem, &prog)
+        .map_err(|e| anyhow!("M2 addr interp failed: {:?}", e))?;
     let mut vi = [0u64; 16];
     for i in 0..16 {
-        vi[i] = u64::from_le_bytes(st[interp::STATE_VREGS + i * 8..interp::STATE_VREGS + i * 8 + 8].try_into().unwrap());
+        vi[i] = u64::from_le_bytes(
+            st[interp::STATE_VREGS + i * 8..interp::STATE_VREGS + i * 8 + 8]
+                .try_into()
+                .unwrap(),
+        );
     }
     // interpreter semantic checks (base = 0)
     assert_eq!(vi[2], 0 + 4 + 0x10, "M2 LEA base+idx*scale+disp wrong");
     assert_eq!(vi[3], 0 + 8, "M2 LEA base+disp wrong");
     assert_eq!(vi[4], 0, "M2 32-bit load of zeroed mem wrong");
     assert_eq!(vi[5] as i64, (0xAAu8 as i8) as i64, "M2 MOVSX8 wrong");
-    assert_eq!(vi[6], 0x1000, "M2 LEA_RIP wrong (got 0x{:X} want 0x{:X})", vi[6], 0x1000);
+    assert_eq!(
+        vi[6], 0x1000,
+        "M2 LEA_RIP wrong (got 0x{:X} want 0x{:X})",
+        vi[6], 0x1000
+    );
     assert_eq!(vi[7], 0xDEAD_BEEF_CAFE_F00D, "M2 LEA_RIP load wrong");
     // interpreter memory effects
-    assert_eq!(&mem[0x14..0x18], &[0x44, 0x33, 0x22, 0x11], "M2 mem32 store wrong");
+    assert_eq!(
+        &mem[0x14..0x18],
+        &[0x44, 0x33, 0x22, 0x11],
+        "M2 mem32 store wrong"
+    );
     assert_eq!(mem[8], 0xAA, "M2 mem8 store wrong");
 
     // Native VM: base v0 = data_va, STATE_RIP = data_va - 0x10 so +0x10 = data_va
@@ -122,7 +136,8 @@ pub(crate) fn run_m2_addr_test() -> Result<()> {
             .copy_from_slice(&(data_va as u64).to_le_bytes());
         b[0x6000 + interp::STATE_PTR_STACK..0x6000 + interp::STATE_PTR_STACK + 8]
             .copy_from_slice(&(stack_va as u64).to_le_bytes());
-        b[0x6000 + interp::STATE_SP..0x6000 + interp::STATE_SP + 8].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[0x6000 + interp::STATE_SP..0x6000 + interp::STATE_SP + 8]
+            .copy_from_slice(&0x1000u64.to_le_bytes());
         b[0x6000 + interp::STATE_RIP..0x6000 + interp::STATE_RIP + 8]
             .copy_from_slice(&((data_va as u64).wrapping_sub(0x10)).to_le_bytes());
         b[0x7000..0x7000 + 0x1000].fill(0);
@@ -131,17 +146,37 @@ pub(crate) fn run_m2_addr_test() -> Result<()> {
     let b = arena.bytes();
     let mut vn = [0u64; 16];
     for i in 0..16 {
-        vn[i] = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + i * 8..0x6000 + interp::STATE_VREGS + i * 8 + 8].try_into().unwrap());
+        vn[i] = u64::from_le_bytes(
+            b[0x6000 + interp::STATE_VREGS + i * 8..0x6000 + interp::STATE_VREGS + i * 8 + 8]
+                .try_into()
+                .unwrap(),
+        );
     }
     // native semantic checks (base = data_va)
     let db = data_va as u64;
-    assert_eq!(vn[2], db + 4 + 0x10, "M2 native LEA base+idx*scale+disp wrong");
+    assert_eq!(
+        vn[2],
+        db + 4 + 0x10,
+        "M2 native LEA base+idx*scale+disp wrong"
+    );
     assert_eq!(vn[3], db + 8, "M2 native LEA base+disp wrong");
     assert_eq!(vn[4], 0, "M2 native 32-bit load of zeroed mem wrong");
-    assert_eq!(vn[5] as i64, (0xAAu8 as i8) as i64, "M2 native MOVSX8 wrong");
-    assert_eq!(vn[6], db, "M2 native LEA_RIP wrong (got 0x{:X} want 0x{:X})", vn[6], db);
+    assert_eq!(
+        vn[5] as i64,
+        (0xAAu8 as i8) as i64,
+        "M2 native MOVSX8 wrong"
+    );
+    assert_eq!(
+        vn[6], db,
+        "M2 native LEA_RIP wrong (got 0x{:X} want 0x{:X})",
+        vn[6], db
+    );
     // the 32-bit store at data+0x14 and the byte store at data+8, and the u64 at data
-    assert_eq!(b[0x7000 + 0x14..0x7000 + 0x18], [0x44, 0x33, 0x22, 0x11], "M2 native mem32 store wrong");
+    assert_eq!(
+        b[0x7000 + 0x14..0x7000 + 0x18],
+        [0x44, 0x33, 0x22, 0x11],
+        "M2 native mem32 store wrong"
+    );
     assert_eq!(b[0x7000 + 8], 0xAA, "M2 native mem8 store wrong");
     Ok(())
 }

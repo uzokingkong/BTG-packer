@@ -3,7 +3,11 @@
 // ==============================================================================
 use crate::pe::builder::SectionData;
 
-pub(crate) fn is_rva_range_protected(start_rva: u32, len: u32, protected_ranges: &[(u32, u32)]) -> bool {
+pub(crate) fn is_rva_range_protected(
+    start_rva: u32,
+    len: u32,
+    protected_ranges: &[(u32, u32)],
+) -> bool {
     let end_rva = start_rva.saturating_add(len);
     for &(p_start, p_end) in protected_ranges {
         if p_start >= end_rva {
@@ -70,7 +74,12 @@ pub(crate) fn collect_import_directory_ranges(
         let name_rva = u32::from_le_bytes(slice[12..16].try_into().unwrap());
         let first_thunk = u32::from_le_bytes(slice[16..20].try_into().unwrap());
 
-        if orig_first_thunk == 0 && time_date_stamp == 0 && forwarder_chain == 0 && name_rva == 0 && first_thunk == 0 {
+        if orig_first_thunk == 0
+            && time_date_stamp == 0
+            && forwarder_chain == 0
+            && name_rva == 0
+            && first_thunk == 0
+        {
             if import_size == 0 {
                 ranges.push((import_rva, curr_rva.saturating_add(20)));
             }
@@ -110,8 +119,14 @@ pub(crate) fn collect_import_directory_ranges(
                         if let Some(slice) = rva_to_slice(sections, by_name_rva) {
                             if slice.len() >= 2 {
                                 let name_slice = &slice[2..];
-                                let name_len = name_slice.iter().position(|&b| b == 0).unwrap_or(name_slice.len());
-                                ranges.push((by_name_rva, by_name_rva.saturating_add(2 + name_len as u32 + 1)));
+                                let name_len = name_slice
+                                    .iter()
+                                    .position(|&b| b == 0)
+                                    .unwrap_or(name_slice.len());
+                                ranges.push((
+                                    by_name_rva,
+                                    by_name_rva.saturating_add(2 + name_len as u32 + 1),
+                                ));
                             }
                         }
                     }
@@ -193,8 +208,14 @@ pub(crate) fn collect_delay_import_directory_ranges(
                         if let Some(slice) = rva_to_slice(sections, by_name_rva) {
                             if slice.len() >= 2 {
                                 let name_slice = &slice[2..];
-                                let name_len = name_slice.iter().position(|&b| b == 0).unwrap_or(name_slice.len());
-                                ranges.push((by_name_rva, by_name_rva.saturating_add(2 + name_len as u32 + 1)));
+                                let name_len = name_slice
+                                    .iter()
+                                    .position(|&b| b == 0)
+                                    .unwrap_or(name_slice.len());
+                                ranges.push((
+                                    by_name_rva,
+                                    by_name_rva.saturating_add(2 + name_len as u32 + 1),
+                                ));
                             }
                         }
                     }

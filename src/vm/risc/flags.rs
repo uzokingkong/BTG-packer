@@ -102,7 +102,8 @@ impl VirtualFlags {
             flags |= VFLAG_PF;
         }
 
-        self.raw = (self.raw & !(VFLAG_CF | VFLAG_PF | VFLAG_AF | VFLAG_ZF | VFLAG_SF | VFLAG_OF)) | flags;
+        self.raw =
+            (self.raw & !(VFLAG_CF | VFLAG_PF | VFLAG_AF | VFLAG_ZF | VFLAG_SF | VFLAG_OF)) | flags;
         (res, cout)
     }
 
@@ -131,6 +132,94 @@ impl VirtualFlags {
         self.set_status(f);
         let mask = mask_for_width(width);
         a.wrapping_sub(b) & mask
+    }
+
+    /// x86 ADC — `a + b + CF`, with all status flags evaluated at `width`.
+    pub fn update_adc(&mut self, a: u64, b: u64, width: u8) -> u64 {
+        let mask = mask_for_width(width);
+        let sign = 1u64 << (width as u32 * 8 - 1);
+        let a = a & mask;
+        let b = b & mask;
+        let cin = u64::from(self.cf());
+        let wide = a as u128 + b as u128 + cin as u128;
+        let res = wide as u64 & mask;
+        let mut f = 0u64;
+        if wide > mask as u128 {
+            f |= VFLAG_CF;
+        }
+        if res == 0 {
+            f |= VFLAG_ZF;
+        }
+        if res & sign != 0 {
+            f |= VFLAG_SF;
+        }
+        if (!(a ^ b) & (a ^ res) & sign) != 0 {
+            f |= VFLAG_OF;
+        }
+        if ((a ^ b ^ res) & 0x10) != 0 {
+            f |= VFLAG_AF;
+        }
+        if (res as u8).count_ones() % 2 == 0 {
+            f |= VFLAG_PF;
+        }
+        self.set_status(f);
+        res
+    }
+
+    /// x86 SBB — `a - b - CF`, with CF representing unsigned borrow-out.
+    pub fn update_sbb(&mut self, a: u64, b: u64, width: u8) -> u64 {
+        let mask = mask_for_width(width);
+        let sign = 1u64 << (width as u32 * 8 - 1);
+        let a = a & mask;
+        let b = b & mask;
+        let bin = u64::from(self.cf());
+        let subtrahend = b as u128 + bin as u128;
+        let res = a.wrapping_sub(b).wrapping_sub(bin) & mask;
+        let mut f = 0u64;
+        if (a as u128) < subtrahend {
+            f |= VFLAG_CF;
+        }
+        if res == 0 {
+            f |= VFLAG_ZF;
+        }
+        if res & sign != 0 {
+            f |= VFLAG_SF;
+        }
+        if ((a ^ b) & (a ^ res) & sign) != 0 {
+            f |= VFLAG_OF;
+        }
+        if ((a ^ b ^ res) & 0x10) != 0 {
+            f |= VFLAG_AF;
+        }
+        if (res as u8).count_ones() % 2 == 0 {
+            f |= VFLAG_PF;
+        }
+        self.set_status(f);
+        res
+    }
+
+    /// x86 ROL. Only CF is defined for non-zero counts; OF is defined for an
+    /// effective count of one. Undefined OF for larger counts is preserved by
+    /// the reference policy so it cannot introduce a synthetic branch signal.
+    pub fn update_rol(&mut self, value: u64, count: u64, width: u8) -> u64 {
+        let bits = width as u32 * 8;
+        let masked = if width == 8 { count & 63 } else { count & 31 };
+        let effective = (masked % bits as u64) as u32;
+        let mask = mask_for_width(width);
+        let value = value & mask;
+        if effective == 0 {
+            return value;
+        }
+        let res = ((value << effective) | (value >> (bits - effective))) & mask;
+        self.set_cf((res & 1) != 0);
+        if effective == 1 {
+            let of = ((res >> (bits - 1)) ^ res) & 1 != 0;
+            self.raw &= !VFLAG_OF;
+            if of {
+                self.raw |= VFLAG_OF;
+            }
+        }
+        res
     }
 
     /// x86 ??퀎(1/2/4/8) INC ??CF 蹂댁〈.
@@ -176,7 +265,8 @@ impl VirtualFlags {
         if (res as u8).count_ones() % 2 == 0 {
             flags |= VFLAG_PF;
         }
-        self.raw = (self.raw & !(VFLAG_CF | VFLAG_PF | VFLAG_OF | VFLAG_ZF | VFLAG_SF | VFLAG_AF)) | flags;
+        self.raw =
+            (self.raw & !(VFLAG_CF | VFLAG_PF | VFLAG_OF | VFLAG_ZF | VFLAG_SF | VFLAG_AF)) | flags;
     }
 
     /// MUL/IMUL쨌DIV/IDIV ??CF/OF 留?媛깆떊 (?ㅻⅨ ?뚮옒洹몃뒗 蹂댁〈 ??x86 "undefined" ?뺤콉).
@@ -201,5 +291,39 @@ impl VirtualFlags {
         if c {
             self.raw |= VFLAG_CF;
         }
+    }
+}
+
+#[cfg(test)]
+mod adc_sbb_tests {
+    use super::*;
+
+    #[test]
+    fn adc_width_boundaries_and_flags() {
+        let mut f = VirtualFlags::new(VFLAG_CF | VFLAG_DF);
+        assert_eq!(f.update_adc(0xFF, 0, 1), 0);
+        assert!(f.cf());
+        assert!(f.zf());
+        assert_eq!(f.raw & VFLAG_DF, VFLAG_DF, "ADC must preserve DF");
+
+        let mut f = VirtualFlags::default();
+        assert_eq!(f.update_adc(0x7FFF_FFFF, 0, 4), 0x7FFF_FFFF);
+        assert!(!f.of());
+        f.raw = VFLAG_CF;
+        assert_eq!(f.update_adc(0x7FFF_FFFF, 0, 4), 0x8000_0000);
+        assert!(f.of());
+    }
+
+    #[test]
+    fn sbb_width_boundaries_and_flags() {
+        let mut f = VirtualFlags::new(VFLAG_CF);
+        assert_eq!(f.update_sbb(0, 0, 1), 0xFF);
+        assert!(f.cf());
+        assert!(f.sf());
+
+        let mut f = VirtualFlags::new(VFLAG_CF);
+        assert_eq!(f.update_sbb(0x8000_0000, 0, 4), 0x7FFF_FFFF);
+        assert!(!f.cf());
+        assert!(f.of());
     }
 }

@@ -6,13 +6,14 @@
 // bodies are byte-identical to the pre-split monolith; only imports and module
 // wiring changed.
 
-use anyhow::{Result, anyhow};
+use crate::vm::arena::Arena;
+use crate::vm::build_vm_module;
+use crate::vm::encode::encode_trampoline;
 use crate::vm::{handlers, interp};
-use iced_x86::{BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, MemoryOperand, Register};
-use crate::vm::{build_vm_module};
-use crate::vm::arena::{Arena};
-use crate::vm::encode::{encode_trampoline};
-
+use anyhow::{anyhow, Result};
+use iced_x86::{
+    BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, MemoryOperand, Register,
+};
 
 /// M3 follow-up self-test: native API bridge. The VM calls a native helper via
 /// OP_NATIVE_CALL (vreg[target] -> RAX, args v1->rcx, v2->rdx, v8->r8, v9->r9,
@@ -53,7 +54,12 @@ pub(crate) fn run_m3_bridge_test() -> Result<()> {
         Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::RDX).unwrap(),
         Instruction::with2(Code::Shl_rm64_imm8, Register::R8, 2).unwrap(),
         Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::R8).unwrap(),
-        Instruction::with2(Code::Mov_r64_rm64, Register::RCX, MemoryOperand::with_base_displ(Register::RSP, 0x28)).unwrap(),
+        Instruction::with2(
+            Code::Mov_r64_rm64,
+            Register::RCX,
+            MemoryOperand::with_base_displ(Register::RSP, 0x28),
+        )
+        .unwrap(),
         Instruction::with2(Code::Shl_rm64_imm8, Register::RCX, 3).unwrap(),
         Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::RCX).unwrap(),
         Instruction::with(Code::Retnq),
@@ -85,7 +91,8 @@ pub(crate) fn run_m3_bridge_test() -> Result<()> {
         b[0x6000..0x6000 + interp::STATE_SIZE].fill(0);
         b[0x6000 + interp::STATE_PTR_STACK..0x6000 + interp::STATE_PTR_STACK + 8]
             .copy_from_slice(&(stack_va as u64).to_le_bytes());
-        b[0x6000 + interp::STATE_SP..0x6000 + interp::STATE_SP + 8].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[0x6000 + interp::STATE_SP..0x6000 + interp::STATE_SP + 8]
+            .copy_from_slice(&0x1000u64.to_le_bytes());
         b[0x7000..0x7000 + 0x1000].fill(0);
         // v4 (RSP register) = stack_va so the bridge finds the 5th stack arg at [v4+0x20].
         b[0x6000 + interp::STATE_VREGS + 4 * 8..0x6000 + interp::STATE_VREGS + 5 * 8]
@@ -95,13 +102,33 @@ pub(crate) fn run_m3_bridge_test() -> Result<()> {
     }
     arena.call(0x8000);
     let b = arena.bytes();
-    let ret = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + 0 * 8..0x6000 + interp::STATE_VREGS + 1 * 8].try_into().unwrap());
+    let ret = u64::from_le_bytes(
+        b[0x6000 + interp::STATE_VREGS + 0 * 8..0x6000 + interp::STATE_VREGS + 1 * 8]
+            .try_into()
+            .unwrap(),
+    );
     // add4(10,20,30,40) = 10 + 2*20 + 4*30 + 8*40 = 10+40+120+320 = 490
     assert_eq!(ret, 490, "M3 native bridge returned {} (want 490)", ret);
     // v1/v2/v8 must be preserved (args), v0 clobbered by return value
-    let v1 = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + 1 * 8..0x6000 + interp::STATE_VREGS + 2 * 8].try_into().unwrap());
-    let v2 = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + 2 * 8..0x6000 + interp::STATE_VREGS + 3 * 8].try_into().unwrap());
-    let v8 = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + 8 * 8..0x6000 + interp::STATE_VREGS + 9 * 8].try_into().unwrap());
-    assert_eq!((v1, v2, v8), (10, 20, 30), "M3 native bridge clobbered arg vregs");
+    let v1 = u64::from_le_bytes(
+        b[0x6000 + interp::STATE_VREGS + 1 * 8..0x6000 + interp::STATE_VREGS + 2 * 8]
+            .try_into()
+            .unwrap(),
+    );
+    let v2 = u64::from_le_bytes(
+        b[0x6000 + interp::STATE_VREGS + 2 * 8..0x6000 + interp::STATE_VREGS + 3 * 8]
+            .try_into()
+            .unwrap(),
+    );
+    let v8 = u64::from_le_bytes(
+        b[0x6000 + interp::STATE_VREGS + 8 * 8..0x6000 + interp::STATE_VREGS + 9 * 8]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(
+        (v1, v2, v8),
+        (10, 20, 30),
+        "M3 native bridge clobbered arg vregs"
+    );
     Ok(())
 }

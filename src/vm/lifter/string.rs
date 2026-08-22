@@ -48,7 +48,7 @@ fn emit_dir_delta(b: &mut BytecodeBuilder, flags_tmp: u8, delta: u8, n: u64) {
     let done = b.new_label();
     b.get_flags(flags_tmp);
     b.test_r_imm32(flags_tmp, F_DF as u32); // ZF = (DF == 0)
-    b.jcc8(COND_JE, fwd);                    // DF clear → forward (+n)
+    b.jcc8(COND_JE, fwd); // DF clear → forward (+n)
     b.mov_r_imm64(delta, (-(n as i64)) as u64); // DF set → backward (-n)
     b.jmp8(done);
     b.mark_label(fwd);
@@ -89,7 +89,8 @@ fn has_any_rep(inst: &Instruction) -> bool {
 pub(super) fn lift_stos(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     let n = stos_lods_width(inst.code());
     let (_, store, _) = width_ops(n);
-    let rdi = 7u8; let rcx = 1u8;
+    let rdi = 7u8;
+    let rcx = 1u8;
     let single = |b: &mut BytecodeBuilder, delta: u8| {
         b.mem_store_a(store, rdi, 0);
         b.lea(rdi, rdi, delta, 0, 0);
@@ -123,7 +124,8 @@ pub(super) fn lift_stos(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
 pub(super) fn lift_lods(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     let n = stos_lods_width(inst.code());
     let (load, _, mask) = width_ops(n);
-    let rsi = 6u8; let rcx = 1u8;
+    let rsi = 6u8;
+    let rcx = 1u8;
     // x86: LODSB writes only AL, LODSW only AX â the upper bits of RAX are
     // PRESERVED (only LODSD zeroes RAX[63:32] via the EAX write, and LODSQ
     // writes all of RAX). Load into SCRATCH (zero-extended) then merge into
@@ -174,7 +176,9 @@ pub(super) fn lift_movs(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
         _ => 8,
     };
     let (load, store, _) = width_ops(n);
-    let rsi = 6u8; let rdi = 7u8; let rcx = 1u8;
+    let rsi = 6u8;
+    let rdi = 7u8;
+    let rcx = 1u8;
     let single = |b: &mut BytecodeBuilder, delta: u8| {
         b.mem_load_a(load, SCRATCH, rsi);
         b.mem_store_a(store, rdi, SCRATCH);
@@ -222,7 +226,8 @@ fn cmp_sub(b: &mut BytecodeBuilder, n: u64, lhs: u8, rhs: u8) {
 ///   * SCAS: lhs = accumulator (vreg0, masked), rhs = [rdi]
 ///   * CMPS: lhs = [rsi]  (masked), rhs = [rdi]
 fn rep_cmp_operands(b: &mut BytecodeBuilder, n: u64, is_cmps: bool) {
-    let rsi = 6u8; let rdi = 7u8;
+    let rsi = 6u8;
+    let rdi = 7u8;
     let (load, _, mask) = width_ops(n);
     // The width loads zero-extend, so memory operands are already masked; the
     // accumulator (vreg0) must be masked down to the element width for SCAS.
@@ -232,13 +237,19 @@ fn rep_cmp_operands(b: &mut BytecodeBuilder, n: u64, is_cmps: bool) {
         b.mov_r_r64(TMP3, 0);
     } else {
         b.mov_r_r(TMP3, 0);
-        if mask != 0xFFFF_FFFF { b.binop_r_imm32(OP_AND_R_IMM32, TMP3, mask); }
+        if mask != 0xFFFF_FFFF {
+            b.binop_r_imm32(OP_AND_R_IMM32, TMP3, mask);
+        }
     }
     b.mem_load_a(load, TMP4, rdi);
     // Compare through a scratch copy: SUB clobbers its destination, and TMP3
     // must survive so REP loops can regenerate the final compare's exact
     // flags on exit (`fix_flags`).
-    if is64(n) { b.mov_r_r64(SCRATCH, TMP3); } else { b.mov_r_r(SCRATCH, TMP3); }
+    if is64(n) {
+        b.mov_r_r64(SCRATCH, TMP3);
+    } else {
+        b.mov_r_r(SCRATCH, TMP3);
+    }
     cmp_sub(b, n, SCRATCH, TMP4);
 }
 
@@ -254,7 +265,8 @@ fn rep_cmp_operands(b: &mut BytecodeBuilder, n: u64, is_cmps: bool) {
 /// entry (DF is loop-invariant — only the lifted CLD/STD change it).
 pub(super) fn lift_scas(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     let n = scas_cmps_width(inst.code());
-    let rdi = 7u8; let rcx = 1u8;
+    let rdi = 7u8;
+    let rcx = 1u8;
     if !has_any_rep(inst) {
         // Direction via a delta vreg before the compare; the compare's flags are
         // the instruction result and the LEA bump (by delta) does not clobber them.
@@ -276,7 +288,7 @@ pub(super) fn lift_scas(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
     b.jcc8(COND_JE, zero_exit);
     // DF dispatch — test the saved entry flags (TMP4 still holds them here).
     b.test_r_imm32(TMP4, F_DF as u32); // ZF = (DF == 0)
-    b.jcc8(COND_JNE, bwd_loop);        // DF set → backward
+    b.jcc8(COND_JNE, bwd_loop); // DF set → backward
     b.mark_label(fwd_loop);
     rep_cmp_operands(b, n, false);
     // Capture the ZF-stop decision BEFORE any flag-clobbering bookkeeping.
@@ -315,7 +327,9 @@ pub(super) fn lift_scas(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
 /// v64: 위 SCAS 와 동일한 종료 플래그/0-count 정합.
 pub(super) fn lift_cmps(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     let n = scas_cmps_width(inst.code());
-    let rsi = 6u8; let rdi = 7u8; let rcx = 1u8;
+    let rsi = 6u8;
+    let rdi = 7u8;
+    let rcx = 1u8;
     if !has_any_rep(inst) {
         emit_dir_delta(b, TMP4, SCRATCH2, n);
         rep_cmp_operands(b, n, true);
@@ -334,7 +348,7 @@ pub(super) fn lift_cmps(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
     b.test_r_r32(rcx, rcx);
     b.jcc8(COND_JE, zero_exit);
     b.test_r_imm32(TMP4, F_DF as u32); // ZF = (DF == 0)
-    b.jcc8(COND_JNE, bwd_loop);        // DF set → backward
+    b.jcc8(COND_JNE, bwd_loop); // DF set → backward
     b.mark_label(fwd_loop);
     rep_cmp_operands(b, n, true);
     b.setcc(SCRATCH2, exit_cond.unwrap_or(COND_JNE));

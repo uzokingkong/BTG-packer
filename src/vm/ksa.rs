@@ -38,7 +38,6 @@
 // EDI = j, EAX/ECX temps, R8D=k1, R9D=k2, R10D=k3.
 // ==============================================================================
 
-
 use iced_x86::{Code, Instruction, MemoryOperand, Register};
 
 /// v10: 비선형 RC4 키 믹스 (단일 소스 — 패커/부트 스텁/VM 공유).
@@ -67,13 +66,25 @@ pub struct KsaInstr {
 
 impl KsaInstr {
     fn plain(inst: Instruction) -> Self {
-        Self { inst, label: None, target: None }
+        Self {
+            inst,
+            label: None,
+            target: None,
+        }
     }
     fn labeled(inst: Instruction, label: KsaLabel) -> Self {
-        Self { inst, label: Some(label), target: None }
+        Self {
+            inst,
+            label: Some(label),
+            target: None,
+        }
     }
     fn branch(inst: Instruction, target: KsaLabel) -> Self {
-        Self { inst, label: None, target: Some(target) }
+        Self {
+            inst,
+            label: None,
+            target: Some(target),
+        }
     }
 }
 
@@ -91,11 +102,16 @@ pub fn build_ksa_instructions(seed_va: u64, k1: u32, k2: u32, k3: u32) -> Vec<Ks
         Instruction::with2(Code::Mov_rm8_r8, sbox(Register::RSI), Register::SIL).unwrap(),
         KsaLabel::InitLoop,
     ));
-    v.push(KsaInstr::plain(Instruction::with1(Code::Inc_rm32, Register::ESI).unwrap()));
+    v.push(KsaInstr::plain(
+        Instruction::with1(Code::Inc_rm32, Register::ESI).unwrap(),
+    ));
     v.push(KsaInstr::plain(
         Instruction::with2(Code::Cmp_rm32_imm32, Register::ESI, 0x100).unwrap(),
     ));
-    v.push(KsaInstr::branch(Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(), KsaLabel::InitLoop));
+    v.push(KsaInstr::branch(
+        Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(),
+        KsaLabel::InitLoop,
+    ));
 
     // ── KSA: j=0, key derivation + swap ──────────────────────────────────────
     v.push(KsaInstr::plain(
@@ -117,10 +133,14 @@ pub fn build_ksa_instructions(seed_va: u64, k1: u32, k2: u32, k3: u32) -> Vec<Ks
     // 변하며, 같은 k1/k2/k3로는 항상 동일해 sizing/최종 패스 길이가 일치한다.
     // xorshift32(k1^k2^k3) 결정적 PRNG로 salt 생성.
     let mut xr = k1 ^ k2.rotate_left(7) ^ k3.rotate_left(13);
-    xr ^= xr << 13; xr ^= xr >> 17; xr ^= xr << 5;
+    xr ^= xr << 13;
+    xr ^= xr >> 17;
+    xr ^= xr << 5;
     let p1a = xr.wrapping_mul(0xA5A5_5A5Au32);
     let mut xr2 = xr.wrapping_add(0x9E37_79B9u32);
-    xr2 ^= xr2 << 13; xr2 ^= xr2 >> 17; xr2 ^= xr2 << 5;
+    xr2 ^= xr2 << 13;
+    xr2 ^= xr2 >> 17;
+    xr2 ^= xr2 << 5;
     let p1b = xr2 | 1u32;
     let p1x = p1a ^ p1b;
     let p1adj = k1.wrapping_sub(p1x);
@@ -141,10 +161,14 @@ pub fn build_ksa_instructions(seed_va: u64, k1: u32, k2: u32, k3: u32) -> Vec<Ks
     ));
     // k2 = (p2a + p2b) ^ p2c
     let mut xr3 = xr2.wrapping_add(0xDEAD_BEEFu32);
-    xr3 ^= xr3 << 13; xr3 ^= xr3 >> 17; xr3 ^= xr3 << 5;
+    xr3 ^= xr3 << 13;
+    xr3 ^= xr3 >> 17;
+    xr3 ^= xr3 << 5;
     let p2a = xr3 | 1u32;
     let mut xr4 = xr3.wrapping_add(0x0BAD_1234u32);
-    xr4 ^= xr4 << 13; xr4 ^= xr4 >> 17; xr4 ^= xr4 << 5;
+    xr4 ^= xr4 << 13;
+    xr4 ^= xr4 >> 17;
+    xr4 ^= xr4 << 5;
     let p2b = xr4 | 1u32;
     let p2c = (p2a.wrapping_add(p2b)) ^ k2;
     v.push(KsaInstr::plain(
@@ -164,10 +188,14 @@ pub fn build_ksa_instructions(seed_va: u64, k1: u32, k2: u32, k3: u32) -> Vec<Ks
     ));
     // k3 = (p3a + p3b) + p3adj   (이중 덧셈 분해)
     let mut xr5 = xr4.wrapping_add(0x55AA_55AAu32);
-    xr5 ^= xr5 << 13; xr5 ^= xr5 >> 17; xr5 ^= xr5 << 5;
+    xr5 ^= xr5 << 13;
+    xr5 ^= xr5 >> 17;
+    xr5 ^= xr5 << 5;
     let p3a = xr5 | 1u32;
     let mut xr6 = xr5.wrapping_add(0xAA55_AA55u32);
-    xr6 ^= xr6 << 13; xr6 ^= xr6 >> 17; xr6 ^= xr6 << 5;
+    xr6 ^= xr6 << 13;
+    xr6 ^= xr6 >> 17;
+    xr6 ^= xr6 << 5;
     let p3b = xr6 | 1u32;
     let p3adj = k3.wrapping_sub(p3a.wrapping_add(p3b));
     v.push(KsaInstr::plain(
@@ -206,18 +234,24 @@ pub fn build_ksa_instructions(seed_va: u64, k1: u32, k2: u32, k3: u32) -> Vec<Ks
     v.push(KsaInstr::plain(
         Instruction::with2(Code::Add_rm32_r32, Register::ECX, Register::R10D).unwrap(),
     )); // ecx += k3
-    v.push(KsaInstr::plain(Instruction::with2(Code::Rol_rm32_imm8, Register::ECX, 5).unwrap()));
+    v.push(KsaInstr::plain(
+        Instruction::with2(Code::Rol_rm32_imm8, Register::ECX, 5).unwrap(),
+    ));
     v.push(KsaInstr::plain(
         Instruction::with2(Code::Mov_r32_rm32, Register::EAX, Register::ESI).unwrap(),
     ));
-    v.push(KsaInstr::plain(Instruction::with2(Code::Rol_rm32_imm8, Register::EAX, 9).unwrap()));
+    v.push(KsaInstr::plain(
+        Instruction::with2(Code::Rol_rm32_imm8, Register::EAX, 9).unwrap(),
+    ));
     v.push(KsaInstr::plain(
         Instruction::with2(Code::Imul_r32_rm32, Register::EAX, Register::R10D).unwrap(),
     )); // rol(i,9)*k3
     v.push(KsaInstr::plain(
         Instruction::with2(Code::Xor_rm32_r32, Register::ECX, Register::EAX).unwrap(),
     ));
-    v.push(KsaInstr::plain(Instruction::with2(Code::Ror_rm32_imm8, Register::ECX, 7).unwrap()));
+    v.push(KsaInstr::plain(
+        Instruction::with2(Code::Ror_rm32_imm8, Register::ECX, 7).unwrap(),
+    ));
     // key byte = seed_masked[i] ^ mix(i)
     v.push(KsaInstr::plain(
         Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, seed(Register::RSI)).unwrap(),
@@ -244,7 +278,9 @@ pub fn build_ksa_instructions(seed_va: u64, k1: u32, k2: u32, k3: u32) -> Vec<Ks
     v.push(KsaInstr::plain(
         Instruction::with2(Code::Mov_rm8_r8, sbox(Register::RSI), Register::CL).unwrap(),
     ));
-    v.push(KsaInstr::plain(Instruction::with1(Code::Inc_rm32, Register::ESI).unwrap()));
+    v.push(KsaInstr::plain(
+        Instruction::with1(Code::Inc_rm32, Register::ESI).unwrap(),
+    ));
     v.push(KsaInstr::plain(
         Instruction::with2(Code::Cmp_rm32_imm32, Register::ESI, 0x100).unwrap(),
     ));

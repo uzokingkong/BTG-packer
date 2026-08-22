@@ -44,9 +44,9 @@ mod xmm;
 
 // ── Public surface (unchanged from the pre-split interp.rs) ─────────────────
 pub use state::{
-    CALL_STACK_SIZE, NREG, STATE_CALL_SP, STATE_CALL_STACK_BUF, STATE_FLAGS, STATE_PTR_BUF,
-    STATE_PTR_CALL_STACK, STATE_PTR_RUNS, STATE_PTR_SBOX, STATE_PTR_SEED, STATE_PTR_STACK,
-    STATE_RIP, STATE_SEG_GS, STATE_SP, STATE_SIZE, STATE_VREGS, STATE_XMM, VmError,
+    VmError, CALL_STACK_SIZE, NREG, STATE_CALL_SP, STATE_CALL_STACK_BUF, STATE_FLAGS,
+    STATE_PTR_BUF, STATE_PTR_CALL_STACK, STATE_PTR_RUNS, STATE_PTR_SBOX, STATE_PTR_SEED,
+    STATE_PTR_STACK, STATE_RIP, STATE_SEG_GS, STATE_SIZE, STATE_SP, STATE_VREGS, STATE_XMM,
 };
 
 /// Interpret `code` starting at ip=0.
@@ -63,7 +63,11 @@ pub fn interpret(state: &mut [u8], mem: &mut [u8], code: &[u8]) -> Result<(), Vm
         // 잘린 바이트코드가 들어오면 Rust panic 이 났다. opcode 의 고정 피연산자
         // 길이(opcode_operand_len)로 미리 범위를 확인해 `VmError::OobIp` 로 돌린다.
         if let Some(olen) = opcode_operand_len(op) {
-            if ip.checked_add(olen).map(|end| end > code.len()).unwrap_or(true) {
+            if ip
+                .checked_add(olen)
+                .map(|end| end > code.len())
+                .unwrap_or(true)
+            {
                 return Err(VmError::OobIp(ip));
             }
         }

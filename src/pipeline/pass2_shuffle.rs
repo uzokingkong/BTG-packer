@@ -44,7 +44,16 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
     //     (build_dispatcher_reencrypt(_c1)은 unit-test용으로만 남겨 둔다.)
     let dispatcher_size = if ctx.reencrypt {
         if ctx.custom_cipher {
-            crate::dispatcher::build_dispatcher_m7_c1(0, 0, num_blocks, ctx.mba_constant, true, 0, 0)?.len()
+            crate::dispatcher::build_dispatcher_m7_c1(
+                0,
+                0,
+                num_blocks,
+                ctx.mba_constant,
+                true,
+                0,
+                0,
+            )?
+            .len()
         } else {
             crate::dispatcher::build_dispatcher_m7(0, 0, num_blocks, ctx.mba_constant, true)?.len()
         }
@@ -67,7 +76,11 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
     // S2: 상태 테이블 예약도 `ctx.m7` 대신 `ctx.reencrypt` 기준으로 통일.
     // v61(+custom-cipher): C1 상태 버퍼(0x80) + S-box 상수 테이블(0x100)을
     // 테이블 직후(first_block_offset 직전)에 예약한다 (reencrypt/m7 per-block).
-    let c1_reserve = if ctx.reencrypt && ctx.custom_cipher { 0x180 } else { 0 };
+    let c1_reserve = if ctx.reencrypt && ctx.custom_cipher {
+        0x180
+    } else {
+        0
+    };
     let required_table_end = table_offset
         + num_blocks * 4
         + if ctx.reencrypt { num_blocks * 4 } else { 0 }
@@ -78,7 +91,8 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
     debug_assert!(
         first_block_offset > table_offset,
         "first_block_offset (0x{:X}) must exceed table_offset (0x{:X})",
-        first_block_offset, table_offset
+        first_block_offset,
+        table_offset
     );
     debug_assert!(
         table_offset > 0x20,
@@ -86,7 +100,8 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         table_offset
     );
 
-    let shuffled_layout = LayoutShuffler::shuffle(ctx.trigger_blocks.clone(), first_block_offset, &mut ctx.rng);
+    let shuffled_layout =
+        LayoutShuffler::shuffle(ctx.trigger_blocks.clone(), first_block_offset, &mut ctx.rng);
 
     println!(
         "[+] Pass 2 Complete: table_offset=0x{:X}, first_block_offset=0x{:X}, {} blocks shuffled.",

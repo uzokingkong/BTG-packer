@@ -1,0 +1,43 @@
+BTG-Packer integrity/value-check hardening — source-change summary (task 0a7814fac57a4897a86affb4a9c5d19d)
+
+Changed files (source):
+  - src/pipeline/crypto/integrity.rs
+      * site 1 (emit_integrity_crc): replaced the `cmp [stored]` value check with an
+        `xor`-based one that leaves V1 = computed ^ stored in EAX (sets ZF) and copies
+        it into R14 as a runtime-derived "poison key". The `je`/`ud2` trap stays, but
+        patching that single branch no longer bypasses integrity: R14 != 0 poisons the
+        string-run / import-resolve decrypt (crash on tamper).
+      * MAC preamble now saves the runtime-derived whiten W32 to a scratch slot
+        (w32_slot_va) so the later sites can reuse it after R15 is clobbered.
+      * added S3 emit_integrity_crc3 (after IAT resolve, whiten = W32) and
+        S4 emit_integrity_crc4 (before dispatcher entry, whiten = rol(W32,13)).
+        Total integrity decision sites: 5 (MAC + CRC1..CRC4) spread across the boot.
+  - src/pipeline/crypto/bootstub/emit.rs
+      * emit_run_decrypt: added a poison loop after each run Prga that XORs the run
+        bytes with the rotating 4 bytes of R14 (V1). Legit V1=0 -> no-op; tamper ->
+        every run/resolve table is corrupted regardless of any branch patch.
+      * added trashformer_mixing_loop(seed): a real-working ARX mixing loop over the
+        S-box frame whose count is seed-derived 1..256 (always nonzero), structurally
+        identical to a real checksum/decrypt loop so a static analyst cannot cheaply
+        separate fake from real paths (removes the "dead path entered with length=0"
+        giveaway).
+  - src/pipeline/crypto/bootstub/ctx.rs
+      * BootStubCtx fields: crc3_va, crc4_va, w32_slot_va.
+      * Label enum: Crc3Done/Crc3Ok, Crc4Done/Crc4Ok, PoisonLoop/PoisonDone, JunkMixLoop.
+  - src/pipeline/crypto/bootstub/build.rs
+      * emit_integrity_crc3 after IAT resolve; emit_integrity_crc4 before dispatcher
+        entry; insert trashformer_mixing_loop alongside trashformer_junk in the prologue.
+  - src/pipeline/crypto/place/mod.rs
+      * stub VA layout: crc3_va=seed_off+276, crc4_va=seed_off+280, w32_slot_va=seed_off+272.
+      * stored values: crc3_stored = crc ^ W32, crc4_stored = crc ^ rol(W32,13);
+        w32_slot written 0 (runtime scratch).
+  - src/pipeline/crypto/tests.rs
+      * BootStubCtx literals updated with the new fields (and the pre-existing WIP
+        `desc_used` field that was already missing).
+
+Verify on node:
+  - cargo build --release            -> clean (0 errors)
+  - cargo test --lib pipeline::crypto:: -> 22 passed / 0 failed
+  - cargo test --lib vm::            -> 285 passed / 0 failed
+  - pack dummy_target.exe --integrity -> legit run exit 0; 1-byte tamper -> crash;
+    packed boot stub shows 5 ud2 trap sites (was 3).

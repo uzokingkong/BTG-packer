@@ -11,14 +11,25 @@ fn analyze_text_lift_dummy_target_reports_coverage() {
     let info = TargetPeInfo::parse(&dummy).unwrap();
     let base_va = info.image_base + info.text_rva as u64;
     let ep_va = info.image_base + info.entry_point_rva as u64;
-    let report =
-        analyze_text_lift(&info.text_bytes, base_va, ep_va, &info.relayed_sections, info.image_base)
-            .unwrap();
+    let report = analyze_text_lift(
+        &info.text_bytes,
+        base_va,
+        ep_va,
+        &info.relayed_sections,
+        info.image_base,
+    )
+    .unwrap();
     if info.text_bytes.is_empty() {
         return;
     }
-    assert!(report.total_blocks > 0, "CFG should find at least one block");
-    assert_eq!(report.total_instructions, report.liftable_instructions + report.unsupported_instructions);
+    assert!(
+        report.total_blocks > 0,
+        "CFG should find at least one block"
+    );
+    assert_eq!(
+        report.total_instructions,
+        report.liftable_instructions + report.unsupported_instructions
+    );
     assert!((0.0..=1.0).contains(&report.coverage()));
     // 각 블록 합이 총 명령 수와 일치
     let block_sum: usize = report.blocks.iter().map(|b| b.instructions).sum();

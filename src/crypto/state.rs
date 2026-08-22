@@ -72,8 +72,14 @@ impl BtgCipher {
             // 32바이트를 초과하는 키는 256-bit 상태(8×u32)에 전체 키 바이트를 흡수 및
             // 비선형 라운드 압축하여 모든 바이트의 엔트로피를 보존한다.
             let mut h = [
-                0x6A09_E667u32, 0xBB67_AE85, 0x3C6E_F372, 0xA54F_F53A,
-                0x510E_527F, 0x9B05_688C, 0x1F83_D9AB, 0x5BE0_CD19,
+                0x6A09_E667u32,
+                0xBB67_AE85,
+                0x3C6E_F372,
+                0xA54F_F53A,
+                0x510E_527F,
+                0x9B05_688C,
+                0x1F83_D9AB,
+                0x5BE0_CD19,
             ];
             for (chunk_idx, chunk) in key.chunks(32).enumerate() {
                 for (i, &b) in chunk.iter().enumerate() {
@@ -82,7 +88,9 @@ impl BtgCipher {
                     h[w_idx] ^= (b as u32) << shift;
                 }
                 for i in 0..8 {
-                    let mut z = h[i].wrapping_add(0x9E37_79B9).wrapping_add(chunk_idx as u32);
+                    let mut z = h[i]
+                        .wrapping_add(0x9E37_79B9)
+                        .wrapping_add(chunk_idx as u32);
                     z = (z ^ (z >> 16)).wrapping_mul(0x85EB_CA6B);
                     z = (z ^ (z >> 13)).wrapping_mul(0xC2B2_AE35);
                     z ^= z >> 16;

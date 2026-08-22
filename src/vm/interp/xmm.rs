@@ -2,7 +2,7 @@
 // BTG v21 - VM Interpreter: XMM moves / shuffles / packed shifts / PINSRW
 // ==============================================================================
 
-use super::state::{VmError, STATE_XMM, mem_get, mem_put, set_vreg64, vreg32, vreg64};
+use super::state::{mem_get, mem_put, set_vreg64, vreg32, vreg64, VmError, STATE_XMM};
 use crate::vm::bytecode::*;
 
 /// Execute one XMM opcode. `ip` points at the first operand byte (opcode
@@ -29,7 +29,12 @@ pub(crate) fn exec(
             let xmm = code[ip] as usize;
             let addr = vreg64(state, code[ip + 1] as usize)? as usize;
             let ip = ip + 2;
-            let v = u64::from_le_bytes(mem_get(mem, addr, 8).ok_or(VmError::OobMem)?.try_into().unwrap());
+            let v = u64::from_le_bytes(
+                mem_get(mem, addr, 8)
+                    .ok_or(VmError::OobMem)?
+                    .try_into()
+                    .unwrap(),
+            );
             let base = STATE_XMM + xmm * 16;
             state[base..base + 8].copy_from_slice(&v.to_le_bytes());
             state[base + 8..base + 16].fill(0);
@@ -136,7 +141,11 @@ pub(crate) fn exec(
             for lane in 0..2 {
                 let off = db + lane * 8;
                 let v = u64::from_le_bytes(state[off..off + 8].try_into().unwrap());
-                let r = if shl { v.wrapping_shl(cnt) } else { v.wrapping_shr(cnt) };
+                let r = if shl {
+                    v.wrapping_shl(cnt)
+                } else {
+                    v.wrapping_shr(cnt)
+                };
                 state[off..off + 8].copy_from_slice(&r.to_le_bytes());
             }
             Ok(ip)
@@ -177,7 +186,8 @@ pub(crate) fn exec(
                 // pshufd: 4 dwords shuffled
                 let mut d = [0u32; 4];
                 for i in 0..4 {
-                    d[i] = u32::from_le_bytes(state[sb + i * 4..sb + i * 4 + 4].try_into().unwrap());
+                    d[i] =
+                        u32::from_le_bytes(state[sb + i * 4..sb + i * 4 + 4].try_into().unwrap());
                 }
                 let mut nd = d;
                 for i in 0..4 {
@@ -194,8 +204,8 @@ pub(crate) fn exec(
         // Scalar FP arithmetic: xmm[dst].low = xmm[dst].low OP xmm[src].low;
         // all other bytes of dst are preserved. No status flags are touched
         // (x86 SSE scalar FP writes MXCSR, not rflags).
-        OP_ADDSS_XMM | OP_ADDSD_XMM | OP_SUBSS_XMM | OP_SUBSD_XMM
-        | OP_MULSS_XMM | OP_MULSD_XMM | OP_DIVSS_XMM | OP_DIVSD_XMM => {
+        OP_ADDSS_XMM | OP_ADDSD_XMM | OP_SUBSS_XMM | OP_SUBSD_XMM | OP_MULSS_XMM | OP_MULSD_XMM
+        | OP_DIVSS_XMM | OP_DIVSD_XMM => {
             let dst = code[ip] as usize;
             let src = code[ip + 1] as usize;
             let ip = ip + 2;

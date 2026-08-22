@@ -8,6 +8,7 @@
 // 인터프리터 실행 결과와 완전히 일치한다 (T1-4 "네이티브↔폴리모픽 동치").
 // ==============================================================================
 
+use super::architecture_family::VmArchitectureFamily;
 use super::isa_spec::VirtualIsaSpec;
 use super::rolling_key::RollingKeyEngine;
 use crate::vm::risc::{BranchCondition, MicroInstr, MicroOperand, RiscOp, RiscProgram};
@@ -27,8 +28,12 @@ pub struct PolymorphicDecoder {
 
 impl PolymorphicDecoder {
     pub fn new(seed: u64) -> Self {
+        Self::new_for_family(seed, VmArchitectureFamily::for_build(seed))
+    }
+
+    pub fn new_for_family(seed: u64, family: VmArchitectureFamily) -> Self {
         Self {
-            spec: VirtualIsaSpec::from_seed(seed),
+            spec: VirtualIsaSpec::from_seed_and_family(seed, family),
             rolling: RollingKeyEngine::new(seed),
         }
     }
@@ -60,18 +65,29 @@ impl PolymorphicDecoder {
                 .reverse_opcode_map
                 .get(&raw_op)
                 .cloned()
-                .ok_or_else(|| anyhow!("poly decoder: unknown decrypted opcode 0x{raw_op:02X} at offset 0x{vip:X} (enc byte 0x{:02X}) after {} instrs", bytecode[vip - 1], instrs.len()))?;
+                .ok_or_else(|| {
+                    anyhow!(super::DecodeError::InvalidOpcode {
+                        byte: raw_op,
+                        at: vip
+                    })
+                })?;
 
             // 1b. 조건 바이트 — VirtualBranch·Setcc·ConditionalMove (opcode 직후)
             let cond = if let RiscOp::VirtualBranch { .. }
             | RiscOp::Setcc { .. }
             | RiscOp::ConditionalMove { .. } = risc_op
             {
+                if vip >= bytecode.len() {
+                    return Err(anyhow!(super::DecodeError::TruncatedOpcode { at: vip }));
+                }
                 let raw_cond = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
                 vip += 1;
-                self.spec
-                    .decode_cond(raw_cond)
-                    .ok_or_else(|| anyhow!("poly decoder: unknown branch cond 0x{raw_cond:02X} at offset 0x{vip:X}"))?
+                self.spec.decode_cond(raw_cond).ok_or_else(|| {
+                    anyhow!(super::DecodeError::InvalidCondition {
+                        byte: raw_cond,
+                        at: vip
+                    })
+                })?
             } else {
                 BranchCondition::Always
             };
@@ -83,7 +99,7 @@ impl PolymorphicDecoder {
             };
 
             if vip + 3 > bytecode.len() {
-                break;
+                return Err(anyhow!(super::DecodeError::TruncatedOperand { at: vip }));
             }
             let op_dst = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
             vip += 1;
@@ -94,24 +110,26 @@ impl PolymorphicDecoder {
 
             // 2. Immediates (src == Imm64 일 때 8B)
             let imm1 = if op_src1 == 0x01 {
+                if vip + 8 > bytecode.len() {
+                    return Err(anyhow!(super::DecodeError::TruncatedImmediate { at: vip }));
+                }
                 let mut b = [0u8; 8];
                 for i in 0..8 {
-                    if vip < bytecode.len() {
-                        b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
-                        vip += 1;
-                    }
+                    b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
+                    vip += 1;
                 }
                 u64::from_le_bytes(b) ^ self.spec.operand_mask
             } else {
                 0
             };
             let imm2 = if op_src2 == 0x01 {
+                if vip + 8 > bytecode.len() {
+                    return Err(anyhow!(super::DecodeError::TruncatedImmediate { at: vip }));
+                }
                 let mut b = [0u8; 8];
                 for i in 0..8 {
-                    if vip < bytecode.len() {
-                        b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
-                        vip += 1;
-                    }
+                    b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
+                    vip += 1;
                 }
                 u64::from_le_bytes(b) ^ self.spec.operand_mask
             } else {
@@ -119,12 +137,13 @@ impl PolymorphicDecoder {
             };
             // cin (AddWithCarry 이고 즉시 피연산자 없을 때 8B) — 인터프리터와 동일 규칙.
             let cin = if op_src1 != 0x01 && op_src2 != 0x01 && risc_op == RiscOp::AddWithCarry {
+                if vip + 8 > bytecode.len() {
+                    return Err(anyhow!(super::DecodeError::TruncatedImmediate { at: vip }));
+                }
                 let mut b = [0u8; 8];
                 for i in 0..8 {
-                    if vip < bytecode.len() {
-                        b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
-                        vip += 1;
-                    }
+                    b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
+                    vip += 1;
                 }
                 u64::from_le_bytes(b) ^ self.spec.operand_mask
             } else {
@@ -133,18 +152,22 @@ impl PolymorphicDecoder {
 
             // VirtualBranch 절대-인덱스 타깃 (src1 이 없으면 8B 즉시값). src1 은 0x00 으로
             // 부호화되므로 `op_src1 == 0x00` 이 곧 "src1 없음" 과 동치다.
-            let branch_target = if matches!(risc_op, RiscOp::VirtualBranch { .. }) && op_src1 == 0x00 {
-                let mut b = [0u8; 8];
-                for i in 0..8 {
-                    if vip < bytecode.len() {
+            let branch_target =
+                if matches!(risc_op, RiscOp::VirtualBranch { .. }) && op_src1 == 0x00 {
+                    if vip + 8 > bytecode.len() {
+                        return Err(anyhow!(super::DecodeError::TruncatedBranchTarget {
+                            at: vip
+                        }));
+                    }
+                    let mut b = [0u8; 8];
+                    for i in 0..8 {
                         b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
                         vip += 1;
                     }
-                }
-                u64::from_le_bytes(b) ^ self.spec.operand_mask
-            } else {
-                0
-            };
+                    u64::from_le_bytes(b) ^ self.spec.operand_mask
+                } else {
+                    0
+                };
 
             let decode_op = |raw: u8| -> Option<MicroOperand> {
                 let kind = raw & 0xC0;
@@ -191,7 +214,10 @@ impl PolymorphicDecoder {
                 break;
             }
             if instrs.len() > MAX_DECODE_INSTRS {
-                break;
+                return Err(anyhow!(super::DecodeError::InstructionLimitExceeded {
+                    limit: MAX_DECODE_INSTRS,
+                    at: vip,
+                }));
             }
         }
 
@@ -210,10 +236,26 @@ mod tests {
     fn test_poly_decode_roundtrip_op_list() {
         let seed = 0x8899AABBCCDDEEFF;
         let mut d = RiscDesynthesizer::new();
-        d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(1200), MicroOperand::Imm64(0));
-        d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(450), MicroOperand::Imm64(0));
-        d.emit_sub(MicroOperand::VReg(0), MicroOperand::VReg(0), MicroOperand::VReg(1));
-        d.emit_xor(MicroOperand::VReg(0), MicroOperand::VReg(0), MicroOperand::Imm64(0x55));
+        d.emit_add(
+            MicroOperand::VReg(0),
+            MicroOperand::Imm64(1200),
+            MicroOperand::Imm64(0),
+        );
+        d.emit_add(
+            MicroOperand::VReg(1),
+            MicroOperand::Imm64(450),
+            MicroOperand::Imm64(0),
+        );
+        d.emit_sub(
+            MicroOperand::VReg(0),
+            MicroOperand::VReg(0),
+            MicroOperand::VReg(1),
+        );
+        d.emit_xor(
+            MicroOperand::VReg(0),
+            MicroOperand::VReg(0),
+            MicroOperand::Imm64(0x55),
+        );
         d.instrs.push(MicroInstr::new(RiscOp::Halt));
         let prog = RiscProgram::new(d.instrs);
 

@@ -6,7 +6,7 @@
 // 32 & 64), ROL/ROR, INC/DEC, CMP/TEST, NEG/NOT, BSWAP, BSR/BSF, TZCNT, SETCC
 // and the CPUID / XGETBV bridge.
 
-use super::state::{VmError, flags_of, set_flags, set_vreg64, vreg32, vreg64};
+use super::state::{flags_of, set_flags, set_vreg64, vreg32, vreg64, VmError};
 use crate::vm::bytecode::*;
 use crate::vm::flags;
 
@@ -177,13 +177,17 @@ pub(crate) fn exec(
             let ip = ip + 2;
             let a = vreg64(state, d)?;
             let b = vreg64(state, s)?;
-            set_vreg64(state, d, match op {
-                OP_ADD_R_R64 => a.wrapping_add(b),
-                OP_SUB_R_R64 => a.wrapping_sub(b),
-                OP_XOR_R_R64 => a ^ b,
-                OP_AND_R_R64 => a & b,
-                _ => a.wrapping_mul(b),
-            })?;
+            set_vreg64(
+                state,
+                d,
+                match op {
+                    OP_ADD_R_R64 => a.wrapping_add(b),
+                    OP_SUB_R_R64 => a.wrapping_sub(b),
+                    OP_XOR_R_R64 => a ^ b,
+                    OP_AND_R_R64 => a & b,
+                    _ => a.wrapping_mul(b),
+                },
+            )?;
             if op != OP_IMUL_R_R64 {
                 let fl = match op {
                     OP_ADD_R_R64 => flags::add_flags64(a, b),
@@ -191,7 +195,11 @@ pub(crate) fn exec(
                     _ => flags::logical_flags64(a & b), // AND
                 };
                 // XOR uses the combined result
-                let fl = if op == OP_XOR_R_R64 { flags::logical_flags64(a ^ b) } else { fl };
+                let fl = if op == OP_XOR_R_R64 {
+                    flags::logical_flags64(a ^ b)
+                } else {
+                    fl
+                };
                 set_flags(state, fl);
             } else {
                 // P0-⑤: 2/3-op IMUL64 sets CF/OF iff the signed product doesn't
@@ -266,7 +274,10 @@ pub(crate) fn exec(
             let a = code[ip] as usize;
             let b = code[ip + 1] as usize;
             let ip = ip + 2;
-            set_flags(state, flags::logical_flags(vreg32(state, a)? & vreg32(state, b)?));
+            set_flags(
+                state,
+                flags::logical_flags(vreg32(state, a)? & vreg32(state, b)?),
+            );
             Ok(ip)
         }
         OP_TEST_R_IMM32 => {
@@ -390,8 +401,16 @@ pub(crate) fn exec(
             let sr = code[ip + 1] as usize;
             let ip = ip + 2;
             let is64 = op == OP_LZCNT_R64;
-            let v = if is64 { vreg64(state, sr)? } else { vreg32(state, sr)? as u64 };
-            let lz = if is64 { v.leading_zeros() as u64 } else { (v as u32).leading_zeros() as u64 };
+            let v = if is64 {
+                vreg64(state, sr)?
+            } else {
+                vreg32(state, sr)? as u64
+            };
+            let lz = if is64 {
+                v.leading_zeros() as u64
+            } else {
+                (v as u32).leading_zeros() as u64
+            };
             set_vreg64(state, d, lz)?;
             // Real x86 (probe-verified): CF=1 iff src==0; ZF follows the RESULT
             // (lzcnt(0)=width → ZF=0; lzcnt(msb-set)=0 → ZF=1). OF/SF/AF cleared.
@@ -405,10 +424,22 @@ pub(crate) fn exec(
             let sr = code[ip + 1] as usize;
             let ip = ip + 2;
             let is64 = op == OP_POPCNT_R64;
-            let v = if is64 { vreg64(state, sr)? } else { vreg32(state, sr)? as u64 };
-            let pc = if is64 { v.count_ones() as u64 } else { (v as u32).count_ones() as u64 };
+            let v = if is64 {
+                vreg64(state, sr)?
+            } else {
+                vreg32(state, sr)? as u64
+            };
+            let pc = if is64 {
+                v.count_ones() as u64
+            } else {
+                (v as u32).count_ones() as u64
+            };
             set_vreg64(state, d, pc)?;
-            if pc == 0 { set_flags(state, F_ZF); } else { set_flags(state, 0); }
+            if pc == 0 {
+                set_flags(state, F_ZF);
+            } else {
+                set_flags(state, 0);
+            }
             Ok(ip)
         }
         OP_BLSR_R32 | OP_BLSR_R64 | OP_BLSMSK_R32 | OP_BLSMSK_R64 | OP_BLSI_R32 | OP_BLSI_R64 => {
@@ -514,14 +545,22 @@ pub(crate) fn exec(
             let ip = ip + 2;
             let is64 = matches!(op, OP_BSR_R64 | OP_BSF_R64);
             let is_bsr = matches!(op, OP_BSR_R32 | OP_BSR_R64);
-            let v = if is64 { vreg64(state, s)? } else { vreg32(state, s)? as u64 };
+            let v = if is64 {
+                vreg64(state, s)?
+            } else {
+                vreg32(state, s)? as u64
+            };
             if v == 0 {
                 // ZF=1; dest undefined per Intel, set 0
                 set_vreg64(state, d, 0)?;
                 set_flags(state, F_ZF);
             } else {
                 let idx = if is_bsr {
-                    if is64 { 63 - v.leading_zeros() } else { 31 - (v as u32).leading_zeros() }
+                    if is64 {
+                        63 - v.leading_zeros()
+                    } else {
+                        31 - (v as u32).leading_zeros()
+                    }
                 } else {
                     v.trailing_zeros()
                 } as u64;
@@ -545,7 +584,10 @@ pub(crate) fn exec(
                 set_vreg64(state, d, res as u64)?;
                 // x86 SHLD: SF/ZF/PF from result; CF = last bit shifted out of
                 // dst; OF/AF undefined (defined 0). Mirrors shift_flags(Shl).
-                set_flags(state, flags::shift_flags(flags::ShiftKind::Shl, dst, cnt as u32, res));
+                set_flags(
+                    state,
+                    flags::shift_flags(flags::ShiftKind::Shl, dst, cnt as u32, res),
+                );
             }
             Ok(next_ip)
         }
@@ -562,7 +604,10 @@ pub(crate) fn exec(
                 let src = vreg32(state, s)?;
                 let res = (dst >> cnt) | (src << (32 - cnt));
                 set_vreg64(state, d, res as u64)?;
-                set_flags(state, flags::shift_flags(flags::ShiftKind::Shr, dst, cnt as u32, res));
+                set_flags(
+                    state,
+                    flags::shift_flags(flags::ShiftKind::Shr, dst, cnt as u32, res),
+                );
             }
             Ok(next_ip)
         }
@@ -579,7 +624,10 @@ pub(crate) fn exec(
                 let src = vreg64(state, s)?;
                 let res = (dst << cnt) | (src >> (64 - cnt));
                 set_vreg64(state, d, res)?;
-                set_flags(state, flags::shift_flags64(flags::ShiftKind::Shl, dst, cnt as u32, res));
+                set_flags(
+                    state,
+                    flags::shift_flags64(flags::ShiftKind::Shl, dst, cnt as u32, res),
+                );
             }
             Ok(next_ip)
         }
@@ -596,7 +644,10 @@ pub(crate) fn exec(
                 let src = vreg64(state, s)?;
                 let res = (dst >> cnt) | (src << (64 - cnt));
                 set_vreg64(state, d, res)?;
-                set_flags(state, flags::shift_flags64(flags::ShiftKind::Shr, dst, cnt as u32, res));
+                set_flags(
+                    state,
+                    flags::shift_flags64(flags::ShiftKind::Shr, dst, cnt as u32, res),
+                );
             }
             Ok(next_ip)
         }

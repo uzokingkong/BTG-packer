@@ -18,7 +18,12 @@ pub(super) fn emit_mul_rr64(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_MUL_R_R64,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::R8, 0)).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
             Instruction::with1(Code::Mul_rm64, Register::R11).unwrap(),
@@ -44,7 +49,12 @@ pub(super) fn emit_mul_rr32(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_MUL_R_R32,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EAX, m(Register::R8, 0)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::R11D, vreg(Register::RCX)).unwrap(),
             Instruction::with1(Code::Mul_rm32, Register::R11D).unwrap(),
@@ -70,7 +80,12 @@ pub(super) fn emit_imul1_rr64(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_IMUL1_R_R64,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::R8, 0)).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
             Instruction::with1(Code::Imul_rm64, Register::R11).unwrap(),
@@ -96,7 +111,12 @@ pub(super) fn emit_imul1_rr32(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_IMUL1_R_R32,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EAX, m(Register::R8, 0)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::R11D, vreg(Register::RCX)).unwrap(),
             Instruction::with1(Code::Imul_rm32, Register::R11D).unwrap(),
@@ -122,7 +142,12 @@ pub(super) fn emit_div_rr64(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_DIV_R_R64,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::R8, 0)).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RDX, m(Register::R8, 16)).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
@@ -140,7 +165,12 @@ pub(super) fn emit_div_rr32(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_DIV_R_R32,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EAX, m(Register::R8, 0)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EDX, m(Register::R8, 16)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::R11D, vreg(Register::RCX)).unwrap(),
@@ -158,7 +188,12 @@ pub(super) fn emit_idiv_rr64(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_IDIV_R_R64,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::R8, 0)).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RDX, m(Register::R8, 16)).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
@@ -176,7 +211,12 @@ pub(super) fn emit_idiv_rr32(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_IDIV_R_R32,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EAX, m(Register::R8, 0)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EDX, m(Register::R8, 16)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::R11D, vreg(Register::RCX)).unwrap(),
@@ -194,7 +234,12 @@ pub(super) fn emit_bswap32(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_BSWAP_R32,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::R11D, vreg(Register::RCX)).unwrap(),
             Instruction::with1(Code::Bswap_r32, Register::R11D).unwrap(),
             Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::R11).unwrap(),
@@ -209,7 +254,12 @@ pub(super) fn emit_bswap64(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_BSWAP_R64,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
             Instruction::with1(Code::Bswap_r64, Register::R11).unwrap(),
             Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::R11).unwrap(),
@@ -230,17 +280,30 @@ pub(super) fn emit_bsr_bsf(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         (OP_BSF_R64, Code::Bsf_r32_rm32, Code::Bsf_r64_rm64, true),
     ] {
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
         ];
         if is64 {
-            body.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RDX)).unwrap());
+            body.push(
+                Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RDX)).unwrap(),
+            );
             body.push(Instruction::with2(code64, Register::RAX, Register::RAX).unwrap());
-            body.push(Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap());
+            body.push(
+                Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(),
+            );
         } else {
-            body.push(Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RDX)).unwrap());
+            body.push(
+                Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RDX)).unwrap(),
+            );
             body.push(Instruction::with2(code32, Register::EAX, Register::EAX).unwrap());
-            body.push(Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap());
+            body.push(
+                Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(),
+            );
         }
         // Capture ONLY ZF (+ carry DF through) — bsr/bsf define no other status bit.
         body.extend(vec![
@@ -267,7 +330,12 @@ pub(super) fn emit_mul_rr8(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_MUL_R_R8,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::R8, 0)).unwrap(),
             Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xFF).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
@@ -295,7 +363,12 @@ pub(super) fn emit_mul_rr16(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_MUL_R_R16,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::R8, 0)).unwrap(),
             Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xFFFF).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
@@ -325,7 +398,12 @@ pub(super) fn emit_imul1_rr8(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_IMUL1_R_R8,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::R8, 0)).unwrap(),
             Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xFF).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
@@ -353,7 +431,12 @@ pub(super) fn emit_imul1_rr16(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_IMUL1_R_R16,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::R8, 0)).unwrap(),
             Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xFFFF).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
@@ -383,7 +466,12 @@ pub(super) fn emit_div_rr8(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_DIV_R_R8,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::R8, 0)).unwrap(),
             Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xFFFF).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
@@ -401,7 +489,12 @@ pub(super) fn emit_div_rr16(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_DIV_R_R16,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::R8, 0)).unwrap(),
             Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xFFFF).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RDX, m(Register::R8, 16)).unwrap(),
@@ -424,7 +517,12 @@ pub(super) fn emit_idiv_rr8(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_IDIV_R_R8,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::R8, 0)).unwrap(),
             Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xFFFF).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
@@ -442,7 +540,12 @@ pub(super) fn emit_idiv_rr16(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_IDIV_R_R16,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::R8, 0)).unwrap(),
             Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xFFFF).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RDX, m(Register::R8, 16)).unwrap(),

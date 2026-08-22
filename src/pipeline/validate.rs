@@ -30,7 +30,7 @@
 
 use crate::mba::MbaGenerator;
 use crate::pipeline::PipelineContext;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use goblin::pe::PE;
 use std::collections::HashSet;
 
@@ -81,20 +81,25 @@ fn collect_sections(pe: &PE) -> Vec<SectionInfo> {
         .collect()
 }
 
-pub(crate) fn section_for_rva<'a>(sections: &'a [SectionInfo], rva: u32) -> Option<&'a SectionInfo> {
+pub(crate) fn section_for_rva<'a>(
+    sections: &'a [SectionInfo],
+    rva: u32,
+) -> Option<&'a SectionInfo> {
     sections.iter().find(|s| s.contains_rva(rva))
 }
 
+mod dirs;
 mod pe;
 mod rsrc;
-mod dirs;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use pe::validate_pe_structure;
-pub(crate) use rsrc::{ResDataEntry, expected_chunks, validate_rsrc, walk_dir, walk_resource_tree};
+pub(crate) use crate::pipeline::ownership::{
+    check_ownership, render_csv, FunctionOwnership, OwnershipReport, RuntimeFunction,
+};
 pub(crate) use dirs::{report_pe_diff, validate_all_directories};
-pub(crate) use crate::pipeline::ownership::{check_ownership, render_csv, FunctionOwnership, OwnershipReport, RuntimeFunction};
+pub(crate) use pe::validate_pe_structure;
+pub(crate) use rsrc::{expected_chunks, validate_rsrc, walk_dir, walk_resource_tree, ResDataEntry};
 
 /// Post-build structural self-validation of the synthesized output PE.
 pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
@@ -132,7 +137,9 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
     //     DOS/NT/Optional 헤더, 정렬, 섹션 RVA/raw 경계·겹침, 16개 데이터
     //     디렉터리 RVA/size, SizeOfImage, 보안 디렉터리 정책.
     validate_pe_structure(out, &pe, ctx, &sections)?;
-    println!("[VALIDATE] OK  PE structural/loader-compat (headers, alignments, sections, 16 data dirs)");
+    println!(
+        "[VALIDATE] OK  PE structural/loader-compat (headers, alignments, sections, 16 data dirs)"
+    );
 
     // 2. Entry point inside an executable section.
     let entry_rva = if (pe.entry as u64) >= pe.image_base as u64 {
@@ -187,7 +194,8 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
     if ctx.crypto_enabled {
         let tb = sections
             .iter()
-            .rev().find(|s| s.name == ".textb")
+            .rev()
+            .find(|s| s.name == ".textb")
             .ok_or_else(|| anyhow!("packed section '.textb' missing from output"))?;
         if tb.characteristics & 0x8000_0000 == 0 {
             bail!("packed section '.textb' missing WRITE (needed for in-place decryption)");
@@ -198,15 +206,19 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
         // 검증으로 고정한다 (게이트: mem_harden 활성이면 프로파일 해석도 mem_harden
         // 유효해야 하며 — reencrypt/vm-oep와의 상충은 resolve가 이미 제거).
         let wx_contract = if ctx.mem_harden {
-            "rwx-at-rest,rx-after-verify"
+            "transient-rw-to-rx,rx-immutable,rw-state"
         } else {
             "rwx-at-rest"
         };
         println!(
-            "[VALIDATE] OK  W^X memory contract: {} (.textb {} — runtime RX transition {})",
+            "[VALIDATE] OK  W^X memory contract: {} (.textb {} — runtime split {})",
             wx_contract,
             "RWX in-file",
-            if ctx.mem_harden { "ENABLED (post-decrypt)" } else { "disabled (stays RWX)" }
+            if ctx.mem_harden {
+                "ENABLED (immutable RX / mutable RW)"
+            } else {
+                "disabled (stays RWX)"
+            }
         );
     }
 
@@ -230,20 +242,30 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
             bail!("dummy import directory zeroed in output");
         }
         let sec = section_for_rva(&sections, dd.virtual_address).ok_or_else(|| {
-            anyhow!("dummy import RVA 0x{:X} outside all sections", dd.virtual_address)
+            anyhow!(
+                "dummy import RVA 0x{:X} outside all sections",
+                dd.virtual_address
+            )
         })?;
         println!(
             "[VALIDATE] OK  dummy import dir @0x{:X} in '{}' (LoadLibraryA/GetProcAddress only)",
             dd.virtual_address, sec.name
         );
     }
-    for (idx, name) in if ctx.iat_hide { vec![(9usize, "TLS")] } else { vec![(1usize, "Import"), (9, "TLS")] } {
+    for (idx, name) in if ctx.iat_hide {
+        vec![(9usize, "TLS")]
+    } else {
+        vec![(1usize, "Import"), (9, "TLS")]
+    } {
         let orig = ctx
             .target_info
             .data_directories
             .get(idx)
             .copied()
-            .unwrap_or(crate::pe::builder::DataDirectory { virtual_address: 0, size: 0 });
+            .unwrap_or(crate::pe::builder::DataDirectory {
+                virtual_address: 0,
+                size: 0,
+            });
         if orig.virtual_address == 0 {
             continue; // 원본에 없으면 검사할 것 없음
         }
@@ -251,7 +273,11 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
             .header
             .optional_header
             .as_ref()
-            .and_then(|oh| oh.data_directories.data_directories[idx].as_ref().map(|(_, d)| *d))
+            .and_then(|oh| {
+                oh.data_directories.data_directories[idx]
+                    .as_ref()
+                    .map(|(_, d)| *d)
+            })
             .ok_or_else(|| {
                 anyhow!(
                     "original {} table @0x{:X} was dropped from output",
@@ -260,10 +286,18 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
                 )
             })?;
         if dd.virtual_address == 0 {
-            bail!("original {} table @0x{:X} zeroed in output", name, orig.virtual_address);
+            bail!(
+                "original {} table @0x{:X} zeroed in output",
+                name,
+                orig.virtual_address
+            );
         }
         let sec = section_for_rva(&sections, dd.virtual_address).ok_or_else(|| {
-            anyhow!("{} table RVA 0x{:X} outside all sections", name, dd.virtual_address)
+            anyhow!(
+                "{} table RVA 0x{:X} outside all sections",
+                name,
+                dd.virtual_address
+            )
         })?;
         println!(
             "[VALIDATE] OK  {} table @0x{:X} preserved in '{}'",
@@ -277,7 +311,8 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
     if ctx.reencrypt {
         let tb = sections
             .iter()
-            .rev().find(|s| s.name == ".textb")
+            .rev()
+            .find(|s| s.name == ".textb")
             .ok_or_else(|| anyhow!("packed section '.textb' missing from output"))?;
         let layout = ctx
             .layout()
@@ -299,11 +334,13 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
             if entry_off + 4 > out.len() {
                 bail!("Phase 0.3: length table entry for block {} beyond EOF", id);
             }
-            let len_enc = u32::from_le_bytes(out[entry_off..entry_off + 4].try_into()
-                .expect("T3-3: 4-byte slice for length table entry (bounds checked above)"));
+            let len_enc = u32::from_le_bytes(
+                out[entry_off..entry_off + 4]
+                    .try_into()
+                    .expect("T3-3: 4-byte slice for length table entry (bounds checked above)"),
+            );
             let decoded_len = len_enc ^ key;
-            if decoded_len != (if is_call_target {0} else {len as u32}) {
-            }
+            if decoded_len != (if is_call_target { 0 } else { len as u32 }) {}
             if is_call_target {
                 if decoded_len != 0 {
                     bail!(
@@ -387,7 +424,8 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
     if ctx.reencrypt {
         let tb = sections
             .iter()
-            .rev().find(|s| s.name == ".textb")
+            .rev()
+            .find(|s| s.name == ".textb")
             .ok_or_else(|| anyhow!("packed section '.textb' missing from output"))?;
         let layout = ctx
             .layout()
@@ -401,21 +439,33 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
             if entry_off + 4 > out.len() {
                 bail!("v61 m7: state table entry for block {} beyond EOF", id);
             }
-            let st = u32::from_le_bytes(out[entry_off..entry_off + 4].try_into()
-                .expect("T3-3: 4-byte slice for state table entry (bounds checked above)"));
+            let st = u32::from_le_bytes(
+                out[entry_off..entry_off + 4]
+                    .try_into()
+                    .expect("T3-3: 4-byte slice for state table entry (bounds checked above)"),
+            );
             let is_call_target = ctx.call_target_block_ids.contains(&block.id);
             if is_call_target {
                 call_target_count += 1;
                 if st != 0 {
-                    bail!("v61 m7: call-target block {} state must be 0 (plaintext), got 0x{:X}", id, st);
+                    bail!(
+                        "v61 m7: call-target block {} state must be 0 (plaintext), got 0x{:X}",
+                        id,
+                        st
+                    );
                 }
             } else if st != 0xFFFF_FFFF {
-                bail!("v61 m7: block {} state must be 0xFFFFFFFF (encrypted) at rest, got 0x{:X}", id, st);
+                bail!(
+                    "v61 m7: block {} state must be 0xFFFFFFFF (encrypted) at rest, got 0x{:X}",
+                    id,
+                    st
+                );
             }
         }
         println!(
             "[VALIDATE] OK  v61 m7: state table verified ({} encrypted, {} call-target plaintext)",
-            num_blocks - call_target_count, call_target_count
+            num_blocks - call_target_count,
+            call_target_count
         );
     }
 
@@ -433,7 +483,10 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
             );
         }
         if psec.is_executable() {
-            bail!("payload section '{}' is executable (must be non-exec data)", psec.name);
+            bail!(
+                "payload section '{}' is executable (must be non-exec data)",
+                psec.name
+            );
         }
         println!(
             "[VALIDATE] OK  payload {} bytes @RVA 0x{:X} in '{}' (non-exec)",
@@ -464,7 +517,10 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
 /// WS2.1 (readccc §4.6): verify every function claimed "∈ VM" by the
 /// function-ownership model is fully covered by its .pdata RUNTIME_FUNCTION
 /// and that no VM function's native entry bypasses its prologue.
-fn derive_ownership_model(ctx: &PipelineContext, out: &[u8]) -> Result<(Vec<FunctionOwnership>, Vec<RuntimeFunction>)> {
+fn derive_ownership_model(
+    ctx: &PipelineContext,
+    out: &[u8],
+) -> Result<(Vec<FunctionOwnership>, Vec<RuntimeFunction>)> {
     let pe = PE::parse(out).map_err(|e| anyhow!("validate: output PE re-parse failed: {e}"))?;
     let sections = collect_sections(&pe);
 
@@ -479,10 +535,18 @@ fn derive_ownership_model(ctx: &PipelineContext, out: &[u8]) -> Result<(Vec<Func
                 let b = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 let e = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
                 if b > 0 && e > b {
-                    runtime_functions.push(RuntimeFunction { begin_rva: b, end_rva: e });
+                    runtime_functions.push(RuntimeFunction {
+                        begin_rva: b,
+                        end_rva: e,
+                    });
                 }
             }
         }
+    }
+
+    // If the binary has no SEH (.pdata is empty), ownership consistency check is not applicable.
+    if runtime_functions.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
     }
 
     // Ownership model: the program-VM module region (which build.rs wraps in a
@@ -547,4 +611,3 @@ pub fn ownership_csv(ctx: &PipelineContext, out: &[u8]) -> Result<Option<String>
 // ──────────────────────────────────────────────────────────────────────────────
 // 단위 테스트
 // ──────────────────────────────────────────────────────────────────────────────
-

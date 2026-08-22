@@ -18,8 +18,8 @@ use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 
 use crate::vm::bytecode::{BytecodeBuilder, FLAG_MASK};
-use crate::vm::{flags, interp};
 use crate::vm::interp::STATE_FLAGS;
+use crate::vm::{flags, interp};
 
 use super::util::{run_native, set_vreg, vreg};
 
@@ -32,10 +32,7 @@ fn flags_of(st: &[u8]) -> u64 {
 /// the state buffer (identical for both sides — the native variant additionally
 /// receives the arena base, which state-only seeds ignore). Returns
 /// (interp_state, native_state).
-fn run_prog_diff(
-    prog: &[u8],
-    seed: impl Fn(&mut [u8]),
-) -> Result<(Vec<u8>, Vec<u8>)> {
+fn run_prog_diff(prog: &[u8], seed: impl Fn(&mut [u8])) -> Result<(Vec<u8>, Vec<u8>)> {
     let (mut st, mut mem) = super::util::interp_state();
     seed(&mut st);
     interp::interpret(&mut st, &mut mem, prog)
@@ -69,42 +66,66 @@ pub(crate) fn run_fuzz_bmi_test() -> Result<()> {
         fn(u64) -> u64,
     )> = vec![
         (
-            "blsr32", OP_BLSR_R32, OP_BLSR_R64, false,
+            "blsr32",
+            OP_BLSR_R32,
+            OP_BLSR_R64,
+            false,
             |a, _| ((a as u32) & (a as u32).wrapping_sub(1)) as u64,
             |d| flags::bls_flags(d),
         ),
         (
-            "blsr64", OP_BLSR_R32, OP_BLSR_R64, true,
+            "blsr64",
+            OP_BLSR_R32,
+            OP_BLSR_R64,
+            true,
             |a, _| a & a.wrapping_sub(1),
             flags::bls_flags,
         ),
         (
-            "blsmsk32", OP_BLSMSK_R32, OP_BLSMSK_R64, false,
+            "blsmsk32",
+            OP_BLSMSK_R32,
+            OP_BLSMSK_R64,
+            false,
             |a, _| ((a as u32) ^ (a as u32).wrapping_sub(1)) as u64,
             |d| flags::bls_flags(d),
         ),
         (
-            "blsmsk64", OP_BLSMSK_R32, OP_BLSMSK_R64, true,
+            "blsmsk64",
+            OP_BLSMSK_R32,
+            OP_BLSMSK_R64,
+            true,
             |a, _| a ^ a.wrapping_sub(1),
             flags::bls_flags,
         ),
         (
-            "blsi32", OP_BLSI_R32, OP_BLSI_R64, false,
+            "blsi32",
+            OP_BLSI_R32,
+            OP_BLSI_R64,
+            false,
             |a, _| ((a as u32) & (a as u32).wrapping_neg()) as u64,
             |d| flags::bls_flags(d),
         ),
         (
-            "blsi64", OP_BLSI_R32, OP_BLSI_R64, true,
+            "blsi64",
+            OP_BLSI_R32,
+            OP_BLSI_R64,
+            true,
             |a, _| a & a.wrapping_neg(),
             flags::bls_flags,
         ),
         (
-            "andn32", OP_ANDN_R_R32, OP_ANDN_R_R64, false,
+            "andn32",
+            OP_ANDN_R_R32,
+            OP_ANDN_R_R64,
+            false,
             |a, b| ((!a as u32) & b as u32) as u64,
             |d| flags::andn_flags(d, false),
         ),
         (
-            "andn64", OP_ANDN_R_R32, OP_ANDN_R_R64, true,
+            "andn64",
+            OP_ANDN_R_R32,
+            OP_ANDN_R_R64,
+            true,
             |a, b| !a & b,
             |d| flags::andn_flags(d, true),
         ),
@@ -139,10 +160,22 @@ pub(crate) fn run_fuzz_bmi_test() -> Result<()> {
 
             let (di, fi) = (vreg(&st_i, 3), flags_of(&st_i));
             let (dn, fn_) = (vreg(&st_n, 3), flags_of(&st_n));
-            assert_eq!(di, want_dst, "{name}(a=0x{a:X},b=0x{b:X}): interp dst 0x{di:X} != expected 0x{want_dst:X}");
-            assert_eq!(dn, want_dst, "{name}(a=0x{a:X},b=0x{b:X}): native dst 0x{dn:X} != expected 0x{want_dst:X}");
-            assert_eq!(fi, want_flags, "{name}(a=0x{a:X},b=0x{b:X}): interp flags 0x{fi:X} != expected 0x{want_flags:X}");
-            assert_eq!(fn_, want_flags, "{name}(a=0x{a:X},b=0x{b:X}): native flags 0x{fn_:X} != expected 0x{want_flags:X}");
+            assert_eq!(
+                di, want_dst,
+                "{name}(a=0x{a:X},b=0x{b:X}): interp dst 0x{di:X} != expected 0x{want_dst:X}"
+            );
+            assert_eq!(
+                dn, want_dst,
+                "{name}(a=0x{a:X},b=0x{b:X}): native dst 0x{dn:X} != expected 0x{want_dst:X}"
+            );
+            assert_eq!(
+                fi, want_flags,
+                "{name}(a=0x{a:X},b=0x{b:X}): interp flags 0x{fi:X} != expected 0x{want_flags:X}"
+            );
+            assert_eq!(
+                fn_, want_flags,
+                "{name}(a=0x{a:X},b=0x{b:X}): native flags 0x{fn_:X} != expected 0x{want_flags:X}"
+            );
         }
     }
     Ok(())
@@ -182,25 +215,56 @@ pub(crate) fn run_fuzz_arith_test() -> Result<()> {
             let (st_i, st_n) = run_prog_diff(&prog, |s| seed_state(s, dirty, am, 0))?;
             let (di, fi) = (vreg(&st_i, 3), flags_of(&st_i));
             let (dn, fn_) = (vreg(&st_n, 3), flags_of(&st_n));
-            assert_eq!(di, pc, "{name}(a=0x{a:X}): interp dst 0x{di:X} != popcount {pc}");
-            assert_eq!(dn, pc, "{name}(a=0x{a:X}): native dst 0x{dn:X} != popcount {pc}");
-            assert_eq!(fi, want_flags, "{name}(a=0x{a:X}): interp flags 0x{fi:X} != expected 0x{want_flags:X}");
-            assert_eq!(fn_, want_flags, "{name}(a=0x{a:X}): native flags 0x{fn_:X} != expected 0x{want_flags:X}");
+            assert_eq!(
+                di, pc,
+                "{name}(a=0x{a:X}): interp dst 0x{di:X} != popcount {pc}"
+            );
+            assert_eq!(
+                dn, pc,
+                "{name}(a=0x{a:X}): native dst 0x{dn:X} != popcount {pc}"
+            );
+            assert_eq!(
+                fi, want_flags,
+                "{name}(a=0x{a:X}): interp flags 0x{fi:X} != expected 0x{want_flags:X}"
+            );
+            assert_eq!(
+                fn_, want_flags,
+                "{name}(a=0x{a:X}): native flags 0x{fn_:X} != expected 0x{want_flags:X}"
+            );
         }
     }
 
     // 64-bit arithmetic/logical: wider random coverage than flags.rs (24 iters).
     let arith: Vec<(u8, fn(u64, u64) -> u64, fn(u64, u64) -> u64)> = vec![
-        (OP_ADD_R_R64, |a, b| a.wrapping_add(b), |a, b| flags::add_flags64(a, b)),
-        (OP_SUB_R_R64, |a, b| a.wrapping_sub(b), |a, b| flags::sub_flags64(a, b)),
-        (OP_XOR_R_R64, |a, b| a ^ b, |a, b| flags::logical_flags64(a ^ b)),
-        (OP_AND_R_R64, |a, b| a & b, |a, b| flags::logical_flags64(a & b)),
-        (OP_OR_R_R64, |a, b| a | b, |a, b| flags::logical_flags64(a | b)),
+        (
+            OP_ADD_R_R64,
+            |a, b| a.wrapping_add(b),
+            |a, b| flags::add_flags64(a, b),
+        ),
+        (
+            OP_SUB_R_R64,
+            |a, b| a.wrapping_sub(b),
+            |a, b| flags::sub_flags64(a, b),
+        ),
+        (
+            OP_XOR_R_R64,
+            |a, b| a ^ b,
+            |a, b| flags::logical_flags64(a ^ b),
+        ),
+        (
+            OP_AND_R_R64,
+            |a, b| a & b,
+            |a, b| flags::logical_flags64(a & b),
+        ),
+        (
+            OP_OR_R_R64,
+            |a, b| a | b,
+            |a, b| flags::logical_flags64(a | b),
+        ),
     ];
     for (op, dst_sem, fl_sem) in arith {
-        let mut rng = StdRng::seed_from_u64(
-            0xADD_64 ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-        );
+        let mut rng =
+            StdRng::seed_from_u64(0xADD_64 ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         for _ in 0..iters {
             let (a, b) = (rng.next_u64(), rng.next_u64());
             let want_dst = dst_sem(a, b);
@@ -249,43 +313,100 @@ pub(crate) fn run_fuzz_bitscan_test() -> Result<()> {
         u64,
     )> = vec![
         (
-            "tzcnt32", OP_TZCNT_R32, false, 32,
-            |a, w| if a == 0 { w as u64 } else { (a as u32).trailing_zeros() as u64 },
+            "tzcnt32",
+            OP_TZCNT_R32,
+            false,
+            32,
+            |a, w| {
+                if a == 0 {
+                    w as u64
+                } else {
+                    (a as u32).trailing_zeros() as u64
+                }
+            },
             |a, d| (if a == 0 { F_CF } else { 0 }) | (if d == 0 { F_ZF } else { 0 }),
             F_CF | F_ZF,
         ),
         (
-            "lzcnt32", OP_LZCNT_R32, false, 32,
-            |a, w| if a == 0 { w as u64 } else { (a as u32).leading_zeros() as u64 },
+            "lzcnt32",
+            OP_LZCNT_R32,
+            false,
+            32,
+            |a, w| {
+                if a == 0 {
+                    w as u64
+                } else {
+                    (a as u32).leading_zeros() as u64
+                }
+            },
             |a, d| (if a == 0 { F_CF } else { 0 }) | (if d == 0 { F_ZF } else { 0 }),
             F_CF | F_ZF,
         ),
         (
-            "lzcnt64", OP_LZCNT_R64, true, 64,
-            |a, w| if a == 0 { w as u64 } else { a.leading_zeros() as u64 },
+            "lzcnt64",
+            OP_LZCNT_R64,
+            true,
+            64,
+            |a, w| {
+                if a == 0 {
+                    w as u64
+                } else {
+                    a.leading_zeros() as u64
+                }
+            },
             |a, d| (if a == 0 { F_CF } else { 0 }) | (if d == 0 { F_ZF } else { 0 }),
             F_CF | F_ZF,
         ),
         (
-            "bsr32", OP_BSR_R32, false, 32,
-            |a, w| if a == 0 { 0 } else { (w - 1 - (a as u32).leading_zeros()) as u64 },
+            "bsr32",
+            OP_BSR_R32,
+            false,
+            32,
+            |a, w| {
+                if a == 0 {
+                    0
+                } else {
+                    (w - 1 - (a as u32).leading_zeros()) as u64
+                }
+            },
             |a, _| if a == 0 { F_ZF } else { 0 },
             F_ZF,
         ),
         (
-            "bsr64", OP_BSR_R64, true, 64,
-            |a, w| if a == 0 { 0 } else { (w - 1 - a.leading_zeros()) as u64 },
+            "bsr64",
+            OP_BSR_R64,
+            true,
+            64,
+            |a, w| {
+                if a == 0 {
+                    0
+                } else {
+                    (w - 1 - a.leading_zeros()) as u64
+                }
+            },
             |a, _| if a == 0 { F_ZF } else { 0 },
             F_ZF,
         ),
         (
-            "bsf32", OP_BSF_R32, false, 32,
-            |a, _| if a == 0 { 0 } else { (a as u32).trailing_zeros() as u64 },
+            "bsf32",
+            OP_BSF_R32,
+            false,
+            32,
+            |a, _| {
+                if a == 0 {
+                    0
+                } else {
+                    (a as u32).trailing_zeros() as u64
+                }
+            },
             |a, _| if a == 0 { F_ZF } else { 0 },
             F_ZF,
         ),
         (
-            "bsf64", OP_BSF_R64, true, 64,
+            "bsf64",
+            OP_BSF_R64,
+            true,
+            64,
             |a, _| if a == 0 { 0 } else { a.trailing_zeros() as u64 },
             |a, _| if a == 0 { F_ZF } else { 0 },
             F_ZF,
@@ -298,7 +419,8 @@ pub(crate) fn run_fuzz_bitscan_test() -> Result<()> {
             contract,
             "{name}: flag_contract mismatch (semantics table out of sync with fuzz)"
         );
-        let mut rng = StdRng::seed_from_u64(0xB175C3A4 ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut rng =
+            StdRng::seed_from_u64(0xB175C3A4 ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         for _ in 0..iters {
             let a = rng.next_u64();
             let am = if is64 { a } else { a as u32 as u64 };
@@ -323,10 +445,24 @@ pub(crate) fn run_fuzz_bitscan_test() -> Result<()> {
             let (st_i, st_n) = run_prog_diff(&prog, |s| seed_state(s, dirty, am, 0))?;
             let (di, fi) = (vreg(&st_i, 3), flags_of(&st_i));
             let (dn, fn_) = (vreg(&st_n, 3), flags_of(&st_n));
-            assert_eq!(di, want_dst, "{name}(a=0x{a:X}): interp dst 0x{di:X} != expected 0x{want_dst:X}");
-            assert_eq!(dn, want_dst, "{name}(a=0x{a:X}): native dst 0x{dn:X} != expected 0x{want_dst:X}");
-            assert_eq!(fi & contract, want_flags, "{name}(a=0x{a:X}): interp flags 0x{fi:X} != expected 0x{want_flags:X}");
-            assert_eq!(fn_ & contract, want_flags, "{name}(a=0x{a:X}): native flags 0x{fn_:X} != expected 0x{want_flags:X}");
+            assert_eq!(
+                di, want_dst,
+                "{name}(a=0x{a:X}): interp dst 0x{di:X} != expected 0x{want_dst:X}"
+            );
+            assert_eq!(
+                dn, want_dst,
+                "{name}(a=0x{a:X}): native dst 0x{dn:X} != expected 0x{want_dst:X}"
+            );
+            assert_eq!(
+                fi & contract,
+                want_flags,
+                "{name}(a=0x{a:X}): interp flags 0x{fi:X} != expected 0x{want_flags:X}"
+            );
+            assert_eq!(
+                fn_ & contract,
+                want_flags,
+                "{name}(a=0x{a:X}): native flags 0x{fn_:X} != expected 0x{want_flags:X}"
+            );
         }
     }
     Ok(())
@@ -357,8 +493,16 @@ fn muldiv_ref(op: u8, width: u8, rax: u64, rdx: u64, src: u64) -> (bool, u64, u6
             (true, (p as u16) as u64, rdx)
         }
         OP_IMUL1_R_R16 | OP_IMUL1_R_R32 | OP_IMUL1_R_R64 => {
-            let sa = if w >= 64 { a as i64 as i128 } else { ((a << (64 - w)) as i64 >> (64 - w)) as i128 };
-            let sb = if w >= 64 { b as i64 as i128 } else { ((b << (64 - w)) as i64 >> (64 - w)) as i128 };
+            let sa = if w >= 64 {
+                a as i64 as i128
+            } else {
+                ((a << (64 - w)) as i64 >> (64 - w)) as i128
+            };
+            let sb = if w >= 64 {
+                b as i64 as i128
+            } else {
+                ((b << (64 - w)) as i64 >> (64 - w)) as i128
+            };
             let p = (sa * sb) as u128;
             (true, p as u64 & mask, ((p >> w) & mask as u128) as u64)
         }
@@ -366,7 +510,9 @@ fn muldiv_ref(op: u8, width: u8, rax: u64, rdx: u64, src: u64) -> (bool, u64, u6
         OP_DIV_R_R8 => {
             let dividend = (rax & 0xFFFF) as u16;
             let d = b as u16;
-            if d == 0 { return (false, 0, rdx); }
+            if d == 0 {
+                return (false, 0, rdx);
+            }
             let (q, r) = (dividend / d, dividend % d);
             (q <= 0xFF, (q as u64) | ((r as u64) << 8), rdx)
         }
@@ -377,22 +523,38 @@ fn muldiv_ref(op: u8, width: u8, rax: u64, rdx: u64, src: u64) -> (bool, u64, u6
                 (((lo(rdx) as u128) << w) | (lo(rax) as u128))
             };
             let d = b as u128;
-            if d == 0 { return (false, 0, 0); }
+            if d == 0 {
+                return (false, 0, 0);
+            }
             let (q, r) = (dividend / d, dividend % d);
-            let fits = if w >= 64 { q <= u64::MAX as u128 } else { q < (1u128 << w) };
+            let fits = if w >= 64 {
+                q <= u64::MAX as u128
+            } else {
+                q < (1u128 << w)
+            };
             (fits, q as u64 & mask, r as u64 & mask)
         }
         // signed IDIV (8-bit: packed in AX, RDX untouched)
         OP_IDIV_R_R8 => {
             let dividend = (rax & 0xFFFF) as u16 as i16;
             let d = b as u8 as i8 as i16;
-            if d == 0 { return (false, 0, rdx); }
+            if d == 0 {
+                return (false, 0, rdx);
+            }
             let (q, r) = (dividend / d, dividend % d);
-            ((-128..=127).contains(&(q as i32)), (q as u8 as u64) | ((r as u8 as u64) << 8), rdx)
+            (
+                (-128..=127).contains(&(q as i32)),
+                (q as u8 as u64) | ((r as u8 as u64) << 8),
+                rdx,
+            )
         }
         OP_IDIV_R_R16 | OP_IDIV_R_R32 | OP_IDIV_R_R64 => {
             let sign_ext = |v: u64| -> i128 {
-                if w >= 64 { v as i64 as i128 } else { ((v << (64 - w)) as i64 >> (64 - w)) as i128 }
+                if w >= 64 {
+                    v as i64 as i128
+                } else {
+                    ((v << (64 - w)) as i64 >> (64 - w)) as i128
+                }
             };
             let dividend_u: u128 = if w >= 64 {
                 ((rdx as u128) << 64) | (rax as u128)
@@ -405,7 +567,9 @@ fn muldiv_ref(op: u8, width: u8, rax: u64, rdx: u64, src: u64) -> (bool, u64, u6
                 ((dividend_u << (64 - w)) as i128) >> (64 - w)
             };
             let d = sign_ext(b);
-            if d == 0 { return (false, 0, 0); }
+            if d == 0 {
+                return (false, 0, 0);
+            }
             // i128::MIN / -1 panics in Rust; real x86 raises #DE for it too.
             if d == -1 && dividend == i128::MIN {
                 return (false, 0, 0);
@@ -438,10 +602,22 @@ pub(crate) fn run_fuzz_muldiv_test() -> Result<()> {
     let dirty = FLAG_MASK & !F_DF;
 
     let cases: Vec<(u8, u8)> = vec![
-        (OP_MUL_R_R8, 8), (OP_MUL_R_R16, 16), (OP_MUL_R_R32, 32), (OP_MUL_R_R64, 64),
-        (OP_IMUL1_R_R8, 8), (OP_IMUL1_R_R16, 16), (OP_IMUL1_R_R32, 32), (OP_IMUL1_R_R64, 64),
-        (OP_DIV_R_R8, 8), (OP_DIV_R_R16, 16), (OP_DIV_R_R32, 32), (OP_DIV_R_R64, 64),
-        (OP_IDIV_R_R8, 8), (OP_IDIV_R_R16, 16), (OP_IDIV_R_R32, 32), (OP_IDIV_R_R64, 64),
+        (OP_MUL_R_R8, 8),
+        (OP_MUL_R_R16, 16),
+        (OP_MUL_R_R32, 32),
+        (OP_MUL_R_R64, 64),
+        (OP_IMUL1_R_R8, 8),
+        (OP_IMUL1_R_R16, 16),
+        (OP_IMUL1_R_R32, 32),
+        (OP_IMUL1_R_R64, 64),
+        (OP_DIV_R_R8, 8),
+        (OP_DIV_R_R16, 16),
+        (OP_DIV_R_R32, 32),
+        (OP_DIV_R_R64, 64),
+        (OP_IDIV_R_R8, 8),
+        (OP_IDIV_R_R16, 16),
+        (OP_IDIV_R_R32, 32),
+        (OP_IDIV_R_R64, 64),
     ];
 
     for (op, width) in cases {
@@ -449,8 +625,14 @@ pub(crate) fn run_fuzz_muldiv_test() -> Result<()> {
         // MUL/IMUL write CF/OF (upper-half overflow); DIV/IDIV write nothing.
         assert_eq!(
             written,
-            if op == OP_DIV_R_R8 || op == OP_DIV_R_R16 || op == OP_DIV_R_R32 || op == OP_DIV_R_R64
-                || op == OP_IDIV_R_R8 || op == OP_IDIV_R_R16 || op == OP_IDIV_R_R32 || op == OP_IDIV_R_R64
+            if op == OP_DIV_R_R8
+                || op == OP_DIV_R_R16
+                || op == OP_DIV_R_R32
+                || op == OP_DIV_R_R64
+                || op == OP_IDIV_R_R8
+                || op == OP_IDIV_R_R16
+                || op == OP_IDIV_R_R32
+                || op == OP_IDIV_R_R64
             {
                 0
             } else {
@@ -458,7 +640,8 @@ pub(crate) fn run_fuzz_muldiv_test() -> Result<()> {
             },
             "op 0x{op:02X}: flag_contract written mask mismatch (P0-⑤)"
         );
-        let mut rng = StdRng::seed_from_u64(0x01D0_0D1E ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut rng =
+            StdRng::seed_from_u64(0x01D0_0D1E ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let mut ran = 0;
         let mut skipped = 0;
         for _ in 0..(iters * 4) {
@@ -476,20 +659,28 @@ pub(crate) fn run_fuzz_muldiv_test() -> Result<()> {
             let mut bc = BytecodeBuilder::new();
             let bop = match width {
                 8 => match op {
-                    OP_MUL_R_R8 => OP_MUL_R_R8, OP_IMUL1_R_R8 => OP_IMUL1_R_R8,
-                    OP_DIV_R_R8 => OP_DIV_R_R8, _ => OP_IDIV_R_R8,
+                    OP_MUL_R_R8 => OP_MUL_R_R8,
+                    OP_IMUL1_R_R8 => OP_IMUL1_R_R8,
+                    OP_DIV_R_R8 => OP_DIV_R_R8,
+                    _ => OP_IDIV_R_R8,
                 },
                 16 => match op {
-                    OP_MUL_R_R16 => OP_MUL_R_R16, OP_IMUL1_R_R16 => OP_IMUL1_R_R16,
-                    OP_DIV_R_R16 => OP_DIV_R_R16, _ => OP_IDIV_R_R16,
+                    OP_MUL_R_R16 => OP_MUL_R_R16,
+                    OP_IMUL1_R_R16 => OP_IMUL1_R_R16,
+                    OP_DIV_R_R16 => OP_DIV_R_R16,
+                    _ => OP_IDIV_R_R16,
                 },
                 32 => match op {
-                    OP_MUL_R_R32 => OP_MUL_R_R32, OP_IMUL1_R_R32 => OP_IMUL1_R_R32,
-                    OP_DIV_R_R32 => OP_DIV_R_R32, _ => OP_IDIV_R_R32,
+                    OP_MUL_R_R32 => OP_MUL_R_R32,
+                    OP_IMUL1_R_R32 => OP_IMUL1_R_R32,
+                    OP_DIV_R_R32 => OP_DIV_R_R32,
+                    _ => OP_IDIV_R_R32,
                 },
                 _ => match op {
-                    OP_MUL_R_R64 => OP_MUL_R_R64, OP_IMUL1_R_R64 => OP_IMUL1_R_R64,
-                    OP_DIV_R_R64 => OP_DIV_R_R64, _ => OP_IDIV_R_R64,
+                    OP_MUL_R_R64 => OP_MUL_R_R64,
+                    OP_IMUL1_R_R64 => OP_IMUL1_R_R64,
+                    OP_DIV_R_R64 => OP_DIV_R_R64,
+                    _ => OP_IDIV_R_R64,
                 },
             };
             bc.mul_r(bop, 3);
@@ -536,14 +727,39 @@ pub(crate) fn run_fuzz_muldiv_test() -> Result<()> {
             // Flags = dirty, with the contract's *written* bits replaced by the
             // op's result (DIV/IDIV write nothing → flags unchanged).
             let expect = (dirty & !written) | want_cf_of;
-            assert_eq!(fi & written, want_cf_of, "{name}: interp CF/OF wrong, got 0x{fi:X}");
-            assert_eq!(fn_ & written, want_cf_of, "{name}: native CF/OF wrong, got 0x{fn_:X}");
-            assert_eq!(fi & preserved, dirty & preserved, "{name}: interp must preserve other flags, got 0x{fi:X}");
-            assert_eq!(fn_ & preserved, dirty & preserved, "{name}: native must preserve other flags, got 0x{fn_:X}");
-            assert_eq!(fi, expect, "{name}: interp flags 0x{fi:X} != expected 0x{expect:X}");
-            assert_eq!(fn_, expect, "{name}: native flags 0x{fn_:X} != expected 0x{expect:X}");
+            assert_eq!(
+                fi & written,
+                want_cf_of,
+                "{name}: interp CF/OF wrong, got 0x{fi:X}"
+            );
+            assert_eq!(
+                fn_ & written,
+                want_cf_of,
+                "{name}: native CF/OF wrong, got 0x{fn_:X}"
+            );
+            assert_eq!(
+                fi & preserved,
+                dirty & preserved,
+                "{name}: interp must preserve other flags, got 0x{fi:X}"
+            );
+            assert_eq!(
+                fn_ & preserved,
+                dirty & preserved,
+                "{name}: native must preserve other flags, got 0x{fn_:X}"
+            );
+            assert_eq!(
+                fi, expect,
+                "{name}: interp flags 0x{fi:X} != expected 0x{expect:X}"
+            );
+            assert_eq!(
+                fn_, expect,
+                "{name}: native flags 0x{fn_:X} != expected 0x{expect:X}"
+            );
         }
-        assert!(ran > 0, "op 0x{op:02X}: no valid inputs found (all skipped)");
+        assert!(
+            ran > 0,
+            "op 0x{op:02X}: no valid inputs found (all skipped)"
+        );
     }
     Ok(())
 }
@@ -577,23 +793,67 @@ pub(crate) fn run_fuzz_shld_rol_test() -> Result<()> {
         fn(u64, u64, u8, u64) -> u64,
     )> = vec![
         (
-            "shld32", OP_SHLD_R_R_IMM8, OP_SHLD_R_R_CL, false,
-            |d, s, c| if c & 31 == 0 { (d as u32 as u64, false) } else { let r = ((d as u32) << (c & 31)) | ((s as u32) >> (32 - (c & 31))); (r as u64, true) },
-            |d, s, c, r| flags::shift_flags(flags::ShiftKind::Shl, d as u32, (c & 31) as u32, r as u32),
+            "shld32",
+            OP_SHLD_R_R_IMM8,
+            OP_SHLD_R_R_CL,
+            false,
+            |d, s, c| {
+                if c & 31 == 0 {
+                    (d as u32 as u64, false)
+                } else {
+                    let r = ((d as u32) << (c & 31)) | ((s as u32) >> (32 - (c & 31)));
+                    (r as u64, true)
+                }
+            },
+            |d, s, c, r| {
+                flags::shift_flags(flags::ShiftKind::Shl, d as u32, (c & 31) as u32, r as u32)
+            },
         ),
         (
-            "shrd32", OP_SHRD_R_R_IMM8, OP_SHRD_R_R_CL, false,
-            |d, s, c| if c & 31 == 0 { (d as u32 as u64, false) } else { let r = ((d as u32) >> (c & 31)) | ((s as u32) << (32 - (c & 31))); (r as u64, true) },
-            |d, s, c, r| flags::shift_flags(flags::ShiftKind::Shr, d as u32, (c & 31) as u32, r as u32),
+            "shrd32",
+            OP_SHRD_R_R_IMM8,
+            OP_SHRD_R_R_CL,
+            false,
+            |d, s, c| {
+                if c & 31 == 0 {
+                    (d as u32 as u64, false)
+                } else {
+                    let r = ((d as u32) >> (c & 31)) | ((s as u32) << (32 - (c & 31)));
+                    (r as u64, true)
+                }
+            },
+            |d, s, c, r| {
+                flags::shift_flags(flags::ShiftKind::Shr, d as u32, (c & 31) as u32, r as u32)
+            },
         ),
         (
-            "shld64", OP_SHLD64_R_R_IMM8, OP_SHLD64_R_R_CL, true,
-            |d, s, c| if c & 63 == 0 { (d, false) } else { let r = (d << (c & 63)) | (s >> (64 - (c & 63))); (r, true) },
+            "shld64",
+            OP_SHLD64_R_R_IMM8,
+            OP_SHLD64_R_R_CL,
+            true,
+            |d, s, c| {
+                if c & 63 == 0 {
+                    (d, false)
+                } else {
+                    let r = (d << (c & 63)) | (s >> (64 - (c & 63)));
+                    (r, true)
+                }
+            },
             |d, s, c, r| flags::shift_flags64(flags::ShiftKind::Shl, d, (c & 63) as u32, r),
         ),
         (
-            "shrd64", OP_SHRD64_R_R_IMM8, OP_SHRD64_R_R_CL, true,
-            |d, s, c| if c & 63 == 0 { (d, false) } else { let r = (d >> (c & 63)) | (s << (64 - (c & 63))); (r, true) },
+            "shrd64",
+            OP_SHRD64_R_R_IMM8,
+            OP_SHRD64_R_R_CL,
+            true,
+            |d, s, c| {
+                if c & 63 == 0 {
+                    (d, false)
+                } else {
+                    let r = (d >> (c & 63)) | (s << (64 - (c & 63)));
+                    (r, true)
+                }
+            },
             |d, s, c, r| flags::shift_flags64(flags::ShiftKind::Shr, d, (c & 63) as u32, r),
         ),
     ];
@@ -601,7 +861,9 @@ pub(crate) fn run_fuzz_shld_rol_test() -> Result<()> {
     for (name, op_imm, op_cl, is64, dst_sem, fl_sem) in cases {
         for mode in ["imm8", "cl"] {
             let mut rng = StdRng::seed_from_u64(
-                0x51DF_0D0E ^ ((op_imm as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) ^ (if mode == "cl" { 0x1 } else { 0x2 }),
+                0x51DF_0D0E
+                    ^ ((op_imm as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                    ^ (if mode == "cl" { 0x1 } else { 0x2 }),
             );
             for _ in 0..iters {
                 let dst = rng.next_u64();
@@ -641,16 +903,42 @@ pub(crate) fn run_fuzz_shld_rol_test() -> Result<()> {
                 let label = format!("{name}/{mode}(dst=0x{dst:X},src=0x{src:X},cnt={cnt})");
                 let (di, fi) = (vreg(&st_i, 3), flags_of(&st_i));
                 let (dn, fn_) = (vreg(&st_n, 3), flags_of(&st_n));
-                assert_eq!(di, want_dst, "{label}: interp dst 0x{di:X} != expected 0x{want_dst:X}");
-                assert_eq!(dn, want_dst, "{label}: native dst 0x{dn:X} != expected 0x{want_dst:X}");
-                let fi_c = if changed { fi & shift_contract } else { fi & FLAG_MASK };
-                let fn_c = if changed { fn_ & shift_contract } else { fn_ & FLAG_MASK };
-                if changed {
-                    assert_eq!(fi_c, want_flags, "{label}: interp flags 0x{fi:X} != expected 0x{want_flags:X}");
-                    assert_eq!(fn_c, want_flags, "{label}: native flags 0x{fn_:X} != expected 0x{want_flags:X}");
+                assert_eq!(
+                    di, want_dst,
+                    "{label}: interp dst 0x{di:X} != expected 0x{want_dst:X}"
+                );
+                assert_eq!(
+                    dn, want_dst,
+                    "{label}: native dst 0x{dn:X} != expected 0x{want_dst:X}"
+                );
+                let fi_c = if changed {
+                    fi & shift_contract
                 } else {
-                    assert_eq!(fi_c, dirty, "{label}: interp must preserve flags (count==0), got 0x{fi:X}");
-                    assert_eq!(fn_c, dirty, "{label}: native must preserve flags (count==0), got 0x{fn_:X}");
+                    fi & FLAG_MASK
+                };
+                let fn_c = if changed {
+                    fn_ & shift_contract
+                } else {
+                    fn_ & FLAG_MASK
+                };
+                if changed {
+                    assert_eq!(
+                        fi_c, want_flags,
+                        "{label}: interp flags 0x{fi:X} != expected 0x{want_flags:X}"
+                    );
+                    assert_eq!(
+                        fn_c, want_flags,
+                        "{label}: native flags 0x{fn_:X} != expected 0x{want_flags:X}"
+                    );
+                } else {
+                    assert_eq!(
+                        fi_c, dirty,
+                        "{label}: interp must preserve flags (count==0), got 0x{fi:X}"
+                    );
+                    assert_eq!(
+                        fn_c, dirty,
+                        "{label}: native must preserve flags (count==0), got 0x{fn_:X}"
+                    );
                 }
             }
         }
@@ -663,7 +951,8 @@ pub(crate) fn run_fuzz_shld_rol_test() -> Result<()> {
             (0, 0),
             "{name}: must stay flagless in the contract"
         );
-        let mut rng = StdRng::seed_from_u64(0x9012_3456 ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut rng =
+            StdRng::seed_from_u64(0x9012_3456 ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         for _ in 0..iters {
             let v = rng.next_u32();
             let cnt = (rng.next_u32() & 31) as u8;
@@ -686,8 +975,14 @@ pub(crate) fn run_fuzz_shld_rol_test() -> Result<()> {
             })?;
             let (di, fi) = (vreg(&st_i, 3), flags_of(&st_i));
             let (dn, fn_) = (vreg(&st_n, 3), flags_of(&st_n));
-            assert_eq!(di, want, "{name}(v=0x{v:X},cnt={cnt}): interp dst 0x{di:X} != expected 0x{want:X}");
-            assert_eq!(dn, want, "{name}(v=0x{v:X},cnt={cnt}): native dst 0x{dn:X} != expected 0x{want:X}");
+            assert_eq!(
+                di, want,
+                "{name}(v=0x{v:X},cnt={cnt}): interp dst 0x{di:X} != expected 0x{want:X}"
+            );
+            assert_eq!(
+                dn, want,
+                "{name}(v=0x{v:X},cnt={cnt}): native dst 0x{dn:X} != expected 0x{want:X}"
+            );
             assert_eq!(fi, dirty, "{name}: interp must be flagless, got 0x{fi:X}");
             assert_eq!(fn_, dirty, "{name}: native must be flagless, got 0x{fn_:X}");
         }
@@ -712,16 +1007,25 @@ fn run_atomic_case(
     use super::util::{interp_state, run_native_with_data, set_vreg};
     let mut b = BytecodeBuilder::new();
     match op {
-        _ if op == crate::vm::bytecode::OP_CMPXCHG_MEM8_A || op == crate::vm::bytecode::OP_CMPXCHG_MEM16_A
-            || op == crate::vm::bytecode::OP_CMPXCHG_MEM32_A || op == crate::vm::bytecode::OP_CMPXCHG_MEM64_A => {
+        _ if op == crate::vm::bytecode::OP_CMPXCHG_MEM8_A
+            || op == crate::vm::bytecode::OP_CMPXCHG_MEM16_A
+            || op == crate::vm::bytecode::OP_CMPXCHG_MEM32_A
+            || op == crate::vm::bytecode::OP_CMPXCHG_MEM64_A =>
+        {
             b.mem_cmpxchg_a(op, 15, 14);
         }
-        _ if op == crate::vm::bytecode::OP_XADD_MEM8_A || op == crate::vm::bytecode::OP_XADD_MEM16_A
-            || op == crate::vm::bytecode::OP_XADD_MEM32_A || op == crate::vm::bytecode::OP_XADD_MEM64_A => {
+        _ if op == crate::vm::bytecode::OP_XADD_MEM8_A
+            || op == crate::vm::bytecode::OP_XADD_MEM16_A
+            || op == crate::vm::bytecode::OP_XADD_MEM32_A
+            || op == crate::vm::bytecode::OP_XADD_MEM64_A =>
+        {
             b.mem_xadd_a(op, 15, 14);
         }
-        _ if op == crate::vm::bytecode::OP_XCHG_MEM8_A || op == crate::vm::bytecode::OP_XCHG_MEM16_A
-            || op == crate::vm::bytecode::OP_XCHG_MEM32_A || op == crate::vm::bytecode::OP_XCHG_MEM64_A => {
+        _ if op == crate::vm::bytecode::OP_XCHG_MEM8_A
+            || op == crate::vm::bytecode::OP_XCHG_MEM16_A
+            || op == crate::vm::bytecode::OP_XCHG_MEM32_A
+            || op == crate::vm::bytecode::OP_XCHG_MEM64_A =>
+        {
             b.mem_xchg_a(op, 15, 14);
         }
         _ => b.lock_inc_a(op, 15),
@@ -737,7 +1041,8 @@ fn run_atomic_case(
     set_vreg(&mut st, 15, ATOM_BASE as u64);
     set_vreg(&mut st, 14, src);
     set_vreg(&mut st, 0, rax);
-    interp::interpret(&mut st, &mut mem, &bc).map_err(|e| anyhow!("atomic interp failed: {:?}", e))?;
+    interp::interpret(&mut st, &mut mem, &bc)
+        .map_err(|e| anyhow!("atomic interp failed: {:?}", e))?;
     let mut vi = [0u64; 16];
     for (i, v) in vi.iter_mut().enumerate() {
         *v = vreg(&st, i);
@@ -775,9 +1080,13 @@ pub(crate) fn run_fuzz_atomic_test() -> Result<()> {
 
     // XCHG: no flags; mem <-> src (upper bits preserved for 8/16).
     for (op, w) in [
-        (OP_XCHG_MEM8_A, 1), (OP_XCHG_MEM16_A, 2), (OP_XCHG_MEM32_A, 4), (OP_XCHG_MEM64_A, 8),
+        (OP_XCHG_MEM8_A, 1),
+        (OP_XCHG_MEM16_A, 2),
+        (OP_XCHG_MEM32_A, 4),
+        (OP_XCHG_MEM64_A, 8),
     ] {
-        let mut rng = StdRng::seed_from_u64(0xC0DE_0001 ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut rng =
+            StdRng::seed_from_u64(0xC0DE_0001 ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         for _ in 0..iters {
             let mem_init = rng.next_u64();
             let src = rng.next_u64();
@@ -790,8 +1099,16 @@ pub(crate) fn run_fuzz_atomic_test() -> Result<()> {
                 4 => old,
                 _ => old,
             };
-            assert_eq!(u64::from_le_bytes(mi[..8].try_into().unwrap()) & mask(w), want_mem, "xchg{w} mem");
-            assert_eq!(u64::from_le_bytes(mn[..8].try_into().unwrap()) & mask(w), want_mem, "xchg{w} native mem");
+            assert_eq!(
+                u64::from_le_bytes(mi[..8].try_into().unwrap()) & mask(w),
+                want_mem,
+                "xchg{w} mem"
+            );
+            assert_eq!(
+                u64::from_le_bytes(mn[..8].try_into().unwrap()) & mask(w),
+                want_mem,
+                "xchg{w} native mem"
+            );
             assert_eq!(vi[14], want_src, "xchg{w} src vreg");
             assert_eq!(fi, 0, "xchg{w} flags must be untouched (0x{fi:X})");
             assert_eq!(fn_, 0, "xchg{w} native flags must be untouched (0x{fn_:X})");
@@ -806,7 +1123,8 @@ pub(crate) fn run_fuzz_atomic_test() -> Result<()> {
         (OP_XADD_MEM64_A, 8, flags::add_flags64(0, 0)),
     ] {
         let _ = fl;
-        let mut rng = StdRng::seed_from_u64(0xC0DE_0002 ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut rng =
+            StdRng::seed_from_u64(0xC0DE_0002 ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         for _ in 0..iters {
             let mem_init = rng.next_u64();
             let src = rng.next_u64();
@@ -814,10 +1132,22 @@ pub(crate) fn run_fuzz_atomic_test() -> Result<()> {
             let a = mem_init & mask(w);
             let b = src & mask(w);
             let (want_mem, want_flags) = match w {
-                1 => { let r = (a as u8).wrapping_add(b as u8) as u64; (r, flags::add_flags_width(a, b, 8)) }
-                2 => { let r = (a as u16).wrapping_add(b as u16) as u64; (r, flags::add_flags_width(a, b, 16)) }
-                4 => { let r = (a as u32).wrapping_add(b as u32) as u64; (r, flags::add_flags(a as u32, b as u32)) }
-                _ => { let r = a.wrapping_add(b); (r, flags::add_flags64(a, b)) }
+                1 => {
+                    let r = (a as u8).wrapping_add(b as u8) as u64;
+                    (r, flags::add_flags_width(a, b, 8))
+                }
+                2 => {
+                    let r = (a as u16).wrapping_add(b as u16) as u64;
+                    (r, flags::add_flags_width(a, b, 16))
+                }
+                4 => {
+                    let r = (a as u32).wrapping_add(b as u32) as u64;
+                    (r, flags::add_flags(a as u32, b as u32))
+                }
+                _ => {
+                    let r = a.wrapping_add(b);
+                    (r, flags::add_flags64(a, b))
+                }
             };
             let want_src = match w {
                 1 => (src & !0xFF) | (a & 0xFF),
@@ -825,19 +1155,39 @@ pub(crate) fn run_fuzz_atomic_test() -> Result<()> {
                 4 => a & 0xFFFF_FFFF,
                 _ => a,
             };
-            assert_eq!(u64::from_le_bytes(mi[..8].try_into().unwrap()) & mask(w), want_mem, "xadd{w} mem");
-            assert_eq!(u64::from_le_bytes(mn[..8].try_into().unwrap()) & mask(w), want_mem, "xadd{w} native mem");
+            assert_eq!(
+                u64::from_le_bytes(mi[..8].try_into().unwrap()) & mask(w),
+                want_mem,
+                "xadd{w} mem"
+            );
+            assert_eq!(
+                u64::from_le_bytes(mn[..8].try_into().unwrap()) & mask(w),
+                want_mem,
+                "xadd{w} native mem"
+            );
             assert_eq!(vi[14], want_src, "xadd{w} src vreg");
-            assert_eq!(fi & FLAG_MASK, want_flags & FLAG_MASK, "xadd{w} flags 0x{fi:X} != 0x{want_flags:X}");
-            assert_eq!(fn_ & FLAG_MASK, want_flags & FLAG_MASK, "xadd{w} native flags 0x{fn_:X} != 0x{want_flags:X}");
+            assert_eq!(
+                fi & FLAG_MASK,
+                want_flags & FLAG_MASK,
+                "xadd{w} flags 0x{fi:X} != 0x{want_flags:X}"
+            );
+            assert_eq!(
+                fn_ & FLAG_MASK,
+                want_flags & FLAG_MASK,
+                "xadd{w} native flags 0x{fn_:X} != 0x{want_flags:X}"
+            );
         }
     }
 
     // CMPXCHG: ZF set on success / cleared on failure, other flags preserved.
     for (op, w) in [
-        (OP_CMPXCHG_MEM8_A, 1), (OP_CMPXCHG_MEM16_A, 2), (OP_CMPXCHG_MEM32_A, 4), (OP_CMPXCHG_MEM64_A, 8),
+        (OP_CMPXCHG_MEM8_A, 1),
+        (OP_CMPXCHG_MEM16_A, 2),
+        (OP_CMPXCHG_MEM32_A, 4),
+        (OP_CMPXCHG_MEM64_A, 8),
     ] {
-        let mut rng = StdRng::seed_from_u64(0xC0DE_0003 ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut rng =
+            StdRng::seed_from_u64(0xC0DE_0003 ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         for _ in 0..iters {
             let mem_init = rng.next_u64();
             let rax = rng.next_u64();
@@ -849,31 +1199,69 @@ pub(crate) fn run_fuzz_atomic_test() -> Result<()> {
             let (want_mem, want_v0, zf) = if cur == expected {
                 (src & mask(w), rax, true)
             } else {
-                (cur, match w { 1 => (rax & !0xFF) | cur, 2 => (rax & !0xFFFF) | cur, 4 => cur, _ => cur }, false)
+                (
+                    cur,
+                    match w {
+                        1 => (rax & !0xFF) | cur,
+                        2 => (rax & !0xFFFF) | cur,
+                        4 => cur,
+                        _ => cur,
+                    },
+                    false,
+                )
             };
             let want_flags = (init_flags & !F_ZF) | if zf { F_ZF } else { 0 };
-            assert_eq!(u64::from_le_bytes(mi[..8].try_into().unwrap()) & mask(w), want_mem, "cmpxchg{w} mem");
-            assert_eq!(u64::from_le_bytes(mn[..8].try_into().unwrap()) & mask(w), want_mem, "cmpxchg{w} native mem");
-            assert_eq!(vi[0], want_v0, "cmpxchg{w} v0(RAX) 0x{:X} != 0x{want_v0:X}", vi[0]);
-            assert_eq!(fi & FLAG_MASK, want_flags & FLAG_MASK, "cmpxchg{w} flags 0x{fi:X} != 0x{want_flags:X}");
-            assert_eq!(fn_ & FLAG_MASK, want_flags & FLAG_MASK, "cmpxchg{w} native flags 0x{fn_:X} != 0x{want_flags:X}");
+            assert_eq!(
+                u64::from_le_bytes(mi[..8].try_into().unwrap()) & mask(w),
+                want_mem,
+                "cmpxchg{w} mem"
+            );
+            assert_eq!(
+                u64::from_le_bytes(mn[..8].try_into().unwrap()) & mask(w),
+                want_mem,
+                "cmpxchg{w} native mem"
+            );
+            assert_eq!(
+                vi[0], want_v0,
+                "cmpxchg{w} v0(RAX) 0x{:X} != 0x{want_v0:X}",
+                vi[0]
+            );
+            assert_eq!(
+                fi & FLAG_MASK,
+                want_flags & FLAG_MASK,
+                "cmpxchg{w} flags 0x{fi:X} != 0x{want_flags:X}"
+            );
+            assert_eq!(
+                fn_ & FLAG_MASK,
+                want_flags & FLAG_MASK,
+                "cmpxchg{w} native flags 0x{fn_:X} != 0x{want_flags:X}"
+            );
         }
     }
 
     // LOCK INC/DEC: INC/DEC flags, CF preserved.
     for (op, w, is_inc) in [
-        (OP_LOCK_INC_MEM8_A, 1, true), (OP_LOCK_INC_MEM16_A, 2, true),
-        (OP_LOCK_INC_MEM32_A, 4, true), (OP_LOCK_INC_MEM64_A, 8, true),
-        (OP_LOCK_DEC_MEM8_A, 1, false), (OP_LOCK_DEC_MEM16_A, 2, false),
-        (OP_LOCK_DEC_MEM32_A, 4, false), (OP_LOCK_DEC_MEM64_A, 8, false),
+        (OP_LOCK_INC_MEM8_A, 1, true),
+        (OP_LOCK_INC_MEM16_A, 2, true),
+        (OP_LOCK_INC_MEM32_A, 4, true),
+        (OP_LOCK_INC_MEM64_A, 8, true),
+        (OP_LOCK_DEC_MEM8_A, 1, false),
+        (OP_LOCK_DEC_MEM16_A, 2, false),
+        (OP_LOCK_DEC_MEM32_A, 4, false),
+        (OP_LOCK_DEC_MEM64_A, 8, false),
     ] {
-        let mut rng = StdRng::seed_from_u64(0xC0DE_0004 ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut rng =
+            StdRng::seed_from_u64(0xC0DE_0004 ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         for _ in 0..iters {
             let mem_init = rng.next_u64();
             let init_flags = F_CF | F_PF | F_AF | F_ZF | F_SF | F_OF; // dirty; CF must survive
             let (mi, fi, vi, mn, fn_) = run_atomic_case(op, w, mem_init, 0, 0, init_flags)?;
             let a = mem_init & mask(w);
-            let want_mem = if is_inc { a.wrapping_add(1) & mask(w) } else { a.wrapping_sub(1) & mask(w) };
+            let want_mem = if is_inc {
+                a.wrapping_add(1) & mask(w)
+            } else {
+                a.wrapping_sub(1) & mask(w)
+            };
             let want_flags = match (w, is_inc) {
                 (1, true) => flags::incdec_flags_width(a, 8, true, init_flags),
                 (1, false) => flags::incdec_flags_width(a, 8, false, init_flags),
@@ -884,10 +1272,32 @@ pub(crate) fn run_fuzz_atomic_test() -> Result<()> {
                 (_, true) => flags::inc_flags64(a, init_flags),
                 (_, false) => flags::dec_flags64(a, init_flags),
             };
-            assert_eq!(u64::from_le_bytes(mi[..8].try_into().unwrap()) & mask(w), want_mem, "lock_{} mem", if is_inc { "inc" } else { "dec" });
-            assert_eq!(u64::from_le_bytes(mn[..8].try_into().unwrap()) & mask(w), want_mem, "lock_{} native mem", if is_inc { "inc" } else { "dec" });
-            assert_eq!(fi & FLAG_MASK, want_flags & FLAG_MASK, "lock_{}{} flags 0x{fi:X} != 0x{want_flags:X}", if is_inc { "inc" } else { "dec" }, w * 8);
-            assert_eq!(fn_ & FLAG_MASK, want_flags & FLAG_MASK, "lock_{}{} native flags 0x{fn_:X} != 0x{want_flags:X}", if is_inc { "inc" } else { "dec" }, w * 8);
+            assert_eq!(
+                u64::from_le_bytes(mi[..8].try_into().unwrap()) & mask(w),
+                want_mem,
+                "lock_{} mem",
+                if is_inc { "inc" } else { "dec" }
+            );
+            assert_eq!(
+                u64::from_le_bytes(mn[..8].try_into().unwrap()) & mask(w),
+                want_mem,
+                "lock_{} native mem",
+                if is_inc { "inc" } else { "dec" }
+            );
+            assert_eq!(
+                fi & FLAG_MASK,
+                want_flags & FLAG_MASK,
+                "lock_{}{} flags 0x{fi:X} != 0x{want_flags:X}",
+                if is_inc { "inc" } else { "dec" },
+                w * 8
+            );
+            assert_eq!(
+                fn_ & FLAG_MASK,
+                want_flags & FLAG_MASK,
+                "lock_{}{} native flags 0x{fn_:X} != 0x{want_flags:X}",
+                if is_inc { "inc" } else { "dec" },
+                w * 8
+            );
             let _ = vi;
         }
     }
@@ -912,7 +1322,9 @@ pub(crate) fn run_fuzz_fpconv_test() -> Result<()> {
     ];
 
     for (name, op, is_ss, trunc) in cases {
-        let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_CAFE ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut rng = StdRng::seed_from_u64(
+            0xDEAD_BEEF_CAFE ^ (op as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        );
         for i in 0..iters {
             let bits = rng.next_u64();
             let x = if is_ss {
@@ -922,7 +1334,11 @@ pub(crate) fn run_fuzz_fpconv_test() -> Result<()> {
             };
             // x86 reference: trunc toward zero / round-to-nearest-even, then the
             // 32-bit integer-indefinite for NaN/±∞/out-of-range.
-            let r = if trunc { x.trunc() } else { x.round_ties_even() };
+            let r = if trunc {
+                x.trunc()
+            } else {
+                x.round_ties_even()
+            };
             let want = if !r.is_finite() || r < -2147483648.0 || r >= 2147483648.0 {
                 0x8000_0000
             } else {
@@ -945,9 +1361,19 @@ pub(crate) fn run_fuzz_fpconv_test() -> Result<()> {
             })?;
 
             let (di, dn) = (vreg(&st_i, 3), vreg(&st_n, 3));
-            let xstr = if is_ss { format!("f32 0x{:08X}", bits as u32) } else { format!("f64 0x{bits:016X}") };
-            assert_eq!(di, want, "{name}#{i}({xstr}): interp 0x{di:X} != expected 0x{want:X}");
-            assert_eq!(dn, want, "{name}#{i}({xstr}): native 0x{dn:X} != expected 0x{want:X}");
+            let xstr = if is_ss {
+                format!("f32 0x{:08X}", bits as u32)
+            } else {
+                format!("f64 0x{bits:016X}")
+            };
+            assert_eq!(
+                di, want,
+                "{name}#{i}({xstr}): interp 0x{di:X} != expected 0x{want:X}"
+            );
+            assert_eq!(
+                dn, want,
+                "{name}#{i}({xstr}): native 0x{dn:X} != expected 0x{want:X}"
+            );
         }
     }
     Ok(())
@@ -991,7 +1417,13 @@ pub(crate) fn run_mt_reentrancy_test() -> Result<()> {
     b.halt();
     let prog = Arc::new(b.finish());
 
-    let inputs: Vec<u64> = (0..8u64).map(|i| 0x0102_0304_0506_0708u64.wrapping_mul(i.wrapping_add(1)).wrapping_add(i)).collect();
+    let inputs: Vec<u64> = (0..8u64)
+        .map(|i| {
+            0x0102_0304_0506_0708u64
+                .wrapping_mul(i.wrapping_add(1))
+                .wrapping_add(i)
+        })
+        .collect();
 
     // 단일 스레드 참조 (입력별).
     let refs: Vec<[u64; 16]> = inputs
@@ -999,8 +1431,7 @@ pub(crate) fn run_mt_reentrancy_test() -> Result<()> {
         .map(|&v| {
             let (mut st, mut mem) = super::util::interp_state();
             set_vreg(&mut st, 0, v);
-            interp::interpret(&mut st, &mut mem, &prog)
-                .expect("reference interp");
+            interp::interpret(&mut st, &mut mem, &prog).expect("reference interp");
             st_vregs(&st)
         })
         .collect();
@@ -1015,9 +1446,12 @@ pub(crate) fn run_mt_reentrancy_test() -> Result<()> {
                 for _ in 0..200 {
                     let (mut st, mut mem) = super::util::interp_state();
                     set_vreg(&mut st, 0, v);
-                    interp::interpret(&mut st, &mut mem, &prog)
-                        .expect("mt interp");
-                    assert_eq!(st_vregs(&st), r, "mt reentrancy: result diverged from single-thread reference");
+                    interp::interpret(&mut st, &mut mem, &prog).expect("mt interp");
+                    assert_eq!(
+                        st_vregs(&st),
+                        r,
+                        "mt reentrancy: result diverged from single-thread reference"
+                    );
                 }
             })
         })

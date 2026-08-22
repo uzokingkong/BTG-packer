@@ -29,9 +29,11 @@ impl RiscLifter {
         );
         // if DF clear → delta = +n
         self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::ConditionalMove { cond: BranchCondition::Zero })
-                .with_dst(delta)
-                .with_src1(MicroOperand::Imm64(n)),
+            MicroInstr::new(RiscOp::ConditionalMove {
+                cond: BranchCondition::Zero,
+            })
+            .with_dst(delta)
+            .with_src1(MicroOperand::Imm64(n)),
         );
     }
     pub(super) fn lift_movs(&mut self, inst: &Instruction) -> Result<()> {
@@ -45,10 +47,14 @@ impl RiscLifter {
             self.emit_dir_delta(n);
             let val = MicroOperand::Temp(5);
             self.desynth.instrs.push(
-                MicroInstr::new(RiscOp::MemoryRead { width }).with_dst(val).with_src1(rsi),
+                MicroInstr::new(RiscOp::MemoryRead { width })
+                    .with_dst(val)
+                    .with_src1(rsi),
             );
             self.desynth.instrs.push(
-                MicroInstr::new(RiscOp::MemoryWrite { width }).with_src1(rdi).with_src2(val),
+                MicroInstr::new(RiscOp::MemoryWrite { width })
+                    .with_src1(rdi)
+                    .with_src2(val),
             );
             self.desynth.emit_add(rsi, rsi, delta);
             self.desynth.emit_add(rdi, rdi, delta);
@@ -60,14 +66,21 @@ impl RiscLifter {
         self.desynth.emit_and(scratch, rcx, rcx); // ZF = (rcx == 0)
         let done_br = self.desynth.instrs.len();
         self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Zero }).with_imm(0),
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::Zero,
+            })
+            .with_imm(0),
         );
         let val = MicroOperand::Temp(5);
         self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::MemoryRead { width }).with_dst(val).with_src1(rsi),
+            MicroInstr::new(RiscOp::MemoryRead { width })
+                .with_dst(val)
+                .with_src1(rsi),
         );
         self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::MemoryWrite { width }).with_src1(rdi).with_src2(val),
+            MicroInstr::new(RiscOp::MemoryWrite { width })
+                .with_src1(rdi)
+                .with_src2(val),
         );
         self.desynth.emit_add(rsi, rsi, delta);
         self.desynth.emit_add(rdi, rdi, delta);
@@ -91,7 +104,9 @@ impl RiscLifter {
         if !has_any_rep(inst) {
             self.emit_dir_delta(n);
             self.desynth.instrs.push(
-                MicroInstr::new(RiscOp::MemoryWrite { width }).with_src1(rdi).with_src2(acc),
+                MicroInstr::new(RiscOp::MemoryWrite { width })
+                    .with_src1(rdi)
+                    .with_src2(acc),
             );
             self.desynth.emit_add(rdi, rdi, delta);
             return Ok(());
@@ -102,10 +117,15 @@ impl RiscLifter {
         self.desynth.emit_and(scratch, rcx, rcx);
         let done_br = self.desynth.instrs.len();
         self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Zero }).with_imm(0),
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::Zero,
+            })
+            .with_imm(0),
         );
         self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::MemoryWrite { width }).with_src1(rdi).with_src2(acc),
+            MicroInstr::new(RiscOp::MemoryWrite { width })
+                .with_src1(rdi)
+                .with_src2(acc),
         );
         self.desynth.emit_add(rdi, rdi, delta);
         self.desynth.emit_sub(rcx, rcx, MicroOperand::Imm64(1));
@@ -130,15 +150,20 @@ impl RiscLifter {
             self.emit_dir_delta(n);
             let val = MicroOperand::Temp(5);
             self.desynth.instrs.push(
-                MicroInstr::new(RiscOp::MemoryRead { width }).with_dst(val).with_src1(rsi),
+                MicroInstr::new(RiscOp::MemoryRead { width })
+                    .with_dst(val)
+                    .with_src1(rsi),
             );
             if width == 8 {
-                self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(acc).with_src1(val));
+                self.desynth
+                    .instrs
+                    .push(MicroInstr::new(RiscOp::Mov).with_dst(acc).with_src1(val));
             } else {
                 // x86 LODSB/LODSW: only the low 8/16 bits of RAX are written; the
                 // upper bits are PRESERVED. acc = (acc & ~mask) | (val & mask).
                 self.desynth.emit_and(acc, acc, MicroOperand::Imm64(!mask));
-                self.desynth.emit_and(MicroOperand::Temp(2), val, MicroOperand::Imm64(mask));
+                self.desynth
+                    .emit_and(MicroOperand::Temp(2), val, MicroOperand::Imm64(mask));
                 self.desynth.emit_or(acc, acc, MicroOperand::Temp(2));
             }
             self.desynth.emit_add(rsi, rsi, delta);
@@ -150,17 +175,25 @@ impl RiscLifter {
         self.desynth.emit_and(scratch, rcx, rcx);
         let done_br = self.desynth.instrs.len();
         self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Zero }).with_imm(0),
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::Zero,
+            })
+            .with_imm(0),
         );
         let val = MicroOperand::Temp(5);
         self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::MemoryRead { width }).with_dst(val).with_src1(rsi),
+            MicroInstr::new(RiscOp::MemoryRead { width })
+                .with_dst(val)
+                .with_src1(rsi),
         );
         if width == 8 {
-            self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(acc).with_src1(val));
+            self.desynth
+                .instrs
+                .push(MicroInstr::new(RiscOp::Mov).with_dst(acc).with_src1(val));
         } else {
             self.desynth.emit_and(acc, acc, MicroOperand::Imm64(!mask));
-            self.desynth.emit_and(MicroOperand::Temp(2), val, MicroOperand::Imm64(mask));
+            self.desynth
+                .emit_and(MicroOperand::Temp(2), val, MicroOperand::Imm64(mask));
             self.desynth.emit_or(acc, acc, MicroOperand::Temp(2));
         }
         self.desynth.emit_add(rsi, rsi, delta);
@@ -181,16 +214,23 @@ impl RiscLifter {
         let lhs = MicroOperand::Temp(6);
         if is_cmps {
             self.desynth.instrs.push(
-                MicroInstr::new(RiscOp::MemoryRead { width }).with_dst(lhs).with_src1(rsi),
+                MicroInstr::new(RiscOp::MemoryRead { width })
+                    .with_dst(lhs)
+                    .with_src1(rsi),
             );
         } else if width == 8 {
-            self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(lhs).with_src1(acc));
+            self.desynth
+                .instrs
+                .push(MicroInstr::new(RiscOp::Mov).with_dst(lhs).with_src1(acc));
         } else {
-            self.desynth.emit_and(lhs, acc, MicroOperand::Imm64(width_mask_u64(width)));
+            self.desynth
+                .emit_and(lhs, acc, MicroOperand::Imm64(width_mask_u64(width)));
         }
         let rhs = MicroOperand::Temp(7);
         self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::MemoryRead { width }).with_dst(rhs).with_src1(rdi),
+            MicroInstr::new(RiscOp::MemoryRead { width })
+                .with_dst(rhs)
+                .with_src1(rdi),
         );
     }
 
@@ -230,7 +270,10 @@ impl RiscLifter {
         self.desynth.emit_and(scratch, rcx, rcx);
         let done_br = self.desynth.instrs.len();
         self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Zero }).with_imm(0),
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::Zero,
+            })
+            .with_imm(0),
         );
         self.scas_cmps_operands(width, false);
         self.desynth.instrs.push(
@@ -240,9 +283,9 @@ impl RiscLifter {
                 .with_src2(MicroOperand::Temp(7)),
         );
         let captured = MicroOperand::Temp(2);
-        self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::Setcc { cond: stop_cond }).with_dst(captured),
-        );
+        self.desynth
+            .instrs
+            .push(MicroInstr::new(RiscOp::Setcc { cond: stop_cond }).with_dst(captured));
         self.desynth.emit_add(rdi, rdi, delta);
         self.desynth.emit_sub(rcx, rcx, MicroOperand::Imm64(1));
         // captured 가 참이면 fix_flags 로 분기 (ZStop 조건 충족)
@@ -250,7 +293,10 @@ impl RiscLifter {
         self.desynth.emit_sub(tz, captured, MicroOperand::Imm64(0)); // ZF = (captured==0)
         let fix_br = self.desynth.instrs.len();
         self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::NotZero }).with_imm(0),
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::NotZero,
+            })
+            .with_imm(0),
         );
         self.desynth.emit_jmp(loop_start as u64);
         // fix_flags: 최종(중단) 비교의 정확한 플래그 재생성 (lhs/rhs 는 Temp6/7 보존)
@@ -302,7 +348,10 @@ impl RiscLifter {
         self.desynth.emit_and(scratch, rcx, rcx);
         let done_br = self.desynth.instrs.len();
         self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Zero }).with_imm(0),
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::Zero,
+            })
+            .with_imm(0),
         );
         self.scas_cmps_operands(width, true);
         self.desynth.instrs.push(
@@ -312,9 +361,9 @@ impl RiscLifter {
                 .with_src2(MicroOperand::Temp(7)),
         );
         let captured = MicroOperand::Temp(2);
-        self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::Setcc { cond: stop_cond }).with_dst(captured),
-        );
+        self.desynth
+            .instrs
+            .push(MicroInstr::new(RiscOp::Setcc { cond: stop_cond }).with_dst(captured));
         self.desynth.emit_add(rsi, rsi, delta);
         self.desynth.emit_add(rdi, rdi, delta);
         self.desynth.emit_sub(rcx, rcx, MicroOperand::Imm64(1));
@@ -322,7 +371,10 @@ impl RiscLifter {
         self.desynth.emit_sub(tz, captured, MicroOperand::Imm64(0));
         let fix_br = self.desynth.instrs.len();
         self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::NotZero }).with_imm(0),
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::NotZero,
+            })
+            .with_imm(0),
         );
         self.desynth.emit_jmp(loop_start as u64);
         let fix_idx = self.desynth.instrs.len();

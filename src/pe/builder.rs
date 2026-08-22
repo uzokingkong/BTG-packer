@@ -5,7 +5,7 @@
 use anyhow::Result;
 use goblin::pe::header::Header;
 use goblin::pe::section_table::{
-    IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, SectionTable,
+    SectionTable, IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -122,15 +122,41 @@ impl PeMultiSectionBuilder {
 
     pub fn build(self) -> Result<Vec<u8>> {
         let align_config = PeAlignmentConfig {
-            file_alignment: if self.file_alignment == 0 { 0x200 } else { self.file_alignment },
-            section_alignment: if self.section_alignment == 0 { 0x1000 } else { self.section_alignment },
+            file_alignment: if self.file_alignment == 0 {
+                0x200
+            } else {
+                self.file_alignment
+            },
+            section_alignment: if self.section_alignment == 0 {
+                0x1000
+            } else {
+                self.section_alignment
+            },
         };
 
         let num_sections = (self.relayed_sections.len()
             + 1
             + usize::from(self.payload_section.is_some())
             + usize::from(self.reloc_section.is_some())) as u16;
-        let header_size = self.original_headers_bytes.len().max(0x400);
+        let original_e_lfanew = self
+            .original_headers_bytes
+            .get(0x3C..0x40)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+            .map(|v| v as usize)
+            .filter(|&v| v >= 0x40)
+            .unwrap_or(0x80);
+        let sec_table_offset = original_e_lfanew
+            .checked_add(4 + 20 + 240)
+            .ok_or_else(|| anyhow::anyhow!("PE section-table offset overflow"))?;
+        let required_header_end = sec_table_offset
+            .checked_add(num_sections as usize * 40)
+            .ok_or_else(|| anyhow::anyhow!("PE section-table size overflow"))?;
+        let header_size = self
+            .original_headers_bytes
+            .len()
+            .max(required_header_end)
+            .max(0x400);
         let size_of_headers = align_config.align_size(header_size as u32, AlignmentType::File);
 
         let mut pe_bytes = vec![0u8; size_of_headers as usize];
@@ -147,8 +173,13 @@ impl PeMultiSectionBuilder {
             pe_bytes[nt_pos..nt_pos + 4].copy_from_slice(b"PE\0\0");
         }
 
-        let e_lfanew = u32::from_le_bytes(pe_bytes[0x3C..0x40].try_into().unwrap_or([0x80, 0, 0, 0])) as usize;
-        let nt_pos = if e_lfanew > 0 && e_lfanew < pe_bytes.len() - 0x100 { e_lfanew } else { 0x80 };
+        let e_lfanew =
+            u32::from_le_bytes(pe_bytes[0x3C..0x40].try_into().unwrap_or([0x80, 0, 0, 0])) as usize;
+        let nt_pos = if e_lfanew > 0 && e_lfanew < pe_bytes.len() - 0x100 {
+            e_lfanew
+        } else {
+            0x80
+        };
 
         // COFF File Header
         let mut header = Header::default();
@@ -170,13 +201,20 @@ impl PeMultiSectionBuilder {
         let max_existing_va = self
             .relayed_sections
             .iter()
-            .map(|s| s.virtual_address + align_config.align_size(s.virtual_size.max(s.bytes.len() as u32), AlignmentType::Section))
+            .map(|s| {
+                s.virtual_address
+                    + align_config.align_size(
+                        s.virtual_size.max(s.bytes.len() as u32),
+                        AlignmentType::Section,
+                    )
+            })
             .max()
             .unwrap_or(0x1000);
 
         let mut adjusted_btg_section = self.btg_section;
         if adjusted_btg_section.virtual_address < max_existing_va {
-            adjusted_btg_section.virtual_address = align_config.align_size(max_existing_va, AlignmentType::Section);
+            adjusted_btg_section.virtual_address =
+                align_config.align_size(max_existing_va, AlignmentType::Section);
         }
 
         // v4: --payload-relocate — 암호화된 코드 페이로드 섹션(.vdata)을 .textb 직후에 배치
@@ -184,7 +222,9 @@ impl PeMultiSectionBuilder {
         let payload_end_va = if let Some(ref mut psec) = adjusted_payload_section {
             let btg_end = adjusted_btg_section.virtual_address
                 + align_config.align_size(
-                    adjusted_btg_section.virtual_size.max(adjusted_btg_section.bytes.len() as u32),
+                    adjusted_btg_section
+                        .virtual_size
+                        .max(adjusted_btg_section.bytes.len() as u32),
                     AlignmentType::Section,
                 );
             let p_va = align_config.align_size(btg_end, AlignmentType::Section);
@@ -196,7 +236,9 @@ impl PeMultiSectionBuilder {
         } else {
             adjusted_btg_section.virtual_address
                 + align_config.align_size(
-                    adjusted_btg_section.virtual_size.max(adjusted_btg_section.bytes.len() as u32),
+                    adjusted_btg_section
+                        .virtual_size
+                        .max(adjusted_btg_section.bytes.len() as u32),
                     AlignmentType::Section,
                 )
         };
@@ -210,6 +252,14 @@ impl PeMultiSectionBuilder {
 
         // Write Section Headers
         let sec_table_offset = nt_pos + 4 + 20 + 240;
+        let required_header_end = sec_table_offset + num_sections as usize * 40;
+        if required_header_end > size_of_headers as usize {
+            return Err(anyhow::anyhow!(
+                "section table exceeds SizeOfHeaders: required=0x{:X}, SizeOfHeaders=0x{:X}",
+                required_header_end,
+                size_of_headers
+            ));
+        }
         let mut current_file_ptr = size_of_headers;
         let mut max_va = 0u32;
 
@@ -236,19 +286,29 @@ impl PeMultiSectionBuilder {
             sec_entry.virtual_size = actual_virtual_size;
             sec_entry.virtual_address = sec_data.virtual_address;
 
-            let raw_size = align_config.align_size(sec_data.bytes.len() as u32, AlignmentType::File);
+            let raw_size =
+                align_config.align_size(sec_data.bytes.len() as u32, AlignmentType::File);
             sec_entry.size_of_raw_data = raw_size;
-            sec_entry.pointer_to_raw_data = if sec_data.bytes.is_empty() { 0 } else { current_file_ptr };
+            sec_entry.pointer_to_raw_data = if sec_data.bytes.is_empty() {
+                0
+            } else {
+                current_file_ptr
+            };
             sec_entry.characteristics = sec_data.characteristics;
 
             // Write Section Table Header Entry
             let entry_pos = sec_table_offset + i * 40;
             pe_bytes[entry_pos..entry_pos + 8].copy_from_slice(&sec_entry.name);
-            pe_bytes[entry_pos + 8..entry_pos + 12].copy_from_slice(&sec_entry.virtual_size.to_le_bytes());
-            pe_bytes[entry_pos + 12..entry_pos + 16].copy_from_slice(&sec_entry.virtual_address.to_le_bytes());
-            pe_bytes[entry_pos + 16..entry_pos + 20].copy_from_slice(&sec_entry.size_of_raw_data.to_le_bytes());
-            pe_bytes[entry_pos + 20..entry_pos + 24].copy_from_slice(&sec_entry.pointer_to_raw_data.to_le_bytes());
-            pe_bytes[entry_pos + 36..entry_pos + 40].copy_from_slice(&sec_entry.characteristics.to_le_bytes());
+            pe_bytes[entry_pos + 8..entry_pos + 12]
+                .copy_from_slice(&sec_entry.virtual_size.to_le_bytes());
+            pe_bytes[entry_pos + 12..entry_pos + 16]
+                .copy_from_slice(&sec_entry.virtual_address.to_le_bytes());
+            pe_bytes[entry_pos + 16..entry_pos + 20]
+                .copy_from_slice(&sec_entry.size_of_raw_data.to_le_bytes());
+            pe_bytes[entry_pos + 20..entry_pos + 24]
+                .copy_from_slice(&sec_entry.pointer_to_raw_data.to_le_bytes());
+            pe_bytes[entry_pos + 36..entry_pos + 40]
+                .copy_from_slice(&sec_entry.characteristics.to_le_bytes());
 
             // Append Raw Section Bytes to PE Buffer if present
             if !sec_data.bytes.is_empty() {
@@ -256,23 +316,31 @@ impl PeMultiSectionBuilder {
                 if pe_bytes.len() < needed_len {
                     pe_bytes.resize(needed_len, 0);
                 }
-                pe_bytes[current_file_ptr as usize..current_file_ptr as usize + sec_data.bytes.len()]
+                pe_bytes
+                    [current_file_ptr as usize..current_file_ptr as usize + sec_data.bytes.len()]
                     .copy_from_slice(&sec_data.bytes);
 
                 current_file_ptr += raw_size;
             }
 
-            max_va = max_va.max(sec_data.virtual_address + align_config.align_size(actual_virtual_size, AlignmentType::Section));
+            max_va = max_va.max(
+                sec_data.virtual_address
+                    + align_config.align_size(actual_virtual_size, AlignmentType::Section),
+            );
         }
 
         let size_of_image = max_va;
 
         // Write Final NT File Header
         let file_hdr_pos = nt_pos + 4;
-        pe_bytes[file_hdr_pos..file_hdr_pos + 2].copy_from_slice(&header.coff_header.machine.to_le_bytes());
-        pe_bytes[file_hdr_pos + 2..file_hdr_pos + 4].copy_from_slice(&header.coff_header.number_of_sections.to_le_bytes());
-        pe_bytes[file_hdr_pos + 16..file_hdr_pos + 18].copy_from_slice(&header.coff_header.size_of_optional_header.to_le_bytes());
-        pe_bytes[file_hdr_pos + 18..file_hdr_pos + 20].copy_from_slice(&header.coff_header.characteristics.to_le_bytes());
+        pe_bytes[file_hdr_pos..file_hdr_pos + 2]
+            .copy_from_slice(&header.coff_header.machine.to_le_bytes());
+        pe_bytes[file_hdr_pos + 2..file_hdr_pos + 4]
+            .copy_from_slice(&header.coff_header.number_of_sections.to_le_bytes());
+        pe_bytes[file_hdr_pos + 16..file_hdr_pos + 18]
+            .copy_from_slice(&header.coff_header.size_of_optional_header.to_le_bytes());
+        pe_bytes[file_hdr_pos + 18..file_hdr_pos + 20]
+            .copy_from_slice(&header.coff_header.characteristics.to_le_bytes());
 
         // Calculate total SizeOfCode and BaseOfCode across all executable code sections
         let total_code_size: u32 = all_sections
@@ -293,13 +361,15 @@ impl PeMultiSectionBuilder {
         let magic: u16 = 0x20B; // PE32+ (64-bit)
         pe_bytes[opt_pos..opt_pos + 2].copy_from_slice(&magic.to_le_bytes());
         pe_bytes[opt_pos + 2] = 14; // MajorLinkerVersion
-        pe_bytes[opt_pos + 3] = 0;  // MinorLinkerVersion
+        pe_bytes[opt_pos + 3] = 0; // MinorLinkerVersion
         pe_bytes[opt_pos + 4..opt_pos + 8].copy_from_slice(&total_code_size.to_le_bytes()); // SizeOfCode
         pe_bytes[opt_pos + 16..opt_pos + 20].copy_from_slice(&self.entry_point_rva.to_le_bytes());
         pe_bytes[opt_pos + 20..opt_pos + 24].copy_from_slice(&base_of_code.to_le_bytes()); // BaseOfCode
         pe_bytes[opt_pos + 24..opt_pos + 32].copy_from_slice(&self.image_base.to_le_bytes());
-        pe_bytes[opt_pos + 32..opt_pos + 36].copy_from_slice(&align_config.section_alignment.to_le_bytes());
-        pe_bytes[opt_pos + 36..opt_pos + 40].copy_from_slice(&align_config.file_alignment.to_le_bytes());
+        pe_bytes[opt_pos + 32..opt_pos + 36]
+            .copy_from_slice(&align_config.section_alignment.to_le_bytes());
+        pe_bytes[opt_pos + 36..opt_pos + 40]
+            .copy_from_slice(&align_config.file_alignment.to_le_bytes());
 
         // OS & Subsystem Versions
         pe_bytes[opt_pos + 40..opt_pos + 42].copy_from_slice(&6u16.to_le_bytes()); // MajorOSVersion
@@ -324,7 +394,8 @@ impl PeMultiSectionBuilder {
             self.dll_characteristics & !(0x0020 | 0x0040 | 0x4000)
         };
         pe_bytes[opt_pos + 68..opt_pos + 70].copy_from_slice(&self.subsystem.to_le_bytes());
-        pe_bytes[opt_pos + 70..opt_pos + 72].copy_from_slice(&sanitized_dll_characteristics.to_le_bytes());
+        pe_bytes[opt_pos + 70..opt_pos + 72]
+            .copy_from_slice(&sanitized_dll_characteristics.to_le_bytes());
 
         // Stack & Heap Reserves
         pe_bytes[opt_pos + 72..opt_pos + 80].copy_from_slice(&self.stack_reserve.to_le_bytes());
@@ -348,7 +419,8 @@ impl PeMultiSectionBuilder {
         // H4: Standard PE CheckSum calculation (Windows CheckSumMappedFile algorithm)
         let checksum_offset = opt_pos + 64;
         let calculated_checksum = calculate_pe_checksum(&pe_bytes, checksum_offset);
-        pe_bytes[checksum_offset..checksum_offset + 4].copy_from_slice(&calculated_checksum.to_le_bytes());
+        pe_bytes[checksum_offset..checksum_offset + 4]
+            .copy_from_slice(&calculated_checksum.to_le_bytes());
 
         Ok(pe_bytes)
     }
@@ -453,6 +525,9 @@ mod tests {
         let e_lfanew = u32::from_le_bytes(pe_bytes[0x3C..0x40].try_into().unwrap()) as usize;
         let opt_pos = e_lfanew + 24;
         let checksum = u32::from_le_bytes(pe_bytes[opt_pos + 64..opt_pos + 68].try_into().unwrap());
-        assert!(checksum > 0, "PE OptionalHeader.CheckSum must be populated and > 0");
+        assert!(
+            checksum > 0,
+            "PE OptionalHeader.CheckSum must be populated and > 0"
+        );
     }
 }

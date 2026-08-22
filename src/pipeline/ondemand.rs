@@ -18,7 +18,6 @@
 // 호출하지 않으므로 무변경.
 // ==============================================================================
 
-
 /// RC4 스트림 (RFC 6229 호환) — 기존 부트 스텁/패커의 RC4와 동일 스트림.
 pub struct Rc4 {
     s: [u8; 256],
@@ -44,8 +43,8 @@ impl Rc4 {
             self.i = self.i.wrapping_add(1);
             self.j = self.j.wrapping_add(self.s[self.i as usize]);
             self.s.swap(self.i as usize, self.j as usize);
-            let k = self
-                .s[(self.s[self.i as usize].wrapping_add(self.s[self.j as usize])) as usize];
+            let k =
+                self.s[(self.s[self.i as usize].wrapping_add(self.s[self.j as usize])) as usize];
             *b ^= k;
         }
     }
@@ -57,7 +56,7 @@ impl Rc4 {
 pub fn process_on_demand<F: FnOnce(&mut [u8])>(buf: &mut [u8], len: usize, key: &[u8], use_it: F) {
     let mut rc4 = Rc4::new(key);
     rc4.crypt(&mut buf[..len]); // decrypt in place
-    use_it(&mut buf[..len]);    // use the plaintext
+    use_it(&mut buf[..len]); // use the plaintext
     let mut rc4b = Rc4::new(key); // reset keystream
     rc4b.crypt(&mut buf[..len]); // re-encrypt in place
 }
@@ -89,7 +88,10 @@ mod tests {
         assert_ne!(cipher, plain, "cipher should differ from plain");
 
         // on-demand: decrypt -> use -> re-encrypt leaves it encrypted.
-        assert!(simulate_dump(plain, &cipher, key), "after use, dump must be encrypted");
+        assert!(
+            simulate_dump(plain, &cipher, key),
+            "after use, dump must be encrypted"
+        );
 
         // And a second decrypt recovers plaintext (round-trip intact).
         let mut buf = cipher.clone();
@@ -111,6 +113,10 @@ mod tests {
             seen.extend_from_slice(p); // during use, we see plaintext
         });
         assert_eq!(seen, b"secret", "use callback must observe plaintext");
-        assert_ne!(buf, b"secret".to_vec(), "after on-demand, buffer must be re-encrypted");
+        assert_ne!(
+            buf,
+            b"secret".to_vec(),
+            "after on-demand, buffer must be re-encrypted"
+        );
     }
 }

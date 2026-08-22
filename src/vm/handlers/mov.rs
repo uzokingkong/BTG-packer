@@ -15,7 +15,12 @@ pub(super) fn emit_mov_r_imm32(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_MOV_R_IMM32,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RDX).unwrap(),
             Instruction::with2(Code::Add_rm64_imm32, Register::R9, 5).unwrap(),
@@ -29,7 +34,12 @@ pub(super) fn emit_mov_r_imm64(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_MOV_R_IMM64,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RDX).unwrap(),
             Instruction::with2(Code::Add_rm64_imm32, Register::R9, 9).unwrap(),
@@ -43,7 +53,12 @@ pub(super) fn emit_mov_r_r(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_MOV_R_R,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RDX)).unwrap(),
             Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(),
@@ -58,7 +73,12 @@ pub(super) fn emit_mov_r_r64(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_MOV_R_R64,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RDX)).unwrap(),
             Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(),
@@ -75,7 +95,12 @@ pub(super) fn emit_mov_r_flags(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_MOV_R_FLAGS,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, state_flags_mem()).unwrap(),
             Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(),
             Instruction::with2(Code::Add_rm64_imm32, Register::R9, 1).unwrap(),
@@ -88,7 +113,12 @@ pub(super) fn emit_mov_flags_r(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         seq,
         OP_MOV_FLAGS_R,
         vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RCX)).unwrap(),
             Instruction::with2(Code::Mov_rm64_r64, state_flags_mem(), Register::RAX).unwrap(),
             Instruction::with2(Code::Add_rm64_imm32, Register::R9, 1).unwrap(),
@@ -109,7 +139,12 @@ pub(super) fn emit_cld(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         vec![
             Instruction::with(Code::Cld),
             // Clear bit 10 (DF) in the modelled flags: and [state_flags], ~F_DF.
-            Instruction::with2(Code::And_rm64_imm32, state_flags_mem(), (!(F_DF as u32)) as i32).unwrap(),
+            Instruction::with2(
+                Code::And_rm64_imm32,
+                state_flags_mem(),
+                (!(F_DF as u32)) as i32,
+            )
+            .unwrap(),
         ],
     );
 }
@@ -121,7 +156,8 @@ pub(super) fn emit_std(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         vec![
             Instruction::with(Code::Std),
             // Set bit 10 (DF) in the modelled flags: or [state_flags], F_DF.
-            Instruction::with2(Code::Or_rm64_imm32, state_flags_mem(), (F_DF as u32) as i32).unwrap(),
+            Instruction::with2(Code::Or_rm64_imm32, state_flags_mem(), (F_DF as u32) as i32)
+                .unwrap(),
         ],
     );
 }
@@ -140,12 +176,23 @@ pub(super) fn emit_mem_loads_wider(seq: &mut Vec<(Instruction, Option<Cl>)>) {
             seq,
             op,
             vec![
-                Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+                Instruction::with2(
+                    Code::Movzx_r32_rm8,
+                    Register::ECX,
+                    MemoryOperand::with_base(Register::R9),
+                )
+                .unwrap(),
                 Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
                 Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, m(Register::R9, 2)).unwrap(),
                 Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RAX)).unwrap(),
-                Instruction::with2(Code::Mov_r64_rm64, Register::R11, ptrslot(Register::RDX)).unwrap(),
-                Instruction::with2(code, dst, MemoryOperand::with_base_index_scale(Register::R11, Register::RAX, 1)).unwrap(),
+                Instruction::with2(Code::Mov_r64_rm64, Register::R11, ptrslot(Register::RDX))
+                    .unwrap(),
+                Instruction::with2(
+                    code,
+                    dst,
+                    MemoryOperand::with_base_index_scale(Register::R11, Register::RAX, 1),
+                )
+                .unwrap(),
                 Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RCX), Register::RAX).unwrap(),
                 Instruction::with2(Code::Add_rm64_imm32, Register::R9, 3).unwrap(),
             ],
@@ -156,21 +203,47 @@ pub(super) fn emit_mem_loads_wider(seq: &mut Vec<(Instruction, Option<Cl>)>) {
 // ── M2 (v22) 0x2D-0x2F wider memory stores (slot, idx, src) ─────────────────
 pub(super) fn emit_mem_stores_wider(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     for (op, store_code, src, load_code) in [
-        (OP_MOV_MEM16_R, Code::Mov_rm16_r16, Register::AX, Code::Mov_r16_rm16),
-        (OP_MOV_MEM32_R, Code::Mov_rm32_r32, Register::EAX, Code::Mov_r32_rm32),
-        (OP_MOV_MEM64_R, Code::Mov_rm64_r64, Register::RAX, Code::Mov_r64_rm64),
+        (
+            OP_MOV_MEM16_R,
+            Code::Mov_rm16_r16,
+            Register::AX,
+            Code::Mov_r16_rm16,
+        ),
+        (
+            OP_MOV_MEM32_R,
+            Code::Mov_rm32_r32,
+            Register::EAX,
+            Code::Mov_r32_rm32,
+        ),
+        (
+            OP_MOV_MEM64_R,
+            Code::Mov_rm64_r64,
+            Register::RAX,
+            Code::Mov_r64_rm64,
+        ),
     ] {
         hdr(
             seq,
             op,
             vec![
-                Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+                Instruction::with2(
+                    Code::Movzx_r32_rm8,
+                    Register::ECX,
+                    MemoryOperand::with_base(Register::R9),
+                )
+                .unwrap(),
                 Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
                 Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, m(Register::R9, 2)).unwrap(),
-                Instruction::with2(Code::Mov_r64_rm64, Register::R11, ptrslot(Register::RCX)).unwrap(),
+                Instruction::with2(Code::Mov_r64_rm64, Register::R11, ptrslot(Register::RCX))
+                    .unwrap(),
                 Instruction::with2(Code::Mov_r64_rm64, Register::RCX, vreg(Register::RDX)).unwrap(),
                 Instruction::with2(load_code, src, vreg(Register::RAX)).unwrap(),
-                Instruction::with2(store_code, MemoryOperand::with_base_index_scale(Register::R11, Register::RCX, 1), src).unwrap(),
+                Instruction::with2(
+                    store_code,
+                    MemoryOperand::with_base_index_scale(Register::R11, Register::RCX, 1),
+                    src,
+                )
+                .unwrap(),
                 Instruction::with2(Code::Add_rm64_imm32, Register::R9, 3).unwrap(),
             ],
         );

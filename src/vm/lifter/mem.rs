@@ -8,14 +8,15 @@
 // used by every family submodule for address computation.
 // ==============================================================================
 
-use super::{SCRATCH, SCRATCH2, vreg};
+use super::{vreg, SCRATCH, SCRATCH2};
 use crate::vm::bytecode::*;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use iced_x86::{Instruction, OpKind, Register};
 
 /// Does this instruction use a RIP-relative memory operand?
 pub(super) fn has_rip_operand(inst: &Instruction) -> bool {
-    (0..inst.op_count()).any(|i| inst.op_kind(i) == OpKind::Memory && inst.is_ip_rel_memory_operand())
+    (0..inst.op_count())
+        .any(|i| inst.op_kind(i) == OpKind::Memory && inst.is_ip_rel_memory_operand())
 }
 
 /// Emit the effective-address computation for memory operand `op_idx`, returning
@@ -72,11 +73,16 @@ pub(super) fn mem_emit_lea(b: &mut BytecodeBuilder, inst: &Instruction, dst: u8)
             if index != Register::None {
                 let scale = inst.memory_index_scale();
                 let scale_enc = match scale {
-                    0 | 1 => 0u8, 2 => 1, 4 => 2, 8 => 3,
+                    0 | 1 => 0u8,
+                    2 => 1,
+                    4 => 2,
+                    8 => 3,
                     _ => return Err(anyhow!("lifter: unsupported scale {}", scale)),
                 };
                 b.mov_r_r(SCRATCH2, vreg(index)?);
-                if scale_enc > 0 { b.shift64_r_imm8(OP_SHL64_R_IMM8, SCRATCH2, scale_enc); }
+                if scale_enc > 0 {
+                    b.shift64_r_imm8(OP_SHL64_R_IMM8, SCRATCH2, scale_enc);
+                }
                 b.binop_r_r(OP_ADD_R_R64, SCRATCH, SCRATCH2);
             }
             if dst != SCRATCH {

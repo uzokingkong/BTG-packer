@@ -2,11 +2,8 @@
 // BTG (Bidirectional Trigger Graph) - Payload Assembler using iced-x86
 // ==============================================================================
 
-
 use anyhow::Result;
-use iced_x86::{
-    BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, Register,
-};
+use iced_x86::{BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, Register};
 
 /// Generates x64 assembly bytes for a Trigger Block with a Dispatcher Bridge JMP at the end.
 ///
@@ -46,18 +43,9 @@ pub fn assemble_block_with_bridge(
     }
 
     if payload_code.has_next() {
-        instructions.push(Instruction::with1(
-            Code::Pushq_imm32,
-            next_block_id as i32,
-        )?);
-        instructions.push(Instruction::with1(
-            Code::Pushq_imm32,
-            state_key as i32,
-        )?);
-        instructions.push(Instruction::with_branch(
-            Code::Jmp_rel32_64,
-            dispatcher_va,
-        )?);
+        instructions.push(Instruction::with1(Code::Pushq_imm32, next_block_id as i32)?);
+        instructions.push(Instruction::with1(Code::Pushq_imm32, state_key as i32)?);
+        instructions.push(Instruction::with_branch(Code::Jmp_rel32_64, dispatcher_va)?);
     }
 
     let block = InstructionBlock::new(&instructions, current_block_va);

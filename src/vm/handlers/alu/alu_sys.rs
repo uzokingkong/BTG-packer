@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // BTG v3 - VM Handler Codegen: system / control instructions - split from alu.rs
 // ==============================================================================
 // NOP, CPUID, XGETBV, TZCNT (v45 --vm-oep Rust-runtime additions).
@@ -57,7 +57,12 @@ pub(crate) fn emit_xgetbv(seq: &mut Vec<(Instruction, Option<Cl>)>) {
 // match real x86.)
 pub(crate) fn emit_tzcnt(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     let mut body = vec![
-        Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(
+            Code::Movzx_r32_rm8,
+            Register::ECX,
+            MemoryOperand::with_base(Register::R9),
+        )
+        .unwrap(),
         Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
         Instruction::with2(Code::Mov_r32_rm32, Register::EAX, vreg(Register::RDX)).unwrap(),
         Instruction::with2(Code::Tzcnt_r32_rm32, Register::EAX, Register::EAX).unwrap(),

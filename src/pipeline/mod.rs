@@ -2,28 +2,49 @@
 // BTG (Bidirectional Trigger Graph) - Pipeline Context & Module Declarations
 // ==============================================================================
 
+pub mod artifacts;
 pub mod build;
+pub mod config;
+pub mod crypto;
+pub mod iat_hide;
+pub mod ondemand;
+pub mod ownership;
+pub mod pack;
 pub mod pass1_slice;
 pub mod pass2_shuffle;
 pub mod pass3_encode;
 pub mod pass4_section;
 pub mod patch_data;
-pub mod crypto;
-pub mod iat_hide;
-pub mod pack;
-pub mod ownership;
-pub mod ondemand;
 pub mod poly_embed;
+pub mod rdata_strip;
 pub mod rsrc_register;
 pub mod selective_vm;
 pub mod validate;
 
-use crate::graph::{BasicBlock, ShuffledLayout};
+pub use artifacts::{CryptoArtifact, PeArtifact, VmArtifact};
+pub use config::{RequestedConfig, ResolvedConfig};
+pub use rdata_strip::RdataMetadataStripper;
+
 use crate::core::trigger_block::TriggerBlock;
-use crate::pe::{parser::TargetPeInfo, builder::SectionData};
+use crate::graph::{BasicBlock, ShuffledLayout};
+use crate::pe::{builder::SectionData, parser::TargetPeInfo};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Default)]
+pub struct VmCoverageMetrics {
+    pub vm_blocks: usize,
+    pub total_blocks: usize,
+    pub vm_instructions: usize,
+    pub total_instructions: usize,
+    pub vm_functions: usize,
+    pub total_functions: usize,
+    pub hot_path_profiled: bool,
+    pub hot_vm_weight: u64,
+    pub hot_total_weight: u64,
+    pub sensitive_regions: usize,
+}
 
 /// 각 Pass 사이에 공유되는 파이프라인 상태.
 ///
@@ -134,6 +155,15 @@ pub struct PipelineContext {
     pub vm_prog_rva: u32,
     /// P4: whole-program VM 모듈 총 길이 (code+table+bytecode+state).
     pub vm_prog_total: u32,
+    /// Code-relative VM→native bridge range requiring its private-frame unwind.
+    pub vm_prog_native_bridge: Option<(u32, u32)>,
+    /// P1-3: commercial Program-VM ownership metrics persisted to the manifest.
+    pub vm_coverage: Option<VmCoverageMetrics>,
+    /// P1-4: instruction-aligned Program-VM bytecode chunks for M7 runtime.
+    pub vm_prog_chunks: Vec<crate::vm::chunk_crypto::BytecodeChunk>,
+    pub vm_prog_bytecode_rva: u32,
+    pub vm_prog_bytecode_len: u32,
+    pub vm_prog_runtime_cipher_hash: Option<String>,
     /// v13.4d diag: --block-ring — 표준 디스패처에 마지막 32개 logical block id
     /// ring-buffer 를 주입한다 (재암호화 디스패처는 미지원).
     pub block_ring: bool,
@@ -220,6 +250,12 @@ impl PipelineContext {
             keep_pdata: false,
             vm_prog_rva: 0,
             vm_prog_total: 0,
+            vm_prog_native_bridge: None,
+            vm_coverage: None,
+            vm_prog_chunks: Vec::new(),
+            vm_prog_bytecode_rva: 0,
+            vm_prog_bytecode_len: 0,
+            vm_prog_runtime_cipher_hash: None,
             block_ring: false,
             custom_cipher: false,
             crypto_mode: crate::crypto::CryptoMode::C1,

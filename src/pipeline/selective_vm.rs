@@ -65,7 +65,9 @@ impl SelectiveVmPass {
 
         for (idx, reg) in regions.iter().enumerate() {
             let slice = &text_data[reg.start_offset..reg.end_offset];
-            let base_va = ctx.target_info.image_base + ctx.target_info.text_rva as u64 + reg.start_offset as u64;
+            let base_va = ctx.target_info.image_base
+                + ctx.target_info.text_rva as u64
+                + reg.start_offset as u64;
 
             let mut decoder = Decoder::with_ip(64, slice, base_va, DecoderOptions::NONE);
             let mut lifter = RiscLifter::new();
@@ -75,10 +77,7 @@ impl SelectiveVmPass {
             while decoder.can_decode() {
                 let inst = decoder.decode();
                 if let Err(e) = lifter.lift_instruction(&inst) {
-                    rejected_inst = Some(format!(
-                        "unsupported instruction 0x{:X}: {e}",
-                        inst.ip()
-                    ));
+                    rejected_inst = Some(format!("unsupported instruction 0x{:X}: {e}", inst.ip()));
                     break;
                 }
             }
@@ -98,7 +97,9 @@ impl SelectiveVmPass {
             let prog = RiscProgram::new(lifter.desynth.instrs);
 
             // ── 마커마다 고유 시드 (기본 시드 + 리전 인덱스) ──────────────────
-            let seed = base_seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(idx as u64 * 0x9E37_79B9);
+            let seed = base_seed
+                .wrapping_mul(0x9E3779B97F4A7C15)
+                .wrapping_add(idx as u64 * 0x9E37_79B9);
             let mut enc = PolymorphicEncoder::new(seed);
             let bytecode = enc.encode(&prog)?;
 
@@ -164,8 +165,8 @@ mod tests {
         // x86 code: mov rax, 42; add rax, 8; ret
         let marked_code = [
             0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00, // mov rax, 42
-            0x48, 0x83, 0xC0, 0x08,                   // add rax, 8
-            0xC3,                                     // ret
+            0x48, 0x83, 0xC0, 0x08, // add rax, 8
+            0xC3, // ret
         ];
         text_data.extend_from_slice(&marked_code);
         text_data.extend_from_slice(&SIG_VM_END);
@@ -193,8 +194,8 @@ mod tests {
     fn test_selective_rejects_unsupported_region() {
         let mut text_data = Vec::new();
         text_data.extend_from_slice(&SIG_VM_START);
-        // xgetbv (unsupported by the RISC lifter) — must trigger full-region rejection.
-        text_data.extend_from_slice(&[0x0F, 0x01, 0xD0]);
+        // syscall remains intentionally unsupported in selective user regions.
+        text_data.extend_from_slice(&[0x0F, 0x05]);
         text_data.extend_from_slice(&SIG_VM_END);
 
         let regions = MarkerScanner::scan_markers(&text_data);
@@ -210,7 +211,10 @@ mod tests {
                 break;
             }
         }
-        assert!(any_err, "xgetbv must be unsupported so the region is rejected");
+        assert!(
+            any_err,
+            "syscall must be unsupported so the region is rejected"
+        );
     }
 
     /// S5: SDK 마커 타깃 pack→run 테스트.
@@ -229,8 +233,8 @@ mod tests {
         // x86 code: mov rax, 42; add rax, 8; ret  →  RAX == 50
         let marked_code = [
             0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00, // mov rax, 42
-            0x48, 0x83, 0xC0, 0x08,                   // add rax, 8
-            0xC3,                                     // ret
+            0x48, 0x83, 0xC0, 0x08, // add rax, 8
+            0xC3, // ret
         ];
         text_data.extend_from_slice(&marked_code);
         text_data.extend_from_slice(&SIG_VM_END);

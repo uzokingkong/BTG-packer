@@ -6,6 +6,6 @@ pub mod slicer;
 #[allow(unused_imports)]
 pub use cfg::{BasicBlock, CfgExtractor};
 #[allow(unused_imports)]
-pub use fixup::RipFixupEngine;
+pub use fixup::{RipFixupEngine, RipFixupError};
 pub use shuffler::{LayoutShuffler, ShuffledLayout};
 pub use slicer::MicroSlicer;

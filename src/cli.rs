@@ -21,6 +21,25 @@ pub struct CliArgs {
     #[arg(short, long, default_value = "protected_btg.exe")]
     pub output: PathBuf,
 
+    /// Fail instead of silently downgrading or disabling any requested
+    /// protection feature because of an incompatible option combination.
+    #[arg(long, default_value_t = false)]
+    pub strict_profile: bool,
+
+    /// Execute the original and protected binaries after packing and fail when
+    /// exit code, stdout, or stderr differ byte-for-byte.
+    #[arg(long, default_value_t = false)]
+    pub verify_output: bool,
+
+    /// Per-process timeout used by --verify-output.
+    #[arg(long, default_value_t = 30)]
+    pub verify_timeout_secs: u64,
+
+    /// Run N independent seeded pack+execution-verification jobs. Each child
+    /// receives --verify-output and writes a distinct seed-suffixed artifact.
+    #[arg(long, default_value_t = 0)]
+    pub verify_seeds: u32,
+
     /// P3-1: 결정적 빌드용 시드. `--seed <u64>`로 패킹의 모든 RNG
     /// (셔플/mba_constant/crypto 시드/폴리 시드/레이아웃 패드)를 고정한다.
     /// 같은 input + seed + config → 같은 output (재현·디버깅·상용 배포용).
@@ -44,6 +63,11 @@ pub struct CliArgs {
     /// Run Automated Multi-Compiler QA Benchmark Suite
     #[arg(short = 't', long, default_value_t = false)]
     pub test_qa: bool,
+
+    /// Run the QA suite through the commercial Program-VM backend and fail the
+    /// command when packed output differs from the original program.
+    #[arg(long, default_value_t = false)]
+    pub qa_commercial: bool,
 
     /// P0-1: 실전 컴파일러 코퍼스를 생성하고 종료한다 (corpus/*.exe).
     /// test/ 크레이트를 -O0/-O1/-O2/-O3/LTO/CGU16/panic-abort/overflow-checks
@@ -123,9 +147,9 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false)]
     pub iat_hide: bool,
 
-    /// v6: 메모리 하드닝 — 복호화 직후 ntdll!NtProtectVirtualMemory로
-    /// .textb를 RWX→RX(PAGE_EXECUTE_READ) 전환 (덤프 후 패치 차단).
-    /// 해석 실패 시 보호 없이 계속 실행(fail-open).
+    /// v6/P1-5: 메모리 하드닝 — 복호화 직후 immutable code/table/bytecode는
+    /// RX, Program-VM state/call-stack/bootstrap data는 RW로 분리한다.
+    /// 보호 API 해석/전환 실패는 fail-closed(실행 거부).
     #[arg(long, default_value_t = false)]
     pub mem_harden: bool,
 

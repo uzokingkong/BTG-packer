@@ -25,24 +25,39 @@
 
 use crate::pe::builder::SectionData;
 use crate::pipeline::selective_vm::PolyVmRegion;
+use crate::vm::embed_hardening::{emit_trap_handler, encrypt_region_descriptor_bytes};
+use crate::vm::seed_lifecycle::derive_seed;
 use crate::vm::threaded::{DirectTailEmitter, DirectThreadedNativeRunner};
 use anyhow::{anyhow, Result};
 use iced_x86::{Code, Instruction, Register};
 
 /// `.btgvm` section magic (LE "BTVM").
 pub const VM_SECTION_MAGIC: u32 = 0x4D_56_54_42;
-pub const VM_SECTION_VERSION: u32 = 1;
+pub const VM_SECTION_VERSION: u32 = 2;
+
+/// W^X compliant section characteristics (Domit §22, §60).
+pub const SECTION_CHARS_RX: u32 = 0x6000_0020; // CODE | EXECUTE | READ
+pub const SECTION_CHARS_RO: u32 = 0x4000_0040; // INITIALIZED_DATA | READ
+pub const SECTION_CHARS_RW: u32 = 0xC000_0040; // INITIALIZED_DATA | READ | WRITE
 
 // ── Fixed offsets within the .btgvm section (relative to section VA) ─────────
-pub const OFF_ENTRY_STUB: usize = 0x0000;   // native entry stub
-pub const OFF_HEADER: usize = 0x400;        // 16-byte header (clear of entry stub)
+pub const OFF_ENTRY_STUB: usize = 0x0000; // native entry stub
+pub const OFF_HEADER: usize = 0x400; // 16-byte header (clear of entry stub)
 pub const OFF_HANDLER_TABLE: usize = 0x0800; // 256 x u64
 pub const OFF_REGION_TABLE: usize = 0x1000; // N x 32 bytes
 pub const OFF_HANDLER_CODE: usize = 0x2000; // direct-threaded handler bodies
 pub const REGION_DESC_SIZE: usize = 32;
 
+/// Tri-section structure conforming to W^X policy (separating RX code, RO data, RW state).
+#[derive(Debug, Clone)]
+pub struct PolyVmSplitSections {
+    pub code_section: SectionData,  // .btgvmx (RX)
+    pub data_section: SectionData,  // .btgvmd (R)
+    pub state_section: SectionData, // .btgvms (RW)
+}
+
 /// Region descriptor (fixed 32 bytes, LE).
-/// Layout: [region_va u64][seed u64][bytecode_off u32][bytecode_len u32][lifted_ops u32][reserved u32]
+/// Layout: [region_va u64][region_salt u64][bytecode_off u32][bytecode_len u32][lifted_ops u32][flags u32]
 #[derive(Debug, Clone)]
 pub struct RegionDesc {
     pub region_va: u64,
@@ -59,8 +74,11 @@ impl RegionDesc {
         b.extend_from_slice(&self.seed.to_le_bytes());
         b.extend_from_slice(&self.bytecode_off.to_le_bytes());
         b.extend_from_slice(&self.bytecode_len.to_le_bytes());
+        #[cfg(debug_assertions)]
         b.extend_from_slice(&self.lifted_ops.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        #[cfg(not(debug_assertions))]
+        b.extend_from_slice(&0u32.to_le_bytes()); // conceal in release
+        b.extend_from_slice(&0u32.to_le_bytes()); // reserved/flags
         b
     }
 }
@@ -106,6 +124,12 @@ pub fn emit_poly_vm_section(
         handler_code.extend_from_slice(code);
     }
 
+    // Append a dedicated trap handler (ud2) right after handler bodies.
+    let trap_off = handler_code.len();
+    let trap_code = emit_trap_handler();
+    let trap_va = handler_base_va + trap_off as u64;
+    handler_code.extend_from_slice(&trap_code);
+
     // State buffer after handler code (aligned).
     let state_off = align_up(OFF_HANDLER_CODE + handler_code.len(), 16);
     let state_va = section_va + state_off as u64;
@@ -145,12 +169,27 @@ pub fn emit_poly_vm_section(
         for r in [Register::R12, Register::R13, Register::R14, Register::R15] {
             es.push(Instruction::with1(Code::Push_r64, r).map_err(|e| anyhow!("{e}"))?);
         }
-        es.push(Instruction::with2(Code::Mov_r64_imm64, Register::R12, first_bytecode_va).map_err(|e| anyhow!("{e}"))?);
-        es.push(Instruction::with2(Code::Mov_r64_imm64, Register::R13, state_va).map_err(|e| anyhow!("{e}"))?);
+        es.push(
+            Instruction::with2(Code::Mov_r64_imm64, Register::R12, first_bytecode_va)
+                .map_err(|e| anyhow!("{e}"))?,
+        );
+        es.push(
+            Instruction::with2(Code::Mov_r64_imm64, Register::R13, state_va)
+                .map_err(|e| anyhow!("{e}"))?,
+        );
         let seed_key = regions[0].seed as u8;
-        es.push(Instruction::with2(Code::Mov_r64_imm64, Register::R14, seed_key as u64).map_err(|e| anyhow!("{e}"))?);
-        es.push(Instruction::with2(Code::Mov_r64_imm64, Register::R15, table_va).map_err(|e| anyhow!("{e}"))?);
-        es.push(Instruction::with2(Code::Mov_r64_imm64, Register::RDX, state_va).map_err(|e| anyhow!("{e}"))?);
+        es.push(
+            Instruction::with2(Code::Mov_r64_imm64, Register::R14, seed_key as u64)
+                .map_err(|e| anyhow!("{e}"))?,
+        );
+        es.push(
+            Instruction::with2(Code::Mov_r64_imm64, Register::R15, table_va)
+                .map_err(|e| anyhow!("{e}"))?,
+        );
+        es.push(
+            Instruction::with2(Code::Mov_r64_imm64, Register::RDX, state_va)
+                .map_err(|e| anyhow!("{e}"))?,
+        );
         DirectTailEmitter::emit_tail_dispatch(&mut es)?;
         let bytes = DirectTailEmitter::assemble(es, section_va)?;
         let n = bytes.len().min(OFF_HANDLER_TABLE - OFF_ENTRY_STUB);
@@ -159,28 +198,32 @@ pub fn emit_poly_vm_section(
 
     // Handler table (256 x u64) at OFF_HANDLER_TABLE.
     {
-        let entry_va = section_va + OFF_ENTRY_STUB as u64;
         // Known handlers occupy opcode slots 0..handlers.len().
         for (i, (_name, va, _code)) in handlers.iter().enumerate() {
             let e = i * 8;
             if OFF_HANDLER_TABLE + e + 8 <= buf.len() {
-                buf[OFF_HANDLER_TABLE + e..OFF_HANDLER_TABLE + e + 8].copy_from_slice(&va.to_le_bytes());
+                buf[OFF_HANDLER_TABLE + e..OFF_HANDLER_TABLE + e + 8]
+                    .copy_from_slice(&va.to_le_bytes());
             }
         }
-        // Unused slots -> entry stub (safe landing).
+        // Domit §21: Unused slots point to trap_handler (ud2) instead of entry stub!
         for i in handlers.len()..256 {
             let e = i * 8;
             if OFF_HANDLER_TABLE + e + 8 <= buf.len() {
-                buf[OFF_HANDLER_TABLE + e..OFF_HANDLER_TABLE + e + 8].copy_from_slice(&entry_va.to_le_bytes());
+                buf[OFF_HANDLER_TABLE + e..OFF_HANDLER_TABLE + e + 8]
+                    .copy_from_slice(&trap_va.to_le_bytes());
             }
         }
     }
 
-    // Region descriptor table at OFF_REGION_TABLE.
+    // Region descriptor table at OFF_REGION_TABLE (encrypted with domain key).
+    let domain_key = regions.first().map(|r| r.seed).unwrap_or(0xA5A5_5A5A);
     for (i, d) in region_descs.iter().enumerate() {
         let off = OFF_REGION_TABLE + i * REGION_DESC_SIZE;
         if off + REGION_DESC_SIZE <= buf.len() {
-            buf[off..off + REGION_DESC_SIZE].copy_from_slice(&d.to_bytes());
+            let mut desc_bytes = d.to_bytes();
+            encrypt_region_descriptor_bytes(&mut desc_bytes, domain_key);
+            buf[off..off + REGION_DESC_SIZE].copy_from_slice(&desc_bytes);
         }
     }
 
@@ -258,11 +301,26 @@ fn align_up(v: usize, a: usize) -> usize {
 /// Returns `None` when there are no poly VM regions (no SDK markers / `--vm` off),
 /// in which case the output is byte-identical to before. Otherwise the `.btgvm`
 /// module is appended to the `.textb` tail and the entry VA is recorded.
-pub fn embed_poly_vm_into_pipeline(ctx: &mut crate::pipeline::PipelineContext) -> Result<Option<u64>> {
+pub fn embed_poly_vm_into_pipeline(
+    ctx: &mut crate::pipeline::PipelineContext,
+) -> Result<Option<u64>> {
     let regions = &ctx.poly_vm_regions;
     if regions.is_empty() {
         return Ok(None);
     }
+
+    // The marker path currently emits a `DirectThreadedNativeRunner` table, but
+    // that runner does not implement the rolling-key polymorphic decoder used
+    // to produce `PolyVmRegion::bytecode`.  Redirecting a marker to it would
+    // therefore create a PE that appears protected yet executes a different
+    // VM ABI at runtime.  Never silently emit such a binary: the commercial
+    // whole-program backend is the supported production path until this
+    // marker backend has an end-to-end native execution proof.
+    return Err(anyhow!(
+        "SDK marker VM is disabled: its embedded native runner does not yet consume the rolling-key polymorphic bytecode. Use --vm --vm-oep --vm-commercial, or remove BTG_VM_START/BTG_VM_END markers."
+    ));
+
+    #[allow(unreachable_code)]
     let btg = ctx
         .btg_section_data
         .as_mut()
@@ -271,7 +329,12 @@ pub fn embed_poly_vm_into_pipeline(ctx: &mut crate::pipeline::PipelineContext) -
     // Append the module at the current tail of .textb.
     let section_rva = btg.virtual_address.saturating_add(btg.bytes.len() as u32);
     let section_alignment = ctx.target_info.section_alignment.max(0x1000);
-    let embed = emit_poly_vm_section(regions, ctx.target_info.image_base, section_rva, section_alignment)?;
+    let embed = emit_poly_vm_section(
+        regions,
+        ctx.target_info.image_base,
+        section_rva,
+        section_alignment,
+    )?;
     let entry_va = embed.entry_va;
 
     // Append the module bytes to the .textb section.
@@ -319,9 +382,21 @@ mod tests {
 
     fn make_region(region_va: u64, seed: u64, lifted_ops: usize) -> PolyVmRegion {
         let mut d = RiscDesynthesizer::new();
-        d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(0x200), MicroOperand::Imm64(0));
-        d.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(5), MicroOperand::Imm64(0));
-        d.emit_xor(MicroOperand::VReg(0), MicroOperand::VReg(0), MicroOperand::Imm64(0x55));
+        d.emit_add(
+            MicroOperand::VReg(0),
+            MicroOperand::Imm64(0x200),
+            MicroOperand::Imm64(0),
+        );
+        d.emit_add(
+            MicroOperand::VReg(1),
+            MicroOperand::Imm64(5),
+            MicroOperand::Imm64(0),
+        );
+        d.emit_xor(
+            MicroOperand::VReg(0),
+            MicroOperand::VReg(0),
+            MicroOperand::Imm64(0x55),
+        );
         d.instrs.push(MicroInstr::new(RiscOp::Halt));
         let prog = RiscProgram::new(d.instrs);
         let mut enc = PolymorphicEncoder::new(seed);
@@ -347,11 +422,19 @@ mod tests {
         assert_eq!(embed.section.name, ".btgvm");
         assert_eq!(embed.section.virtual_address, 0x7000);
         assert_eq!(
-            u32::from_le_bytes(embed.section.bytes[OFF_HEADER..OFF_HEADER + 4].try_into().unwrap()),
+            u32::from_le_bytes(
+                embed.section.bytes[OFF_HEADER..OFF_HEADER + 4]
+                    .try_into()
+                    .unwrap()
+            ),
             VM_SECTION_MAGIC
         );
         assert_eq!(
-            u32::from_le_bytes(embed.section.bytes[OFF_HEADER + 8..OFF_HEADER + 12].try_into().unwrap()),
+            u32::from_le_bytes(
+                embed.section.bytes[OFF_HEADER + 8..OFF_HEADER + 12]
+                    .try_into()
+                    .unwrap()
+            ),
             2
         );
         assert_eq!(embed.section.bytes[OFF_ENTRY_STUB], 0x41);
@@ -359,28 +442,32 @@ mod tests {
         let code = &embed.section.bytes[OFF_HANDLER_CODE..OFF_HANDLER_CODE + 32];
         assert!(code.iter().any(|&b| b != 0));
 
+        let mut region_bytes =
+            embed.section.bytes[OFF_REGION_TABLE..OFF_REGION_TABLE + REGION_DESC_SIZE].to_vec();
+        crate::vm::embed_hardening::decrypt_region_descriptor_bytes(
+            &mut region_bytes,
+            regions[0].seed,
+        );
         let d0 = RegionDesc {
-            region_va: u64::from_le_bytes(
-                embed.section.bytes[OFF_REGION_TABLE..OFF_REGION_TABLE + 8].try_into().unwrap(),
-            ),
-            seed: u64::from_le_bytes(
-                embed.section.bytes[OFF_REGION_TABLE + 8..OFF_REGION_TABLE + 16].try_into().unwrap(),
-            ),
-            bytecode_off: u32::from_le_bytes(
-                embed.section.bytes[OFF_REGION_TABLE + 16..OFF_REGION_TABLE + 20].try_into().unwrap(),
-            ),
-            bytecode_len: u32::from_le_bytes(
-                embed.section.bytes[OFF_REGION_TABLE + 20..OFF_REGION_TABLE + 24].try_into().unwrap(),
-            ),
+            region_va: u64::from_le_bytes(region_bytes[0..8].try_into().unwrap()),
+            seed: u64::from_le_bytes(region_bytes[8..16].try_into().unwrap()),
+            bytecode_off: u32::from_le_bytes(region_bytes[16..20].try_into().unwrap()),
+            bytecode_len: u32::from_le_bytes(region_bytes[20..24].try_into().unwrap()),
             lifted_ops: 0,
         };
         assert_eq!(d0.region_va, 0x140001100);
         assert_eq!(d0.seed, 0x1111222233334444);
         assert_eq!(d0.bytecode_len, regions[0].bytecode.len() as u32);
-        let blob = &embed.section.bytes[d0.bytecode_off as usize..d0.bytecode_off as usize + d0.bytecode_len as usize];
+        let blob = &embed.section.bytes
+            [d0.bytecode_off as usize..d0.bytecode_off as usize + d0.bytecode_len as usize];
         assert_eq!(blob, regions[0].bytecode.as_slice());
 
-        let mut dec = Decoder::with_ip(64, &embed.section.bytes[OFF_ENTRY_STUB..OFF_ENTRY_STUB + 16], embed.entry_va, DecoderOptions::NONE);
+        let mut dec = Decoder::with_ip(
+            64,
+            &embed.section.bytes[OFF_ENTRY_STUB..OFF_ENTRY_STUB + 16],
+            embed.entry_va,
+            DecoderOptions::NONE,
+        );
         assert!(dec.can_decode());
     }
 
@@ -410,7 +497,8 @@ mod tests {
             bytes: text.clone(),
         };
         let entry_va = 0x140007000;
-        let n = patch_marker_trampolines(&regions, &mut sec, 0x140000000, 0x1000, entry_va).unwrap();
+        let n =
+            patch_marker_trampolines(&regions, &mut sec, 0x140000000, 0x1000, entry_va).unwrap();
         assert_eq!(n, 1);
 
         let off = regions[0].start_offset;

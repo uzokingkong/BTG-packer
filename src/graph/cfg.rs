@@ -2,7 +2,6 @@
 // BTG (Bidirectional Trigger Graph) - Multi-Edge CFG Extractor Engine
 // ==============================================================================
 
-
 use crate::core::graph::{BidirectionalGraph, EdgeType};
 use anyhow::Result;
 use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Instruction};
@@ -25,6 +24,39 @@ impl CfgExtractor {
         relayed_sections: &[crate::pe::builder::SectionData],
         image_base: u64,
     ) -> Result<(Vec<BasicBlock>, BidirectionalGraph)> {
+        // RawSize commonly includes file-alignment zero padding after .text's
+        // VirtualSize. Decoding that padding creates fake `add [rax],al` blocks
+        // and used to be masked later by a synthetic RET. Restrict CFG input to
+        // the executable virtual span when section metadata is available.
+        let logical_len = relayed_sections
+            .iter()
+            .find(|sec| sec.name == ".text" && image_base + sec.virtual_address as u64 == base_va)
+            .map(|sec| sec.virtual_size as usize)
+            .unwrap_or(text_bytes.len())
+            .min(text_bytes.len());
+        let text_bytes = &text_bytes[..logical_len];
+        // Collect explicit control-flow targets before classifying 0xCC runs. A
+        // branch-targeted INT3 is executable program semantics, never padding.
+        let mut explicit_code_targets = std::collections::BTreeSet::new();
+        explicit_code_targets.insert(entry_point_va);
+        let mut target_decoder = Decoder::with_ip(64, text_bytes, base_va, DecoderOptions::NONE);
+        while target_decoder.can_decode() {
+            let inst = target_decoder.decode();
+            if !inst.is_invalid()
+                && matches!(
+                    inst.flow_control(),
+                    FlowControl::UnconditionalBranch
+                        | FlowControl::ConditionalBranch
+                        | FlowControl::Call
+                )
+            {
+                let target = inst.near_branch_target();
+                if target >= base_va && target < base_va + text_bytes.len() as u64 {
+                    explicit_code_targets.insert(target);
+                }
+            }
+        }
+
         let mut decoder = Decoder::with_ip(64, text_bytes, base_va, DecoderOptions::NONE);
 
         let mut instructions = Vec::new();
@@ -37,16 +69,39 @@ impl CfgExtractor {
         while decoder.can_decode() {
             let inst = decoder.decode();
 
-            if inst.is_invalid() || inst.code() == Code::Int3 {
-                // Skip aligned 0xCC padding or non-code data inside .text
+            if inst.is_invalid() {
+                // Invalid decode gaps are not valid instructions. Keep their
+                // boundary bookkeeping separate from intentional INT3 traps.
                 if pad_start.is_none() {
                     pad_start = Some(inst.ip());
                 }
                 let current_ip = decoder.ip();
                 if ((current_ip - base_va) as usize) < text_bytes.len() {
-                    decoder = Decoder::with_ip(64, &text_bytes[(current_ip - base_va) as usize..], current_ip, DecoderOptions::NONE);
+                    decoder = Decoder::with_ip(
+                        64,
+                        &text_bytes[(current_ip - base_va) as usize..],
+                        current_ip,
+                        DecoderOptions::NONE,
+                    );
                 }
                 continue;
+            }
+
+            if inst.code() == Code::Int3 {
+                let after_terminal = pad_start.is_some()
+                    || instructions.last().is_some_and(|prev: &Instruction| {
+                        matches!(
+                            prev.flow_control(),
+                            FlowControl::Return | FlowControl::UnconditionalBranch
+                        )
+                    });
+                if after_terminal && !explicit_code_targets.contains(&inst.ip()) {
+                    if pad_start.is_none() {
+                        pad_start = Some(inst.ip());
+                    }
+                    continue;
+                }
+                // Reachable/targeted INT3 is a real trap instruction.
             }
 
             if let Some(ps) = pad_start.take() {
@@ -80,7 +135,9 @@ impl CfgExtractor {
                 if sec.bytes.len() >= 4 {
                     for off in (0..sec.bytes.len().saturating_sub(3)).step_by(4) {
                         // Check 32-bit RVA
-                        let val32 = u32::from_le_bytes(sec.bytes[off..off + 4].try_into().unwrap_or([0; 4]));
+                        let val32 = u32::from_le_bytes(
+                            sec.bytes[off..off + 4].try_into().unwrap_or([0; 4]),
+                        );
                         let va32 = image_base + val32 as u64;
                         if va32 >= base_va && va32 < text_end_va {
                             block_starts.insert(va32);
@@ -88,7 +145,9 @@ impl CfgExtractor {
 
                         // Check 64-bit VA (at 8-byte aligned offsets)
                         if off % 8 == 0 && off + 8 <= sec.bytes.len() {
-                            let val64 = u64::from_le_bytes(sec.bytes[off..off + 8].try_into().unwrap_or([0; 8]));
+                            let val64 = u64::from_le_bytes(
+                                sec.bytes[off..off + 8].try_into().unwrap_or([0; 8]),
+                            );
                             if val64 >= base_va && val64 < text_end_va {
                                 block_starts.insert(val64);
                             }
@@ -192,7 +251,11 @@ impl CfgExtractor {
                 match last.flow_control() {
                     FlowControl::UnconditionalBranch => {
                         let target = last.near_branch_target();
-                        let target_id = basic_blocks.iter().find(|b| b.start_va == target).map(|b| b.id).unwrap_or(u32::MAX);
+                        let target_id = basic_blocks
+                            .iter()
+                            .find(|b| b.start_va == target)
+                            .map(|b| b.id)
+                            .unwrap_or(u32::MAX);
                         if target_id != u32::MAX {
                             graph.add_edge(bb.id, target_id, EdgeType::Unconditional, 1);
                         }
@@ -200,9 +263,17 @@ impl CfgExtractor {
                     FlowControl::ConditionalBranch => {
                         let taken = last.near_branch_target();
                         let fallthrough = last.ip() + last.len() as u64;
-                        let taken_id = basic_blocks.iter().find(|b| b.start_va == taken).map(|b| b.id).unwrap_or(u32::MAX);
-                        let fallthrough_id = basic_blocks.iter().find(|b| b.start_va == fallthrough).map(|b| b.id).unwrap_or(u32::MAX);
-                        
+                        let taken_id = basic_blocks
+                            .iter()
+                            .find(|b| b.start_va == taken)
+                            .map(|b| b.id)
+                            .unwrap_or(u32::MAX);
+                        let fallthrough_id = basic_blocks
+                            .iter()
+                            .find(|b| b.start_va == fallthrough)
+                            .map(|b| b.id)
+                            .unwrap_or(u32::MAX);
+
                         if taken_id != u32::MAX {
                             graph.add_edge(bb.id, taken_id, EdgeType::ConditionalTrue, 1);
                         }
@@ -212,7 +283,11 @@ impl CfgExtractor {
                     }
                     FlowControl::Call => {
                         let return_site = last.ip() + last.len() as u64;
-                        let return_id = basic_blocks.iter().find(|b| b.start_va == return_site).map(|b| b.id).unwrap_or(u32::MAX);
+                        let return_id = basic_blocks
+                            .iter()
+                            .find(|b| b.start_va == return_site)
+                            .map(|b| b.id)
+                            .unwrap_or(u32::MAX);
                         if return_id != u32::MAX {
                             graph.add_edge(bb.id, return_id, EdgeType::Call, 1);
                         }
@@ -248,5 +323,37 @@ impl CfgExtractor {
             }
         }
         successors
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reachable_int3_is_preserved() {
+        let bytes = [0xCC, 0xC3]; // int3; ret
+        let (blocks, _) = CfgExtractor::extract(&bytes, 0x1000, 0x1000, &[], 0).unwrap();
+        assert_eq!(blocks[0].instructions[0].code(), Code::Int3);
+    }
+
+    #[test]
+    fn branch_targeted_int3_is_preserved() {
+        let bytes = [0xEB, 0x01, 0xC3, 0xCC, 0xC3]; // jmp +1 -> int3
+        let (blocks, _) = CfgExtractor::extract(&bytes, 0x1000, 0x1000, &[], 0).unwrap();
+        assert!(blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|inst| inst.ip() == 0x1003 && inst.code() == Code::Int3));
+    }
+
+    #[test]
+    fn terminal_alignment_int3_run_is_padding() {
+        let bytes = [0xC3, 0xCC, 0xCC, 0x90, 0xC3];
+        let (blocks, _) = CfgExtractor::extract(&bytes, 0x1000, 0x1000, &[], 0).unwrap();
+        assert!(!blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|inst| inst.code() == Code::Int3));
     }
 }

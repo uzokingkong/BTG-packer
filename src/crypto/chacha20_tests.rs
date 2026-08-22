@@ -7,8 +7,26 @@
 //    == 네이티브 blob 복호화 (부트 스텁 복호화 계약).
 // ==============================================================================
 
-use crate::crypto::chacha20::{chacha20_block, chacha_apply, chacha_init_state};
+use crate::crypto::chacha20::{
+    chacha20_block, chacha_apply, chacha_init_state, CHA_OFF_CTR, CHA_STATE_SIZE,
+};
 use crate::vm::arena::Arena;
+
+#[test]
+fn aead_block0_key_is_separate_from_payload_counter1() {
+    let key = [0x42u8; 32];
+    let nonce = [0x24u8; 12];
+    let block0 = chacha20_block(&key, 0, &nonce);
+    let block1 = chacha20_block(&key, 1, &nonce);
+    assert_ne!(&block0[..32], &block1[..32]);
+
+    let mut state = [0u8; CHA_STATE_SIZE];
+    chacha_init_state(&mut state, &key, &nonce);
+    state[CHA_OFF_CTR..CHA_OFF_CTR + 8].copy_from_slice(&1u64.to_le_bytes());
+    let mut payload = [0u8; 64];
+    chacha_apply(&mut state, &mut payload);
+    assert_eq!(payload, block1, "AEAD payload must begin at counter 1");
+}
 
 /// RFC 8439 §2.3.2 test vector.
 #[test]
@@ -19,10 +37,11 @@ fn chacha20_block_matches_rfc8439_test_vector() {
     ];
     let ks = chacha20_block(&key, 1, &nonce);
     let expected = [
-        0x10, 0xf1, 0xe7, 0xe4, 0xd1, 0x3b, 0x59, 0x15, 0x50, 0x0f, 0xdd, 0x1f, 0xa3, 0x20, 0x71, 0xc4,
-        0xc7, 0xd1, 0xf4, 0xc7, 0x33, 0xc0, 0x68, 0x03, 0x04, 0x22, 0xaa, 0x9a, 0xc3, 0xd4, 0x6c, 0x4e,
-        0xd2, 0x82, 0x64, 0x46, 0x07, 0x9f, 0xaa, 0x09, 0x14, 0xc2, 0xd7, 0x05, 0xd9, 0x8b, 0x02, 0xa2,
-        0xb5, 0x12, 0x9c, 0xd1, 0xde, 0x16, 0x4e, 0xb9, 0xcb, 0xd0, 0x83, 0xe8, 0xa2, 0x50, 0x3c, 0x4e,
+        0x10, 0xf1, 0xe7, 0xe4, 0xd1, 0x3b, 0x59, 0x15, 0x50, 0x0f, 0xdd, 0x1f, 0xa3, 0x20, 0x71,
+        0xc4, 0xc7, 0xd1, 0xf4, 0xc7, 0x33, 0xc0, 0x68, 0x03, 0x04, 0x22, 0xaa, 0x9a, 0xc3, 0xd4,
+        0x6c, 0x4e, 0xd2, 0x82, 0x64, 0x46, 0x07, 0x9f, 0xaa, 0x09, 0x14, 0xc2, 0xd7, 0x05, 0xd9,
+        0x8b, 0x02, 0xa2, 0xb5, 0x12, 0x9c, 0xd1, 0xde, 0x16, 0x4e, 0xb9, 0xcb, 0xd0, 0x83, 0xe8,
+        0xa2, 0x50, 0x3c, 0x4e,
     ];
     assert_eq!(ks, expected, "RFC 8439 block vector mismatch");
 }
@@ -41,12 +60,17 @@ fn chacha20_keystream_matches_rfc8439_sample_256b() {
     // ("Ladies and Gentlemen...", key 0x80..0x9f, nonce 07:00:00:00:40:41:42:43:44:45:46:47).
     let ks1 = chacha20_block(&key, 1, &nonce);
     let expected_first_block = [
-        0x9f, 0x7b, 0xe9, 0x5d, 0x01, 0xfd, 0x40, 0xba, 0x15, 0xe2, 0x8f, 0xfb, 0x36, 0x81, 0x0a, 0xae,
-        0xc1, 0xc0, 0x88, 0x3f, 0x09, 0x01, 0x6e, 0xde, 0xdd, 0x8a, 0xd0, 0x87, 0x55, 0x82, 0x03, 0xa5,
-        0x4e, 0x9e, 0xcb, 0x38, 0xac, 0x8e, 0x5e, 0x2b, 0xb8, 0xda, 0xb2, 0x0f, 0xfa, 0xdb, 0x52, 0xe8,
-        0x75, 0x04, 0xb2, 0x6e, 0xbe, 0x69, 0x6d, 0x4f, 0x60, 0xa4, 0x85, 0xcf, 0x11, 0xb8, 0x1b, 0x59,
+        0x9f, 0x7b, 0xe9, 0x5d, 0x01, 0xfd, 0x40, 0xba, 0x15, 0xe2, 0x8f, 0xfb, 0x36, 0x81, 0x0a,
+        0xae, 0xc1, 0xc0, 0x88, 0x3f, 0x09, 0x01, 0x6e, 0xde, 0xdd, 0x8a, 0xd0, 0x87, 0x55, 0x82,
+        0x03, 0xa5, 0x4e, 0x9e, 0xcb, 0x38, 0xac, 0x8e, 0x5e, 0x2b, 0xb8, 0xda, 0xb2, 0x0f, 0xfa,
+        0xdb, 0x52, 0xe8, 0x75, 0x04, 0xb2, 0x6e, 0xbe, 0x69, 0x6d, 0x4f, 0x60, 0xa4, 0x85, 0xcf,
+        0x11, 0xb8, 0x1b, 0x59,
     ];
-    assert_eq!(&ks1[..], &expected_first_block[..], "RFC 8439 §2.4.2 first block mismatch");
+    assert_eq!(
+        &ks1[..],
+        &expected_first_block[..],
+        "RFC 8439 §2.4.2 first block mismatch"
+    );
 }
 
 /// 네이티브 crypt blob의 다중 호출 연속 키스트림 == reference `chacha_apply`.
@@ -62,15 +86,25 @@ fn chacha_native_blob_multi_call_matches_reference() {
     let mut arena = Arena::new(0x40000).unwrap();
     let state_va = (arena.base + state_off) as u64;
     let code = crate::crypto::chacha20_native::emit_chacha20_blob(state_va);
-    assert!(code.len() <= state_off, "chacha blob ({}B) overlaps state", code.len());
+    assert!(
+        code.len() <= state_off,
+        "chacha blob ({}B) overlaps state",
+        code.len()
+    );
     {
         let b = arena.bytes();
         b[blob_off..blob_off + code.len()].copy_from_slice(&code);
     }
 
     // key/nonce (deterministic)
-    let key: [u8; 32] = (0u8..32).map(|i| i.wrapping_mul(7).wrapping_add(0x13)).collect::<Vec<_>>().try_into().unwrap();
-    let nonce: [u8; 12] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc];
+    let key: [u8; 32] = (0u8..32)
+        .map(|i| i.wrapping_mul(7).wrapping_add(0x13))
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let nonce: [u8; 12] = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+    ];
     {
         let b = arena.bytes();
         chacha_init_state(
@@ -97,8 +131,14 @@ fn chacha_native_blob_multi_call_matches_reference() {
     let b = arena.bytes();
     let native1: Vec<u8> = b[buf1_off..buf1_off + 100].to_vec();
     let native2: Vec<u8> = b[buf2_off..buf2_off + 37].to_vec();
-    assert_eq!(native1, ref1, "chacha blob call 1 must match reference keystream");
-    assert_eq!(native2, ref2, "chacha blob call 2 (continuation) must match reference keystream");
+    assert_eq!(
+        native1, ref1,
+        "chacha blob call 1 must match reference keystream"
+    );
+    assert_eq!(
+        native2, ref2,
+        "chacha blob call 2 (continuation) must match reference keystream"
+    );
     assert_ne!(native1, vec![0u8; 100], "keystream must be non-zero");
 }
 
@@ -115,18 +155,26 @@ fn chacha_packer_key_native_decrypt_equivalence() {
     let mut arena = Arena::new(0x40000).unwrap();
     let state_va = (arena.base + state_off) as u64;
     let code = crate::crypto::chacha20_native::emit_chacha20_blob(state_va);
-    assert!(code.len() <= state_off, "chacha blob ({}B) overlaps state", code.len());
+    assert!(
+        code.len() <= state_off,
+        "chacha blob ({}B) overlaps state",
+        code.len()
+    );
     {
         let b = arena.bytes();
         b[blob_off..blob_off + code.len()].copy_from_slice(&code);
     }
 
     // deterministic 256B seed -> (key, nonce)
-    let seed: Vec<u8> = (0u8..=255).map(|i| i.wrapping_mul(3).wrapping_add(7)).collect();
+    let seed: Vec<u8> = (0u8..=255)
+        .map(|i| i.wrapping_mul(3).wrapping_add(7))
+        .collect();
     let (key, nonce) = derive_chacha_key_nonce(&seed);
 
     for len in [1usize, 63, 64, 65, 130, 300] {
-        let plain: Vec<u8> = (0..len).map(|i| ((i as u32 * 131 + 7) % 251) as u8).collect();
+        let plain: Vec<u8> = (0..len)
+            .map(|i| ((i as u32 * 131 + 7) % 251) as u8)
+            .collect();
 
         // packer: reference stream encrypt
         let mut st = [0u8; 0x80];
@@ -170,20 +218,28 @@ fn chacha_raw_seed_at_rest_roundtrip_matches_native_blob() {
     let mut arena = Arena::new(0x40000).unwrap();
     let state_va = (arena.base + state_off) as u64;
     let code = crate::crypto::chacha20_native::emit_chacha20_blob(state_va);
-    assert!(code.len() <= state_off, "chacha blob ({}B) overlaps state", code.len());
+    assert!(
+        code.len() <= state_off,
+        "chacha blob ({}B) overlaps state",
+        code.len()
+    );
     {
         let b = arena.bytes();
         b[blob_off..blob_off + code.len()].copy_from_slice(&code);
     }
 
     // 256B seed (패커 seed_masked) → key = seed[0..32], nonce = seed[32..44]
-    let seed: Vec<u8> = (0u8..=255).map(|i| i.wrapping_mul(17).wrapping_add(3)).collect();
+    let seed: Vec<u8> = (0u8..=255)
+        .map(|i| i.wrapping_mul(17).wrapping_add(3))
+        .collect();
     let (key, nonce) = derive_chacha_key_nonce_raw(&seed);
     assert_eq!(&key[..], &seed[..32], "raw key = seed[0..32]");
     assert_eq!(&nonce[..], &seed[32..44], "raw nonce = seed[32..44]");
 
     for len in [1usize, 63, 64, 65, 130, 1000, 4096] {
-        let plain: Vec<u8> = (0..len).map(|i| ((i as u32 * 251 + 13) % 241) as u8).collect();
+        let plain: Vec<u8> = (0..len)
+            .map(|i| ((i as u32 * 251 + 13) % 241) as u8)
+            .collect();
 
         // packer: reference stream encrypt
         let mut st = [0u8; 0x80];

@@ -5,8 +5,8 @@
 // 직접 변환하여 정적/동적 디스어셈블러의 패턴 매칭을 무력화한다.
 // ==============================================================================
 
-use iced_x86::{Code, Instruction, Register};
 use anyhow::{anyhow, Result};
+use iced_x86::{Code, Instruction, Register};
 
 pub struct InlineMbaObfuscator;
 
@@ -24,20 +24,16 @@ impl InlineMbaObfuscator {
                 .map_err(|e| anyhow!("mba: {e}"))?,
         );
         // 2. push reg (save original)
-        instructions.push(
-            Instruction::with1(Code::Push_r64, reg)
-                .map_err(|e| anyhow!("mba: {e}"))?,
-        );
+        instructions
+            .push(Instruction::with1(Code::Push_r64, reg).map_err(|e| anyhow!("mba: {e}"))?);
         // 3. reg = reg ^ scratch
         instructions.push(
             Instruction::with2(Code::Xor_r64_rm64, reg, scratch)
                 .map_err(|e| anyhow!("mba: {e}"))?,
         );
         // 4. pop scratch (scratch = original reg)
-        instructions.push(
-            Instruction::with1(Code::Pop_r64, scratch)
-                .map_err(|e| anyhow!("mba: {e}"))?,
-        );
+        instructions
+            .push(Instruction::with1(Code::Pop_r64, scratch).map_err(|e| anyhow!("mba: {e}"))?);
         // 5. scratch = scratch & imm
         instructions.push(
             Instruction::with2(Code::And_rm64_imm32, scratch, imm)
@@ -45,8 +41,7 @@ impl InlineMbaObfuscator {
         );
         // 6. scratch = scratch * 2 (shl scratch, 1)
         instructions.push(
-            Instruction::with2(Code::Shl_rm64_imm8, scratch, 1)
-                .map_err(|e| anyhow!("mba: {e}"))?,
+            Instruction::with2(Code::Shl_rm64_imm8, scratch, 1).map_err(|e| anyhow!("mba: {e}"))?,
         );
         // 7. add reg, scratch
         instructions.push(
@@ -199,7 +194,9 @@ mod tests {
 
     fn assemble(instrs: Vec<Instruction>) -> Vec<u8> {
         let block = InstructionBlock::new(&instrs, 0x140001000);
-        BlockEncoder::encode(64, block, BlockEncoderOptions::NONE).unwrap().code_buffer
+        BlockEncoder::encode(64, block, BlockEncoderOptions::NONE)
+            .unwrap()
+            .code_buffer
     }
 
     /// MBA reg-reg 시퀀스가 `add r10, r11`과 같은 opcode 구성인지 확인한다
@@ -259,7 +256,10 @@ mod tests {
         .unwrap();
         let codes1: Vec<_> = v1.iter().map(|i| i.code()).collect();
         let codes2: Vec<_> = v2.iter().map(|i| i.code()).collect();
-        assert_ne!(codes1, codes2, "two ADD MBA variants must differ structurally");
+        assert_ne!(
+            codes1, codes2,
+            "two ADD MBA variants must differ structurally"
+        );
         assert_eq!(
             codes2,
             vec![

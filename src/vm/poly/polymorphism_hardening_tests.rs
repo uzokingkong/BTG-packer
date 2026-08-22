@@ -34,12 +34,18 @@ fn per_seed_opcode_map_polymorphism() {
     for op in &ops {
         let a = s1.opcode_for(*op);
         let b = s2.opcode_for(*op);
-        assert!(a.is_some() && b.is_some(), "op {op:?} must be encodable in both specs");
+        assert!(
+            a.is_some() && b.is_some(),
+            "op {op:?} must be encodable in both specs"
+        );
         if a != b {
             differing += 1;
         }
     }
-    assert!(differing > 0, "different seeds must produce different opcode maps (polymorphism)");
+    assert!(
+        differing > 0,
+        "different seeds must produce different opcode maps (polymorphism)"
+    );
 }
 
 /// The opcode map must be injective within a single build — no two distinct
@@ -59,6 +65,9 @@ fn opcode_map_is_injective_per_build() {
         let code = spec
             .opcode_for(*op)
             .unwrap_or_else(|| panic!("op {op:?} must be encodable"));
-        assert!(seen.insert(code), "opcode for {op:?} collides within a single build");
+        assert!(
+            seen.insert(code),
+            "opcode for {op:?} collides within a single build"
+        );
     }
 }

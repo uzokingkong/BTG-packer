@@ -43,6 +43,9 @@ pub struct BuildManifest {
     /// v63/P3-2: effective crypto primitive (`rc4`/`c1`/`chacha20`) used by the
     /// boot stub at-rest decryption (readccc.md §6.1 capability manifest).
     pub crypto_mode: String,
+    pub crypto_construction: String,
+    pub payload_initial_counter: u32,
+    pub poly_key_embedded: bool,
     /// v63/P3-2: at-rest encryption was applied to the code region and/or data runs.
     pub at_rest_encryption: bool,
     /// v63/P3-2: ASLR (relocation-aware output) preserved. at-rest encryption
@@ -57,8 +60,9 @@ pub struct BuildManifest {
     pub anti_debug_policy: String,
     /// readccc §4.4: W^X 메모리 계약 — 실행 코드가 어떤 권한 라이프사이클을
     /// 갖는지 기록한다. 값 (쉼표 구분):
-    ///   `rwx-at-rest`   : `.textb`가 파일에서 RWX로 매핑 (in-place 부트 복호화)
-    ///   `rx-after-verify`: `--mem-harden` — 복호화+무결성 검증 후 RX 전환
+    ///   `rwx-at-rest`   : mem-harden 미사용 레거시 in-place 경로
+    ///   `transient-rw-to-rx`: bootstrap 뒤 영구 RWX가 없는 전환 계약
+    ///   `rx-after-verify`: 복호화+무결성 검증 후 immutable 영역 RX
     ///   `code-data-split`: `--payload-relocate` — 암호화 페이로드는 비실행
     ///                      `.vdata`(데이터)에, 실행 스텁은 `.textb`에 분리
     pub wx_contract: String,
@@ -66,6 +70,22 @@ pub struct BuildManifest {
     pub input_hash: String,
     /// SHA-256 (hex) of the output PE bytes.
     pub output_hash: String,
+    /// Whether post-pack execution comparison was requested.
+    pub execution_verification_attempted: bool,
+    /// Whether exit code/stdout/stderr matched the original byte-for-byte.
+    pub execution_verified: bool,
+    /// Captured execution facts for an accepted verified artifact.
+    pub verified_exit_code: Option<i32>,
+    pub verified_stdout_len: Option<usize>,
+    pub verified_stderr_len: Option<usize>,
+    pub vm_coverage: Option<crate::pipeline::VmCoverageMetrics>,
+    /// Generated VM→native machine-code bridge ranges as RVA half-open ranges.
+    pub native_bridge_ranges: Vec<(u32, u32)>,
+    pub vm_bytecode_chunks: usize,
+    pub vm_bytecode_chunk_max: u32,
+    pub vm_bytecode_rva: u32,
+    pub vm_bytecode_len: u32,
+    pub vm_runtime_cipher_hash: Option<String>,
 }
 
 impl BuildManifest {
@@ -89,15 +109,70 @@ impl BuildManifest {
             crypto_version: CRYPTO_VERSION,
             feature_flags,
             crypto_mode: "c1".to_string(),
+            crypto_construction: "btg-c1".to_string(),
+            payload_initial_counter: 0,
+            poly_key_embedded: false,
             at_rest_encryption: false,
             aslr_preserved: true,
             integrity: false,
             crypto_coverage: 0,
             anti_debug_policy: "trap".to_string(),
-            wx_contract: "rwx-at-rest".to_string(),
+            wx_contract: "unsealed".to_string(),
             input_hash,
             output_hash,
+            execution_verification_attempted: false,
+            execution_verified: false,
+            verified_exit_code: None,
+            verified_stdout_len: None,
+            verified_stderr_len: None,
+            vm_coverage: None,
+            native_bridge_ranges: Vec::new(),
+            vm_bytecode_chunks: 0,
+            vm_bytecode_chunk_max: 0,
+            vm_bytecode_rva: 0,
+            vm_bytecode_len: 0,
+            vm_runtime_cipher_hash: None,
         }
+    }
+
+    pub fn with_vm_ownership(
+        mut self,
+        coverage: Option<&crate::pipeline::VmCoverageMetrics>,
+        vm_program_rva: u32,
+        bridge: Option<(u32, u32)>,
+        chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
+        bytecode_rva: u32,
+        bytecode_len: u32,
+        runtime_cipher_hash: Option<&str>,
+    ) -> Self {
+        self.vm_coverage = coverage.cloned();
+        if let Some((start, end)) = bridge.filter(|(start, end)| start < end) {
+            self.native_bridge_ranges.push((
+                vm_program_rva.saturating_add(start),
+                vm_program_rva.saturating_add(end),
+            ));
+        }
+        self.vm_bytecode_chunks = chunks.len();
+        self.vm_bytecode_chunk_max = chunks.iter().map(|chunk| chunk.len).max().unwrap_or(0);
+        self.vm_bytecode_rva = bytecode_rva;
+        self.vm_bytecode_len = bytecode_len;
+        self.vm_runtime_cipher_hash = runtime_cipher_hash.map(str::to_string);
+        self
+    }
+
+    pub fn with_execution_verification(
+        mut self,
+        attempted: bool,
+        report: Option<&crate::differential::DifferentialReport>,
+    ) -> Self {
+        self.execution_verification_attempted = attempted;
+        self.execution_verified = report.is_some();
+        if let Some(report) = report {
+            self.verified_exit_code = Some(report.original.exit_code);
+            self.verified_stdout_len = Some(report.original.stdout.len());
+            self.verified_stderr_len = Some(report.original.stderr.len());
+        }
+        self
     }
 
     /// P3-2/readccc §6.1: record effective protection capabilities so the
@@ -114,6 +189,14 @@ impl BuildManifest {
         wx_contract: &str,
     ) -> Self {
         self.crypto_mode = crypto_mode.to_string();
+        if crypto_mode == "chacha20" {
+            self.crypto_construction = "rfc8439-chacha20-poly1305".to_string();
+            self.payload_initial_counter = 1;
+        } else {
+            self.crypto_construction = crypto_mode.to_string();
+            self.payload_initial_counter = 0;
+        }
+        self.poly_key_embedded = false;
         self.at_rest_encryption = at_rest_encryption;
         self.aslr_preserved = aslr_preserved;
         self.integrity = integrity;
@@ -130,20 +213,119 @@ impl BuildManifest {
         out.push_str(&format!("build_id = {}\n", self.build_id));
         out.push_str(&format!(
             "seed_id = {}\n",
-            self.seed_id.map(|s| format!("0x{:016X}", s)).unwrap_or_else(|| "none".to_string())
+            self.seed_id
+                .map(|s| format!("0x{:016X}", s))
+                .unwrap_or_else(|| "none".to_string())
         ));
         out.push_str(&format!("vm_version = {}\n", self.vm_version));
         out.push_str(&format!("crypto_version = {}\n", self.crypto_version));
         out.push_str(&format!("input_hash = {}\n", self.input_hash));
         out.push_str(&format!("output_hash = {}\n", self.output_hash));
-        out.push_str(&format!("feature_flags = {}\n", self.feature_flags.join(",")));
+        out.push_str(&format!(
+            "feature_flags = {}\n",
+            self.feature_flags.join(",")
+        ));
         out.push_str(&format!("crypto_mode = {}\n", self.crypto_mode));
-        out.push_str(&format!("at_rest_encryption = {}\n", self.at_rest_encryption));
+        out.push_str(&format!(
+            "crypto_construction = {}\n",
+            self.crypto_construction
+        ));
+        out.push_str(&format!(
+            "payload_initial_counter = {}\n",
+            self.payload_initial_counter
+        ));
+        out.push_str(&format!("poly_key_embedded = {}\n", self.poly_key_embedded));
+        out.push_str(&format!(
+            "at_rest_encryption = {}\n",
+            self.at_rest_encryption
+        ));
         out.push_str(&format!("aslr_preserved = {}\n", self.aslr_preserved));
         out.push_str(&format!("integrity = {}\n", self.integrity));
         out.push_str(&format!("crypto_coverage = {}\n", self.crypto_coverage));
         out.push_str(&format!("anti_debug_policy = {}\n", self.anti_debug_policy));
         out.push_str(&format!("wx_contract = {}\n", self.wx_contract));
+        out.push_str(&format!(
+            "execution_verification_attempted = {}\n",
+            self.execution_verification_attempted
+        ));
+        out.push_str(&format!(
+            "execution_verified = {}\n",
+            self.execution_verified
+        ));
+        out.push_str(&format!(
+            "verified_exit_code = {}\n",
+            self.verified_exit_code
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        out.push_str(&format!(
+            "verified_stdout_len = {}\n",
+            self.verified_stdout_len
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        out.push_str(&format!(
+            "verified_stderr_len = {}\n",
+            self.verified_stderr_len
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        if let Some(c) = &self.vm_coverage {
+            out.push_str(&format!("vm_blocks = {}/{}\n", c.vm_blocks, c.total_blocks));
+            out.push_str(&format!(
+                "vm_instructions = {}/{}\n",
+                c.vm_instructions, c.total_instructions
+            ));
+            out.push_str(&format!(
+                "vm_functions = {}/{}\n",
+                c.vm_functions, c.total_functions
+            ));
+            out.push_str(&format!(
+                "vm_hot_path = {}\n",
+                if c.hot_path_profiled {
+                    format!("{}/{}", c.hot_vm_weight, c.hot_total_weight)
+                } else {
+                    "unprofiled".to_string()
+                }
+            ));
+            out.push_str(&format!("vm_sensitive_regions = {}\n", c.sensitive_regions));
+        } else {
+            out.push_str("vm_blocks = none\nvm_instructions = none\nvm_functions = none\nvm_hot_path = unprofiled\nvm_sensitive_regions = 0\n");
+        }
+        out.push_str(&format!(
+            "native_bridge_ranges = {}\n",
+            if self.native_bridge_ranges.is_empty() {
+                "none".to_string()
+            } else {
+                self.native_bridge_ranges
+                    .iter()
+                    .map(|(start, end)| format!("0x{start:X}..0x{end:X}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        ));
+        out.push_str(&format!(
+            "vm_bytecode_chunks = {}\n",
+            self.vm_bytecode_chunks
+        ));
+        out.push_str(&format!(
+            "vm_bytecode_chunk_max = {}\n",
+            self.vm_bytecode_chunk_max
+        ));
+        out.push_str(&format!("vm_bytecode_rva = 0x{:X}\n", self.vm_bytecode_rva));
+        out.push_str(&format!("vm_bytecode_len = {}\n", self.vm_bytecode_len));
+        out.push_str(&format!(
+            "vm_runtime_cipher_hash = {}\n",
+            self.vm_runtime_cipher_hash.as_deref().unwrap_or("none")
+        ));
+        out.push_str(&format!(
+            "vm_bytecode_chunk_encryption = {}\n",
+            if self.vm_bytecode_chunks == 0 {
+                "disabled"
+            } else {
+                "active-register-only"
+            }
+        ));
         out
     }
 
@@ -177,23 +359,57 @@ pub fn feature_flags(
     seed: bool,
 ) -> Vec<String> {
     let mut v = Vec::new();
-    if anti_debug { v.push("anti_debug".to_string()); }
-    if vm { v.push("vm".to_string()); }
-    if vm_oep { v.push("vm_oep".to_string()); }
-    if vm_commercial { v.push("vm_commercial".to_string()); }
-    if m7 { v.push("m7".to_string()); }
-    if m8 { v.push("m8".to_string()); }
-    if integrity { v.push("integrity".to_string()); }
-    if dispatcher_reencrypt { v.push("dispatcher_reencrypt".to_string()); }
-    if payload_relocate { v.push("payload_relocate".to_string()); }
-    if rsrc_register { v.push("rsrc_register".to_string()); }
-    if iat_hide { v.push("iat_hide".to_string()); }
-    if mem_harden { v.push("mem_harden".to_string()); }
-    if custom_cipher { v.push("custom_cipher".to_string()); }
-    if chacha20 { v.push("chacha20".to_string()); }
-    if map { v.push("map".to_string()); }
-    if sym_map { v.push("sym_map".to_string()); }
-    if seed { v.push("seed".to_string()); }
+    if anti_debug {
+        v.push("anti_debug".to_string());
+    }
+    if vm {
+        v.push("vm".to_string());
+    }
+    if vm_oep {
+        v.push("vm_oep".to_string());
+    }
+    if vm_commercial {
+        v.push("vm_commercial".to_string());
+    }
+    if m7 {
+        v.push("m7".to_string());
+    }
+    if m8 {
+        v.push("m8".to_string());
+    }
+    if integrity {
+        v.push("integrity".to_string());
+    }
+    if dispatcher_reencrypt {
+        v.push("dispatcher_reencrypt".to_string());
+    }
+    if payload_relocate {
+        v.push("payload_relocate".to_string());
+    }
+    if rsrc_register {
+        v.push("rsrc_register".to_string());
+    }
+    if iat_hide {
+        v.push("iat_hide".to_string());
+    }
+    if mem_harden {
+        v.push("mem_harden".to_string());
+    }
+    if custom_cipher {
+        v.push("custom_cipher".to_string());
+    }
+    if chacha20 {
+        v.push("chacha20".to_string());
+    }
+    if map {
+        v.push("map".to_string());
+    }
+    if sym_map {
+        v.push("sym_map".to_string());
+    }
+    if seed {
+        v.push("seed".to_string());
+    }
     v
 }
 
@@ -215,7 +431,8 @@ const K: [u32; 64] = [
 /// SHA-256 of `data`, lower-case hex.
 pub fn sha256_hex(data: &[u8]) -> String {
     let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
     ];
     let bit_len = (data.len() as u64).wrapping_mul(8);
 
@@ -240,9 +457,8 @@ pub fn sha256_hex(data: &[u8]) -> String {
                 .wrapping_add(w[i - 7])
                 .wrapping_add(s1);
         }
-        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) = (
-            h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
-        );
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ (!e & g);

@@ -8,8 +8,8 @@
 
 use crate::core::trigger_block::TriggerBlock;
 use iced_x86::{BlockEncoder, BlockEncoderOptions, InstructionBlock};
-use rand::Rng;
 use rand::seq::SliceRandom;
+use rand::Rng;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -29,7 +29,8 @@ pub struct ShuffledLayout {
 
 impl ShuffledLayout {
     pub fn get_layout(&self, logical_id: u32) -> anyhow::Result<&BlockLayout> {
-        self.layout_map.get(&logical_id)
+        self.layout_map
+            .get(&logical_id)
             .ok_or_else(|| anyhow::anyhow!("Invalid block ID: {}", logical_id))
     }
 }
@@ -69,7 +70,12 @@ impl LayoutShuffler {
                 Ok(result) => result.code_buffer.len(),
                 Err(_) => {
                     // Fallback safety estimation if dummy encoding is not fully bound yet
-                    block.raw_instructions.iter().map(|i| i.len()).sum::<usize>() + 32
+                    block
+                        .raw_instructions
+                        .iter()
+                        .map(|i| i.len())
+                        .sum::<usize>()
+                        + 32
                 }
             };
 
@@ -87,10 +93,13 @@ impl LayoutShuffler {
             current_offset = (current_offset + 31) & !31;
 
             blocks_by_id.insert(block.id, block.clone());
-            layout_map.insert(block.id, BlockLayout {
-                physical_offset: table_offsets[logical_id],
-                encrypted_entry: table_offsets[logical_id], // encrypted later in pass3
-            });
+            layout_map.insert(
+                block.id,
+                BlockLayout {
+                    physical_offset: table_offsets[logical_id],
+                    encrypted_entry: table_offsets[logical_id], // encrypted later in pass3
+                },
+            );
             shuffled_blocks.push(block);
         }
 

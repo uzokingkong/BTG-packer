@@ -2,12 +2,12 @@
 // BTG (Bidirectional Trigger Graph) - 2-Pass Micro-Slicing Engine (Pass 1)
 // ==============================================================================
 
-use crate::core::trigger_block::{TriggerBlock, EntryPointInfo, EntryPointType, CpuState};
+use crate::core::trigger_block::{CpuState, EntryPointInfo, EntryPointType, TriggerBlock};
 use crate::graph::cfg::BasicBlock;
 use crate::mba::MbaGenerator;
 use anyhow::Result;
 use iced_x86::{Code, FlowControl, Instruction, Register};
-use std::collections::{HashMap, BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub struct MicroSlicer {
     max_chunk_size: usize,
@@ -24,7 +24,12 @@ pub struct MicroSlicer {
 }
 
 impl MicroSlicer {
-    pub fn new(max_chunk_size: usize, obf_level: usize, mba_constant: u32, reencrypt: bool) -> Self {
+    pub fn new(
+        max_chunk_size: usize,
+        obf_level: usize,
+        mba_constant: u32,
+        reencrypt: bool,
+    ) -> Self {
         Self {
             max_chunk_size,
             obf_level,
@@ -40,8 +45,8 @@ impl MicroSlicer {
         dispatcher_va: u64,
         text_start_va: u64,
         text_end_va: u64,
+        native_starts: &HashSet<u64>,
     ) -> Result<(Vec<TriggerBlock>, BTreeMap<u64, u32>, HashSet<u32>)> {
-
         let mut draft_blocks = Vec::new();
         let mut va_to_trigger_id = BTreeMap::new();
         let mut next_trigger_id = 0u32;
@@ -60,12 +65,15 @@ impl MicroSlicer {
 
                 // Map every instruction's original IP to the current trigger_id
                 // This ensures branch targets pointing anywhere inside a sliced block resolve correctly!
-                va_to_trigger_id.entry(current_inst.ip()).or_insert(next_trigger_id);
+                va_to_trigger_id
+                    .entry(current_inst.ip())
+                    .or_insert(next_trigger_id);
                 if first_block_for_bb {
-                    va_to_trigger_id.entry(bb.start_va).or_insert(next_trigger_id);
+                    va_to_trigger_id
+                        .entry(bb.start_va)
+                        .or_insert(next_trigger_id);
                     first_block_for_bb = false;
                 }
-
 
                 chunk.push(current_inst);
 
@@ -85,7 +93,6 @@ impl MicroSlicer {
                 }
             }
         }
-
 
         // ---------------------------------------------------------------------------
         // v11: 직접 call 타깃 블록 수집 (재암호화 모드 평문 유지 대상)
@@ -144,21 +151,24 @@ impl MicroSlicer {
                 entry_type: EntryPointType::Normal,
                 cpu_state: cpu_state.clone(),
                 execution_path: vec![block_id],
-            }).unwrap_or_default();
+            })
+            .unwrap_or_default();
 
-            // O2: Multi-entry polymorphic trigger blocks (RFLAGS-safe 0x66 0x90 prefix).
-            // Enabled when obf_level >= 3 for maximum anti-disassembly without flag mutation.
-            let enable_overlap = self.obf_level >= 3;
+            // O2: Multi-entry polymorphic trigger blocks (RFLAGS-safe 0x66 0x90 prefix ready).
+            // Disabled by default to preserve ASLR .reloc exact instruction boundary alignment.
+            let enable_overlap = false;
             if enable_overlap {
                 tb.add_entry_point(EntryPointInfo {
                     offset: 1,
                     entry_type: EntryPointType::Misaligned(1),
                     cpu_state,
                     execution_path: vec![block_id, block_id + 1],
-                }).unwrap_or_default();
+                })
+                .unwrap_or_default();
             }
 
-            let is_terminal = is_last_inst && matches!(flow, FlowControl::Return | FlowControl::IndirectBranch);
+            let is_terminal =
+                is_last_inst && matches!(flow, FlowControl::Return | FlowControl::IndirectBranch);
 
             // v14 FIX: 터미널 블록(ret/간접분기 종단)도 평문 유지 대상에 추가한다.
             // 재암호화 디스패처는 디스패치할 때마다 타깃 블록을 복호화하지만, 터미널
@@ -194,7 +204,10 @@ impl MicroSlicer {
 
             if is_gs_routine {
                 let last_code = chunk.last().map(|inst| inst.code());
-                if last_code != Some(Code::Retnq) && last_code != Some(Code::Jmp_rel32_64) && last_code != Some(Code::Jmp_rm64) {
+                if last_code != Some(Code::Retnq)
+                    && last_code != Some(Code::Jmp_rel32_64)
+                    && last_code != Some(Code::Jmp_rm64)
+                {
                     chunk.push(Instruction::with(Code::Retnq));
                     // v14: 가짜 ret를 삽입한 GS 블록도 디스패처 스텁 없이 종단된다 —
                     // 재암호화 디스패처의 이중 복호화 방지를 위해 평문 유지 대상에 추가.
@@ -209,8 +222,20 @@ impl MicroSlicer {
                 let taken_target_va = current_inst.near_branch_target();
                 let fallthrough_va = current_inst.ip() + current_inst.len() as u64;
 
-                let taken_id = Self::resolve_target_id(&va_to_trigger_id, taken_target_va, block_id, text_start_va, text_end_va);
-                let fall_id = Self::resolve_target_id(&va_to_trigger_id, fallthrough_va, block_id, text_start_va, text_end_va);
+                let taken_id = Self::resolve_target_id(
+                    &va_to_trigger_id,
+                    taken_target_va,
+                    block_id,
+                    text_start_va,
+                    text_end_va,
+                );
+                let fall_id = Self::resolve_target_id(
+                    &va_to_trigger_id,
+                    fallthrough_va,
+                    block_id,
+                    text_start_va,
+                    text_end_va,
+                );
                 let taken_is_trigger = taken_id.is_some();
                 let fall_is_trigger = fall_id.is_some();
 
@@ -219,17 +244,18 @@ impl MicroSlicer {
                 // current_id(자기 자신)는 디스패처가 '직전 블록'을 재암호화하는 데 쓰인다.
                 // v10 FIX: 일반 디스패처는 2-푸시 규약이므로 current_id push를 생략한다
                 // (남으면 디스패치마다 8B 스택 누수 → RSP 8바이트 어긋남).
-                let push_dispatch_stub = |chunk: &mut Vec<Instruction>, target: u32| -> anyhow::Result<usize> {
-                    let stub_idx = chunk.len();
-                    if self.reencrypt {
-                        chunk.push(Instruction::with1(Code::Pushq_imm32, block_id as i32)?);
-                    }
-                    chunk.push(Instruction::with1(Code::Pushq_imm32, target as i32)?);
-                    let seed = MbaGenerator::seed_for(self.mba_constant, target);
-                    chunk.push(Instruction::with1(Code::Pushq_imm32, seed as i32)?);
-                    chunk.push(Instruction::with_branch(Code::Jmp_rel32_64, dispatcher_va)?);
-                    Ok(stub_idx)
-                };
+                let push_dispatch_stub =
+                    |chunk: &mut Vec<Instruction>, target: u32| -> anyhow::Result<usize> {
+                        let stub_idx = chunk.len();
+                        if self.reencrypt {
+                            chunk.push(Instruction::with1(Code::Pushq_imm32, block_id as i32)?);
+                        }
+                        chunk.push(Instruction::with1(Code::Pushq_imm32, target as i32)?);
+                        let seed = MbaGenerator::seed_for(self.mba_constant, target);
+                        chunk.push(Instruction::with1(Code::Pushq_imm32, seed as i32)?);
+                        chunk.push(Instruction::with_branch(Code::Jmp_rel32_64, dispatcher_va)?);
+                        Ok(stub_idx)
+                    };
 
                 let jcc_inst_idx = chunk.len();
                 // as_near_branch() mutates in-place (&mut self -> ()) in iced-x86 v1.21.
@@ -255,7 +281,10 @@ impl MicroSlicer {
                     let target_taken_id = taken_id.unwrap();
                     jcc_inst.set_near_branch64(current_inst.ip() + 26);
                     chunk.push(jcc_inst);
-                    chunk.push(Instruction::with_branch(Code::Jmp_rel32_64, fallthrough_va)?);
+                    chunk.push(Instruction::with_branch(
+                        Code::Jmp_rel32_64,
+                        fallthrough_va,
+                    )?);
                     let taken_stub_idx = push_dispatch_stub(&mut chunk, target_taken_id)?;
                     tb.jcc_info = Some((jcc_inst_idx, taken_stub_idx));
                 } else if fall_is_trigger {
@@ -271,25 +300,47 @@ impl MicroSlicer {
                     // resolves both displacements to original .text addresses).
                     jcc_inst.set_near_branch64(taken_target_va);
                     chunk.push(jcc_inst);
-                    chunk.push(Instruction::with_branch(Code::Jmp_rel32_64, fallthrough_va)?);
+                    chunk.push(Instruction::with_branch(
+                        Code::Jmp_rel32_64,
+                        fallthrough_va,
+                    )?);
                     tb.jcc_info = None;
                 }
             } else if !is_terminal {
-                let is_uncond_jmp = is_last_inst && matches!(flow, FlowControl::UnconditionalBranch);
+                let is_uncond_jmp =
+                    is_last_inst && matches!(flow, FlowControl::UnconditionalBranch);
                 let target_block_id_opt = if is_last_inst {
                     if is_uncond_jmp {
                         let target_va = current_inst.near_branch_target();
-                        let target_id = Self::resolve_target_id(&va_to_trigger_id, target_va, block_id, text_start_va, text_end_va);
+                        let target_id = Self::resolve_target_id(
+                            &va_to_trigger_id,
+                            target_va,
+                            block_id,
+                            text_start_va,
+                            text_end_va,
+                        );
                         if target_id.is_some() {
                             chunk.pop(); // Remove raw JMP instruction ONLY if successfully replaced with Dispatcher stub
                         }
                         target_id
                     } else {
                         let fallthrough_va = current_inst.ip() + current_inst.len() as u64;
-                        Self::resolve_target_id(&va_to_trigger_id, fallthrough_va, block_id, text_start_va, text_end_va)
+                        Self::resolve_target_id(
+                            &va_to_trigger_id,
+                            fallthrough_va,
+                            block_id,
+                            text_start_va,
+                            text_end_va,
+                        )
                     }
                 } else {
-                    Self::resolve_target_id(&va_to_trigger_id, current_inst.ip() + current_inst.len() as u64, block_id, text_start_va, text_end_va)
+                    Self::resolve_target_id(
+                        &va_to_trigger_id,
+                        current_inst.ip() + current_inst.len() as u64,
+                        block_id,
+                        text_start_va,
+                        text_end_va,
+                    )
                 };
 
                 if let Some(target_block_id) = target_block_id_opt {
@@ -305,14 +356,37 @@ impl MicroSlicer {
 
                     // v10 FIX: current_id push는 재암호화(3-푸시) 모드에서만.
                     if self.reencrypt {
-                        chunk.push(Instruction::with1(Code::Pushq_imm32, block_id as i32)?); // current
+                        chunk.push(Instruction::with1(Code::Pushq_imm32, block_id as i32)?);
+                        // current
                     }
-                    chunk.push(Instruction::with1(Code::Pushq_imm32, target_block_id as i32)?);
+                    chunk.push(Instruction::with1(
+                        Code::Pushq_imm32,
+                        target_block_id as i32,
+                    )?);
                     chunk.push(Instruction::with1(Code::Pushq_imm32, seed as i32)?);
                     chunk.push(Instruction::with_branch(Code::Jmp_rel32_64, dispatcher_va)?);
                 } else if !is_uncond_jmp {
-                    // Out-of-bounds fallthrough target for non-JMP block -> emit safe return to caller
-                    chunk.push(Instruction::with(Code::Retnq));
+                    let fallthrough_va = current_inst.ip() + current_inst.len() as u64;
+                    if native_starts.contains(&fallthrough_va) {
+                        // Proven shuffled→native edge: make the original
+                        // fallthrough explicit after relocation. This is a
+                        // native bridge, not a synthesized terminal.
+                        chunk.push(Instruction::with_branch(
+                            Code::Jmp_rel32_64,
+                            fallthrough_va,
+                        )?);
+                        tb.raw_instructions = chunk;
+                        trigger_blocks.push(tb);
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!(
+                        "UnresolvedFallthrough: block={} instruction=0x{:X} fallthrough=0x{:X} text=[0x{:X},0x{:X}); refusing to synthesize RET",
+                        block_id,
+                        current_inst.ip(),
+                        fallthrough_va,
+                        text_start_va,
+                        text_end_va
+                    ));
                 }
             }
 
@@ -358,5 +432,4 @@ impl MicroSlicer {
         }
         map.range(..=target_va).next_back().map(|(_, &id)| id)
     }
-
 }

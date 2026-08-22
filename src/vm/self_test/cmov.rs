@@ -8,8 +8,8 @@
 // every condition family and executing it through BOTH the reference
 // interpreter and the native VM (interp == native == expected).
 
-use anyhow::{Result, anyhow};
-use crate::vm::lifter::{LiftedInstr, lift_block, diagnose_unsupported};
+use crate::vm::lifter::{diagnose_unsupported, lift_block, LiftedInstr};
+use anyhow::{anyhow, Result};
 use iced_x86::{Code, Instruction, Register};
 
 use super::util::{interp_state, run_native, set_vreg, vreg};
@@ -26,7 +26,9 @@ pub(crate) fn run_cmovcc_test() -> Result<()> {
     // Lift a block that seeds ZF/SF/CF/OF/PF via `cmp rax,rax` (all clear except
     // ZF=1 and PF=1 for a zero result) then issues every CMOVcc family member.
     let mut seq: Vec<LiftedInstr> = Vec::new();
-    seq.push(LiftedInstr::plain(Instruction::with2(Code::Cmp_rm64_r64, Register::RAX, Register::RAX).unwrap()));
+    seq.push(LiftedInstr::plain(
+        Instruction::with2(Code::Cmp_rm64_r64, Register::RAX, Register::RAX).unwrap(),
+    ));
     // (dst, cond code) — condition taken given ZF=1,CF=0,SF=0,OF=0,PF=1:
     //   e→T ne→F  b→F ae→T  a→F be→T  s→F ns→T  o→F no→T  p→T np→F  l→F ge→T  le→T g→F
     let cmovs: &[(iced_x86::Register, Code)] = &[
@@ -46,7 +48,9 @@ pub(crate) fn run_cmovcc_test() -> Result<()> {
         (Register::RAX, Code::Cmovge_r64_rm64),
     ];
     for (dst, code) in cmovs {
-        seq.push(LiftedInstr::plain(Instruction::with2(*code, *dst, Register::R8).unwrap()));
+        seq.push(LiftedInstr::plain(
+            Instruction::with2(*code, *dst, Register::R8).unwrap(),
+        ));
     }
 
     let bad = diagnose_unsupported(&seq);
@@ -57,7 +61,8 @@ pub(crate) fn run_cmovcc_test() -> Result<()> {
     // ── interpreter ────────────────────────────────────────────────────────
     let (mut st, mut mem) = interp_state();
     seed_state(&mut st);
-    interp::interpret(&mut st, &mut mem, &bc).map_err(|e| anyhow!("cmov interp failed: {:?}", e))?;
+    interp::interpret(&mut st, &mut mem, &bc)
+        .map_err(|e| anyhow!("cmov interp failed: {:?}", e))?;
     let st_i = st.clone();
 
     // ── native VM ──────────────────────────────────────────────────────────
@@ -72,13 +77,19 @@ pub(crate) fn run_cmovcc_test() -> Result<()> {
         if vi != expect {
             return Err(anyhow!(
                 "cmov interp mismatch: {:?} dst={:?} expected 0x{:X} got 0x{:X}",
-                code, dst, expect, vi
+                code,
+                dst,
+                expect,
+                vi
             ));
         }
         if vn != expect {
             return Err(anyhow!(
                 "cmov native mismatch: {:?} dst={:?} expected 0x{:X} got 0x{:X}",
-                code, dst, expect, vn
+                code,
+                dst,
+                expect,
+                vn
             ));
         }
     }
@@ -90,14 +101,22 @@ fn cmov_taken(code: Code) -> bool {
     use iced_x86::Code::*;
     matches!(
         code,
-        Cmove_r64_rm64 | Cmove_r32_rm32
-            | Cmovae_r64_rm64 | Cmovae_r32_rm32
-            | Cmovbe_r64_rm64 | Cmovbe_r32_rm32
-            | Cmovns_r64_rm64 | Cmovns_r32_rm32
-            | Cmovno_r64_rm64 | Cmovno_r32_rm32
-            | Cmovp_r64_rm64 | Cmovp_r32_rm32
-            | Cmovge_r64_rm64 | Cmovge_r32_rm32
-            | Cmovle_r64_rm64 | Cmovle_r32_rm32
+        Cmove_r64_rm64
+            | Cmove_r32_rm32
+            | Cmovae_r64_rm64
+            | Cmovae_r32_rm32
+            | Cmovbe_r64_rm64
+            | Cmovbe_r32_rm32
+            | Cmovns_r64_rm64
+            | Cmovns_r32_rm32
+            | Cmovno_r64_rm64
+            | Cmovno_r32_rm32
+            | Cmovp_r64_rm64
+            | Cmovp_r32_rm32
+            | Cmovge_r64_rm64
+            | Cmovge_r32_rm32
+            | Cmovle_r64_rm64
+            | Cmovle_r32_rm32
     )
 }
 

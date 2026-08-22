@@ -8,8 +8,8 @@
 // STATE_PTR_CALL_STACK) and keep the program's observed return VA on [v4].
 
 use super::state::{
-    VmError, call_sp_of, call_stack_addr, mem_get, mem_put, set_call_sp, set_sp, set_vreg64, sp_of, vreg64,
-    CALL_STACK_SIZE,
+    call_sp_of, call_stack_addr, mem_get, mem_put, set_call_sp, set_sp, set_vreg64, sp_of, vreg64,
+    VmError, CALL_STACK_SIZE,
 };
 use crate::vm::bytecode::*;
 
@@ -63,7 +63,12 @@ pub(crate) fn exec(
             let ip = ip + 1;
             let sp = sp_of(state);
             let addr = sp as usize;
-            let val = u64::from_le_bytes(mem_get(mem, addr, 8).ok_or(VmError::OobMem)?.try_into().unwrap());
+            let val = u64::from_le_bytes(
+                mem_get(mem, addr, 8)
+                    .ok_or(VmError::OobMem)?
+                    .try_into()
+                    .unwrap(),
+            );
             set_vreg64(state, r, val)?;
             set_sp(state, sp.wrapping_add(8));
             Ok(ip)
@@ -89,7 +94,12 @@ pub(crate) fn exec(
             // pushed return VA.
             let csp = call_sp_of(state);
             check_call_pop(csp)?;
-            let val = u64::from_le_bytes(mem_get(mem, call_stack_addr(state, csp), 8).ok_or(VmError::OobMem)?.try_into().unwrap());
+            let val = u64::from_le_bytes(
+                mem_get(mem, call_stack_addr(state, csp), 8)
+                    .ok_or(VmError::OobMem)?
+                    .try_into()
+                    .unwrap(),
+            );
             set_call_sp(state, csp.wrapping_add(8));
             set_sp(state, sp_of(state).wrapping_add(8));
             Ok(val as usize)
@@ -99,7 +109,12 @@ pub(crate) fn exec(
             let ip = ip + 2;
             let csp = call_sp_of(state);
             check_call_pop(csp)?;
-            let val = u64::from_le_bytes(mem_get(mem, call_stack_addr(state, csp), 8).ok_or(VmError::OobMem)?.try_into().unwrap());
+            let val = u64::from_le_bytes(
+                mem_get(mem, call_stack_addr(state, csp), 8)
+                    .ok_or(VmError::OobMem)?
+                    .try_into()
+                    .unwrap(),
+            );
             set_call_sp(state, csp.wrapping_add(8));
             set_sp(state, sp_of(state).wrapping_add(8 + imm as u64));
             Ok(val as usize)

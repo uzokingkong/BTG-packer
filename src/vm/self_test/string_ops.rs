@@ -9,10 +9,10 @@
 // through BOTH the reference interpreter and the native VM, checking registers
 // and memory (interp == native == expected).
 
-use anyhow::{Result, anyhow};
 use crate::vm::bytecode::F_ZF;
 use crate::vm::interp;
-use crate::vm::lifter::{LiftedInstr, lift_block, diagnose_unsupported};
+use crate::vm::lifter::{diagnose_unsupported, lift_block, LiftedInstr};
+use anyhow::{anyhow, Result};
 use iced_x86::{Decoder, DecoderOptions, Instruction};
 
 use super::util::{interp_state, run_native, set_vreg, vreg};
@@ -46,7 +46,8 @@ fn run_case(
     let (mut st, mut mem) = interp_state();
     mem[BASE as usize..BASE as usize + data.len()].copy_from_slice(data);
     seed(&mut st, 0);
-    interp::interpret(&mut st, &mut mem, &bc).map_err(|e| anyhow!("string interp failed: {:?}", e))?;
+    interp::interpret(&mut st, &mut mem, &bc)
+        .map_err(|e| anyhow!("string interp failed: {:?}", e))?;
     let (mut st_n, vbase) = run_native(&bc, data, 0, seed)?;
     // Native address vregs are absolute VAs (arena base + offset); the interp
     // holds base-relative offsets. Normalize rsi(6)/rdi(7) back to offsets.
@@ -80,8 +81,15 @@ pub(crate) fn run_string_ops_test() -> Result<()> {
 fn run_cases() -> Result<()> {
     use iced_x86::Register;
 
+    let trace = |name: &str| {
+        if std::env::var_os("BTG_TRACE_STRING_OPS").is_some() {
+            eprintln!("[string-ops] {name}");
+        }
+    };
+
     // ── rep stosq ─────────────────────────────────────────────────────────────
     {
+        trace("rep stosq");
         let data = vec![0u8; 0x100];
         let seed = |s: &mut [u8], base: u64| {
             set_vreg(s, 0, 0x1122_3344_5566_7788u64);
@@ -97,6 +105,7 @@ fn run_cases() -> Result<()> {
 
     // ── rep movsq: copy 2 qwords [rsi] -> [rdi] ───────────────────────────────
     {
+        trace("rep movsq");
         let mut data = vec![0u8; 0x200];
         data[0x000..0x010].copy_from_slice(&[1u8; 16]);
         data[0x010..0x020].copy_from_slice(&[2u8; 16]);
@@ -115,6 +124,7 @@ fn run_cases() -> Result<()> {
 
     // ── rep lodsq: load 2 qwords [rsi] -> rax (last one wins) ─────────────────
     {
+        trace("rep lodsq");
         let mut data = vec![0u8; 0x100];
         data[0x000..0x008].copy_from_slice(&0xAAAA_BBBB_CCCC_DDDDu64.to_le_bytes());
         data[0x008..0x010].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
@@ -135,6 +145,7 @@ fn run_cases() -> Result<()> {
     // x86-exact: the terminating iteration still advances rdi and decrements
     // rcx (rdi points PAST the mismatch, 1 iteration left, ZF=0 at exit).
     {
+        trace("repe scasq");
         let mut data = vec![0u8; 0x100];
         data[0x000..0x008].copy_from_slice(&0xAAu64.to_le_bytes());
         data[0x008..0x010].copy_from_slice(&0xBBu64.to_le_bytes());
@@ -155,6 +166,7 @@ fn run_cases() -> Result<()> {
     // ── repne scasq: stop at the first qword == rax ───────────────────────────
     // buffer = {0xBB, 0xAA, 0xCC}; rax = 0xAA; rcx = 3 → match at index 1.
     {
+        trace("repne scasq");
         let mut data = vec![0u8; 0x100];
         data[0x000..0x008].copy_from_slice(&0xBBu64.to_le_bytes());
         data[0x008..0x010].copy_from_slice(&0xAAu64.to_le_bytes());
@@ -168,12 +180,17 @@ fn run_cases() -> Result<()> {
         for st in [&si, &sn] {
             assert_eq!(vreg(st, 7), addr(0, 0x010), "repne scasq rdi (past match)");
             assert_eq!(vreg(st, 1), 1, "repne scasq rcx (1 iteration left)");
-            assert_eq!(flags(st) & F_ZF, F_ZF, "repne scasq exit flags ZF=1 (match)");
+            assert_eq!(
+                flags(st) & F_ZF,
+                F_ZF,
+                "repne scasq exit flags ZF=1 (match)"
+            );
         }
     }
 
     // ── movsq (non-REP): single copy, rcx untouched ───────────────────────────
     {
+        trace("movsq non-rep");
         let mut data = vec![0u8; 0x200];
         data[0x000..0x008].copy_from_slice(&0xDEAD_BEEF_CAFE_F00Du64.to_le_bytes());
         let seed = |s: &mut [u8], base: u64| {
@@ -191,6 +208,7 @@ fn run_cases() -> Result<()> {
 
     // ── rep stosb: fill rcx bytes at [rdi] with AL (low byte of rax) ──────────
     {
+        trace("rep stosb");
         let data = vec![0u8; 0x100];
         let seed = |s: &mut [u8], base: u64| {
             set_vreg(s, 0, 0xAA); // rax (AL = 0xAA)
@@ -208,6 +226,7 @@ fn run_cases() -> Result<()> {
     // x86: rep stos/movs/lods 는 RFLAGS 를 변경하지 않는다. 루프 제어(TEST/DEC)가
     // 플래그를 덮어쓰지 않도록 진입 시점을 저장·복원해야 한다 (interp == native).
     {
+        trace("flags preserve");
         let data = vec![0u8; 0x100];
         let seed = |s: &mut [u8], base: u64| {
             set_vreg(s, 0, 0x1122_3344_5566_7788u64);
@@ -234,6 +253,7 @@ fn run_cases() -> Result<()> {
     // ── v64: 0-count REP string ops — 아무 것도 하지 않고 RFLAGS 유지 ────────
     // x86: rcx==0 이면 REP 명령은 실행되지 않는다 (flags 불변, 포인터 불변).
     {
+        trace("zero-count");
         let data = vec![0u8; 0x100];
         let seed = |s: &mut [u8], base: u64| {
             set_vreg(s, 0, 0xAA);
@@ -244,13 +264,21 @@ fn run_cases() -> Result<()> {
         };
         let (si, sn) = run_case(decode(&[0xF3, 0xAA]), &data, seed)?; // rep stosb, rcx=0
         for st in [&si, &sn] {
-            assert_eq!(vreg(st, 7), addr(0, 0x000), "0-count rep stosb rdi unchanged");
+            assert_eq!(
+                vreg(st, 7),
+                addr(0, 0x000),
+                "0-count rep stosb rdi unchanged"
+            );
             assert_eq!(vreg(st, 1), 0, "0-count rep stosb rcx");
             assert_eq!(flags(st), 0x8D5, "0-count rep stosb must preserve RFLAGS");
         }
         let (si, sn) = run_case(decode(&[0xF3, 0x48, 0xAF]), &data, seed)?; // repe scasq, rcx=0
         for st in [&si, &sn] {
-            assert_eq!(vreg(st, 7), addr(0, 0x000), "0-count repe scasq rdi unchanged");
+            assert_eq!(
+                vreg(st, 7),
+                addr(0, 0x000),
+                "0-count repe scasq rdi unchanged"
+            );
             assert_eq!(flags(st), 0x8D5, "0-count repe scasq must preserve RFLAGS");
         }
     }
@@ -259,26 +287,44 @@ fn run_cases() -> Result<()> {
     // Sequence: `std; rep movsb` — [rsi] -> [rdi] with rsi/rdi DECREMENTED each
     // iteration. The whole thing must run identically through interp and native.
     {
+        trace("df backward movsb");
         let mut data = vec![0u8; 0x200];
         // source block [BASE+0x010..BASE+0x014] = {1,2,3,4}
         data[0x010..0x014].copy_from_slice(&[1u8, 2, 3, 4]);
         let seq = vec![
-            LiftedInstr::plain(decode(&[0xFD])),                      // std
-            LiftedInstr::plain(decode(&[0xF3, 0xA4])),                // rep movsb
+            LiftedInstr::plain(decode(&[0xFD])),       // std
+            LiftedInstr::plain(decode(&[0xF3, 0xA4])), // rep movsb
         ];
         let bad = diagnose_unsupported(&seq);
-        assert!(bad.is_empty(), "std/rep movsb: unexpected unsupported {:?}", bad);
+        assert!(
+            bad.is_empty(),
+            "std/rep movsb: unexpected unsupported {:?}",
+            bad
+        );
         let bc = lift_block(&seq, 0)?;
         let (mut st, mut mem) = interp_state();
         // source {1,2,3,4} at mem[0x9010..0x9014]; rsi starts at the LAST byte.
         mem[0x9010..0x9014].copy_from_slice(&[1u8, 2, 3, 4]);
         set_vreg(&mut st, 6, addr(0, 0x013)); // rsi = last byte of source
         set_vreg(&mut st, 7, addr(0, 0x023)); // rdi = last byte of dest
-        set_vreg(&mut st, 1, 4);     // rcx = 4
-        interp::interpret(&mut st, &mut mem, &bc).map_err(|e| anyhow!("std interp failed: {:?}", e))?;
-        assert_eq!(vreg(&st, 6), addr(0, 0x00F), "std rep movsb rsi decremented");
-        assert_eq!(vreg(&st, 7), addr(0, 0x01F), "std rep movsb rdi decremented");
-        assert_eq!(&mem[0x9020..0x9024], &[1u8, 2, 3, 4], "std rep movsb copied backward");
+        set_vreg(&mut st, 1, 4); // rcx = 4
+        interp::interpret(&mut st, &mut mem, &bc)
+            .map_err(|e| anyhow!("std interp failed: {:?}", e))?;
+        assert_eq!(
+            vreg(&st, 6),
+            addr(0, 0x00F),
+            "std rep movsb rsi decremented"
+        );
+        assert_eq!(
+            vreg(&st, 7),
+            addr(0, 0x01F),
+            "std rep movsb rdi decremented"
+        );
+        assert_eq!(
+            &mem[0x9020..0x9024],
+            &[1u8, 2, 3, 4],
+            "std rep movsb copied backward"
+        );
         assert_eq!(vreg(&st, 1), 0, "std rep movsb rcx");
         let (mut st_n, vbase) = run_native(&bc, &data, 0, |s, base| {
             set_vreg(s, 6, addr(base, 0x013));
@@ -300,20 +346,30 @@ fn run_cases() -> Result<()> {
 
     // ── v65: cld; rep stosq — forward fill after clearing DF ─────────────────
     {
+        trace("cld forward stosq");
         let data = vec![0u8; 0x100];
         let seq = vec![
-            LiftedInstr::plain(decode(&[0xFC])), // cld (DF=0)
+            LiftedInstr::plain(decode(&[0xFC])),             // cld (DF=0)
             LiftedInstr::plain(decode(&[0xF3, 0x48, 0xAB])), // rep stosq
         ];
         let bad = diagnose_unsupported(&seq);
-        assert!(bad.is_empty(), "cld/rep stosq: unexpected unsupported {:?}", bad);
+        assert!(
+            bad.is_empty(),
+            "cld/rep stosq: unexpected unsupported {:?}",
+            bad
+        );
         let bc = lift_block(&seq, 0)?;
         let (mut st, mut mem) = interp_state();
         set_vreg(&mut st, 0, 0x1122_3344_5566_7788u64);
         set_vreg(&mut st, 7, addr(0, 0x000));
         set_vreg(&mut st, 1, 3);
-        interp::interpret(&mut st, &mut mem, &bc).map_err(|e| anyhow!("cld interp failed: {:?}", e))?;
-        assert_eq!(vreg(&st, 7), addr(0, 0x018), "cld rep stosq rdi advanced forward");
+        interp::interpret(&mut st, &mut mem, &bc)
+            .map_err(|e| anyhow!("cld interp failed: {:?}", e))?;
+        assert_eq!(
+            vreg(&st, 7),
+            addr(0, 0x018),
+            "cld rep stosq rdi advanced forward"
+        );
         assert_eq!(mem[0x9000..0x9008], 0x1122_3344_5566_7788u64.to_le_bytes());
         // native parity: rep stosq forward after cld
         let (mut st_n, vbase) = run_native(&bc, &data, 0, |s, base| {

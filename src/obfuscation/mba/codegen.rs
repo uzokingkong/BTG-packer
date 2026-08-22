@@ -9,10 +9,10 @@ use rand::Rng;
 /// Instruction 구성 실패 → 도메인 오류로 변환 (리뷰 지적 #22: `unwrap_or_default()`
 /// 로 잘못된(기본값) 명령을 조용히 스트림에 넣으면 인코더가 통과해도 **의미가 다른**
 /// 코드가 생성된다. 반드시 오류로 올려야 한다).
-fn mk(r: std::result::Result<Instruction, iced_x86::IcedError>) -> crate::error::Result<Instruction> {
-    r.map_err(|e| {
-        BtgError::Obfuscation(ObfuscationError::MbaCodegenFailed(e.to_string()))
-    })
+fn mk(
+    r: std::result::Result<Instruction, iced_x86::IcedError>,
+) -> crate::error::Result<Instruction> {
+    r.map_err(|e| BtgError::Obfuscation(ObfuscationError::MbaCodegenFailed(e.to_string())))
 }
 
 impl MbaPolynomial {
@@ -54,117 +54,125 @@ impl MbaPolynomial {
         instructions.push(mk(Instruction::with1(Code::Push_r64, Register::R8))?);
 
         // R8D = y (EDX)
-        instructions.push(
-            mk(Instruction::with2(Code::Mov_r32_rm32, Register::R8D, Register::EDX))?
-        );
+        instructions.push(mk(Instruction::with2(
+            Code::Mov_r32_rm32,
+            Register::R8D,
+            Register::EDX,
+        ))?);
         // EAX = x (0xFFFFFFFF)
-        instructions.push(
-            mk(Instruction::with2(Code::Mov_r32_imm32, Register::EAX, 0xFFFFFFFFu32))?
-        );
+        instructions.push(mk(Instruction::with2(
+            Code::Mov_r32_imm32,
+            Register::EAX,
+            0xFFFFFFFFu32,
+        ))?);
         // R8D ^= EAX → R8D = x ^ y = var_val
-        instructions.push(
-            mk(Instruction::with2(Code::Xor_rm32_r32, Register::R8D, Register::EAX))?
-        );
+        instructions.push(mk(Instruction::with2(
+            Code::Xor_rm32_r32,
+            Register::R8D,
+            Register::EAX,
+        ))?);
         // EAX = 0 (누적 결과 초기화)
-        instructions.push(
-            mk(Instruction::with2(Code::Xor_r32_rm32, Register::EAX, Register::EAX))?
-        );
+        instructions.push(mk(Instruction::with2(
+            Code::Xor_r32_rm32,
+            Register::EAX,
+            Register::EAX,
+        ))?);
 
         for term in &self.terms {
             // ECX = coefficient
-            instructions.push(
-                mk(Instruction::with2(Code::Mov_r32_imm32, Register::ECX, term.coefficient))?
-            );
+            instructions.push(mk(Instruction::with2(
+                Code::Mov_r32_imm32,
+                Register::ECX,
+                term.coefficient,
+            ))?);
 
             // 부울 연산 적용: ECX = op(ECX, R8D)
             // R8D는 var_val이며 모든 항에서 보존됨
             for &op in &term.operations {
                 match op {
                     BooleanOp::And => {
-                        instructions.push(
-                            mk(Instruction::with2(Code::And_rm32_r32, Register::ECX, Register::R8D))?
-                        );
+                        instructions.push(mk(Instruction::with2(
+                            Code::And_rm32_r32,
+                            Register::ECX,
+                            Register::R8D,
+                        ))?);
                     }
                     BooleanOp::Or => {
-                        instructions.push(
-                            mk(Instruction::with2(Code::Or_rm32_r32, Register::ECX, Register::R8D))?
-                        );
+                        instructions.push(mk(Instruction::with2(
+                            Code::Or_rm32_r32,
+                            Register::ECX,
+                            Register::R8D,
+                        ))?);
                     }
                     BooleanOp::Xor => {
-                        instructions.push(
-                            mk(Instruction::with2(Code::Xor_rm32_r32, Register::ECX, Register::R8D))?
-                        );
+                        instructions.push(mk(Instruction::with2(
+                            Code::Xor_rm32_r32,
+                            Register::ECX,
+                            Register::R8D,
+                        ))?);
                     }
                     BooleanOp::Not => {
-                        instructions.push(
-                            mk(Instruction::with1(Code::Not_rm32, Register::ECX))?
-                        );
+                        instructions.push(mk(Instruction::with1(Code::Not_rm32, Register::ECX))?);
                     }
                     BooleanOp::Nand => {
                         // ECX = ECX & R8D; ECX = ~ECX
-                        instructions.push(
-                            mk(Instruction::with2(Code::And_rm32_r32, Register::ECX, Register::R8D))?
-                        );
-                        instructions.push(
-                            mk(Instruction::with1(Code::Not_rm32, Register::ECX))?
-                        );
+                        instructions.push(mk(Instruction::with2(
+                            Code::And_rm32_r32,
+                            Register::ECX,
+                            Register::R8D,
+                        ))?);
+                        instructions.push(mk(Instruction::with1(Code::Not_rm32, Register::ECX))?);
                     }
                     BooleanOp::Nor => {
                         // ECX = ECX | R8D; ECX = ~ECX
-                        instructions.push(
-                            mk(Instruction::with2(Code::Or_rm32_r32, Register::ECX, Register::R8D))?
-                        );
-                        instructions.push(
-                            mk(Instruction::with1(Code::Not_rm32, Register::ECX))?
-                        );
+                        instructions.push(mk(Instruction::with2(
+                            Code::Or_rm32_r32,
+                            Register::ECX,
+                            Register::R8D,
+                        ))?);
+                        instructions.push(mk(Instruction::with1(Code::Not_rm32, Register::ECX))?);
                     }
                     BooleanOp::Xnor => {
                         // ECX = ECX ^ R8D; ECX = ~ECX
-                        instructions.push(
-                            mk(Instruction::with2(Code::Xor_rm32_r32, Register::ECX, Register::R8D))?
-                        );
-                        instructions.push(
-                            mk(Instruction::with1(Code::Not_rm32, Register::ECX))?
-                        );
+                        instructions.push(mk(Instruction::with2(
+                            Code::Xor_rm32_r32,
+                            Register::ECX,
+                            Register::R8D,
+                        ))?);
+                        instructions.push(mk(Instruction::with1(Code::Not_rm32, Register::ECX))?);
                     }
                     BooleanOp::AndNot => {
                         // ECX = ECX & ~R8D
                         // R8D 보존: push r8 → not r8d → and ecx, r8d → pop r8
-                        instructions.push(
-                            mk(Instruction::with1(Code::Push_r64, Register::R8))?
-                        );
-                        instructions.push(
-                            mk(Instruction::with1(Code::Not_rm32, Register::R8D))?
-                        );
-                        instructions.push(
-                            mk(Instruction::with2(Code::And_rm32_r32, Register::ECX, Register::R8D))?
-                        );
-                        instructions.push(
-                            mk(Instruction::with1(Code::Pop_r64, Register::R8))?
-                        );
+                        instructions.push(mk(Instruction::with1(Code::Push_r64, Register::R8))?);
+                        instructions.push(mk(Instruction::with1(Code::Not_rm32, Register::R8D))?);
+                        instructions.push(mk(Instruction::with2(
+                            Code::And_rm32_r32,
+                            Register::ECX,
+                            Register::R8D,
+                        ))?);
+                        instructions.push(mk(Instruction::with1(Code::Pop_r64, Register::R8))?);
                     }
                     BooleanOp::OrNot => {
                         // ECX = ECX | ~R8D
-                        instructions.push(
-                            mk(Instruction::with1(Code::Push_r64, Register::R8))?
-                        );
-                        instructions.push(
-                            mk(Instruction::with1(Code::Not_rm32, Register::R8D))?
-                        );
-                        instructions.push(
-                            mk(Instruction::with2(Code::Or_rm32_r32, Register::ECX, Register::R8D))?
-                        );
-                        instructions.push(
-                            mk(Instruction::with1(Code::Pop_r64, Register::R8))?
-                        );
+                        instructions.push(mk(Instruction::with1(Code::Push_r64, Register::R8))?);
+                        instructions.push(mk(Instruction::with1(Code::Not_rm32, Register::R8D))?);
+                        instructions.push(mk(Instruction::with2(
+                            Code::Or_rm32_r32,
+                            Register::ECX,
+                            Register::R8D,
+                        ))?);
+                        instructions.push(mk(Instruction::with1(Code::Pop_r64, Register::R8))?);
                     }
                 }
             }
 
             // 결과 누적: EAX ^= ECX
-            instructions.push(
-                mk(Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::ECX))?
-            );
+            instructions.push(mk(Instruction::with2(
+                Code::Xor_rm32_r32,
+                Register::EAX,
+                Register::ECX,
+            ))?);
         }
 
         // 레지스터 복원

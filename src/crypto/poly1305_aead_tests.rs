@@ -18,7 +18,9 @@ use crate::crypto::poly1305::{
 /// Deterministic key/nonce/AAD (RFC 8439 §2.8 AEAD sample style).
 fn key_nonce_aad() -> ([u8; 32], [u8; 12], &'static [u8]) {
     let key = (0x10u8..0x30).collect::<Vec<_>>().try_into().unwrap();
-    let nonce = [0x07, 0x00, 0x00, 0x00, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47];
+    let nonce = [
+        0x07, 0x00, 0x00, 0x00, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+    ];
     (key, nonce, &POLY1305_AEAD_AAD)
 }
 
@@ -61,7 +63,9 @@ fn poly1305_aead_tag_roundtrip_deterministic() {
     let (_, _, aad) = key_nonce_aad();
     let poly_key: [u8; 32] = (0x80u8..=0x9f).collect::<Vec<_>>().try_into().unwrap();
     for len in [0usize, 15, 16, 17, 64, 300] {
-        let ct: Vec<u8> = (0..len).map(|i| ((i as u32 * 131 + 7) % 251) as u8).collect();
+        let ct: Vec<u8> = (0..len)
+            .map(|i| ((i as u32 * 131 + 7) % 251) as u8)
+            .collect();
         let tag = poly1305_aead_tag(aad, &ct, &poly_key);
         assert_eq!(tag.len(), 16);
         // recompute → deterministic
@@ -76,7 +80,9 @@ fn poly1305_aead_tag_roundtrip_deterministic() {
 fn poly1305_aead_tampered_tag_fails() {
     let (_, _, aad) = key_nonce_aad();
     let poly_key: [u8; 32] = (0x40u8..0x60).collect::<Vec<_>>().try_into().unwrap();
-    let ct: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(7).wrapping_add(0x11)).collect();
+    let ct: Vec<u8> = (0..64u8)
+        .map(|i| i.wrapping_mul(7).wrapping_add(0x11))
+        .collect();
     let tag = poly1305_aead_tag(aad, &ct, &poly_key);
     let mut bad = tag;
     bad[0] ^= 0xFF;
@@ -90,7 +96,9 @@ fn poly1305_aead_tampered_tag_fails() {
 fn poly1305_aead_tampered_ct_fails() {
     let (_, _, aad) = key_nonce_aad();
     let poly_key: [u8; 32] = (0x40u8..0x60).collect::<Vec<_>>().try_into().unwrap();
-    let ct: Vec<u8> = (0..100u8).map(|i| i.wrapping_mul(3).wrapping_add(9)).collect();
+    let ct: Vec<u8> = (0..100u8)
+        .map(|i| i.wrapping_mul(3).wrapping_add(9))
+        .collect();
     let tag = poly1305_aead_tag(aad, &ct, &poly_key);
     let mut bad_ct = ct.clone();
     bad_ct[0] ^= 0x01;
@@ -103,7 +111,9 @@ fn poly1305_aead_tampered_ct_fails() {
 fn poly1305_aead_wrong_aad_fails() {
     let (_, _, aad) = key_nonce_aad();
     let poly_key: [u8; 32] = (0x40u8..0x60).collect::<Vec<_>>().try_into().unwrap();
-    let ct: Vec<u8> = (0..80u8).map(|i| i.wrapping_mul(5).wrapping_add(2)).collect();
+    let ct: Vec<u8> = (0..80u8)
+        .map(|i| i.wrapping_mul(5).wrapping_add(2))
+        .collect();
     let tag_ok = poly1305_aead_tag(aad, &ct, &poly_key);
     let tag_wrong = poly1305_aead_tag(b"wrong-aad-binding!", &ct, &poly_key);
     assert_ne!(tag_ok, tag_wrong, "wrong AAD must change the tag");

@@ -1,11 +1,11 @@
 // ==============================================================================
 // BTG - post-build resource (.rsrc) validation - split from validate.rs
 // ==============================================================================
+use super::{section_for_rva, SectionInfo, CHUNK_SIZE, MAX_CHUNKS};
 use crate::pipeline::PipelineContext;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use goblin::pe::PE;
 use std::collections::HashSet;
-use super::{SectionInfo, section_for_rva, MAX_CHUNKS, CHUNK_SIZE};
 
 /// A leaf IMAGE_RESOURCE_DATA_ENTRY found in the tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +83,10 @@ pub(crate) fn walk_dir(
                     size
                 );
             }
-            out.push(ResDataEntry { offset_rva: rva, size });
+            out.push(ResDataEntry {
+                offset_rva: rva,
+                size,
+            });
         }
     }
     Ok(())
@@ -130,7 +133,14 @@ pub(crate) fn walk_resource_tree(
     let mut visited = HashSet::new();
     // Tree pointers are relative to the resource base == root_off within the
     // section, so pass root_off as `base`.
-    walk_dir(sec_bytes, root_off, root_off, &mut visited, &mut entries, sections)?;
+    walk_dir(
+        sec_bytes,
+        root_off,
+        root_off,
+        &mut visited,
+        &mut entries,
+        sections,
+    )?;
     Ok(entries)
 }
 
@@ -182,8 +192,12 @@ pub(crate) fn validate_rsrc(
     );
 
     // b+c. Tree walk + data-entry section coverage.
-    let tree_sec = section_for_rva(sections, ctx.rsrc_dir_rva)
-        .ok_or_else(|| anyhow!("resource dir RVA 0x{:X} outside all sections", ctx.rsrc_dir_rva))?;
+    let tree_sec = section_for_rva(sections, ctx.rsrc_dir_rva).ok_or_else(|| {
+        anyhow!(
+            "resource dir RVA 0x{:X} outside all sections",
+            ctx.rsrc_dir_rva
+        )
+    })?;
     let entries = walk_resource_tree(tree_sec, out, ctx.rsrc_dir_rva, ctx.rsrc_dir_size, sections)?;
     println!(
         "[VALIDATE] OK  resource tree walk: {} data entries in section '{}'",
@@ -194,7 +208,10 @@ pub(crate) fn validate_rsrc(
     // d. Every expected RT_RCDATA chunk must be registered.
     let expected = expected_chunks(ctx.payload_rva, ctx.payload_len);
     for (rva, size) in &expected {
-        if !entries.iter().any(|e| e.offset_rva == *rva && e.size == *size) {
+        if !entries
+            .iter()
+            .any(|e| e.offset_rva == *rva && e.size == *size)
+        {
             bail!(
                 "RT_RCDATA chunk @RVA 0x{:X} size 0x{:X} missing from resource tree",
                 rva,

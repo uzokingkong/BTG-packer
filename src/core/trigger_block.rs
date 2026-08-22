@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use iced_x86::Instruction;
+use std::collections::HashMap;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -54,9 +54,12 @@ impl TriggerBlock {
 
     pub fn add_entry_point(&mut self, info: EntryPointInfo) -> Result<()> {
         if self.entries.contains_key(&info.offset) {
-            return Err(anyhow!("Entry point at offset {} already exists", info.offset));
+            return Err(anyhow!(
+                "Entry point at offset {} already exists",
+                info.offset
+            ));
         }
-        
+
         if info.offset >= self.data.len() && !self.data.is_empty() {
             return Err(anyhow!(
                 "Entry point offset {} >= block size {}",
@@ -64,16 +67,18 @@ impl TriggerBlock {
                 self.data.len()
             ));
         }
-        
+
         self.entries.insert(info.offset, info);
         Ok(())
     }
 
     #[allow(dead_code)]
     pub fn verify_execution_path(&self, offset: usize) -> Result<bool> {
-        let entry = self.entries.get(&offset)
+        let entry = self
+            .entries
+            .get(&offset)
             .ok_or_else(|| anyhow!("No entry point at offset {}", offset))?;
-        
+
         Ok(!entry.execution_path.is_empty())
     }
 
@@ -82,19 +87,17 @@ impl TriggerBlock {
         if self.entries.len() < 2 {
             return Err(anyhow!("Polymorphism requires at least 2 entry points"));
         }
-        
-        let paths: Vec<_> = self.entries.values()
-            .map(|e| &e.execution_path)
-            .collect();
-        
+
+        let paths: Vec<_> = self.entries.values().map(|e| &e.execution_path).collect();
+
         for i in 0..paths.len() {
-            for j in (i+1)..paths.len() {
+            for j in (i + 1)..paths.len() {
                 if paths[i] == paths[j] {
                     return Err(anyhow!("Entry points {} and {} have same path", i, j));
                 }
             }
         }
-        
+
         Ok(())
     }
 }

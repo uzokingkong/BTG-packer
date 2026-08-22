@@ -60,12 +60,17 @@ pub fn detect_tls_callback_ranges(
         }
     }
     funcs.sort();
-    let func_of = |va: u64| -> Option<(u64, u64)> {
-        funcs.iter().copied().find(|&(s, e)| s <= va && va < e)
-    };
+    let func_of =
+        |va: u64| -> Option<(u64, u64)> { funcs.iter().copied().find(|&(s, e)| s <= va && va < e) };
 
     // 1) TLS directory -> AddressOfCallBacks array.
-    let tls_dir = data_directories.get(9).copied().unwrap_or(crate::pe::builder::DataDirectory { virtual_address: 0, size: 0 });
+    let tls_dir = data_directories
+        .get(9)
+        .copied()
+        .unwrap_or(crate::pe::builder::DataDirectory {
+            virtual_address: 0,
+            size: 0,
+        });
     let mut callback_vas: Vec<u64> = Vec::new();
     if tls_dir.virtual_address != 0 && tls_dir.size >= 0x18 + 8 {
         for sec in relayed_sections {
@@ -86,9 +91,8 @@ pub fn detect_tls_callback_ranges(
                             let coff = (cb_rva as u64 - cva) as usize;
                             let mut i = coff;
                             while i + 8 <= cbsec.bytes.len() {
-                                let fva = u64::from_le_bytes(
-                                    cbsec.bytes[i..i + 8].try_into().unwrap(),
-                                );
+                                let fva =
+                                    u64::from_le_bytes(cbsec.bytes[i..i + 8].try_into().unwrap());
                                 if fva == 0 {
                                     break;
                                 }
@@ -129,7 +133,10 @@ pub fn detect_tls_callback_ranges(
             continue;
         }
         let va = inst.ip();
-        if matches!(inst.flow_control(), FlowControl::Call | FlowControl::UnconditionalBranch) {
+        if matches!(
+            inst.flow_control(),
+            FlowControl::Call | FlowControl::UnconditionalBranch
+        ) {
             let near = inst.near_branch_target();
             if near >= base_va && near < base_va + text_bytes.len() as u64 {
                 callees.entry(va).or_default().push(near);
@@ -138,8 +145,17 @@ pub fn detect_tls_callback_ranges(
     }
     let mut queue: Vec<u64> = native.iter().copied().collect();
     while let Some(fs) = queue.pop() {
-        let fe = funcs.iter().find(|&&(ss, _)| ss == fs).map(|&(_, e)| e).unwrap_or(fs + 1);
-        let mut d = Decoder::with_ip(64, &text_bytes[(fs - base_va) as usize..], fs, DecoderOptions::NONE);
+        let fe = funcs
+            .iter()
+            .find(|&&(ss, _)| ss == fs)
+            .map(|&(_, e)| e)
+            .unwrap_or(fs + 1);
+        let mut d = Decoder::with_ip(
+            64,
+            &text_bytes[(fs - base_va) as usize..],
+            fs,
+            DecoderOptions::NONE,
+        );
         let mut guard = 0usize;
         for inst in d {
             if guard > 1_000_000 {
@@ -152,7 +168,10 @@ pub fn detect_tls_callback_ranges(
             if inst.is_invalid() {
                 continue;
             }
-            if matches!(inst.flow_control(), FlowControl::Call | FlowControl::UnconditionalBranch) {
+            if matches!(
+                inst.flow_control(),
+                FlowControl::Call | FlowControl::UnconditionalBranch
+            ) {
                 let near = inst.near_branch_target();
                 if near >= base_va && near < base_va + text_bytes.len() as u64 {
                     if let Some((cs, _)) = func_of(near) {
@@ -228,7 +247,7 @@ mod tests {
         text.extend_from_slice(&0xe8u8.to_le_bytes());
         text.extend_from_slice(&disp.to_le_bytes());
         text.extend_from_slice(&[0xc3]); // ret (A: 6B total)
-        // B @ offset 6: xor rax,rax; ret (4B)
+                                         // B @ offset 6: xor rax,rax; ret (4B)
         text.extend_from_slice(&[0x48, 0x31, 0xc0, 0xc3]);
         // C @ offset 10: shl rax,0 (4B)
         text.extend_from_slice(&[0x48, 0xc1, 0xe0, 0x00]);
@@ -245,18 +264,24 @@ mod tests {
         // .rdata: TLS dir @0x2000, callbacks array @0x3000.
         let mut rdata = vec![0u8; 0x1100]; // covers 0x2000..0x3100
         let tls_off = 0x2000 - 0x2000; // rdata va = 0x2000
-        // IMAGE_TLS_DIRECTORY64: put AddressOfCallBacks at +0x18.
+                                       // IMAGE_TLS_DIRECTORY64: put AddressOfCallBacks at +0x18.
         rdata[tls_off + 0x18..tls_off + 0x20].copy_from_slice(&(image_base + 0x3000).to_le_bytes());
         let cb_off = 0x3000 - 0x2000;
         rdata[cb_off..cb_off + 8].copy_from_slice(&(image_base + 0x1000).to_le_bytes()); // -> A
-        // null terminator already zero.
+                                                                                         // null terminator already zero.
 
         let relayed = vec![
             section(".text", 0x1000, text),
             section(".pdata", 0x1000 + 0x200, pdata_bytes),
             section(".rdata", 0x2000, rdata),
         ];
-        let mut dirs = vec![DataDirectory { virtual_address: 0, size: 0 }; 16];
+        let mut dirs = vec![
+            DataDirectory {
+                virtual_address: 0,
+                size: 0
+            };
+            16
+        ];
         dirs[9] = DataDirectory {
             virtual_address: 0x2000,
             size: 40,
@@ -287,8 +312,15 @@ mod tests {
             section(".text", 0x1000, vec![0x48, 0x31, 0xc0]),
             section(".pdata", 0x1200, pdata_entry(0x1000, 0x1003)),
         ];
-        let dirs = vec![DataDirectory { virtual_address: 0, size: 0 }; 16]; // no TLS dir
-        let ex = detect_tls_callback_ranges(&relayed[0].bytes, base_va, image_base, &relayed, &dirs);
+        let dirs = vec![
+            DataDirectory {
+                virtual_address: 0,
+                size: 0
+            };
+            16
+        ]; // no TLS dir
+        let ex =
+            detect_tls_callback_ranges(&relayed[0].bytes, base_va, image_base, &relayed, &dirs);
         assert!(ex.func_ranges.is_empty());
         assert!(ex.callback_entries.is_empty());
     }

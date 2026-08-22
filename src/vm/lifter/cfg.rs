@@ -16,7 +16,7 @@ use super::{
     check_scratch_collision, is_jcc, jcc_cond, lift_one, vreg, LiftedInstr, SCRATCH, SCRATCH2,
 };
 use crate::vm::bytecode::*;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use iced_x86::{Code, OpKind, Register};
 
 /// A-5: diagnose which instructions in a block cannot be lifted.
@@ -33,18 +33,42 @@ pub fn diagnose_unsupported(seq: &[LiftedInstr]) -> Vec<(String, Code)> {
         }
         if matches!(
             code,
-            Code::Jmp_rel32_64 | Code::Jmp_rel8_64
-                | Code::Je_rel32_64 | Code::Jne_rel32_64 | Code::Jb_rel32_64
-                | Code::Jae_rel32_64 | Code::Jg_rel32_64 | Code::Jge_rel32_64 | Code::Jl_rel32_64
-                | Code::Jle_rel32_64 | Code::Js_rel32_64 | Code::Jns_rel32_64 | Code::Jo_rel32_64
-                | Code::Jno_rel32_64 | Code::Jp_rel32_64 | Code::Jnp_rel32_64
-                | Code::Ja_rel32_64 | Code::Jbe_rel32_64
-                | Code::Je_rel8_64 | Code::Jne_rel8_64 | Code::Jb_rel8_64
-                | Code::Jae_rel8_64 | Code::Jg_rel8_64 | Code::Jge_rel8_64 | Code::Jl_rel8_64
-                | Code::Jle_rel8_64 | Code::Js_rel8_64 | Code::Jns_rel8_64 | Code::Jo_rel8_64
-                | Code::Jno_rel8_64 | Code::Jp_rel8_64 | Code::Jnp_rel8_64
-                | Code::Ja_rel8_64 | Code::Jbe_rel8_64
-                | Code::Jecxz_rel8_64 | Code::Jrcxz_rel8_64
+            Code::Jmp_rel32_64
+                | Code::Jmp_rel8_64
+                | Code::Je_rel32_64
+                | Code::Jne_rel32_64
+                | Code::Jb_rel32_64
+                | Code::Jae_rel32_64
+                | Code::Jg_rel32_64
+                | Code::Jge_rel32_64
+                | Code::Jl_rel32_64
+                | Code::Jle_rel32_64
+                | Code::Js_rel32_64
+                | Code::Jns_rel32_64
+                | Code::Jo_rel32_64
+                | Code::Jno_rel32_64
+                | Code::Jp_rel32_64
+                | Code::Jnp_rel32_64
+                | Code::Ja_rel32_64
+                | Code::Jbe_rel32_64
+                | Code::Je_rel8_64
+                | Code::Jne_rel8_64
+                | Code::Jb_rel8_64
+                | Code::Jae_rel8_64
+                | Code::Jg_rel8_64
+                | Code::Jge_rel8_64
+                | Code::Jl_rel8_64
+                | Code::Jle_rel8_64
+                | Code::Js_rel8_64
+                | Code::Jns_rel8_64
+                | Code::Jo_rel8_64
+                | Code::Jno_rel8_64
+                | Code::Jp_rel8_64
+                | Code::Jnp_rel8_64
+                | Code::Ja_rel8_64
+                | Code::Jbe_rel8_64
+                | Code::Jecxz_rel8_64
+                | Code::Jrcxz_rel8_64
                 | Code::Loopne_rel8_64_RCX
         ) {
             continue;
@@ -136,7 +160,14 @@ pub fn lift_block(seq: &[LiftedInstr], seq_base_va: u64) -> Result<Vec<u8>> {
 
 /// M5 (v30) ??multi-block control-flow lift driver.
 pub fn lift_cfg(blocks: &[crate::graph::BasicBlock]) -> Result<Vec<u8>> {
-    lift_cfg_switch(blocks, &[], &std::collections::HashMap::new(), None, &Default::default(), &[])
+    lift_cfg_switch(
+        blocks,
+        &[],
+        &std::collections::HashMap::new(),
+        None,
+        &Default::default(),
+        &[],
+    )
 }
 
 /// Lift a whole CFG to a single VM program.
@@ -163,8 +194,10 @@ pub fn lift_cfg_switch(
         block_label.insert(bb.start_va, b.new_label());
     }
     let mut sym_blocks: Vec<(usize, u64, bool, u64)> = Vec::new();
-    let switch_lookup: std::collections::HashMap<u64, &Vec<(i64, u64)>> =
-        switch_cases.iter().map(|(va, cases)| (*va, cases)).collect();
+    let switch_lookup: std::collections::HashMap<u64, &Vec<(i64, u64)>> = switch_cases
+        .iter()
+        .map(|(va, cases)| (*va, cases))
+        .collect();
 
     if let Some(entry) = entry_va {
         let target_lbl = block_label.get(&entry).copied().or_else(|| {
@@ -179,7 +212,8 @@ pub fn lift_cfg_switch(
             b.jmp32(lbl);
         } else {
             return Err(anyhow!(
-                "lift_cfg_switch: no valid block start found for entry_va 0x{:X}", entry
+                "lift_cfg_switch: no valid block start found for entry_va 0x{:X}",
+                entry
             ));
         }
     }
@@ -188,7 +222,12 @@ pub fn lift_cfg_switch(
         b.mark_label(block_label[&bb.start_va]);
         let src_len: u64 = bb.instructions.iter().map(|i| i.len() as u64).sum();
         if crate::vm::mapper::active() {
-            sym_blocks.push((b.bytes.len(), bb.start_va, excluded.contains(&bb.start_va), src_len));
+            sym_blocks.push((
+                b.bytes.len(),
+                bb.start_va,
+                excluded.contains(&bb.start_va),
+                src_len,
+            ));
         }
         if excluded.contains(&bb.start_va) {
             // v59: bridge to the enclosing FUNCTION entry so the prologue runs.
@@ -198,7 +237,8 @@ pub fn lift_cfg_switch(
             b.ret();
             continue;
         }
-        let n = bb.instructions.len();        let mut va = bb.start_va;
+        let n = bb.instructions.len();
+        let mut va = bb.start_va;
         for (i, inst) in bb.instructions.iter().enumerate() {
             let is_last = i + 1 == n;
             let inst_va = va;
@@ -276,10 +316,13 @@ pub fn lift_cfg_switch(
                     FlowControl::ConditionalBranch => {
                         if code == Code::Loopne_rel8_64_RCX {
                             b.dec_r(1);
-                            b.jcc32(COND_JNE, *block_label.get(&inst.near_branch_target()).ok_or_else(|| anyhow!("loopne target"))?);
-                        } else if matches!(code,
-                            Code::Jecxz_rel8_64 | Code::Jrcxz_rel8_64)
-                        {
+                            b.jcc32(
+                                COND_JNE,
+                                *block_label
+                                    .get(&inst.near_branch_target())
+                                    .ok_or_else(|| anyhow!("loopne target"))?,
+                            );
+                        } else if matches!(code, Code::Jecxz_rel8_64 | Code::Jrcxz_rel8_64) {
                             let t = inst.near_branch_target();
                             b.test_r_r32(1, 1);
                             if let Some(&lbl) = block_label.get(&t) {
@@ -335,7 +378,8 @@ pub fn lift_cfg_switch(
                     _ => { /* not a terminator: fall through to next block */ }
                 }
             }
-            lift_one(&mut b, inst).map_err(|e| anyhow!("{} (at VA 0x{:X}, inst={})", e, inst_va, inst))?;
+            lift_one(&mut b, inst)
+                .map_err(|e| anyhow!("{} (at VA 0x{:X}, inst={})", e, inst_va, inst))?;
             va += len;
         }
     }
@@ -344,7 +388,10 @@ pub fn lift_cfg_switch(
     if crate::vm::mapper::active() && !sym_blocks.is_empty() {
         let total = b.bytes.len();
         for (i, &(bc_start, src_va, native, src_len)) in sym_blocks.iter().enumerate() {
-            let bc_end = sym_blocks.get(i + 1).map(|&(s, _, _, _)| s).unwrap_or(total);
+            let bc_end = sym_blocks
+                .get(i + 1)
+                .map(|&(s, _, _, _)| s)
+                .unwrap_or(total);
             crate::vm::mapper::record_block_start(
                 bc_start,
                 src_va,

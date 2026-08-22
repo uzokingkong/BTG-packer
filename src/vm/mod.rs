@@ -19,15 +19,19 @@
 //   reference Rust KSA == bytecode interpreter == native x86 KSA == VM module
 // ==============================================================================
 
-
-pub mod bytecode;
-pub mod conceal;
-pub mod dispatch_perm;
-pub mod nested;
-pub mod c1;
-pub mod semantic_obf;
-pub mod flags;
 pub mod abi;
+pub mod bytecode;
+pub mod c1;
+pub mod canonical_semantics;
+pub mod chunk_crypto;
+pub mod commercial_build;
+pub mod conceal;
+pub mod data_lifetime;
+pub mod dispatch_perm;
+pub mod distributed_integrity;
+pub mod embed_hardening;
+pub mod flags;
+pub mod handler_poly;
 pub mod handlers;
 pub mod import_key;
 pub mod interp;
@@ -35,25 +39,25 @@ pub mod ksa;
 pub mod lifter;
 pub mod mapper;
 pub mod mem_model;
+pub mod nested;
+pub mod ownership_verifier;
 pub mod poly;
 pub mod prga;
 pub mod risc;
+pub mod seed_lifecycle;
+pub mod semantic_obf;
 pub mod semantics;
+pub mod table_layout;
 pub mod text_lift;
 pub mod threaded;
-pub mod canonical_semantics;
-pub mod commercial_build;
-pub mod embed_hardening;
-pub mod handler_poly;
-pub mod ownership_verifier;
-pub mod seed_lifecycle;
-pub mod table_layout;
 pub mod vm_context;
-pub use commercial_build::{build_program_vm_commercial, COMMERCIAL_STATE_SIZE};
+pub use commercial_build::{
+    build_program_vm_commercial, build_program_vm_commercial_with_superops, COMMERCIAL_STATE_SIZE,
+};
 pub use vm_context::VmExecutionContext;
 
 use crate::vm::lifter::LiftedInstr;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, MemoryOperand, Register,
 };
@@ -75,6 +79,8 @@ pub struct VmModule {
     /// offset of each handler's first instruction within `code`. Exposed for
     /// the obfuscation self-test to verify offsets point at real handlers.
     pub handler_offsets: Vec<usize>,
+    /// Optional code-relative range requiring bridge-specific unwind metadata.
+    pub native_bridge_range: Option<(usize, usize)>,
 }
 
 impl VmModule {
@@ -101,7 +107,13 @@ pub fn build_vm_module(
         let handler_va = code_va + vmc.handler_offsets[op] as u64;
         table.extend_from_slice(&handler_va.to_le_bytes());
     }
-    Ok(VmModule { code: vmc.code, table, bytecode, handler_offsets: vmc.handler_offsets.clone() })
+    Ok(VmModule {
+        code: vmc.code,
+        table,
+        bytecode,
+        handler_offsets: vmc.handler_offsets.clone(),
+        native_bridge_range: None,
+    })
 }
 
 /// M8: build a VM module with an MBA-obfuscated handler table.
@@ -147,7 +159,13 @@ pub fn build_vm_module_mba(
         let k = handlers::per_op_dispatch_key(op as u8, master);
         table.extend_from_slice(&(handler_va ^ k).to_le_bytes());
     }
-    Ok(VmModule { code: vmc.code, table, bytecode, handler_offsets: vmc.handler_offsets.clone() })
+    Ok(VmModule {
+        code: vmc.code,
+        table,
+        bytecode,
+        handler_offsets: vmc.handler_offsets.clone(),
+        native_bridge_range: None,
+    })
 }
 
 /// M6 Phase-2 embed helper: wrap a lifted program's VM bytecode (from
@@ -164,9 +182,22 @@ pub fn build_program_vm(
     rng: &mut impl RngCore,
 ) -> Result<VmModule> {
     let m = if m8 {
-        build_vm_module_mba(code_va, table_va, bytecode_va, bytecode, handlers::EntryMode::Program, rng)?
+        build_vm_module_mba(
+            code_va,
+            table_va,
+            bytecode_va,
+            bytecode,
+            handlers::EntryMode::Program,
+            rng,
+        )?
     } else {
-        build_vm_module(code_va, table_va, bytecode_va, bytecode, handlers::EntryMode::Program)?
+        build_vm_module(
+            code_va,
+            table_va,
+            bytecode_va,
+            bytecode,
+            handlers::EntryMode::Program,
+        )?
     };
     // The Ksa entry stub snapshots RBX?뭦tr_sbox/RDX?뭦tr_seed from the caller; for a
     // program VM the boot stub will instead pre-load the original entry GPRs into the
@@ -228,7 +259,13 @@ pub fn build_vm_module_obf(
         table[s * 8..s * 8 + 8].copy_from_slice(&va.to_le_bytes());
     }
 
-    Ok(VmModule { code, table, bytecode: obf_bytecode, handler_offsets: vmc.handler_offsets })
+    Ok(VmModule {
+        code,
+        table,
+        bytecode: obf_bytecode,
+        handler_offsets: vmc.handler_offsets,
+        native_bridge_range: None,
+    })
 }
 
 // ?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧??
@@ -239,10 +276,9 @@ pub fn build_vm_module_obf(
 //   bench.rs    - --vm-bench interpreter vs native throughput
 // ?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧??
 pub(crate) mod arena;
+mod bench;
 mod encode;
 mod self_test;
-mod bench;
 
-pub use self_test::run_self_test;
 pub use bench::run_vm_bench;
-
+pub use self_test::run_self_test;

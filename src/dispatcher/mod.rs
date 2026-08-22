@@ -16,9 +16,7 @@ mod reencrypt;
 mod reencrypt_c1;
 mod validate;
 
-pub use build::{
-    RING_ENTRIES, RING_REGION, RING_INDEX_OFF, RING_META_OFF, build_dispatcher,
-};
+pub use build::{build_dispatcher, RING_ENTRIES, RING_INDEX_OFF, RING_META_OFF, RING_REGION};
 pub use m7::build_dispatcher_m7;
 pub use m7_c1::build_dispatcher_m7_c1;
 pub use reencrypt::build_dispatcher_reencrypt;
@@ -66,7 +64,10 @@ pub fn dispatcher_unwind_codes(code: &[u8]) -> (Vec<UnwindCodeSpec>, u8) {
         }
         match inst.code() {
             Code::Pushfq => {
-                codes.push(UnwindCodeSpec { offset: off as u8, reg: UNWIND_ALLOC8 });
+                codes.push(UnwindCodeSpec {
+                    offset: off as u8,
+                    reg: UNWIND_ALLOC8,
+                });
             }
             Code::Push_r64 => {
                 let reg = inst.op0_register();
@@ -86,7 +87,10 @@ pub fn dispatcher_unwind_codes(code: &[u8]) -> (Vec<UnwindCodeSpec>, u8) {
                 } else {
                     UNWIND_ALLOC8
                 };
-                codes.push(UnwindCodeSpec { offset: off as u8, reg: spec });
+                codes.push(UnwindCodeSpec {
+                    offset: off as u8,
+                    reg: spec,
+                });
             }
             // Trace mode prepends `int3`; tolerate harmless no-ops.
             Code::Int3 | Code::Nopd | Code::Nopw | Code::Nopq => {}

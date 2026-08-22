@@ -76,7 +76,11 @@ mod tests {
 
     fn sub_vm_returns(ret: u64) -> RiscProgram {
         let mut d = crate::vm::risc::RiscDesynthesizer::new();
-        d.emit_add(MicroOperand::VReg(0), MicroOperand::Imm64(ret), MicroOperand::Imm64(0));
+        d.emit_add(
+            MicroOperand::VReg(0),
+            MicroOperand::Imm64(ret),
+            MicroOperand::Imm64(0),
+        );
         d.instrs.push(MicroInstr::new(RiscOp::Halt));
         RiscProgram::new(d.instrs)
     }
@@ -88,7 +92,9 @@ mod tests {
         // Outer state with non-trivial registers, flags, stack, and memory.
         let mut outer = RiscEvalState::default();
         for (i, r) in outer.regs.iter_mut().enumerate() {
-            *r = (i as u64).wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0x1122334455667788);
+            *r = (i as u64)
+                .wrapping_mul(0x9E3779B97F4A7C15)
+                .wrapping_add(0x1122334455667788);
         }
         outer.temps = [0x111, 0x222, 0x333, 0, 0, 0, 0, 0];
         outer.flags = 0x8D5;
@@ -118,9 +124,15 @@ mod tests {
 
         // Build a caller that pushes state, does VmCallBridge(id=3), then resumes.
         let mut caller = crate::vm::risc::RiscDesynthesizer::new();
-        caller.emit_add(MicroOperand::VReg(1), MicroOperand::Imm64(0xCAFE), MicroOperand::Imm64(0));
+        caller.emit_add(
+            MicroOperand::VReg(1),
+            MicroOperand::Imm64(0xCAFE),
+            MicroOperand::Imm64(0),
+        );
         caller.emit_push(MicroOperand::VReg(1));
-        caller.instrs.push(MicroInstr::new(RiscOp::VmCallBridge).with_imm(3));
+        caller
+            .instrs
+            .push(MicroInstr::new(RiscOp::VmCallBridge).with_imm(3));
         caller.emit_pop(MicroOperand::VReg(2));
         caller.instrs.push(MicroInstr::new(RiscOp::Halt));
         let mut subs = HashMap::new();
@@ -143,9 +155,18 @@ mod tests {
             via_layer.regs[2] = v;
         }
 
-        assert_eq!(via_layer.regs[0], via_reference.regs[0], "RAX matches reference");
-        assert_eq!(via_layer.regs[2], 0xCAFE, "caller resume popped saved frame");
+        assert_eq!(
+            via_layer.regs[0], via_reference.regs[0],
+            "RAX matches reference"
+        );
+        assert_eq!(
+            via_layer.regs[2], 0xCAFE,
+            "caller resume popped saved frame"
+        );
         assert_eq!(via_layer.vsp, via_reference.vsp, "VSP matches reference");
-        assert_eq!(via_layer.stack, via_reference.stack, "stack matches reference");
+        assert_eq!(
+            via_layer.stack, via_reference.stack,
+            "stack matches reference"
+        );
     }
 }

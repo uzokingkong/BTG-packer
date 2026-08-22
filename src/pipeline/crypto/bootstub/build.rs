@@ -5,13 +5,18 @@
 // build_rc4_block (orchestrates the full RC4 boot stub).
 // ==============================================================================
 
-use super::emit::{emit_base_bind_loop, emit_c1_init, emit_code_decrypt, emit_dispatcher_entry,
-    emit_ksa_init, emit_rest_decrypt, emit_run_decrypt, emit_self_wipe, trashformer_junk};
-use super::ctx::BootStubCtx;
 use super::super::{cipher, encode, iat, integrity, memharden, payload, vm_embed};
-use iced_x86::{Code, Instruction, Register};
+use super::ctx::BootStubCtx;
+use super::emit::{
+    emit_base_bind_loop, emit_c1_init, emit_code_decrypt, emit_desc_decrypt, emit_dispatcher_entry,
+    emit_ksa_init, emit_rest_decrypt, emit_run_decrypt, emit_self_wipe, trashformer_junk,
+    trashformer_mixing_loop,
+};
+use iced_x86::{Code, Instruction, MemoryOperand, Register};
 
-pub(crate) fn build_anti_debug_raw_block(policy: crate::dispatcher::antidebug::AntiDebugPolicy) -> Vec<u8> {
+pub(crate) fn build_anti_debug_raw_block(
+    policy: crate::dispatcher::antidebug::AntiDebugPolicy,
+) -> Vec<u8> {
     // ── v10: 3중 PEB/Heap 검사 + 정책별 실패 경로 (readccc §4.5) ──────────────
     // 기본 레이아웃(고정 73B)은 기존과 동일:
     //   pushfq; push rax; (BeingDebugged) jnz→실패; (NtGlobalFlag) jnz→실패;
@@ -25,34 +30,24 @@ pub(crate) fn build_anti_debug_raw_block(policy: crate::dispatcher::antidebug::A
         // mov rax, gs:[0x60] (PEB)
         0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00,
         // movzx eax, byte [rax+2] (BeingDebugged)
-        0x0F, 0xB6, 0x40, 0x02,
-        // test eax, eax
-        0x85, 0xC0,
-        // jnz +0x32 → 실패 슬롯 (Warn: +0x34 → 정상 경로)
-        0x75, 0x32,
-        // mov rax, gs:[0x60]
+        0x0F, 0xB6, 0x40, 0x02, // test eax, eax
+        0x85, 0xC0, // jnz +0x32 → 실패 슬롯 (Warn: +0x34 → 정상 경로)
+        0x75, 0x32, // mov rax, gs:[0x60]
         0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00,
         // mov eax, [rax+0xBC] (NtGlobalFlag)
-        0x8B, 0x80, 0xBC, 0x00, 0x00, 0x00,
-        // and eax, 0x70
+        0x8B, 0x80, 0xBC, 0x00, 0x00, 0x00, // and eax, 0x70
         0x25, 0x70, 0x00, 0x00, 0x00,
         // jnz +0x1C → 실패 슬롯 (Warn: +0x1E → 정상 경로)
-        0x75, 0x1C,
-        // mov rax, gs:[0x60]
+        0x75, 0x1C, // mov rax, gs:[0x60]
         0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00,
         // mov rax, [rax+0x30] (ProcessHeap)
-        0x48, 0x8B, 0x40, 0x30,
-        // mov eax, [rax+0x70] (Heap.Flags)
-        0x8B, 0x80, 0x70, 0x00, 0x00, 0x00,
-        // and eax, 0x70
+        0x48, 0x8B, 0x40, 0x30, // mov eax, [rax+0x70] (Heap.Flags)
+        0x8B, 0x80, 0x70, 0x00, 0x00, 0x00, // and eax, 0x70
         0x25, 0x70, 0x00, 0x00, 0x00,
         // jnz +0x02 → 실패 슬롯 (Warn: +0x04 → 정상 경로)
-        0x75, 0x02,
-        // jmp +0x02 → 정상 경로 (pop rax)
-        0xEB, 0x02,
-        // 실패 슬롯 (2B — Trap: ud2 / Hang: jmp $ / Warn: nop nop)
-        0x0F, 0x0B,
-        0x58, // pop rax
+        0x75, 0x02, // jmp +0x02 → 정상 경로 (pop rax)
+        0xEB, 0x02, // 실패 슬롯 (2B — Trap: ud2 / Hang: jmp $ / Warn: nop nop)
+        0x0F, 0x0B, 0x58, // pop rax
         0x9D, // popfq
     ];
     // ── 정책 적용 (고정 길이 유지 — 인코딩/길이 불변성 무회귀) ─────────────
@@ -81,7 +76,7 @@ pub(crate) fn build_anti_debug_raw_block(policy: crate::dispatcher::antidebug::A
             // 레이아웃: jnz@0x11(+0x32), jnz@0x27(+0x1C), jnz@0x41(+0x02),
             // jmp@0x43(+0x02 → pop rax). 정상 경로는 len-2(=0x47)다.
             let normal = (b.len() - 2) as u8; // 0x47
-            // jnz@0x11: next=0x13, disp = normal - 0x13 = 0x34
+                                              // jnz@0x11: next=0x13, disp = normal - 0x13 = 0x34
             b[0x12] = normal.wrapping_sub(0x13);
             // jnz@0x27: next=0x29, disp = normal - 0x29 = 0x1E
             b[0x28] = normal.wrapping_sub(0x29);
@@ -105,16 +100,127 @@ pub(crate) fn build_anti_debug_raw_block(policy: crate::dispatcher::antidebug::A
 /// T3-1 Phase D: chacha 경로의 복호화-전 Poly1305 AEAD 인증 스테이지.
 /// poly_blob_va(rel32 call)를 호출해 at-rest 암호문+고정 AAD의 태그를 검증하고,
 /// 반환 rax==0(매치)면 계속, !=0이면 ud2 (fail-safe — decrypt-and-run 금지).
-fn emit_poly1305_verify(seq: &mut Vec<(Instruction, Option<super::ctx::Label>)>, stub: &BootStubCtx) {
-    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.code_va).unwrap(), None));
-    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX, stub.code_len as u64).unwrap(), None));
-    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R8, stub.poly_key_va).unwrap(), None));
-    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R9, stub.poly_tag_va).unwrap(), None));
-    seq.push((Instruction::with_branch(Code::Call_rel32_64, stub.poly_blob_va).unwrap(), None));
-    seq.push((Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(), None));
-    seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(super::ctx::Label::PolyOk)));
+fn emit_poly1305_verify(
+    seq: &mut Vec<(Instruction, Option<super::ctx::Label>)>,
+    stub: &BootStubCtx,
+) {
+    // Generate the RFC 8439 Poly1305 one-time key from ChaCha block 0 into a
+    // zero-initialized runtime scratch buffer.  emit_chacha_init left ctr=0.
+    seq.push((
+        Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.poly_key_va).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Mov_r64_imm64, Register::RDX, 32).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Call_rel32_64, stub.chacha_blob_va).unwrap(),
+        None,
+    ));
+    if !stub.no_crypto {
+        seq.push((
+            Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.desc_va).unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RCX,
+                MemoryOperand::with_base_displ(Register::RAX, 0x00),
+            )
+            .unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RDX,
+                MemoryOperand::with_base_displ(Register::RAX, 0x08),
+            )
+            .unwrap(),
+            None,
+        ));
+    } else {
+        seq.push((
+            Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.code_va).unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(Code::Mov_r64_imm64, Register::RDX, stub.code_len as u64).unwrap(),
+            None,
+        ));
+    }
+    seq.push((
+        Instruction::with2(Code::Mov_r64_imm64, Register::R8, stub.poly_key_va).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Mov_r64_imm64, Register::R9, stub.poly_tag_va).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Call_rel32_64, stub.poly_blob_va).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(),
+        Some(super::ctx::Label::PolyOk),
+    ));
     seq.push((Instruction::with(Code::Ud2), None));
-    seq.push((Instruction::with(Code::Nopd), Some(super::ctx::Label::PolyOk)));
+    seq.push((
+        Instruction::with(Code::Nopd),
+        Some(super::ctx::Label::PolyOk),
+    ));
+    // The MAC key must not outlive verification.
+    seq.push((
+        Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.poly_key_va).unwrap(),
+        None,
+    ));
+    for off in [0, 8, 16, 24] {
+        seq.push((
+            Instruction::with2(
+                Code::Mov_rm64_imm32,
+                MemoryOperand::with_base_displ(Register::RAX, off as i64),
+                0,
+            )
+            .unwrap(),
+            None,
+        ));
+    }
+    // Discard the unused half of block 0 and start payload crypt at counter 1.
+    seq.push((
+        Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.chacha_state_va).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Mov_rm64_imm32,
+            MemoryOperand::with_base_displ(
+                Register::RAX,
+                crate::crypto::chacha20::CHA_OFF_CTR as i64,
+            ),
+            1,
+        )
+        .unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Mov_rm32_imm32,
+            MemoryOperand::with_base_displ(
+                Register::RAX,
+                crate::crypto::chacha20::CHA_OFF_KS_OFF as i64,
+            ),
+            0x40,
+        )
+        .unwrap(),
+        None,
+    ));
 }
 
 pub(crate) fn build_rc4_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
@@ -127,10 +233,16 @@ pub(crate) fn build_rc4_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     vm_embed::emit_program_vm_state_capture(&mut seq, stub);
 
     // 스택에 S-box 할당 (v6: 외부 API 호출 시 16B 정렬 프레임 사용)
-    seq.push((Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, stub.stack_frame)
-        .map_err(|e| anyhow::anyhow!("boot stub Sub_rm64_imm32 failed: {e}"))?, None));
-    seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::RSP)
-        .map_err(|e| anyhow::anyhow!("boot stub Mov_r64_rm64 failed: {e}"))?, None));
+    seq.push((
+        Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, stub.stack_frame)
+            .map_err(|e| anyhow::anyhow!("boot stub Sub_rm64_imm32 failed: {e}"))?,
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::RSP)
+            .map_err(|e| anyhow::anyhow!("boot stub Mov_r64_rm64 failed: {e}"))?,
+        None,
+    ));
 
     // v17 (TrashFormer-기반): 프로시저 서문에 데드 레지스터 정크 명령을 삽입해,
     // 부트 스텁 바이트가 **빌드마다 달라지게** 한다. 이 지점에선 rax/rcx/rdx/rsi/rdi/
@@ -141,11 +253,27 @@ pub(crate) fn build_rc4_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     for junk in trashformer_junk(stub.k1 ^ stub.k2 ^ stub.k3) {
         seq.push((junk, None));
     }
+    // v17+ (junk rework): 실작동하는 mixing loop 정크도 함께 삽입한다. 루프 카운트는
+    // 시드에서 유도한 1..256 (항상 비영)이라 "길이=0으로 들어가는 dead loop"로
+    // 읽히지 않고, 실제 checksum/복호화 루프와 구조적으로 동일해 fake/real 경로를
+    // 정적으로 분리하기 어렵게 만든다. (S-box 프레임 [RSP..+0x100]은 이후 KSA가
+    // 초기화하므로 여기서 쓰레기로 채워도 안전.)
+    for item in trashformer_mixing_loop(stub.k1 ^ stub.k2 ^ stub.k3) {
+        seq.push(item);
+    }
 
     // v19: base-bound key — 시드를 실제 로드 base로 바인딩 (재배치/rehost 방해).
     // no_crypto 경로에는 시드가 없으므로 crypto 경로에서만 수행.
     if !stub.no_crypto {
         emit_base_bind_loop(&mut seq, stub.seed_va);
+    }
+
+    // M12 Decrypt-Descriptor: base_bind 직후 디스크립터(파생 키 = RC4 keystream으로
+    // 암호화)를 KSA(seed)+canonical PRGA로 복호화한다. (base_bind가 먼저여야
+    // seed@seed_va = seed_masked.) 이 스테이지의 S-box는 즉시 뒤 main KSA-init이
+    // 덮어쓰므로 일시적이며, main 코드/런 키스트림은 byte-identical을 유지한다.
+    if !stub.no_crypto {
+        // [A/B] emit_desc_decrypt temporarily disabled
     }
 
     // v60 (--custom-cipher): BTG-C1 경로는 RC4 KSA 대신 C1 상태 초기화를 수행한다.
@@ -176,8 +304,18 @@ pub(crate) fn build_rc4_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     integrity::emit_integrity_crc(&mut seq, stub);
     emit_run_decrypt(&mut seq, stub);
     emit_rest_decrypt(&mut seq, stub);
+    // S2 (--integrity multi-site): run/rest decrypt 직후 두 번째 독립 CRC32 검증.
+    integrity::emit_integrity_crc2(&mut seq, stub);
     iat::emit_iat_slots(&mut seq, stub);
     iat::emit_iat_resolve(&mut seq, stub);
+    // S3 (--integrity 멀티사이트 확장): IAT 리졸브 직후 세 번째 독립 CRC32 검증 —
+    // 부트 후반에도 무결성 게이트를 유지한다 (사이트 1/2와 다른 시점).
+    integrity::emit_integrity_crc3(&mut seq, stub);
+    // S4 must run before self-wipe: it derives its expected value from
+    // w32_slot, which lives in the seed/integrity scratch area erased by
+    // emit_self_wipe.  Running this after the wipe made every integrity-enabled
+    // image take the CRC4 UD2 path even when the file was untouched.
+    integrity::emit_integrity_crc4(&mut seq, stub);
     emit_self_wipe(&mut seq, stub);
     memharden::emit_mem_harden(&mut seq, stub);
     emit_dispatcher_entry(&mut seq, stub);

@@ -106,18 +106,22 @@ pub(crate) fn collect_data_reference_target_ids(
                 && offset + 8 <= sec.bytes.len()
                 && !is_rva_range_protected(current_rva, 8, protected_ranges)
             {
-                let val64 = u64::from_le_bytes(
-                    sec.bytes[offset..offset + 8].try_into().unwrap_or([0; 8]),
+                let val64 =
+                    u64::from_le_bytes(sec.bytes[offset..offset + 8].try_into().unwrap_or([0; 8]));
+                mark_block_entry(
+                    &mut out,
+                    va_to_trigger_id,
+                    val64,
+                    text_start_va,
+                    text_end_va,
                 );
-                mark_block_entry(&mut out, va_to_trigger_id, val64, text_start_va, text_end_va);
             }
 
             // 2. 32-bit RVA 포인터 (SEH ScopeTable, RTTI, CRT 함수 포인터 테이블,
             //    x64 MSVC 점프 테이블)
             if !is_rva_range_protected(current_rva, 4, protected_ranges) {
-                let val32 = u32::from_le_bytes(
-                    sec.bytes[offset..offset + 4].try_into().unwrap_or([0; 4]),
-                );
+                let val32 =
+                    u32::from_le_bytes(sec.bytes[offset..offset + 4].try_into().unwrap_or([0; 4]));
                 if val32 >= text_rva_start && val32 < text_rva_end {
                     mark_block_entry(
                         &mut out,
@@ -162,8 +166,7 @@ pub(crate) fn collect_code_materialized_target_ids(
             && inst.memory_index() == iced_x86::Register::None
         {
             let target = inst.ip() + inst.len() as u64 + inst.memory_displacement64();
-            if let Some(id) =
-                resolve_block_id(va_to_trigger_id, target, text_start_va, text_end_va)
+            if let Some(id) = resolve_block_id(va_to_trigger_id, target, text_start_va, text_end_va)
             {
                 out.insert(id);
             }
@@ -172,7 +175,13 @@ pub(crate) fn collect_code_materialized_target_ids(
         // mov reg, imm64 — 절대 함수 주소 직접 재료화
         if inst.code() == iced_x86::Code::Mov_r64_imm64 {
             let target = inst.immediate64();
-            mark_block_entry(&mut out, va_to_trigger_id, target, text_start_va, text_end_va);
+            mark_block_entry(
+                &mut out,
+                va_to_trigger_id,
+                target,
+                text_start_va,
+                text_end_va,
+            );
         }
     }
 

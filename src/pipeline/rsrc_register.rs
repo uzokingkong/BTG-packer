@@ -175,7 +175,11 @@ fn parse_dir(sec: &[u8], off: usize) -> Vec<PEntry> {
         let name = u32at(eo);
         let raw = u32at(eo + 4);
         let is_dir = raw & 0x8000_0000 != 0;
-        out.push(PEntry { name, is_dir, target: raw & 0x7fff_ffff });
+        out.push(PEntry {
+            name,
+            is_dir,
+            target: raw & 0x7fff_ffff,
+        });
     }
     out
 }
@@ -287,12 +291,25 @@ fn rebuild_rsrc_section(sec: &[u8], sec_rva: u32, chunks: &[(u32, u32)]) -> Vec<
         let mut entries: Vec<(u32, u32)> = Vec::with_capacity(n);
         for node in nodes {
             match node {
-                Node::Dir { name, name_str, children } => {
+                Node::Dir {
+                    name,
+                    name_str,
+                    children,
+                } => {
                     let nf = emit_name(name, name_str.as_deref(), buf);
                     let child_off = emit_nodes(children, sec_rva, buf);
                     entries.push((nf, 0x8000_0000 | child_off));
                 }
-                Node::Leaf { name, name_str, rva, size, codepage, reserved, internal, blob } => {
+                Node::Leaf {
+                    name,
+                    name_str,
+                    rva,
+                    size,
+                    codepage,
+                    reserved,
+                    internal,
+                    blob,
+                } => {
                     let nf = emit_name(name, name_str.as_deref(), buf);
                     let mut out_rva = *rva;
                     if *internal && !blob.is_empty() {
@@ -415,7 +432,8 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         ctx.rsrc_dir_size = tree.len() as u32;
         println!(
             "[+] RT_RCDATA: resource directory @RVA 0x{:X} ({} bytes) appended to .vdata",
-            dir_rva, tree.len()
+            dir_rva,
+            tree.len()
         );
     } else {
         return Err(anyhow::anyhow!(

@@ -37,7 +37,8 @@ fn encode_block_at(
     let real_block_va = dispatcher_va + phys_offset as u64;
 
     if block.entries.len() > 1 {
-        block.validate_polymorphism()
+        block
+            .validate_polymorphism()
             .map_err(|e| anyhow::anyhow!("Polymorphism validation failed: {}", e))?;
     }
 
@@ -69,7 +70,11 @@ fn encode_block_at(
             inst.op0_kind(),
             OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
         ) {
-            let is_jcc = if let Some((jcc_idx, _)) = block.jcc_info { idx == jcc_idx } else { false };
+            let is_jcc = if let Some((jcc_idx, _)) = block.jcc_info {
+                idx == jcc_idx
+            } else {
+                false
+            };
             if !is_jcc {
                 branch_target_vas.insert(idx, inst.near_branch_target());
             }
@@ -89,7 +94,8 @@ fn encode_block_at(
                 va_to_trigger_id,
                 table_offsets,
                 dispatcher_va,
-            ).unwrap_or(target_va);
+            )
+            .unwrap_or(target_va);
 
             RipFixupEngine::process_fixup(inst, temp_ip, effective_target_va)?;
         } else if let Some(&orig_target_va) = branch_target_vas.get(&idx) {
@@ -100,7 +106,8 @@ fn encode_block_at(
                 va_to_trigger_id,
                 table_offsets,
                 dispatcher_va,
-            ).unwrap_or(orig_target_va);
+            )
+            .unwrap_or(orig_target_va);
 
             inst.set_near_branch64(effective_target_va);
         }
@@ -110,7 +117,13 @@ fn encode_block_at(
         let single_block = InstructionBlock::new(&inst_arr, temp_ip);
         let inst_len = match BlockEncoder::encode(64, single_block, BlockEncoderOptions::NONE) {
             Ok(res) => res.code_buffer.len(),
-            Err(_) => if inst.len() > 0 { inst.len() } else { 5 },
+            Err(_) => {
+                if inst.len() > 0 {
+                    inst.len()
+                } else {
+                    5
+                }
+            }
         };
 
         temp_ip += inst_len as u64;
@@ -127,10 +140,7 @@ fn encode_block_at(
     // ── 4. 전체 블록 일괄 인코딩 (Batch BlockEncoder) ─────────────────────────
     let enc_block = InstructionBlock::new(&block.raw_instructions, code_start_va);
     let encoded_result = BlockEncoder::encode(64, enc_block, BlockEncoderOptions::NONE)
-        .map_err(|e| anyhow::anyhow!(
-            "Batch BlockEncoder error for block {}: {:?}",
-            block.id, e
-        ))?;
+        .map_err(|e| anyhow::anyhow!("Batch BlockEncoder error for block {}: {:?}", block.id, e))?;
 
     let mut final_bytes = Vec::new();
     if !prefix_bytes.is_empty() {
@@ -145,12 +155,12 @@ fn encode_block_at(
     //   (디스패처 runtime 키 유도와 동일 레벨이어야 복호화가 성립한다.
     //    reencrypt/M7 경로는 디스패처가 레벨 2 고정이라 2 로 클램프.)
     let seed = crate::mba::MbaGenerator::seed_for(mba_constant, block.id);
-    let dynamic_table_key = crate::mba::MbaGenerator::compute_key(seed, block.id, mba_constant, obf_level);
+    let dynamic_table_key =
+        crate::mba::MbaGenerator::compute_key(seed, block.id, mba_constant, obf_level);
 
     let real_code_phys_offset = (phys_offset as u32) + (entry_offset as u32);
     Ok((real_code_phys_offset, dynamic_table_key))
 }
-
 
 /// 16바이트 정렬이 실제로 필요한 블록인지 검사한다.
 /// 정렬된 SIMD 메모리 접근(movaps/movapd/movdqa 등)을 포함한 블록만 16B
@@ -180,7 +190,9 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
     let obf_level = ctx.effective_obf_level();
 
     // ── 블록별 처리 ──────────────────────────────────────────────────────────────
-    let layout = ctx.shuffled_layout.as_mut()
+    let layout = ctx
+        .shuffled_layout
+        .as_mut()
         .ok_or_else(|| anyhow::anyhow!("ShuffledLayout not yet built — run Pass 2 first"))?;
 
     let num_blocks = layout.shuffled_blocks.len();
@@ -277,7 +289,10 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         layout.encrypted_table_entries[logical_id] = real_off ^ key;
     }
 
-    println!("[+] Pass 3 Complete: {} blocks densely packed; table entries encrypted.", num_blocks);
+    println!(
+        "[+] Pass 3 Complete: {} blocks densely packed; table entries encrypted.",
+        num_blocks
+    );
 
     // ── v13.1-검증: 인코딩 완료 블록이 암호문(비-평문) 블록을 직접 참조하면 안 된다 ──
     // 재암호화 모드에서 디스패처를 거치지 않는 직접 참조(call/jmp/jcc/rip-relative/imm64)가
@@ -293,28 +308,46 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
             let off = layout.table_offsets[id as usize] as usize;
             let bva = dispatcher + off as u64;
             let plain = ctx.call_target_block_ids.contains(&id);
-            let mut dec = iced_x86::Decoder::with_ip(64, &block.instructions, bva, iced_x86::DecoderOptions::NONE);
+            let mut dec = iced_x86::Decoder::with_ip(
+                64,
+                &block.instructions,
+                bva,
+                iced_x86::DecoderOptions::NONE,
+            );
             while dec.can_decode() {
                 let inst = dec.decode();
-                if inst.is_invalid() { continue; }
+                if inst.is_invalid() {
+                    continue;
+                }
                 // 1) near branch target
-                if matches!(inst.op0_kind(), iced_x86::OpKind::NearBranch16 | iced_x86::OpKind::NearBranch32 | iced_x86::OpKind::NearBranch64) {
+                if matches!(
+                    inst.op0_kind(),
+                    iced_x86::OpKind::NearBranch16
+                        | iced_x86::OpKind::NearBranch32
+                        | iced_x86::OpKind::NearBranch64
+                ) {
                     let tgt = inst.near_branch_target();
                     if tgt >= sec_start && tgt < sec_end {
-                        let tid_opt = ctx.va_to_trigger_id.iter()
+                        let tid_opt = ctx
+                            .va_to_trigger_id
+                            .iter()
                             .filter(|(_, &v)| v == id) // same block self-ref ok
-                            .map(|(k,_)| *k).next();
+                            .map(|(k, _)| *k)
+                            .next();
                         let _ = tid_opt;
                         // find which logical block owns this relocated VA
-                        let target_id = layout.shuffled_blocks.iter()
+                        let target_id = layout
+                            .shuffled_blocks
+                            .iter()
                             .find(|b| {
                                 let o = layout.table_offsets[b.id as usize] as u64;
-                                tgt >= dispatcher + o && tgt < dispatcher + o + b.instructions.len() as u64
+                                tgt >= dispatcher + o
+                                    && tgt < dispatcher + o + b.instructions.len() as u64
                             })
                             .map(|b| b.id);
                         if let Some(tid) = target_id {
                             if tid != id && !ctx.call_target_block_ids.contains(&tid) {
-                                refs_bad.push((id, inst.ip()-bva, tgt, tid, "branch", plain));
+                                refs_bad.push((id, inst.ip() - bva, tgt, tid, "branch", plain));
                             }
                         }
                     }
@@ -323,15 +356,18 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
                 if inst.memory_base() == iced_x86::Register::RIP {
                     let tgt = inst.ip_rel_memory_address();
                     if tgt >= sec_start && tgt < sec_end {
-                        let target_id = layout.shuffled_blocks.iter()
+                        let target_id = layout
+                            .shuffled_blocks
+                            .iter()
                             .find(|b| {
                                 let o = layout.table_offsets[b.id as usize] as u64;
-                                tgt >= dispatcher + o && tgt < dispatcher + o + b.instructions.len() as u64
+                                tgt >= dispatcher + o
+                                    && tgt < dispatcher + o + b.instructions.len() as u64
                             })
                             .map(|b| b.id);
                         if let Some(tid) = target_id {
                             if tid != id && !ctx.call_target_block_ids.contains(&tid) {
-                                refs_bad.push((id, inst.ip()-bva, tgt, tid, "rip", plain));
+                                refs_bad.push((id, inst.ip() - bva, tgt, tid, "rip", plain));
                             }
                         }
                     }
@@ -340,15 +376,18 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
                 if inst.code() == iced_x86::Code::Mov_r64_imm64 {
                     let tgt = inst.immediate64();
                     if tgt >= sec_start && tgt < sec_end {
-                        let target_id = layout.shuffled_blocks.iter()
+                        let target_id = layout
+                            .shuffled_blocks
+                            .iter()
                             .find(|b| {
                                 let o = layout.table_offsets[b.id as usize] as u64;
-                                tgt >= dispatcher + o && tgt < dispatcher + o + b.instructions.len() as u64
+                                tgt >= dispatcher + o
+                                    && tgt < dispatcher + o + b.instructions.len() as u64
                             })
                             .map(|b| b.id);
                         if let Some(tid) = target_id {
                             if tid != id && !ctx.call_target_block_ids.contains(&tid) {
-                                refs_bad.push((id, inst.ip()-bva, tgt, tid, "imm64", plain));
+                                refs_bad.push((id, inst.ip() - bva, tgt, tid, "imm64", plain));
                             }
                         }
                     }
@@ -356,9 +395,25 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
             }
         }
         if !refs_bad.is_empty() {
-            println!("[!] v13.1-VALIDATE: {} direct reference(s) from blocks to ENCRYPTED blocks found:", refs_bad.len());
+            println!(
+                "[!] v13.1-VALIDATE: {} direct reference(s) from blocks to ENCRYPTED blocks found:",
+                refs_bad.len()
+            );
             for (frm, foff, tgt, tid, kind, plain) in refs_bad.iter().take(40) {
-                println!("    block {} [{}] @+0x{:x} -> 0x{:x} block {} ({}) [src_plain={}]", frm, kind, foff, tgt, tid, if ctx.call_target_block_ids.contains(tid) {"plain"} else {"ENCRYPTED"}, plain);
+                println!(
+                    "    block {} [{}] @+0x{:x} -> 0x{:x} block {} ({}) [src_plain={}]",
+                    frm,
+                    kind,
+                    foff,
+                    tgt,
+                    tid,
+                    if ctx.call_target_block_ids.contains(tid) {
+                        "plain"
+                    } else {
+                        "ENCRYPTED"
+                    },
+                    plain
+                );
             }
         } else {
             println!("[+] v13.1-VALIDATE: no block-to-block direct reference targets an encrypted block. ✓");

@@ -25,7 +25,10 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         ctx.target_info.image_base,
     )?;
 
-    println!("[+] Extracted {} Basic Blocks from target CFG.", basic_blocks.len());
+    println!(
+        "[+] Extracted {} Basic Blocks from target CFG.",
+        basic_blocks.len()
+    );
 
     bi_graph
         .validate_bidirectionality()
@@ -59,6 +62,8 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         .iter()
         .map(|bb| (bb.start_va, bb.successor_vas.clone()))
         .collect();
+    let all_cfg_starts: std::collections::HashSet<u64> =
+        basic_blocks.iter().map(|bb| bb.start_va).collect();
     let total_before = basic_blocks.len();
     let basic_blocks: Vec<_> = basic_blocks
         .into_iter()
@@ -81,14 +86,16 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
     // SEH/native 유지 함수와 닿는 엣지(또는 .text 밖/패딩 타깃)는 직접 분기 → 미포함.
     let shuffled_starts: std::collections::HashSet<u64> =
         basic_blocks.iter().map(|bb| bb.start_va).collect();
+    let native_starts: std::collections::HashSet<u64> = all_cfg_starts
+        .difference(&shuffled_starts)
+        .copied()
+        .collect();
     let flattened_cfg_edges = pre_filter_edges
         .iter()
         .map(|(src, succs)| {
             succs
                 .iter()
-                .filter(|dst| {
-                    shuffled_starts.contains(src) && shuffled_starts.contains(dst)
-                })
+                .filter(|dst| shuffled_starts.contains(src) && shuffled_starts.contains(dst))
                 .count()
         })
         .sum();
@@ -100,7 +107,12 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
     // MicroSlicer: max_chunk_size = usize::MAX → 원자 기본 블록 경계 유지.
     // 블록 내부에서 자르면 SSE(movaps) 등에서 요구하는 16-byte RSP 정렬이 깨질 수 있음.
     // v10: 디스패처 스택 규약 선택을 전달 (2-푸시 일반 / 3-푸시 재암호화).
-    let slicer = MicroSlicer::new(usize::MAX, ctx.obf_complexity, ctx.mba_constant, ctx.reencrypt);
+    let slicer = MicroSlicer::new(
+        usize::MAX,
+        ctx.obf_complexity,
+        ctx.mba_constant,
+        ctx.reencrypt,
+    );
     let (text_start_va, text_end_va) = ctx.text_va_range();
 
     // dispatcher_va + 0x20 = 실제 셸코드 시작점 (OEP Stub 0x00~0x1F 이후)
@@ -109,6 +121,7 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         ctx.dispatcher_va + 0x20,
         text_start_va,
         text_end_va,
+        &native_starts,
     )?;
 
     // v13: 데이터/코드 **직접 참조** 블록도 평문 유지 대상에 추가한다.
@@ -130,8 +143,10 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
             &ctx.target_info.relayed_sections,
             cookie_rva,
         );
-        let text_rva_end =
-            ctx.target_info.text_rva.saturating_add(ctx.target_info.text_vsize as u32);
+        let text_rva_end = ctx
+            .target_info
+            .text_rva
+            .saturating_add(ctx.target_info.text_vsize as u32);
         let data_refs = crate::pipeline::patch_data::collect_data_reference_target_ids(
             &ctx.target_info.relayed_sections,
             ctx.target_info.image_base,
@@ -177,7 +192,9 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         let mut added_v132: std::collections::HashSet<u32> = std::collections::HashSet::new();
         while dec.can_decode() {
             let inst = dec.decode();
-            if inst.is_invalid() { continue; }
+            if inst.is_invalid() {
+                continue;
+            }
             // 1) 직접 분기: call / jmp / jcc — 타깃이 블록이면 평문이어야 함
             let is_near = matches!(
                 inst.op0_kind(),
@@ -188,7 +205,10 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
             if is_near {
                 let tgt = inst.near_branch_target();
                 if let Some(id) = crate::pipeline::patch_data::resolve_block_id(
-                    &va_to_trigger_id, tgt, text_start_va, text_end_va,
+                    &va_to_trigger_id,
+                    tgt,
+                    text_start_va,
+                    text_end_va,
                 ) {
                     if !call_target_block_ids.contains(&id) {
                         added_v132.insert(id);
@@ -199,7 +219,10 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
             if inst.memory_base() == iced_x86::Register::RIP {
                 let tgt = inst.ip_rel_memory_address();
                 if let Some(id) = crate::pipeline::patch_data::resolve_block_id(
-                    &va_to_trigger_id, tgt, text_start_va, text_end_va,
+                    &va_to_trigger_id,
+                    tgt,
+                    text_start_va,
+                    text_end_va,
                 ) {
                     if !call_target_block_ids.contains(&id) {
                         added_v132.insert(id);
@@ -228,7 +251,9 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
                 call_target_block_ids.len()
             );
         } else {
-            println!("[+] v13.2-VERIFY: all direct references in .text resolve to plaintext blocks. ✓");
+            println!(
+                "[+] v13.2-VERIFY: all direct references in .text resolve to plaintext blocks. ✓"
+            );
         }
     }
 
@@ -247,10 +272,22 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
     println!("\n------------------------------------------------------------------");
     println!(" [METRICS] BTG Protection Intensity Evaluation ");
     println!("------------------------------------------------------------------");
-    println!("  Total Trigger Blocks:        {}", metrics.total_trigger_blocks);
-    println!("  Overlapped Blocks:           {}", metrics.overlapped_blocks);
-    println!("  Instruction Overlap Density: {:.2}%", metrics.overlap_density);
-    println!("  Control Flow Flattening:     {:.2}% (measured: {} / {} CFG edges routed via dispatcher)", metrics.flattening_ratio, metrics.flattened_cfg_edges, metrics.total_cfg_edges);
+    println!(
+        "  Total Trigger Blocks:        {}",
+        metrics.total_trigger_blocks
+    );
+    println!(
+        "  Overlapped Blocks:           {}",
+        metrics.overlapped_blocks
+    );
+    println!(
+        "  Instruction Overlap Density: {:.2}%",
+        metrics.overlap_density
+    );
+    println!(
+        "  Control Flow Flattening:     {:.2}% (measured: {} / {} CFG edges routed via dispatcher)",
+        metrics.flattening_ratio, metrics.flattened_cfg_edges, metrics.total_cfg_edges
+    );
     println!("  MBA Key Entropy Score:       {:.2} bits/byte (measured Shannon over {} per-block MBA keys; theoretical bound {} bits)", metrics.mba_entropy_score, metrics.total_trigger_blocks, metrics.mba_entropy_bits);
     println!("------------------------------------------------------------------\n");
 

@@ -22,7 +22,6 @@
 // CF (carry/unsigned-below from the last CMP), stored at STATE_FLAGS.
 // ==============================================================================
 
-
 // =============================================================================
 // Opcode registry — SINGLE source of truth for the VM opcode set (P2-10).
 // Every opcode is declared exactly once here as `(OP_NAME = 0x..: mnemonic, olen)`.
@@ -339,8 +338,6 @@ opcodes! {
 /// Index-slot sentinel for LEA: no index term (see opcodes! / OP_LEA).
 pub const ADDR_NO_INDEX: u8 = 0xFF;
 
-
-
 // ══════════════════════════════════════════════════════════════════════════════
 // M1 — flag model (v21)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -350,11 +347,11 @@ pub const ADDR_NO_INDEX: u8 = 0xFF;
 // Arithmetic/logic ops update these flags; conditional branches (Jcc) read them.
 // This lets a single OP_JCC8 opcode encode all x86 conditional-jump conditions.
 // ══════════════════════════════════════════════════════════════════════════════
-pub const F_CF: u64 = 1 << 0;  // carry
-pub const F_PF: u64 = 1 << 2;  // parity (even # of 1s in low byte)
-pub const F_AF: u64 = 1 << 4;  // auxiliary carry (bit 3)
-pub const F_ZF: u64 = 1 << 6;  // zero
-pub const F_SF: u64 = 1 << 7;  // sign
+pub const F_CF: u64 = 1 << 0; // carry
+pub const F_PF: u64 = 1 << 2; // parity (even # of 1s in low byte)
+pub const F_AF: u64 = 1 << 4; // auxiliary carry (bit 3)
+pub const F_ZF: u64 = 1 << 6; // zero
+pub const F_SF: u64 = 1 << 7; // sign
 pub const F_DF: u64 = 1 << 10; // direction (string ops; NOT a status flag)
 pub const F_OF: u64 = 1 << 11; // overflow (signed)
 /// The 6 modelled status-flag bits. STATE_FLAGS may hold other (unused) bits,
@@ -362,22 +359,22 @@ pub const F_OF: u64 = 1 << 11; // overflow (signed)
 pub const FLAG_MASK: u64 = F_CF | F_PF | F_AF | F_ZF | F_SF | F_OF;
 
 // Condition identifiers for OP_JCC8 (match x86 Jcc semantics).
-pub const COND_JE: u8 = 0;    // ZF
-pub const COND_JNE: u8 = 1;   // !ZF
-pub const COND_JB: u8 = 2;    // CF          (unsigned below)
-pub const COND_JAE: u8 = 3;   // !CF         (unsigned above/equal)
-pub const COND_JG: u8 = 4;    // signed >    (!ZF && SF==OF)
-pub const COND_JGE: u8 = 5;   // signed >=   (SF==OF)
-pub const COND_JL: u8 = 6;    // signed <    (SF!=OF)
-pub const COND_JLE: u8 = 7;   // signed <=   (ZF || SF!=OF)
-pub const COND_JS: u8 = 8;    // SF
-pub const COND_JNS: u8 = 9;   // !SF
-pub const COND_JO: u8 = 10;   // OF
-pub const COND_JNO: u8 = 11;  // !OF
-pub const COND_JP: u8 = 12;   // PF
-pub const COND_JNP: u8 = 13;  // !PF
-pub const COND_JA: u8 = 14;   // unsigned >  (!CF && !ZF)
-pub const COND_JBE: u8 = 15;  // unsigned <= (CF || ZF)
+pub const COND_JE: u8 = 0; // ZF
+pub const COND_JNE: u8 = 1; // !ZF
+pub const COND_JB: u8 = 2; // CF          (unsigned below)
+pub const COND_JAE: u8 = 3; // !CF         (unsigned above/equal)
+pub const COND_JG: u8 = 4; // signed >    (!ZF && SF==OF)
+pub const COND_JGE: u8 = 5; // signed >=   (SF==OF)
+pub const COND_JL: u8 = 6; // signed <    (SF!=OF)
+pub const COND_JLE: u8 = 7; // signed <=   (ZF || SF!=OF)
+pub const COND_JS: u8 = 8; // SF
+pub const COND_JNS: u8 = 9; // !SF
+pub const COND_JO: u8 = 10; // OF
+pub const COND_JNO: u8 = 11; // !OF
+pub const COND_JP: u8 = 12; // PF
+pub const COND_JNP: u8 = 13; // !PF
+pub const COND_JA: u8 = 14; // unsigned >  (!CF && !ZF)
+pub const COND_JBE: u8 = 15; // unsigned <= (CF || ZF)
 
 /// Evaluate an OP_JCC8 condition against a flags word (see `cond_taken` in flags.rs).
 /// JCXZ/JECXZ (register-based) are intentionally deferred to M2.
@@ -388,4 +385,3 @@ pub const MEM_SEED: u8 = 1;
 pub const MEM_BUF: u8 = 2;
 pub const MEM_RUNS: u8 = 3;
 pub const MEM_STACK: u8 = 4; // M3: stack region
-

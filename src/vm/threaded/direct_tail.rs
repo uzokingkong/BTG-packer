@@ -5,8 +5,8 @@
 // 다음 핸들러 주소를 롤링 키로 복호화하여 직접 tail-call 점프하는 기계어 방출기.
 // ==============================================================================
 
-use iced_x86::{BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, Register};
 use anyhow::{anyhow, Result};
+use iced_x86::{BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, Register};
 
 pub struct DirectTailEmitter;
 

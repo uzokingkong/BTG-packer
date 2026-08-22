@@ -37,6 +37,9 @@ jobs:
       - name: Build (release)
         run: cargo build --release --locked
 
+      # QA tests invoke target/release/btg-packer.exe, so the binary build above
+      # is an explicit prerequisite. This prevents a stale local-style packer
+      # artifact from being used by the end-to-end gates.
       # Unit / differential tests (T3-1 chacha + VM + pipeline + QA lib tests).
       - name: Test (release)
         run: cargo test --release --locked --lib

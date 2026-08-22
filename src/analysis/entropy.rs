@@ -28,7 +28,9 @@ pub(crate) fn shannon_entropy(data: &[u8]) -> f64 {
 /// 출력 PE의 섹션별 엔트로피를 출력한다 (v4).
 pub fn print_entropy_report(output_pe_bytes: &[u8]) {
     use goblin::pe::PE;
-    let Ok(pe) = PE::parse(output_pe_bytes) else { return };
+    let Ok(pe) = PE::parse(output_pe_bytes) else {
+        return;
+    };
     println!("\n[ENTROPY] per-section Shannon entropy (bits/byte):");
     for sec in &pe.sections {
         let name = sec.name().unwrap_or("?");

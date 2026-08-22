@@ -2,7 +2,7 @@
 // BTG v21 - VM Interpreter: atomic compare-exchange / exchange / fetch-add ops
 // ==============================================================================
 
-use super::state::{VmError, flags_of, mem_get, mem_put, set_flags, set_vreg64, vreg64};
+use super::state::{flags_of, mem_get, mem_put, set_flags, set_vreg64, vreg64, VmError};
 use crate::vm::bytecode::*;
 use crate::vm::flags;
 
@@ -170,34 +170,69 @@ pub(crate) fn exec(
                 OP_LOCK_INC_MEM32_A | OP_LOCK_DEC_MEM32_A => 4,
                 _ => 8,
             };
-            let is_inc = matches!(op,
-                OP_LOCK_INC_MEM8_A | OP_LOCK_INC_MEM16_A | OP_LOCK_INC_MEM32_A | OP_LOCK_INC_MEM64_A);
+            let is_inc = matches!(
+                op,
+                OP_LOCK_INC_MEM8_A
+                    | OP_LOCK_INC_MEM16_A
+                    | OP_LOCK_INC_MEM32_A
+                    | OP_LOCK_INC_MEM64_A
+            );
             let prev = flags_of(state);
             let g = mem_get(mem, addr, w).ok_or(VmError::OobMem)?;
             match w {
                 1 => {
                     let a = g[0];
-                    let r = if is_inc { a.wrapping_add(1) } else { a.wrapping_sub(1) };
+                    let r = if is_inc {
+                        a.wrapping_add(1)
+                    } else {
+                        a.wrapping_sub(1)
+                    };
                     mem_put(mem, addr, &r.to_le_bytes())?;
                     set_flags(state, flags::incdec_flags_width(a as u64, 8, is_inc, prev));
                 }
                 2 => {
                     let a = u16::from_le_bytes([g[0], g[1]]);
-                    let r = if is_inc { a.wrapping_add(1) } else { a.wrapping_sub(1) };
+                    let r = if is_inc {
+                        a.wrapping_add(1)
+                    } else {
+                        a.wrapping_sub(1)
+                    };
                     mem_put(mem, addr, &r.to_le_bytes())?;
                     set_flags(state, flags::incdec_flags_width(a as u64, 16, is_inc, prev));
                 }
                 4 => {
                     let a = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
-                    let r = if is_inc { a.wrapping_add(1) } else { a.wrapping_sub(1) };
+                    let r = if is_inc {
+                        a.wrapping_add(1)
+                    } else {
+                        a.wrapping_sub(1)
+                    };
                     mem_put(mem, addr, &r.to_le_bytes())?;
-                    set_flags(state, if is_inc { flags::inc_flags(a, prev) } else { flags::dec_flags(a, prev) });
+                    set_flags(
+                        state,
+                        if is_inc {
+                            flags::inc_flags(a, prev)
+                        } else {
+                            flags::dec_flags(a, prev)
+                        },
+                    );
                 }
                 _ => {
                     let a = u64::from_le_bytes(g);
-                    let r = if is_inc { a.wrapping_add(1) } else { a.wrapping_sub(1) };
+                    let r = if is_inc {
+                        a.wrapping_add(1)
+                    } else {
+                        a.wrapping_sub(1)
+                    };
                     mem_put(mem, addr, &r.to_le_bytes())?;
-                    set_flags(state, if is_inc { flags::inc_flags64(a, prev) } else { flags::dec_flags64(a, prev) });
+                    set_flags(
+                        state,
+                        if is_inc {
+                            flags::inc_flags64(a, prev)
+                        } else {
+                            flags::dec_flags64(a, prev)
+                        },
+                    );
                 }
             }
             Ok(ip)

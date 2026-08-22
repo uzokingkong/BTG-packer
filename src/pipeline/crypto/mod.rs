@@ -23,8 +23,8 @@
 //   → 정적 파일에서 단순 추출 불가, 실행 시점에만 복원됨
 // ==============================================================================
 
-use crate::crypto::{chain_encrypt, BlockCryptoMeta, CryptoMode, CryptoProvider};
 use crate::crypto::chacha20::{chacha_apply, chacha_init_state, CHA_STATE_SIZE};
+use crate::crypto::{chain_encrypt, BlockCryptoMeta, CryptoMode, CryptoProvider};
 use crate::pipeline::pass4_section::BOOT_AREA_RESERVE;
 use crate::pipeline::PipelineContext;
 use anyhow::Result;
@@ -104,7 +104,9 @@ pub fn run(
     }
     // v9: --integrity 조합 구현 — chained(평문 CRC) / reencrypt(암호문·파일 CRC)
     if chained && integrity {
-        println!("[+] v5 Integrity + v7 Chained-Crypto: CRC over decrypted code (chain loop runs first)");
+        println!(
+            "[+] v5 Integrity + v7 Chained-Crypto: CRC over decrypted code (chain loop runs first)"
+        );
     }
     if reencrypt && integrity {
         println!("[+] v5 Integrity + v8 Re-Encrypt: CRC over ciphertext as stored in file (boot-time tamper check)");
@@ -211,7 +213,11 @@ pub fn run(
         // 네이티브 초기화자/콜백 호출이 동작하게 한다. (문자열/데이터 은닉은 별도 유지)
         0
     } else if no_crypto {
-        if payload_relocate { full_code_len } else { 0 }
+        if payload_relocate {
+            full_code_len
+        } else {
+            0
+        }
     } else if coverage_effective >= 100 {
         full_code_len
     } else {
@@ -244,23 +250,31 @@ pub fn run(
 
     println!(
         "[+] v3 Crypto: code region 0x{:X}..0x{:X} ({} bytes), {} string runs encrypted.",
-        first_block_offset, max_phys_end, code_len, runs.len()
+        first_block_offset,
+        max_phys_end,
+        code_len,
+        runs.len()
     );
 
-    let (seed_masked, seed_stored, key) = cipher::derive_seed_and_key(&mut rng, image_base, k1, k2, k3);
+    let (seed_masked, seed_stored, key) =
+        cipher::derive_seed_and_key(&mut rng, image_base, k1, k2, k3);
 
     // ── 5. 이제 서로 다른 필드(btg_section_data / patched_sections)만 빌려서 ──
     //    복호화 순서와 동일하게 암호화 (코드 영역 → 런 순서) ────────────────────
-    let btg = ctx.btg_section_data.as_mut()
+    let btg = ctx
+        .btg_section_data
+        .as_mut()
         .ok_or_else(|| anyhow::anyhow!("btg_section_data not set — run Pass 4 first"))?;
     if boot_off == 0 || boot_off + BOOT_AREA_RESERVE > btg.bytes.len() {
-        return Err(anyhow::anyhow!("Boot area not reserved by Pass 4 (boot_off=0x{:X})", boot_off));
+        return Err(anyhow::anyhow!(
+            "Boot area not reserved by Pass 4 (boot_off=0x{:X})",
+            boot_off
+        ));
     }
     let mut rc4 = Rc4::new(&key);
     let mut c1: Option<crate::crypto::BtgCipher> = None;
     let mut chacha_state: Option<[u8; CHA_STATE_SIZE]> = None;
     // T3-1 Phase D: chacha 경로의 Poly1305 AEAD one-time 키/태그 (암호문+AAD로 계산).
-    let mut chacha_aead_key: Option<[u8; 32]> = None;
     let mut chacha_aead_tag: Option<[u8; 16]> = None;
 
     // 5a. 코드 영역
@@ -295,8 +309,7 @@ pub fn run(
             for (off, len, key_u32) in &block_keys {
                 let meta = BlockCryptoMeta::new(*off as u32, *off as u64, *len as u32);
                 let mut rc4b = <Rc4 as CryptoProvider>::from_key(&key_u32.to_le_bytes());
-                rc4b
-                    .encrypt_block(&meta, &mut btg.bytes[*off..*off + *len])
+                rc4b.encrypt_block(&meta, &mut btg.bytes[*off..*off + *len])
                     .map_err(|e| anyhow::anyhow!("reencrypt block {}: {}", meta.block_id, e))?;
             }
         }
@@ -329,6 +342,10 @@ pub fn run(
             let (ckey, cnonce) = cipher::derive_chacha_key_nonce_raw(&seed_masked);
             let mut st = [0u8; CHA_STATE_SIZE];
             chacha_init_state(&mut st, &ckey, &cnonce);
+            // RFC 8439 reserves counter 0 for the Poly1305 one-time key.
+            // Payload encryption therefore starts at counter 1.
+            st[crate::crypto::chacha20::CHA_OFF_CTR..crate::crypto::chacha20::CHA_OFF_CTR + 8]
+                .copy_from_slice(&1u64.to_le_bytes());
             chacha_apply(&mut st, &mut btg.bytes[code_start..code_end]);
             // T3-1 Phase D: Poly1305 AEAD 태그를 at-rest 암호문(+고정 AAD)으로 계산.
             // 부트 스텁이 복호화 전에 동일 태그를 검증해 변조 시 ud2 (decrypt-and-run 금지).
@@ -339,7 +356,6 @@ pub fn run(
                 &btg.bytes[code_start..code_end],
                 &poly_key,
             );
-            chacha_aead_key = Some(poly_key);
             chacha_aead_tag = Some(tag);
             chacha_state = Some(st);
         } else if c1_mode {
@@ -376,7 +392,11 @@ pub fn run(
         if ctx.at_rest_encrypted { "ON" } else { "OFF" },
         code_len,
         runs.len(),
-        if ctx.at_rest_encrypted { "DISABLED (loader relocation would corrupt ciphertext)" } else { "ENABLED" }
+        if ctx.at_rest_encrypted {
+            "DISABLED (loader relocation would corrupt ciphertext)"
+        } else {
+            "ENABLED"
+        }
     );
 
     // 5b. 문자열 런 (부트 스텁 런 테이블과 같은 순서) — CryptoProvider.apply
@@ -432,7 +452,6 @@ pub fn run(
         // (요청값)가 아니라 이 함수가 판정한 유효 모드(chacha_mode/c1_mode)여야
         // 패커 암호화와 부트 스텁 복호화가 일치한다.
         effective_mode,
-        chacha_aead_key,
         chacha_aead_tag,
         &mut rng,
     )?;

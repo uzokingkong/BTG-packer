@@ -50,7 +50,7 @@ pub struct VmAbi {
     pub volatile_gprs: &'static [Register],
     /// ??쑵?띈쳸?뽮쉐 XMM (XMM6-15) ??????癰귣벊???袁⑹뒄 (??롫짗 ?癒? + ?얜챷苑??.
     pub nonvolatile_xmm_start: u8, // XMM6
-    pub nonvolatile_xmm_end: u8,   // XMM15
+    pub nonvolatile_xmm_end: u8, // XMM15
     /// RSP 16B ?類ｌ졊 (call 筌욊낯??.
     pub stack_alignment: usize,
     /// shadow space (32B).
@@ -126,7 +126,8 @@ pub fn validate_win64_abi(code: &[u8], entry_ip: u64) -> Result<Vec<String>> {
             } else if !saved[n] && writes_reg(&inst, *r) {
                 violations.push(format!(
                     "0x{:X}: writes callee-saved reg{} before saving (violates Win64 ABI)",
-                    ip, r.number()
+                    ip,
+                    r.number()
                 ));
             }
         }
@@ -154,10 +155,10 @@ mod tests {
     fn detects_unsaved_callee_saved_write() {
         // push rbx (saved) ??mov rbx, 5 (OK) ??mov r12, 7 (r12 unsaved ???袁⑥뺘)
         let code = vec![
-            0x53,             // push rbx
+            0x53, // push rbx
             0xBB, 0x05, 0x00, 0x00, 0x00, // mov ebx, 5
             0x41, 0xBC, 0x07, 0x00, 0x00, 0x00, // mov r12d, 7
-            0xC3,             // ret
+            0xC3, // ret
         ];
         let v = validate_win64_abi(&code, 0x1000).unwrap();
         assert!(
@@ -174,25 +175,25 @@ mod tests {
     fn abi_valid_code_passes() {
         // 筌뤴뫀諭?callee-saved??push ?????? ret
         let code = vec![
-            0x41, 0x57,             // push r15
-            0x41, 0x56,             // push r14
-            0x41, 0x55,             // push r13
-            0x41, 0x54,             // push r12
-            0x57,                   // push rdi
-            0x56,                   // push rsi
-            0x53,                   // push rbx
-            0x55,                   // push rbp
+            0x41, 0x57, // push r15
+            0x41, 0x56, // push r14
+            0x41, 0x55, // push r13
+            0x41, 0x54, // push r12
+            0x57, // push rdi
+            0x56, // push rsi
+            0x53, // push rbx
+            0x55, // push rbp
             0x41, 0xBC, 0x07, 0x00, 0x00, 0x00, // mov r12d, 7 (saved)
-            0x41, 0x5C,             // pop r12
-            0x5D,                   // pop rbp
-            0x5B,                   // pop rbx
-            0x5E,                   // pop rsi
-            0x5F,                   // pop rdi
-            0x41, 0x5C,             // pop r12
-            0x41, 0x5D,             // pop r13
-            0x41, 0x5E,             // pop r14
-            0x41, 0x5F,             // pop r15
-            0xC3,                   // ret
+            0x41, 0x5C, // pop r12
+            0x5D, // pop rbp
+            0x5B, // pop rbx
+            0x5E, // pop rsi
+            0x5F, // pop rdi
+            0x41, 0x5C, // pop r12
+            0x41, 0x5D, // pop r13
+            0x41, 0x5E, // pop r14
+            0x41, 0x5F, // pop r15
+            0xC3, // ret
         ];
         let v = validate_win64_abi(&code, 0x1000).unwrap();
         assert!(v.is_empty(), "no violations expected, got: {v:?}");
@@ -203,11 +204,61 @@ mod tests {
     #[test]
     fn generated_dispatchers_preserve_win64_abi() {
         let cases: Vec<(&str, Vec<u8>)> = vec![
-            ("plain", crate::dispatcher::build_dispatcher(0x140001000, 0x80, 16, false, 0xCAFEBABE, false, 0, 2)),
-            ("reencrypt", crate::dispatcher::build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false).unwrap()),
-            ("m7", crate::dispatcher::build_dispatcher_m7(0x140001000, 0x600, 16, 0xCAFEBABE, false).unwrap()),
-            ("m7_c1", crate::dispatcher::build_dispatcher_m7_c1(0x140001000, 0x600, 16, 0xCAFEBABE, false, 0x140003000, 0x140003100).unwrap()),
-            ("reencrypt_c1", crate::dispatcher::build_dispatcher_reencrypt_c1(0x140001000, 0x600, 16, 0xCAFEBABE, false, 0x140003000, 0x140003100).unwrap()),
+            (
+                "plain",
+                crate::dispatcher::build_dispatcher(
+                    0x140001000,
+                    0x80,
+                    16,
+                    false,
+                    0xCAFEBABE,
+                    false,
+                    0,
+                    2,
+                ),
+            ),
+            (
+                "reencrypt",
+                crate::dispatcher::build_dispatcher_reencrypt(
+                    0x140001000,
+                    0x600,
+                    16,
+                    0xCAFEBABE,
+                    false,
+                )
+                .unwrap(),
+            ),
+            (
+                "m7",
+                crate::dispatcher::build_dispatcher_m7(0x140001000, 0x600, 16, 0xCAFEBABE, false)
+                    .unwrap(),
+            ),
+            (
+                "m7_c1",
+                crate::dispatcher::build_dispatcher_m7_c1(
+                    0x140001000,
+                    0x600,
+                    16,
+                    0xCAFEBABE,
+                    false,
+                    0x140003000,
+                    0x140003100,
+                )
+                .unwrap(),
+            ),
+            (
+                "reencrypt_c1",
+                crate::dispatcher::build_dispatcher_reencrypt_c1(
+                    0x140001000,
+                    0x600,
+                    16,
+                    0xCAFEBABE,
+                    false,
+                    0x140003000,
+                    0x140003100,
+                )
+                .unwrap(),
+            ),
         ];
         for (name, code) in cases {
             let v = validate_win64_abi(&code, 0x140001000 + 0x20).unwrap();

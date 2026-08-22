@@ -28,14 +28,14 @@ use anyhow::Result;
 // ???源놁졆 boot_end????嚥????????truncate) reserve????ш끽維뽳쭛????ル늅?????ㅺ강????? 癲ル슔?됭짆?륂렭?
 // ????????????? ????낆툗??
 pub const BOOT_AREA_RESERVE: usize = 0x4000000; // v61: 0x120000??x4000000 (64 MiB) ??????commercial ??嚥?
-                                                  // (SNK-RAT hello.exe: ??ш끽維곩ㅇ??쒑쳸紐꾧덧??VM ?袁⑸즴???嶺뚮ㅎ?듸쭕??11.6MB + branch_map
-                                                  //  ~1.16M ip_map ??????용끏??x 16B ??18MB) ?????"Boot area layout
-                                                  //  overlap" (runs_off??x1B57AC8??8MB) ??좊읈? ???? crypto.rs ??
-                                                  //  ??????????源놁졆 boot_end ????嚥????????reserve ????ш끽維뽳쭛????ル늅??
-                                                  //  ???ㅺ강????? 癲ル슔?됭짆?륂렭?????????????? ????낆툗??
-    //          program-VM bytecode??좊읈? ~310KB (200KB ??嚥???れ삀??, ???⑤챷??~177KB)嚥싲갭큔?? ??節뗪콬鶯??
-    //          crypto.rs truncates the section to actual boot_end, so final file size
-    //          is unaffected.
+                                                // (SNK-RAT hello.exe: ??ш끽維곩ㅇ??쒑쳸紐꾧덧??VM ?袁⑸즴???嶺뚮ㅎ?듸쭕??11.6MB + branch_map
+                                                //  ~1.16M ip_map ??????용끏??x 16B ??18MB) ?????"Boot area layout
+                                                //  overlap" (runs_off??x1B57AC8??8MB) ??좊읈? ???? crypto.rs ??
+                                                //  ??????????源놁졆 boot_end ????嚥????????reserve ????ш끽維뽳쭛????ル늅??
+                                                //  ???ㅺ강????? 癲ル슔?됭짆?륂렭?????????????? ????낆툗??
+                                                //          program-VM bytecode??좊읈? ~310KB (200KB ??嚥???れ삀??, ???⑤챷??~177KB)嚥싲갭큔?? ??節뗪콬鶯??
+                                                //          crypto.rs truncates the section to actual boot_end, so final file size
+                                                //          is unaffected.
 
 /// Pass 4: ??釉먯뒠獒??????嶺뚮ㅎ?듸쭕?? OEP Stub, ??誘⑦???????? ??怨?繞??袁⑸즴???嶺? ?濡ろ뜏??????筌뚯슦肉?
 /// `.btg` ???????袁⑸즴?????類????????釉뚰????筌먲퐢??
@@ -44,8 +44,16 @@ pub const BOOT_AREA_RESERVE: usize = 0x4000000; // v61: 0x120000??x4000000 (64 M
 /// `needs_boot_stub`??true?????tail????딅텑???????읐????ㅼ굡??????怨좊뭿??筌먲퐢??
 /// v9: crypto??좊읈? false????IAT/癲ル슢?????袁⑤렓???嚥▲꺁??????쒓낮??棺??짆?삠궘????띠룇???? ???源끹걬癲???딅텑???????읐?
 /// (?濡ろ뜑?????IAT ???⑤똾留??怨뚮옖甕곕?苡?癲ル슢?????袁⑤렓???嚥▲꺁???筌뤾쑴??????ш낄援η뵳????ㅼ굡??????怨좊뭿??筌먲퐢??
-pub fn run(ctx: &mut PipelineContext, anti_debug: bool, anti_debug_policy: crate::dispatcher::antidebug::AntiDebugPolicy, needs_boot_stub: bool, trace_blocks: bool) -> Result<()> {
-    let layout = ctx.shuffled_layout.as_ref()
+pub fn run(
+    ctx: &mut PipelineContext,
+    anti_debug: bool,
+    anti_debug_policy: crate::dispatcher::antidebug::AntiDebugPolicy,
+    needs_boot_stub: bool,
+    trace_blocks: bool,
+) -> Result<()> {
+    let layout = ctx
+        .shuffled_layout
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("ShuffledLayout not yet built ??run Pass 2 first"))?;
     let table_offset = ctx.table_offset;
     let first_block_offset = ctx.first_block_offset;
@@ -73,7 +81,11 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, anti_debug_policy: crate
     // S2: 상태 테이블 예약도 `ctx.m7` 대신 `ctx.reencrypt` 기준으로 통일 —
     //     --dispatcher-reencrypt도 M7식 디스패처/상태 테이블을 쓴다.
     // v61(+custom-cipher): C1 ???ㅺ컼??0x80) + S-box ???ㅼ굡??0x100) ???怨좊뭿 (first_block 癲ル슣????.
-    let c1_reserve = if ctx.reencrypt && ctx.custom_cipher { 0x180 } else { 0 };
+    let c1_reserve = if ctx.reencrypt && ctx.custom_cipher {
+        0x180
+    } else {
+        0
+    };
     let required_table_end = table_offset
         + num_blocks * 4
         + if ctx.reencrypt { num_blocks * 4 } else { 0 }
@@ -173,7 +185,8 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, anti_debug_policy: crate
     )?;
     // P0-2 (VM ABI): ??獄쏅똻?????釉먯뒠獒??????쨬??쎛 Win64 callee-saved GPR????????ш끽維?醫귥땡?
     // ?????嚥▲꺂痢롳┼??넊? ?嶺뚮Ĳ????濡ろ떟?癲?(??ш끽維곻쭚?????????癲꾧퀗???).
-    let abi_violations = crate::vm::abi::validate_win64_abi(&dispatcher_bytes, dispatcher_va + 0x20)?;
+    let abi_violations =
+        crate::vm::abi::validate_win64_abi(&dispatcher_bytes, dispatcher_va + 0x20)?;
     if !abi_violations.is_empty() {
         return Err(anyhow::anyhow!(
             "Win64 ABI violation in generated dispatcher:\n  {}",
@@ -220,7 +233,8 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, anti_debug_policy: crate
             println!("[!] Anti-Debug shellcode skipped: overlaps --block-ring ring region without a boot stub (use a boot-stub config).");
             (Vec::new(), 0)
         } else {
-            let off = total_section_size.saturating_sub(dispatcher::antidebug::ANTI_DEBUG_SIZE + 16);
+            let off =
+                total_section_size.saturating_sub(dispatcher::antidebug::ANTI_DEBUG_SIZE + 16);
             let ad = dispatcher::antidebug::build_anti_debug_shellcode(
                 dispatcher_va + off as u64,
                 dispatcher_va + 0x20,
@@ -257,17 +271,17 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, anti_debug_policy: crate
     if ctx.reencrypt {
         // v8(Phase 0.3): ??釉먯뒠獒?????3-?嶺뚮ㅎ?э쭛????獒뺣돁??[seed][target_id][current_id].
         // 癲???釉먯뒠獒??繞????獒?癲ル슣??????怨?繞?????⑤챶?뺜벧猿뗪묄???current = 0xFFFFFFFF(???紐껎룂??.
-        oep_stub.extend_from_slice(&[0x68]);                       // push imm32 (current_id = sentinel)
+        oep_stub.extend_from_slice(&[0x68]); // push imm32 (current_id = sentinel)
         oep_stub.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        oep_stub.extend_from_slice(&[0x68]);                       // push imm32 (entry_block_id)
+        oep_stub.extend_from_slice(&[0x68]); // push imm32 (entry_block_id)
         oep_stub.extend_from_slice(&(entry_block_id as u32).to_le_bytes());
-        oep_stub.extend_from_slice(&[0x68]);                       // push imm32 (entry_seed)
+        oep_stub.extend_from_slice(&[0x68]); // push imm32 (entry_seed)
         oep_stub.extend_from_slice(&entry_seed.to_le_bytes());
-        oep_stub.extend_from_slice(&[0xEB, 0x0F]);                 // jmp short +0x0F ??0x20
+        oep_stub.extend_from_slice(&[0xEB, 0x0F]); // jmp short +0x0F ??0x20
     } else {
-        oep_stub.extend_from_slice(&[0x68]);                       // push imm32 (entry_block_id)
+        oep_stub.extend_from_slice(&[0x68]); // push imm32 (entry_block_id)
         oep_stub.extend_from_slice(&(entry_block_id as u32).to_le_bytes());
-        oep_stub.extend_from_slice(&[0x68]);                       // push imm32 (entry_seed)
+        oep_stub.extend_from_slice(&[0x68]); // push imm32 (entry_seed)
         oep_stub.extend_from_slice(&entry_seed.to_le_bytes());
         if !anti_debug_bytes.is_empty() {
             // v10 FIX: ????낇룂??釉먮폏?遺룹쐺??嶺뚮ㅎ?듸쭕???濡ろ뜑?灌鍮???OEP ???嶺뚮ㅎ?듸쭕???濡ろ떟??? ????釉먯뒠獒?????0x20).
@@ -276,7 +290,7 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, anti_debug_policy: crate
             oep_stub.extend_from_slice(&[0xE9]);
             oep_stub.extend_from_slice(&(disp as i32).to_le_bytes());
         } else {
-            oep_stub.extend_from_slice(&[0xEB, 0x14]);             // jmp short +0x14 ??0x20
+            oep_stub.extend_from_slice(&[0xEB, 0x14]); // jmp short +0x14 ??0x20
         }
     }
 
@@ -284,14 +298,13 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, anti_debug_policy: crate
 
     // ???? CFG ????읐?(offset 0x18~0x1F) ??????????????????????????????????????????????????????????????????????????????????????????
     btg_bytes[0x18..0x1C].copy_from_slice(&[0x01, 0x00, 0x00, 0x00]); // UNWIND_INFO
-    btg_bytes[0x1D..0x1F].copy_from_slice(&[0xFF, 0xE0]);              // jmp rax
-    btg_bytes[0x1F] = 0xC3;                                            // ret
+    btg_bytes[0x1D..0x1F].copy_from_slice(&[0xFF, 0xE0]); // jmp rax
+    btg_bytes[0x1F] = 0xC3; // ret
 
     // ???? Anti-Debug shellcode (???????????? ???ㅼ굡????袁⑸즲??? ????????????????????????????????????????????????????
     // v10: ad_offset????ш끽維???OEP ????읐??맞???影?얠맽 ??節뚮쳮雅?(??關履????ヂ?筌???嶺뚮ㅎ?듸쭕??.
     if !anti_debug_bytes.is_empty() {
-        btg_bytes[ad_offset..ad_offset + anti_debug_bytes.len()]
-            .copy_from_slice(&anti_debug_bytes);
+        btg_bytes[ad_offset..ad_offset + anti_debug_bytes.len()].copy_from_slice(&anti_debug_bytes);
         println!("[+] Anti-Debug: Placed at section offset 0x{:X}", ad_offset);
     }
 
@@ -299,7 +312,9 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, anti_debug_policy: crate
     btg_bytes[0x20..disp_end].copy_from_slice(&dispatcher_bytes);
 
     // ???? Jump Table (offset table_offset) ??????????????????????????????????????????????????????????????????????????????????
-    let layout = ctx.shuffled_layout.as_ref()
+    let layout = ctx
+        .shuffled_layout
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("T3-3: shuffled_layout not set — run pass3 before pass4"))?;
     for (logical_id, &encrypted_entry) in layout.encrypted_table_entries.iter().enumerate() {
         let tbl_pos = table_offset + logical_id * 4;
@@ -414,8 +429,12 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, anti_debug_policy: crate
         if phys_offset + block_len > btg_bytes.len() {
             return Err(anyhow::anyhow!(
                 "Block {} at offset 0x{:X} + len {} exceeds section size 0x{:X}!",
-                block.id, phys_offset, block_len, btg_bytes.len()
-            ).into());
+                block.id,
+                phys_offset,
+                block_len,
+                btg_bytes.len()
+            )
+            .into());
         }
 
         if i + 1 < layout.shuffled_blocks.len() {
@@ -465,7 +484,11 @@ pub fn run(ctx: &mut PipelineContext, anti_debug: bool, anti_debug_policy: crate
 
     // v3: crypto/??딅텑???????읐???????????RWX??(??딅텑???????읐???熬곣뫀????ｏ쭗?in-place ?怨뚮옖甕???
     // ?怨뚮옖甕곕?苡? ???獒?IAT ???????れ삀??쎈뭄?
-    let characteristics = if needs_boot_stub { 0xE0000020u32 } else { 0x60000020u32 };
+    let characteristics = if needs_boot_stub {
+        0xE0000020u32
+    } else {
+        0x60000020u32
+    };
 
     ctx.btg_section_data = Some(SectionData {
         name: ".textb".to_string(), // decoy section name (was .btg)
@@ -489,22 +512,34 @@ fn resolve_entry_block_id(ctx: &PipelineContext) -> Result<usize> {
     let va_map = &ctx.va_to_trigger_id;
 
     if let Some(&id) = va_map.get(&target_ep_va) {
-        println!("[INFO] Entry Block ID resolved to {} for OEP VA 0x{:X}", id, target_ep_va);
+        println!(
+            "[INFO] Entry Block ID resolved to {} for OEP VA 0x{:X}",
+            id, target_ep_va
+        );
         return Ok(id as usize);
     }
 
     if let Some((&next_va, &next_id)) = va_map.range((target_ep_va + 1)..).next() {
         if next_va - target_ep_va <= MAX_PADDING_SIZE {
-            println!("[INFO] Entry Block ID resolved to {} (next after padding) for OEP VA 0x{:X}", next_id, target_ep_va);
+            println!(
+                "[INFO] Entry Block ID resolved to {} (next after padding) for OEP VA 0x{:X}",
+                next_id, target_ep_va
+            );
             return Ok(next_id as usize);
         }
     }
 
     if let Some((_, &id)) = va_map.range(..=target_ep_va).next_back() {
-        eprintln!("[WARN] OEP VA 0x{:X} is inside block ID {}. Using that block.", target_ep_va, id);
+        eprintln!(
+            "[WARN] OEP VA 0x{:X} is inside block ID {}. Using that block.",
+            target_ep_va, id
+        );
         return Ok(id as usize);
     }
 
-    eprintln!("[WARN] Could not find entry block for OEP VA 0x{:X}! Defaulting to block 0.", target_ep_va);
+    eprintln!(
+        "[WARN] Could not find entry block for OEP VA 0x{:X}! Defaulting to block 0.",
+        target_ep_va
+    );
     Ok(0)
 }

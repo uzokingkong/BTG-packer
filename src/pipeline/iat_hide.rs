@@ -9,9 +9,8 @@
 //                원본 IAT 슬롯에 채운다. 정적 분석 시 API 목록이 2개만 노출.
 //
 // --mem-harden : 복호화 완료 직후 부트 스텁이 ntdll!NtProtectVirtualMemory를
-//                호출해 .textb를 RWX → RX(PAGE_EXECUTE_READ)로 전환한다.
-//                메모리 덤프 후 패치/재기록을 차단 (fail-open — 해석 실패 시
-//                보호 없이 계속 실행).
+//                호출해 immutable prefix는 RX, mutable VM tail은 RW로 전환한다.
+//                API 해석/보호 전환 실패는 fail-closed다.
 //
 // 배치: 두 기능의 데이터(더미 import 블록, 리졸브 테이블, 문자열)는 crypto::run이
 // 부트 영역 레이아웃을 확정한 뒤 .textb tail에 배치한다. 이 모듈은 그 데이터
@@ -19,7 +18,7 @@
 // ==============================================================================
 
 use crate::pipeline::PipelineContext;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use goblin::pe::PE;
 use std::collections::HashSet;
 
@@ -99,11 +98,11 @@ pub fn build_dummy_import_block(base_rva: u32) -> (Vec<u8>, u32, u32, u32, u32) 
     let mut b = Vec::new();
     // descriptor (20B)
     b.extend_from_slice(&rva(namearr_off).to_le_bytes()); // OriginalFirstThunk
-    b.extend_from_slice(&0u32.to_le_bytes());             // TimeDateStamp
-    b.extend_from_slice(&0u32.to_le_bytes());             // ForwarderChain
-    b.extend_from_slice(&rva(name_off).to_le_bytes());    // Name
-    b.extend_from_slice(&rva(iat_off).to_le_bytes());     // FirstThunk
-    // null descriptor (20B)
+    b.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
+    b.extend_from_slice(&0u32.to_le_bytes()); // ForwarderChain
+    b.extend_from_slice(&rva(name_off).to_le_bytes()); // Name
+    b.extend_from_slice(&rva(iat_off).to_le_bytes()); // FirstThunk
+                                                      // null descriptor (20B)
     b.extend_from_slice(&[0u8; 20]);
     debug_assert_eq!(b.len(), name_off);
     // dll name
@@ -113,7 +112,7 @@ pub fn build_dummy_import_block(base_rva: u32) -> (Vec<u8>, u32, u32, u32, u32) 
     b.extend_from_slice(&(rva(ll_hn_off) as u64).to_le_bytes());
     b.extend_from_slice(&(rva(gpa_hn_off) as u64).to_le_bytes());
     b.extend_from_slice(&0u64.to_le_bytes()); // OFT 체인 NULL 종료 (FIX v12)
-    // hint/name entries (u16 hint + cstr)
+                                              // hint/name entries (u16 hint + cstr)
     b.extend_from_slice(&0u16.to_le_bytes());
     b.extend_from_slice(b"LoadLibraryA\0");
     b.extend_from_slice(&0u16.to_le_bytes());
@@ -131,10 +130,10 @@ pub fn build_dummy_import_block(base_rva: u32) -> (Vec<u8>, u32, u32, u32, u32) 
 
     (
         b,
-        base_rva,               // desc RVA
-        0x28,                   // desc size (descriptor 2개)
-        rva(iat_off),           // LoadLibraryA 슬롯 RVA
-        rva(iat_off + 8),       // GetProcAddress 슬롯 RVA
+        base_rva,         // desc RVA
+        0x28,             // desc size (descriptor 2개)
+        rva(iat_off),     // LoadLibraryA 슬롯 RVA
+        rva(iat_off + 8), // GetProcAddress 슬롯 RVA
     )
 }
 
@@ -174,7 +173,10 @@ pub fn build_resolve_table(
     // DLL 순서 보존 그룹핑
     let mut groups: Vec<(&str, Vec<&OriginalImport>)> = Vec::new();
     for imp in imports {
-        if let Some(g) = groups.iter_mut().find(|(name, _)| *name == imp.dll.as_str()) {
+        if let Some(g) = groups
+            .iter_mut()
+            .find(|(name, _)| *name == imp.dll.as_str())
+        {
             g.1.push(imp);
         } else {
             groups.push((&imp.dll, vec![imp]));
@@ -237,12 +239,12 @@ fn zero_rva_range(ctx: &mut PipelineContext, rva: u32, len: u32) {
 pub fn erase_original_imports(ctx: &mut PipelineContext) {
     // 원본 목록 스냅샷 (patched_sections 가변 대여 중 ctx를 다시 빌리지 않기 위해)
     let imports: Vec<OriginalImport> = ctx.original_imports.clone();
-    let dd1 = ctx
-        .target_info
-        .data_directories
-        .get(1)
-        .copied()
-        .unwrap_or(crate::pe::builder::DataDirectory { virtual_address: 0, size: 0 });
+    let dd1 = ctx.target_info.data_directories.get(1).copied().unwrap_or(
+        crate::pe::builder::DataDirectory {
+            virtual_address: 0,
+            size: 0,
+        },
+    );
 
     // 1) import 디렉터리 영역 제로아웃 (DataDirectory[1]은 더미로 대체됨)
     if dd1.virtual_address != 0 && dd1.size != 0 {
@@ -286,10 +288,8 @@ pub fn erase_original_imports(ctx: &mut PipelineContext) {
     }
 }
 
-/// TLS callbacks execute before the PE entry point. They therefore cannot use an
-/// IAT that the boot stub plans to reconstruct later. Skipping those callbacks is
-/// also unsafe (Rust uses them for thread-local initialization/teardown), so reject
-/// this combination instead of emitting a binary with a broken lifecycle.
+/// TLS callback 존재 여부. Program-VM은 callback target을 native-owned thunk로
+/// 유지하며, 결합 프로파일은 실행 동등성 게이트로 callback lifecycle을 검증한다.
 fn has_tls_callbacks(ctx: &PipelineContext) -> bool {
     let Some(dir) = ctx.target_info.data_directories.get(9) else {
         return false;
@@ -314,15 +314,15 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         return Ok(());
     }
     if ctx.iat_hide {
-        if has_tls_callbacks(ctx) {
-            return Err(anyhow!(
-                "--iat-hide cannot be used on a PE with TLS callbacks: callbacks run before the boot stub, and disabling them corrupts Rust/CRT teardown"
-            ));
-        }
+        // TLS callback code is kept under native ownership by the Program-VM
+        // TLS guard.  Its import slots are loader-owned thunks and are handled
+        // by the bootstrap policy below instead of silently disabling IAT hide.
+        let tls_owned = has_tls_callbacks(ctx);
         erase_original_imports(ctx);
         println!(
-            "[+] v6 IAT Hiding: {} original imports erased; dummy import (LoadLibraryA/GetProcAddress) installed",
-            ctx.original_imports.len()
+            "[+] v6 IAT Hiding: {} original imports erased; dummy import (LoadLibraryA/GetProcAddress) installed{}",
+            ctx.original_imports.len(),
+            if tls_owned { "; TLS callbacks retained as native-owned thunks" } else { "" }
         );
     }
     if ctx.mem_harden {
@@ -339,12 +339,25 @@ mod tests {
     fn test_dummy_import_block_layout() {
         // base_rva=0x3000으로 블록 생성 → 내부 RVA가 base를 반영하는지 검증
         let (b, dir_rva, dir_size, ll_slot, gpa_slot) = build_dummy_import_block(0x3000);
-        eprintln!("DBG block hex 0x30..0x70: {}", b[0x30..0x70].iter().map(|x| format!("{:02X}", x)).collect::<Vec<_>>().join(" "));
-        eprintln!("DBG len={} dir_rva={:#x} ll_slot={:#x} gpa_slot={:#x}", b.len(), dir_rva, ll_slot, gpa_slot);
+        eprintln!(
+            "DBG block hex 0x30..0x70: {}",
+            b[0x30..0x70]
+                .iter()
+                .map(|x| format!("{:02X}", x))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        eprintln!(
+            "DBG len={} dir_rva={:#x} ll_slot={:#x} gpa_slot={:#x}",
+            b.len(),
+            dir_rva,
+            ll_slot,
+            gpa_slot
+        );
         assert_eq!(dir_rva, 0x3000);
         assert_eq!(dir_size, 0x28);
         let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
-        assert_eq!(u32at(0), 0x3035);  // OriginalFirstThunk -> name array
+        assert_eq!(u32at(0), 0x3035); // OriginalFirstThunk -> name array
         assert_eq!(u32at(12), 0x3028); // Name ("kernel32.dll")
         assert_eq!(u32at(16), 0x3070); // FirstThunk (IAT)
         assert_eq!(ll_slot, 0x3070);
@@ -355,12 +368,24 @@ mod tests {
         let s2 = String::from_utf8_lossy(&b[0x4D + 2..0x4D + 2 + 12]);
         assert_eq!(s2, "LoadLibraryA");
         // name array (OFT) 엔트리 2개 + NULL 종료
-        assert_eq!(u64::from_le_bytes(b[0x35..0x3D].try_into().unwrap()), 0x304D);
-        assert_eq!(u64::from_le_bytes(b[0x3D..0x45].try_into().unwrap()), 0x305C);
+        assert_eq!(
+            u64::from_le_bytes(b[0x35..0x3D].try_into().unwrap()),
+            0x304D
+        );
+        assert_eq!(
+            u64::from_le_bytes(b[0x3D..0x45].try_into().unwrap()),
+            0x305C
+        );
         assert_eq!(u64::from_le_bytes(b[0x45..0x4D].try_into().unwrap()), 0);
         // IAT: hint/name RVA 체인 + NULL 종료 (로더가 해석 주소로 덮어씀)
-        assert_eq!(u64::from_le_bytes(b[0x70..0x78].try_into().unwrap()), 0x304D);
-        assert_eq!(u64::from_le_bytes(b[0x78..0x80].try_into().unwrap()), 0x305C);
+        assert_eq!(
+            u64::from_le_bytes(b[0x70..0x78].try_into().unwrap()),
+            0x304D
+        );
+        assert_eq!(
+            u64::from_le_bytes(b[0x78..0x80].try_into().unwrap()),
+            0x305C
+        );
         assert_eq!(u64::from_le_bytes(b[0x80..0x88].try_into().unwrap()), 0);
     }
 
@@ -370,13 +395,28 @@ mod tests {
         // `mov [slot], rax`로 기록하므로). RVA를 그대로 쓰면 미매핑 주소에 기록된다.
         let image_base: u64 = 0x140000000;
         let imports = vec![
-            OriginalImport { dll: "kernel32.dll".into(), slot_rva: 0x2028, name_rva: 0x2058, func: FuncRef::Name("ExitProcess".into()) },
-            OriginalImport { dll: "kernel32.dll".into(), slot_rva: 0x2030, name_rva: 0x2068, func: FuncRef::Name("GetModuleHandleA".into()) },
-            OriginalImport { dll: "user32.dll".into(), slot_rva: 0x2038, name_rva: 0x2078, func: FuncRef::Ordinal(5) },
+            OriginalImport {
+                dll: "kernel32.dll".into(),
+                slot_rva: 0x2028,
+                name_rva: 0x2058,
+                func: FuncRef::Name("ExitProcess".into()),
+            },
+            OriginalImport {
+                dll: "kernel32.dll".into(),
+                slot_rva: 0x2030,
+                name_rva: 0x2068,
+                func: FuncRef::Name("GetModuleHandleA".into()),
+            },
+            OriginalImport {
+                dll: "user32.dll".into(),
+                slot_rva: 0x2038,
+                name_rva: 0x2078,
+                func: FuncRef::Ordinal(5),
+            },
         ];
         let t = build_resolve_table(&imports, image_base, 0, 0);
         assert_eq!(u32::from_le_bytes(t[0..4].try_into().unwrap()), 2); // dll_count
-        // 1st dll: "kernel32.dll"(12)+NUL, func_count=2
+                                                                        // 1st dll: "kernel32.dll"(12)+NUL, func_count=2
         let p = 4usize;
         assert_eq!(u32::from_le_bytes(t[p..p + 4].try_into().unwrap()), 12);
         assert_eq!(&t[p + 4..p + 4 + 12], b"kernel32.dll");
@@ -385,25 +425,43 @@ mod tests {
         assert_eq!(u32::from_le_bytes(t[q..q + 4].try_into().unwrap()), 2);
         q += 4;
         // func1: slot = 0x140000000 + 0x2028, "ExitProcess"(11)
-        assert_eq!(u64::from_le_bytes(t[q..q + 8].try_into().unwrap()), 0x140002028);
+        assert_eq!(
+            u64::from_le_bytes(t[q..q + 8].try_into().unwrap()),
+            0x140002028
+        );
         q += 8;
         assert_eq!(u32::from_le_bytes(t[q..q + 4].try_into().unwrap()), 11);
-        assert_eq!(mba_xor(&t[q + 4..q + 4 + 11], 1, 0, 0).as_slice(), b"ExitProcess");
+        assert_eq!(
+            mba_xor(&t[q + 4..q + 4 + 11], 1, 0, 0).as_slice(),
+            b"ExitProcess"
+        );
         q += 4 + 11 + 1;
         // func2: slot = 0x140000000 + 0x2030, "GetModuleHandleA"(17)
-        assert_eq!(u64::from_le_bytes(t[q..q + 8].try_into().unwrap()), 0x140002030);
+        assert_eq!(
+            u64::from_le_bytes(t[q..q + 8].try_into().unwrap()),
+            0x140002030
+        );
         q += 8;
         assert_eq!(u32::from_le_bytes(t[q..q + 4].try_into().unwrap()), 16);
         q += 4 + 16 + 1;
         // 2nd dll: "user32.dll"(10) + ordinal func
         assert_eq!(u32::from_le_bytes(t[q..q + 4].try_into().unwrap()), 10);
-        assert_eq!(mba_xor(&t[q + 4..q + 4 + 10], 3, 0, 0).as_slice(), b"user32.dll");
+        assert_eq!(
+            mba_xor(&t[q + 4..q + 4 + 10], 3, 0, 0).as_slice(),
+            b"user32.dll"
+        );
         q += 4 + 10 + 1;
         assert_eq!(u32::from_le_bytes(t[q..q + 4].try_into().unwrap()), 1);
         q += 4;
-        assert_eq!(u64::from_le_bytes(t[q..q + 8].try_into().unwrap()), 0x140002038);
+        assert_eq!(
+            u64::from_le_bytes(t[q..q + 8].try_into().unwrap()),
+            0x140002038
+        );
         q += 8;
-        assert_eq!(u32::from_le_bytes(t[q..q + 4].try_into().unwrap()), 0xFFFF_0000);
+        assert_eq!(
+            u32::from_le_bytes(t[q..q + 4].try_into().unwrap()),
+            0xFFFF_0000
+        );
         assert_eq!(u16::from_le_bytes(t[q + 4..q + 6].try_into().unwrap()), 5);
         q += 4 + 2 + 1;
         assert_eq!(q, t.len(), "table fully consumed");
@@ -415,8 +473,18 @@ mod tests {
         // 0이 아닌 한 어떤 항목도 원본 RVA와 같으면 안 된다.
         let image_base: u64 = 0x140000000;
         let imports = vec![
-            OriginalImport { dll: "kernel32.dll".into(), slot_rva: 0x2028, name_rva: 0x2058, func: FuncRef::Name("ExitProcess".into()) },
-            OriginalImport { dll: "user32.dll".into(), slot_rva: 0x2038, name_rva: 0x2078, func: FuncRef::Ordinal(5) },
+            OriginalImport {
+                dll: "kernel32.dll".into(),
+                slot_rva: 0x2028,
+                name_rva: 0x2058,
+                func: FuncRef::Name("ExitProcess".into()),
+            },
+            OriginalImport {
+                dll: "user32.dll".into(),
+                slot_rva: 0x2038,
+                name_rva: 0x2078,
+                func: FuncRef::Ordinal(5),
+            },
         ];
         let t = build_resolve_table(&imports, image_base, 0, 0);
         // dll_count(4) + dll1(4+12+1+4) + func1(8+4+11+1) + dll2(4+10+1+4) + func2(8+4+2+1)
@@ -433,7 +501,11 @@ mod tests {
                 q += 8;
                 let fname_len = u32::from_le_bytes(t[q..q + 4].try_into().unwrap());
                 q += 4;
-                q += if fname_len == 0xFFFF_0000 { 2 + 1 } else { fname_len as usize + 1 };
+                q += if fname_len == 0xFFFF_0000 {
+                    2 + 1
+                } else {
+                    fname_len as usize + 1
+                };
             }
         }
         assert_eq!(q, t.len());
@@ -456,18 +528,27 @@ mod tests {
             path = std::path::PathBuf::from("/tmp/import_test.exe");
         }
         if !path.exists() {
-            eprintln!("skipping import fixture test: {} is missing", path.display());
+            eprintln!(
+                "skipping import fixture test: {} is missing",
+                path.display()
+            );
             return;
         }
         let bytes = std::fs::read(&path).unwrap();
         let imports = collect_from_pe(&bytes).unwrap();
-        assert!(!imports.is_empty(), "fixture must import at least one function");
+        assert!(
+            !imports.is_empty(),
+            "fixture must import at least one function"
+        );
         // goblin과 1:1 대조 (순서/개수/DLL/이름/슬롯 RVA)
         let pe = goblin::pe::PE::parse(&bytes).unwrap();
         assert_eq!(imports.len(), pe.imports.len());
         for (got, imp) in imports.iter().zip(pe.imports.iter()) {
             assert_eq!(got.dll, imp.dll);
-            assert_eq!(got.slot_rva, imp.offset as u32, "IAT slot RVA must match goblin");
+            assert_eq!(
+                got.slot_rva, imp.offset as u32,
+                "IAT slot RVA must match goblin"
+            );
             match &got.func {
                 FuncRef::Name(n) => assert_eq!(&imp.name, n),
                 _ => panic!("fixture imports must be by name"),

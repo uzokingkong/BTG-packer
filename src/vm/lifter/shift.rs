@@ -10,7 +10,7 @@
 use super::mem::mem_emit;
 use super::{vreg, SCRATCH2};
 use crate::vm::bytecode::*;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use iced_x86::{Instruction, OpKind};
 
 /// Unified lifter for SHL, SHR, SAR, ROL, ROR (8/16/32/64-bit, reg/mem, _1/_imm8/_CL).
@@ -154,14 +154,22 @@ pub(super) fn lift_incdec(b: &mut BytecodeBuilder, inst: &Instruction) -> Result
             Dec_rm32 => OP_LOCK_DEC_MEM32_A,
             _ => OP_LOCK_DEC_MEM64_A,
         };
-        if is_inc { b.lock_inc_a(op, addr); } else { b.lock_dec_a(op, addr); }
+        if is_inc {
+            b.lock_inc_a(op, addr);
+        } else {
+            b.lock_dec_a(op, addr);
+        }
         return Ok(());
     }
     if inst.op0_kind() == OpKind::Register {
         let r = vreg(inst.op0_register())?;
         let is64 = matches!(inst.code(), Inc_rm64 | Dec_rm64);
         if is_inc {
-            if is64 { b.inc_r64(r); } else { b.inc_r(r); }
+            if is64 {
+                b.inc_r64(r);
+            } else {
+                b.inc_r(r);
+            }
         } else if is64 {
             b.dec_r64(r);
         } else {
@@ -176,11 +184,25 @@ pub(super) fn lift_incdec(b: &mut BytecodeBuilder, inst: &Instruction) -> Result
         Inc_rm32 | Dec_rm32 => 32,
         _ => 64,
     };
-    let load = match sz { 8 => OP_MOVZX_R_MEM8_A, 16 => OP_MOVZX_R_MEM16_A, 32 => OP_MOVZX_R_MEM32_A, _ => OP_MOV_R_MEM64_A };
-    let store = match sz { 8 => OP_MOV_MEM8_A, 16 => OP_MOV_MEM16_A, 32 => OP_MOV_MEM32_A, _ => OP_MOV_MEM64_A };
+    let load = match sz {
+        8 => OP_MOVZX_R_MEM8_A,
+        16 => OP_MOVZX_R_MEM16_A,
+        32 => OP_MOVZX_R_MEM32_A,
+        _ => OP_MOV_R_MEM64_A,
+    };
+    let store = match sz {
+        8 => OP_MOV_MEM8_A,
+        16 => OP_MOV_MEM16_A,
+        32 => OP_MOV_MEM32_A,
+        _ => OP_MOV_MEM64_A,
+    };
     b.mem_load_a(load, SCRATCH2, addr);
     if is_inc {
-        if sz == 64 { b.inc_r64(SCRATCH2); } else { b.inc_r(SCRATCH2); }
+        if sz == 64 {
+            b.inc_r64(SCRATCH2);
+        } else {
+            b.inc_r(SCRATCH2);
+        }
     } else if sz == 64 {
         b.dec_r64(SCRATCH2);
     } else {
@@ -196,40 +218,64 @@ pub(super) fn lift_not_neg(b: &mut BytecodeBuilder, inst: &Instruction) -> Resul
     let code = inst.code();
     let name = format!("{:?}", code);
     let is_not = name.starts_with("Not_");
-    let is8  = name.contains("_rm8");
+    let is8 = name.contains("_rm8");
     let is16 = name.contains("_rm16");
     let is64 = name.contains("_rm64");
 
     if inst.op0_kind() == OpKind::Register {
         let r = vreg(inst.op0_register())?;
         if is_not {
-            if is64 { b.not_r64(r); } else { b.not_r(r); }
+            if is64 {
+                b.not_r64(r);
+            } else {
+                b.not_r(r);
+            }
         } else {
-            if is64 { b.neg_r64(r); } else { b.neg_r(r); }
+            if is64 {
+                b.neg_r64(r);
+            } else {
+                b.neg_r(r);
+            }
         }
-        if is8  { b.binop_r_imm32(OP_AND_R_IMM32, r, 0xFF); }
-        if is16 { b.binop_r_imm32(OP_AND_R_IMM32, r, 0xFFFF); }
+        if is8 {
+            b.binop_r_imm32(OP_AND_R_IMM32, r, 0xFF);
+        }
+        if is16 {
+            b.binop_r_imm32(OP_AND_R_IMM32, r, 0xFFFF);
+        }
         return Ok(());
     }
 
     let addr = mem_emit(b, inst, 0)?;
     let (load, store) = if is8 {
-        (OP_MOVZX_R_MEM8_A,  OP_MOV_MEM8_A)
+        (OP_MOVZX_R_MEM8_A, OP_MOV_MEM8_A)
     } else if is16 {
         (OP_MOVZX_R_MEM16_A, OP_MOV_MEM16_A)
     } else if is64 {
-        (OP_MOV_R_MEM64_A,   OP_MOV_MEM64_A)
+        (OP_MOV_R_MEM64_A, OP_MOV_MEM64_A)
     } else {
         (OP_MOVZX_R_MEM32_A, OP_MOV_MEM32_A)
     };
     b.mem_load_a(load, SCRATCH2, addr);
     if is_not {
-        if is64 { b.not_r64(SCRATCH2); } else { b.not_r(SCRATCH2); }
+        if is64 {
+            b.not_r64(SCRATCH2);
+        } else {
+            b.not_r(SCRATCH2);
+        }
     } else {
-        if is64 { b.neg_r64(SCRATCH2); } else { b.neg_r(SCRATCH2); }
+        if is64 {
+            b.neg_r64(SCRATCH2);
+        } else {
+            b.neg_r(SCRATCH2);
+        }
     }
-    if is8  { b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH2, 0xFF); }
-    if is16 { b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH2, 0xFFFF); }
+    if is8 {
+        b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH2, 0xFF);
+    }
+    if is16 {
+        b.binop_r_imm32(OP_AND_R_IMM32, SCRATCH2, 0xFFFF);
+    }
     b.mem_store_a(store, addr, SCRATCH2);
     Ok(())
 }
@@ -247,20 +293,36 @@ pub(super) fn lift_shld_shrd(b: &mut BytecodeBuilder, inst: &Instruction) -> Res
 
     if is_shld {
         if is_cl {
-            let op = if is64 { OP_SHLD64_R_R_CL } else { OP_SHLD_R_R_CL };
+            let op = if is64 {
+                OP_SHLD64_R_R_CL
+            } else {
+                OP_SHLD_R_R_CL
+            };
             b.shld_cl(op, dst, src);
         } else {
             let imm = inst.immediate8();
-            let op = if is64 { OP_SHLD64_R_R_IMM8 } else { OP_SHLD_R_R_IMM8 };
+            let op = if is64 {
+                OP_SHLD64_R_R_IMM8
+            } else {
+                OP_SHLD_R_R_IMM8
+            };
             b.shld_imm(op, dst, src, imm);
         }
     } else {
         if is_cl {
-            let op = if is64 { OP_SHRD64_R_R_CL } else { OP_SHRD_R_R_CL };
+            let op = if is64 {
+                OP_SHRD64_R_R_CL
+            } else {
+                OP_SHRD_R_R_CL
+            };
             b.shld_cl(op, dst, src);
         } else {
             let imm = inst.immediate8();
-            let op = if is64 { OP_SHRD64_R_R_IMM8 } else { OP_SHRD_R_R_IMM8 };
+            let op = if is64 {
+                OP_SHRD64_R_R_IMM8
+            } else {
+                OP_SHRD_R_R_IMM8
+            };
             b.shld_imm(op, dst, src, imm);
         }
     }

@@ -18,7 +18,7 @@
 
 use super::SectionInfo;
 use crate::pipeline::PipelineContext;
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use goblin::pe::PE;
 
 /// COFF machine: x64
@@ -45,7 +45,12 @@ fn check_section_overlap(sections: &[SectionInfo]) -> Result<()> {
         if w[0].1 > w[1].0 {
             bail!(
                 "PE structural: section '{}' [0x{:X},0x{:X}) overlaps '{}' [0x{:X},0x{:X})",
-                w[0].2, w[0].0, w[0].1, w[1].2, w[1].0, w[1].1
+                w[0].2,
+                w[0].0,
+                w[0].1,
+                w[1].2,
+                w[1].0,
+                w[1].1
             );
         }
     }
@@ -96,7 +101,10 @@ pub fn validate_pe_structure(
     let std = &oh.standard_fields;
     let win = &oh.windows_fields;
     if std.magic != PE32_PLUS {
-        bail!("PE structural: optional magic 0x{:04X} != PE32+ (0x20B)", std.magic);
+        bail!(
+            "PE structural: optional magic 0x{:04X} != PE32+ (0x20B)",
+            std.magic
+        );
     }
     let sa = win.section_alignment;
     let fa = win.file_alignment;
@@ -120,12 +128,17 @@ pub fn validate_pe_structure(
     // ── 4. 섹션 정합 ─────────────────────────────────────────────────────────────
     for s in sections {
         if s.rva % sa != 0 {
-            bail!("PE structural: section '{}' RVA 0x{:X} not aligned to 0x{sa:X}", s.name, s.rva);
+            bail!(
+                "PE structural: section '{}' RVA 0x{:X} not aligned to 0x{sa:X}",
+                s.name,
+                s.rva
+            );
         }
         if s.raw_size > 0 && s.raw_ptr % fa != 0 {
             bail!(
                 "PE structural: section '{}' raw ptr 0x{:X} not aligned to 0x{fa:X}",
-                s.name, s.raw_ptr
+                s.name,
+                s.raw_ptr
             );
         }
         // raw 데이터가 virtual보다 크면 로더가 파일 끝을 넘어 읽을 수 있음
@@ -133,13 +146,16 @@ pub fn validate_pe_structure(
         //  상향 반올림. 로더는 min(virtual, raw) 만 매핑하므로 거부하지 않는다.
         //  핵심은 raw 범위가 파일 안인지 + 디렉터리 size가 raw 안인지 — 아래 검사.)
         let _ = s; // (위 주석만 — raw>virtual 허용)
-        // raw 범위가 파일 안
+                   // raw 범위가 파일 안
         if s.raw_size > 0 {
             let raw_end = (s.raw_ptr as usize).saturating_add(s.raw_size as usize);
             if (s.raw_ptr as usize) >= out.len() || raw_end > out.len() {
                 bail!(
                     "PE structural: section '{}' raw [0x{:X},0x{:X}) exceeds file 0x{:X}",
-                    s.name, s.raw_ptr, raw_end, out.len()
+                    s.name,
+                    s.raw_ptr,
+                    raw_end,
+                    out.len()
                 );
             }
         }
@@ -161,7 +177,9 @@ pub fn validate_pe_structure(
 
     // ── 5. 16개 데이터 디렉터리 전수 검증 ───────────────────────────────────────
     for (i, dd_opt) in oh.data_directories.data_directories.iter().enumerate() {
-        let Some((_, dd)) = dd_opt.as_ref() else { continue };
+        let Some((_, dd)) = dd_opt.as_ref() else {
+            continue;
+        };
         if dd.virtual_address == 0 {
             continue; // 미사용/패커가 지운 디렉터리
         }
@@ -187,7 +205,8 @@ pub fn validate_pe_structure(
             if local + dd.size as usize > sec.raw_size as usize {
                 bail!(
                     "PE structural: data directory[{i}] size 0x{:X} exceeds section '{}' raw data",
-                    dd.size, sec.name
+                    dd.size,
+                    sec.name
                 );
             }
         }
@@ -214,7 +233,14 @@ mod tests {
     use super::*;
 
     fn sec(name: &str, rva: u32, vsize: u32, raw: u32, rsize: u32) -> SectionInfo {
-        SectionInfo { name: name.into(), rva, virtual_size: vsize, raw_ptr: raw, raw_size: rsize, characteristics: 0x60000020 }
+        SectionInfo {
+            name: name.into(),
+            rva,
+            virtual_size: vsize,
+            raw_ptr: raw,
+            raw_size: rsize,
+            characteristics: 0x60000020,
+        }
     }
 
     #[test]
@@ -224,7 +250,10 @@ mod tests {
             sec(".data", 0x1800, 0x1000, 0x1400, 0x1000), // overlaps .text
         ];
         let e = check_section_overlap(&sections).unwrap_err();
-        assert!(e.to_string().contains("overlap"), "expected overlap error, got {e}");
+        assert!(
+            e.to_string().contains("overlap"),
+            "expected overlap error, got {e}"
+        );
     }
 
     #[test]

@@ -2,17 +2,28 @@
 // BTG - Commercial-Grade VM: Phase 2 Polymorphic ISA Module
 // ==============================================================================
 
+pub mod architecture_family;
+pub mod decode_error;
 pub mod decoder;
 pub mod encoder;
 pub mod interpreter;
 pub mod isa_spec;
+pub mod operand_packing;
 pub mod rolling_key;
+pub mod state_machine;
 
+pub use architecture_family::{
+    architecture_signature, assign_function_families, CrossVmBridge, DispatchTopology, FlagModel,
+    FunctionFamilyAssignment, VmArchitectureFamily, VmCallConvention, VmFamilyProfile,
+};
+pub use decode_error::DecodeError;
 pub use decoder::PolymorphicDecoder;
 pub use encoder::PolymorphicEncoder;
 pub use interpreter::PolymorphicInterpreter;
 pub use isa_spec::VirtualIsaSpec;
+pub use operand_packing::{BitPackedOperandCodec, ChainedImmediateCodec, OpaqueBytecodeJunk};
 pub use rolling_key::RollingKeyEngine;
+pub use state_machine::StateMachineDecoder;
 
 #[cfg(test)]
 mod polymorphism_hardening_tests;

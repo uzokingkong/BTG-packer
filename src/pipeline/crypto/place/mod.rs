@@ -51,9 +51,8 @@ pub(crate) fn place_boot_stub(
     k3: u32,
     m8_mod: bool,
     crypto_mode: crate::crypto::CryptoMode,
-    // T3-1 Phase D: chacha 경로의 Poly1305 AEAD one-time 키 + 태그 (run()에서
-    // 암호문+고정 AAD로 계산해 전달). None이면 chacha_aead 비활성 (RC4/C1 no-op).
-    chacha_aead_key: Option<[u8; 32]>,
+    // T3-1 Phase D: the one-time key is derived into this scratch area at runtime.
+    // Only the tag is persisted in the image.
     chacha_aead_tag: Option<[u8; 16]>,
     rng: &mut impl RngCore,
 ) -> Result<()> {
@@ -65,14 +64,21 @@ pub(crate) fn place_boot_stub(
     // P3 (G1): 상용 프로그램 리프트의 ip_map (source-IP -> micro-op index) — the
     // VirtualBranch native handler uses it to resolve branch targets to bytecode
     // byte offsets. Populated in the lift below and passed to build_prog_vm_mod.
-    let (vm_prog_bytecode, vm_oep_native_entry, oep_va, vm_prog_ip_map) = lift_program(
-        ctx,
-        image_base,
-        vm_oep_effective,
-        vm_commercial,
-    )?;
+    let (
+        vm_prog_bytecode,
+        vm_oep_native_entry,
+        oep_va,
+        vm_prog_ip_map,
+        vm_prog_superops,
+        vm_coverage,
+        vm_prog_chunks,
+    ) = lift_program(ctx, image_base, vm_oep_effective, vm_commercial)?;
+    ctx.vm_coverage = vm_coverage;
+    ctx.vm_prog_chunks = vm_prog_chunks;
 
-    let btg = ctx.btg_section_data.as_mut()
+    let btg = ctx
+        .btg_section_data
+        .as_mut()
         .ok_or_else(|| anyhow::anyhow!("btg_section_data not set — run Pass 4 first"))?;
 
     // ── 6. 부트 스텁 배치 ────────────────────────────────────────────────────
@@ -113,15 +119,39 @@ pub(crate) fn place_boot_stub(
         //   → 이 값이 곧 1순위 가설(entry_native)의 정답이다.
         println!("[VM-OEP-DIAG] EP             = 0x{:X}", oep_va);
         println!("[VM-OEP-DIAG] entry_native   = {}", vm_oep_native_entry);
-        println!("[VM-OEP-DIAG] bytecode       = {} bytes (blocks={})", vm_prog_bytecode.len(), if vm_oep_native_entry { "n/a (OEP native)" } else { "n/a" });
-        println!("[VM-OEP-DIAG] route          = {}", if vm_oep_native_entry { "boot → native OEP → CRT → Once (Program VM 실행 안 함)" } else { "boot → Program VM → native_call → CRT → Once" });
+        println!(
+            "[VM-OEP-DIAG] bytecode       = {} bytes (blocks={})",
+            vm_prog_bytecode.len(),
+            if vm_oep_native_entry {
+                "n/a (OEP native)"
+            } else {
+                "n/a"
+            }
+        );
+        println!(
+            "[VM-OEP-DIAG] route          = {}",
+            if vm_oep_native_entry {
+                "boot → native OEP → CRT → Once (Program VM 실행 안 함)"
+            } else {
+                "boot → Program VM → native_call → CRT → Once"
+            }
+        );
         // STATE_SP 진단 (single-stack fix): boot stub는 vreg[4]=RSP를 스택 포인터로
         // 쓴다. 이제 CALL32/RET/PUSH/POP가 vreg[4]로 실제 스택을 공유하므로, 과거
         // STATE_SP=0 + STATE_PTR_STACK=RSP가 별도 오프셋 스택을 만들어 OEP 프레임과
         // 겹치던 (스택 오염) 문제가 제거되었다. [VM-OEP-DIAG] STATE_SP/PTR_STACK 미사용 (vreg[4]=RSP).
     }
 
+    // M12: 순수 RC4 비-chained/비-reencrypt/비-vm 경로만 디크립트 디스크립터 사용.
+    // (그 외 모드 — chained/C1/ChaCha/vm — 는 기존 imm 기반 decrypt 유지 → 무회귀)
+    let desc_used = crypto_mode == crate::crypto::CryptoMode::Rc4
+        && !chained_effective
+        && !reencrypt
+        && !vm_effective;
     let stub = BootStubCtx {
+        desc_va: 0,
+        desc_size: 0,
+        desc_used,
         boot_va,
         anti_debug,
         dispatcher_va: dispatcher_va + 0x20,
@@ -150,6 +180,7 @@ pub(crate) fn place_boot_stub(
         vm_oep: vm_oep_effective,
         vm_prog_entry_va: if vm_oep_effective { dispatcher_va } else { 0 },
         vm_prog_state_va: 0, // imm64 라 길이 불변 — 0으로 두고 아래에서 채움
+        vm_prog_runtime_layout_seed: vm_commercial.then_some(ctx.poly_vm_seed),
         vm_oep_native_entry: vm_oep_native_entry,
         vm_oep_native_va: oep_va,
         // M6 Phase-2.3 at-rest: VM bytecode VA/길이 (imm — 최종 패스에서 채움)
@@ -163,6 +194,10 @@ pub(crate) fn place_boot_stub(
         integrity: integrity_effective,
         crc_va: 0,
         mac_va: 0,
+        crc2_va: 0,
+        crc3_va: 0,
+        crc4_va: 0,
+        w32_slot_va: 0,
         iat_enabled: !iat_table_blob.is_empty(),
         mba_master: ctx.mba_constant,
         mba_c: IMPORT_MBA_C,
@@ -174,9 +209,15 @@ pub(crate) fn place_boot_stub(
         mem_ntprot_name_va: 0,
         mem_code_base: 0,
         mem_code_size: 0,
+        mem_state_base: 0,
+        mem_state_size: 0,
         // Win64 entry에서 RSP는 16-byte 경계보다 8만큼 어긋나 있다. 8 mod 16인
         // 프레임을 빼야 VM/native helper CALL 직전 RSP가 16-byte 정렬된다.
-        stack_frame: if ctx.iat_hide || ctx.mem_harden { 0x138 } else { 0x118 },
+        stack_frame: if ctx.iat_hide || ctx.mem_harden {
+            0x138
+        } else {
+            0x118
+        },
         // v60/v63 (--custom-cipher / --crypto-mode): 선택된 crypto primitive
         // (1st pass 자리표시자 — stub2/3에서 확정)
         crypto_mode,
@@ -212,24 +253,42 @@ pub(crate) fn place_boot_stub(
     // 바이트코드는 VA 독립적이므로 1차 sizing(VA=0)으로 크기를 확정한 뒤,
     // 최종 VA로 재생성한다. 모듈 레이아웃: [code][table][bytecode][state]
     // v61: --custom-cipher + --vm — RC4 KSA 대신 C1 상태 초기화 VM(C1Init 모드).
-    let vm_mod: Option<vm::VmModule> = if vm_effective {
+    let vm_plain_bc: Option<Vec<u8>> = if vm_effective {
         if c1_mode {
-            let bc = vm::c1::build_c1_init_bytecode();
-            Some(build_vm_mod(m8_mod, 0, 0, 0, bc, vm::handlers::EntryMode::C1Init, rng)?)
+            Some(vm::c1::build_c1_init_bytecode())
         } else {
-            let bc = vm::lifter::lift_ksa(&vm::ksa::build_ksa_instructions(0, k1, k2, k3))?;
-            Some(build_vm_mod(m8_mod, 0, 0, 0, bc, vm::handlers::EntryMode::Ksa, rng)?)
+            Some(vm::lifter::lift_ksa(&vm::ksa::build_ksa_instructions(
+                0, k1, k2, k3,
+            ))?)
         }
+    } else {
+        None
+    };
+    let vm_mod: Option<vm::VmModule> = if let Some(ref bc) = vm_plain_bc {
+        let mode = if c1_mode {
+            vm::handlers::EntryMode::C1Init
+        } else {
+            vm::handlers::EntryMode::Ksa
+        };
+        Some(build_vm_mod(m8_mod, 0, 0, 0, bc.clone(), mode, rng)?)
     } else {
         None
     };
     // v19: PRGA VM (RC4 키스트림 생성/복호화 루프) — vm과 함께 배치.
     // 바이트코드는 VA 독립이므로 1차 sizing(VA=0)으로 크기 확정 후 최종 VA 재생성.
     // v61: --custom-cipher + --vm — 키스트림은 C1 blob이 생성하므로 PRGA VM 생략.
-    let vm_prga_mod: Option<vm::VmModule> = if vm_effective && !c1_mode {
-        Some(build_vm_mod(m8_mod, 
-            0, 0, 0,
-            vm::prga::build_prga_bytecode(),
+    let vm_prga_plain_bc: Option<Vec<u8>> = if vm_effective && !c1_mode {
+        Some(vm::prga::build_prga_bytecode())
+    } else {
+        None
+    };
+    let vm_prga_mod: Option<vm::VmModule> = if let Some(ref bc) = vm_prga_plain_bc {
+        Some(build_vm_mod(
+            m8_mod,
+            0,
+            0,
+            0,
+            bc.clone(),
             vm::handlers::EntryMode::Prga,
             rng,
         )?)
@@ -238,10 +297,36 @@ pub(crate) fn place_boot_stub(
     };
     // ── M6 Phase-2: 프로그램 VM — 원본 .text를 평문 복호화하지 않고 전체 lift된
     //    프로그램을 VM으로 실행. (OEP→VM entry 전환, --vm-oep)
-    let vm_prog_mod: Option<vm::VmModule> = if vm_oep_effective {
+    let vm_prog_plain_bc: Option<Vec<u8>> = if vm_oep_effective {
+        Some(vm_prog_bytecode)
+    } else {
+        None
+    };
+    let vm_prog_mod: Option<vm::VmModule> = if let Some(ref bc) = vm_prog_plain_bc {
         // use the lift computed above (before the 1st-pass stub) so the entry
         // decision and the module bytecode come from the same single lift.
-        Some(build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed, 0, 0, 0, vm_prog_bytecode, 0, vm_prog_ip_map.as_ref(), m8_mod, rng)?)
+        let m = build_prog_vm_mod(
+            vm_commercial,
+            ctx.poly_vm_seed,
+            0,
+            0,
+            0,
+            bc.clone(),
+            0,
+            vm_prog_ip_map.as_ref(),
+            vm_prog_superops.as_ref(),
+            &ctx.vm_prog_chunks,
+            m8_mod,
+            rng,
+        )?;
+        println!(
+            "[DEBUG pass1 vm_prog_mod] code={} table={} bc={} total={}",
+            m.code.len(),
+            m.table.len(),
+            m.bytecode.len(),
+            m.total_len()
+        );
+        Some(m)
     } else {
         None
     };
@@ -269,10 +354,26 @@ pub(crate) fn place_boot_stub(
     } else {
         0
     };
-    let c1_blob_va = if c1_mode { dispatcher_va + c1_blob_off as u64 } else { 0 };
-    let c1_sbox_va = if c1_mode { dispatcher_va + c1_sbox_off as u64 } else { 0 };
-    let c1_state_va = if c1_mode { dispatcher_va + c1_state_off as u64 } else { 0 };
-    let c1_end = if c1_mode { c1_state_off + C1_STATE_SIZE } else { cursor };
+    let c1_blob_va = if c1_mode {
+        dispatcher_va + c1_blob_off as u64
+    } else {
+        0
+    };
+    let c1_sbox_va = if c1_mode {
+        dispatcher_va + c1_sbox_off as u64
+    } else {
+        0
+    };
+    let c1_state_va = if c1_mode {
+        dispatcher_va + c1_state_off as u64
+    } else {
+        0
+    };
+    let c1_end = if c1_mode {
+        c1_state_off + C1_STATE_SIZE
+    } else {
+        cursor
+    };
     cursor = c1_end;
 
     // ── v63 (--crypto-mode chacha20): ChaCha20 crypt blob + 상태 영역 배치 ──────
@@ -308,8 +409,8 @@ pub(crate) fn place_boot_stub(
 
     // ── T3-1 Phase D (--crypto-mode chacha20 + AEAD): Poly1305 blob + 키/태그 ──
     // RFC 8439 네이티브 Poly1305 verify blob을 chacha 상태 버퍼 뒤에 배치하고,
-    // 그 뒤에 32B ChaCha20-Poly1305 one-time 키와 16B AEAD 태그를 붙인다 (패커가
-    // run()에서 암호문+고정 AAD로 계산해 전달). blob 길이는 imm64/rel32만 써서
+    // 그 뒤에 32B runtime key scratch와 16B AEAD 태그를 붙인다. scratch는 파일에서
+    // zero이며 런타임 block 0 파생 직후 검증에만 사용하고 즉시 소거한다.
     // VA 무관(고정) — 1차 sizing에서 확정 가능.
     let mut poly_blob_off = 0usize;
     let mut poly_key_off = 0usize;
@@ -347,8 +448,8 @@ pub(crate) fn place_boot_stub(
 
     let vm_off = cursor;
     let (vm_entry_va, vm_state_va, vm_total) = if let Some(m) = &vm_mod {
-        let state_va = dispatcher_va
-            + (vm_off + m.code.len() + m.table.len() + m.bytecode.len()) as u64;
+        let state_va =
+            dispatcher_va + (vm_off + m.code.len() + m.table.len() + m.bytecode.len()) as u64;
         (dispatcher_va + vm_off as u64, state_va, m.total_len())
     } else {
         (0, 0, 0)
@@ -359,8 +460,8 @@ pub(crate) fn place_boot_stub(
     // v19: PRGA VM을 KSA VM 바로 뒤에 배치 (각각 독립 state 버퍼)
     let vm_prga_off = cursor;
     let (vm_prga_entry_va, vm_prga_state_va, vm_prga_total) = if let Some(m) = &vm_prga_mod {
-        let sva = dispatcher_va
-            + (vm_prga_off + m.code.len() + m.table.len() + m.bytecode.len()) as u64;
+        let sva =
+            dispatcher_va + (vm_prga_off + m.code.len() + m.table.len() + m.bytecode.len()) as u64;
         (dispatcher_va + vm_prga_off as u64, sva, m.total_len())
     } else {
         (0, 0, 0)
@@ -371,15 +472,28 @@ pub(crate) fn place_boot_stub(
     // ── M6 Phase-2: 프로그램 VM을 KSA/PRGA VM 뒤에 배치 (각각 독립 state) ──────
     let vm_prog_off = cursor;
     let (vm_prog_entry_va, vm_prog_state_va, vm_prog_total) = if let Some(m) = &vm_prog_mod {
-        let sva = dispatcher_va
-            + (vm_prog_off + m.code.len() + m.table.len() + m.bytecode.len()) as u64;
-        (dispatcher_va + vm_prog_off as u64, sva, m.total_len())
+        // P1-5: keep mutable Program-VM state on a page that does not overlap
+        // generated code, immutable tables, or ciphertext bytecode.  This lets
+        // mem-harden seal the preceding pages RX without making state writes
+        // fault.  The zero-filled alignment gap is intentional.
+        let immutable_end = vm_prog_off + m.code.len() + m.table.len() + m.bytecode.len();
+        let state_off = (immutable_end + 0xFFF) & !0xFFF;
+        let sva = dispatcher_va + state_off as u64;
+        (
+            dispatcher_va + vm_prog_off as u64,
+            sva,
+            state_off - vm_prog_off + vm::VM_STATE_SIZE,
+        )
     } else {
         (0, 0, 0)
     };
     // reserve the dedicated bytecode return-IP stack (CALL_STACK_SIZE) for the program VM
     cursor += vm_prog_total
-        + if vm_prog_mod.is_some() { crate::vm::interp::CALL_STACK_SIZE } else { 0 };
+        + if vm_prog_mod.is_some() {
+            crate::vm::interp::CALL_STACK_SIZE
+        } else {
+            0
+        };
     cursor = (cursor + 7) & !7; // align 8
 
     // ── P4 (전체 SEH 가상화): Program VM 모듈 위치를 ctx에 기록 — build.rs가
@@ -391,16 +505,23 @@ pub(crate) fn place_boot_stub(
         0
     };
     ctx.vm_prog_total = vm_prog_total as u32;
+    ctx.vm_prog_native_bridge = vm_prog_mod
+        .as_ref()
+        .and_then(|m| m.native_bridge_range.map(|(s, e)| (s as u32, e as u32)));
 
     // ── M6 Phase-2.3: at-rest 암호화 대상 확정 ──────────────────────────────
     // Program VM bytecode offset/len (boot area — .textb는 이미 RWX라 in-place 복호화 가능)
     let vm_prog_bc_len = if vm_oep_effective {
-        vm_prog_mod.as_ref().map(|m| m.bytecode.len() as u32).unwrap_or(0)
+        vm_prog_mod
+            .as_ref()
+            .map(|m| m.bytecode.len() as u32)
+            .unwrap_or(0)
     } else {
         0
     };
     let vm_prog_bc_off = if vm_prog_bc_len > 0 {
-        let m = vm_prog_mod.as_ref()
+        let m = vm_prog_mod
+            .as_ref()
             .expect("T3-3: vm_prog_bc_len > 0 implies vm_prog_mod is Some (checked above)");
         vm_prog_off + m.code.len() + m.table.len()
     } else {
@@ -411,24 +532,33 @@ pub(crate) fn place_boot_stub(
     } else {
         0
     };
+    ctx.vm_prog_bytecode_rva = vm_prog_bc_va.saturating_sub(image_base) as u32;
+    ctx.vm_prog_bytecode_len = vm_prog_bc_len;
     // 보존 원본 .text at-rest 암호화는 실제 실행되는 TLS 콜백이 없는 타깃에서 활성화.
     // TLS 디렉터리 내 AddressOfCallBacks가 가리키는 콜백 배열이 존재하지 않으면
     // 로더가 사전 실행하는 콜백이 없으므로 .text 전체를 안전하게 100% 암호화한다.
-    let has_tls_cb = ctx.target_info.data_directories.get(9).map(|dir| {
-        if dir.virtual_address == 0 || dir.size < 0x20 {
-            return false;
-        }
-        ctx.patched_sections.iter().any(|sec| {
-            if dir.virtual_address < sec.virtual_address {
+    let has_tls_cb = ctx
+        .target_info
+        .data_directories
+        .get(9)
+        .map(|dir| {
+            if dir.virtual_address == 0 || dir.size < 0x20 {
                 return false;
             }
-            let off = (dir.virtual_address - sec.virtual_address) as usize;
-            off + 0x20 <= sec.bytes.len()
-                && sec.bytes[off + 0x18..off + 0x20].try_into().ok()
-                    .map(|b: [u8; 8]| u64::from_le_bytes(b) != 0)
-                    .unwrap_or(false)
+            ctx.patched_sections.iter().any(|sec| {
+                if dir.virtual_address < sec.virtual_address {
+                    return false;
+                }
+                let off = (dir.virtual_address - sec.virtual_address) as usize;
+                off + 0x20 <= sec.bytes.len()
+                    && sec.bytes[off + 0x18..off + 0x20]
+                        .try_into()
+                        .ok()
+                        .map(|b: [u8; 8]| u64::from_le_bytes(b) != 0)
+                        .unwrap_or(false)
+            })
         })
-    }).unwrap_or(false);
+        .unwrap_or(false);
 
     // P5: partial .text at-rest encryption — encrypt every `.text` region EXCEPT
     // the TLS-callback-reachable function ranges (the loader runs those before
@@ -510,7 +640,36 @@ pub(crate) fn place_boot_stub(
     } else {
         8 + text_enc_runs.len() * 16
     };
-    let text_runs_off = (seed_off + 256 + if integrity_effective { 4 + 8 } else { 0 } + 7) & !7;
+    // ── M12 Decrypt-Descriptor: 정적 RC4 decrypt target/size/bytecode/table 주소를
+    // 부트 스텁 imm으로 노출하지 않고, 파생 키(RC4 keystream — 키 유도 계층)로 암호화한
+    // 작은 디스크립터를 부트 데이터 영역에 저장한다. 부트 스텁이 KSA(키 유도) 직후 이
+    // 디스크립터를 PRGA로 복호화하고, 이어지는 코드/런/바이트코드 복호화가 그 값들을
+    // 메모리([R13+off])에서 읽는다 → 정적 분석으로 target/size가 노출되지 않는다.
+    // 레이아웃 (전부 u64, little-endian):
+    //   +0x00 code_va, +0x08 code_len, +0x10 runs_va, +0x18 num_runs,
+    //   +0x20 vm_oep_bc_va, +0x28 vm_oep_bc_len, +0x30 vm_oep_text_runs_va,
+    //   +0x38 vm_oep_text_runs_count.
+    const DESC_OFF_CODE_VA: usize = 0x00;
+    const DESC_OFF_CODE_LEN: usize = 0x08;
+    const DESC_OFF_RUNS_VA: usize = 0x10;
+    const DESC_OFF_NUM_RUNS: usize = 0x18;
+    const DESC_OFF_BC_VA: usize = 0x20;
+    const DESC_OFF_BC_LEN: usize = 0x28;
+    const DESC_OFF_TEXT_RUNS_VA: usize = 0x30;
+    const DESC_OFF_TEXT_RUNS_COUNT: usize = 0x38;
+    const DESC_SIZE: usize = 0x40;
+    let desc_off = (seed_off
+        + 256
+        + if integrity_effective {
+            4 + 8 + 4 + 4 + 4 + 4
+        } else {
+            0
+        }
+        + 7)
+        & !7;
+    let desc_size = DESC_SIZE as u32;
+    let desc_va = dispatcher_va + desc_off as u64;
+    let text_runs_off = (desc_off + DESC_SIZE + 7) & !7;
     let text_runs_va = if text_enc_runs.is_empty() {
         0
     } else {
@@ -521,14 +680,47 @@ pub(crate) fn place_boot_stub(
     // ── v6: 더미 import / 리졸브 테이블 / mem 문자열 배치 (crc 뒤) ───────────
     let iat_start = text_runs_off + text_runs_block;
     let mut iat_cursor = iat_start;
-    // 1st pass: 블록 길이 확정 (base_rva=0)
-    let (dummy_blob0, _, _, _, _) = crate::pipeline::iat_hide::build_dummy_import_block(0);
+    let original_bootstrap_slot = |wanted: &str| {
+        ctx.original_imports.iter().find_map(|imp| match &imp.func {
+            crate::pipeline::iat_hide::FuncRef::Name(name) if name.eq_ignore_ascii_case(wanted) => {
+                Some(imp.slot_rva)
+            }
+            _ => None,
+        })
+    };
+    let original_ll = original_bootstrap_slot("LoadLibraryA");
+    let original_gpa = original_bootstrap_slot("GetProcAddress");
+    // Synthetic/unit-test images may have no import directory at all. Keep the
+    // self-contained dummy bootstrap for those; real mem-only images retain
+    // their original loader-owned import directory.
+    if ctx.mem_harden
+        && !ctx.iat_hide
+        && !ctx.original_imports.is_empty()
+        && (original_ll.is_none() || original_gpa.is_none())
+    {
+        anyhow::bail!("--mem-harden requires LoadLibraryA and GetProcAddress bootstrap imports when preserving the original IAT");
+    }
+    let needs_dummy_bootstrap = ctx.iat_hide || ctx.original_imports.is_empty();
+    // The dummy directory belongs exclusively to IAT hiding.  Mem-harden by
+    // itself must retain the loader-populated original IAT (notably for TLS
+    // callbacks that run before OEP).
+    let (dummy_blob0, _, _, _, _) = if needs_dummy_bootstrap {
+        crate::pipeline::iat_hide::build_dummy_import_block(0)
+    } else {
+        (Vec::new(), 0, 0, 0, 0)
+    };
     let dummy_off = iat_cursor;
     iat_cursor += dummy_blob0.len();
     // 2nd pass: 배치 RVA 반영 (내부 RVA는 u32 고정 길이 — 길이 불변)
     let dummy_base_rva = dispatcher_rva + dummy_off as u32;
     let (dummy_blob, dummy_dir_rva, dummy_dir_size, iat_ll_slot_rva, iat_gpa_slot_rva) =
-        crate::pipeline::iat_hide::build_dummy_import_block(dummy_base_rva);
+        if needs_dummy_bootstrap {
+            crate::pipeline::iat_hide::build_dummy_import_block(dummy_base_rva)
+        } else {
+            let ll = original_ll.expect("bootstrap presence checked above");
+            let gpa = original_gpa.expect("bootstrap presence checked above");
+            (Vec::new(), 0, 0, ll, gpa)
+        };
     debug_assert_eq!(dummy_blob.len(), dummy_blob0.len());
     let table_off = if !iat_table_blob.is_empty() {
         let off = iat_cursor;
@@ -551,8 +743,10 @@ pub(crate) fn place_boot_stub(
 
     // v6: 더미 import 디렉터리/슬롯/테이블/문자열 RVA·VA 기록 (build.rs/validate가 사용)
     if ctx.iat_hide || ctx.mem_harden {
-        ctx.iat_dir_rva = dummy_dir_rva;
-        ctx.iat_dir_size = dummy_dir_size;
+        if ctx.iat_hide {
+            ctx.iat_dir_rva = dummy_dir_rva;
+            ctx.iat_dir_size = dummy_dir_size;
+        }
         ctx.iat_ll_slot_rva = iat_ll_slot_rva;
         ctx.iat_gpa_slot_rva = iat_gpa_slot_rva;
         if !iat_table_blob.is_empty() {
@@ -569,6 +763,8 @@ pub(crate) fn place_boot_stub(
     let stub2 = BootStubCtx {
         runs_va,
         seed_va,
+        desc_va,
+        desc_size,
         vm_entry_va,
         vm_state_va,
         vm_prga_entry_va,
@@ -589,7 +785,11 @@ pub(crate) fn place_boot_stub(
     };
     let stub_code = build_rc4_block(&stub2)?;
     if stub_code.len() != stub_code_len {
-        anyhow::bail!("boot stub size changed after VA fixup: {} vs {}", stub_code.len(), stub_code_len);
+        anyhow::bail!(
+            "boot stub size changed after VA fixup: {} vs {}",
+            stub_code.len(),
+            stub_code_len
+        );
     }
 
     // 안티디버그 블록 + RC4 블록 결합 (길이 확정용)
@@ -602,7 +802,8 @@ pub(crate) fn place_boot_stub(
     if stub_end > boot_off + BOOT_AREA_RESERVE {
         return Err(anyhow::anyhow!(
             "Boot stub too large: {} bytes (reserve {})",
-            full_stub.len(), BOOT_AREA_RESERVE
+            full_stub.len(),
+            BOOT_AREA_RESERVE
         ));
     }
 
@@ -611,7 +812,13 @@ pub(crate) fn place_boot_stub(
     let boot_data_end = if ctx.iat_hide || ctx.mem_harden {
         iat_end
     } else {
-        seed_off + 256 + if integrity_effective { 4 + 8 } else { 0 }
+        seed_off
+            + 256
+            + if integrity_effective {
+                4 + 8 + 4 + 4 + 4 + 4
+            } else {
+                0
+            }
     };
     if runs_off < stub_end || boot_data_end > boot_off + BOOT_AREA_RESERVE {
         return Err(anyhow::anyhow!(
@@ -644,6 +851,8 @@ pub(crate) fn place_boot_stub(
         .max(runs_off + 8 + total_num_runs * 16)
         .max(text_runs_off + text_runs_block)
         .max(boot_data_end);
+    println!("[DEBUG boot_end] stub_end={} vm_prog_off={} vm_prog_total={} prog_end={} boot_data_end={} boot_end={}",
+        stub_end, vm_prog_off, vm_prog_total, vm_prog_off + vm_prog_total + vm_prog_call_stack, boot_data_end, boot_end);
     let old_section_len = btg.bytes.len();
     let new_section_len = (boot_end + 0xFF) & !0xFF;
     if new_section_len < old_section_len {
@@ -694,10 +903,18 @@ pub(crate) fn place_boot_stub(
     // ── 3rd pass: 최종 스텁 (payload_va + crc_va 반영) ─────────────────────────
     let crc_va = dispatcher_va + (seed_off + 256) as u64;
     let mac_va = dispatcher_va + (seed_off + 260) as u64;
+    let crc2_va = dispatcher_va + (seed_off + 268) as u64;
+    let w32_slot_va = dispatcher_va + (seed_off + 272) as u64;
+    let crc3_va = dispatcher_va + (seed_off + 276) as u64;
+    let crc4_va = dispatcher_va + (seed_off + 280) as u64;
     let stub3 = BootStubCtx {
         payload_va,
         crc_va,
         mac_va,
+        crc2_va,
+        crc3_va,
+        crc4_va,
+        w32_slot_va,
         // M6 Phase-2.3: at-rest 암호화 대상 VA/길이 확정 (imm64/imm32 — 길이 불변)
         vm_oep_bc_va: vm_prog_bc_va,
         vm_oep_bc_len: vm_prog_bc_len,
@@ -724,7 +941,24 @@ pub(crate) fn place_boot_stub(
         mem_ntdll_name_va: mem_ntdll_va,
         mem_ntprot_name_va: mem_ntprot_va,
         mem_code_base: dispatcher_va,
-        mem_code_size: ((new_section_len as u64) + 0xFFF) & !0xFFF,
+        // Program-VM state starts on its own page.  Seal only the immutable
+        // prefix; state/call-stack/import slots remain writable.
+        mem_code_size: if vm_prog_state_va > dispatcher_va {
+            vm_prog_state_va - dispatcher_va
+        } else {
+            ((new_section_len as u64) + 0xFFF) & !0xFFF
+        },
+        mem_state_base: if vm_prog_state_va > dispatcher_va {
+            vm_prog_state_va
+        } else {
+            0
+        },
+        mem_state_size: if vm_prog_state_va > dispatcher_va {
+            ((dispatcher_va + new_section_len as u64 + 0xFFF) & !0xFFF)
+                .saturating_sub(vm_prog_state_va)
+        } else {
+            0
+        },
         ..stub2
     };
     let stub_code_final = build_rc4_block(&stub3)?;
@@ -739,7 +973,11 @@ pub(crate) fn place_boot_stub(
     full_stub_final.extend_from_slice(&ad_bytes);
     full_stub_final.extend_from_slice(&stub_code_final);
     if full_stub_final.len() != full_stub.len() {
-        anyhow::bail!("boot stub final length mismatch: {} vs {}", full_stub_final.len(), full_stub.len());
+        anyhow::bail!(
+            "boot stub final length mismatch: {} vs {}",
+            full_stub_final.len(),
+            full_stub.len()
+        );
     }
 
     // 부트 스텁 복사
@@ -749,7 +987,11 @@ pub(crate) fn place_boot_stub(
     if c1_mode {
         // blob은 최종 VA(c1_state_va/c1_sbox_va)로 재생성 — 길이는 1차와 동일.
         let blob = crate::crypto::native::emit_btg_crypt_blob(c1_state_va, c1_sbox_va);
-        debug_assert_eq!(blob.len(), c1_blob_len, "BTG-C1 blob length must be VA-independent");
+        debug_assert_eq!(
+            blob.len(),
+            c1_blob_len,
+            "BTG-C1 blob length must be VA-independent"
+        );
         btg.bytes[c1_blob_off..c1_blob_off + blob.len()].copy_from_slice(&blob);
         // S-box 상수 테이블 (패커가 기록 — 스텁 emit_c1_init은 상태만 초기화)
         let sbox = crate::crypto::nonlinear::sbox();
@@ -758,7 +1000,10 @@ pub(crate) fn place_boot_stub(
         btg.bytes[c1_state_off..c1_state_off + C1_STATE_SIZE].fill(0);
         println!(
             "[+] v60 BTG-C1: crypt blob @0x{:X} ({}B), sbox @0x{:X}, state @0x{:X}",
-            c1_blob_off, blob.len(), c1_sbox_off, c1_state_off
+            c1_blob_off,
+            blob.len(),
+            c1_sbox_off,
+            c1_state_off
         );
     }
 
@@ -766,43 +1011,60 @@ pub(crate) fn place_boot_stub(
     if chacha_mode {
         // blob은 최종 VA(chacha_state_va)로 재생성 — 길이는 1차와 동일.
         let blob = crate::crypto::chacha20_native::emit_chacha20_blob(chacha_state_va);
-        debug_assert_eq!(blob.len(), chacha_blob_len, "ChaCha20 blob length must be VA-independent");
+        debug_assert_eq!(
+            blob.len(),
+            chacha_blob_len,
+            "ChaCha20 blob length must be VA-independent"
+        );
         btg.bytes[chacha_blob_off..chacha_blob_off + blob.len()].copy_from_slice(&blob);
         // 상태 버퍼는 0으로 초기화 (스텁 emit_chacha_init이 런타임에 key/ctr/nonce/ks_off 기록)
         let st_size = crate::crypto::chacha20::CHA_STATE_SIZE;
         btg.bytes[chacha_state_off..chacha_state_off + st_size].fill(0);
         println!(
             "[+] v63 ChaCha20: crypt blob @0x{:X} ({}B), state @0x{:X}",
-            chacha_blob_off, blob.len(), chacha_state_off
+            chacha_blob_off,
+            blob.len(),
+            chacha_state_off
         );
     }
 
     // ── T3-1 Phase D: Poly1305 verify blob + 키/태그 기록 (chacha 경로) ────────
     if chacha_mode {
         let blob = crate::crypto::poly1305_native::emit_poly1305_verify_blob(0);
-        debug_assert_eq!(blob.len(), poly_blob_len, "Poly1305 blob length must be VA-independent");
+        debug_assert_eq!(
+            blob.len(),
+            poly_blob_len,
+            "Poly1305 blob length must be VA-independent"
+        );
         btg.bytes[poly_blob_off..poly_blob_off + blob.len()].copy_from_slice(&blob);
-        if let Some(k) = chacha_aead_key {
-            btg.bytes[poly_key_off..poly_key_off + 32].copy_from_slice(&k);
-        }
+        btg.bytes[poly_key_off..poly_key_off + 32].fill(0);
         if let Some(t) = chacha_aead_tag {
             btg.bytes[poly_tag_off..poly_tag_off + 16].copy_from_slice(&t);
         }
         println!(
-            "[+] T3-1 Phase D: Poly1305 verify blob @0x{:X} ({}B), AEAD key @0x{:X}, tag @0x{:X}",
-            poly_blob_off, blob.len(), poly_key_off, poly_tag_off
+            "[+] T3-1 Phase D: Poly1305 verify blob @0x{:X} ({}B), runtime key scratch @0x{:X}, tag @0x{:X}",
+            poly_blob_off,
+            blob.len(),
+            poly_key_off,
+            poly_tag_off
         );
     }
 
     // ── VM 모듈 배치 (최종 VA로 재생성 후 복사) ───────────────────────────────
     if let Some(m) = vm_mod {
         let vm_va = dispatcher_va + vm_off as u64;
-        let mode = if c1_mode { vm::handlers::EntryMode::C1Init } else { vm::handlers::EntryMode::Ksa };
-        let module = build_vm_mod(m8_mod, 
+        let mode = if c1_mode {
+            vm::handlers::EntryMode::C1Init
+        } else {
+            vm::handlers::EntryMode::Ksa
+        };
+        let plain_bc = vm_plain_bc.expect("vm_plain_bc must be present when vm_mod is Some");
+        let module = build_vm_mod(
+            m8_mod,
             vm_va,
             vm_va + m.code.len() as u64,
             vm_va + (m.code.len() + m.table.len()) as u64,
-            m.bytecode.clone(),
+            plain_bc,
             mode,
             rng,
         )?;
@@ -810,7 +1072,9 @@ pub(crate) fn place_boot_stub(
         if vm_end > boot_off + BOOT_AREA_RESERVE {
             return Err(anyhow::anyhow!(
                 "VM module too large: {} bytes at 0x{:X} (reserve 0x{:X})",
-                module.total_len(), vm_off, BOOT_AREA_RESERVE
+                module.total_len(),
+                vm_off,
+                BOOT_AREA_RESERVE
             ));
         }
         btg.bytes[vm_off..vm_off + module.code.len()].copy_from_slice(&module.code);
@@ -832,11 +1096,14 @@ pub(crate) fn place_boot_stub(
     // v19: PRGA VM 모듈 배치 (최종 VA로 재생성 후 복사)
     if let Some(m) = vm_prga_mod {
         let pva = dispatcher_va + vm_prga_off as u64;
-        let pmod = build_vm_mod(m8_mod, 
+        let plain_bc =
+            vm_prga_plain_bc.expect("vm_prga_plain_bc must be present when vm_prga_mod is Some");
+        let pmod = build_vm_mod(
+            m8_mod,
             pva,
             pva + m.code.len() as u64,
             pva + (m.code.len() + m.table.len()) as u64,
-            m.bytecode.clone(),
+            plain_bc,
             vm::handlers::EntryMode::Prga,
             rng,
         )?;
@@ -844,7 +1111,8 @@ pub(crate) fn place_boot_stub(
         if pend > boot_off + BOOT_AREA_RESERVE {
             return Err(anyhow::anyhow!(
                 "PRGA VM module too large: {} bytes at 0x{:X}",
-                pmod.total_len(), vm_prga_off
+                pmod.total_len(),
+                vm_prga_off
             ));
         }
         btg.bytes[vm_prga_off..vm_prga_off + pmod.code.len()].copy_from_slice(&pmod.code);
@@ -866,27 +1134,50 @@ pub(crate) fn place_boot_stub(
     // ── M6 Phase-2: 프로그램 VM 모듈 배치 (최종 VA로 재생성 후 복사) ──────────
     if let Some(m) = vm_prog_mod {
         let prva = dispatcher_va + vm_prog_off as u64;
-let prmod = build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed, 
-              prva,
-              prva + m.code.len() as u64,
-              prva + (m.code.len() + m.table.len()) as u64,
-              m.bytecode.clone(),
-              vm_prog_state_va,
-              vm_prog_ip_map.as_ref(),
-              m8_mod,
-              rng,
-          )?;
+        let plain_bc =
+            vm_prog_plain_bc.expect("vm_prog_plain_bc must be present when vm_prog_mod is Some");
+        let prmod = build_prog_vm_mod(
+            vm_commercial,
+            ctx.poly_vm_seed,
+            prva,
+            prva + m.code.len() as u64,
+            prva + (m.code.len() + m.table.len()) as u64,
+            plain_bc,
+            vm_prog_state_va,
+            vm_prog_ip_map.as_ref(),
+            vm_prog_superops.as_ref(),
+            &ctx.vm_prog_chunks,
+            m8_mod,
+            rng,
+        )?;
         let prend = vm_prog_off + prmod.total_len();
+        println!(
+            "[DEBUG pass2 prmod] code={} table={} bc={} total={} prend={} btg_len={}",
+            prmod.code.len(),
+            prmod.table.len(),
+            prmod.bytecode.len(),
+            prmod.total_len(),
+            prend,
+            btg.bytes.len()
+        );
         if prend > boot_off + BOOT_AREA_RESERVE {
             return Err(anyhow::anyhow!(
                 "Program VM module too large: {} bytes at 0x{:X}",
-                prmod.total_len(), vm_prog_off
+                prmod.total_len(),
+                vm_prog_off
             ));
         }
         btg.bytes[vm_prog_off..vm_prog_off + prmod.code.len()].copy_from_slice(&prmod.code);
         let t = vm_prog_off + prmod.code.len();
         btg.bytes[t..t + prmod.table.len()].copy_from_slice(&prmod.table);
         let b = t + prmod.table.len();
+        println!(
+            "[DEBUG copy bc] b={} bc_len={} b+bc_len={} btg_len={}",
+            b,
+            prmod.bytecode.len(),
+            b + prmod.bytecode.len(),
+            btg.bytes.len()
+        );
         btg.bytes[b..b + prmod.bytecode.len()].copy_from_slice(&prmod.bytecode);
         println!(
             "[+] M6 Phase-2 Program VM: module @0x{:X} (code {}B table {}B bytecode {}B state {}B) entry_va=0x{:X} state_va=0x{:X}",
@@ -901,6 +1192,31 @@ let prmod = build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed,
     }
 
     // ── M6 Phase-2.3: at-rest 암호화 적용 ───────────────────────────────────
+    // P1-4 M7 outer layer. The boot RC4 below wraps these bytes for at-rest
+    // transport and removes only that wrapper at startup; the per-chunk layer
+    // remains in memory and is unmasked byte-by-byte by the Program-VM decoder.
+    if ctx.m7 && !ctx.vm_prog_chunks.is_empty() && vm_prog_bc_len > 0 {
+        for chunk in &ctx.vm_prog_chunks {
+            let start = vm_prog_bc_off + chunk.offset as usize;
+            let end = start + chunk.len as usize;
+            if end > btg.bytes.len() {
+                return Err(anyhow::anyhow!(
+                    "P1-4 Program-VM chunk encryption OOB: {}..{} > {}",
+                    start,
+                    end,
+                    btg.bytes.len()
+                ));
+            }
+            vm::chunk_crypto::crypt_chunk(&mut btg.bytes[start..end], chunk.key);
+        }
+        let runtime_cipher = &btg.bytes[vm_prog_bc_off..vm_prog_bc_off + vm_prog_bc_len as usize];
+        ctx.vm_prog_runtime_cipher_hash = Some(crate::manifest::sha256_hex(runtime_cipher));
+        println!(
+            "[+] P1-4 Program-VM M7: outer encryption ACTIVE for {} chunk(s); runtime decoder unmasks fetched bytes only",
+            ctx.vm_prog_chunks.len()
+        );
+    }
+
     // fresh RC4(seed_stored) 하나로 .text → bytecode 순 연속 암호화. 부트 스텁의
     // emit_rest_decrypt가 같은 순서로 복호화한다. (.textb는 RWX, .text는 WRITE
     // 비트 추가로 in-place 복호화를 허용한다.)
@@ -932,8 +1248,11 @@ let prmod = build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed,
                      vm_prog_bc_off=0x{:X} len=0x{:X} but section is only 0x{:X}B \
                      (boot_end=0x{:X} new_section_len=0x{:X}). \
                      Likely vm_prog_off/vm_prog_total mismatch.",
-                    vm_prog_bc_off, vm_prog_bc_len, btg.bytes.len(),
-                    boot_end, new_section_len
+                    vm_prog_bc_off,
+                    vm_prog_bc_len,
+                    btg.bytes.len(),
+                    boot_end,
+                    new_section_len
                 ));
             }
             r.crypt(&mut btg.bytes[vm_prog_bc_off..bc_end]);
@@ -956,14 +1275,42 @@ let prmod = build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed,
     }
     if table_is_run {
         let e = runs_off + 8 + runs.len() * 16;
-        btg.bytes[e..e + 8]
-            .copy_from_slice(&(dispatcher_va + table_off as u64).to_le_bytes());
+        btg.bytes[e..e + 8].copy_from_slice(&(dispatcher_va + table_off as u64).to_le_bytes());
         btg.bytes[e + 8..e + 16].copy_from_slice(&(iat_table_blob.len() as u64).to_le_bytes());
     }
 
     // 시드 (masked)
     // v19: base-bound — 파일에는 seed_stored(=seed_masked ^ bind(preferred_base)) 저장.
     btg.bytes[seed_off..seed_off + 256].copy_from_slice(&seed_stored);
+
+    // ── M12 Decrypt-Descriptor: 정적 decrypt target/size/bytecode/table 주소를
+    // 부트 스텁 imm으로 노출하지 않고, 파생 키(RC4 keystream — 키 유도 계층)로 암호화해
+    // 이 디스크립터에 저장한다. 부트 스텁 emit_desc_decrypt가 KSA(키 유도) 직후 이
+    // 디스크립터를 PRGA로 복호화하고, 이어지는 코드/런/바이트코드 복호화가 그 값들을
+    // 메모리에서 읽는다 → 정적 분석으로 target/size가 노출되지 않는다.
+    let code_va = dispatcher_va + code_start as u64;
+    let mut desc = [0u8; DESC_SIZE];
+    desc[DESC_OFF_CODE_VA..DESC_OFF_CODE_VA + 8].copy_from_slice(&code_va.to_le_bytes());
+    desc[DESC_OFF_CODE_LEN..DESC_OFF_CODE_LEN + 8]
+        .copy_from_slice(&(code_len as u64).to_le_bytes());
+    desc[DESC_OFF_RUNS_VA..DESC_OFF_RUNS_VA + 8].copy_from_slice(&runs_va.to_le_bytes());
+    desc[DESC_OFF_NUM_RUNS..DESC_OFF_NUM_RUNS + 8]
+        .copy_from_slice(&(num_runs_u32 as u64).to_le_bytes());
+    desc[DESC_OFF_BC_VA..DESC_OFF_BC_VA + 8].copy_from_slice(&vm_prog_bc_va.to_le_bytes());
+    desc[DESC_OFF_BC_LEN..DESC_OFF_BC_LEN + 8]
+        .copy_from_slice(&(vm_prog_bc_len as u64).to_le_bytes());
+    desc[DESC_OFF_TEXT_RUNS_VA..DESC_OFF_TEXT_RUNS_VA + 8]
+        .copy_from_slice(&text_runs_va.to_le_bytes());
+    desc[DESC_OFF_TEXT_RUNS_COUNT..DESC_OFF_TEXT_RUNS_COUNT + 8]
+        .copy_from_slice(&(text_runs_count as u64).to_le_bytes());
+    btg.bytes[desc_off..desc_off + DESC_SIZE].copy_from_slice(&desc);
+    // crypto-on에서만 암호화 (부트 스텁 emit_desc_decrypt가 복호화). no_crypto는 평문으로
+    // 남기되 부트 스텁이 디스크립터를 읽지 않으므로 소비자는 imm64를 그대로 쓴다.
+    // [A/B] descriptor written plaintext (no encryption) for testing
+    // if !no_crypto {
+    //     let mut rc = Rc4::new(seed_masked);
+    //     rc.crypt(&mut btg.bytes[desc_off..desc_off + DESC_SIZE]);
+    // }
 
     // ── P5: .text at-rest decrypt run-table 기록 (부트 스텁 emit_rest_decrypt가 소비) ──
     if !text_enc_runs.is_empty() {
@@ -982,12 +1329,38 @@ let prmod = build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed,
         // T2-3: 키 결합 MAC — CRC32는 키 없는 손상검출용이라 변조 시 4바이트를 함께
         // 바꾸면 우회된다. seed_stored를 키로 코드 영역 keyed-MAC을 계산해 로그로
         // 남긴다 (변조 시 실행 거부용 — 부트 스텁 네이티브 검증은 별도 계층으로 확장).
-        let mac_val = crate::crypto::BtgKeyedMac::mac(seed_stored, crc_source.as_deref().unwrap_or(&[]));
-        println!("[+] T2-3 Integrity keyed-MAC over code region: {:016X} (keyed)", mac_val);
-        btg.bytes[seed_off + 256..seed_off + 260].copy_from_slice(&crc_val.to_le_bytes());
+        let mac_val =
+            crate::crypto::BtgKeyedMac::mac(seed_stored, crc_source.as_deref().unwrap_or(&[]));
+        println!(
+            "[+] T2-3 Integrity keyed-MAC over code region: {:016X} (keyed)",
+            mac_val
+        );
+        // S-hardening (multi-site + runtime-derived whiten): 저장값은 평문이 아니라
+        //   crc_stored = crc ^ mac_lo32 (CRC↔MAC 결합) / mac_stored = mac ^ W32 /
+        //   crc2_stored = crc ^ W32 (사이트 2). W32 = derive_integrity_key(seed_masked,
+        //   image_base) — runtime-derived multi-factor whiten (seed_masked 256B +
+        //   PEB ImageBaseAddress low/high bytes). 사이트 3/4는 W32 / rol(W32,13)로 결합.
+        let w32 = super::integrity::derive_integrity_key(seed_masked, image_base) as u64;
+        let crc_stored = crc_val ^ (mac_val as u32);
+        let mac_stored = mac_val ^ w32;
+        let crc2_stored = crc_val ^ (w32 as u32);
+        // S3/S4 확장: 사이트별로 다른 runtime-derived whiten 결합 —
+        //   crc3_stored = crc ^ W32 / crc4_stored = crc ^ rol(W32,13).
+        let crc3_stored = crc_val ^ (w32 as u32);
+        // The native CRC4 verifier loads only the low dword into R11D and
+        // executes `rol r11d, 13`.  Rotate that same 32-bit value here.  A
+        // 64-bit rotate followed by truncation folds different high bits into
+        // the result and made every untouched image fail CRC4 at runtime.
+        let crc4_stored = super::integrity::crc4_stored_value(crc_val, w32 as u32);
+        btg.bytes[seed_off + 256..seed_off + 260].copy_from_slice(&crc_stored.to_le_bytes());
         // S1: keyed-MAC(8B)를 crc 뒤 seed_off+260에 저장 — 부트 스텁이 런타임에
         // 재계산·비교 (불일치 시 ud2). 키 = seed_stored.
-        btg.bytes[seed_off + 260..seed_off + 268].copy_from_slice(&mac_val.to_le_bytes());
+        btg.bytes[seed_off + 260..seed_off + 268].copy_from_slice(&mac_stored.to_le_bytes());
+        btg.bytes[seed_off + 268..seed_off + 272].copy_from_slice(&crc2_stored.to_le_bytes());
+        // w32_slot(seed_off+272)은 런타임이 W32를 저장하는 스크래치 — 파일에는 0.
+        btg.bytes[seed_off + 272..seed_off + 276].fill(0);
+        btg.bytes[seed_off + 276..seed_off + 280].copy_from_slice(&crc3_stored.to_le_bytes());
+        btg.bytes[seed_off + 280..seed_off + 284].copy_from_slice(&crc4_stored.to_le_bytes());
         println!(
             "[+] S1 Integrity keyed-MAC stored @0x{:X} (8B, keyed=seed_stored; boot stub re-verifies -> ud2 on mismatch)",
             seed_off + 260
@@ -1001,7 +1374,9 @@ let prmod = build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed,
 
     // ── v6: 더미 import / 리졸브 테이블 / mem 문자열 기록 ────────────────────
     if ctx.iat_hide || ctx.mem_harden {
-        btg.bytes[dummy_off..dummy_off + dummy_blob.len()].copy_from_slice(&dummy_blob);
+        if !dummy_blob.is_empty() {
+            btg.bytes[dummy_off..dummy_off + dummy_blob.len()].copy_from_slice(&dummy_blob);
+        }
         if !iat_table_blob.is_empty() {
             btg.bytes[table_off..table_off + iat_table_blob.len()].copy_from_slice(&iat_table_blob);
             // v9: crypto-on에서만 리졸브 테이블을 마지막 run으로 암호화한다.
@@ -1015,7 +1390,8 @@ let prmod = build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed,
             let dll = b"ntdll.dll\0";
             let fname = b"NtProtectVirtualMemory\0";
             btg.bytes[mem_off..mem_off + dll.len()].copy_from_slice(dll);
-            btg.bytes[mem_off + dll.len()..mem_off + dll.len() + fname.len()].copy_from_slice(fname);
+            btg.bytes[mem_off + dll.len()..mem_off + dll.len() + fname.len()]
+                .copy_from_slice(fname);
         }
         println!(
             "[+] v6 IAT/Mem data placed: dummy_import@0x{:X} (dir_rva=0x{:X}), table@0x{:X}/{}B, mem_str@0x{:X}",
@@ -1035,7 +1411,11 @@ let prmod = build_prog_vm_mod(vm_commercial, ctx.poly_vm_seed,
 
     println!(
         "[+] v3 Crypto: boot stub @0x{:X} ({} bytes), runs @0x{:X}, seed @0x{:X}, entry=0x{:X}",
-        boot_off, full_stub.len(), runs_off, seed_off, ctx.boot_entry_offset
+        boot_off,
+        full_stub.len(),
+        runs_off,
+        seed_off,
+        ctx.boot_entry_offset
     );
 
     // ── v4: .vdata 페이로드 섹션 등록 (빌더가 .textb 직후 배치) ───────────────

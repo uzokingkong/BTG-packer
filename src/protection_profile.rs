@@ -12,8 +12,8 @@
 //
 // 기존 main.rs 의 규칙을 **의미 보존**하며 옮겼다:
 //  * `--full`은 부족한 플래그를 채운다 (개별 플래그 우선, OR).
-//  * `--vm-oep`는 `--dispatcher-reencrypt`/`--iat-hide`/`--mem-harden`을 무력화
-//    (전체 프로그램 VM 가상화는 per-block 디스패치/IAT 은닉/RX 전환과 배타적).
+//  * `--vm-oep`는 네이티브 block dispatcher re-encryption만 무력화한다.
+//    IAT hiding과 post-bootstrap RX sealing은 Program-VM과 함께 적용된다.
 //  * `--dispatcher-reencrypt`는 `--mem-harden`을 무력화 (재암호화는 .textb 쓰기 필요).
 //  * `--m7`(on-demand 재암호화)는 crypto + 비-VM일 때만 유효.
 //  * crypto off면 `--vm`/`--vm-oep`/`--m7`/`--chained-crypto`/`--integrity` 비활성.
@@ -174,24 +174,19 @@ pub fn resolve(req: &RequestedConfig) -> ResolveOutcome {
     let payload_relocate = req.payload_relocate || full;
     let rsrc_register = req.rsrc_register || full;
 
-    let iat_hide = (req.iat_hide || full) && !vm_oep_requested;
-    if (req.iat_hide || full) && vm_oep_requested {
-        warnings.push(
-            "--vm-oep takes precedence over --iat-hide (implied by --full): IAT hiding skipped (incompatible with full-program VM virtualization / TLS-callback targets)".into(),
-        );
-    }
+    // P1-6: the Program-VM bridge and import resolver share the same original
+    // IAT slots, so hiding is orthogonal to VM ownership.  Do not silently
+    // downgrade this protection when --vm-oep is selected.
+    let iat_hide = req.iat_hide || full;
 
     // --dispatcher-reencrypt 는 .textb 에 쓰기 권한이 계속 필요하므로 mem-harden 의
-    // RX 전환과 배타적. --vm-oep 도 프로그램 VM 런타임과 배타적. (dispatcher_reencrypt
-    // 는 vm_oep_requested 시 이미 false 이므로 아래 if/else-if 는 상호 배타.)
-    let mem_harden = (req.mem_harden || full) && !dispatcher_reencrypt && !vm_oep_requested;
+    // RX 전환과 배타적. Program-VM bytecode is ciphertext/read-only at runtime
+    // and mutable VM state is separately owned, so vm-oep itself is not a
+    // reason to suppress the post-bootstrap RX seal (P1-5).
+    let mem_harden = (req.mem_harden || full) && !dispatcher_reencrypt;
     if (req.mem_harden || full) && dispatcher_reencrypt {
         warnings.push(
             "--dispatcher-reencrypt takes precedence over --mem-harden: runtime per-block decryption needs writable .textb (RX transition skipped)".into(),
-        );
-    } else if (req.mem_harden || full) && vm_oep_requested {
-        warnings.push(
-            "--vm-oep takes precedence over --mem-harden (implied by --full): .textb RX switch skipped (incompatible with the program VM's runtime)".into(),
         );
     }
 
@@ -199,10 +194,14 @@ pub fn resolve(req: &RequestedConfig) -> ResolveOutcome {
 
     let crypto_enabled = !req.no_crypto;
     let vm_enabled = (req.vm || req.vm_oep) && crypto_enabled;
-    let m7_effective = req.m7 && crypto_enabled && !vm_enabled;
     let vm_oep_effective = req.vm_oep && vm_enabled;
     let vm_commercial = req.vm_commercial && req.vm_oep && vm_enabled;
-    let reencrypt = dispatcher_reencrypt || m7_effective;
+    let native_m7 = req.m7 && crypto_enabled && !vm_enabled;
+    let program_vm_m7 = req.m7 && crypto_enabled && vm_commercial;
+    let m7_effective = native_m7 || program_vm_m7;
+    // Native M7 reuses the shuffled-block dispatcher. Program-VM M7 has its
+    // own bytecode chunk lifecycle and must not disable vm_effective below.
+    let reencrypt = dispatcher_reencrypt || native_m7;
     // v63 (T3-1 Phase B): --crypto-mode 명시 시 우선, 없으면 레거시 플래그로 파생.
     // custom_cipher도 명시 선택과 일치시켜, 재암호화/m7 등 커스텀 암호 경로가
     // 사용자가 선택한 primitive와 어긋나지 않게 한다.
@@ -236,10 +235,14 @@ pub fn resolve(req: &RequestedConfig) -> ResolveOutcome {
         );
     }
     if !crypto_enabled && req.chained_crypto {
-        warnings.push("--chained-crypto requires the crypto layer; ignoring (use without --no-crypto)".into());
+        warnings.push(
+            "--chained-crypto requires the crypto layer; ignoring (use without --no-crypto)".into(),
+        );
     }
     if !crypto_enabled && integrity {
-        warnings.push("--integrity requires the crypto layer; ignoring (use without --no-crypto)".into());
+        warnings.push(
+            "--integrity requires the crypto layer; ignoring (use without --no-crypto)".into(),
+        );
     }
     if dispatcher_reencrypt && !crypto_enabled {
         errors.push(ResolveError::DispatcherReencryptRequiresCrypto);
@@ -255,11 +258,13 @@ pub fn resolve(req: &RequestedConfig) -> ResolveOutcome {
         );
     }
     if (req.vm || req.vm_oep) && !crypto_enabled {
-        warnings.push("--vm / --vm-oep requires the crypto layer; ignoring (use without --no-crypto)".into());
+        warnings.push(
+            "--vm / --vm-oep requires the crypto layer; ignoring (use without --no-crypto)".into(),
+        );
     }
     if req.m7 && !m7_effective {
         warnings.push(
-            "--m7 (on-demand re-encrypt) requires the crypto layer and conflicts with --vm / --vm-oep (per-block dispatcher vs bulk-decrypt boot flow); ignored (--dispatcher-reencrypt and --m7 now share the M7 on-demand re-encrypt dispatcher)".into(),
+            "--m7 requires crypto and either native mode or --vm --vm-oep --vm-commercial; ignored for this profile".into(),
         );
     }
     if req.rc4 && req.custom_cipher {
@@ -351,7 +356,10 @@ mod tests {
         assert!(!c.vm_enabled);
         assert!(!c.vm_oep);
         assert!(!c.reencrypt);
-        assert!(c.needs_boot_stub, "crypto on by default -> boot stub needed");
+        assert!(
+            c.needs_boot_stub,
+            "crypto on by default -> boot stub needed"
+        );
         assert_eq!(c.obf_level, 2);
         assert_eq!(c.custom_cipher, true, "default cipher is BTG-C1");
     }
@@ -370,13 +378,19 @@ mod tests {
         assert!(c.payload_relocate);
         assert!(c.rsrc_register);
         assert!(c.iat_hide);
-        assert!(!c.mem_harden, "--full implies dispatcher-reencrypt which disables mem-harden");
+        assert!(
+            !c.mem_harden,
+            "--full implies dispatcher-reencrypt which disables mem-harden"
+        );
         assert_eq!(c.obf_level, 3);
         assert!(c.needs_boot_stub);
-        assert!(o.warnings.iter().any(|w| w.contains("mem-harden")), "mem-harden suppressed warning");
+        assert!(
+            o.warnings.iter().any(|w| w.contains("mem-harden")),
+            "mem-harden suppressed warning"
+        );
     }
 
-    /// --full --vm-oep → vm-oep 가 dispatcher-reencrypt/iat-hide/mem-harden 을 무력화.
+    /// --full --vm-oep → native dispatcher만 제외하고 IAT/W^X 보호는 유지.
     #[test]
     fn resolve_full_vm_oep_precedence() {
         let mut r = base();
@@ -386,12 +400,35 @@ mod tests {
         let o = resolve(&r);
         let c = o.config;
         assert!(o.errors.is_empty());
-        assert!(!c.dispatcher_reencrypt, "vm-oep disables dispatcher-reencrypt");
-        assert!(!c.iat_hide, "vm-oep disables iat-hide");
-        assert!(!c.mem_harden, "vm-oep disables mem-harden");
+        assert!(
+            !c.dispatcher_reencrypt,
+            "vm-oep disables dispatcher-reencrypt"
+        );
+        assert!(c.iat_hide, "vm-oep composes with iat-hide");
+        assert!(c.mem_harden, "vm-oep composes with mem-harden");
         assert!(c.vm_enabled);
         assert!(c.vm_oep);
-        assert!(o.warnings.iter().any(|w| w.contains("vm-oep takes precedence")), "precedence warnings emitted");
+        assert!(
+            o.warnings
+                .iter()
+                .any(|w| w.contains("vm-oep takes precedence")),
+            "dispatcher precedence warning emitted"
+        );
+    }
+
+    #[test]
+    fn resolve_vm_oep_composes_with_iat_and_mem_hardening() {
+        let mut r = base();
+        r.vm_oep = true;
+        r.iat_hide = true;
+        r.mem_harden = true;
+        let o = resolve(&r);
+        assert!(o.errors.is_empty());
+        assert!(o.config.vm_oep);
+        assert!(o.config.iat_hide);
+        assert!(o.config.mem_harden);
+        assert!(!o.warnings.iter().any(|w| w.contains("IAT hiding skipped")));
+        assert!(!o.warnings.iter().any(|w| w.contains("RX switch skipped")));
     }
 
     /// --vm-oep 단독 (vm 미지정) → vm_enabled (vm_oep 가 vm 을 함의), vm_oep 유효.
@@ -422,7 +459,10 @@ mod tests {
         assert!(!c.vm_enabled);
         assert!(!c.vm_oep);
         assert!(!c.m7);
-        assert!(o.warnings.iter().any(|w| w.contains("requires the crypto layer")));
+        assert!(o
+            .warnings
+            .iter()
+            .any(|w| w.contains("requires the crypto layer")));
     }
 
     /// --m7 (crypto, 비-VM) → m7/reencrypt 유효.
@@ -437,7 +477,7 @@ mod tests {
         assert!(c.reencrypt, "m7 shares the per-block reencrypt path");
     }
 
-    /// --m7 + --vm → m7 무효 (vm 우선), 경고.
+    /// --m7 + selective --vm (no Program-VM) remains unsupported.
     #[test]
     fn resolve_m7_with_vm() {
         let mut r = base();
@@ -445,7 +485,28 @@ mod tests {
         r.vm = true;
         let o = resolve(&r);
         assert!(!o.config.m7);
-        assert!(o.warnings.iter().any(|w| w.contains("conflicts with --vm")));
+        assert!(o
+            .warnings
+            .iter()
+            .any(|w| w.contains("--vm --vm-oep --vm-commercial")));
+    }
+
+    #[test]
+    fn resolve_m7_with_commercial_program_vm_keeps_vm_path() {
+        let mut r = base();
+        r.m7 = true;
+        r.vm = true;
+        r.vm_oep = true;
+        r.vm_commercial = true;
+        let o = resolve(&r);
+        assert!(o.errors.is_empty());
+        assert!(o.config.m7);
+        assert!(o.config.vm_oep);
+        assert!(o.config.vm_commercial);
+        assert!(
+            !o.config.reencrypt,
+            "Program-VM M7 must not select native block reencrypt"
+        );
     }
 
     /// --dispatcher-reencrypt + --mem-harden → mem-harden 무효.
@@ -459,7 +520,10 @@ mod tests {
         assert!(o.errors.is_empty());
         assert!(c.dispatcher_reencrypt);
         assert!(!c.mem_harden);
-        assert!(o.warnings.iter().any(|w| w.contains("dispatcher-reencrypt takes precedence over --mem-harden")));
+        assert!(o
+            .warnings
+            .iter()
+            .any(|w| w.contains("dispatcher-reencrypt takes precedence over --mem-harden")));
     }
 
     /// --rsrc-register 단독 → 하드 에러.
@@ -468,7 +532,9 @@ mod tests {
         let mut r = base();
         r.rsrc_register = true;
         let o = resolve(&r);
-        assert!(o.errors.contains(&ResolveError::RsrcRegisterRequiresPayloadRelocate));
+        assert!(o
+            .errors
+            .contains(&ResolveError::RsrcRegisterRequiresPayloadRelocate));
     }
 
     /// --rsrc-register + --payload-relocate → 에러 없음.
@@ -490,7 +556,9 @@ mod tests {
         r.dispatcher_reencrypt = true;
         r.no_crypto = true;
         let o = resolve(&r);
-        assert!(o.errors.contains(&ResolveError::DispatcherReencryptRequiresCrypto));
+        assert!(o
+            .errors
+            .contains(&ResolveError::DispatcherReencryptRequiresCrypto));
     }
 
     /// --rc4 → custom_cipher=false, --custom-cipher 동시 지정 시 경고.
@@ -501,7 +569,10 @@ mod tests {
         r.custom_cipher = true;
         let o = resolve(&r);
         assert!(!o.config.custom_cipher, "--rc4 forces RC4");
-        assert!(o.warnings.iter().any(|w| w.contains("--rc4 takes precedence")));
+        assert!(o
+            .warnings
+            .iter()
+            .any(|w| w.contains("--rc4 takes precedence")));
     }
 
     /// --m8 는 vm_enabled 일 때만 유효.
@@ -526,8 +597,14 @@ mod tests {
         r.rc4 = true; // 레거시 플래그와 충돌 — --crypto-mode가 우선
         let o = resolve(&r);
         assert_eq!(o.config.crypto_mode, CryptoMode::ChaCha20);
-        assert!(o.config.custom_cipher, "custom_cipher stays true (chacha는 custom path 아님 — 평문 bulk 전용)");
-        assert!(o.warnings.iter().any(|w| w.contains("--crypto-mode chacha20 takes precedence over --rc4")));
+        assert!(
+            o.config.custom_cipher,
+            "custom_cipher stays true (chacha는 custom path 아님 — 평문 bulk 전용)"
+        );
+        assert!(o
+            .warnings
+            .iter()
+            .any(|w| w.contains("--crypto-mode chacha20 takes precedence over --rc4")));
     }
 
     /// --crypto-mode rc4 → RC4, --custom-cipher보다 우선 + 경고.
@@ -539,7 +616,10 @@ mod tests {
         let o = resolve(&r);
         assert_eq!(o.config.crypto_mode, CryptoMode::Rc4);
         assert!(!o.config.custom_cipher, "--crypto-mode rc4 forces RC4");
-        assert!(o.warnings.iter().any(|w| w.contains("--crypto-mode rc4 takes precedence over --custom-cipher")));
+        assert!(o
+            .warnings
+            .iter()
+            .any(|w| w.contains("--crypto-mode rc4 takes precedence over --custom-cipher")));
     }
 
     /// 기본 (플래그 없음) → C1 (기본 cipher).

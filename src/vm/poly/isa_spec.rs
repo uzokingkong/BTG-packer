@@ -6,6 +6,7 @@
 // 정적 시그니처 분석 및 자동 디컴파일 도구를 완전히 무력화한다.
 // ==============================================================================
 
+use super::architecture_family::{family_isa_seed, VmArchitectureFamily, VmFamilyProfile};
 use crate::vm::risc::{BranchCondition, RiscOp};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::collections::HashMap;
@@ -13,6 +14,10 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct VirtualIsaSpec {
     pub seed: u64,
+    /// Architecture family is part of the ISA identity, not merely metadata.
+    /// Its domain separator changes every generated opcode/register/condition map.
+    pub family: VmArchitectureFamily,
+    pub family_profile: VmFamilyProfile,
     /// 전체 도달 가능한 RiscOp 집합에 매핑되는 무작위 1바이트 Opcode.
     /// 메모리 폭(MemoryRead/MemoryWrite)은 폭별로 서로 다른 Opcode를 갖고,
     /// VirtualBranch 는 조건과 무관한 단일 Opcode 를 갖는다(조건은 `branch_cond_map`).
@@ -35,7 +40,11 @@ const COUNTER_WIDTHS: [u8; 3] = [2, 4, 8];
 
 impl VirtualIsaSpec {
     pub fn from_seed(seed: u64) -> Self {
-        let mut rng = StdRng::seed_from_u64(seed);
+        Self::from_seed_and_family(seed, VmArchitectureFamily::for_build(seed))
+    }
+
+    pub fn from_seed_and_family(seed: u64, family: VmArchitectureFamily) -> Self {
+        let mut rng = StdRng::seed_from_u64(family_isa_seed(seed, family));
 
         // 1. Generate unique random opcodes for the ENTIRE reachable RiscOp set.
         //    기존 11개 매핑(Nor/AddWithCarry/ShiftRight/ShiftLeft/VirtualPush/
@@ -47,6 +56,9 @@ impl VirtualIsaSpec {
         ops.push(RiscOp::AddWithCarry);
         ops.push(RiscOp::ShiftRight);
         ops.push(RiscOp::ArithmeticShiftRight);
+        for w in [1u8, 2, 4, 8] {
+            ops.push(RiscOp::RotateLeft { width: w });
+        }
         ops.push(RiscOp::ShiftLeft);
         ops.push(RiscOp::VirtualPush);
         ops.push(RiscOp::VirtualPop);
@@ -64,6 +76,7 @@ impl VirtualIsaSpec {
         ops.push(RiscOp::NativeCallBridge);
         ops.push(RiscOp::SetFlag);
         ops.push(RiscOp::Halt);
+        ops.push(RiscOp::Trap);
         ops.push(RiscOp::VirtualRet);
         ops.push(RiscOp::Mov);
         // P2: 정수/비트/제어 복합 연산 — 부호/폭/모드별로 별도 Opcode.
@@ -111,10 +124,63 @@ impl VirtualIsaSpec {
         for w in [1u8, 2, 4, 8] {
             ops.push(RiscOp::Add { width: w });
             ops.push(RiscOp::SubWithBorrow { width: w });
+            ops.push(RiscOp::Adc { width: w });
+            ops.push(RiscOp::Sbb { width: w });
             ops.push(RiscOp::Inc { width: w });
             ops.push(RiscOp::Dec { width: w });
             ops.push(RiscOp::Not { width: w });
         }
+        // P1: legacy 128-bit packed SSE. Width/lane metadata is part of the
+        // opcode identity so native dispatch cannot confuse differently sized
+        // lane operations after opcode randomization.
+        ops.push(RiscOp::PackedMove);
+        for (elem_width, lanes) in [(1u8, 16u8), (2, 8), (4, 4), (8, 2)] {
+            ops.push(RiscOp::PackedAdd { elem_width, lanes });
+            ops.push(RiscOp::PackedSub { elem_width, lanes });
+            ops.push(RiscOp::PackedCmpEq { elem_width, lanes });
+            ops.push(RiscOp::PackedCmpGt { elem_width, lanes });
+        }
+        ops.push(RiscOp::PackedXor);
+        ops.push(RiscOp::PackedAnd);
+        ops.push(RiscOp::PackedOr);
+        ops.push(RiscOp::PackedAndNot);
+        for elem_width in [1u8, 2, 4, 8] {
+            ops.push(RiscOp::PackedUnpack {
+                elem_width,
+                high: false,
+            });
+            ops.push(RiscOp::PackedUnpack {
+                elem_width,
+                high: true,
+            });
+        }
+        ops.push(RiscOp::PackedShiftRightQ);
+        ops.push(RiscOp::PackedShuffle { low_words: false });
+        ops.push(RiscOp::PackedShuffle { low_words: true });
+        for width in [2u8, 4, 8] {
+            ops.push(RiscOp::DoubleShiftLeft { width });
+        }
+        for width in [4u8, 8] {
+            for modify in [0u8, 1, 2] {
+                ops.push(RiscOp::BitTest {
+                    width,
+                    modify,
+                    memory: false,
+                });
+                ops.push(RiscOp::BitTest {
+                    width,
+                    modify,
+                    memory: true,
+                });
+            }
+        }
+        ops.push(RiscOp::PackedMovMaskBytes);
+        ops.push(RiscOp::PackedMovMaskPs);
+        ops.push(RiscOp::PackedInsertWord);
+        ops.push(RiscOp::CpuId);
+        ops.push(RiscOp::XGetBv);
+        ops.push(RiscOp::ReadSegmentBase { gs: false });
+        ops.push(RiscOp::ReadSegmentBase { gs: true });
         // R4: SSE/FPU 스칼라 — FloatAdd/Sub/Mul/Div{4,8} + IntToFloat/FloatToInt/
         // FloatToFloat (모든 reachable src/dst_bits·truncate 조합). 이전에는 isa_spec
         // 미포함 → `is_encodable`=false → `--vm-commercial`이 FP 포함 함수를 통째로
@@ -128,10 +194,20 @@ impl VirtualIsaSpec {
         }
         for sb in [4u8, 8] {
             for db in [4u8, 8] {
-                ops.push(RiscOp::IntToFloat { src_bits: sb, dst_bits: db });
-                ops.push(RiscOp::FloatToFloat { src_bits: sb, dst_bits: db });
+                ops.push(RiscOp::IntToFloat {
+                    src_bits: sb,
+                    dst_bits: db,
+                });
+                ops.push(RiscOp::FloatToFloat {
+                    src_bits: sb,
+                    dst_bits: db,
+                });
                 for t in [false, true] {
-                    ops.push(RiscOp::FloatToInt { src_bits: sb, dst_bits: db, truncate: t });
+                    ops.push(RiscOp::FloatToInt {
+                        src_bits: sb,
+                        dst_bits: db,
+                        truncate: t,
+                    });
                 }
             }
         }
@@ -218,6 +294,8 @@ impl VirtualIsaSpec {
 
         Self {
             seed,
+            family,
+            family_profile: family.profile(),
             opcode_map,
             reverse_opcode_map,
             branch_cond_map,
@@ -280,7 +358,9 @@ impl VirtualIsaSpec {
     pub fn is_encodable(op: RiscOp) -> bool {
         use std::sync::OnceLock;
         static SPEC: OnceLock<VirtualIsaSpec> = OnceLock::new();
-        SPEC.get_or_init(|| VirtualIsaSpec::from_seed(0)).opcode_for(op).is_some()
+        SPEC.get_or_init(|| VirtualIsaSpec::from_seed(0))
+            .opcode_for(op)
+            .is_some()
     }
 }
 
@@ -301,9 +381,7 @@ mod tests {
         }
 
         // 산술 시프트 · 브랜치 · 네이티브 콜 브리지 존재
-        assert!(spec
-            .opcode_for(RiscOp::ArithmeticShiftRight)
-            .is_some());
+        assert!(spec.opcode_for(RiscOp::ArithmeticShiftRight).is_some());
         assert!(spec
             .opcode_for(RiscOp::VirtualBranch {
                 cond: BranchCondition::Always

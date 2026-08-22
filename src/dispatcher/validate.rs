@@ -120,7 +120,9 @@ fn inst_rsp_delta(inst: &Instruction) -> i64 {
                 0
             }
         }
-        Code::Lea_r64_m if inst.op0_register() == Register::RSP => inst.memory_displacement64() as i64,
+        Code::Lea_r64_m if inst.op0_register() == Register::RSP => {
+            inst.memory_displacement64() as i64
+        }
         Code::Retnq | Code::Retnq_imm16 => 8,
         _ => 0,
     }
@@ -160,7 +162,9 @@ fn validate_stack_delta(bytes: &[u8]) -> crate::error::Result<i64> {
             )
             .into());
         }
-        let Some(inst) = decode_one(bytes, ip) else { continue };
+        let Some(inst) = decode_one(bytes, ip) else {
+            continue;
+        };
         let len = inst.len() as u64;
         let d = *delta.get(&ip).unwrap_or(&0);
         // 종단: ret (영역 내에서 서브루틴이 아닌 최종 반환은 delta 동일해야 함)
@@ -172,9 +176,12 @@ fn validate_stack_delta(bytes: &[u8]) -> crate::error::Result<i64> {
         let next_d = d + eff;
         // call은 callee(ret)가 push한 반환 주소를 상쇄 → fall-through delta 불변.
         // 단, call 자체는 스택을 바꾸므로 여기서는 다음 명령이 동일 delta로 시작.
-        let push_next = |next: u64, nd: i64, work: &mut Vec<u64>,
+        let push_next = |next: u64,
+                         nd: i64,
+                         work: &mut Vec<u64>,
                          delta: &mut std::collections::HashMap<u64, i64>,
-                         guard_ip: u64| -> crate::error::Result<()> {
+                         guard_ip: u64|
+         -> crate::error::Result<()> {
             if next < base || next >= base + bytes.len() as u64 {
                 return Ok(());
             }
@@ -389,7 +396,8 @@ fn validate_indirect_targets(bytes: &[u8], num_blocks: usize) -> crate::error::R
     if num_blocks > 0 && indirect_branches > 0 && !has_table_bounds_check(bytes, num_blocks) {
         return Err(anyhow::anyhow!(
             "Dispatcher has {} indirect branch(es) but no `cmp idx, {}; cmovae` table bounds check",
-            indirect_branches, num_blocks
+            indirect_branches,
+            num_blocks
         )
         .into());
     }
@@ -496,7 +504,9 @@ pub fn validate_dispatcher(bytes: &[u8]) -> crate::error::Result<()> {
 
     // ── 3. 반환 경로 존재 ──────────────────────────────────────────────────────
     if !found_ret {
-        return Err(anyhow::anyhow!("Dispatcher does not contain a ret (return path missing)!" ).into());
+        return Err(
+            anyhow::anyhow!("Dispatcher does not contain a ret (return path missing)!").into(),
+        );
     }
 
     // ── 7. stack-delta: 분기 지점 간 RSP 변화 일관성 ────────────────────────────
@@ -537,7 +547,10 @@ pub fn validate_dispatcher_with_base(
     // 타깃을 얻는다.
     let code_base_va = dispatcher_va + 0x20;
     let region = if region_len > 0 {
-        Some((dispatcher_va, dispatcher_va.saturating_add(region_len as u64)))
+        Some((
+            dispatcher_va,
+            dispatcher_va.saturating_add(region_len as u64),
+        ))
     } else {
         None
     };
@@ -560,7 +573,10 @@ pub fn validate_dispatcher_with_base(
                         let scale = inst.memory_index_scale();
                         let base_r = inst.memory_base();
                         // base(테이블 시작) + index*4|8: 점프 테이블 룩업
-                        if base_r != Register::None && idx != Register::None && (scale == 4 || scale == 8) {
+                        if base_r != Register::None
+                            && idx != Register::None
+                            && (scale == 4 || scale == 8)
+                        {
                             has_indexed_table = true;
                         }
                     }

@@ -13,7 +13,6 @@
 // `--text-vm-oep` diagnostic uses it to report the target's mapped regions.
 // ==============================================================================
 
-
 /// Region kinds the VM memory model tracks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemKind {
@@ -59,7 +58,12 @@ pub struct MemRegion {
 
 impl MemRegion {
     pub fn new(base_va: u64, size: u64, kind: MemKind, rwx: u8) -> Self {
-        Self { base_va, size, kind, rwx }
+        Self {
+            base_va,
+            size,
+            kind,
+            rwx,
+        }
     }
     pub fn end(&self) -> u64 {
         self.base_va.saturating_add(self.size)
@@ -138,7 +142,12 @@ pub fn model_from_pe(
             _ => MemKind::Data,
         };
         let rwx = if kind == MemKind::Code { 0b111 } else { 0b011 };
-        m.add(MemRegion::new(image_base + *rva as u64, *vsize as u64, kind, rwx));
+        m.add(MemRegion::new(
+            image_base + *rva as u64,
+            *vsize as u64,
+            kind,
+            rwx,
+        ));
     }
     // The original entry block lives in .text; expose it as the model's entry anchor.
     let _ = entry_rva;
@@ -155,14 +164,22 @@ mod tests {
     fn mem_model_resolve_bounds() {
         let mut m = VmMemoryModel::new();
         m.add(MemRegion::new(0x140001000, 0x2000, MemKind::Code, 0b111));
-        m.add(MemRegion::new(0x140003000, 0x1000, MemKind::ReadOnly, 0b101));
+        m.add(MemRegion::new(
+            0x140003000,
+            0x1000,
+            MemKind::ReadOnly,
+            0b101,
+        ));
         m.add(MemRegion::new(0x140004000, 0x1000, MemKind::Data, 0b011));
 
         // inside .text
         assert_eq!(m.resolve(0x140001000).map(|r| r.kind), Some(MemKind::Code));
         assert_eq!(m.resolve(0x140002FFF).map(|r| r.kind), Some(MemKind::Code));
         // .rdata starts right after .text
-        assert_eq!(m.resolve(0x140003000).map(|r| r.kind), Some(MemKind::ReadOnly));
+        assert_eq!(
+            m.resolve(0x140003000).map(|r| r.kind),
+            Some(MemKind::ReadOnly)
+        );
         // unmapped gap after the last region
         assert!(m.resolve(0x140005000).is_none());
         // far outside

@@ -17,29 +17,27 @@
 // 이 모듈의 출력(블록별 바이트코드 + 커버리지)을 소비한다.
 // ==============================================================================
 
-
 use crate::graph::{BasicBlock, CfgExtractor};
-use crate::vm::lifter::{LiftedInstr, diagnose_unsupported, lift_block, lift_cfg, lift_cfg_switch};
-use anyhow::{Result, anyhow};
+use crate::vm::lifter::{diagnose_unsupported, lift_block, lift_cfg, lift_cfg_switch, LiftedInstr};
+use crate::vm::risc::{RiscLifter, RiscProgram};
+use anyhow::{anyhow, Result};
 use iced_x86::Code;
 use iced_x86::Instruction;
 use std::collections::{HashMap, HashSet};
-use crate::vm::risc::{RiscLifter, RiscProgram};
 
-pub mod exclusions;
-pub mod tls_guard;
 pub mod commercial;
+pub mod exclusions;
 pub mod switch;
 #[cfg(test)]
 mod tests;
+pub mod tls_guard;
 
+pub use commercial::{lift_program_cfg_commercial, ProgramLiftCommercial};
 pub use exclusions::{
     detect_panic_unwind_ranges, detect_seh_native_functions, detect_setjmp_longjmp_functions,
 };
-pub use tls_guard::{TlsCallbackExclusion, detect_tls_callback_ranges};
 pub use switch::resolve_switch_cases;
-pub use commercial::{ProgramLiftCommercial, lift_program_cfg_commercial};
-
+pub use tls_guard::{detect_tls_callback_ranges, TlsCallbackExclusion};
 
 /// 기본 블록 하나의 lift 결과.
 #[derive(Debug, Clone)]
@@ -244,7 +242,8 @@ impl ProgramLift {
         if self.total_instructions == 0 {
             1.0
         } else {
-            self.total_instructions.saturating_sub(self.unsupported.len()) as f64
+            self.total_instructions
+                .saturating_sub(self.unsupported.len()) as f64
                 / self.total_instructions as f64
         }
     }
@@ -293,8 +292,10 @@ pub fn lift_program_cfg(
             switch_cases.len()
         );
     }
-    let sc: Vec<(u64, Vec<(i64, u64)>)> =
-        switch_cases.iter().map(|(va, _, c)| (*va, c.clone())).collect();
+    let sc: Vec<(u64, Vec<(i64, u64)>)> = switch_cases
+        .iter()
+        .map(|(va, _, c)| (*va, c.clone()))
+        .collect();
     let sc_idx: std::collections::HashMap<u64, u8> =
         switch_cases.iter().map(|(va, iv, _)| (*va, *iv)).collect();
     // Panic/unwind runtime exclusion: detect the Rust std/CRT panic & unwind
@@ -324,14 +325,23 @@ pub fn lift_program_cfg(
     // concern is handled by the real lock VM opcodes (v46-v49/v55), so the old
     // shared-global block net is dropped here too.
     let excl = detect_seh_native_functions(
-        text_bytes, base_va, image_base, relayed_sections, entry_point_va, true,
+        text_bytes,
+        base_va,
+        image_base,
+        relayed_sections,
+        entry_point_va,
+        true,
     );
     let mut excl = excl;
     // setjmp/longjmp boundary: keep every non-local-jump user (and its call
     // closure) native — a longjmp through virtualized code restores the host
     // register file and diverges from the VM's virtual registers.
     let sjlj = detect_setjmp_longjmp_functions(
-        pe_bytes, text_bytes, base_va, image_base, relayed_sections,
+        pe_bytes,
+        text_bytes,
+        base_va,
+        image_base,
+        relayed_sections,
     );
     excl.func_ranges.extend(sjlj);
     excl.func_ranges.sort_by_key(|r| r.0);
@@ -339,7 +349,9 @@ pub fn lift_program_cfg(
     let mut excluded_blocks: std::collections::HashSet<u64> = blocks
         .iter()
         .filter(|bb| {
-            excl.func_ranges.iter().any(|(s, e)| *s <= bb.start_va && bb.start_va < *e)
+            excl.func_ranges
+                .iter()
+                .any(|(s, e)| *s <= bb.start_va && bb.start_va < *e)
         })
         .map(|bb| bb.start_va)
         .collect();
@@ -364,7 +376,11 @@ pub fn lift_program_cfg(
             let bad = diagnose_unsupported(&seq);
             if !bad.is_empty() {
                 // 블록 전체 대신 포함 함수 전체를 제외 (프롤로그/에필로그 일관성)
-                if let Some((s, e)) = excl.func_ranges.iter().find(|(s, e)| *s <= bb.start_va && bb.start_va < *e) {
+                if let Some((s, e)) = excl
+                    .func_ranges
+                    .iter()
+                    .find(|(s, e)| *s <= bb.start_va && bb.start_va < *e)
+                {
                     for other in blocks.iter() {
                         if *s <= other.start_va && other.start_va < *e {
                             if excluded_blocks.insert(other.start_va) {
@@ -451,7 +467,11 @@ pub fn lift_program_cfg(
         unsupported.extend(diagnose_unsupported(&seq));
     }
 
-    let entry_block = blocks.iter().find(|b| b.start_va == entry_point_va).map(|b| b.start_va).unwrap_or(entry_point_va);
+    let entry_block = blocks
+        .iter()
+        .find(|b| b.start_va == entry_point_va)
+        .map(|b| b.start_va)
+        .unwrap_or(entry_point_va);
 
     Ok(ProgramLift {
         bytecode,
@@ -474,7 +494,6 @@ pub fn lift_text_block(bb: &BasicBlock) -> Result<Vec<u8>> {
     lift_block(&seq, bb.start_va)
         .map_err(|e| anyhow!("lift_text_block failed @0x{:X}: {}", bb.start_va, e))
 }
-
 
 /// Is this instruction compiler zero-fill padding (`add [rax],al`, opcode 00 00)?
 pub(crate) fn is_zero_padding(inst: &iced_x86::Instruction) -> bool {

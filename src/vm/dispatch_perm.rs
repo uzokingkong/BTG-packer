@@ -27,6 +27,58 @@ pub struct DispatchPermutation {
     inverse: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DispatcherTopology {
+    DirectThreaded,
+    IndirectThreaded,
+    SwitchSplit,
+    CallRet,
+    Distributed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatcherPlan {
+    pub topology: DispatcherTopology,
+    pub split_selector: u8,
+    pub island_count: u8,
+    pub table_lane_rotation: u8,
+}
+
+impl DispatcherPlan {
+    pub fn from_seed(seed: u64) -> Self {
+        let a = mix(seed ^ 0x4449_5350_4154_4348);
+        let topology = match a % 5 {
+            0 => DispatcherTopology::DirectThreaded,
+            1 => DispatcherTopology::IndirectThreaded,
+            2 => DispatcherTopology::SwitchSplit,
+            3 => DispatcherTopology::CallRet,
+            _ => DispatcherTopology::Distributed,
+        };
+        let b = mix(a);
+        Self {
+            topology,
+            split_selector: 1 << ((b >> 8) & 7),
+            island_count: 2 + ((b >> 19) % 7) as u8,
+            table_lane_rotation: ((b >> 32) & 31) as u8,
+        }
+    }
+
+    pub fn normalized_signature(self) -> u64 {
+        (self.topology as u64)
+            | ((self.split_selector as u64) << 8)
+            | ((self.island_count as u64) << 16)
+            | ((self.table_lane_rotation as u64) << 24)
+    }
+}
+
+fn mix(mut z: u64) -> u64 {
+    z ^= z >> 30;
+    z = z.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z ^= z >> 27;
+    z = z.wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 impl DispatchPermutation {
     /// Build a permutation over `n` handler slots from a seed, using a simple
     /// deterministic Fisher–Yates shuffle over the ordered handler slots.
@@ -54,6 +106,12 @@ impl DispatchPermutation {
             inverse[s] = op;
         }
         Self { n, slot, inverse }
+    }
+
+    /// Build a permutation using secret-separated domain key and per-region salt (Domit §73).
+    pub fn from_domain_key_and_salt(domain_key: u64, salt: u64, n: usize) -> Self {
+        let combined_seed = crate::vm::seed_lifecycle::derive_seed(domain_key, salt);
+        Self::from_seed(combined_seed, n)
     }
 
     pub fn len(&self) -> usize {
@@ -122,7 +180,10 @@ mod tests {
         // And no opcode is identically mapped for the *entire* table (identity
         // table would expose stable opcode==handler, defeating the purpose).
         let not_identity = (0..16).any(|op| a.slot_for_opcode(op) != op);
-        assert!(not_identity, "mapping must not be the identity (opcode==handler)");
+        assert!(
+            not_identity,
+            "mapping must not be the identity (opcode==handler)"
+        );
     }
 
     /// Same seed → same mapping (determinism / reproducibility).
@@ -133,5 +194,23 @@ mod tests {
         for op in 0..32 {
             assert_eq!(a.slot_for_opcode(op), b.slot_for_opcode(op));
         }
+    }
+
+    #[test]
+    fn n20_single_dispatch_signature_success_is_below_ten_percent() {
+        use std::collections::{HashMap, HashSet};
+        let plans: Vec<_> = (0..20).map(DispatcherPlan::from_seed).collect();
+        let topologies: HashSet<_> = plans.iter().map(|p| p.topology).collect();
+        assert_eq!(topologies.len(), 5);
+        let mut counts = HashMap::new();
+        for signature in plans.iter().map(|p| p.normalized_signature()) {
+            *counts.entry(signature).or_insert(0usize) += 1;
+        }
+        let best = counts.values().copied().max().unwrap_or_default();
+        assert!(
+            best * 10 < plans.len(),
+            "single signature succeeds in {best}/{} builds",
+            plans.len()
+        );
     }
 }

@@ -1,9 +1,9 @@
 // ==============================================================================
 // BTG - cookie / protected-RVA-range collection - split from patch_data.rs
 // ==============================================================================
+use super::imports::{collect_delay_import_directory_ranges, collect_import_directory_ranges};
 use crate::pe::builder::SectionData;
 use crate::pipeline::PipelineContext;
-use super::imports::{collect_delay_import_directory_ranges, collect_import_directory_ranges};
 
 /// LoadConfig 내 SecurityCookie VA를 읽어 RVA를 반환한다.
 /// 실패 시 `.data`/`.rdata`에서 기본 시드값(`0x00002B992DDFA232`)으로 스캔한다.
@@ -16,7 +16,9 @@ pub(crate) fn locate_security_cookie(ctx: &PipelineContext, sections: &[SectionD
         if lc_dir.virtual_address > 0 && lc_dir.size >= 0x60 {
             let lc_rva = lc_dir.virtual_address;
             for s in sections {
-                if lc_rva >= s.virtual_address && lc_rva + 0x60 <= s.virtual_address + s.virtual_size {
+                if lc_rva >= s.virtual_address
+                    && lc_rva + 0x60 <= s.virtual_address + s.virtual_size
+                {
                     let off = (lc_rva - s.virtual_address) as usize;
                     if off + 0x60 <= s.bytes.len() {
                         let cookie_va = u64::from_le_bytes(
@@ -57,7 +59,10 @@ pub(crate) fn collect_protected_rva_ranges(
     // DataDirectory 0: Export Directory
     if let Some(dir) = ctx.target_info.data_directories.get(0) {
         if dir.virtual_address > 0 && dir.size > 0 {
-            raw_ranges.push((dir.virtual_address, dir.virtual_address.saturating_add(dir.size)));
+            raw_ranges.push((
+                dir.virtual_address,
+                dir.virtual_address.saturating_add(dir.size),
+            ));
         }
     }
 
@@ -70,14 +75,20 @@ pub(crate) fn collect_protected_rva_ranges(
     // DataDirectory 10: Load Config Directory
     if let Some(dir) = ctx.target_info.data_directories.get(10) {
         if dir.virtual_address > 0 && dir.size > 0 {
-            raw_ranges.push((dir.virtual_address, dir.virtual_address.saturating_add(dir.size)));
+            raw_ranges.push((
+                dir.virtual_address,
+                dir.virtual_address.saturating_add(dir.size),
+            ));
         }
     }
 
     // DataDirectory 12: IAT
     if let Some(dir) = ctx.target_info.data_directories.get(12) {
         if dir.virtual_address > 0 && dir.size > 0 {
-            raw_ranges.push((dir.virtual_address, dir.virtual_address.saturating_add(dir.size)));
+            raw_ranges.push((
+                dir.virtual_address,
+                dir.virtual_address.saturating_add(dir.size),
+            ));
         }
     }
 
@@ -90,12 +101,17 @@ pub(crate) fn collect_protected_rva_ranges(
     // DataDirectory 9: TLS Directory
     if let Some(dir) = ctx.target_info.data_directories.get(9) {
         if dir.virtual_address > 0 && dir.size > 0 {
-            raw_ranges.push((dir.virtual_address, dir.virtual_address.saturating_add(dir.size)));
+            raw_ranges.push((
+                dir.virtual_address,
+                dir.virtual_address.saturating_add(dir.size),
+            ));
 
             // IMAGE_TLS_DIRECTORY64: AddressOfCallBacks is at offset 0x18 (24)
             let tls_rva = dir.virtual_address;
             for s in sections {
-                if tls_rva >= s.virtual_address && tls_rva + 0x28 <= s.virtual_address + s.virtual_size {
+                if tls_rva >= s.virtual_address
+                    && tls_rva + 0x28 <= s.virtual_address + s.virtual_size
+                {
                     let off = (tls_rva - s.virtual_address) as usize;
                     if off + 0x20 <= s.bytes.len() {
                         // v58 (Phase 2.5-fix): protect the TLS RAW DATA TEMPLATE
@@ -110,9 +126,8 @@ pub(crate) fn collect_protected_rva_ranges(
                         // (e.g. mpsc/thread::spawn in test [9]) hits a corrupted
                         // borrow state and aborts with "the System allocator may not
                         // use TLS with destructors". Keep the template plaintext.
-                        let start_va = u64::from_le_bytes(
-                            s.bytes[off..off + 8].try_into().unwrap_or([0; 8]),
-                        );
+                        let start_va =
+                            u64::from_le_bytes(s.bytes[off..off + 8].try_into().unwrap_or([0; 8]));
                         let end_va = u64::from_le_bytes(
                             s.bytes[off + 8..off + 16].try_into().unwrap_or([0; 8]),
                         );
@@ -131,18 +146,24 @@ pub(crate) fn collect_protected_rva_ranges(
 
                             // Scan individual TLS Callback function VAs and protect their target functions
                             for s2 in sections {
-                                if cb_rva >= s2.virtual_address && cb_rva < s2.virtual_address + s2.virtual_size {
+                                if cb_rva >= s2.virtual_address
+                                    && cb_rva < s2.virtual_address + s2.virtual_size
+                                {
                                     let mut cb_off = (cb_rva - s2.virtual_address) as usize;
                                     while cb_off + 8 <= s2.bytes.len() {
                                         let func_va = u64::from_le_bytes(
-                                            s2.bytes[cb_off..cb_off + 8].try_into().unwrap_or([0; 8]),
+                                            s2.bytes[cb_off..cb_off + 8]
+                                                .try_into()
+                                                .unwrap_or([0; 8]),
                                         );
                                         if func_va == 0 {
                                             break;
                                         }
                                         if func_va > ctx.target_info.image_base {
-                                            let func_rva = (func_va - ctx.target_info.image_base) as u32;
-                                            raw_ranges.push((func_rva, func_rva.saturating_add(256)));
+                                            let func_rva =
+                                                (func_va - ctx.target_info.image_base) as u32;
+                                            raw_ranges
+                                                .push((func_rva, func_rva.saturating_add(256)));
                                         }
                                         cb_off += 8;
                                     }

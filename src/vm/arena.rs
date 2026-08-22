@@ -10,7 +10,7 @@
 // (arena ?곗씠?곕? ?쎌? ?딅뒗) 肄붾뱶??seal(RX) ???ㅽ뻾??W^X 怨꾩빟??吏?????덈떎.
 // 肄붾뱶? ?곗씠?곕? ?꾩쟾??遺꾨━ 留ㅽ븨?쇰줈 ?섎늻???묒뾽???꾩슂?섎㈃ ???뚯씪?먯꽌 ?쒖옉?쒕떎.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
 /// Native-execution arena: RWX memory to run generated machine code.
 ///
@@ -39,7 +39,10 @@ impl Arena {
         if p == libc::MAP_FAILED {
             return Err(anyhow!("VM self-test: mmap RWX failed"));
         }
-        Ok(Arena { base: p as usize, size })
+        Ok(Arena {
+            base: p as usize,
+            size,
+        })
     }
 
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
@@ -50,13 +53,22 @@ impl Arena {
     /// P1-2 (W^X): RW ??RX (seal). ?먯껜 ?꾧껐 肄붾뱶 ?ㅽ뻾 ?꾩뿉 ?몄텧.
     pub fn seal(&self) -> Result<()> {
         // SAFETY: mprotect on our own mapping.
-        let r = unsafe { libc::mprotect(self.base as *mut libc::c_void, self.size, libc::PROT_READ | libc::PROT_EXEC) };
+        let r = unsafe {
+            libc::mprotect(
+                self.base as *mut libc::c_void,
+                self.size,
+                libc::PROT_READ | libc::PROT_EXEC,
+            )
+        };
         if r != 0 {
             return Err(anyhow!("VM self-test: mprotect -> RX failed"));
         }
         // SAFETY: instruction-cache flush for non-coherent targets (no-op on x86_64).
         unsafe {
-            libc::__clear_cache(self.base as *mut libc::c_void, (self.base + self.size) as *mut libc::c_void);
+            libc::__clear_cache(
+                self.base as *mut libc::c_void,
+                (self.base + self.size) as *mut libc::c_void,
+            );
         }
         Ok(())
     }
@@ -64,7 +76,13 @@ impl Arena {
     /// P1-2 (W^X): RX ??RW (unseal).
     pub fn unseal(&self) -> Result<()> {
         // SAFETY: mprotect on our own mapping.
-        let r = unsafe { libc::mprotect(self.base as *mut libc::c_void, self.size, libc::PROT_READ | libc::PROT_WRITE) };
+        let r = unsafe {
+            libc::mprotect(
+                self.base as *mut libc::c_void,
+                self.size,
+                libc::PROT_READ | libc::PROT_WRITE,
+            )
+        };
         if r != 0 {
             return Err(anyhow!("VM self-test: mprotect -> RW failed"));
         }
@@ -86,15 +104,7 @@ impl Arena {
     }
 
     /// Execute machine code with 5 Win64 args (BTG-C1 native equivalence tests).
-    pub(crate) fn call5(
-        &self,
-        off: usize,
-        a1: usize,
-        a2: u64,
-        a3: u32,
-        a4: usize,
-        a5: usize,
-    ) {
+    pub(crate) fn call5(&self, off: usize, a1: usize, a2: u64, a3: u32, a4: usize, a5: usize) {
         // SAFETY: generated code with the exact (ptr, u64, u32, ptr, ptr) ABI.
         let f: extern "C" fn(usize, u64, u32, usize, usize) =
             unsafe { std::mem::transmute(self.base + off) };
@@ -131,11 +141,8 @@ mod arena_win {
             fl_allocation_type: u32,
             fl_protect: u32,
         ) -> *mut std::ffi::c_void;
-        fn VirtualFree(
-            lp_address: *mut std::ffi::c_void,
-            dw_size: usize,
-            dw_free_type: u32,
-        ) -> i32;
+        fn VirtualFree(lp_address: *mut std::ffi::c_void, dw_size: usize, dw_free_type: u32)
+            -> i32;
         fn VirtualProtect(
             lp_address: *mut std::ffi::c_void,
             dw_size: usize,
@@ -155,7 +162,14 @@ mod arena_win {
         pub fn seal(&self) -> Result<()> {
             let mut old = 0u32;
             // SAFETY: VirtualProtect on our own allocation.
-            let r = unsafe { VirtualProtect(self.base as *mut std::ffi::c_void, self.size, PAGE_EXECUTE_READ, &mut old) };
+            let r = unsafe {
+                VirtualProtect(
+                    self.base as *mut std::ffi::c_void,
+                    self.size,
+                    PAGE_EXECUTE_READ,
+                    &mut old,
+                )
+            };
             if r == 0 {
                 return Err(anyhow!("VM self-test: VirtualProtect -> RX failed"));
             }
@@ -166,7 +180,14 @@ mod arena_win {
         pub fn unseal(&self) -> Result<()> {
             let mut old = 0u32;
             // SAFETY: VirtualProtect on our own allocation.
-            let r = unsafe { VirtualProtect(self.base as *mut std::ffi::c_void, self.size, PAGE_READWRITE, &mut old) };
+            let r = unsafe {
+                VirtualProtect(
+                    self.base as *mut std::ffi::c_void,
+                    self.size,
+                    PAGE_READWRITE,
+                    &mut old,
+                )
+            };
             if r == 0 {
                 return Err(anyhow!("VM self-test: VirtualProtect -> RW failed"));
             }
@@ -186,7 +207,10 @@ mod arena_win {
             if p.is_null() {
                 return Err(anyhow!("VM self-test: VirtualAlloc RWX failed"));
             }
-            Ok(Arena { base: p as usize, size })
+            Ok(Arena {
+                base: p as usize,
+                size,
+            })
         }
 
         pub fn bytes(&mut self) -> &mut [u8] {
@@ -210,15 +234,7 @@ mod arena_win {
         }
 
         /// Execute machine code with 5 Win64 args (BTG-C1 native equivalence tests).
-        pub fn call5(
-            &self,
-            off: usize,
-            a1: usize,
-            a2: u64,
-            a3: u32,
-            a4: usize,
-            a5: usize,
-        ) {
+        pub fn call5(&self, off: usize, a1: usize, a2: u64, a3: u32, a4: usize, a5: usize) {
             // SAFETY: generated code with the exact (ptr, u64, u32, ptr, ptr) ABI.
             let f: extern "C" fn(usize, u64, u32, usize, usize) =
                 unsafe { std::mem::transmute(self.base + off) };

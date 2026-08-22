@@ -32,7 +32,10 @@ pub(crate) fn cvt_f64_int_interp(f: f64, dst_bits: u8, truncate: bool) -> u64 {
             }
         }
         _ => {
-            if !r.is_finite() || r < -9_223_372_036_854_775_808.0 || r >= 9_223_372_036_854_775_808.0 {
+            if !r.is_finite()
+                || r < -9_223_372_036_854_775_808.0
+                || r >= 9_223_372_036_854_775_808.0
+            {
                 0x8000_0000_0000_0000
             } else {
                 r as i64 as u64
@@ -47,7 +50,11 @@ fn round_ties_even_interp(x: f64) -> i64 {
     let diff = x - fl;
     if diff == 0.5 {
         let f = fl as i64;
-        if f % 2 == 0 { f } else { f + 1 }
+        if f % 2 == 0 {
+            f
+        } else {
+            f + 1
+        }
     } else {
         x.round() as i64
     }
@@ -60,7 +67,13 @@ pub(crate) fn sign_extend_i128_interp(v: u128, bits: u32) -> i128 {
 }
 
 /// 인터프리터 dst 저장 — `store_operand`와 동일.
-pub(crate) fn interp_store(regs: &mut [u64; 16], temps: &mut [u64; 8], spec: &VirtualIsaSpec, raw: u8, val: u64) {
+pub(crate) fn interp_store(
+    regs: &mut [u64; 16],
+    temps: &mut [u64; 8],
+    spec: &VirtualIsaSpec,
+    raw: u8,
+    val: u64,
+) {
     let kind = raw & 0xC0;
     let payload = raw & 0x3F;
     match kind {
@@ -91,21 +104,35 @@ pub(crate) fn mul_wide_interp(
     let mask = width_mask_interp(bits);
     // P0-2 signed MUL/IMUL: 피연산자를 2*bits 폭으로 부호 확장해 고 half 정합.
     let full = if signed {
-        sign_extend_to_interp(a & mask, bits, bits * 2).wrapping_mul(sign_extend_to_interp(b & mask, bits, bits * 2))
+        sign_extend_to_interp(a & mask, bits, bits * 2).wrapping_mul(sign_extend_to_interp(
+            b & mask,
+            bits,
+            bits * 2,
+        ))
     } else {
         ((a & mask) as u128).wrapping_mul((b & mask) as u128)
     };
     let low = (full & width_mask_interp(bits * 2) as u128) as u64;
     let high = ((full >> bits) as u64) & mask;
     let ovf = if signed {
-        let sign_ext = if low & (1u64 << (bits - 1)) != 0 { mask } else { 0 };
+        let sign_ext = if low & (1u64 << (bits - 1)) != 0 {
+            mask
+        } else {
+            0
+        };
         high != sign_ext
     } else {
         high != 0
     };
     flags.set_cf_of(ovf);
     if width == 1 {
-        interp_store(regs, temps, spec, op_dst, (low & 0xFF) | ((high & 0xFF) << 8));
+        interp_store(
+            regs,
+            temps,
+            spec,
+            op_dst,
+            (low & 0xFF) | ((high & 0xFF) << 8),
+        );
     } else {
         interp_store(regs, temps, spec, op_dst, low);
         regs[2] = high; // RDX
@@ -127,14 +154,22 @@ pub(crate) fn mul_low_interp(
     let bits = width as u32 * 8;
     let mask = width_mask_interp(bits);
     let full = if signed {
-        sign_extend_to_interp(a & mask, bits, bits * 2).wrapping_mul(sign_extend_to_interp(b & mask, bits, bits * 2))
+        sign_extend_to_interp(a & mask, bits, bits * 2).wrapping_mul(sign_extend_to_interp(
+            b & mask,
+            bits,
+            bits * 2,
+        ))
     } else {
         ((a & mask) as u128).wrapping_mul((b & mask) as u128)
     };
     let low = (full & width_mask_interp(bits * 2) as u128) as u64;
     let high = ((full >> bits) as u64) & mask;
     let ovf = if signed {
-        let sign_ext = if low & (1u64 << (bits - 1)) != 0 { mask } else { 0 };
+        let sign_ext = if low & (1u64 << (bits - 1)) != 0 {
+            mask
+        } else {
+            0
+        };
         high != sign_ext
     } else {
         high != 0
@@ -147,8 +182,16 @@ pub(crate) fn mul_low_interp(
 pub(crate) fn sign_extend_to_interp(v: u64, from_bits: u32, to_bits: u32) -> u128 {
     let sign = (v >> (from_bits - 1)) & 1;
     let low = (v as u128) & ((1u128 << from_bits) - 1);
-    let ext = if sign != 0 { low | (u128::MAX << from_bits) } else { low };
-    ext & (if to_bits < 128 { (1u128 << to_bits) - 1 } else { u128::MAX })
+    let ext = if sign != 0 {
+        low | (u128::MAX << from_bits)
+    } else {
+        low
+    };
+    ext & (if to_bits < 128 {
+        (1u128 << to_bits) - 1
+    } else {
+        u128::MAX
+    })
 }
 
 /// DIV/IDIV — eval_state `div_wide`와 동일. (제수 0 → 참조 기본값 0.)
@@ -195,7 +238,11 @@ pub(crate) fn div_wide_interp(
         let qmax = (1i128 << (bits - 1)) - 1;
         q < qmin || q > qmax
     } else {
-        let qmax: u128 = (if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 }) as u128;
+        let qmax: u128 = (if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        }) as u128;
         q > qmax
     };
     if overflow {
@@ -205,7 +252,13 @@ pub(crate) fn div_wide_interp(
         );
     }
     if width == 1 {
-        interp_store(regs, temps, spec, op_dst, ((r as u64) & 0xFF) << 8 | ((q as u64) & 0xFF));
+        interp_store(
+            regs,
+            temps,
+            spec,
+            op_dst,
+            ((r as u64) & 0xFF) << 8 | ((q as u64) & 0xFF),
+        );
     } else {
         interp_store(regs, temps, spec, op_dst, (q as u64) & mask);
         regs[2] = (r as u64) & mask;

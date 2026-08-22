@@ -31,11 +31,13 @@
 // is unchanged.
 // ==============================================================================
 
-
 use crate::vm::bytecode::*;
-use crate::vm::interp::{STATE_CALL_SP, STATE_FLAGS, STATE_PTR_CALL_STACK, STATE_PTR_STACK, STATE_RIP, STATE_SEG_GS, STATE_SP, STATE_XMM};
+use crate::vm::interp::{
+    STATE_CALL_SP, STATE_FLAGS, STATE_PTR_CALL_STACK, STATE_PTR_STACK, STATE_RIP, STATE_SEG_GS,
+    STATE_SP, STATE_XMM,
+};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, MemoryOperand, Register,
 };
@@ -153,25 +155,60 @@ fn jmp_disp() -> Instruction {
 /// threaded epilogues pass `None`).
 fn emit_dispatch(seq: &mut Vec<(Instruction, Option<Cl>)>, lbl: Option<Cl>) {
     seq.push((
-        Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, MemoryOperand::with_base(Register::R9)).unwrap(),
+        Instruction::with2(
+            Code::Movzx_r32_rm8,
+            Register::EAX,
+            MemoryOperand::with_base(Register::R9),
+        )
+        .unwrap(),
         lbl,
     ));
-    seq.push((Instruction::with1(Code::Inc_rm64, Register::R9).unwrap(), None));
+    seq.push((
+        Instruction::with1(Code::Inc_rm64, Register::R9).unwrap(),
+        None,
+    ));
 
     // Per-opcode rolling dispatch key (state-dependent) — see per_op_dispatch_key.
     let rolling = MBA_ROLLING.with(|c| c.get());
     if rolling {
         // key(op) = (op*C1) ^ (op<<17) ^ C4 ^ master(r15). rax keeps the opcode
         // (the table index); scratch rcx/rdx/r11 hold the derivation.
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::RAX).unwrap(), None)); // rcx = op
-        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX, DISPATCH_C1).unwrap(), None)); // rdx = C1
-        seq.push((Instruction::with2(Code::Imul_r64_rm64, Register::RDX, Register::RCX).unwrap(), None)); // rdx = op*C1
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RCX).unwrap(), None)); // r11 = op
-        seq.push((Instruction::with2(Code::Shl_rm64_imm8, Register::R11, 17).unwrap(), None)); // r11 = op<<17
-        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RDX, Register::R11).unwrap(), None)); // rdx = op*C1 ^ op<<17
-        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R11, DISPATCH_C4).unwrap(), None)); // r11 = C4
-        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RDX, Register::R11).unwrap(), None)); // rdx ^= C4
-        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RDX, Register::R15).unwrap(), None)); // rdx ^= master
+        seq.push((
+            Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::RAX).unwrap(),
+            None,
+        )); // rcx = op
+        seq.push((
+            Instruction::with2(Code::Mov_r64_imm64, Register::RDX, DISPATCH_C1).unwrap(),
+            None,
+        )); // rdx = C1
+        seq.push((
+            Instruction::with2(Code::Imul_r64_rm64, Register::RDX, Register::RCX).unwrap(),
+            None,
+        )); // rdx = op*C1
+        seq.push((
+            Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RCX).unwrap(),
+            None,
+        )); // r11 = op
+        seq.push((
+            Instruction::with2(Code::Shl_rm64_imm8, Register::R11, 17).unwrap(),
+            None,
+        )); // r11 = op<<17
+        seq.push((
+            Instruction::with2(Code::Xor_rm64_r64, Register::RDX, Register::R11).unwrap(),
+            None,
+        )); // rdx = op*C1 ^ op<<17
+        seq.push((
+            Instruction::with2(Code::Mov_r64_imm64, Register::R11, DISPATCH_C4).unwrap(),
+            None,
+        )); // r11 = C4
+        seq.push((
+            Instruction::with2(Code::Xor_rm64_r64, Register::RDX, Register::R11).unwrap(),
+            None,
+        )); // rdx ^= C4
+        seq.push((
+            Instruction::with2(Code::Xor_rm64_r64, Register::RDX, Register::R15).unwrap(),
+            None,
+        )); // rdx ^= master
         seq.push((
             Instruction::with2(
                 Code::Mov_r64_rm64,
@@ -181,8 +218,14 @@ fn emit_dispatch(seq: &mut Vec<(Instruction, Option<Cl>)>, lbl: Option<Cl>) {
             .unwrap(),
             None,
         )); // rax = table[op]
-        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RDX).unwrap(), None)); // decrypt with key(op)
-        seq.push((Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap(), None));
+        seq.push((
+            Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RDX).unwrap(),
+            None,
+        )); // decrypt with key(op)
+        seq.push((
+            Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap(),
+            None,
+        ));
     } else {
         seq.push((
             Instruction::with2(
@@ -196,8 +239,14 @@ fn emit_dispatch(seq: &mut Vec<(Instruction, Option<Cl>)>, lbl: Option<Cl>) {
         // r15 holds K (MBA) or 0 (plain); XOR decrypts the table entry. Also clears
         // ZF etc. — RFLAGS are never read at a handler entry (handlers capture the
         // modelled flags into STATE_FLAGS via cap_flags), so this is safe.
-        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R15).unwrap(), None));
-        seq.push((Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap(), None));
+        seq.push((
+            Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R15).unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap(),
+            None,
+        ));
     }
 }
 
@@ -287,10 +336,20 @@ fn cap_flags_cf_of() -> Vec<Instruction> {
         Instruction::with(Code::Pushfq),
         Instruction::with1(Code::Pop_r64, Register::R11).unwrap(),
         // r11 = only CF/OF from the host flags
-        Instruction::with2(Code::And_rm64_imm32, Register::R11, (F_CF | F_OF) as u32 as i32).unwrap(),
+        Instruction::with2(
+            Code::And_rm64_imm32,
+            Register::R11,
+            (F_CF | F_OF) as u32 as i32,
+        )
+        .unwrap(),
         // rcx = existing VM flags minus CF/OF (preserve SF/ZF/AF/PF + DF)
         Instruction::with2(Code::Mov_r64_rm64, Register::RCX, state_flags_mem()).unwrap(),
-        Instruction::with2(Code::And_rm64_imm32, Register::RCX, !((F_CF | F_OF) as u32) as i32).unwrap(),
+        Instruction::with2(
+            Code::And_rm64_imm32,
+            Register::RCX,
+            !((F_CF | F_OF) as u32) as i32,
+        )
+        .unwrap(),
         Instruction::with2(Code::Or_rm64_r64, Register::RCX, Register::R11).unwrap(),
         Instruction::with2(Code::Mov_rm64_r64, state_flags_mem(), Register::RCX).unwrap(),
     ]
@@ -321,7 +380,9 @@ fn obfuscate_handler_layout(seq: &mut Vec<(Instruction, Option<Cl>)>, seed: u64)
     use rand::{Rng, SeedableRng};
     let mut rng = StdRng::seed_from_u64(seed);
 
-    let first_handler = seq.iter().position(|(_, l)| matches!(l, Some(Cl::Handler(_))));
+    let first_handler = seq
+        .iter()
+        .position(|(_, l)| matches!(l, Some(Cl::Handler(_))));
     let Some(fh) = first_handler else { return };
     let handlers: Vec<(Instruction, Option<Cl>)> = seq.drain(fh..).collect();
 
@@ -407,7 +468,10 @@ pub fn generate_vm_code(
     // Push order (bottom->top): RAX,RCX,RDX,RBX,RBP,RSI,RDI,R8,R9,R10,R11,R15,R14,R13,R12.
     // Bug-6 fix: also save the Win64 callee-saved XMM6..XMM15 (160 bytes) first.
     // 160 is a multiple of 16, so RSP%16 is unchanged before the GPR pushes below.
-    seq.push((Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, 0xA0).unwrap(), Some(Cl::Entry)));
+    seq.push((
+        Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, 0xA0).unwrap(),
+        Some(Cl::Entry),
+    ));
     // v65: normalize the host DF so the threaded dispatch's pushfq-based cap_flags
     // captures the guest's modelled DF (only the lifted CLD/STD change it).
     seq.push((Instruction::with(Code::Cld), None));
@@ -422,7 +486,10 @@ pub fn generate_vm_code(
             None,
         ));
     }
-    seq.push((Instruction::with1(Code::Push_r64, Register::RAX).unwrap(), None));
+    seq.push((
+        Instruction::with1(Code::Push_r64, Register::RAX).unwrap(),
+        None,
+    ));
     for r in [
         Register::RCX,
         Register::RDX,
@@ -444,21 +511,25 @@ pub fn generate_vm_code(
     match mode {
         EntryMode::Ksa => {
             seq.push((
-                Instruction::with2(Code::Mov_rm64_r64, m(Register::RCX, 0x110), Register::RBX).unwrap(),
+                Instruction::with2(Code::Mov_rm64_r64, m(Register::RCX, 0x110), Register::RBX)
+                    .unwrap(),
                 None,
             ));
             seq.push((
-                Instruction::with2(Code::Mov_rm64_r64, m(Register::RCX, 0x118), Register::RDX).unwrap(),
+                Instruction::with2(Code::Mov_rm64_r64, m(Register::RCX, 0x118), Register::RDX)
+                    .unwrap(),
                 None,
             ));
         }
         EntryMode::Prga => {
             seq.push((
-                Instruction::with2(Code::Mov_rm64_r64, m(Register::RCX, 0x110), Register::RBX).unwrap(),
+                Instruction::with2(Code::Mov_rm64_r64, m(Register::RCX, 0x110), Register::RBX)
+                    .unwrap(),
                 None,
             ));
             seq.push((
-                Instruction::with2(Code::Mov_rm64_r64, m(Register::RCX, 0x120), Register::RDX).unwrap(),
+                Instruction::with2(Code::Mov_rm64_r64, m(Register::RCX, 0x120), Register::RDX)
+                    .unwrap(),
                 None,
             ));
             // v3 = R8 (buffer length); VREGS+3*8 = 0 + 24 = 24
@@ -471,11 +542,13 @@ pub fn generate_vm_code(
             // v61 (--custom-cipher + --vm): C1 상태 초기화 — RDX=seed VA → MEM_SEED,
             // R8=C1 상태 버퍼 VA → MEM_BUF. (C1 키 유도가 VM 안에서만 일어난다.)
             seq.push((
-                Instruction::with2(Code::Mov_rm64_r64, m(Register::RCX, 0x118), Register::RDX).unwrap(),
+                Instruction::with2(Code::Mov_rm64_r64, m(Register::RCX, 0x118), Register::RDX)
+                    .unwrap(),
                 None,
             ));
             seq.push((
-                Instruction::with2(Code::Mov_rm64_r64, m(Register::RCX, 0x120), Register::R8).unwrap(),
+                Instruction::with2(Code::Mov_rm64_r64, m(Register::RCX, 0x120), Register::R8)
+                    .unwrap(),
                 None,
             ));
         }
@@ -484,9 +557,18 @@ pub fn generate_vm_code(
             // Do NOT clobber state slots with caller RBX/RDX.
         }
     }
-    seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::R8, Register::RCX).unwrap(), None));
-    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R9, bytecode_va).unwrap(), None));
-    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R10, table_va).unwrap(), None));
+    seq.push((
+        Instruction::with2(Code::Mov_r64_rm64, Register::R8, Register::RCX).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Mov_r64_imm64, Register::R9, bytecode_va).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Mov_r64_imm64, Register::R10, table_va).unwrap(),
+        None,
+    ));
     // v58 (Phase 2.5): the MBA table key K = a + b is derived ONCE at entry into
     // r15 (a callee-saved register the VM owns for the whole execution — the
     // NATIVE_CALL bridge pushes/pops it around the call, and HALT restores the
@@ -497,17 +579,44 @@ pub fn generate_vm_code(
     // handler table stays XOR-masked in the file and at rest in memory. K is
     // materialized transiently in a register only.
     if let Some((a, b)) = mba_key {
-        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R15, a).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX, b).unwrap(), None));
-        seq.push((Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::R15).unwrap(), None));
-        seq.push((Instruction::with2(Code::And_rm64_r64, Register::RCX, Register::RDX).unwrap(), None));
-        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::RCX, Register::RCX).unwrap(), None));
-        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::R15, Register::RDX).unwrap(), None));
-        seq.push((Instruction::with2(Code::Add_rm64_r64, Register::R15, Register::RCX).unwrap(), None));
+        seq.push((
+            Instruction::with2(Code::Mov_r64_imm64, Register::R15, a).unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(Code::Mov_r64_imm64, Register::RDX, b).unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::R15).unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(Code::And_rm64_r64, Register::RCX, Register::RDX).unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(Code::Add_rm64_r64, Register::RCX, Register::RCX).unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(Code::Xor_rm64_r64, Register::R15, Register::RDX).unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(Code::Add_rm64_r64, Register::R15, Register::RCX).unwrap(),
+            None,
+        ));
     } else {
-        seq.push((Instruction::with2(Code::Xor_rm64_r64, Register::R15, Register::R15).unwrap(), None));
+        seq.push((
+            Instruction::with2(Code::Xor_rm64_r64, Register::R15, Register::R15).unwrap(),
+            None,
+        ));
     }
-    seq.push((Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap(), Some(Cl::Dispatch)));
+    seq.push((
+        Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap(),
+        Some(Cl::Dispatch),
+    ));
 
     // ── Dispatch loop ───────────────────────────────────────────────────────────
     // Shared block reached only from the entry stub (threaded dispatch inlines
@@ -692,9 +801,9 @@ pub fn generate_vm_code(
                 if op == 0 {
                     offsets[&Cl::Invalid]
                 } else {
-                    *offsets
-                        .get(&Cl::Handler(op as u8))
-                        .unwrap_or_else(|| panic!("generate_vm_code: no handler emitted for opcode 0x{op:02X}"))
+                    *offsets.get(&Cl::Handler(op as u8)).unwrap_or_else(|| {
+                        panic!("generate_vm_code: no handler emitted for opcode 0x{op:02X}")
+                    })
                 }
             })
             .collect(),
@@ -733,7 +842,10 @@ pub fn validate_vm_code(code: &[u8]) -> Result<()> {
     while dec.can_decode() {
         let inst = dec.decode();
         if inst.is_invalid() {
-            return Err(anyhow!("VM code: invalid instruction at offset 0x{:X}", dec.ip()));
+            return Err(anyhow!(
+                "VM code: invalid instruction at offset 0x{:X}",
+                dec.ip()
+            ));
         }
         if inst.code() == Code::Retnq {
             found_ret = true;

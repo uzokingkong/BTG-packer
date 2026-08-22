@@ -26,7 +26,6 @@
 //                           reference leave them untouched).
 // ==============================================================================
 
-
 use crate::vm::bytecode::{F_AF, F_CF, F_OF, F_PF, F_SF, F_ZF};
 
 /// x86 PF: set iff the low byte has an even number of set bits.
@@ -101,7 +100,6 @@ pub fn add_flags_width(a: u64, b: u64, width: u32) -> u64 {
     }
     f
 }
-
 
 /// Flags for SUB / CMP at 8/16/32-bit width (like add_flags_width: the
 /// carry/sign/overflow boundaries are bit 7 / bit 15 / bit 31, not bit 31).
@@ -331,8 +329,16 @@ pub fn mul_upper_ovf(low: u64, high: u64, bits: u32, signed: bool) -> bool {
     if !signed {
         return high != 0;
     }
-    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
-    let sign_ext = if low & (1u64 << (bits - 1)) != 0 { mask } else { 0 };
+    let mask = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let sign_ext = if low & (1u64 << (bits - 1)) != 0 {
+        mask
+    } else {
+        0
+    };
     high != sign_ext
 }
 

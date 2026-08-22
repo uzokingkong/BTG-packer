@@ -11,7 +11,11 @@
 // selective_vm T1-2) so no wrong / half-lifted code is ever generated.
 // ==============================================================================
 
-use super::{detect_seh_native_functions, is_zero_padding, resolve_switch_cases};
+use super::exclusions::seh::parse_pdata_functions;
+use super::{
+    detect_seh_native_functions, detect_setjmp_longjmp_functions, is_zero_padding,
+    resolve_switch_cases,
+};
 use crate::graph::CfgExtractor;
 use crate::vm::poly::isa_spec::VirtualIsaSpec;
 use crate::vm::risc::{BranchCondition, MicroInstr, RiscLifter, RiscOp, RiscProgram};
@@ -94,7 +98,10 @@ fn detect_fp_return_functions(
             }
             let writes_rax = inst.op_count() > 0
                 && inst.op0_kind() == OpKind::Register
-                && matches!(inst.op0_register(), Register::RAX | Register::EAX | Register::AX | Register::AL);
+                && matches!(
+                    inst.op0_register(),
+                    Register::RAX | Register::EAX | Register::AX | Register::AL
+                );
             if writes_rax {
                 last_rax_write = Some(inst.ip());
             }
@@ -115,7 +122,6 @@ fn detect_fp_return_functions(
     out
 }
 
-
 /// P3 (G1): --vm-oep 상용 엔진 백엔드용 프로그램 리프트 결과.
 #[derive(Debug, Clone)]
 pub struct ProgramLiftCommercial {
@@ -134,6 +140,15 @@ pub struct ProgramLiftCommercial {
     pub native_blocks: usize,
     /// 전체(제외 포함) 원본 명령 수.
     pub total_instructions: usize,
+    /// VM 소유 블록에 포함된 원본 x64 명령 수.
+    pub virtualized_instructions: usize,
+    /// CFG에 관측된 .pdata 함수 수 / 그중 완전 VM 소유 함수 수.
+    pub total_functions: usize,
+    pub virtualized_functions: usize,
+    pub hot_path_profiled: bool,
+    pub hot_vm_weight: u64,
+    pub hot_total_weight: u64,
+    pub sensitive_regions: usize,
     /// lift된 RISC 마이크로-op 수.
     pub lifted_ops: usize,
     /// RISC 리프터가 처리 못 하는 명령 진단 (실패 지점 노출).
@@ -211,13 +226,35 @@ pub fn lift_program_cfg_commercial(
     relayed_sections: &[crate::pe::builder::SectionData],
     image_base: u64,
 ) -> Result<ProgramLiftCommercial> {
-    let (blocks, _g) = CfgExtractor::extract(
-        text_bytes,
+    let marker_regions = crate::sdk::MarkerScanner::scan_markers(text_bytes);
+    let mut marker_normalized;
+    let cfg_text = if marker_regions.is_empty() {
+        text_bytes
+    } else {
+        marker_normalized = text_bytes.to_vec();
+        for region in &marker_regions {
+            marker_normalized[region.start_offset - 8..region.start_offset].fill(0x90);
+            marker_normalized[region.end_offset + 2..region.end_offset + 10].fill(0x90);
+        }
+        marker_normalized.as_slice()
+    };
+    let (mut blocks, _g) = CfgExtractor::extract(
+        cfg_text,
         base_va,
         entry_point_va,
         relayed_sections,
         image_base,
     )?;
+    // Marker signatures are inline data skipped by their leading `jmp +8`.
+    // A whole-text CFG sweep can still seed blocks inside those eight bytes;
+    // discard only such impossible entries before liftability/atomicity logic.
+    blocks.retain(|bb| {
+        let off = bb.start_va.saturating_sub(base_va) as usize;
+        !marker_regions.iter().any(|region| {
+            (region.start_offset.saturating_sub(8)..region.start_offset).contains(&off)
+                || (region.end_offset + 2..region.end_offset + 10).contains(&off)
+        })
+    });
     if blocks.is_empty() {
         return Ok(ProgramLiftCommercial {
             program: RiscProgram::new(Vec::new()),
@@ -227,6 +264,13 @@ pub fn lift_program_cfg_commercial(
             virtualized_blocks: 0,
             native_blocks: 0,
             total_instructions: 0,
+            virtualized_instructions: 0,
+            total_functions: 0,
+            virtualized_functions: 0,
+            hot_path_profiled: false,
+            hot_vm_weight: 0,
+            hot_total_weight: 0,
+            sensitive_regions: 0,
             lifted_ops: 0,
             unsupported: Vec::new(),
         });
@@ -243,8 +287,13 @@ pub fn lift_program_cfg_commercial(
     }
 
     // F2: SEH/panic-unwind 제외 넷 — BTG_SEH_NONE=1 설정 시 full-SEH 가상화 적용
-    let full_seh = std::env::var("BTG_SEH_NONE").map_or(false, |v| v != "0");
-    let excl = detect_seh_native_functions(
+    let full_seh = std::env::var("BTG_SEH_OWNERSHIP").map_or(false, |v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "full" | "strict" | "guarded"
+        )
+    }) || std::env::var("BTG_SEH_NONE").map_or(false, |v| v != "0");
+    let mut excl = detect_seh_native_functions(
         text_bytes,
         base_va,
         image_base,
@@ -252,13 +301,98 @@ pub fn lift_program_cfg_commercial(
         entry_point_va,
         full_seh,
     );
+    let seh_func_ranges = excl.func_ranges.clone();
+    // Commercial whole-program lifting bypasses the legacy wrapper where the
+    // non-local-jump boundary was historically applied.  Static MSVC
+    // setjmp/longjmp signatures do not need PE imports, so enforce that policy
+    // here as well.
+    excl.func_ranges.extend(detect_setjmp_longjmp_functions(
+        &[],
+        text_bytes,
+        base_va,
+        image_base,
+        relayed_sections,
+    ));
+    excl.func_ranges.sort_by_key(|range| range.0);
+    excl.func_ranges.dedup();
     let mut excluded_blocks: HashSet<u64> = blocks
         .iter()
         .filter(|bb| {
-            excl.func_ranges.iter().any(|(s, e)| *s <= bb.start_va && bb.start_va < *e)
+            excl.func_ranges
+                .iter()
+                .any(|(s, e)| *s <= bb.start_va && bb.start_va < *e)
         })
         .map(|bb| bb.start_va)
         .collect();
+    let seh_policy_blocks: HashSet<u64> = blocks
+        .iter()
+        .filter(|bb| {
+            seh_func_ranges
+                .iter()
+                .any(|(s, e)| *s <= bb.start_va && bb.start_va < *e)
+        })
+        .map(|bb| bb.start_va)
+        .collect();
+    // Function ownership must be atomic for *all* functions, not only the
+    // SEH subset.  A RISC-unliftable block in an ordinary .pdata function used
+    // to leave its siblings virtualized, allowing a VM branch to land in the
+    // native function body without its prologue/ABI state.  Track the complete
+    // native-function set independently from the SEH policy so every later
+    // bridge and return-value decision sees the same ownership boundary.
+    let all_function_ranges: Vec<(u64, u64)> = parse_pdata_functions(relayed_sections, image_base)
+        .into_iter()
+        .map(|(start, end, _)| (start, end))
+        .collect();
+    let mut native_function_ranges = excl.func_ranges.clone();
+
+    // SHLD and BT/BTR/BTS have passed family-isolated and combined whole-program
+    // differential execution, so they are VM-owned by default.  Keep an opt-in
+    // diagnostic quarantine for reproducing old ownership boundaries.
+    let quarantined_families = std::env::var("BTG_VM_INTEGRATION_QUARANTINE")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let quarantine_shld = quarantined_families.split(',').any(|v| v.trim() == "shld");
+    let quarantine_bt = quarantined_families
+        .split(',')
+        .any(|v| matches!(v.trim(), "bt" | "bit-test"));
+    let integration_sensitive = |i: &Instruction| {
+        (quarantine_shld && matches!(i.code(), iced_x86::Code::Shld_rm64_r64_imm8))
+            || (quarantine_bt
+                && matches!(
+                    i.code(),
+                    iced_x86::Code::Bt_rm32_imm8
+                        | iced_x86::Code::Bt_rm32_r32
+                        | iced_x86::Code::Bt_rm64_imm8
+                        | iced_x86::Code::Bt_rm64_r64
+                        | iced_x86::Code::Btr_rm64_imm8
+                        | iced_x86::Code::Btr_rm64_r64
+                        | iced_x86::Code::Bts_rm64_imm8
+                        | iced_x86::Code::Bts_rm64_r64
+                ))
+    };
+    let quarantine_ranges: Vec<(u64, u64)> = all_function_ranges
+        .iter()
+        .copied()
+        .filter(|(s, e)| {
+            blocks.iter().any(|bb| {
+                *s <= bb.start_va
+                    && bb.start_va < *e
+                    && bb.instructions.iter().any(integration_sensitive)
+            })
+        })
+        .collect();
+    let mut integration_quarantine_blocks = HashSet::new();
+    for range in quarantine_ranges {
+        if !native_function_ranges.contains(&range) {
+            native_function_ranges.push(range);
+        }
+        for bb in &blocks {
+            if range.0 <= bb.start_va && bb.start_va < range.1 {
+                integration_quarantine_blocks.insert(bb.start_va);
+                excluded_blocks.insert(bb.start_va);
+            }
+        }
+    }
 
     // RISC-unliftable 제외 넷 (전량-거부): RISC 리프터가 못 다루는 명령이 있는
     // 블록은 (그 함수 전체를) 네이티브로 유지 — 절대 절반 lift 금지.
@@ -285,11 +419,13 @@ pub fn lift_program_cfg_commercial(
                 continue;
             }
             if !block_poly_liftable(&real) {
-                if let Some((s, e)) = excl
-                    .func_ranges
+                if let Some((s, e)) = all_function_ranges
                     .iter()
                     .find(|(s, e)| *s <= bb.start_va && bb.start_va < *e)
                 {
+                    if !native_function_ranges.iter().any(|r| r == &(*s, *e)) {
+                        native_function_ranges.push((*s, *e));
+                    }
                     for other in blocks.iter() {
                         if *s <= other.start_va && other.start_va < *e {
                             if excluded_blocks.insert(other.start_va) {
@@ -307,8 +443,13 @@ pub fn lift_program_cfg_commercial(
         }
     }
     println!(
-        "[+] --vm-commercial: excluded {} block(s) (SEH minimal + RISC-unliftable-instruction functions)",
-        excluded_blocks.len()
+        "[+] --vm-commercial ownership exclusions: total={} SEH/panic={} integration-quarantine={} other/function-atomic={}",
+        excluded_blocks.len(),
+        seh_policy_blocks.len(),
+        integration_quarantine_blocks.len(),
+        excluded_blocks
+            .len()
+            .saturating_sub(seh_policy_blocks.union(&integration_quarantine_blocks).count())
     );
 
     // OEP-force (lift_program_cfg와 동일): entry 블록이 RISC로 온전히 lift되고
@@ -328,14 +469,17 @@ pub fn lift_program_cfg_commercial(
                 block_poly_liftable(&real)
             })
             .unwrap_or(false);
-        if entry_liftable {
+        let entry_function_native = native_function_ranges
+            .iter()
+            .any(|(s, e)| *s <= entry_point_va && entry_point_va < *e);
+        if entry_liftable && !entry_function_native {
             excluded_blocks.remove(&entry_point_va);
             println!(
                 "[+] --vm-commercial: OEP virtualized (entry_native=false) -- Program VM dispatches the program"
             );
         } else {
             println!(
-                "[!] --vm-commercial: OEP not RISC-liftable -- keeping entry_native=true (native OEP)"
+                "[!] --vm-commercial: OEP function is not fully RISC-liftable -- keeping entry_native=true (native OEP)"
             );
         }
     }
@@ -360,6 +504,7 @@ pub fn lift_program_cfg_commercial(
     let mut virtualized = 0usize;
     let mut native_blocks = 0usize;
     let mut total_inst = 0usize;
+    let mut virtualized_inst = 0usize;
     for bb in &blocks {
         let real: Vec<Instruction> = bb
             .instructions
@@ -394,14 +539,12 @@ pub fn lift_program_cfg_commercial(
             let block_ops = lifter.desynth.instrs.len();
             instrs.extend(lifter.desynth.instrs);
             virtualized += 1;
+            virtualized_inst += real.len();
             // P3 (G1): 상용 엔진 리프트 매핑 기록 — 원본 VA → RISC micro-op 인덱스
             // 범위. 폴리 바이트코드 오프셋은 인코딩 후 fill_risc_poly_offsets가 채운다.
             if crate::vm::mapper::active() {
                 for (k, &(ip, idx)) in local_ip.iter().enumerate() {
-                    let end = local_ip
-                        .get(k + 1)
-                        .map(|&(_, n)| n)
-                        .unwrap_or(block_ops);
+                    let end = local_ip.get(k + 1).map(|&(_, n)| n).unwrap_or(block_ops);
                     let count = end.saturating_sub(idx);
                     if count == 0 {
                         continue;
@@ -427,7 +570,8 @@ pub fn lift_program_cfg_commercial(
     let ip_map_snapshot = ip_map.clone();
     let mut program = RiscProgram::with_ip_map(instrs, ip_map);
     let lifted_ops = program.instrs.len();
-    let redirected = bridge_to_function_entries(&mut program, &ip_map_snapshot, &excl.func_ranges);
+    let redirected =
+        bridge_to_function_entries(&mut program, &ip_map_snapshot, &native_function_ranges);
     if redirected > 0 {
         println!(
             "[+] P0-① boundary atomicity: redirected {} direct branch(es) to excluded function entry (prologue-preserving native bridge)",
@@ -439,7 +583,7 @@ pub fn lift_program_cfg_commercial(
     // 힌트 주입. 네이티브 브릿지가 double/float 리턴 함수를 XMM0(FP)가 아니라
     // RAX(정수)에서 읽는 조용한 오답을 막는다. (보수적 — false positive 는 정수
     // 함수를 XMM0 가비지로 잘못 읽으므로 위험.)
-    let fp_returns = detect_fp_return_functions(text_bytes, base_va, &excl.func_ranges);
+    let fp_returns = detect_fp_return_functions(text_bytes, base_va, &native_function_ranges);
     if !fp_returns.is_empty() {
         program.annotate_native_fp_returns(&fp_returns);
         println!(
@@ -462,7 +606,11 @@ pub fn lift_program_cfg_commercial(
             };
             *hist.entry(key).or_insert(0) += 1;
         }
-        println!("[BTG_DUMP_RISC_OPS] lifted_ops={} total_instrs={}", lifted_ops, program.instrs.len());
+        println!(
+            "[BTG_DUMP_RISC_OPS] lifted_ops={} total_instrs={}",
+            lifted_ops,
+            program.instrs.len()
+        );
         for (k, v) in &hist {
             println!("  {k}: {v}");
         }
@@ -479,15 +627,10 @@ pub fn lift_program_cfg_commercial(
     // P2 (G3) 정제: SEH/panic-unwind 로 네이티브 유지되는 블록(구조적으로 VM 대상이
     // 아님)은 제외하고, **RISC-unliftable 만으로** 네이티브로 밀려난 블록의 실패
     // 명령만 집계한다. 그래야 남은 RISC 리프터 확장 항목(= P2 게이트)이 정확히 보인다.
-    let seh_block: HashSet<u64> = blocks
-        .iter()
-        .filter(|bb| {
-            excl.func_ranges.iter().any(|(s, e)| *s <= bb.start_va && bb.start_va < *e)
-        })
-        .map(|bb| bb.start_va)
-        .collect();
+    let seh_block = seh_policy_blocks;
     let mut risc_unliftable_blocks = 0usize;
     let mut unsupported = Vec::new();
+    let mut unsupported_reasons: Vec<(u64, String)> = Vec::new();
     for bb in &blocks {
         if seh_block.contains(&bb.start_va) {
             continue;
@@ -501,9 +644,10 @@ pub fn lift_program_cfg_commercial(
         let mut lifter = RiscLifter::new();
         let mut failed = false;
         for i in &real {
-            if lifter.lift_instruction(i).is_err() {
+            if let Err(err) = lifter.lift_instruction(i) {
                 failed = true;
                 unsupported.push((format!("0x{:X}", i.ip()), i.code()));
+                unsupported_reasons.push((i.ip(), err.to_string()));
             }
         }
         if failed {
@@ -511,10 +655,11 @@ pub fn lift_program_cfg_commercial(
         }
     }
     println!(
-        "[P2-RISC-GAP] blocks: {} virtualized, {} native (SEH {}+RISC-unliftable {}), {} RISC-lift unsupported instruction(s) in RISC-unliftable blocks:",
+        "[P2-RISC-GAP] blocks: {} virtualized, {} native (SEH/panic-policy {} + integration-quarantine {} + RISC-unliftable {}), {} RISC-lift unsupported instruction(s) in RISC-unliftable blocks:",
         virtualized,
         native_blocks,
-        excluded_blocks.len().saturating_sub(risc_unliftable_blocks),
+        seh_block.len(),
+        integration_quarantine_blocks.len(),
         risc_unliftable_blocks,
         unsupported.len()
     );
@@ -527,8 +672,184 @@ pub fn lift_program_cfg_commercial(
         for (k, v) in &by_code {
             println!("    - {}  (x{})", k, v);
         }
+
+        // Reason-level diagnostics distinguish a missing opcode from a supported
+        // opcode rejected by an addressing/operand constraint. Also report the
+        // number of distinct .pdata functions affected so work can be prioritized
+        // by recovered VM coverage instead of raw instruction frequency alone.
+        let mut by_reason: BTreeMap<String, (usize, HashSet<u64>)> = BTreeMap::new();
+        for (ip, reason) in &unsupported_reasons {
+            let function_start = all_function_ranges
+                .iter()
+                .find(|(s, e)| *s <= *ip && *ip < *e)
+                .map(|(s, _)| *s)
+                .unwrap_or(*ip);
+            let entry = by_reason
+                .entry(reason.clone())
+                .or_insert_with(|| (0, HashSet::new()));
+            entry.0 += 1;
+            entry.1.insert(function_start);
+        }
+        println!("[P2-RISC-REASON] failure reasons (occurrences / affected functions):");
+        for (reason, (count, functions)) in &by_reason {
+            println!(
+                "    - {}  (x{} / {} function(s))",
+                reason,
+                count,
+                functions.len()
+            );
+        }
     } else {
         println!("[P2-RISC-GAP] all non-SEH blocks RISC-liftable (no unsupported)");
+    }
+
+    let observed_functions: Vec<(u64, u64)> = all_function_ranges
+        .iter()
+        .copied()
+        .filter(|(s, e)| {
+            blocks
+                .iter()
+                .any(|bb| *s <= bb.start_va && bb.start_va < *e)
+        })
+        .collect();
+    let virtualized_functions = observed_functions
+        .iter()
+        .filter(|(s, e)| {
+            blocks.iter().any(|bb| {
+                *s <= bb.start_va && bb.start_va < *e && !excluded_blocks.contains(&bb.start_va)
+            }) && !blocks.iter().any(|bb| {
+                *s <= bb.start_va && bb.start_va < *e && excluded_blocks.contains(&bb.start_va)
+            })
+        })
+        .count();
+    let instruction_ratio = if total_inst == 0 {
+        0.0
+    } else {
+        virtualized_inst as f64 / total_inst as f64
+    };
+
+    // SDK marker regions are an explicit 100%-ownership contract. A marked
+    // range that is unreachable from the recovered CFG, or contains any native
+    // block, is a hard pack failure rather than a best-effort hint.
+    for (index, region) in marker_regions.iter().enumerate() {
+        let start = base_va + region.start_offset as u64;
+        let end = base_va + region.end_offset as u64;
+        let covered: Vec<_> = blocks
+            .iter()
+            .filter(|bb| {
+                bb.instructions
+                    .iter()
+                    .any(|ins| start <= ins.ip() && ins.ip() < end)
+            })
+            .collect();
+        if covered.is_empty()
+            || covered
+                .iter()
+                .any(|bb| excluded_blocks.contains(&bb.start_va))
+        {
+            let native: Vec<String> = covered
+                .iter()
+                .filter(|bb| excluded_blocks.contains(&bb.start_va))
+                .map(|bb| format!("0x{:X}", bb.start_va))
+                .collect();
+            return Err(anyhow::anyhow!(
+                "sensitive marker ownership gate failed for region {} (0x{:X}..0x{:X}): every covered block must be VM-owned (covered={}, native={:?})",
+                index + 1,
+                start,
+                end,
+                covered.len(),
+                native,
+            ));
+        }
+    }
+    if !marker_regions.is_empty() {
+        println!(
+            "[VM-SENSITIVE-GATE] {} marked region(s), 100% VM ownership -- PASS",
+            marker_regions.len()
+        );
+    }
+
+    // Optional weighted hot-path profile: comma-separated `RVA[:hits]` or
+    // absolute `VA[:hits]`. Supplying a profile makes 100% hot ownership a
+    // release gate; absent profile data is reported explicitly as unprofiled.
+    let hot_profile = std::env::var("BTG_VM_HOT_PATH").ok();
+    let mut hot_vm = 0u64;
+    let mut hot_total = 0u64;
+    if let Some(raw) = hot_profile.as_deref() {
+        for item in raw.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+            let (address, hits) = item.split_once(':').unwrap_or((item, "1"));
+            let parsed = address
+                .strip_prefix("0x")
+                .or_else(|| address.strip_prefix("0X"))
+                .map(|v| u64::from_str_radix(v, 16))
+                .unwrap_or_else(|| address.parse::<u64>())
+                .map_err(|_| anyhow::anyhow!("invalid BTG_VM_HOT_PATH address: {address}"))?;
+            let va = if parsed < image_base {
+                image_base + parsed
+            } else {
+                parsed
+            };
+            let weight: u64 = hits
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid BTG_VM_HOT_PATH hit count: {hits}"))?;
+            hot_total = hot_total.saturating_add(weight);
+            if ip_map_snapshot.contains_key(&va) {
+                hot_vm = hot_vm.saturating_add(weight);
+            }
+        }
+        if hot_total == 0 || hot_vm != hot_total {
+            return Err(anyhow::anyhow!(
+                "VM hot-path ownership gate failed: VM-owned weight {}/{} ({:.3}%)",
+                hot_vm,
+                hot_total,
+                if hot_total == 0 {
+                    0.0
+                } else {
+                    hot_vm as f64 * 100.0 / hot_total as f64
+                }
+            ));
+        }
+    }
+    let hot_json = if hot_profile.is_some() {
+        format!(
+            "{{\"status\":\"profiled\",\"vm_weight\":{},\"total_weight\":{},\"ratio\":{:.6}}}",
+            hot_vm,
+            hot_total,
+            hot_vm as f64 / hot_total as f64
+        )
+    } else {
+        "{\"status\":\"unprofiled\"}".to_string()
+    };
+    println!(
+        "[VM-COVERAGE] {{\"blocks\":{{\"vm\":{},\"total\":{},\"ratio\":{:.6}}},\"instructions\":{{\"vm\":{},\"total\":{},\"ratio\":{:.6}}},\"functions\":{{\"vm\":{},\"total\":{},\"ratio\":{:.6}}},\"hot_path\":{}}}",
+        virtualized,
+        blocks.len(),
+        if blocks.is_empty() { 0.0 } else { virtualized as f64 / blocks.len() as f64 },
+        virtualized_inst,
+        total_inst,
+        instruction_ratio,
+        virtualized_functions,
+        observed_functions.len(),
+        if observed_functions.is_empty() { 0.0 } else { virtualized_functions as f64 / observed_functions.len() as f64 },
+        hot_json,
+    );
+    if let Ok(raw) = std::env::var("BTG_MIN_VM_INSTRUCTION_COVERAGE") {
+        let minimum: f64 = raw.parse().map_err(|_| {
+            anyhow::anyhow!("BTG_MIN_VM_INSTRUCTION_COVERAGE must be a percentage in 0..=100")
+        })?;
+        if !(0.0..=100.0).contains(&minimum) {
+            return Err(anyhow::anyhow!(
+                "BTG_MIN_VM_INSTRUCTION_COVERAGE must be a percentage in 0..=100"
+            ));
+        }
+        let actual = instruction_ratio * 100.0;
+        if actual + f64::EPSILON < minimum {
+            return Err(anyhow::anyhow!(
+                "VM instruction coverage gate failed: actual {:.3}% < required {:.3}%",
+                actual,
+                minimum
+            ));
+        }
     }
 
     Ok(ProgramLiftCommercial {
@@ -539,6 +860,13 @@ pub fn lift_program_cfg_commercial(
         virtualized_blocks: virtualized,
         native_blocks,
         total_instructions: total_inst,
+        virtualized_instructions: virtualized_inst,
+        total_functions: observed_functions.len(),
+        virtualized_functions,
+        hot_path_profiled: hot_profile.is_some(),
+        hot_vm_weight: hot_vm,
+        hot_total_weight: hot_total,
+        sensitive_regions: marker_regions.len(),
         lifted_ops,
         unsupported,
     })
@@ -556,21 +884,21 @@ mod tests {
         // 세 개의 리프 가능/불가 함수를 가진 소형 합성 .text:
         //   0x1000: mov rax, 1 ; mov [rbx], rax ; ret      (전부 RISC lift 가능)
         //   0x100D: mov rcx, 2 ; ret                        (RISC lift 가능)
-        //   0x1016: xgetbv ; ret                            (RISC lift 불가 → 네이티브)
+        //   0x1016: syscall ; ret                           (RISC lift 불가 → 네이티브)
         // 세 함수 모두 .pdata에 없는 leaf — SEH 제외 넷에 안 걸림 (구조적 제외 없음).
         let mut text = Vec::new();
         let f0 = [
             0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
-            0x48, 0x89, 0x03,                         // mov [rbx], rax
-            0xC3,                                     // ret
+            0x48, 0x89, 0x03, // mov [rbx], rax
+            0xC3, // ret
         ];
         let f1 = [
             0x48, 0xC7, 0xC1, 0x02, 0x00, 0x00, 0x00, // mov rcx, 2
-            0xC3,                                     // ret
+            0xC3, // ret
         ];
         let f2 = [
-            0x0F, 0x01, 0xD0, // xgetbv (RISC lifter 미지원)
-            0xC3,             // ret
+            0x0F, 0x05, // syscall (RISC lifter intentionally unsupported)
+            0xC3, // ret
         ];
         text.extend_from_slice(&f0);
         text.extend_from_slice(&f1);
@@ -578,27 +906,33 @@ mod tests {
         let base_va = 0x140001000u64;
         let entry = base_va;
 
-        let lift_legacy = crate::vm::text_lift::lift_program_cfg(
-            &text, base_va, entry, &[], 0x140000000, &[],
-        )
-        .expect("legacy lift");
+        let lift_legacy =
+            crate::vm::text_lift::lift_program_cfg(&text, base_va, entry, &[], 0x140000000, &[])
+                .expect("legacy lift");
         let lift_com = lift_program_cfg_commercial(&text, base_va, entry, &[], 0x140000000)
             .expect("commercial lift");
 
         // 레거시 리프터는 세 함수 모두 lift 가능 → 모두 포함 (블록 수 동일).
-        assert_eq!(lift_legacy.blocks, lift_com.blocks, "CFG block set identical");
-        // 상용 경로는 f0/f1을 VM화하고 f2(xgetbv)는 네이티브로 유지해야 한다.
-        assert_eq!(lift_com.virtualized_blocks, 2, "f0+f1 virtualized");
-        assert_eq!(lift_com.native_blocks, 1, "f2 (xgetbv) kept native");
+        assert_eq!(
+            lift_legacy.blocks, lift_com.blocks,
+            "CFG block set identical"
+        );
+        // 상용 경로는 f0/f1을 VM화하고 f2(syscall)는 네이티브로 유지해야 한다.
+        assert_eq!(
+            lift_com.virtualized_blocks,
+            lift_com.blocks - 1,
+            "all blocks except syscall virtualized"
+        );
+        assert_eq!(lift_com.native_blocks, 1, "f2 (syscall) kept native");
         // ip_map이 포함 블록의 명령 IP를 해석해야 한다 (f0 첫 명령).
         assert!(
             lift_com.program.instrs.len() > 0,
             "commercial lift produced RISC micro-ops"
         );
-        // xgetbv가 unsupported 진단에 기록되어야 한다.
+        // syscall이 unsupported 진단에 기록되어야 한다.
         assert!(
             !lift_com.unsupported.is_empty(),
-            "unsupported diagnostics should list xgetbv"
+            "unsupported diagnostics should list syscall"
         );
     }
 
@@ -626,14 +960,14 @@ mod tests {
         let raw = [
             0x48, 0xC7, 0xC0, 0x64, 0x00, 0x00, 0x00, // mov rax, 100
             0x48, 0xC7, 0xC3, 0x32, 0x00, 0x00, 0x00, // mov rbx, 50
-            0x48, 0x01, 0xD8,                         // add rax, rbx
-            0x48, 0xC1, 0xE0, 0x02,                   // shl rax, 2
-            0x48, 0xC1, 0xE8, 0x01,                   // shr rax, 1
-            0x48, 0x35, 0x34, 0x12, 0x00, 0x00,       // xor rax, 0x1234
-            0x53,                                     // push rbx
-            0x59,                                     // pop rcx
-            0x48, 0x89, 0xC2,                         // mov rdx, rax
-            0xC3,                                     // ret
+            0x48, 0x01, 0xD8, // add rax, rbx
+            0x48, 0xC1, 0xE0, 0x02, // shl rax, 2
+            0x48, 0xC1, 0xE8, 0x01, // shr rax, 1
+            0x48, 0x35, 0x34, 0x12, 0x00, 0x00, // xor rax, 0x1234
+            0x53, // push rbx
+            0x59, // pop rcx
+            0x48, 0x89, 0xC2, // mov rdx, rax
+            0xC3, // ret
         ];
         let base = 0x140001000u64;
 
@@ -642,7 +976,9 @@ mod tests {
         let mut lifter = RiscLifter::new();
         while decoder.can_decode() {
             let inst = decoder.decode();
-            lifter.lift_instruction(&inst).expect("all instructions RISC-liftable");
+            lifter
+                .lift_instruction(&inst)
+                .expect("all instructions RISC-liftable");
         }
         let prog = RiscProgram::new(lifter.desynth.instrs);
         assert!(!prog.instrs.is_empty(), "lifted program must be non-empty");
@@ -699,14 +1035,14 @@ mod tests {
         let f0 = [
             0x48, 0xC7, 0xC0, 0x64, 0x00, 0x00, 0x00, // mov rax, 100
             0x48, 0xC7, 0xC3, 0x32, 0x00, 0x00, 0x00, // mov rbx, 50
-            0x48, 0x01, 0xD8,                         // add rax, rbx
-            0x48, 0xC1, 0xE0, 0x02,                   // shl rax, 2
-            0x48, 0xC1, 0xE8, 0x01,                   // shr rax, 1
-            0x48, 0x35, 0x34, 0x12, 0x00, 0x00,       // xor rax, 0x1234
-            0x53,                                     // push rbx
-            0x59,                                     // pop rcx
-            0x48, 0x89, 0xC2,                         // mov rdx, rax
-            0xC3,                                     // ret
+            0x48, 0x01, 0xD8, // add rax, rbx
+            0x48, 0xC1, 0xE0, 0x02, // shl rax, 2
+            0x48, 0xC1, 0xE8, 0x01, // shr rax, 1
+            0x48, 0x35, 0x34, 0x12, 0x00, 0x00, // xor rax, 0x1234
+            0x53, // push rbx
+            0x59, // pop rcx
+            0x48, 0x89, 0xC2, // mov rdx, rax
+            0xC3, // ret
         ];
         let base_va = 0x140001000u64;
         let entry = base_va;
@@ -715,7 +1051,10 @@ mod tests {
             .expect("commercial program lift");
         // OEP가 RISC로 온전히 lift되므로 VM화(entry_native=false)되어야 한다.
         assert!(!lift.entry_native, "OEP virtualized (entry_native=false)");
-        assert!(lift.virtualized_blocks >= 1, "at least one block virtualized");
+        assert!(
+            lift.virtualized_blocks >= 1,
+            "at least one block virtualized"
+        );
         assert!(!lift.program.instrs.is_empty(), "lifted program non-empty");
         // OEP가 VM화되면 lift된 프로그램은 `VirtualBranch(Always) → OEP` entry-jump로
         // 시작한다 (CfgExtractor 주소순 블록 나열에서 OEP가 바이트코드[0]이 아니므로).
@@ -768,25 +1107,27 @@ mod tests {
         let raw = [
             0x48, 0xC7, 0xC0, 0x00, 0x02, 0x00, 0x00, // mov rax, 0x200
             0x48, 0xC7, 0xC3, 0x05, 0x00, 0x00, 0x00, // mov rbx, 5
-            0x48, 0x01, 0xD8,                         // add rax, rbx
-            0x48, 0xC1, 0xE0, 0x03,                   // shl rax, 3
-            0x48, 0xC1, 0xE8, 0x01,                   // shr rax, 1
-            0x48, 0x83, 0xE8, 0x10,                   // sub rax, 0x10
-            0x48, 0x25, 0xFF, 0xFF, 0x00, 0x00,       // and rax, 0xFFFF
-            0x48, 0x31, 0xC9,                         // xor rcx, rcx
-            0x50,                                     // push rax
-            0x53,                                     // push rbx
-            0x5A,                                     // pop rdx
-            0x59,                                     // pop rcx
-            0x48, 0x89, 0xC6,                         // mov rsi, rax
-            0xC3,                                     // ret
+            0x48, 0x01, 0xD8, // add rax, rbx
+            0x48, 0xC1, 0xE0, 0x03, // shl rax, 3
+            0x48, 0xC1, 0xE8, 0x01, // shr rax, 1
+            0x48, 0x83, 0xE8, 0x10, // sub rax, 0x10
+            0x48, 0x25, 0xFF, 0xFF, 0x00, 0x00, // and rax, 0xFFFF
+            0x48, 0x31, 0xC9, // xor rcx, rcx
+            0x50, // push rax
+            0x53, // push rbx
+            0x5A, // pop rdx
+            0x59, // pop rcx
+            0x48, 0x89, 0xC6, // mov rsi, rax
+            0xC3, // ret
         ];
         let base = 0x140001000u64;
         let mut decoder = Decoder::with_ip(64, &raw, base, DecoderOptions::NONE);
         let mut lifter = RiscLifter::new();
         while decoder.can_decode() {
             let inst = decoder.decode();
-            lifter.lift_instruction(&inst).expect("all instructions RISC-liftable");
+            lifter
+                .lift_instruction(&inst)
+                .expect("all instructions RISC-liftable");
         }
         let prog = RiscProgram::new(lifter.desynth.instrs);
         assert!(!prog.instrs.is_empty(), "lifted program must be non-empty");
@@ -812,12 +1153,12 @@ mod tests {
 
         // 기대 값 직접 확인.
         let exp_rax = ((((0x200u64 + 5) << 3) >> 1).wrapping_sub(0x10)) & 0xFFFF;
-        assert_eq!(ref_st.regs[0], exp_rax, "rax final");                  // reg[0] = rax
-        // push rax; push rbx; pop rdx; pop rcx → rdx=rbx(5), rcx=rax(exp_rax)
-        assert_eq!(ref_st.regs[1], exp_rax, "rcx = popped rax");         // reg[1] = rcx
-        assert_eq!(ref_st.regs[2], 5, "rdx = pushed rbx");               // reg[2] = rdx
-        assert_eq!(ref_st.regs[3], 5, "rbx still 5");                    // reg[3] = rbx
-        assert_eq!(ref_st.regs[6], exp_rax, "rsi = rax");                // reg[6] = rsi
+        assert_eq!(ref_st.regs[0], exp_rax, "rax final"); // reg[0] = rax
+                                                          // push rax; push rbx; pop rdx; pop rcx → rdx=rbx(5), rcx=rax(exp_rax)
+        assert_eq!(ref_st.regs[1], exp_rax, "rcx = popped rax"); // reg[1] = rcx
+        assert_eq!(ref_st.regs[2], 5, "rdx = pushed rbx"); // reg[2] = rdx
+        assert_eq!(ref_st.regs[3], 5, "rbx still 5"); // reg[3] = rbx
+        assert_eq!(ref_st.regs[6], exp_rax, "rsi = rax"); // reg[6] = rsi
         assert_eq!(ref_st.stack.len(), 0, "push+pop balanced");
         assert_eq!(ref_st.vsp, 0, "vsp balanced");
     }
@@ -842,17 +1183,18 @@ mod tests {
         use iced_x86::{Decoder, DecoderOptions};
 
         let raw = [
-            0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, 0x1122334455667788
+            0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22,
+            0x11, // mov rax, 0x1122334455667788
             0x04, 0x01, // add al, 1
             0x04, 0x7F, // add al, 0x7F  (low 0x89+0x7F=0x108 → 0x08, CF=1)
             0x2C, 0x02, // sub al, 2    (0x08-2 = 0x06)
             0x3C, 0x06, // cmp al, 6    (ZF=1)
             0xA8, 0x01, // test al, 1   (0x06&1=0 → ZF=0)
-            0x90,       // nop
+            0x90, // nop
             0x31, 0xC9, // xor ecx, ecx
             0xB1, 0x80, // mov cl, 0x80
             0x84, 0xC8, // test al, cl  (0x06&0x80=0 → ZF=1)
-            0xC3,       // ret
+            0xC3, // ret
         ];
         let base = 0x140001000u64;
 
@@ -860,7 +1202,9 @@ mod tests {
         let mut lifter = RiscLifter::new();
         while decoder.can_decode() {
             let inst = decoder.decode();
-            lifter.lift_instruction(&inst).expect("all instructions RISC-liftable");
+            lifter
+                .lift_instruction(&inst)
+                .expect("all instructions RISC-liftable");
         }
         let prog = RiscProgram::new(lifter.desynth.instrs);
         assert!(!prog.instrs.is_empty(), "lifted program must be non-empty");
@@ -884,11 +1228,18 @@ mod tests {
         }
 
         // x86 실제 의미론 값 단언 (lift 버그 회귀 고정):
-        assert_eq!(ref_st.regs[0], 0x1122334455667706, "rax: upper preserved + low byte 0x06");
+        assert_eq!(
+            ref_st.regs[0], 0x1122334455667706,
+            "rax: upper preserved + low byte 0x06"
+        );
         // mov cl, 0x80 → rcx low byte 0x80 (rcx는 xor로 0 확장됨)
         assert_eq!(ref_st.regs[1], 0x80, "rcx low byte 0x80");
         // 최종 test al, cl: 0x06 & 0x80 == 0 → ZF=1
-        assert_ne!(ref_st.flags & crate::vm::risc::flags::VFLAG_ZF, 0, "ZF set by final test");
+        assert_ne!(
+            ref_st.flags & crate::vm::risc::flags::VFLAG_ZF,
+            0,
+            "ZF set by final test"
+        );
         assert_eq!(ref_st.vsp, 0, "vsp balanced");
     }
 
@@ -906,18 +1257,38 @@ mod tests {
         ip_map.insert(0x140001000u64, 0usize); // 가상화된 블록
 
         let mut prog = RiscProgram::new(vec![
-            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Always }).with_imm(0x140002028), // → 함수 중간 (리다이렉트)
-            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Zero }).with_imm(0x140001000),   // → 가상화 블록 (유지)
-            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Always }).with_imm(0x140003000), // → 범위 밖 (유지)
-            MicroInstr::new(RiscOp::VirtualBranch { cond: BranchCondition::Always }).with_src1(MicroOperand::VReg(1)), // 간접 (유지)
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::Always,
+            })
+            .with_imm(0x140002028), // → 함수 중간 (리다이렉트)
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::Zero,
+            })
+            .with_imm(0x140001000), // → 가상화 블록 (유지)
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::Always,
+            })
+            .with_imm(0x140003000), // → 범위 밖 (유지)
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::Always,
+            })
+            .with_src1(MicroOperand::VReg(1)), // 간접 (유지)
         ]);
 
         let n = bridge_to_function_entries(&mut prog, &ip_map, &func_ranges);
         assert_eq!(n, 1, "exactly the mid-function branch is redirected");
-        assert_eq!(prog.instrs[0].imm, 0x140002000, "redirected to function entry (prologue)");
-        assert_eq!(prog.instrs[1].imm, 0x140001000, "virtualized-block branch untouched");
-        assert_eq!(prog.instrs[2].imm, 0x140003000, "out-of-range branch untouched");
+        assert_eq!(
+            prog.instrs[0].imm, 0x140002000,
+            "redirected to function entry (prologue)"
+        );
+        assert_eq!(
+            prog.instrs[1].imm, 0x140001000,
+            "virtualized-block branch untouched"
+        );
+        assert_eq!(
+            prog.instrs[2].imm, 0x140003000,
+            "out-of-range branch untouched"
+        );
         assert!(prog.instrs[3].src1.is_some(), "indirect branch untouched");
     }
 }
-

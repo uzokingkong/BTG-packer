@@ -3,7 +3,7 @@
 // ==============================================================================
 
 use crate::vm::ksa;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, Register};
 
 /// Encode the native x86 KSA reference (mirrors the boot stub's inline loop):
@@ -22,9 +22,21 @@ pub(crate) fn encode_ksa_native(
     base_va: u64,
 ) -> Result<Vec<u8>> {
     let mut seq: Vec<(Instruction, Option<ksa::KsaLabel>, Option<ksa::KsaLabel>)> = Vec::new();
-    seq.push((Instruction::with1(Code::Push_r64, Register::RBX).unwrap(), None, None));
-    seq.push((Instruction::with1(Code::Push_r64, Register::RSI).unwrap(), None, None));
-    seq.push((Instruction::with1(Code::Push_r64, Register::RDI).unwrap(), None, None));
+    seq.push((
+        Instruction::with1(Code::Push_r64, Register::RBX).unwrap(),
+        None,
+        None,
+    ));
+    seq.push((
+        Instruction::with1(Code::Push_r64, Register::RSI).unwrap(),
+        None,
+        None,
+    ));
+    seq.push((
+        Instruction::with1(Code::Push_r64, Register::RDI).unwrap(),
+        None,
+        None,
+    ));
     seq.push((
         Instruction::with2(Code::Mov_r64_imm64, Register::RBX, sbox_va).unwrap(),
         None,
@@ -33,9 +45,21 @@ pub(crate) fn encode_ksa_native(
     for item in ksa::build_ksa_instructions(seed_va, k1, k2, k3) {
         seq.push((item.inst, item.label, item.target));
     }
-    seq.push((Instruction::with1(Code::Pop_r64, Register::RDI).unwrap(), None, None));
-    seq.push((Instruction::with1(Code::Pop_r64, Register::RSI).unwrap(), None, None));
-    seq.push((Instruction::with1(Code::Pop_r64, Register::RBX).unwrap(), None, None));
+    seq.push((
+        Instruction::with1(Code::Pop_r64, Register::RDI).unwrap(),
+        None,
+        None,
+    ));
+    seq.push((
+        Instruction::with1(Code::Pop_r64, Register::RSI).unwrap(),
+        None,
+        None,
+    ));
+    seq.push((
+        Instruction::with1(Code::Pop_r64, Register::RBX).unwrap(),
+        None,
+        None,
+    ));
     seq.push((Instruction::with(Code::Retnq), None, None));
 
     encode_labeled_block(&seq, base_va)
@@ -47,7 +71,8 @@ pub(crate) fn encode_labeled_block(
     base_va: u64,
 ) -> Result<Vec<u8>> {
     // label -> instruction index
-    let mut label_idx: std::collections::HashMap<ksa::KsaLabel, usize> = std::collections::HashMap::new();
+    let mut label_idx: std::collections::HashMap<ksa::KsaLabel, usize> =
+        std::collections::HashMap::new();
     for (i, (_, lbl, _)) in seq.iter().enumerate() {
         if let Some(l) = lbl {
             label_idx.insert(*l, i);
@@ -56,7 +81,8 @@ pub(crate) fn encode_labeled_block(
 
     // pass 1: measure -> IP per instruction, label IPs
     let mut ip = base_va;
-    let mut label_ips: std::collections::HashMap<ksa::KsaLabel, u64> = std::collections::HashMap::new();
+    let mut label_ips: std::collections::HashMap<ksa::KsaLabel, u64> =
+        std::collections::HashMap::new();
     for (inst, lbl, _) in seq.iter() {
         let mut m = *inst;
         if lbl.is_some() && is_branch_code(inst.code()) {
@@ -99,7 +125,13 @@ pub(crate) fn encode_labeled_block(
 /// Encode the VM-call trampoline for the self-test:
 ///   push rbx; mov rcx, state_va; mov rbx, sbox_va; mov rdx, seed_va;
 ///   call entry_va; pop rbx; ret
-pub(crate) fn encode_trampoline(state_va: u64, sbox_va: u64, seed_va: u64, entry_va: u64, base_va: u64) -> Result<Vec<u8>> {
+pub(crate) fn encode_trampoline(
+    state_va: u64,
+    sbox_va: u64,
+    seed_va: u64,
+    entry_va: u64,
+    base_va: u64,
+) -> Result<Vec<u8>> {
     let insts = [
         Instruction::with1(Code::Push_r64, Register::RBX).unwrap(),
         Instruction::with2(Code::Mov_r64_imm64, Register::RCX, state_va).unwrap(),

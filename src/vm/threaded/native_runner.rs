@@ -37,7 +37,12 @@ impl DirectThreadedNativeRunner {
         Ok(Self { arena })
     }
 
-    fn emit_two_reg(instrs: &mut Vec<Instruction>, code: Code, a: Register, b: Register) -> Result<()> {
+    fn emit_two_reg(
+        instrs: &mut Vec<Instruction>,
+        code: Code,
+        a: Register,
+        b: Register,
+    ) -> Result<()> {
         instrs.push(Instruction::with2(code, a, b).map_err(|e| anyhow!("{e}"))?);
         Ok(())
     }
@@ -118,9 +123,8 @@ impl DirectThreadedNativeRunner {
     /// ```
     pub fn build_virtual_push_handler(target_va: u64) -> Result<Vec<u8>> {
         let mut instrs = Vec::new();
-        instrs.push(
-            Instruction::with2(Code::Sub_rm64_imm8, ABI_VSP, 8).map_err(|e| anyhow!("{e}"))?,
-        );
+        instrs
+            .push(Instruction::with2(Code::Sub_rm64_imm8, ABI_VSP, 8).map_err(|e| anyhow!("{e}"))?);
         let mem = iced_x86::MemoryOperand::with_base(ABI_VSP);
         instrs.push(
             Instruction::with2(Code::Mov_rm64_r64, mem, ABI_ARG1).map_err(|e| anyhow!("{e}"))?,
@@ -141,9 +145,8 @@ impl DirectThreadedNativeRunner {
         instrs.push(
             Instruction::with2(Code::Mov_r64_rm64, ABI_ARG1, mem).map_err(|e| anyhow!("{e}"))?,
         );
-        instrs.push(
-            Instruction::with2(Code::Add_rm64_imm8, ABI_VSP, 8).map_err(|e| anyhow!("{e}"))?,
-        );
+        instrs
+            .push(Instruction::with2(Code::Add_rm64_imm8, ABI_VSP, 8).map_err(|e| anyhow!("{e}"))?);
         DirectTailEmitter::emit_tail_dispatch(&mut instrs)?;
         DirectTailEmitter::assemble(instrs, target_va)
     }
@@ -213,7 +216,11 @@ impl DirectThreadedNativeRunner {
     pub fn build_all_handlers(base_va: u64) -> Result<Vec<(String, u64, Vec<u8>)>> {
         let mut out = Vec::new();
         let mut va = base_va;
-        let push = |name: &str, f: fn(u64) -> Result<Vec<u8>>, out: &mut Vec<(String, u64, Vec<u8>)>, va: &mut u64| -> Result<()> {
+        let push = |name: &str,
+                    f: fn(u64) -> Result<Vec<u8>>,
+                    out: &mut Vec<(String, u64, Vec<u8>)>,
+                    va: &mut u64|
+         -> Result<()> {
             let code = f(*va)?;
             out.push((name.to_string(), *va, code.clone()));
             *va += code.len() as u64;
@@ -226,7 +233,12 @@ impl DirectThreadedNativeRunner {
         push("PUSH", Self::build_virtual_push_handler, &mut out, &mut va)?;
         push("POP", Self::build_virtual_pop_handler, &mut out, &mut va)?;
         push("MEM_RD", Self::build_memory_read_handler, &mut out, &mut va)?;
-        push("MEM_WR", Self::build_memory_write_handler, &mut out, &mut va)?;
+        push(
+            "MEM_WR",
+            Self::build_memory_write_handler,
+            &mut out,
+            &mut va,
+        )?;
         push("SET_FLAG", Self::build_set_flag_handler, &mut out, &mut va)?;
         push("HALT", Self::build_halt_handler, &mut out, &mut va)?;
         Ok(out)
@@ -328,7 +340,10 @@ mod tests {
         use iced_x86::{Decoder, DecoderOptions, Mnemonic, Register};
 
         let halt = DirectThreadedNativeRunner::build_halt_handler(0x1400010A0).unwrap();
-        assert!(halt.len() >= 5, "HALT handler must be >= 5 bytes (4 pops + ret)");
+        assert!(
+            halt.len() >= 5,
+            "HALT handler must be >= 5 bytes (4 pops + ret)"
+        );
 
         let mut dec = Decoder::with_ip(64, &halt, 0x1400010A0, DecoderOptions::NONE);
         let mut pops = Vec::new();
@@ -344,12 +359,18 @@ mod tests {
             }
         }
         // 역순 pop: R15, R14, R13, R12 — 엔트리 push(R12,R13,R14,R15)와 짝을 이룬다.
-        assert_eq!(pops, vec![
-            Register::R15, Register::R14, Register::R13, Register::R12
-        ], "HALT must pop R15,R14,R13,R12 (reverse of entry push) to restore callee-saved regs");
+        assert_eq!(
+            pops,
+            vec![Register::R15, Register::R14, Register::R13, Register::R12],
+            "HALT must pop R15,R14,R13,R12 (reverse of entry push) to restore callee-saved regs"
+        );
         assert!(saw_ret, "HALT must end with ret");
         // RSP 16B 정렬: 4개 8B pop은 32B를 되돌려 엔트리 push 직전 RSP(=부트 스텁
         // dispatch 직후, 16B 정렬)로 정확히 복원한다. 명령 수 기반 불변식으로 보강.
-        assert_eq!(pops.len() * 8, 32, "4 callee-saved regs = 32B = RSP restore amount");
+        assert_eq!(
+            pops.len() * 8,
+            32,
+            "4 callee-saved regs = 32B = RSP restore amount"
+        );
     }
 }

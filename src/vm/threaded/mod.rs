@@ -5,15 +5,25 @@
 pub mod direct_tail;
 pub mod harness;
 pub mod inline_mba;
+pub mod micro_dispatcher;
 pub mod native_runner;
 pub mod poly_direct;
+pub mod reg_permutation;
+pub mod runtime_layout;
 pub mod super_ops;
 
 pub use direct_tail::DirectTailEmitter;
 pub use inline_mba::InlineMbaObfuscator;
+pub use micro_dispatcher::{MicroDispatchStrategy, MicroDispatcher};
 pub use native_runner::DirectThreadedNativeRunner;
 pub use poly_direct::run_native_poly_direct;
-pub use super_ops::{FusedPattern, SuperOperatorSynthesizer};
+pub use reg_permutation::{ContextOffsetScrambler, RegisterAssignment, VmRole};
+pub use runtime_layout::VmRuntimeLayout;
+pub use super_ops::{
+    AssignedSuperOp, FusedPattern, PreparedSuperOpProgram, SuperOpBuildMetadata, SuperOpCandidate,
+    SuperOpIndexMap, SuperOpOccurrence, SuperOpPlan, SuperOpRewrite, SuperOpStreamInstr,
+    SuperOperatorSynthesizer,
+};
 
 #[cfg(test)]
 mod tests {

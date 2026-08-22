@@ -4,7 +4,7 @@
 
 use crate::pe::builder::SectionData;
 use crate::pipeline::PipelineContext;
-use crate::util::{resolve_va_to_real_va, is_block_entry};
+use crate::util::{is_block_entry, resolve_va_to_real_va};
 use anyhow::Result;
 use std::collections::HashSet;
 
@@ -20,7 +20,9 @@ use std::collections::HashSet;
 /// 완료 후 `ctx.patched_sections`에 결과가 저장된다.
 pub fn run(ctx: &mut PipelineContext, mut relayed_sections: Vec<SectionData>) -> Result<()> {
     let dispatcher_va = ctx.dispatcher_va;
-    let layout = ctx.shuffled_layout.as_ref()
+    let layout = ctx
+        .shuffled_layout
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("ShuffledLayout not built"))?;
     let table_offsets = &layout.table_offsets;
     let va_to_trigger_id = &ctx.va_to_trigger_id;
@@ -41,12 +43,16 @@ pub fn run(ctx: &mut PipelineContext, mut relayed_sections: Vec<SectionData>) ->
     // 0이면 기본 MSVC 시드(0x00002B992DDFA232)를 미리 써준다.
     if cookie_rva > 0 {
         for sec in &mut relayed_sections {
-            if cookie_rva >= sec.virtual_address && cookie_rva + 8 <= sec.virtual_address + sec.virtual_size {
+            if cookie_rva >= sec.virtual_address
+                && cookie_rva + 8 <= sec.virtual_address + sec.virtual_size
+            {
                 let off = (cookie_rva - sec.virtual_address) as usize;
                 if off + 8 <= sec.bytes.len() {
-                    let cur_val = u64::from_le_bytes(sec.bytes[off..off + 8].try_into().unwrap_or([0; 8]));
+                    let cur_val =
+                        u64::from_le_bytes(sec.bytes[off..off + 8].try_into().unwrap_or([0; 8]));
                     if cur_val == 0 {
-                        sec.bytes[off..off + 8].copy_from_slice(&0x00002B992DDFA232u64.to_le_bytes());
+                        sec.bytes[off..off + 8]
+                            .copy_from_slice(&0x00002B992DDFA232u64.to_le_bytes());
                         println!("[+] Pre-initialized unset __security_cookie @ RVA 0x{:X} with default MSVC seed.", cookie_rva);
                     }
                 }
@@ -90,7 +96,12 @@ pub fn run(ctx: &mut PipelineContext, mut relayed_sections: Vec<SectionData>) ->
         {
             let sec_start_va = image_base + sec.virtual_address as u64;
             let mut patches = Vec::new();
-            let mut decoder = iced_x86::Decoder::with_ip(64, &sec.bytes, sec_start_va, iced_x86::DecoderOptions::NONE);
+            let mut decoder = iced_x86::Decoder::with_ip(
+                64,
+                &sec.bytes,
+                sec_start_va,
+                iced_x86::DecoderOptions::NONE,
+            );
 
             while decoder.can_decode() {
                 let mut inst = decoder.decode();
@@ -121,22 +132,30 @@ pub fn run(ctx: &mut PipelineContext, mut relayed_sections: Vec<SectionData>) ->
                                 table_offsets,
                                 dispatcher_va,
                             ) {
-                                let target_block_id =
-                                    va_to_trigger_id.get(&orig_target_va).copied().unwrap_or(u32::MAX);
+                                let target_block_id = va_to_trigger_id
+                                    .get(&orig_target_va)
+                                    .copied()
+                                    .unwrap_or(u32::MAX);
                                 inst.set_near_branch64(real_target_va);
                                 let offset_in_sec = (inst.ip() - sec_start_va) as usize;
                                 let inst_arr = [inst];
-                                let single_block = iced_x86::InstructionBlock::new(&inst_arr, inst.ip());
+                                let single_block =
+                                    iced_x86::InstructionBlock::new(&inst_arr, inst.ip());
                                 if let Ok(encoded) = iced_x86::BlockEncoder::encode(
-                                    64, single_block, iced_x86::BlockEncoderOptions::NONE
+                                    64,
+                                    single_block,
+                                    iced_x86::BlockEncoderOptions::NONE,
                                 ) {
                                     // FIX(안전): 재인코딩된 분기 길이가 원본보다 길어지면
                                     // in-place 패치는 다음 명령을 덮어쓴다(중첩 손상).
                                     // 길이가 같거나 짧을 때만 적용한다.
                                     if encoded.code_buffer.len() <= inst.len() {
                                         patches.push((
-                                            offset_in_sec, encoded.code_buffer,
-                                            orig_target_va, real_target_va, target_block_id,
+                                            offset_in_sec,
+                                            encoded.code_buffer,
+                                            orig_target_va,
+                                            real_target_va,
+                                            target_block_id,
                                         ));
                                     }
                                 }
@@ -145,9 +164,12 @@ pub fn run(ctx: &mut PipelineContext, mut relayed_sections: Vec<SectionData>) ->
                     }
                 }
             }
-            for (offset_in_sec, code_buf, orig_target_va, real_target_va, target_block_id) in patches {
+            for (offset_in_sec, code_buf, orig_target_va, real_target_va, target_block_id) in
+                patches
+            {
                 if offset_in_sec + code_buf.len() <= sec.bytes.len() {
-                    sec.bytes[offset_in_sec..offset_in_sec + code_buf.len()].copy_from_slice(&code_buf);
+                    sec.bytes[offset_in_sec..offset_in_sec + code_buf.len()]
+                        .copy_from_slice(&code_buf);
                     println!(
                         "[+] Executable Section Fixup: Sec {} Offset 0x{:X} | Target 0x{:X} -> 0x{:X} (Block {})",
                         sec.name, offset_in_sec, orig_target_va, real_target_va, target_block_id
@@ -200,7 +222,8 @@ pub fn run(ctx: &mut PipelineContext, mut relayed_sections: Vec<SectionData>) ->
                 if is_rva_range_protected(current_rva, 4, &protected_ranges) {
                     continue;
                 }
-                let val32 = u32::from_le_bytes(sec.bytes[offset..offset + 4].try_into().unwrap_or([0; 4]));
+                let val32 =
+                    u32::from_le_bytes(sec.bytes[offset..offset + 4].try_into().unwrap_or([0; 4]));
                 if val32 >= text_rva_start && val32 < text_rva_end {
                     let orig_va = image_base + val32 as u64;
                     if let Some(&_tid) = va_to_trigger_id.get(&orig_va) {
@@ -217,7 +240,9 @@ pub fn run(ctx: &mut PipelineContext, mut relayed_sections: Vec<SectionData>) ->
                 // 1. 64-bit VA 재배치 (8바이트 정렬 오프셋일 때)
                 if offset % 8 == 0 && offset + 8 <= sec.bytes.len() {
                     if !is_rva_range_protected(current_rva, 8, &protected_ranges) {
-                        let val64 = u64::from_le_bytes(sec.bytes[offset..offset + 8].try_into().unwrap_or([0; 8]));
+                        let val64 = u64::from_le_bytes(
+                            sec.bytes[offset..offset + 8].try_into().unwrap_or([0; 8]),
+                        );
                         if val64 >= text_start_va && val64 < text_end_va {
                             // FIX: va_to_trigger_id는 모든 인스트럭션 IP를 키로 갖는다.
                             // 블록 중간 인스트럭션을 가리키는 데이터 상수를 블록 시작점으로
@@ -226,8 +251,10 @@ pub fn run(ctx: &mut PipelineContext, mut relayed_sections: Vec<SectionData>) ->
                             //  실행되므로 안전)
                             if let Some(&target_block_id) = va_to_trigger_id.get(&val64) {
                                 if is_block_entry(va_to_trigger_id, val64, target_block_id) {
-                                    let real_target_va = dispatcher_va + table_offsets[target_block_id as usize] as u64;
-                                    sec.bytes[offset..offset + 8].copy_from_slice(&real_target_va.to_le_bytes());
+                                    let real_target_va = dispatcher_va
+                                        + table_offsets[target_block_id as usize] as u64;
+                                    sec.bytes[offset..offset + 8]
+                                        .copy_from_slice(&real_target_va.to_le_bytes());
                                     patched_ptrs_count += 1;
                                     log::debug!(
                                         "[+] Section Data Fixup (64-bit Exact VA): Sec {} Offset 0x{:X} | Old VA: 0x{:X} -> New VA: 0x{:X}",
@@ -248,15 +275,19 @@ pub fn run(ctx: &mut PipelineContext, mut relayed_sections: Vec<SectionData>) ->
                         || rva32_candidates.contains(&(offset + 4)))
                     && !is_rva_range_protected(current_rva, 4, &protected_ranges)
                 {
-                    let val32 = u32::from_le_bytes(sec.bytes[offset..offset + 4].try_into().unwrap_or([0; 4]));
+                    let val32 = u32::from_le_bytes(
+                        sec.bytes[offset..offset + 4].try_into().unwrap_or([0; 4]),
+                    );
                     if val32 >= text_rva_start && val32 < text_rva_end {
                         let orig_va = image_base + val32 as u64;
                         // FIX: 위 64-bit 경로와 동일하게 **블록 시작점(block entry)일 때만** 재배치.
                         if let Some(&target_block_id) = va_to_trigger_id.get(&orig_va) {
                             if is_block_entry(va_to_trigger_id, orig_va, target_block_id) {
-                                let real_target_va = dispatcher_va + table_offsets[target_block_id as usize] as u64;
+                                let real_target_va =
+                                    dispatcher_va + table_offsets[target_block_id as usize] as u64;
                                 let real_rva = (real_target_va - image_base) as u32;
-                                sec.bytes[offset..offset + 4].copy_from_slice(&real_rva.to_le_bytes());
+                                sec.bytes[offset..offset + 4]
+                                    .copy_from_slice(&real_rva.to_le_bytes());
                                 patched_ptrs_count += 1;
                                 log::debug!(
                                     "[+] Section Data Fixup (32-bit Exact RVA): Sec {} Offset 0x{:X} | Old RVA: 0x{:X} -> New RVA: 0x{:X}",
@@ -280,7 +311,7 @@ pub fn run(ctx: &mut PipelineContext, mut relayed_sections: Vec<SectionData>) ->
     // no-op 스텁(ret / jmp rax)으로 리다이렉트하고 GuardCFFunctionTable/Count/Flags를
     // 0으로 만들어 로더가 CFG 계측으로 인식하지 못하게 한다. (원본 real_win_calc.exe는
     // /guard:cf 빌드라 .btg로 옮겨진 간접 호출 타깃이 CFG 비트맵에 없어 RtlFailFast 발생)
-    let check_stub_va = dispatcher_va + 0x1F;   // RET stub
+    let check_stub_va = dispatcher_va + 0x1F; // RET stub
     let dispatch_stub_va = dispatcher_va + 0x1D; // JMP RAX stub
 
     if let Some(lc_dir) = ctx.target_info.data_directories.get(10) {
@@ -294,24 +325,39 @@ pub fn run(ctx: &mut PipelineContext, mut relayed_sections: Vec<SectionData>) ->
 
                 if lc_rva >= sec_va && lc_rva < sec_va + sec_vsize {
                     let offset_in_sec = (lc_rva - sec_va) as usize;
-                    let lc_end = (offset_in_sec + lc_size).min(relayed_sections[sec_idx].bytes.len());
+                    let lc_end =
+                        (offset_in_sec + lc_size).min(relayed_sections[sec_idx].bytes.len());
 
                     // GuardCFCheckFunctionPointer (offset 0x70)
                     patch_cfg_ptr(
-                        &mut relayed_sections, sec_idx, offset_in_sec, lc_end,
-                        0x70, check_stub_va, image_base, "GuardCFCheckFunctionPointer",
+                        &mut relayed_sections,
+                        sec_idx,
+                        offset_in_sec,
+                        lc_end,
+                        0x70,
+                        check_stub_va,
+                        image_base,
+                        "GuardCFCheckFunctionPointer",
                     );
 
                     // GuardCFDispatchFunctionPointer (offset 0x78)
                     patch_cfg_ptr(
-                        &mut relayed_sections, sec_idx, offset_in_sec, lc_end,
-                        0x78, dispatch_stub_va, image_base, "GuardCFDispatchFunctionPointer",
+                        &mut relayed_sections,
+                        sec_idx,
+                        offset_in_sec,
+                        lc_end,
+                        0x78,
+                        dispatch_stub_va,
+                        image_base,
+                        "GuardCFDispatchFunctionPointer",
                     );
 
                     // GuardCFFunctionTable / Count / Flags 제거
                     if offset_in_sec + 0x94 <= lc_end {
-                        relayed_sections[sec_idx].bytes[offset_in_sec + 0x80..offset_in_sec + 0x88].fill(0);
-                        relayed_sections[sec_idx].bytes[offset_in_sec + 0x88..offset_in_sec + 0x90].fill(0);
+                        relayed_sections[sec_idx].bytes[offset_in_sec + 0x80..offset_in_sec + 0x88]
+                            .fill(0);
+                        relayed_sections[sec_idx].bytes[offset_in_sec + 0x88..offset_in_sec + 0x90]
+                            .fill(0);
                         relayed_sections[sec_idx].bytes[offset_in_sec + 0x90..offset_in_sec + 0x94]
                             .copy_from_slice(&0u32.to_le_bytes());
                         println!(
@@ -375,6 +421,11 @@ mod imports;
 mod protect;
 mod refs;
 
-pub(crate) use imports::{is_rva_range_protected, rva_to_slice, get_ascii_string_rva_range, collect_import_directory_ranges, collect_delay_import_directory_ranges};
+pub(crate) use imports::{
+    collect_delay_import_directory_ranges, collect_import_directory_ranges,
+    get_ascii_string_rva_range, is_rva_range_protected, rva_to_slice,
+};
 pub(crate) use protect::{collect_protected_rva_ranges, locate_security_cookie};
-pub(crate) use refs::{collect_code_materialized_target_ids, collect_data_reference_target_ids, resolve_block_id};
+pub(crate) use refs::{
+    collect_code_materialized_target_ids, collect_data_reference_target_ids, resolve_block_id,
+};

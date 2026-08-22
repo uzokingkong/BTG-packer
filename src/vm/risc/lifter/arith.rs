@@ -5,13 +5,82 @@
 use super::*;
 
 impl RiscLifter {
+    pub(super) fn lift_carry_alu(&mut self, inst: &Instruction, adc: bool) -> Result<()> {
+        let width = Self::operand_width(inst);
+        let make_op = || {
+            if adc {
+                RiscOp::Adc { width }
+            } else {
+                RiscOp::Sbb { width }
+            }
+        };
+        match inst.op0_kind() {
+            OpKind::Register => {
+                let dst = Self::reg_to_vreg(inst.op0_register())
+                    .ok_or_else(|| anyhow!("invalid carry-ALU dst"))?;
+                let right = self.operand_value(inst, 1)?;
+                if width <= 2 {
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Mov)
+                            .with_dst(MicroOperand::Temp(0))
+                            .with_src1(dst),
+                    );
+                }
+                self.desynth.instrs.push(
+                    MicroInstr::new(make_op())
+                        .with_dst(dst)
+                        .with_src1(dst)
+                        .with_src2(right),
+                );
+                if width <= 2 {
+                    // Merging the low result back into the original GPR uses
+                    // flag-producing primitives, so preserve ADC/SBB flags.
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Mov)
+                            .with_dst(MicroOperand::Temp(7))
+                            .with_src1(MicroOperand::Vflags),
+                    );
+                    self.preserve_upper(dst, width);
+                    self.desynth
+                        .instrs
+                        .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
+                }
+            }
+            OpKind::Memory => {
+                let addr = MicroOperand::Temp(4);
+                self.lower_effective_address(inst, addr)?;
+                let left = MicroOperand::Temp(5);
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::MemoryRead { width })
+                        .with_dst(left)
+                        .with_src1(addr),
+                );
+                let right = self.operand_value(inst, 1)?;
+                self.desynth.instrs.push(
+                    MicroInstr::new(make_op())
+                        .with_dst(left)
+                        .with_src1(left)
+                        .with_src2(right),
+                );
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::MemoryWrite { width })
+                        .with_src1(addr)
+                        .with_src2(left),
+                );
+            }
+            _ => return Err(anyhow!("risc lifter: invalid op0 kind for ADC/SBB")),
+        }
+        Ok(())
+    }
+
     pub(super) fn lift_binary_alu(&mut self, inst: &Instruction, alu: Alu) -> Result<()> {
         // P0-1: x86 SUB은 borrow-CF(네이티브 플래그 소비 분기 정합)를 위해
         // desynth(AddWithCarry) 대신 전용 SubWithBorrow(width)로 lift한다.
         let width = Self::operand_width(inst);
         match inst.op0_kind() {
             OpKind::Register => {
-                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
+                let dst =
+                    Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
                 let right = self.operand_value(inst, 1)?;
                 // P2 (G3): 8/16비트 레지스터 Add/Sub는 상위 비트 보존이 필요하다.
                 // Add/Sub{width}가 dst를 마스크로 덮어쓰므로, **먼저** 원본을 Temp(0)에
@@ -19,14 +88,19 @@ impl RiscLifter {
                 let preserve = (alu == Alu::Add || alu == Alu::Sub) && (width == 1 || width == 2);
                 // R7: 8/16-bit XOR/AND/OR — desynth(NOR 시퀀스)는 Temp(0..2)를
                 // 내부 소모하므로 원본을 Temp(5)에 보존한다.
-                let narrow_logic = matches!(alu, Alu::Xor | Alu::And | Alu::Or) && (width == 1 || width == 2);
+                let narrow_logic =
+                    matches!(alu, Alu::Xor | Alu::And | Alu::Or) && (width == 1 || width == 2);
                 if preserve {
                     self.desynth.instrs.push(
-                        MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::Temp(0)).with_src1(dst),
+                        MicroInstr::new(RiscOp::Mov)
+                            .with_dst(MicroOperand::Temp(0))
+                            .with_src1(dst),
                     );
                 } else if narrow_logic {
                     self.desynth.instrs.push(
-                        MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::Temp(5)).with_src1(dst),
+                        MicroInstr::new(RiscOp::Mov)
+                            .with_dst(MicroOperand::Temp(5))
+                            .with_src1(dst),
                     );
                 }
                 if alu == Alu::Sub {
@@ -133,7 +207,12 @@ impl RiscLifter {
 
     /// P2 (G3): 8/16비트 연산에서 **레지스터** 피연산자만 폭으로 마스크해 지정
     /// temp에 저장한다 (x86은 low-byte/word만 사용). 메모리/즉시 피연산자는 그대로.
-    fn mask_reg_operand(&mut self, op: MicroOperand, width: u8, temp: MicroOperand) -> Result<MicroOperand> {
+    fn mask_reg_operand(
+        &mut self,
+        op: MicroOperand,
+        width: u8,
+        temp: MicroOperand,
+    ) -> Result<MicroOperand> {
         if width >= 8 {
             return Ok(op);
         }
@@ -191,11 +270,15 @@ impl RiscLifter {
         // (2) 시프트 후 합성 op 뒤에 시프트 결과 flags를 복원한다.
         let save_flags = |d: &mut Self| {
             d.desynth.instrs.push(
-                MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::Temp(7)).with_src1(MicroOperand::Vflags),
+                MicroInstr::new(RiscOp::Mov)
+                    .with_dst(MicroOperand::Temp(7))
+                    .with_src1(MicroOperand::Vflags),
             );
         };
         let restore_flags = |d: &mut Self| {
-            d.desynth.instrs.push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
+            d.desynth
+                .instrs
+                .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
         };
         if narrow {
             save_flags(self);
@@ -209,7 +292,11 @@ impl RiscLifter {
             | OpKind::Immediate32to64
             | OpKind::Immediate64 => {
                 let v = inst.immediate64();
-                if width == 8 { MicroOperand::Imm64(v) } else { MicroOperand::Imm64(v & 31) }
+                if width == 8 {
+                    MicroOperand::Imm64(v)
+                } else {
+                    MicroOperand::Imm64(v & 31)
+                }
             }
             OpKind::Register => {
                 let c = Self::reg_to_vreg(inst.op1_register())
@@ -245,12 +332,15 @@ impl RiscLifter {
         };
         match inst.op0_kind() {
             OpKind::Register => {
-                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid shift dst"))?;
+                let dst = Self::reg_to_vreg(inst.op0_register())
+                    .ok_or_else(|| anyhow!("invalid shift dst"))?;
                 if narrow {
                     // 상위 비트 보존용 원본은 desynth(emit_and)가 내부 소모하는
                     // Temp(0)/Temp(1)을 피해 Temp(5)에 저장한다.
                     self.desynth.instrs.push(
-                        MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::Temp(5)).with_src1(dst),
+                        MicroInstr::new(RiscOp::Mov)
+                            .with_dst(MicroOperand::Temp(5))
+                            .with_src1(dst),
                     );
                     let src = if is_sar {
                         sign_extend_into(self, MicroOperand::Temp(6), dst, width);
@@ -263,9 +353,12 @@ impl RiscLifter {
                     // P0-3: 합성 op가 flags를 오염시켰으므로 원본 flags 복원
                     // (count==0 에서 x86 flags 보존 의미론).
                     restore_flags(self);
-                    self.desynth
-                        .instrs
-                        .push(MicroInstr::new(op).with_dst(dst).with_src1(src).with_src2(count));
+                    self.desynth.instrs.push(
+                        MicroInstr::new(op)
+                            .with_dst(dst)
+                            .with_src1(src)
+                            .with_src2(count),
+                    );
                     // P0-3: 시프트 결과 flags를 보존했다가 mask/preserve 합성 op
                     // 뒤에 복원한다 (합성 AND/OR 가 시프트 flags를 덮어쓰지 않게).
                     save_flags(self);
@@ -273,15 +366,21 @@ impl RiscLifter {
                     self.preserve_upper_from(dst, width, MicroOperand::Temp(5));
                     restore_flags(self);
                 } else if width == 4 {
-                    self.desynth
-                        .instrs
-                        .push(MicroInstr::new(op).with_dst(dst).with_src1(dst).with_src2(count));
+                    self.desynth.instrs.push(
+                        MicroInstr::new(op)
+                            .with_dst(dst)
+                            .with_src1(dst)
+                            .with_src2(count),
+                    );
                     // 32비트 레지스터 시프트 결과는 상위 32비트를 0으로.
                     self.zero_extend_dst_if32(inst, dst);
                 } else {
-                    self.desynth
-                        .instrs
-                        .push(MicroInstr::new(op).with_dst(dst).with_src1(dst).with_src2(count));
+                    self.desynth.instrs.push(
+                        MicroInstr::new(op)
+                            .with_dst(dst)
+                            .with_src1(dst)
+                            .with_src2(count),
+                    );
                 }
             }
             OpKind::Memory => {
@@ -305,9 +404,12 @@ impl RiscLifter {
                 if narrow {
                     restore_flags(self);
                 }
-                self.desynth
-                    .instrs
-                    .push(MicroInstr::new(op).with_dst(left).with_src1(src).with_src2(count));
+                self.desynth.instrs.push(
+                    MicroInstr::new(op)
+                        .with_dst(left)
+                        .with_src1(src)
+                        .with_src2(count),
+                );
                 self.desynth.instrs.push(
                     MicroInstr::new(RiscOp::MemoryWrite { width })
                         .with_src1(addr)
@@ -319,10 +421,81 @@ impl RiscLifter {
         Ok(())
     }
 
+    pub(super) fn lift_rotate_left(&mut self, inst: &Instruction) -> Result<()> {
+        let width = match inst.op0_kind() {
+            OpKind::Register => inst.op0_register().size() as u8,
+            OpKind::Memory => inst.memory_size().size() as u8,
+            _ => return Err(anyhow!("risc lifter: invalid ROL destination")),
+        };
+        let count = match inst.op1_kind() {
+            OpKind::Immediate8 | OpKind::Immediate8to64 => {
+                MicroOperand::Imm64(inst.immediate8() as u64)
+            }
+            OpKind::Register => Self::reg_to_vreg(inst.op1_register())
+                .ok_or_else(|| anyhow!("invalid ROL count register"))?,
+            _ => return Err(anyhow!("risc lifter: invalid ROL count")),
+        };
+        let op = RiscOp::RotateLeft { width };
+        match inst.op0_kind() {
+            OpKind::Register => {
+                let dst = Self::reg_to_vreg(inst.op0_register())
+                    .ok_or_else(|| anyhow!("invalid ROL dst"))?;
+                if width <= 2 {
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Mov)
+                            .with_dst(MicroOperand::Temp(5))
+                            .with_src1(dst),
+                    );
+                }
+                self.desynth.instrs.push(
+                    MicroInstr::new(op)
+                        .with_dst(dst)
+                        .with_src1(dst)
+                        .with_src2(count),
+                );
+                if width <= 2 {
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Mov)
+                            .with_dst(MicroOperand::Temp(7))
+                            .with_src1(MicroOperand::Vflags),
+                    );
+                    self.preserve_upper_from(dst, width, MicroOperand::Temp(5));
+                    self.desynth
+                        .instrs
+                        .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
+                }
+            }
+            OpKind::Memory => {
+                let addr = MicroOperand::Temp(4);
+                self.lower_effective_address(inst, addr)?;
+                let val = MicroOperand::Temp(5);
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::MemoryRead { width })
+                        .with_dst(val)
+                        .with_src1(addr),
+                );
+                self.desynth.instrs.push(
+                    MicroInstr::new(op)
+                        .with_dst(val)
+                        .with_src1(val)
+                        .with_src2(count),
+                );
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::MemoryWrite { width })
+                        .with_src1(addr)
+                        .with_src2(val),
+                );
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
     /// MOVZX: 8/16-bit 소스를 0-확장해 64비트 결과로. AND 마스크로 표현.
 
     pub(super) fn lift_movzx(&mut self, inst: &Instruction, mask: u64) -> Result<()> {
-        let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid movzx dst"))?;
+        let dst =
+            Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid movzx dst"))?;
         let src = self.operand_value(inst, 1)?;
         self.desynth.emit_and(dst, src, MicroOperand::Imm64(mask));
         Ok(())
@@ -333,7 +506,8 @@ impl RiscLifter {
     /// 부호 비트를 복제한다. (MOVSX는 논리 시프트만으로는 표현 불가 — 산술 시프트 필요)
 
     pub(super) fn lift_movsx(&mut self, inst: &Instruction, src_bits: u8) -> Result<()> {
-        let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid movsx dst"))?;
+        let dst =
+            Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid movsx dst"))?;
         let src = self.operand_value(inst, 1)?;
         let shift = 64 - src_bits;
         let t = MicroOperand::Temp(3);
@@ -370,15 +544,20 @@ impl RiscLifter {
     /// 조건부 분기 emit (타깃 = 절대 x86 IP)
 
     pub(super) fn emit_jcc(&mut self, cond: BranchCondition, target: u64) {
-        self.desynth.instrs.push(
-            MicroInstr::new(RiscOp::VirtualBranch { cond }).with_imm(target),
-        );
+        self.desynth
+            .instrs
+            .push(MicroInstr::new(RiscOp::VirtualBranch { cond }).with_imm(target));
     }
 
     /// P2: 연산 결과를 `width`바이트 폭으로 잘라낸다 (8/16/32비트 INC/DEC 등).
     /// 32비트는 기존 zero-extension 헬퍼, 8/16비트는 AND 마스크로 표현한다.
 
-    pub(super) fn mask_result(&mut self, width: u8, inst: &Instruction, dst: MicroOperand) -> Result<()> {
+    pub(super) fn mask_result(
+        &mut self,
+        width: u8,
+        inst: &Instruction,
+        dst: MicroOperand,
+    ) -> Result<()> {
         let mask = match width {
             1 => 0xFF,
             2 => 0xFFFF,
@@ -424,8 +603,13 @@ impl RiscLifter {
             2 => 0xFFFFu64,
             _ => return,
         };
-        let keep = MicroOperand::Temp(1);
-        self.desynth.emit_and(keep, orig, MicroOperand::Imm64(!mask));
+        // `emit_or` uses Temp(0..2) internally.  Keeping the preserved upper
+        // bits in Temp(1) aliases that scratch space and makes the OR consume
+        // a value it has already overwritten (e.g. `mov al, bl` became a full
+        // 64-bit register copy).  Temp(6) is reserved for this final operand.
+        let keep = MicroOperand::Temp(6);
+        self.desynth
+            .emit_and(keep, orig, MicroOperand::Imm64(!mask));
         self.desynth.emit_or(dst, dst, keep);
     }
 
@@ -437,16 +621,21 @@ impl RiscLifter {
         let narrow = width == 1 || width == 2;
         match inst.op0_kind() {
             OpKind::Register => {
-                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
+                let dst =
+                    Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
                 if narrow {
                     self.desynth.instrs.push(
-                        MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::Temp(0)).with_src1(dst),
+                        MicroInstr::new(RiscOp::Mov)
+                            .with_dst(MicroOperand::Temp(0))
+                            .with_src1(dst),
                     );
                 }
                 if is_not {
                     // NOT{width}: 플래그 불변, 폭별 마스크.
                     self.desynth.instrs.push(
-                        MicroInstr::new(RiscOp::Not { width }).with_dst(dst).with_src1(dst),
+                        MicroInstr::new(RiscOp::Not { width })
+                            .with_dst(dst)
+                            .with_src1(dst),
                     );
                 } else {
                     // NEG: 0 - dst — borrow-CF를 위해 SubWithBorrow{width}.
@@ -473,7 +662,9 @@ impl RiscLifter {
                 );
                 if is_not {
                     self.desynth.instrs.push(
-                        MicroInstr::new(RiscOp::Not { width: w }).with_dst(left).with_src1(left),
+                        MicroInstr::new(RiscOp::Not { width: w })
+                            .with_dst(left)
+                            .with_src1(left),
                     );
                 } else {
                     self.desynth.instrs.push(
@@ -560,21 +751,39 @@ impl RiscLifter {
         let r0 = inst.op0_kind() == OpKind::Register;
         let r1 = inst.op1_kind() == OpKind::Register;
         if r0 && r1 {
-            let a = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid xchg a"))?;
-            let b = Self::reg_to_vreg(inst.op1_register()).ok_or_else(|| anyhow!("invalid xchg b"))?;
+            let a =
+                Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid xchg a"))?;
+            let b =
+                Self::reg_to_vreg(inst.op1_register()).ok_or_else(|| anyhow!("invalid xchg b"))?;
             let ta = MicroOperand::Temp(0);
             let tb = MicroOperand::Temp(1);
-            self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(ta).with_src1(a));
-            self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(tb).with_src1(b));
-            self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(a).with_src1(tb));
-            self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(b).with_src1(ta));
+            self.desynth
+                .instrs
+                .push(MicroInstr::new(RiscOp::Mov).with_dst(ta).with_src1(a));
+            self.desynth
+                .instrs
+                .push(MicroInstr::new(RiscOp::Mov).with_dst(tb).with_src1(b));
+            self.desynth
+                .instrs
+                .push(MicroInstr::new(RiscOp::Mov).with_dst(a).with_src1(tb));
+            self.desynth
+                .instrs
+                .push(MicroInstr::new(RiscOp::Mov).with_dst(b).with_src1(ta));
             return Ok(());
         }
         // 하나는 메모리, 하나는 레지스터 (x86은 메모리-메모리 XCHG 불가).
         let (reg, addr) = if r0 {
-            (Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid xchg reg"))?, inst)
+            (
+                Self::reg_to_vreg(inst.op0_register())
+                    .ok_or_else(|| anyhow!("invalid xchg reg"))?,
+                inst,
+            )
         } else if r1 {
-            (Self::reg_to_vreg(inst.op1_register()).ok_or_else(|| anyhow!("invalid xchg reg"))?, inst)
+            (
+                Self::reg_to_vreg(inst.op1_register())
+                    .ok_or_else(|| anyhow!("invalid xchg reg"))?,
+                inst,
+            )
         } else {
             return Err(anyhow!("risc lifter: xchg mem,mem impossible"));
         };
@@ -601,18 +810,24 @@ impl RiscLifter {
             Code::Xadd_rm32_r32 => 4,
             _ => 8,
         };
-        let reg = Self::reg_to_vreg(inst.op1_register()).ok_or_else(|| anyhow!("invalid xadd reg"))?;
+        let reg =
+            Self::reg_to_vreg(inst.op1_register()).ok_or_else(|| anyhow!("invalid xadd reg"))?;
         match inst.op0_kind() {
             OpKind::Register => {
-                let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid xadd dst"))?;
+                let dst = Self::reg_to_vreg(inst.op0_register())
+                    .ok_or_else(|| anyhow!("invalid xadd dst"))?;
                 let old = MicroOperand::Temp(0);
-                self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(old).with_src1(dst));
+                self.desynth
+                    .instrs
+                    .push(MicroInstr::new(RiscOp::Mov).with_dst(old).with_src1(dst));
                 // dst = old + reg  (XADD 덧셈 → 플래그)
                 self.desynth.emit_add(dst, old, reg);
                 self.mask_result(width, inst, dst)?;
                 // reg = 이전 dst (폭별 마스크된 값, 플래그 보존)
                 let oldm = self.mask_operand(old, width)?;
-                self.desynth.instrs.push(MicroInstr::new(RiscOp::Mov).with_dst(reg).with_src1(oldm));
+                self.desynth
+                    .instrs
+                    .push(MicroInstr::new(RiscOp::Mov).with_dst(reg).with_src1(oldm));
             }
             OpKind::Memory => {
                 let addr = MicroOperand::Temp(4);

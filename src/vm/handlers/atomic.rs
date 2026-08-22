@@ -28,26 +28,67 @@ pub(super) fn emit_cmpxchg(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         // implicit upper-half zeroing does not apply. This violated the codebase
         // convention that 32-bit results are zero-extended when committed (cf. every
         // OP_*_R_R / OP_MUL_R_R32 handler, which store RAX into the 64-bit vreg).
-        (OP_CMPXCHG_MEM32_A, Code::Cmpxchg_rm32_r32, Register::ECX, Register::RAX, Code::Mov_r32_rm32, Code::Mov_rm64_r64),
-        (OP_CMPXCHG_MEM64_A, Code::Cmpxchg_rm64_r64, Register::RCX, Register::RAX, Code::Mov_r64_rm64, Code::Mov_rm64_r64),
+        (
+            OP_CMPXCHG_MEM32_A,
+            Code::Cmpxchg_rm32_r32,
+            Register::ECX,
+            Register::RAX,
+            Code::Mov_r32_rm32,
+            Code::Mov_rm64_r64,
+        ),
+        (
+            OP_CMPXCHG_MEM64_A,
+            Code::Cmpxchg_rm64_r64,
+            Register::RCX,
+            Register::RAX,
+            Code::Mov_r64_rm64,
+            Code::Mov_rm64_r64,
+        ),
         // v49: 8/16-bit variants. Hardware compares only AL/AX; on a failed cmpxchg
         // the CPU writes the byte/word into AL/AX and leaves the rest of RAX
         // untouched, so committing the full RAX to the v0 slot matches x86 exactly.
         // src is loaded as the low byte/word of the src vreg (CL/CX).
-        (OP_CMPXCHG_MEM8_A, Code::Cmpxchg_rm8_r8, Register::CL, Register::RAX, Code::Mov_r8_rm8, Code::Mov_rm64_r64),
-        (OP_CMPXCHG_MEM16_A, Code::Cmpxchg_rm16_r16, Register::CX, Register::RAX, Code::Mov_r16_rm16, Code::Mov_rm64_r64),
+        (
+            OP_CMPXCHG_MEM8_A,
+            Code::Cmpxchg_rm8_r8,
+            Register::CL,
+            Register::RAX,
+            Code::Mov_r8_rm8,
+            Code::Mov_rm64_r64,
+        ),
+        (
+            OP_CMPXCHG_MEM16_A,
+            Code::Cmpxchg_rm16_r16,
+            Register::CX,
+            Register::RAX,
+            Code::Mov_r16_rm16,
+            Code::Mov_rm64_r64,
+        ),
     ] {
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
-            Instruction::with2(Code::Mov_r64_rm64, Register::RAX, MemoryOperand::with_base(Register::R8)).unwrap(),
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base(Register::R8),
+            )
+            .unwrap(),
             Instruction::with2(load_code, src_r, vreg(Register::RDX)).unwrap(),
         ];
-        let mut ci = Instruction::with2(cmp_code, MemoryOperand::with_base(Register::R11), src_r).unwrap();
+        let mut ci =
+            Instruction::with2(cmp_code, MemoryOperand::with_base(Register::R11), src_r).unwrap();
         ci.set_has_lock_prefix(true);
         body.push(ci);
-        body.push(Instruction::with2(store_code, MemoryOperand::with_base(Register::R8), acc_r).unwrap());
+        body.push(
+            Instruction::with2(store_code, MemoryOperand::with_base(Register::R8), acc_r).unwrap(),
+        );
         // Deterministic ZF-only capture (cmpxchg defines ZF; other flags are
         // undefined). IMPORTANT: capture the flags with pushfq IMMEDIATELY after
         // the cmpxchg -- the `and rdx,~F_ZF` below would otherwise clobber ZF and
@@ -57,15 +98,22 @@ pub(super) fn emit_cmpxchg(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         body.push(Instruction::with(Code::Pushfq));
         body.push(Instruction::with1(Code::Pop_r64, Register::R11).unwrap());
         body.push(Instruction::with2(Code::And_rm64_imm32, Register::R11, F_ZF as i32).unwrap());
-        body.push(Instruction::with2(Code::Mov_r64_rm64, Register::RDX, state_flags_mem()).unwrap());
+        body.push(
+            Instruction::with2(Code::Mov_r64_rm64, Register::RDX, state_flags_mem()).unwrap(),
+        );
         // Clear ONLY the ZF bit from the preserved word. NOTE: the mask is
         // `!F_ZF` (0xFFFFFFBF), NOT `F_ZF.wrapping_neg()` (0xFFFFFFC0) — the
         // latter sign-extends to 0xFFFFFFFFFFFFFFC0 which also clears bits 0-5
         // (CF/PF/AF), silently dropping the "other flags preserved" contract
         // whenever a preceding op had set them (caught by the atomic fuzz).
-        body.push(Instruction::with2(Code::And_rm64_imm32, Register::RDX, (!(F_ZF as u32)) as i32).unwrap());
+        body.push(
+            Instruction::with2(Code::And_rm64_imm32, Register::RDX, (!(F_ZF as u32)) as i32)
+                .unwrap(),
+        );
         body.push(Instruction::with2(Code::Or_rm64_r64, Register::RDX, Register::R11).unwrap());
-        body.push(Instruction::with2(Code::Mov_rm64_r64, state_flags_mem(), Register::RDX).unwrap());
+        body.push(
+            Instruction::with2(Code::Mov_rm64_r64, state_flags_mem(), Register::RDX).unwrap(),
+        );
         body.push(Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap());
         hdr(seq, op, body);
     }
@@ -93,12 +141,18 @@ pub(super) fn emit_xchg(seq: &mut Vec<(Instruction, Option<Cl>)>) {
             seq,
             op,
             vec![
-                Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+                Instruction::with2(
+                    Code::Movzx_r32_rm8,
+                    Register::ECX,
+                    MemoryOperand::with_base(Register::R9),
+                )
+                .unwrap(),
                 Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
                 Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
                 Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RDX)).unwrap(),
                 // atomic swap: [addr] <-> reg  (implicitly atomic for memory xchg)
-                Instruction::with2(xchg_code, MemoryOperand::with_base(Register::R11), xreg).unwrap(),
+                Instruction::with2(xchg_code, MemoryOperand::with_base(Register::R11), xreg)
+                    .unwrap(),
                 // reg = old [addr]; upper bits already correct (see lift_xchg)
                 Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RDX), Register::RAX).unwrap(),
                 Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap(),
@@ -124,7 +178,12 @@ pub(super) fn emit_lock_incdec(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         (OP_LOCK_DEC_MEM64_A, Code::Dec_rm64),
     ] {
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
         ];
         let mut ci = Instruction::with1(code, MemoryOperand::with_base(Register::R11)).unwrap();
@@ -144,17 +203,25 @@ pub(super) fn emit_xadd(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         (OP_XADD_MEM64_A, Code::Xadd_rm64_r64, Register::RAX),
     ] {
         let mut body = vec![
-            Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, MemoryOperand::with_base(Register::R9)).unwrap(),
+            Instruction::with2(
+                Code::Movzx_r32_rm8,
+                Register::ECX,
+                MemoryOperand::with_base(Register::R9),
+            )
+            .unwrap(),
             Instruction::with2(Code::Movzx_r32_rm8, Register::EDX, m(Register::R9, 1)).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::R11, vreg(Register::RCX)).unwrap(),
             Instruction::with2(Code::Mov_r64_rm64, Register::RAX, vreg(Register::RDX)).unwrap(),
         ];
         // LOCK is mandatory for XADD atomicity (unlike XCHG).
-        let mut ci = Instruction::with2(xadd_code, MemoryOperand::with_base(Register::R11), xreg).unwrap();
+        let mut ci =
+            Instruction::with2(xadd_code, MemoryOperand::with_base(Register::R11), xreg).unwrap();
         ci.set_has_lock_prefix(true);
         body.push(ci);
         // src = old [addr] (upper bits per x86: preserved for 8/16, zeroed for 32)
-        body.push(Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RDX), Register::RAX).unwrap());
+        body.push(
+            Instruction::with2(Code::Mov_rm64_r64, vreg(Register::RDX), Register::RAX).unwrap(),
+        );
         // xadd sets ADD flags (OF/SF/ZF/AF/PF/CF)
         body.extend(cap_flags(true));
         body.push(Instruction::with2(Code::Add_rm64_imm32, Register::R9, 2).unwrap());

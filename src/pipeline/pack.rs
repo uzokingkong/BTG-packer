@@ -10,7 +10,9 @@
 
 use crate::pe::TargetPeInfo;
 use crate::pipeline::PipelineContext;
-use crate::pipeline::{pass1_slice, pass2_shuffle, pass3_encode, pass4_section, patch_data, build, crypto};
+use crate::pipeline::{
+    build, crypto, pass1_slice, pass2_shuffle, pass3_encode, pass4_section, patch_data,
+};
 use anyhow::Result;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
@@ -35,13 +37,18 @@ pub fn run_full(
     let info = TargetPeInfo::parse(input_pe)?;
 
     // Dispatcher RVA computed the same way as main.rs (after the last section).
-    let section_alignment = if info.section_alignment == 0 { 0x1000 } else { info.section_alignment };
+    let section_alignment = if info.section_alignment == 0 {
+        0x1000
+    } else {
+        info.section_alignment
+    };
     let dispatcher_rva: u32 = info
         .relayed_sections
         .iter()
         .map(|s| {
             s.virtual_address
-                + ((s.virtual_size.max(s.bytes.len() as u32) + section_alignment - 1) / section_alignment)
+                + ((s.virtual_size.max(s.bytes.len() as u32) + section_alignment - 1)
+                    / section_alignment)
                     * section_alignment
         })
         .max()
@@ -62,12 +69,29 @@ pub fn run_full(
     pass1_slice::run(&mut ctx)?;
     pass2_shuffle::run(&mut ctx)?;
     pass3_encode::run(&mut ctx)?;
-    pass4_section::run(&mut ctx, false, crate::dispatcher::antidebug::AntiDebugPolicy::Trap, true, false)?;
+    pass4_section::run(
+        &mut ctx,
+        false,
+        crate::dispatcher::antidebug::AntiDebugPolicy::Trap,
+        true,
+        false,
+    )?;
 
     let relayed = ctx.target_info.relayed_sections.clone();
     patch_data::run(&mut ctx, relayed)?;
 
-    crypto::run(&mut ctx, true, false, crate::dispatcher::antidebug::AntiDebugPolicy::Trap, false, crypto_coverage, true, false, false, false)?;
+    crypto::run(
+        &mut ctx,
+        true,
+        false,
+        crate::dispatcher::antidebug::AntiDebugPolicy::Trap,
+        false,
+        crypto_coverage,
+        true,
+        false,
+        false,
+        false,
+    )?;
 
     // build::run writes to the given path; pass the caller's optional path.
     // None → build in-memory only (no side-effect file in the caller's cwd).
@@ -115,13 +139,18 @@ mod tests {
         let input = crate::pe::generate_dummy_target_pe().expect("generate dummy PE");
         let pack = |seed: u64| -> Vec<u8> {
             let info = TargetPeInfo::parse(&input).expect("parse");
-            let section_alignment = if info.section_alignment == 0 { 0x1000 } else { info.section_alignment };
+            let section_alignment = if info.section_alignment == 0 {
+                0x1000
+            } else {
+                info.section_alignment
+            };
             let dispatcher_rva: u32 = info
                 .relayed_sections
                 .iter()
                 .map(|s| {
                     s.virtual_address
-                        + ((s.virtual_size.max(s.bytes.len() as u32) + section_alignment - 1) / section_alignment)
+                        + ((s.virtual_size.max(s.bytes.len() as u32) + section_alignment - 1)
+                            / section_alignment)
                             * section_alignment
                 })
                 .max()
@@ -134,16 +163,38 @@ mod tests {
             pass1_slice::run(&mut ctx).expect("pass1");
             pass2_shuffle::run(&mut ctx).expect("pass2");
             pass3_encode::run(&mut ctx).expect("pass3");
-            pass4_section::run(&mut ctx, false, crate::dispatcher::antidebug::AntiDebugPolicy::Trap, true, false).expect("pass4");
+            pass4_section::run(
+                &mut ctx,
+                false,
+                crate::dispatcher::antidebug::AntiDebugPolicy::Trap,
+                true,
+                false,
+            )
+            .expect("pass4");
             let relayed = ctx.target_info.relayed_sections.clone();
             patch_data::run(&mut ctx, relayed).expect("patch");
             // vm=true → KSA/PRGA VM 모듈이 build_vm_module_mba 경로를 탄다.
-            crypto::run(&mut ctx, true, false, crate::dispatcher::antidebug::AntiDebugPolicy::Trap, true, 100, true, false, false, false).expect("crypto");
+            crypto::run(
+                &mut ctx,
+                true,
+                false,
+                crate::dispatcher::antidebug::AntiDebugPolicy::Trap,
+                true,
+                100,
+                true,
+                false,
+                false,
+                false,
+            )
+            .expect("crypto");
             build::run(&ctx, None).expect("build")
         };
         let a = pack(0x1234);
         let b = pack(0x1234);
-        assert_eq!(a, b, "--seed --vm --m8 must be byte-identical (readccc §4.2 determinism)");
+        assert_eq!(
+            a, b,
+            "--seed --vm --m8 must be byte-identical (readccc §4.2 determinism)"
+        );
         assert!(!a.is_empty());
         assert_ne!(a, input);
     }

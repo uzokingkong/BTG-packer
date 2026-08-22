@@ -27,7 +27,7 @@
 // (CSV, per the project's mapping-file convention) via `render_csv`.
 // ==============================================================================
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 
 /// A single build-time ownership decision for one function (by RVA).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +88,28 @@ fn covering_rf(runtime_functions: &[RuntimeFunction], rva: u32) -> Option<(u32, 
         .map(|rf| (rf.begin_rva, rf.end_rva))
 }
 
+/// Extend coverage across adjacent RUNTIME_FUNCTION records. A generated VM
+/// module legitimately uses different unwind recipes for its entry, native-call
+/// bridge, and post-bridge code while remaining gaplessly covered.
+fn contiguous_coverage_end(
+    runtime_functions: &[RuntimeFunction],
+    start: u32,
+) -> Option<(u32, u32)> {
+    let (first_begin, mut end) = covering_rf(runtime_functions, start)?;
+    let mut sorted: Vec<_> = runtime_functions.iter().collect();
+    sorted.sort_by_key(|rf| rf.begin_rva);
+    loop {
+        let Some(next) = sorted
+            .iter()
+            .find(|rf| rf.begin_rva <= end && rf.end_rva > end)
+        else {
+            break;
+        };
+        end = next.end_rva;
+    }
+    Some((first_begin, end))
+}
+
 /// Run the §1.3 consistency check over the explicit ownership model.
 ///
 /// Returns `Ok(report)` when the model is consistent (report.is_clean() == true).
@@ -123,7 +145,7 @@ pub fn check_ownership(
         vm_entries.push(f);
 
         // (1) fully covered by a RUNTIME_FUNCTION
-        let Some((b, e)) = covering_rf(runtime_functions, f.start_rva) else {
+        let Some((b, e)) = contiguous_coverage_end(runtime_functions, f.start_rva) else {
             report.inconsistencies += 1;
             report.notes.push(format!(
                 "VM function 0x{:X}..0x{:X} is NOT covered by any RUNTIME_FUNCTION",
@@ -134,7 +156,7 @@ pub fn check_ownership(
         if f.end_rva > e {
             report.inconsistencies += 1;
             report.notes.push(format!(
-                "VM function 0x{:X}..0x{:X} extends beyond its RUNTIME_FUNCTION \
+                "VM function 0x{:X}..0x{:X} extends beyond contiguous RUNTIME_FUNCTION coverage \
                  (covering [0x{:X}..0x{:X}))",
                 f.start_rva, f.end_rva, b, e
             ));
@@ -170,7 +192,11 @@ pub fn check_ownership(
 
     if !report.is_clean() {
         let joined = report.notes.join("; ");
-        bail!("function-ownership ↔ .pdata inconsistency ({}): {}", report.inconsistencies, joined);
+        bail!(
+            "function-ownership ↔ .pdata inconsistency ({}): {}",
+            report.inconsistencies,
+            joined
+        );
     }
     Ok(report)
 }
@@ -202,7 +228,10 @@ mod tests {
     use super::*;
 
     fn rf(b: u32, e: u32) -> RuntimeFunction {
-        RuntimeFunction { begin_rva: b, end_rva: e }
+        RuntimeFunction {
+            begin_rva: b,
+            end_rva: e,
+        }
     }
     fn own(start: u32, end: u32, vm: bool) -> FunctionOwnership {
         FunctionOwnership {
@@ -244,6 +273,32 @@ mod tests {
         assert!(rep.is_clean());
         assert_eq!(rep.vm_functions, 1);
         assert_eq!(rep.native_functions, 1);
+    }
+
+    #[test]
+    fn vm_module_accepts_gapless_multi_recipe_coverage() {
+        let model = vec![FunctionOwnership {
+            start_rva: 0x5000,
+            end_rva: 0x9000,
+            owned_by_vm: true,
+            enforce_entry_begin: false,
+            reason: "program-vm-module",
+        }];
+        let rfs = vec![rf(0x5000, 0x6100), rf(0x6100, 0x6800), rf(0x6800, 0x9000)];
+        assert!(check_ownership(&model, &rfs).unwrap().is_clean());
+    }
+
+    #[test]
+    fn vm_module_rejects_gap_between_unwind_recipes() {
+        let model = vec![FunctionOwnership {
+            start_rva: 0x5000,
+            end_rva: 0x9000,
+            owned_by_vm: true,
+            enforce_entry_begin: false,
+            reason: "program-vm-module",
+        }];
+        let rfs = vec![rf(0x5000, 0x6100), rf(0x6110, 0x9000)];
+        assert!(check_ownership(&model, &rfs).is_err());
     }
 
     #[test]

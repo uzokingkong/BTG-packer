@@ -22,8 +22,8 @@
 // Win64 ABI contract without perturbing the live reference/interpreter paths.
 // ==============================================================================
 
-use crate::vm::abi::{WIN64_NONVOL_GPRS, validate_win64_abi};
-use anyhow::{Result, bail};
+use crate::vm::abi::{validate_win64_abi, WIN64_NONVOL_GPRS};
+use anyhow::{bail, Result};
 use iced_x86::{Code, Decoder, DecoderOptions};
 
 /// Win64 fixed costs.
@@ -142,7 +142,7 @@ pub fn emit_native_call_site(args: [u64; 4], target: u64, rax_slot_disp: i8) -> 
 
     // PRE-CALL
     w.pop_r(reg::R11); // ret_ip <- VM virtual stack
-    // materialize the four Win64 args (RCX,RDX,R8,R9)
+                       // materialize the four Win64 args (RCX,RDX,R8,R9)
     w.mov_r64_imm(reg::RCX, args[0]);
     w.mov_r64_imm(reg::RDX, args[1]);
     w.mov_r64_imm(reg::R8, args[2]);
@@ -161,7 +161,7 @@ pub fn emit_native_call_site(args: [u64; 4], target: u64, rax_slot_disp: i8) -> 
 
     // POST-CALL
     w.mov_mem_rsi_disp8_rax(rax_slot_disp); // RAX -> virtual RAX slot
-    // restore callee-saved in reverse order
+                                            // restore callee-saved in reverse order
     for r in WIN64_NONVOL_GPRS.iter().rev() {
         let n = r.number() as u8;
         w.pop_r(n);
@@ -235,7 +235,8 @@ pub fn verify_call_site(code: &[u8], entry_ip: u64) -> Result<CallSiteReport> {
             Code::Jmp_rm64 => rep.has_resume_jmp = true,
             Code::Mov_rm64_r64 => {
                 // return sync: store of rax to memory
-                if inst.op1_register().number() == 0 && inst.memory_base() != iced_x86::Register::None
+                if inst.op1_register().number() == 0
+                    && inst.memory_base() != iced_x86::Register::None
                 {
                     rep.has_return_sync = true;
                 }
@@ -247,7 +248,10 @@ pub fn verify_call_site(code: &[u8], entry_ip: u64) -> Result<CallSiteReport> {
     // callee-saved preservation (unsaved-write check) — hard gate
     let violations = validate_win64_abi(code, entry_ip)?;
     if !violations.is_empty() {
-        bail!("Win64 ABI violation in call site: {}", violations.join("; "));
+        bail!(
+            "Win64 ABI violation in call site: {}",
+            violations.join("; ")
+        );
     }
     if !rep.is_valid() {
         bail!(
@@ -300,7 +304,11 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!((pushed + sub) % 16, 0, "stack delta must keep 16B alignment");
+        assert_eq!(
+            (pushed + sub) % 16,
+            0,
+            "stack delta must keep 16B alignment"
+        );
     }
 
     #[test]
@@ -330,6 +338,9 @@ mod tests {
             0x41, 0xBC, 0x07, 0x00, 0x00, 0x00, // mov r12d, 7 (unsaved)
             0xC3,
         ];
-        assert!(validate_win64_abi(&bad, 0x1000).unwrap().iter().any(|s| s.contains("reg12")));
+        assert!(validate_win64_abi(&bad, 0x1000)
+            .unwrap()
+            .iter()
+            .any(|s| s.contains("reg12")));
     }
 }

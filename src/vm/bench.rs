@@ -6,7 +6,7 @@ use super::arena::Arena;
 use super::encode::encode_trampoline;
 use super::{build_vm_module_mba, VM_STATE_SIZE};
 use crate::vm::{handlers, interp, ksa, lifter};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 
@@ -38,9 +38,22 @@ pub fn run_vm_bench() -> Result<()> {
     let vsbox_va = arena.base + 0xA000;
     let tramp_va = arena.base + 0xB000;
     let mut m8_rng = StdRng::seed_from_u64(0xB7AB);
-    let module = build_vm_module_mba(code_va as u64, table_va as u64, bc_va as u64, bc.clone(), handlers::EntryMode::Ksa, &mut m8_rng)?;
+    let module = build_vm_module_mba(
+        code_va as u64,
+        table_va as u64,
+        bc_va as u64,
+        bc.clone(),
+        handlers::EntryMode::Ksa,
+        &mut m8_rng,
+    )?;
     handlers::validate_vm_code(&module.code)?;
-    let tramp = encode_trampoline(state_va as u64, vsbox_va as u64, seed_va as u64, code_va as u64, tramp_va as u64)?;
+    let tramp = encode_trampoline(
+        state_va as u64,
+        vsbox_va as u64,
+        seed_va as u64,
+        code_va as u64,
+        tramp_va as u64,
+    )?;
     {
         let b = arena.bytes();
         b[0x3000..0x3000 + 256].copy_from_slice(&seed_masked);
@@ -62,7 +75,8 @@ pub fn run_vm_bench() -> Result<()> {
             .copy_from_slice(&(0x100usize as u64).to_le_bytes());
         st[interp::STATE_PTR_SEED..interp::STATE_PTR_SEED + 8]
             .copy_from_slice(&(0x1000usize as u64).to_le_bytes());
-        interp::interpret(&mut st, &mut mem, &bc).map_err(|e| anyhow!("bench interp failed: {:?}", e))?;
+        interp::interpret(&mut st, &mut mem, &bc)
+            .map_err(|e| anyhow!("bench interp failed: {:?}", e))?;
     }
     let interp_dur = t0.elapsed();
 
@@ -81,7 +95,10 @@ pub fn run_vm_bench() -> Result<()> {
     let speedup = interp_per / native_per.max(1e-12);
 
     println!("==================================================================");
-    println!(" [VM BENCH] M8 — 인터프리터 vs 네이티브 VM (KSA, {}회)", iters);
+    println!(
+        " [VM BENCH] M8 — 인터프리터 vs 네이티브 VM (KSA, {}회)",
+        iters
+    );
     println!("==================================================================");
     println!("  bytecode: {} B", bc.len());
     println!("  handler table: MBA-obfuscated (--m8 경로)");
@@ -91,7 +108,3 @@ pub fn run_vm_bench() -> Result<()> {
     println!("==================================================================");
     Ok(())
 }
-
-
-
-

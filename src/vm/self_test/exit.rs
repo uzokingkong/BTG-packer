@@ -6,12 +6,11 @@
 // bodies are byte-identical to the pre-split monolith; only imports and module
 // wiring changed.
 
-use anyhow::{Result, anyhow};
+use crate::vm::arena::Arena;
+use crate::vm::build_vm_module;
+use crate::vm::encode::encode_trampoline;
 use crate::vm::{bytecode, handlers, interp};
-use crate::vm::{build_vm_module};
-use crate::vm::arena::{Arena};
-use crate::vm::encode::{encode_trampoline};
-
+use anyhow::{anyhow, Result};
 
 // =============================================================================
 // [추가 테스트] v_exit: 종료 시 Once teardown 패닉 / VA 크래시 재현
@@ -51,11 +50,11 @@ use crate::vm::encode::{encode_trampoline};
 ///     r12-r15 가 sentinel 그대로인지 확인한다.
 ///   → 오염이 있으면 테스트가 FAIL 을 출력하고 Err 를 반환한다.
 pub fn run_exit_teardown_test() -> anyhow::Result<()> {
-    use crate::vm::bytecode::*;
-    use crate::vm::{handlers, interp};
+    use super::build_vm_module;
     use crate::vm::arena::Arena;
+    use crate::vm::bytecode::*;
     use crate::vm::encode::encode_trampoline;
-    use super::{build_vm_module};
+    use crate::vm::{handlers, interp};
     use anyhow::anyhow;
 
     // ── 공용 arena 설정 ────────────────────────────────────────────────────
@@ -145,20 +144,22 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
     // ─────────────────────────────────────────────────────────────────────────
     let once_cases: &[(u8, u8, bool, u8)] = &[
         // 성공: mem == expected_al (RUNNING=1 → COMPLETE=3)
-        (0x01, 0x01, true,  0x03),
+        (0x01, 0x01, true, 0x03),
         // 실패: mem != expected_al → mem 불변, al = mem_curr
         (0x01, 0x02, false, 0x01),
         // dirty upper RAX bits: 저바이트(0x01)만 비교해야 성공
         // → 8-bit CAS 는 AL(v0 저바이트)만 사용해야 한다
-        (0x01, 0x01, true,  0x03),  // upper bits 는 seed 로 더럽힘(아래 참고)
+        (0x01, 0x01, true, 0x03), // upper bits 는 seed 로 더럽힘(아래 참고)
         // POISONED(=2) → COMPLETE(=3): Once 재진입 방지 경로
-        (0x02, 0x02, true,  0x03),
+        (0x02, 0x02, true, 0x03),
     ];
 
     let complete: u8 = 0x03; // Rust Once::COMPLETE
-    let new_val: u8  = complete;
+    let new_val: u8 = complete;
 
-    for (case_i, &(mem_init, expected_al, expect_success, mem_after)) in once_cases.iter().enumerate() {
+    for (case_i, &(mem_init, expected_al, expect_success, mem_after)) in
+        once_cases.iter().enumerate()
+    {
         let mut bc = BytecodeBuilder::new();
         bc.mem_cmpxchg_a(OP_CMPXCHG_MEM8_A, 15, 14);
         bc.halt();
@@ -175,50 +176,60 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
         };
 
         let seed = &[
-            (15usize, 0x8000u64),     // v15 = mem 주소 (runner 가 native 시 보정)
-            (0usize,  v0_seed),       // v0 = RAX (expected)
+            (15usize, 0x8000u64),      // v15 = mem 주소 (runner 가 native 시 보정)
+            (0usize, v0_seed),         // v0 = RAX (expected)
             (14usize, new_val as u64), // v14 = new value (COMPLETE)
         ];
 
         let (vi, mi, vn, mn) = run(&prog, &data, seed)?;
 
         // ZF 검증
-        let zf_i = u64::from_le_bytes(
-            {
-                let mut st = vec![0u8; interp::STATE_SIZE];
-                let mut m  = vec![0u8; 0x10000];
-                m[0x8000] = mem_init;
-                let off0 = interp::STATE_VREGS;
-                st[off0..off0+8].copy_from_slice(&v0_seed.to_le_bytes());
-                let off14 = interp::STATE_VREGS + 14*8;
-                st[off14..off14+8].copy_from_slice(&(new_val as u64).to_le_bytes());
-                let off15 = interp::STATE_VREGS + 15*8;
-                st[off15..off15+8].copy_from_slice(&0x8000u64.to_le_bytes());
-                interp::interpret(&mut st, &mut m, &prog).unwrap();
-                st[interp::STATE_FLAGS..interp::STATE_FLAGS+8].try_into().unwrap()
-            }
-        ) & crate::vm::bytecode::F_ZF;
+        let zf_i = u64::from_le_bytes({
+            let mut st = vec![0u8; interp::STATE_SIZE];
+            let mut m = vec![0u8; 0x10000];
+            m[0x8000] = mem_init;
+            let off0 = interp::STATE_VREGS;
+            st[off0..off0 + 8].copy_from_slice(&v0_seed.to_le_bytes());
+            let off14 = interp::STATE_VREGS + 14 * 8;
+            st[off14..off14 + 8].copy_from_slice(&(new_val as u64).to_le_bytes());
+            let off15 = interp::STATE_VREGS + 15 * 8;
+            st[off15..off15 + 8].copy_from_slice(&0x8000u64.to_le_bytes());
+            interp::interpret(&mut st, &mut m, &prog).unwrap();
+            st[interp::STATE_FLAGS..interp::STATE_FLAGS + 8]
+                .try_into()
+                .unwrap()
+        }) & crate::vm::bytecode::F_ZF;
 
         let got_mem = mi[0];
         if expect_success {
             if got_mem != mem_after {
                 return Err(anyhow!(
                     "[32-S1] case{}: byte CAS success → mem should be 0x{:02X}, got 0x{:02X}",
-                    case_i, mem_after, got_mem
+                    case_i,
+                    mem_after,
+                    got_mem
                 ));
             }
             if zf_i == 0 {
-                return Err(anyhow!("[32-S1] case{}: byte CAS success → ZF should be 1", case_i));
+                return Err(anyhow!(
+                    "[32-S1] case{}: byte CAS success → ZF should be 1",
+                    case_i
+                ));
             }
         } else {
             if got_mem != mem_after {
                 return Err(anyhow!(
                     "[32-S1] case{}: byte CAS fail → mem should stay 0x{:02X}, got 0x{:02X}",
-                    case_i, mem_after, got_mem
+                    case_i,
+                    mem_after,
+                    got_mem
                 ));
             }
             if zf_i != 0 {
-                return Err(anyhow!("[32-S1] case{}: byte CAS fail → ZF should be 0", case_i));
+                return Err(anyhow!(
+                    "[32-S1] case{}: byte CAS fail → ZF should be 0",
+                    case_i
+                ));
             }
             // 실패 시 v0(al) 에 [mem] 로드
             let al_loaded = vi[0] & 0xFF;
@@ -231,14 +242,27 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
         }
         // interp == native
         if mi != mn {
-            return Err(anyhow!("[32-S1] case{}: interp/native memory mismatch", case_i));
+            return Err(anyhow!(
+                "[32-S1] case{}: interp/native memory mismatch",
+                case_i
+            ));
         }
         let vregs_eq = vi.iter().zip(vn.iter()).enumerate().all(|(i, (a, b))| {
-            if i == 15 { true } // native 주소 보정으로 v15 는 비교 제외
-            else { a == b }
+            if i == 15 {
+                true
+            }
+            // native 주소 보정으로 v15 는 비교 제외
+            else {
+                a == b
+            }
         });
         if !vregs_eq {
-            return Err(anyhow!("[32-S1] case{}: interp/native vreg mismatch\ninterp={:?}\nnative={:?}", case_i, vi, vn));
+            return Err(anyhow!(
+                "[32-S1] case{}: interp/native vreg mismatch\ninterp={:?}\nnative={:?}",
+                case_i,
+                vi,
+                vn
+            ));
         }
     }
     println!("[32-S1] Once byte CAS (RUNNING→COMPLETE, dirty-upper-RAX, fail→load-mem): PASS");
@@ -263,10 +287,7 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
             let mut data = vec![0u8; 8];
             data[0] = mem_init;
 
-            let seed = &[
-                (15usize, 0x8000u64),
-                (14usize, al_val as u64),
-            ];
+            let seed = &[(15usize, 0x8000u64), (14usize, al_val as u64)];
 
             let (vi, mi, vn, mn) = run(&prog, &data, seed)?;
 
@@ -274,13 +295,17 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
             if mi[0] != al_val {
                 return Err(anyhow!(
                     "[32-S2] xchg mem: expected 0x{:02X}, got 0x{:02X} (mem_init=0x{:02X})",
-                    al_val, mi[0], mem_init
+                    al_val,
+                    mi[0],
+                    mem_init
                 ));
             }
             if (vi[14] & 0xFF) != mem_init as u64 {
                 return Err(anyhow!(
                     "[32-S2] xchg vreg: expected 0x{:02X}, got 0x{:02X} (al_val=0x{:02X})",
-                    mem_init, vi[14] & 0xFF, al_val
+                    mem_init,
+                    vi[14] & 0xFF,
+                    al_val
                 ));
             }
             // interp == native
@@ -334,20 +359,26 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
         // (여기선 Rust 컴파일러가 보장하므로 명시적 asm read 대신 side-effect 확인)
         let b = arena.bytes();
         let vreg14 = u64::from_le_bytes(
-            b[0x6000 + interp::STATE_VREGS + 14*8..][..8].try_into().unwrap()
+            b[0x6000 + interp::STATE_VREGS + 14 * 8..][..8]
+                .try_into()
+                .unwrap(),
         );
         let vreg15 = u64::from_le_bytes(
-            b[0x6000 + interp::STATE_VREGS + 15*8..][..8].try_into().unwrap()
+            b[0x6000 + interp::STATE_VREGS + 15 * 8..][..8]
+                .try_into()
+                .unwrap(),
         );
 
         if vreg14 != 0xDEAD_C0DE_1234_5678u64 {
             return Err(anyhow!(
-                "[32-S3] vreg14(R14) not written correctly: 0x{:X}", vreg14
+                "[32-S3] vreg14(R14) not written correctly: 0x{:X}",
+                vreg14
             ));
         }
         if vreg15 != 0xBADF_BABE_DEAD_BEEFu64 {
             return Err(anyhow!(
-                "[32-S3] vreg15(R15) not written correctly: 0x{:X}", vreg15
+                "[32-S3] vreg15(R15) not written correctly: 0x{:X}",
+                vreg15
             ));
         }
 
@@ -360,8 +391,10 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
     }
 
     // matrix 전용 runner: interp + native 동시 실행, v15 주소 보정.
-    let mut mrun = |prog: &[u8], data_init: &[u8], state_seed: &[(usize, u64)]|
-        -> anyhow::Result<(Vec<u64>, Vec<u8>, Vec<u64>, Vec<u8>)> {
+    let mut mrun = |prog: &[u8],
+                    data_init: &[u8],
+                    state_seed: &[(usize, u64)]|
+     -> anyhow::Result<(Vec<u64>, Vec<u8>, Vec<u64>, Vec<u8>)> {
         let mut st_i = vec![0u8; interp::STATE_SIZE];
         let mut mem_i = vec![0u8; 0x10000];
         mem_i[0x8000..0x8000 + data_init.len()].copy_from_slice(data_init);
@@ -371,10 +404,12 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
         }
         interp::interpret(&mut st_i, &mut mem_i, prog)
             .map_err(|e| anyhow!("mrun interp failed: {:?}", e))?;
-        let vregs_i: Vec<u64> = (0..16).map(|i| {
-            let off = interp::STATE_VREGS + i * 8;
-            u64::from_le_bytes(st_i[off..off + 8].try_into().unwrap())
-        }).collect();
+        let vregs_i: Vec<u64> = (0..16)
+            .map(|i| {
+                let off = interp::STATE_VREGS + i * 8;
+                u64::from_le_bytes(st_i[off..off + 8].try_into().unwrap())
+            })
+            .collect();
         let mem_slice_i = mem_i[0x8000..0x8000 + data_init.len()].to_vec();
         {
             let b = arena.bytes();
@@ -389,10 +424,12 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
         }
         arena.call(0x8000);
         let b = arena.bytes();
-        let vregs_n: Vec<u64> = (0..16).map(|i| {
-            let off = interp::STATE_VREGS + i * 8;
-            u64::from_le_bytes(b[0x6000 + off..0x6000 + off + 8].try_into().unwrap())
-        }).collect();
+        let vregs_n: Vec<u64> = (0..16)
+            .map(|i| {
+                let off = interp::STATE_VREGS + i * 8;
+                u64::from_le_bytes(b[0x6000 + off..0x6000 + off + 8].try_into().unwrap())
+            })
+            .collect();
         let mem_slice_n = b[0x9000..0x9000 + data_init.len()].to_vec();
         Ok((vregs_i, mem_slice_i, vregs_n, mem_slice_n))
     };
@@ -409,17 +446,25 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
     {
         use crate::vm::bytecode::*;
         let cmpxchg_specs: &[(u8, usize)] = &[
-            (OP_CMPXCHG_MEM8_A, 1), (OP_CMPXCHG_MEM16_A, 2),
-            (OP_CMPXCHG_MEM32_A, 4), (OP_CMPXCHG_MEM64_A, 8),
+            (OP_CMPXCHG_MEM8_A, 1),
+            (OP_CMPXCHG_MEM16_A, 2),
+            (OP_CMPXCHG_MEM32_A, 4),
+            (OP_CMPXCHG_MEM64_A, 8),
         ];
         for &(op, w) in cmpxchg_specs {
-            let mask = if w == 8 { u64::MAX } else { (1u64 << (w * 8)) - 1 };
+            let mask = if w == 8 {
+                u64::MAX
+            } else {
+                (1u64 << (w * 8)) - 1
+            };
             let mem_lo: u64 = 0x0101_0202_0303_0404 & mask;
             let src_val: u64 = 0xABCD_EF01_2345_6789;
 
             // (a) success: mem==expected → mem=src, ZF=1
             let mut data = vec![0u8; 16];
-            for (i, b) in mem_lo.to_le_bytes().iter().enumerate().take(w) { data[i] = *b; }
+            for (i, b) in mem_lo.to_le_bytes().iter().enumerate().take(w) {
+                data[i] = *b;
+            }
             let mut bc = BytecodeBuilder::new();
             bc.mov_r_imm64(0, mem_lo);
             bc.mov_r_imm64(14, src_val);
@@ -431,14 +476,21 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
             let got_i = u64::from_le_bytes(mi[..8].try_into().unwrap()) & mask;
             let got_n = u64::from_le_bytes(mn[..8].try_into().unwrap()) & mask;
             if got_i != want_lo || got_n != want_lo {
-                return Err(anyhow!("[32-S4] cmpxchg{w} success: mem not written (i={:X} n={:X} want={:X})", got_i, got_n, want_lo));
+                return Err(anyhow!(
+                    "[32-S4] cmpxchg{w} success: mem not written (i={:X} n={:X} want={:X})",
+                    got_i,
+                    got_n,
+                    want_lo
+                ));
             }
 
             // (b) fail: mem != expected → v0 low width = mem, ZF=0 (dirty upper RAX)
             let mem2_lo: u64 = 0x1122_3344_5566_7788 & mask;
             let dirty_exp: u64 = 0xDEAD_BEEF_0000_0000u64 | (mem2_lo ^ 0x55); // low != mem → fail
             let mut data2 = vec![0u8; 16];
-            for (i, b) in mem2_lo.to_le_bytes().iter().enumerate().take(w) { data2[i] = *b; }
+            for (i, b) in mem2_lo.to_le_bytes().iter().enumerate().take(w) {
+                data2[i] = *b;
+            }
             let mut bc2 = BytecodeBuilder::new();
             bc2.mov_r_imm64(0, dirty_exp);
             bc2.mov_r_imm64(14, 0x2222_2222_2222_2222u64);
@@ -457,7 +509,12 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
                 _ => mem2_lo,
             };
             if v0_i != exp_v0 || v0_n != exp_v0 {
-                return Err(anyhow!("[32-S4] cmpxchg{w} fail: v0 mismatch i={:X} n={:X} want={:X}", v0_i, v0_n, exp_v0));
+                return Err(anyhow!(
+                    "[32-S4] cmpxchg{w} fail: v0 mismatch i={:X} n={:X} want={:X}",
+                    v0_i,
+                    v0_n,
+                    exp_v0
+                ));
             }
         }
         println!("[32-S4] width matrix 8/16/32/64 atomic CAS (Once state, success/fail, dirty-upper-RAX): PASS");
@@ -466,15 +523,23 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
     {
         use crate::vm::bytecode::*;
         let xchg_specs: &[(u8, usize)] = &[
-            (OP_XCHG_MEM8_A, 1), (OP_XCHG_MEM16_A, 2),
-            (OP_XCHG_MEM32_A, 4), (OP_XCHG_MEM64_A, 8),
+            (OP_XCHG_MEM8_A, 1),
+            (OP_XCHG_MEM16_A, 2),
+            (OP_XCHG_MEM32_A, 4),
+            (OP_XCHG_MEM64_A, 8),
         ];
         for &(op, w) in xchg_specs {
-            let mask = if w == 8 { u64::MAX } else { (1u64 << (w * 8)) - 1 };
+            let mask = if w == 8 {
+                u64::MAX
+            } else {
+                (1u64 << (w * 8)) - 1
+            };
             let mem_lo: u64 = 0x0102_0304_0506_0708 & mask;
             let src_val: u64 = 0xF0F0_F1F1_F2F2_F3F3;
             let mut data = vec![0u8; 16];
-            for (i, b) in mem_lo.to_le_bytes().iter().enumerate().take(w) { data[i] = *b; }
+            for (i, b) in mem_lo.to_le_bytes().iter().enumerate().take(w) {
+                data[i] = *b;
+            }
             let mut bc = BytecodeBuilder::new();
             bc.mov_r_imm64(14, src_val);
             bc.mem_xchg_a(op, 15, 14);
@@ -485,15 +550,26 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
             let got_mem_i = u64::from_le_bytes(mi[..8].try_into().unwrap()) & mask;
             let got_mem_n = u64::from_le_bytes(mn[..8].try_into().unwrap()) & mask;
             if got_mem_i != src_lo || got_mem_n != src_lo {
-                return Err(anyhow!("[32-S5] xchg{w}: mem mismatch (i={:X} n={:X} want={:X})", got_mem_i, got_mem_n, src_lo));
+                return Err(anyhow!(
+                    "[32-S5] xchg{w}: mem mismatch (i={:X} n={:X} want={:X})",
+                    got_mem_i,
+                    got_mem_n,
+                    src_lo
+                ));
             }
             let want_v = match w {
                 1 => (src_val & !0xFF) | (mem_lo & 0xFF),
                 2 => (src_val & !0xFFFF) | (mem_lo & 0xFFFF),
-                4 => mem_lo & 0xFFFF_FFFF, _ => mem_lo,
+                4 => mem_lo & 0xFFFF_FFFF,
+                _ => mem_lo,
             };
             if vi[14] != want_v || vn[14] != want_v {
-                return Err(anyhow!("[32-S5] xchg{w}: vreg mismatch (i={:X} n={:X} want={:X})", vi[14], vn[14], want_v));
+                return Err(anyhow!(
+                    "[32-S5] xchg{w}: vreg mismatch (i={:X} n={:X} want={:X})",
+                    vi[14],
+                    vn[14],
+                    want_v
+                ));
             }
             if mi != mn {
                 return Err(anyhow!("[32-S5] xchg{w}: interp/native mem mismatch"));
@@ -505,15 +581,23 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
     {
         use crate::vm::bytecode::*;
         let xadd_specs: &[(u8, usize)] = &[
-            (OP_XADD_MEM8_A, 1), (OP_XADD_MEM16_A, 2),
-            (OP_XADD_MEM32_A, 4), (OP_XADD_MEM64_A, 8),
+            (OP_XADD_MEM8_A, 1),
+            (OP_XADD_MEM16_A, 2),
+            (OP_XADD_MEM32_A, 4),
+            (OP_XADD_MEM64_A, 8),
         ];
         for &(op, w) in xadd_specs {
-            let mask = if w == 8 { u64::MAX } else { (1u64 << (w * 8)) - 1 };
+            let mask = if w == 8 {
+                u64::MAX
+            } else {
+                (1u64 << (w * 8)) - 1
+            };
             let mem_lo: u64 = 0x10 & mask;
             let add_lo: u64 = 0x05;
             let mut data = vec![0u8; 16];
-            for (i, b) in mem_lo.to_le_bytes().iter().enumerate().take(w) { data[i] = *b; }
+            for (i, b) in mem_lo.to_le_bytes().iter().enumerate().take(w) {
+                data[i] = *b;
+            }
             let mut bc = BytecodeBuilder::new();
             bc.mov_r_imm64(14, add_lo);
             bc.mem_xadd_a(op, 15, 14);
@@ -524,21 +608,34 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
             let got_i = u64::from_le_bytes(mi[..8].try_into().unwrap()) & mask;
             let got_n = u64::from_le_bytes(mn[..8].try_into().unwrap()) & mask;
             if got_i != sum_lo || got_n != sum_lo {
-                return Err(anyhow!("[32-S6] xadd{w}: mem sum mismatch (i={:X} n={:X} want={:X})", got_i, got_n, sum_lo));
+                return Err(anyhow!(
+                    "[32-S6] xadd{w}: mem sum mismatch (i={:X} n={:X} want={:X})",
+                    got_i,
+                    got_n,
+                    sum_lo
+                ));
             }
             let want_v = match w {
                 1 => (add_lo & !0xFF) | (mem_lo & 0xFF),
                 2 => (add_lo & !0xFFFF) | (mem_lo & 0xFFFF),
-                4 => mem_lo & 0xFFFF_FFFF, _ => mem_lo,
+                4 => mem_lo & 0xFFFF_FFFF,
+                _ => mem_lo,
             };
             if vi[14] != want_v || vn[14] != want_v {
-                return Err(anyhow!("[32-S6] xadd{w}: vreg old mismatch (i={:X} n={:X} want={:X})", vi[14], vn[14], want_v));
+                return Err(anyhow!(
+                    "[32-S6] xadd{w}: vreg old mismatch (i={:X} n={:X} want={:X})",
+                    vi[14],
+                    vn[14],
+                    want_v
+                ));
             }
             if mi != mn {
                 return Err(anyhow!("[32-S6] xadd{w}: interp/native mem mismatch"));
             }
         }
-        println!("[32-S6] width matrix 8/16/32/64 atomic XADD (AtomicUsize fetch_add refcount): PASS");
+        println!(
+            "[32-S6] width matrix 8/16/32/64 atomic XADD (AtomicUsize fetch_add refcount): PASS"
+        );
     }
 
     // ── S7: Rust Once::call_once 2회 — 클로저는 정확히 1회만 실행해야 한다 ──
@@ -554,15 +651,15 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
         let l_call2 = bc.new_label();
         let l_skip2 = bc.new_label();
         // v15 = &state 는 아래 mrun(.., state_seed=[(15,0x8000)]) 로 시드 (native는 arena-absolute 보정)
-        bc.mov_r_r64(13, 15);                // v13 = v15 (state)
+        bc.mov_r_r64(13, 15); // v13 = v15 (state)
         bc.binop_r_imm64(OP_ADD_R_IMM64, 13, 8); // v13 = &count(0x8008)
 
         // call_once #1
-        bc.mov_r_imm64(0, 0);                // expected INCOMPLETE
-        bc.mov_r_imm64(14, 1);               // new RUNNING
+        bc.mov_r_imm64(0, 0); // expected INCOMPLETE
+        bc.mov_r_imm64(14, 1); // new RUNNING
         bc.mem_cmpxchg_a(OP_CMPXCHG_MEM8_A, 15, 14); // [state]: 0→1, 성공시 ZF=1
-        bc.jcc8(COND_JNE, l_call2);          // CAS 실패면 #2로
-        // 클로저: count += 1
+        bc.jcc8(COND_JNE, l_call2); // CAS 실패면 #2로
+                                    // 클로저: count += 1
         bc.mov_r_imm64(12, 1);
         bc.mem_xadd_a(OP_XADD_MEM8_A, 13, 12);
         // CompletionGuard: state = COMPLETE(3) via XCHG
@@ -571,32 +668,35 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
 
         // call_once #2
         bc.mark_label(l_call2);
-        bc.mov_r_imm64(0, 0);                // expected INCOMPLETE
+        bc.mov_r_imm64(0, 0); // expected INCOMPLETE
         bc.mov_r_imm64(14, 1);
         bc.mem_cmpxchg_a(OP_CMPXCHG_MEM8_A, 15, 14); // state==COMPLETE(3) → 실패(ZF=0)
-        bc.jcc8(COND_JNE, l_skip2);          // 실패(COMPLETE)면 클로저 재실행 금지 → skip
-        // (만약 여기 도달하면 = CAS가 COMPLETE를 RUNNING으로 오인 → 클로저 재실행 = BUG)
+        bc.jcc8(COND_JNE, l_skip2); // 실패(COMPLETE)면 클로저 재실행 금지 → skip
+                                    // (만약 여기 도달하면 = CAS가 COMPLETE를 RUNNING으로 오인 → 클로저 재실행 = BUG)
         bc.mark_label(l_skip2);
         bc.halt();
 
         let prog = bc.finish();
         let mut data = vec![0u8; 16];
-        data[0] = 0;                         // state INCOMPLETE
-        data[8] = 0;                         // count = 0
+        data[0] = 0; // state INCOMPLETE
+        data[8] = 0; // count = 0
         let (_, mi, _, mn) = mrun(&prog, &data, &[(15usize, 0x8000u64)])?;
         let state_i = mi[0];
         let state_n = mn[0];
         let cnt_i = u64::from_le_bytes(mi[8..16].try_into().unwrap());
         let cnt_n = u64::from_le_bytes(mn[8..16].try_into().unwrap());
         if state_i != 3 || state_n != 3 {
-            return Err(anyhow!("[32-S7] Once 2x call_once: state must be COMPLETE(3) (i={} n={})", state_i, state_n));
+            return Err(anyhow!(
+                "[32-S7] Once 2x call_once: state must be COMPLETE(3) (i={} n={})",
+                state_i,
+                state_n
+            ));
         }
         if cnt_i != 1 || cnt_n != 1 {
             return Err(anyhow!("[32-S7] Once 2x call_once: closure must run EXACTLY ONCE (i={} n={}) -> would be once.rs:166 f.take().unwrap() on None", cnt_i, cnt_n));
         }
         println!("[32-S7] Once::call_once x2 end-to-end (CAS RUNNING + XCHG COMPLETE; closure runs exactly once): PASS");
     }
-
 
     Ok(())
 }

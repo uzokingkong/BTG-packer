@@ -7,9 +7,9 @@
 // executed through BOTH the reference interpreter and the native VM, and the
 // resulting vregs are compared (interp == native == expected).
 
-use anyhow::{Result, anyhow};
 use crate::vm::bytecode::{self, BytecodeBuilder};
 use crate::vm::{handlers, interp};
+use anyhow::{anyhow, Result};
 
 use super::util::{run_native, set_vreg, vreg};
 
@@ -39,7 +39,12 @@ pub(crate) fn run_bmi_test() -> Result<()> {
     use crate::vm::bytecode::*;
 
     // (name, build_fn, seed_fn, expected_dst)
-    let cases: Vec<(&str, Box<dyn Fn(&mut BytecodeBuilder)>, Box<dyn Fn(&mut [u8])>, u64)> = vec![
+    let cases: Vec<(
+        &str,
+        Box<dyn Fn(&mut BytecodeBuilder)>,
+        Box<dyn Fn(&mut [u8])>,
+        u64,
+    )> = vec![
         // lzcnt32(0x0F00) = 20
         (
             "lzcnt32",
@@ -143,9 +148,21 @@ pub(crate) fn run_bmi_test() -> Result<()> {
         let (st_i, st_n) = run_case(build, seed)?;
         let got_i = vreg(&st_i, 3);
         let got_n = vreg(&st_n, 3);
-        assert_eq!(got_i, expected, "{name}: interp mismatch: expected 0x{:X} got 0x{:X}", expected, got_i);
-        assert_eq!(got_n, expected, "{name}: native mismatch: expected 0x{:X} got 0x{:X}", expected, got_n);
-        assert_eq!(got_i, got_n, "{name}: interp != native (0x{:X} vs 0x{:X})", got_i, got_n);
+        assert_eq!(
+            got_i, expected,
+            "{name}: interp mismatch: expected 0x{:X} got 0x{:X}",
+            expected, got_i
+        );
+        assert_eq!(
+            got_n, expected,
+            "{name}: native mismatch: expected 0x{:X} got 0x{:X}",
+            expected, got_n
+        );
+        assert_eq!(
+            got_i, got_n,
+            "{name}: interp != native (0x{:X} vs 0x{:X})",
+            got_i, got_n
+        );
     }
 
     // Regression: BLSR/BLSMSK/BLSI/ANDN are NOT flagless. Intel SDM gives them
@@ -160,7 +177,11 @@ pub(crate) fn run_bmi_test() -> Result<()> {
 
 /// Read the modelled flags word from a state buffer (STATE_FLAGS slot).
 fn flags_of(st: &[u8]) -> u64 {
-    u64::from_le_bytes(st[interp::STATE_FLAGS..interp::STATE_FLAGS + 8].try_into().unwrap())
+    u64::from_le_bytes(
+        st[interp::STATE_FLAGS..interp::STATE_FLAGS + 8]
+            .try_into()
+            .unwrap(),
+    )
 }
 
 /// Differential flags check for the BMI group: run each op over several inputs

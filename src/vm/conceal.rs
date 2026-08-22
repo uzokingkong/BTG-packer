@@ -74,7 +74,10 @@ mod tests {
     fn wipe_zeroes_key_buffer() {
         let mut key = vec![0x5Au8; 64];
         wipe_sensitive(&mut key);
-        assert!(is_fully_zeroed(&key), "key buffer must be wiped to zero after use");
+        assert!(
+            is_fully_zeroed(&key),
+            "key buffer must be wiped to zero after use"
+        );
     }
 
     /// Keystream-state / seed buffers are also wiped.
@@ -99,7 +102,10 @@ mod tests {
             g.as_slice()[0] ^= 0xFF;
             // no explicit wipe — Drop must wipe
         }
-        assert!(is_fully_zeroed(&buf), "guard must wipe the buffer on scope exit");
+        assert!(
+            is_fully_zeroed(&buf),
+            "guard must wipe the buffer on scope exit"
+        );
     }
 
     /// A fresh (pre-use) buffer need not be wiped; this guards against a test that

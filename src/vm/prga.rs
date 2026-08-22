@@ -29,11 +29,9 @@
 //   * v0/v1    -> i/j (0 on the very first call; carried over afterwards)
 // ==============================================================================
 
-
 use crate::vm::bytecode::{
-    OP_ADD_R_IMM32, OP_ADD_R_R, OP_AND_R_IMM32, OP_CMP_R_IMM32, OP_DEC_R, OP_JMP8, OP_JB8,
-    OP_MOV_MEM8_R, OP_MOV_R_IMM32, OP_MOVZX_R_MEM8, OP_XOR_R_R, BytecodeBuilder,
-    MEM_BUF, MEM_SBOX,
+    BytecodeBuilder, MEM_BUF, MEM_SBOX, OP_ADD_R_IMM32, OP_ADD_R_R, OP_AND_R_IMM32, OP_CMP_R_IMM32,
+    OP_DEC_R, OP_JB8, OP_JMP8, OP_MOVZX_R_MEM8, OP_MOV_MEM8_R, OP_MOV_R_IMM32, OP_XOR_R_R,
 };
 
 /// Pure-Rust reference PRGA. `sbox` is mutated in place (keystream state) and

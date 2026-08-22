@@ -1,5 +1,5 @@
+use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
-use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone)]
 pub struct BidirectionalGraph {
@@ -47,24 +47,32 @@ impl BidirectionalGraph {
     }
 
     pub fn can_reach_forward(&mut self, from: u32, to: u32) -> Result<bool> {
-        if from == to { return Ok(true); }
+        if from == to {
+            return Ok(true);
+        }
         let key = (from, to);
         if let Some(path) = self.forward_paths.get(&key) {
             return Ok(!path.is_empty());
         }
         let _path = self.bfs_forward(from, to)?;
-        self.forward_paths.get(&key).map(|p| !p.is_empty())
+        self.forward_paths
+            .get(&key)
+            .map(|p| !p.is_empty())
             .ok_or_else(|| anyhow!("Path not in cache"))
     }
 
     pub fn can_reach_backward(&mut self, from: u32, to: u32) -> Result<bool> {
-        if from == to { return Ok(true); }
+        if from == to {
+            return Ok(true);
+        }
         let key = (from, to);
         if let Some(path) = self.backward_paths.get(&key) {
             return Ok(!path.is_empty());
         }
         let _path = self.bfs_backward(from, to)?;
-        self.backward_paths.get(&key).map(|p| !p.is_empty())
+        self.backward_paths
+            .get(&key)
+            .map(|p| !p.is_empty())
             .ok_or_else(|| anyhow!("Path not in cache"))
     }
 
@@ -76,7 +84,10 @@ impl BidirectionalGraph {
             if forward_ok != backward_ok {
                 return Err(anyhow!(
                     "Bidirectionality violation: {} -> {} (fwd: {}, bwd: {})",
-                    from, to, forward_ok, backward_ok
+                    from,
+                    to,
+                    forward_ok,
+                    backward_ok
                 ));
             }
         }
@@ -87,10 +98,10 @@ impl BidirectionalGraph {
         let mut queue = VecDeque::new();
         let mut visited = HashSet::new();
         let mut parent = HashMap::new();
-        
+
         queue.push_back(start);
         visited.insert(start);
-        
+
         while let Some(current) = queue.pop_front() {
             if current == target {
                 let mut path = vec![current];
@@ -121,10 +132,10 @@ impl BidirectionalGraph {
         let mut queue = VecDeque::new();
         let mut visited = HashSet::new();
         let mut parent = HashMap::new();
-        
+
         queue.push_back(start);
         visited.insert(start);
-        
+
         while let Some(current) = queue.pop_front() {
             if current == target {
                 let mut path = vec![current];
@@ -169,7 +180,7 @@ mod tests {
         let mut graph = BidirectionalGraph::new();
         graph.add_edge(1, 2, EdgeType::Unconditional, 1);
         graph.add_edge(2, 3, EdgeType::Unconditional, 1);
-        
+
         assert!(graph.can_reach_forward(1, 3)?);
         assert!(graph.can_reach_backward(3, 1)?);
         Ok(())
@@ -190,7 +201,7 @@ mod tests {
         graph.add_edge(1, 2, EdgeType::Unconditional, 1);
         graph.add_edge(2, 3, EdgeType::Unconditional, 1);
         graph.add_edge(3, 1, EdgeType::Unconditional, 1);
-        
+
         assert!(graph.can_reach_forward(1, 3)?);
         assert!(graph.can_reach_backward(3, 1)?);
         assert!(graph.validate_bidirectionality().is_ok());
@@ -201,7 +212,7 @@ mod tests {
     fn test_isolated_node() -> Result<()> {
         let mut graph = BidirectionalGraph::new();
         graph.add_edge(1, 2, EdgeType::Unconditional, 1);
-        
+
         // Node 3 is isolated
         assert!(!graph.can_reach_forward(1, 3)?);
         assert!(!graph.can_reach_backward(3, 1)?);
@@ -215,7 +226,7 @@ mod tests {
         graph.add_edge(1, 3, EdgeType::ConditionalFalse, 1);
         graph.add_edge(2, 4, EdgeType::Unconditional, 1);
         graph.add_edge(3, 4, EdgeType::Unconditional, 1);
-        
+
         assert!(graph.can_reach_forward(1, 4)?);
         assert!(graph.can_reach_backward(4, 1)?);
         assert!(graph.validate_bidirectionality().is_ok());
@@ -228,14 +239,23 @@ mod tests {
         // 캐시가 무효화돼 새 경로를 반영해야 한다.
         let mut graph = BidirectionalGraph::new();
         graph.add_edge(1, 2, EdgeType::Unconditional, 1);
-        assert!(!graph.can_reach_forward(1, 3)?, "1→3 must be unreachable initially");
+        assert!(
+            !graph.can_reach_forward(1, 3)?,
+            "1→3 must be unreachable initially"
+        );
 
         // 엣지 추가 (2 → 3). 캐시가 지워지지 않으면 1→3 이 여전히 false 로 남는다.
         graph.add_edge(2, 3, EdgeType::Unconditional, 1);
-        assert!(graph.can_reach_forward(1, 3)?, "1→3 must be reachable after adding 2→3");
+        assert!(
+            graph.can_reach_forward(1, 3)?,
+            "1→3 must be reachable after adding 2→3"
+        );
 
         // backward 방향도 마찬가지.
-        assert!(graph.can_reach_backward(3, 1)?, "3→1 backward must also reflect the new edge");
+        assert!(
+            graph.can_reach_backward(3, 1)?,
+            "3→1 backward must also reflect the new edge"
+        );
 
         // 엣지 추가 후 이전에 캐시된 경로가 있는지 재확인 (무효화 확인).
         let cached_before = graph.forward_paths.contains_key(&(1, 2));

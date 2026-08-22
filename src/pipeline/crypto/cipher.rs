@@ -35,7 +35,8 @@ impl Rc4 {
             self.i = self.i.wrapping_add(1);
             self.j = self.j.wrapping_add(self.s[self.i as usize]);
             self.s.swap(self.i as usize, self.j as usize);
-            let k = self.s[(self.s[self.i as usize] as usize + self.s[self.j as usize] as usize) & 0xFF];
+            let k = self.s
+                [(self.s[self.i as usize] as usize + self.s[self.j as usize] as usize) & 0xFF];
             *byte ^= k;
         }
     }
@@ -49,7 +50,6 @@ impl Rc4 {
 /// v7: 청크 체이닝 암호화는 `crate::crypto::provider::chain_encrypt`로 이동
 /// (plan.txt 1~3단계 — CryptoProvider 추상화 계층). 부트 스텁 셸코드와 동일
 /// 알고리즘을 유지하므로 동작은 그대로다.
-
 
 /// v19: 시드 생성 + RC4 키 파생 (base-bound). 패커 키 == 부트 스텁/VM 경로와 동일.
 pub(crate) fn derive_seed_and_key(
@@ -98,7 +98,10 @@ pub(crate) fn derive_c1_key_nonce(seed_masked: &[u8]) -> ([u8; 32], u32) {
 /// nonce (RFC 8439 IETF 변형). 부트 스텁 `emit_chacha_init`이 seed_va에서 같은
 /// 바이트를 그대로 복사하므로 패커와 런타임이 항상 일치한다.
 pub(crate) fn derive_chacha_key_nonce_raw(seed_masked: &[u8]) -> ([u8; 32], [u8; 12]) {
-    debug_assert!(seed_masked.len() >= 44, "seed must be 256 bytes for ChaCha20");
+    debug_assert!(
+        seed_masked.len() >= 44,
+        "seed must be 256 bytes for ChaCha20"
+    );
     let mut key = [0u8; 32];
     key.copy_from_slice(&seed_masked[..32]);
     let mut nonce = [0u8; 12];
@@ -119,27 +122,47 @@ pub(crate) fn repeat4(key: u32) -> [u8; 32] {
 
 pub(crate) fn emit_prga_sub(seq: &mut Vec<(Instruction, Option<Label>)>, _stub: &BootStubCtx) {
     // ── PRGA 서브루틴: rcx=buf, rdx=len ──
-    seq.push((Instruction::with2(Code::Test_rm64_r64, Register::RDX, Register::RDX).unwrap(), Some(Label::Prga)));
-    seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Label::PrgaDone)));
-    seq.push((Instruction::with1(Code::Inc_rm32, Register::ESI).unwrap(), Some(Label::PrgaLoop)));
-    seq.push((Instruction::with2(Code::And_rm32_imm32, Register::ESI, 0xFF).unwrap(), None));
+    seq.push((
+        Instruction::with2(Code::Test_rm64_r64, Register::RDX, Register::RDX).unwrap(),
+        Some(Label::Prga),
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(),
+        Some(Label::PrgaDone),
+    ));
+    seq.push((
+        Instruction::with1(Code::Inc_rm32, Register::ESI).unwrap(),
+        Some(Label::PrgaLoop),
+    ));
+    seq.push((
+        Instruction::with2(Code::And_rm32_imm32, Register::ESI, 0xFF).unwrap(),
+        None,
+    ));
     seq.push((
         Instruction::with2(
             Code::Movzx_r32_rm8,
             Register::EAX,
             MemoryOperand::with_base_index_scale(Register::RBX, Register::RSI, 1),
-        ).unwrap(),
+        )
+        .unwrap(),
         None,
     ));
-    seq.push((Instruction::with2(Code::Add_rm32_r32, Register::EDI, Register::EAX).unwrap(), None));
-    seq.push((Instruction::with2(Code::And_rm32_imm32, Register::EDI, 0xFF).unwrap(), None));
+    seq.push((
+        Instruction::with2(Code::Add_rm32_r32, Register::EDI, Register::EAX).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::And_rm32_imm32, Register::EDI, 0xFF).unwrap(),
+        None,
+    ));
     // swap(S[i], S[j])
     seq.push((
         Instruction::with2(
             Code::Movzx_r32_rm8,
             Register::R8D,
             MemoryOperand::with_base_index_scale(Register::RBX, Register::RSI, 1),
-        ).unwrap(),
+        )
+        .unwrap(),
         None,
     ));
     seq.push((
@@ -147,7 +170,8 @@ pub(crate) fn emit_prga_sub(seq: &mut Vec<(Instruction, Option<Label>)>, _stub: 
             Code::Movzx_r32_rm8,
             Register::R9D,
             MemoryOperand::with_base_index_scale(Register::RBX, Register::RDI, 1),
-        ).unwrap(),
+        )
+        .unwrap(),
         None,
     ));
     seq.push((
@@ -155,7 +179,8 @@ pub(crate) fn emit_prga_sub(seq: &mut Vec<(Instruction, Option<Label>)>, _stub: 
             Code::Mov_rm8_r8,
             MemoryOperand::with_base_index_scale(Register::RBX, Register::RSI, 1),
             Register::R9L,
-        ).unwrap(),
+        )
+        .unwrap(),
         None,
     ));
     seq.push((
@@ -163,19 +188,30 @@ pub(crate) fn emit_prga_sub(seq: &mut Vec<(Instruction, Option<Label>)>, _stub: 
             Code::Mov_rm8_r8,
             MemoryOperand::with_base_index_scale(Register::RBX, Register::RDI, 1),
             Register::R8L,
-        ).unwrap(),
+        )
+        .unwrap(),
         None,
     ));
     // K = S[(S[i]+S[j]) & 0xFF]
-    seq.push((Instruction::with2(Code::Mov_r32_rm32, Register::EAX, Register::R8D).unwrap(), None));
-    seq.push((Instruction::with2(Code::Add_rm32_r32, Register::EAX, Register::R9D).unwrap(), None));
-    seq.push((Instruction::with2(Code::And_rm32_imm32, Register::EAX, 0xFF).unwrap(), None));
+    seq.push((
+        Instruction::with2(Code::Mov_r32_rm32, Register::EAX, Register::R8D).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Add_rm32_r32, Register::EAX, Register::R9D).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::And_rm32_imm32, Register::EAX, 0xFF).unwrap(),
+        None,
+    ));
     seq.push((
         Instruction::with2(
             Code::Movzx_r32_rm8,
             Register::EAX,
             MemoryOperand::with_base_index_scale(Register::RBX, Register::RAX, 1),
-        ).unwrap(),
+        )
+        .unwrap(),
         None,
     ));
     seq.push((
@@ -183,16 +219,26 @@ pub(crate) fn emit_prga_sub(seq: &mut Vec<(Instruction, Option<Label>)>, _stub: 
             Code::Xor_rm8_r8,
             MemoryOperand::with_base(Register::RCX),
             Register::AL,
-        ).unwrap(),
+        )
+        .unwrap(),
         None,
     ));
-    seq.push((Instruction::with1(Code::Inc_rm64, Register::RCX).unwrap(), None));
-    seq.push((Instruction::with1(Code::Dec_rm64, Register::RDX).unwrap(), None));
+    seq.push((
+        Instruction::with1(Code::Inc_rm64, Register::RCX).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with1(Code::Dec_rm64, Register::RDX).unwrap(),
+        None,
+    ));
     // FIX: 루프는 매 회차 종료 조건을 다시 검사해야 한다. 과거 코드는
     // `jmp PrgaLoop`(inc esi)로 되돌아가 `test rdx,rdx; je done`을 우회하여
     // 첫 호출(코드 영역 복호화)이 rdx=0에서 끝나지 않고 스텁 자신의 코드를
     // 계속 XOR로 덮어쓰다 0xC0000005로 크래시했다. -> `jmp Prga`(test)로 복귀.
-    seq.push((Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap(), Some(Label::Prga)));
+    seq.push((
+        Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap(),
+        Some(Label::Prga),
+    ));
     seq.push((Instruction::with(Code::Retnq), Some(Label::PrgaDone)));
 }
 
@@ -200,65 +246,151 @@ pub(crate) fn emit_ksa_sub(seq: &mut Vec<(Instruction, Option<Label>)>, _stub: &
     // ── v7 chained-crypto: KSA 서브루틴 (rcx=key 256B, rbx=S-box base) ───────
     // 표준 RC4 KSA (key 길이 256 고정 → i%256==i). 청크마다 재호출된다.
     // S[i] = i 초기화
-    seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::ESI, Register::ESI).unwrap(), Some(Label::Ksa)));
-    seq.push((Instruction::with2(
-        Code::Mov_rm8_r8,
-        MemoryOperand::with_base_index_scale(Register::RBX, Register::RSI, 1),
-        Register::SIL,
-    ).unwrap(), Some(Label::KsaInitLoop)));
-    seq.push((Instruction::with1(Code::Inc_rm32, Register::ESI).unwrap(), None));
-    seq.push((Instruction::with2(Code::Cmp_rm32_imm32, Register::ESI, 0x100).unwrap(), None));
-    seq.push((Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(), Some(Label::KsaInitLoop)));
+    seq.push((
+        Instruction::with2(Code::Xor_r32_rm32, Register::ESI, Register::ESI).unwrap(),
+        Some(Label::Ksa),
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Mov_rm8_r8,
+            MemoryOperand::with_base_index_scale(Register::RBX, Register::RSI, 1),
+            Register::SIL,
+        )
+        .unwrap(),
+        Some(Label::KsaInitLoop),
+    ));
+    seq.push((
+        Instruction::with1(Code::Inc_rm32, Register::ESI).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Cmp_rm32_imm32, Register::ESI, 0x100).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(),
+        Some(Label::KsaInitLoop),
+    ));
     // KSA: j = (j + S[i] + key[i]) & 0xFF ; swap(S[i], S[j])
-    seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::ESI, Register::ESI).unwrap(), None));
-    seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::EDI, Register::EDI).unwrap(), None));
-    seq.push((Instruction::with2(
-        Code::Movzx_r32_rm8,
-        Register::EAX,
-        MemoryOperand::with_base_index_scale(Register::RBX, Register::RSI, 1),
-    ).unwrap(), Some(Label::KsaLoopK)));
-    seq.push((Instruction::with2(Code::Add_rm32_r32, Register::EDI, Register::EAX).unwrap(), None));
-    seq.push((Instruction::with2(
-        Code::Movzx_r32_rm8,
-        Register::EAX,
-        MemoryOperand::with_base_index_scale(Register::RCX, Register::RSI, 1),
-    ).unwrap(), None));
-    seq.push((Instruction::with2(Code::Add_rm32_r32, Register::EDI, Register::EAX).unwrap(), None));
-    seq.push((Instruction::with2(Code::And_rm32_imm32, Register::EDI, 0xFF).unwrap(), None));
-    seq.push((Instruction::with2(
-        Code::Movzx_r32_rm8,
-        Register::EAX,
-        MemoryOperand::with_base_index_scale(Register::RBX, Register::RSI, 1),
-    ).unwrap(), None));
-    seq.push((Instruction::with2(
-        Code::Movzx_r32_rm8,
-        Register::R8D,
-        MemoryOperand::with_base_index_scale(Register::RBX, Register::RDI, 1),
-    ).unwrap(), None));
-    seq.push((Instruction::with2(
-        Code::Mov_rm8_r8,
-        MemoryOperand::with_base_index_scale(Register::RBX, Register::RDI, 1),
-        Register::AL,
-    ).unwrap(), None));
-    seq.push((Instruction::with2(
-        Code::Mov_rm8_r8,
-        MemoryOperand::with_base_index_scale(Register::RBX, Register::RSI, 1),
-        Register::R8L,
-    ).unwrap(), None));
-    seq.push((Instruction::with1(Code::Inc_rm32, Register::ESI).unwrap(), None));
-    seq.push((Instruction::with2(Code::Cmp_rm32_imm32, Register::ESI, 0x100).unwrap(), None));
-    seq.push((Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(), Some(Label::KsaLoopK)));
+    seq.push((
+        Instruction::with2(Code::Xor_r32_rm32, Register::ESI, Register::ESI).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Xor_r32_rm32, Register::EDI, Register::EDI).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Movzx_r32_rm8,
+            Register::EAX,
+            MemoryOperand::with_base_index_scale(Register::RBX, Register::RSI, 1),
+        )
+        .unwrap(),
+        Some(Label::KsaLoopK),
+    ));
+    seq.push((
+        Instruction::with2(Code::Add_rm32_r32, Register::EDI, Register::EAX).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Movzx_r32_rm8,
+            Register::EAX,
+            MemoryOperand::with_base_index_scale(Register::RCX, Register::RSI, 1),
+        )
+        .unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Add_rm32_r32, Register::EDI, Register::EAX).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::And_rm32_imm32, Register::EDI, 0xFF).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Movzx_r32_rm8,
+            Register::EAX,
+            MemoryOperand::with_base_index_scale(Register::RBX, Register::RSI, 1),
+        )
+        .unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Movzx_r32_rm8,
+            Register::R8D,
+            MemoryOperand::with_base_index_scale(Register::RBX, Register::RDI, 1),
+        )
+        .unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Mov_rm8_r8,
+            MemoryOperand::with_base_index_scale(Register::RBX, Register::RDI, 1),
+            Register::AL,
+        )
+        .unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Mov_rm8_r8,
+            MemoryOperand::with_base_index_scale(Register::RBX, Register::RSI, 1),
+            Register::R8L,
+        )
+        .unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with1(Code::Inc_rm32, Register::ESI).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Cmp_rm32_imm32, Register::ESI, 0x100).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(),
+        Some(Label::KsaLoopK),
+    ));
     seq.push((Instruction::with(Code::Retnq), None));
 }
 
 pub(crate) fn emit_zeromem_sub(seq: &mut Vec<(Instruction, Option<Label>)>, _stub: &BootStubCtx) {
     // ── v7 chained-crypto: ZeroMem 서브루틴 (rcx=buf, rdx=len) ───────────────
-    seq.push((Instruction::with2(Code::Test_rm64_r64, Register::RDX, Register::RDX).unwrap(), Some(Label::ZeroMem)));
-    seq.push((Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(), Some(Label::ZeroDone)));
-    seq.push((Instruction::with2(Code::Mov_rm8_imm8, MemoryOperand::with_base(Register::RCX), 0u32).unwrap(), None));
-    seq.push((Instruction::with1(Code::Inc_rm64, Register::RCX).unwrap(), None));
-    seq.push((Instruction::with1(Code::Dec_rm64, Register::RDX).unwrap(), None));
-    seq.push((Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap(), Some(Label::ZeroMem)));
+    seq.push((
+        Instruction::with2(Code::Test_rm64_r64, Register::RDX, Register::RDX).unwrap(),
+        Some(Label::ZeroMem),
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(),
+        Some(Label::ZeroDone),
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Mov_rm8_imm8,
+            MemoryOperand::with_base(Register::RCX),
+            0u32,
+        )
+        .unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with1(Code::Inc_rm64, Register::RCX).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with1(Code::Dec_rm64, Register::RDX).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap(),
+        Some(Label::ZeroMem),
+    ));
     seq.push((Instruction::with(Code::Retnq), Some(Label::ZeroDone)));
 }
-

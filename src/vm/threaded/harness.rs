@@ -28,17 +28,23 @@
 use super::direct_tail::DirectTailEmitter;
 use crate::vm::arena::Arena;
 use crate::vm::poly::PolymorphicDecoder;
-use crate::vm::risc::{BranchCondition, MicroInstr, MicroOperand, RiscEvalState, RiscOp, RiscProgram};
+use crate::vm::risc::{
+    BranchCondition, MicroInstr, MicroOperand, RiscEvalState, RiscOp, RiscProgram,
+};
 use anyhow::{anyhow, Result};
 use iced_x86::{Code, Instruction, InstructionBlock, Register};
 
-pub(crate) use layout::{OFF_BRANCH_MAP, OFF_BYTECODE, OFF_CODE, OFF_STACK_BASE, OFF_STATE, OFF_TABLE, ARENA_SIZE, REGS_OFF, TEMPS_OFF, FLAGS_OFF, VSP_OFF, STATE_END, FLAG_MASK};
+pub(crate) use layout::{
+    ARENA_SIZE, FLAGS_OFF, FLAG_MASK, OFF_BRANCH_MAP, OFF_BYTECODE, OFF_CODE, OFF_STACK_BASE,
+    OFF_STATE, OFF_TABLE, REGS_OFF, STATE_END, TEMPS_OFF, VSP_OFF,
+};
 
 mod branch_helper;
+mod cond_helpers;
 mod emit_block;
-mod layout;
 #[cfg(test)]
 mod harness_tests;
+mod layout;
 
 /// 직접 ?�레?�드 ?�이?�브 VM ?�네??
 pub struct NativeVmHarness {
@@ -52,7 +58,6 @@ pub struct NativeVmHarness {
 }
 
 impl NativeVmHarness {
-
     /// RISC ?�로그램???�문???�이?�브 블록?�로 컴파?�해 arena??배치?�다.
     pub fn compile(prog: &RiscProgram, key: u8) -> Result<Self> {
         Self::compile_with_mba(prog, key, 0)
@@ -113,15 +118,34 @@ impl NativeVmHarness {
         let entry_start = OFF_CODE + helper_code.as_ref().map_or(0, |h| h.len());
         let entry_va = (arena.base + entry_start) as u64;
         let mut entry_instrs = Vec::new();
-        entry_instrs.push(Instruction::with1(Code::Push_r64, Register::R12).map_err(|e| anyhow!("{e}"))?);
-        entry_instrs.push(Instruction::with1(Code::Push_r64, Register::R13).map_err(|e| anyhow!("{e}"))?);
-        entry_instrs.push(Instruction::with1(Code::Push_r64, Register::R14).map_err(|e| anyhow!("{e}"))?);
-        entry_instrs.push(Instruction::with1(Code::Push_r64, Register::R15).map_err(|e| anyhow!("{e}"))?);
-        entry_instrs.push(Instruction::with2(Code::Mov_r64_imm64, Register::R12, bytecode_base).map_err(|e| anyhow!("{e}"))?);
-        entry_instrs.push(Instruction::with2(Code::Mov_r64_imm64, Register::R13, stack_base).map_err(|e| anyhow!("{e}"))?);
-        entry_instrs.push(Instruction::with2(Code::Mov_r64_imm64, Register::R14, key as u64).map_err(|e| anyhow!("{e}"))?);
-        entry_instrs.push(Instruction::with2(Code::Mov_r64_imm64, Register::R15, table_base).map_err(|e| anyhow!("{e}"))?);
-        entry_instrs.push(Instruction::with2(Code::Mov_r64_imm64, Register::RDX, state_base).map_err(|e| anyhow!("{e}"))?);
+        entry_instrs
+            .push(Instruction::with1(Code::Push_r64, Register::R12).map_err(|e| anyhow!("{e}"))?);
+        entry_instrs
+            .push(Instruction::with1(Code::Push_r64, Register::R13).map_err(|e| anyhow!("{e}"))?);
+        entry_instrs
+            .push(Instruction::with1(Code::Push_r64, Register::R14).map_err(|e| anyhow!("{e}"))?);
+        entry_instrs
+            .push(Instruction::with1(Code::Push_r64, Register::R15).map_err(|e| anyhow!("{e}"))?);
+        entry_instrs.push(
+            Instruction::with2(Code::Mov_r64_imm64, Register::R12, bytecode_base)
+                .map_err(|e| anyhow!("{e}"))?,
+        );
+        entry_instrs.push(
+            Instruction::with2(Code::Mov_r64_imm64, Register::R13, stack_base)
+                .map_err(|e| anyhow!("{e}"))?,
+        );
+        entry_instrs.push(
+            Instruction::with2(Code::Mov_r64_imm64, Register::R14, key as u64)
+                .map_err(|e| anyhow!("{e}"))?,
+        );
+        entry_instrs.push(
+            Instruction::with2(Code::Mov_r64_imm64, Register::R15, table_base)
+                .map_err(|e| anyhow!("{e}"))?,
+        );
+        entry_instrs.push(
+            Instruction::with2(Code::Mov_r64_imm64, Register::RDX, state_base)
+                .map_err(|e| anyhow!("{e}"))?,
+        );
         DirectTailEmitter::emit_tail_dispatch(&mut entry_instrs)?;
         let entry = DirectTailEmitter::assemble(entry_instrs, entry_va)?;
 
@@ -145,10 +169,18 @@ impl NativeVmHarness {
                 DirectTailEmitter::emit_tail_dispatch(&mut instrs)?;
             } else {
                 // HALT / VIRTUAL_RET(최상위): Win64 callee-saved ?��??�터(R12~R15) 복원 ??ret.
-                instrs.push(Instruction::with1(Code::Pop_r64, Register::R15).map_err(|e| anyhow!("{e}"))?);
-                instrs.push(Instruction::with1(Code::Pop_r64, Register::R14).map_err(|e| anyhow!("{e}"))?);
-                instrs.push(Instruction::with1(Code::Pop_r64, Register::R13).map_err(|e| anyhow!("{e}"))?);
-                instrs.push(Instruction::with1(Code::Pop_r64, Register::R12).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(
+                    Instruction::with1(Code::Pop_r64, Register::R15).map_err(|e| anyhow!("{e}"))?,
+                );
+                instrs.push(
+                    Instruction::with1(Code::Pop_r64, Register::R14).map_err(|e| anyhow!("{e}"))?,
+                );
+                instrs.push(
+                    Instruction::with1(Code::Pop_r64, Register::R13).map_err(|e| anyhow!("{e}"))?,
+                );
+                instrs.push(
+                    Instruction::with1(Code::Pop_r64, Register::R12).map_err(|e| anyhow!("{e}"))?,
+                );
                 instrs.push(Instruction::with(Code::Retnq));
             }
             block_lists.push(instrs);
@@ -175,7 +207,8 @@ impl NativeVmHarness {
         }
 
         // fallback 블록 (?�이블에???�용?��? ?��? opcode ???�순 ret)
-        let fallback = DirectTailEmitter::assemble(vec![Instruction::with(Code::Retnq)], code_base)?;
+        let fallback =
+            DirectTailEmitter::assemble(vec![Instruction::with(Code::Retnq)], code_base)?;
 
         // 4) 배치: [helper][entry][block0..blockN][fallback]
         let mut layout = Vec::new();
@@ -206,14 +239,22 @@ impl NativeVmHarness {
             let mut off = OFF_CODE;
             for seg in &layout {
                 s.push_str(&format!("-- seg @ 0x{:x} ({} bytes) --\n", off, seg.len()));
-                let mut dec = iced_x86::Decoder::with_ip(64, seg, (arena.base + off) as u64, iced_x86::DecoderOptions::NONE);
+                let mut dec = iced_x86::Decoder::with_ip(
+                    64,
+                    seg,
+                    (arena.base + off) as u64,
+                    iced_x86::DecoderOptions::NONE,
+                );
                 while dec.can_decode() {
                     let ins = dec.decode();
                     s.push_str(&format!("0x{:08x}  {:?}\n", ins.ip(), ins));
                 }
                 off += seg.len();
             }
-            let _ = std::fs::write("C:\\Users\\uzoki\\Desktop\\asdfsadfecwecc\\_harness_dump.txt", s);
+            let _ = std::fs::write(
+                "C:\\Users\\uzoki\\Desktop\\asdfsadfecwecc\\_harness_dump.txt",
+                s,
+            );
         }
         // 7) arena??복사.
         {
@@ -223,8 +264,7 @@ impl NativeVmHarness {
                 buf[off..off + seg.len()].copy_from_slice(seg);
                 off += seg.len();
             }
-            buf[OFF_TABLE..OFF_TABLE + 256 * 8]
-                .copy_from_slice(&bytemuck_le(&table));
+            buf[OFF_TABLE..OFF_TABLE + 256 * 8].copy_from_slice(&bytemuck_le(&table));
             buf[OFF_BYTECODE..OFF_BYTECODE + bytecode.len()].copy_from_slice(&bytecode);
             buf[OFF_STATE..OFF_STATE + STATE_END].fill(0);
             // 분기 �? (ip, index) u64 ??배열.
@@ -267,10 +307,18 @@ impl NativeVmHarness {
         let s = self.state_off;
         let mut st = RiscEvalState::default();
         for i in 0..16 {
-            st.regs[i] = u64::from_le_bytes(buf[s + REGS_OFF + i * 8..s + REGS_OFF + i * 8 + 8].try_into().unwrap());
+            st.regs[i] = u64::from_le_bytes(
+                buf[s + REGS_OFF + i * 8..s + REGS_OFF + i * 8 + 8]
+                    .try_into()
+                    .unwrap(),
+            );
         }
         for i in 0..8 {
-            st.temps[i] = u64::from_le_bytes(buf[s + TEMPS_OFF + i * 8..s + TEMPS_OFF + i * 8 + 8].try_into().unwrap());
+            st.temps[i] = u64::from_le_bytes(
+                buf[s + TEMPS_OFF + i * 8..s + TEMPS_OFF + i * 8 + 8]
+                    .try_into()
+                    .unwrap(),
+            );
         }
         st.flags = u64::from_le_bytes(buf[s + FLAGS_OFF..s + FLAGS_OFF + 8].try_into().unwrap());
         st.vsp = u64::from_le_bytes(buf[s + VSP_OFF..s + VSP_OFF + 8].try_into().unwrap());

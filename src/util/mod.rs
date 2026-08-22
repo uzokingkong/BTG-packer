@@ -67,7 +67,9 @@ pub fn resolve_va_to_real_va(
 
     // 2. Padding gap: 다음 블록 시작이 MAX_PADDING_SIZE 이내이면 그 블록 시작점으로
     if let Some((&next_va, &next_block_id)) = va_to_trigger_id.range((target_va + 1)..).next() {
-        if next_va - target_va <= MAX_PADDING_SIZE && is_block_entry(va_to_trigger_id, next_va, next_block_id) {
+        if next_va - target_va <= MAX_PADDING_SIZE
+            && is_block_entry(va_to_trigger_id, next_va, next_block_id)
+        {
             let real_va = dispatcher_va + table_offsets[next_block_id as usize] as u64;
             return Some(real_va);
         }

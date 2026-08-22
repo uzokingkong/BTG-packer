@@ -6,73 +6,76 @@
 // bodies are byte-identical to the pre-split monolith; only imports and module
 // wiring changed.
 
-use rand::RngCore;
-use anyhow::{Result, anyhow};
-use crate::vm::{bytecode, handlers, import_key, interp, ksa, lifter, prga};
-use iced_x86::{Code, Instruction, Register};
-use crate::vm::{VM_STATE_SIZE, build_vm_module};
-use crate::vm::arena::{Arena};
+use crate::vm::arena::Arena;
 use crate::vm::encode::{encode_ksa_native, encode_trampoline};
+use crate::vm::{build_vm_module, VM_STATE_SIZE};
+use crate::vm::{bytecode, handlers, import_key, interp, ksa, lifter, prga};
+use anyhow::{anyhow, Result};
+use iced_x86::{Code, Instruction, Register};
+use rand::RngCore;
 
 // ── submodule declarations (decomposed self_test) ───────────────
-mod flags;
-mod mem;
-mod stack;
-mod addr;
-mod bridge;
-mod lift;
 mod a2_a5;
 mod abi;
-mod text;
-mod multiblock;
-mod muldiv;
-mod sse;
-mod exit;
-mod cmov;
-mod util;
-mod string_ops;
+mod addr;
 mod bmi;
-mod sse_fpu;
-mod lock_incdec;
-mod ir;
-mod fuzz;
+mod bridge;
+mod cfg_differential;
+mod cmov;
 mod cross_path;
+mod exit;
+mod flags;
+mod fuzz;
+mod ir;
+mod lift;
+mod lock_incdec;
+mod mem;
+mod muldiv;
+mod multiblock;
+mod semobf;
+mod sse;
+mod sse_fpu;
+mod stack;
+mod string_ops;
+mod text;
+mod util;
 
 // ── test functions the orchestrator dispatches (from submodules) ──
 use self::a2_a5::run_a2_a5_test;
 use self::a2_a5::run_a2_lift_completion_test;
-use self::muldiv::run_a2_muldiv_8_16_test;
-use self::muldiv::run_a2_muldiv_bswap_test;
 use self::a2_a5::run_a2a5_lift_residual_test;
-use self::sse::run_a5_sse_cond_test;
-use self::flags::run_carry_flag_fix_test;
-use self::exit::run_exit_teardown_test;
-use self::cmov::run_cmovcc_test;
-use self::string_ops::run_string_ops_test;
+use self::abi::run_handler_abi_test;
+use self::abi::run_m8_handler_mba_test;
+use self::addr::run_m2_addr_test;
 use self::bmi::run_bmi_test;
-use self::sse_fpu::run_sse_fpu_test;
-use self::lock_incdec::run_lock_incdec_test;
-use self::ir::run_ir_test;
+use self::bridge::run_m3_bridge_test;
+use self::cmov::run_cmovcc_test;
 use self::cross_path::run_cross_path_test;
+use self::exit::run_exit_teardown_test;
+use self::flags::run_carry_flag_fix_test;
+use self::flags::run_flags_jcc_test;
 use self::fuzz::{
     run_fuzz_arith_test, run_fuzz_atomic_test, run_fuzz_bitscan_test, run_fuzz_bmi_test,
     run_fuzz_fpconv_test, run_fuzz_muldiv_test, run_fuzz_shld_rol_test, run_mt_reentrancy_test,
 };
-use self::flags::run_flags_jcc_test;
-use self::abi::run_handler_abi_test;
-use self::addr::run_m2_addr_test;
-use self::mem::run_m2_mem_test;
-use self::bridge::run_m3_bridge_test;
-use self::stack::run_m3_stack_test;
-use self::mem::run_m4_cmpxchg_test;
+use self::ir::run_ir_test;
 use self::lift::run_m4_lift_test;
+use self::lock_incdec::run_lock_incdec_test;
+use self::mem::run_m2_mem_test;
+use self::mem::run_m4_cmpxchg_test;
+use self::mem::run_m7_ondemand_reencrypt_test;
+use self::mem::run_mem_model_test;
+use self::muldiv::run_a2_muldiv_8_16_test;
+use self::muldiv::run_a2_muldiv_bswap_test;
 use self::multiblock::run_m5_multiblock_test;
+use self::multiblock::run_switch_lift_test;
+use self::semobf::run_semobf_test;
+use self::sse::run_a5_sse_cond_test;
+use self::sse_fpu::run_sse_fpu_test;
+use self::stack::run_m3_stack_test;
+use self::string_ops::run_string_ops_test;
 use self::text::run_m6_phase2_lift_test;
 use self::text::run_m6_phase2_native_program_test;
-use self::mem::run_m7_ondemand_reencrypt_test;
-use self::abi::run_m8_handler_mba_test;
-use self::mem::run_mem_model_test;
-use self::multiblock::run_switch_lift_test;
 use self::text::run_text_lift_test;
 
 // ── orchestrator + shared helper ──────────────────────────────────
@@ -100,12 +103,19 @@ pub fn run_self_test() -> Result<()> {
     // ── Reference (pure Rust) ──────────────────────────────────────────────────
     let mut expected = [0u8; 256];
     ksa::reference_ksa(&seed_masked, k1, k2, k3, &mut expected);
-    println!("[1] reference KSA computed (k1=0x{:08X} k2=0x{:08X} k3=0x{:08X})", k1, k2, k3);
+    println!(
+        "[1] reference KSA computed (k1=0x{:08X} k2=0x{:08X} k3=0x{:08X})",
+        k1, k2, k3
+    );
 
     // ── Lift to bytecode ───────────────────────────────────────────────────────
     let seq = ksa::build_ksa_instructions(0, k1, k2, k3);
     let bc = lifter::lift_ksa(&seq)?;
-    println!("[2] lifted {} KSA instructions -> {} bytes of bytecode", seq.len(), bc.len());
+    println!(
+        "[2] lifted {} KSA instructions -> {} bytes of bytecode",
+        seq.len(),
+        bc.len()
+    );
     log::debug!("VM bytecode:\n{}", bytecode::disassemble(&bc));
 
     // ── Interpreter ────────────────────────────────────────────────────────────
@@ -295,7 +305,10 @@ pub fn run_self_test() -> Result<()> {
     match run_flags_jcc_test() {
         Ok(_) => println!("[9] VM flag model + full Jcc (16 conds incl. JA/JBE): PASS"),
         Err(e) => {
-            println!("[9] VM flag model + full Jcc:                   FAIL ({})", e);
+            println!(
+                "[9] VM flag model + full Jcc:                   FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -304,7 +317,10 @@ pub fn run_self_test() -> Result<()> {
     match run_m2_mem_test() {
         Ok(_) => println!("[10] M2 mem width (16/32/64-bit, sign-ext):   PASS"),
         Err(e) => {
-            println!("[10] M2 mem width:                              FAIL ({})", e);
+            println!(
+                "[10] M2 mem width:                              FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -322,7 +338,10 @@ pub fn run_self_test() -> Result<()> {
     match run_m2_addr_test() {
         Ok(_) => println!("[12] M2 addressing modes (disp/idx*scale/RIP-rel): PASS"),
         Err(e) => {
-            println!("[12] M2 addressing modes:                      FAIL ({})", e);
+            println!(
+                "[12] M2 addressing modes:                      FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -331,7 +350,10 @@ pub fn run_self_test() -> Result<()> {
     match run_m3_bridge_test() {
         Ok(_) => println!("[13] M3 native API bridge (VM→GPR→call→restore): PASS"),
         Err(e) => {
-            println!("[13] M3 native API bridge:                     FAIL ({})", e);
+            println!(
+                "[13] M3 native API bridge:                     FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -340,7 +362,10 @@ pub fn run_self_test() -> Result<()> {
     match run_m4_lift_test() {
         Ok(_) => println!("[14] M4 block lift (dummy_fn == native):      PASS"),
         Err(e) => {
-            println!("[14] M4 block lift:                              FAIL ({})", e);
+            println!(
+                "[14] M4 block lift:                              FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -349,7 +374,10 @@ pub fn run_self_test() -> Result<()> {
     match run_text_lift_test() {
         Ok(_) => println!("[16] M6 text->VM lift (real .text block == native): PASS"),
         Err(e) => {
-            println!("[16] M6 text->VM lift:                            FAIL ({})", e);
+            println!(
+                "[16] M6 text->VM lift:                            FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -359,7 +387,10 @@ pub fn run_self_test() -> Result<()> {
     match run_a2_a5_test() {
         Ok(_) => println!("[15] A-2/A-5 OR/NEG/NOT, 64-shift, NOP, diag:  PASS"),
         Err(e) => {
-            println!("[15] A-2/A-5 opcodes/diagnostics:               FAIL ({})", e);
+            println!(
+                "[15] A-2/A-5 opcodes/diagnostics:               FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -369,7 +400,10 @@ pub fn run_self_test() -> Result<()> {
     match run_a2_lift_completion_test() {
         Ok(_) => println!("[17] A-2/A-5 lift-table completion (reg/imm/cmp/test/push): PASS"),
         Err(e) => {
-            println!("[17] A-2/A-5 lift-table completion:               FAIL ({})", e);
+            println!(
+                "[17] A-2/A-5 lift-table completion:               FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -379,7 +413,10 @@ pub fn run_self_test() -> Result<()> {
     match run_a5_sse_cond_test() {
         Ok(_) => println!("[18] A-5 SSE/FPU + setcc/cmovcc/sbb + rep stosq/loopne: PASS"),
         Err(e) => {
-            println!("[18] A-5 SSE/FPU + setcc/cmovcc/sbb:              FAIL ({})", e);
+            println!(
+                "[18] A-5 SSE/FPU + setcc/cmovcc/sbb:              FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -387,9 +424,14 @@ pub fn run_self_test() -> Result<()> {
 
     // ── M5 (v30): multi-block control-flow lift (rel32 branches + block connection) ──
     match run_m5_multiblock_test() {
-        Ok(_) => println!("[19] M5 multi-block lift (loop, rel32 cross-block, block connect): PASS"),
+        Ok(_) => {
+            println!("[19] M5 multi-block lift (loop, rel32 cross-block, block connect): PASS")
+        }
         Err(e) => {
-            println!("[19] M5 multi-block lift:                             FAIL ({})", e);
+            println!(
+                "[19] M5 multi-block lift:                             FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -399,7 +441,10 @@ pub fn run_self_test() -> Result<()> {
     match run_a2_muldiv_bswap_test() {
         Ok(_) => println!("[20] A-2 mul/div (1-op MUL/IMUL/DIV/IDIV 32/64) + BSWAP: PASS"),
         Err(e) => {
-            println!("[20] A-2 mul/div + BSWAP:                              FAIL ({})", e);
+            println!(
+                "[20] A-2 mul/div + BSWAP:                              FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -409,7 +454,10 @@ pub fn run_self_test() -> Result<()> {
     match run_a2a5_lift_residual_test() {
         Ok(_) => println!("[21] A-2/A-5 8/16-bit arith + JCXZ/JECXZ + rep movs/cmps: PASS"),
         Err(e) => {
-            println!("[21] A-2/A-5 8/16-bit arith + JCXZ/JECXZ + rep movs/cmps: FAIL ({})", e);
+            println!(
+                "[21] A-2/A-5 8/16-bit arith + JCXZ/JECXZ + rep movs/cmps: FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -419,7 +467,10 @@ pub fn run_self_test() -> Result<()> {
     match run_a2_muldiv_8_16_test() {
         Ok(_) => println!("[22] A-2 mul/div (1-op MUL/IMUL/DIV/IDIV 8/16-bit width): PASS"),
         Err(e) => {
-            println!("[22] A-2 mul/div 8/16-bit:                                  FAIL ({})", e);
+            println!(
+                "[22] A-2 mul/div 8/16-bit:                                  FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -429,7 +480,10 @@ pub fn run_self_test() -> Result<()> {
     match run_m6_phase2_lift_test() {
         Ok(_) => println!("[23] M6 Phase-2 whole-CFG OEP lift (reachable CFG -> single VM): PASS"),
         Err(e) => {
-            println!("[23] M6 Phase-2 whole-CFG OEP lift:                        FAIL ({})", e);
+            println!(
+                "[23] M6 Phase-2 whole-CFG OEP lift:                        FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -437,9 +491,14 @@ pub fn run_self_test() -> Result<()> {
 
     // ── B-3 (v35): switch/테이블 점프 → VM 내부 디스패치 ─────────────────────────
     match run_switch_lift_test() {
-        Ok(_) => println!("[24] B-3 switch jump table -> VM dispatch (compare-and-jump chain): PASS"),
+        Ok(_) => {
+            println!("[24] B-3 switch jump table -> VM dispatch (compare-and-jump chain): PASS")
+        }
         Err(e) => {
-            println!("[24] B-3 switch jump table:                                FAIL ({})", e);
+            println!(
+                "[24] B-3 switch jump table:                                FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -449,7 +508,10 @@ pub fn run_self_test() -> Result<()> {
     match run_mem_model_test() {
         Ok(_) => println!("[25] C-1 VM memory model (region schema + resolve + bounds): PASS"),
         Err(e) => {
-            println!("[25] C-1 VM memory model:                                  FAIL ({})", e);
+            println!(
+                "[25] C-1 VM memory model:                                  FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -457,9 +519,14 @@ pub fn run_self_test() -> Result<()> {
 
     // ── M6 Phase-2 (v38): 원본 프로그램을 lift 한 VM 프로그램의 네이티브 VM 실행 ──
     match run_m6_phase2_native_program_test() {
-        Ok(_) => println!("[26] M6 Phase-2 native-VM program execution (lifted CFG == native VM == x86): PASS"),
+        Ok(_) => println!(
+            "[26] M6 Phase-2 native-VM program execution (lifted CFG == native VM == x86): PASS"
+        ),
         Err(e) => {
-            println!("[26] M6 Phase-2 native-VM program execution:              FAIL ({})", e);
+            println!(
+                "[26] M6 Phase-2 native-VM program execution:              FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -467,9 +534,14 @@ pub fn run_self_test() -> Result<()> {
 
     // ── M7 (v41): on-demand 재암호화(anti-dump) ────────────────────────────────
     match run_m7_ondemand_reencrypt_test() {
-        Ok(_) => println!("[27] M7 on-demand re-encrypt (decrypt→use→re-encrypt; dump stays ciphertext): PASS"),
+        Ok(_) => println!(
+            "[27] M7 on-demand re-encrypt (decrypt→use→re-encrypt; dump stays ciphertext): PASS"
+        ),
         Err(e) => {
-            println!("[27] M7 on-demand re-encrypt:                              FAIL ({})", e);
+            println!(
+                "[27] M7 on-demand re-encrypt:                              FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -489,7 +561,10 @@ pub fn run_self_test() -> Result<()> {
     match run_m4_cmpxchg_test() {
         Ok(_) => println!("[29] v49 atomic mem cmpxchg (8/16/32/64; interp==native): PASS"),
         Err(e) => {
-            println!("[29] v49 atomic mem cmpxchg:                            FAIL ({})", e);
+            println!(
+                "[29] v49 atomic mem cmpxchg:                            FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
@@ -505,9 +580,21 @@ pub fn run_self_test() -> Result<()> {
         use crate::vm::bytecode::BytecodeBuilder;
         use crate::vm::lifter::lift_one;
         let mut b = BytecodeBuilder::new();
-        let r15_ok = lift_one(&mut b, &Instruction::with2(Code::Mov_r64_rm64, Register::R15, Register::RAX).unwrap()).is_ok();
-        let r14_ok = lift_one(&mut b, &Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RAX).unwrap()).is_ok();
-        let normal_ok = lift_one(&mut b, &Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RBX).unwrap()).is_ok();
+        let r15_ok = lift_one(
+            &mut b,
+            &Instruction::with2(Code::Mov_r64_rm64, Register::R15, Register::RAX).unwrap(),
+        )
+        .is_ok();
+        let r14_ok = lift_one(
+            &mut b,
+            &Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RAX).unwrap(),
+        )
+        .is_ok();
+        let normal_ok = lift_one(
+            &mut b,
+            &Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RBX).unwrap(),
+        )
+        .is_ok();
         let mut bc = BytecodeBuilder::new();
         bc.mov_r_imm64(15, 0x1122_3344_5566_7788u64);
         bc.mov_r_r64(0, 15);
@@ -515,7 +602,11 @@ pub fn run_self_test() -> Result<()> {
         let mut st = vec![0u8; interp::STATE_SIZE];
         let mut mem = vec![0u8; 64];
         let exec_ok = interp::interpret(&mut st, &mut mem, &bc.finish()).is_ok();
-        let rax = if exec_ok { u64::from_le_bytes(st[interp::STATE_VREGS + 0 * 8..][..8].try_into().unwrap()) } else { 0 };
+        let rax = if exec_ok {
+            u64::from_le_bytes(st[interp::STATE_VREGS + 0 * 8..][..8].try_into().unwrap())
+        } else {
+            0
+        };
         if r15_ok && r14_ok && normal_ok && exec_ok && rax == 0x1122_3344_5566_7788u64 {
             println!("[29] P0-3 R15/R14 usable as program vregs (lift + interp execution): PASS");
         } else {
@@ -530,13 +621,18 @@ pub fn run_self_test() -> Result<()> {
     // (built over 0..NUM_OPS) has a distinct handler for every non-zero opcode
     // slot — so bytecode/handlers/interp/lifter cannot silently drift apart.
     {
-        use crate::vm::bytecode::{NUM_OPS, OPCODE_INFO, opcode_name, opcode_operand_len};
+        use crate::vm::bytecode::{opcode_name, opcode_operand_len, NUM_OPS, OPCODE_INFO};
         let mut ok = true;
         let mut seen = std::collections::HashSet::new();
         for (val, mnem, olen) in OPCODE_INFO {
             if opcode_name(*val) == "??" || opcode_name(*val) != *mnem {
                 ok = false;
-                eprintln!("[30] opcode {}: mnemonic mismatch (name='{}' table='{}')", val, opcode_name(*val), mnem);
+                eprintln!(
+                    "[30] opcode {}: mnemonic mismatch (name='{}' table='{}')",
+                    val,
+                    opcode_name(*val),
+                    mnem
+                );
             }
             if opcode_operand_len(*val) != Some(*olen) {
                 ok = false;
@@ -553,7 +649,8 @@ pub fn run_self_test() -> Result<()> {
         }
         // handler-table coverage: every non-zero slot must have a real handler
         // (distinct from the invalid-opcode handler at slot 0).
-        let vmc = handlers::generate_vm_code(0x1000, 0x3000, 0x2000, handlers::EntryMode::Ksa, None)?;
+        let vmc =
+            handlers::generate_vm_code(0x1000, 0x3000, 0x2000, handlers::EntryMode::Ksa, None)?;
         let invalid_off = vmc.handler_offsets[0];
         for op in 1..NUM_OPS {
             if vmc.handler_offsets[op] == invalid_off {
@@ -577,14 +674,14 @@ pub fn run_self_test() -> Result<()> {
     {
         use crate::vm::bytecode::*;
         let mut bc = BytecodeBuilder::new();
-        bc.mem_xchg_a(OP_XCHG_MEM32_A, 9, 1);   // [8000h] <-> v1 (32-bit)
-        bc.mem_xchg_a(OP_XCHG_MEM64_A, 10, 2);  // [8008h] <-> v2 (64-bit)
-        bc.mem_xchg_a(OP_XCHG_MEM8_A, 11, 3);   // [8010h] <-> v3 (8-bit)
-        bc.mem_xchg_a(OP_XCHG_MEM16_A, 12, 4);  // [8018h] <-> v4 (16-bit)
-        bc.mem_xadd_a(OP_XADD_MEM32_A, 13, 5);  // [8020h] += v5 ; v5 = old
-        bc.mem_xadd_a(OP_XADD_MEM64_A, 14, 6);  // [8028h] += v6 ; v6 = old
-        bc.mem_xadd_a(OP_XADD_MEM8_A, 15, 7);   // [8030h] += v7 ; v7 = old
-        bc.mem_xadd_a(OP_XADD_MEM16_A, 0, 8);   // [8038h] += v8 ; v8 = old (addr in v0)
+        bc.mem_xchg_a(OP_XCHG_MEM32_A, 9, 1); // [8000h] <-> v1 (32-bit)
+        bc.mem_xchg_a(OP_XCHG_MEM64_A, 10, 2); // [8008h] <-> v2 (64-bit)
+        bc.mem_xchg_a(OP_XCHG_MEM8_A, 11, 3); // [8010h] <-> v3 (8-bit)
+        bc.mem_xchg_a(OP_XCHG_MEM16_A, 12, 4); // [8018h] <-> v4 (16-bit)
+        bc.mem_xadd_a(OP_XADD_MEM32_A, 13, 5); // [8020h] += v5 ; v5 = old
+        bc.mem_xadd_a(OP_XADD_MEM64_A, 14, 6); // [8028h] += v6 ; v6 = old
+        bc.mem_xadd_a(OP_XADD_MEM8_A, 15, 7); // [8030h] += v7 ; v7 = old
+        bc.mem_xadd_a(OP_XADD_MEM16_A, 0, 8); // [8038h] += v8 ; v8 = old (addr in v0)
         bc.halt();
         let prog = bc.finish();
 
@@ -601,8 +698,15 @@ pub fn run_self_test() -> Result<()> {
 
         // Expected final vregs v1..v8 (index 0 left zero).
         let want_v: [u64; 9] = [
-            0, 0xAABB_CCDD, 0x8899_AABB_CCDD_EEFF, 0x77, 0x5566,
-            0x20, 0x300, 0xFA, 0xFFFF,
+            0,
+            0xAABB_CCDD,
+            0x8899_AABB_CCDD_EEFF,
+            0x77,
+            0x5566,
+            0x20,
+            0x300,
+            0xFA,
+            0xFFFF,
         ];
         // Expected final data bytes.
         let mut want_d = vec![0u8; 0x40];
@@ -626,12 +730,22 @@ pub fn run_self_test() -> Result<()> {
                     s[interp::STATE_VREGS + v * 8..interp::STATE_VREGS + v * 8 + 8]
                         .copy_from_slice(&x.to_le_bytes())
                 };
-                put(1, 0x1122_3344); put(2, 0x0102_0304_0506_0708);
-                put(3, 0xAA); put(4, 0xBBBB); put(5, 0x10);
-                put(6, 0x100); put(7, 0x05); put(8, 0x0100);
-                put(9, base + 0x8000); put(10, base + 0x8008); put(11, base + 0x8010);
-                put(12, base + 0x8018); put(13, base + 0x8020); put(14, base + 0x8028);
-                put(15, base + 0x8030); put(0, base + 0x8038);
+                put(1, 0x1122_3344);
+                put(2, 0x0102_0304_0506_0708);
+                put(3, 0xAA);
+                put(4, 0xBBBB);
+                put(5, 0x10);
+                put(6, 0x100);
+                put(7, 0x05);
+                put(8, 0x0100);
+                put(9, base + 0x8000);
+                put(10, base + 0x8008);
+                put(11, base + 0x8010);
+                put(12, base + 0x8018);
+                put(13, base + 0x8020);
+                put(14, base + 0x8028);
+                put(15, base + 0x8030);
+                put(0, base + 0x8038);
             }};
         }
 
@@ -644,19 +758,34 @@ pub fn run_self_test() -> Result<()> {
             .map_err(|e| anyhow!("[31] atomic XCHG/XADD interp failed: {:?}", e))?;
         let mut vi = [0u64; 9];
         for i in 0..9 {
-            vi[i] = u64::from_le_bytes(st[interp::STATE_VREGS + i * 8..interp::STATE_VREGS + i * 8 + 8].try_into().unwrap());
+            vi[i] = u64::from_le_bytes(
+                st[interp::STATE_VREGS + i * 8..interp::STATE_VREGS + i * 8 + 8]
+                    .try_into()
+                    .unwrap(),
+            );
         }
         let mem_i = mem[0x8000..0x8000 + 0x40].to_vec();
 
         // Native VM run.
         let mut varena = Arena::new(0x40000)?;
         let (vc, vt, vb, vs, vtr, vdata) = (
-            varena.base + 0x1000, varena.base + 0x5800, varena.base + 0x5000,
-            varena.base + 0x6000, varena.base + 0x8000, varena.base + 0x9000,
+            varena.base + 0x1000,
+            varena.base + 0x5800,
+            varena.base + 0x5000,
+            varena.base + 0x6000,
+            varena.base + 0x8000,
+            varena.base + 0x9000,
         );
-        let module = build_vm_module(vc as u64, vt as u64, vb as u64, prog.clone(), handlers::EntryMode::Ksa)?;
+        let module = build_vm_module(
+            vc as u64,
+            vt as u64,
+            vb as u64,
+            prog.clone(),
+            handlers::EntryMode::Ksa,
+        )?;
         handlers::validate_vm_code(&module.code)?;
-        let tramp = encode_trampoline(vs as u64, vdata as u64, vdata as u64, vc as u64, vtr as u64)?;
+        let tramp =
+            encode_trampoline(vs as u64, vdata as u64, vdata as u64, vc as u64, vtr as u64)?;
         let vbase = varena.base as u64;
         {
             let b = varena.bytes();
@@ -672,18 +801,39 @@ pub fn run_self_test() -> Result<()> {
         let b = varena.bytes();
         let mut vn = [0u64; 9];
         for i in 0..9 {
-            vn[i] = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + i * 8..0x6000 + interp::STATE_VREGS + i * 8 + 8].try_into().unwrap());
+            vn[i] = u64::from_le_bytes(
+                b[0x6000 + interp::STATE_VREGS + i * 8..0x6000 + interp::STATE_VREGS + i * 8 + 8]
+                    .try_into()
+                    .unwrap(),
+            );
         }
         let mem_n = b[0x9000..0x9000 + 0x40].to_vec();
 
-        assert_eq!(vi[1..], want_v[1..], "[31] atomic XCHG/XADD interpreter vregs mismatch\ninterp={:?}\nwant  ={:?}", &vi[1..], &want_v[1..]);
-        assert_eq!(vn[1..], want_v[1..], "[31] atomic XCHG/XADD native vregs mismatch\nnative={:?}\nwant  ={:?}", &vn[1..], &want_v[1..]);
+        assert_eq!(
+            vi[1..],
+            want_v[1..],
+            "[31] atomic XCHG/XADD interpreter vregs mismatch\ninterp={:?}\nwant  ={:?}",
+            &vi[1..],
+            &want_v[1..]
+        );
+        assert_eq!(
+            vn[1..],
+            want_v[1..],
+            "[31] atomic XCHG/XADD native vregs mismatch\nnative={:?}\nwant  ={:?}",
+            &vn[1..],
+            &want_v[1..]
+        );
         // v0 was used only as the XADD16 address; it must be unchanged.
         assert_eq!(vi[0], 0x8038, "[31] interp address vreg clobbered");
         assert_eq!(vn[0], vbase + 0x9038, "[31] native address vreg clobbered");
-        assert_eq!(mem_i, want_d, "[31] atomic XCHG/XADD interpreter mem mismatch");
+        assert_eq!(
+            mem_i, want_d,
+            "[31] atomic XCHG/XADD interpreter mem mismatch"
+        );
         assert_eq!(mem_n, want_d, "[31] atomic XCHG/XADD native mem mismatch");
-        println!("[31] v48 atomic memory XCHG/XADD (interp == native == x86, 8/16/32/64-bit): PASS");
+        println!(
+            "[31] v48 atomic memory XCHG/XADD (interp == native == x86, 8/16/32/64-bit): PASS"
+        );
     }
     let _ = std::io::stdout().flush();
 
@@ -721,14 +871,19 @@ pub fn run_self_test() -> Result<()> {
     match run_cmovcc_test() {
         Ok(_) => println!("[35] D-1 CMOVcc (all cond families; lift==interp==native): PASS"),
         Err(e) => {
-            println!("[35] D-1 CMOVcc:                                                FAIL ({})", e);
+            println!(
+                "[35] D-1 CMOVcc:                                                FAIL ({})",
+                e
+            );
             return Err(e);
         }
     }
     let _ = std::io::stdout().flush();
 
     match run_string_ops_test() {
-        Ok(_) => println!("[36] C-1 string ops (rep stos/movs/lods/scas/cmps + non-REP; interp==native): PASS"),
+        Ok(_) => println!(
+            "[36] C-1 string ops (rep stos/movs/lods/scas/cmps + non-REP; interp==native): PASS"
+        ),
         Err(e) => {
             println!("[36] C-1 string ops:                                                                   FAIL ({})", e);
             return Err(e);
@@ -737,7 +892,9 @@ pub fn run_self_test() -> Result<()> {
     let _ = std::io::stdout().flush();
 
     match run_bmi_test() {
-        Ok(_) => println!("[37] B-1 BMI1/2 (lzcnt/popcnt/blsr/blsmsk/blsi/andn; interp==native): PASS"),
+        Ok(_) => {
+            println!("[37] B-1 BMI1/2 (lzcnt/popcnt/blsr/blsmsk/blsi/andn; interp==native): PASS")
+        }
         Err(e) => {
             println!("[37] B-1 BMI1/2:                                                                     FAIL ({})", e);
             return Err(e);
@@ -746,7 +903,9 @@ pub fn run_self_test() -> Result<()> {
     let _ = std::io::stdout().flush();
 
     match run_fuzz_bmi_test() {
-        Ok(_) => println!("[37a] FUZZ BMI flags (random operands, interp==native==ref):                PASS"),
+        Ok(_) => println!(
+            "[37a] FUZZ BMI flags (random operands, interp==native==ref):                PASS"
+        ),
         Err(e) => {
             println!("[37a] FUZZ BMI flags:                                                              FAIL ({})", e);
             return Err(e);
@@ -755,7 +914,9 @@ pub fn run_self_test() -> Result<()> {
     let _ = std::io::stdout().flush();
 
     match run_fuzz_arith_test() {
-        Ok(_) => println!("[37b] FUZZ arith/popcnt (random operands, interp==native==ref):              PASS"),
+        Ok(_) => println!(
+            "[37b] FUZZ arith/popcnt (random operands, interp==native==ref):              PASS"
+        ),
         Err(e) => {
             println!("[37b] FUZZ arith/popcnt:                                                            FAIL ({})", e);
             return Err(e);
@@ -764,7 +925,9 @@ pub fn run_self_test() -> Result<()> {
     let _ = std::io::stdout().flush();
 
     match run_fuzz_bitscan_test() {
-        Ok(_) => println!("[37c] FUZZ bitscan tzcnt/lzcnt/bsr/bsf (real-x86-locked, interp==native==ref): PASS"),
+        Ok(_) => println!(
+            "[37c] FUZZ bitscan tzcnt/lzcnt/bsr/bsf (real-x86-locked, interp==native==ref): PASS"
+        ),
         Err(e) => {
             println!("[37c] FUZZ bitscan:                                                              FAIL ({})", e);
             return Err(e);
@@ -782,7 +945,9 @@ pub fn run_self_test() -> Result<()> {
     let _ = std::io::stdout().flush();
 
     match run_fuzz_shld_rol_test() {
-        Ok(_) => println!("[37e] FUZZ shld/shrd 32/64 + rol/ror (count==0 preserve, interp==native==ref): PASS"),
+        Ok(_) => println!(
+            "[37e] FUZZ shld/shrd 32/64 + rol/ror (count==0 preserve, interp==native==ref): PASS"
+        ),
         Err(e) => {
             println!("[37e] FUZZ shld/shrd/rol/ror:                                                      FAIL ({})", e);
             return Err(e);
@@ -854,11 +1019,20 @@ pub fn run_self_test() -> Result<()> {
     let _ = std::io::stdout().flush();
 
     println!("==================================================================");
+    // ── Audit #6: fused/permuted/variable encoding (semantic obfuscation) ──
+    match run_semobf_test() {
+        Ok(_) => println!("[41] A-6 fused/permuted/variable VM encoding (fused handlers == interp == native; per-seed permutation; variable operand len): PASS"),
+        Err(e) => {
+            println!("[41] A-6 fused/permuted/variable VM encoding:            FAIL ({})", e);
+            return Err(e);
+        }
+    }
+    let _ = std::io::stdout().flush();
+
     println!(" [VM SELF-TEST] ALL CHECKS PASSED");
     println!("==================================================================");
     Ok(())
 }
-
 
 fn pass_fail(ok: bool) -> String {
     if ok {

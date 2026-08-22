@@ -1,0 +1,2268 @@
+응. 이번에는 README/기존 보고서만 보고 평가한 게 아니라, 업로드한 vm-obf-main (5).zip을 실제 소스 트리 전체 기준으로 다시 훑었다.
+현재 아카이브는 대략:
+• src/test 포함 248개 파일
+• Rust 코드 약 7.3만 줄
+• src/vm만 119개 Rust 파일
+• src/pipeline42개
+• src/crypto16개
+• src/dispatcher9개
+• 테스트 함수 약 439개
+• unsafe 사용 지점 약 35개
+• extern "C" 지점 10개
+수준이라서, 단순히 몇 개 파일을 읽고 말할 단계가 아니다.
+다만 현재 환경에는 cargo가 설치되어 있지 않아 실제 Windows 빌드/실행까지는 검증하지 못했다. 따라서 아래 평가는 소스 코드의 실제 정적 분석 + 모듈 간 연결관계 분석 + 테스트/문서와 코드의 교차검증 결과다.
+
+───
+
+1. 전체 구조부터 다시 판정
+현재 프로젝트는 사실상 서로 다른 3개의 보호 엔진이 같이 존재한다.
+text
+BTG PACKER
+                        │
+       ┌────────────────┼────────────────┐
+       │                │                │
+       ▼                ▼                ▼
+ Legacy VM          Commercial VM     PE Protector
+       │                │                │
+ bytecode/          RISC               CFG
+ handlers           ↓                  slicing
+ interp             Poly               ↓
+ lifter              ↓               shuffle
+                     Threaded           ↓
+                     ↓               encode
+                  Native VM            ↓
+                                    crypto
+
+이게 굉장히 중요하다.
+현재 코드의 가장 큰 장점이면서 동시에 가장 큰 위험은:
+각 subsystem은 상당히 많이 구현되어 있는데, 전체 pipeline의 실제 production path에서 어떤 것이 사용되고 어떤 것이 legacy인지가 매우 복잡하다.
+즉 코드 양에 비해서 실행 경로 복잡도가 상당히 높다.
+
+───
+
+2. src/vm은 현재 프로젝트의 핵심
+src/vm에만 119개 파일이 있다.
+구조를 다시 보면:
+text
+vm/
+├── bytecode/
+├── handlers/
+├── interp/
+├── lifter/
+├── risc/
+├── poly/
+├── threaded/
+├── text_lift/
+├── self_test/
+├── nested.rs
+├── conceal.rs
+├── dispatch_perm.rs
+├── commercial_build.rs
+├── mapper.rs
+├── mem_model.rs
+├── semantics.rs
+└── ...
+
+이걸 기능적으로 나누면:
+A. Legacy 1:1 VM
+text
+x86
+ ↓
+vm/lifter
+ ↓
+bytecode
+ ↓
+interp / handlers
+
+B. Commercial VM
+text
+x86
+ ↓
+risc/lifter
+ ↓
+RiscProgram
+ ↓
+poly/encoder
+ ↓
+rolling-key bytecode
+ ↓
+threaded/poly_direct
+ ↓
+native x64
+
+C. Program-level VM
+text
+PE .text
+ ↓
+CFG
+ ↓
+text_lift
+ ↓
+RISC
+ ↓
+poly
+ ↓
+commercial_build
+
+이 세 경로가 동시에 존재한다.
+
+───
+
+3. Legacy VM은 생각보다 상당히 완성되어 있다
+vm/bytecode/registry.rs가 opcode의 source of truth이고, README에 적힌 대로 상당히 넓은 x86 범위를 모델링한다.
+구현 범위에는:
+text
+MOV
+MOVZX
+MOVSX
+
+ADD
+SUB
+IMUL
+AND
+OR
+XOR
+INC
+DEC
+NEG
+NOT
+CMP
+TEST
+
+SHL
+SHR
+SAR
+ROL
+ROR
+
+MUL
+DIV
+IDIV
+
+BSWAP
+BSR
+BSF
+TZCNT
+LZCNT
+POPCNT
+
+BMI
+
+SETcc
+CMOVcc
+
+PUSH
+POP
+CALL
+RET
+
+LEA
+LEA_RIP
+LEA_GS
+
+string instructions
+
+CMPXCHG
+XCHG
+XADD
+LOCK INC/DEC
+
+SSE/FPU scalar
+
+CPUID
+XGETBV
+
+native call
+
+등이 들어가 있다.
+판정
+Legacy VM은 연구용으로 상당히 넓은 ISA를 갖췄다.
+문제는 이것이 commercial VM과 동일한 ISA가 아니라는 것이다.
+
+───
+
+4. 그래서 현재 프로젝트에서 “193 opcode”를 보고 오해하면 안 된다
+Commercial VM은 실제로:
+text
+193 x86 VM opcode
+
+를 사용하는 게 아니다.
+실제 핵심은:
+text
+x86
+ ↓
+RISC micro-op
+
+이다.
+즉:
+text
+RISC opcode
+
+가 semantic intermediate representation 역할을 한다.
+이 설계는 좋다.
+왜냐하면 x86 instruction 하나마다 handler를 하나씩 만들 필요가 없기 때문이다.
+
+───
+
+5. RISC 계층 분석
+src/vm/risc/는 현재 프로젝트에서 가장 중요한 설계 중 하나다.
+특히:
+text
+RiscProgram
+RiscEvalState
+RiscLifter
+RiscDesynthesizer
+VirtualFlags
+native_abi
+
+가 있다.
+이 계층은:
+text
+x86 semantics
+      ↓
+RISC semantics
+      ↓
+multiple native realization
+
+으로 만들 수 있는 기반이다.
+이 부분은 내가 높게 평가한다.
+왜냐하면 상용 VM을 만들 때:
+text
+x86 → VM opcode
+
+보다
+text
+x86 → canonical IR
+        ↓
+     VM encoding
+        ↓
+     native handler
+
+가 훨씬 관리하기 좋기 때문이다.
+
+───
+
+6. 그런데 RISC가 아직 “완전히 의미 독립적인 IR”은 아니다
+RiscOp를 보면 x86 특성이 상당히 많이 남아 있다.
+예:
+text
+VirtualBranch
+CompareExchange
+AtomicExchange
+AtomicAdd
+
+FloatAdd
+FloatSub
+FloatMul
+FloatDiv
+
+IntToFloat
+FloatToInt
+FloatToFloat
+
+SetNativeFpReturn
+
+즉 이름은 RISC지만 일부 operation은 상당히 high-level이다.
+특히:
+text
+SetNativeFpReturn
+
+같은 것은 VM semantic이 아니라 bridge implementation detail이다.
+이런 것이 IR에 들어오면:
+text
+RISC semantic
+
+과
+text
+runtime ABI semantic
+
+이 결합된다.
+장기적으로 분리하는 게 좋다.
+
+───
+
+7. RiscDesynthesizer는 방향은 좋지만 “원본 파괴” 효과는 생각보다 제한적
+예:
+text
+OR
+ ↓
+NOR
+ ↓
+NOT
+
+그리고:
+text
+SUB
+ ↓
+NOT
+ ↓
+ADC
+
+등으로 변환한다.
+이건 static pattern을 어느 정도 파괴한다.
+하지만 중요한 문제가 있다.
+RISC opcode 자체가 너무 canonical하면 분석자가 다시 semantic을 합칠 수 있다.
+예:
+text
+NOR(a,b)
+NOR(a,a)
+
+는 OR 후보라는 것을 쉽게 찾을 수 있다.
+따라서 RISCification 자체를 보호기능으로 생각하면 안 되고:
+VM compiler 내부의 semantic normalization layer
+로 보는 게 정확하다.
+
+───
+
+8. RiscOptimizer는 현재 약하다
+src/vm/risc/opt.rs가 있지만 실제로는 peephole 중심이다.
+이건 오히려 현재 단계에서는 괜찮다.
+왜냐하면 optimizer가 너무 강하면:
+text
+desynthesis
+
+한 것이 다시:
+text
+canonical x86 semantic
+
+으로 합쳐져 버릴 수 있기 때문이다.
+따라서:
+text
+RISC lowering
+
+과:
+text
+obfuscation optimization
+
+을 분리하는 게 좋다.
+
+───
+
+9. 가장 중요한 VirtualFlags
+risc/flags.rs와 semantics.rs를 보면 이 프로젝트가 단순한 opcode 변환기가 아니라 flag semantics를 상당히 신경 쓰고 있다.
+이건 매우 좋은 점이다.
+특히:
+text
+CF
+ZF
+SF
+OF
+AF
+PF
+DF
+
+계열을 모델링한다.
+그리고 native handler에서도 하드웨어 flags를 캡처해서 VM flags로 merge한다.
+이것은 정확성 측면에서 좋은 설계다.
+
+───
+
+10. 하지만 이 부분은 현재 프로젝트의 가장 위험한 correctness 영역
+소스에 flag 관련 특수 처리들이 매우 많다.
+예:
+text
+INC/DEC → CF 보존
+shift → shift-out CF
+TZCNT/LZCNT → CF/ZF
+POPCNT → 특정 flags
+BSF/BSR → ZF
+
+이런 식이다.
+즉:
+text
+reference
+=
+interpreter
+=
+native handler
+
+가 정확히 동일해야 한다.
+여기서 한 비트만 다르면:
+text
+CMP
+ ↓
+Jcc
+
+전체 프로그램 흐름이 달라진다.
+판정
+현재 VM의 실제 품질을 결정하는 핵심은 handler 수가 아니라 semantics.rs와 native handler 간 differential correctness다.
+
+───
+
+11. Poly VM 분석
+src/vm/poly/:
+text
+isa_spec.rs
+encoder.rs
+decoder.rs
+interpreter.rs
+rolling_key.rs
+
+구조다.
+여기서 핵심은:
+text
+seed
+ ↓
+VirtualIsaSpec
+ ↓
+opcode permutation
+ ↓
+register permutation
+ ↓
+operand mask
+ ↓
+rolling key
+
+이다.
+이건 좋은 구조다.
+
+───
+
+12. 그런데 poly decoder에는 실제로 개선할 부분이 보인다
+decode_full()을 보면 bytecode가 부족할 때:
+rust
+if vip + 3 > bytecode.len() {
+    break;
+}
+
+같이 오류가 아니라 조용히 decode 종료하는 경로가 있다.
+즉 malformed bytecode를:
+text
+Err
+
+로 처리하지 않고:
+text
+partial program
+
+으로 반환할 수 있다.
+이건 production parser로는 좋지 않다.
+특히:
+text
+operand immediate
+branch target
+cin
+
+을 읽는 과정에서도 길이 부족 시 일부 byte를 0으로 채우는 경로가 있다.
+개선 필요
+text
+truncated opcode
+truncated operand
+truncated immediate
+truncated branch target
+
+전부 명시적인 decode error가 되어야 한다.
+
+───
+
+13. 이것은 단순 보안 문제가 아니라 VM 정확성 문제
+현재 decoder의 contract는:
+text
+valid bytecode → correct RiscProgram
+
+이어야 한다.
+그런데 malformed stream에서:
+text
+valid-looking partial program
+
+을 반환하면:
+text
+packer bug
+
+와:
+text
+corrupt bytecode
+
+를 구분하기 어려워진다.
+
+───
+
+14. rolling_key.rs
+rolling key 자체는 꽤 잘 설계돼 있다.
+개념적으로:
+text
+key_i
+ ↓
+opcode
+ ↓
+VIP
+ ↓
+key_(i+1)
+
+이다.
+따라서 bytecode의 각 byte가 단순:
+text
+byte XOR constant
+
+가 아니다.
+이건 packed-1.exe 분석에서 보였던 단순한 encrypted dispatcher보다 한 단계 낫다.
+
+───
+
+15. 하지만 현재 rolling-key의 진짜 약점
+seed가 알려지면 전체 stream이 deterministic하다.
+즉:
+text
+seed
++
+decoder algorithm
++
+bytecode
+
+를 확보하면 전체 VM bytecode를 정적으로 복구할 수 있다.
+따라서 rolling key는:
+암호화
+가 아니라:
+polymorphic encoding / static pattern disruption
+으로 보는 것이 맞다.
+이건 설계적으로 올바른 위치다.
+
+───
+
+16. threaded/poly_direct.rs가 현재 프로젝트에서 가장 중요한 파일
+약 2,887줄이다.
+여기에:
+• self-decoder
+• handler generation
+• operand decoding
+• branch resolution
+• flag synchronization
+• native calls
+• handler table
+• integrity
+• direct dispatch
+• state
+• stack
+이 모두 들어 있다.
+즉 현재 commercial VM의 실질적인 runtime core다.
+
+───
+
+17. 여기서 아주 중요한 장점
+현재 self-decoding은:
+text
+encrypted bytecode
+ ↓
+rolling decoder
+ ↓
+plaintext opcode
+ ↓
+operand decoder
+ ↓
+semantic handler
+
+로 되어 있다.
+그리고 opcode별 key도 파생한다.
+이전 packed-1.exe에서 봤던:
+text
+handler_table[opcode]
+XOR constant
+
+보다 훨씬 낫다.
+
+───
+
+18. 하지만 여기에도 큰 구조적 약점이 있다
+build_self_decoding_parts_with()에서:
+text
+VirtualIsaSpec::from_seed(seed)
+
+로부터 모든 것이 결정된다.
+즉 한 번:
+text
+seed
+
+를 찾으면:
+text
+opcode map
+register map
+operand format
+condition map
+rolling key
+
+가 모두 복구된다.
+즉 한 seed가 VM의 모든 polymorphism을 결정하는 단일 root secret이다.
+이게 분석 비용을 크게 낮춘다.
+
+───
+
+19. 더 중요한 문제: VM metadata가 너무 많이 존재한다
+SelfDecodingParts:
+text
+table
+table_key
+table_checksum
+offs_tab
+flags_tab
+cond_codes
+branch_map
+
+그리고 commercial_build.rs에서는 이것들을 하나의 table blob으로 합친다.
+즉:
+text
+table
+ +0x000 handler table
+ +0x800 operand offset
+ +0x900 operand kind
+ +0xA00 condition
+ +0xB00 branch map
+
+구조다.
+이건 runtime 구현은 편하지만 reverse engineering에는 굉장히 좋은 metadata anchor다.
+
+───
+
+20. 특히 branch_map은 상당한 static oracle
+현재 builder가:
+text
+decode bytecode
+ ↓
+re-encode
+ ↓
+op_offsets
+ ↓
+branch_map
+
+을 만든다.
+즉 빌드 단계에서 이미:
+VM instruction ↔ bytecode offset ↔ original IP
+관계를 계산하고 있다.
+이건 정확성을 위해 필요한 정보지만, 최종 binary에 너무 직접적인 형태로 남아 있으면 분석자에게 매우 유용하다.
+
+───
+
+21. poly_embed.rs에서 가장 큰 문제를 찾았다
+여기 실제 코드:
+text
+.btgvm
+├── entry stub
+├── header
+├── handler table
+├── region table
+├── handler code
+├── VM state
+└── bytecode
+
+이다.
+그런데:
+rust
+RegionDesc {
+    region_va,
+    seed,
+    bytecode_off,
+    bytecode_len,
+    lifted_ops
+}
+
+가 평문으로 들어간다.
+즉 output PE만 가지고도:
+text
+region VA
+seed
+bytecode 위치
+bytecode 길이
+micro-op 개수
+
+를 얻을 수 있다.
+이건 commercial VM의 핵심 weakness다.
+
+───
+
+22. 더 심각한 문제: handler table도 이 경로에서는 평문이다
+poly_embed.rs:
+rust
+buf[OFF_HANDLER_TABLE + e ..].copy_from_slice(&va.to_le_bytes());
+
+즉 handler VA가 그대로 들어간다.
+poly_direct의 P6-3 handler table hardening과 poly_embed의 T1-3 embedding path가 서로 다른 보안 수준이다.
+이건 매우 중요한 발견이다.
+즉 현재 프로젝트에는:
+text
+commercial self-decoding path
+        ↓
+P6-3 hardening 있음
+
+poly_embed path
+        ↓
+평문 handler table
+
+이라는 두 개의 security domain이 있다.
+
+───
+
+23. unused opcode 처리도 좋지 않다
+poly_embed.rs:
+rust
+for i in handlers.len()..256 {
+    table[i] = entry_va;
+}
+
+즉 unused opcode가:
+text
+invalid
+
+가 아니라:
+text
+entry stub
+
+로 연결된다.
+이건 probe/fuzz 분석 시 매우 이상한 실행 경로를 만든다.
+poly_direct에서는 UD2 기반 trap 정책을 가지고 있으므로 이쪽도 동일한 invalid-op policy로 통일하는 것이 좋다.
+
+───
+
+24. 더 중요한 문제: .btgvm characteristics
+rust
+0xE000_0020
+
+즉:
+text
+CODE
+EXECUTE
+READ
+WRITE
+
+다.
+결과적으로:
+실행 코드 + handler table + mutable state + bytecode가 RWX 영역에 공존할 가능성이 높다.
+이건 상용 protector 관점에서는 상당한 약점이다.
+
+───
+
+25. DirectTailEmitter는 단순하지만 분석하기 쉽다
+현재 dispatch:
+asm
+movzx eax,[r12]
+inc r12
+xor rax,r14
+mov rax,[r15+rax*8]
+jmp rax
+
+이다.
+장점:
+• 빠름
+• 중앙 dispatcher loop 없음
+• native CFG가 복잡해짐
+하지만 정적 분석자는 이 패턴을 찾기 쉽다.
+특히:
+text
+VIP
++
+rolling key
++
+table base
++
+indirect JMP
+
+가 모든 handler에서 반복된다.
+따라서 signature가 매우 강하다.
+
+───
+
+26. 여기서 handler polymorphism이 필요하다
+현재 handler가 모두 비슷한 epilogue를 갖기 때문에:
+text
+handler boundary
+
+를 자동으로 잡기 쉽다.
+따라서 단순 junk보다:
+text
+Handler A:
+    decode
+    operation
+    tail
+
+Handler B:
+    decode
+    operation
+    shared tail
+
+Handler C:
+    operation
+    inline next-op decode
+
+Handler D:
+    fused operation + next dispatch
+
+처럼 구조 자체를 다양화하는 게 더 중요하다.
+
+───
+
+27. super_ops.rs는 방향이 정확하다
+현재:
+text
+FusedPattern
+SuperOperatorSynthesizer
+
+가 있다.
+이걸 적극적으로 production path에 연결하면:
+text
+ADD
+CMP
+BRANCH
+
+가 각각 따로 보이지 않고:
+text
+SUPER_17
+
+같은 하나의 handler로 합쳐질 수 있다.
+이건 static recovery 난이도를 크게 높일 수 있다.
+
+───
+
+28. 하지만 super-op의 현재 한계
+현재는:
+text
+패턴 기반 fusion
+
+이다.
+즉 어떤 패턴을 fusion할지 결정하는 정책이 제한적이다.
+그리고 super-op 자체가 build마다 크게 달라지지 않으면 분석자는 다시 semantic library를 만들 수 있다.
+따라서:
+text
+build seed
++
+profile
++
+CFG
++
+instruction frequency
+
+를 이용해서 fusion 결과도 달라지게 하는 게 좋다.
+
+───
+
+29. nested.rs
+Nested VM abstraction 자체는 존재한다.
+이건 설계적으로 아주 좋은 방향이다.
+하지만 중요한 건:
+nested VM module이 존재한다는 것과 실제 commercial packed binary에서 사용된다는 것은 다르다.
+현재 코드를 보면 이 둘 사이의 연결이 아직 완전히 강제된 구조는 아니다.
+즉:
+text
+Nested VM
+
+은 현재 연구 기능에 가깝고:
+text
+commercial default runtime
+
+의 핵심 요소라고 보기 어렵다.
+
+───
+
+30. conceal.rs
+state wipe:
+text
+SensitiveWipeGuard
+wipe_sensitive
+
+등은 좋다.
+하지만 이것은:
+메모리 lifecycle hygiene
+에 가깝다.
+현재 VM state 자체는:
+text
+regs
+temps
+flags
+vsp
+stack
+
+가 비교적 명확하다.
+따라서 memory dump에서 state를 찾는 것은 어렵지 않은 편이다.
+
+───
+
+31. dispatch_perm.rs
+dispatcher permutation은 좋은 보강이다.
+하지만 이것 역시:
+text
+seed → permutation
+
+이면 seed 하나가 확보될 때 전체 permutation이 재생성된다.
+즉:
+text
+secret separation
+
+이 부족하다.
+
+───
+
+32. text_lift/commercial.rs는 실제 상용화의 가장 큰 병목
+여기서 아주 중요한 정책:
+text
+RISC-lift 불가
+ ↓
+함수 전체 native 유지
+
+를 사용한다.
+이건 correctness 관점에서 아주 좋은 선택이다.
+절반만 lift해서:
+text
+VM
+ ↓
+native middle
+ ↓
+VM
+
+로 만드는 것보다 안전하다.
+
+───
+
+33. 그런데 코드에 스스로 기록된 핵심 문제
+주석에 이미:
+SEH func_ranges 밖의 함수는 unsupported block 하나만 제외되어 함수 중간에 VM/native 경계가 생길 수 있다.
+라고 적혀 있다.
+이건 실제로 중요한 설계 문제다.
+즉:
+text
+Function A
+ ├── block 1 → VM
+ ├── block 2 → VM
+ ├── block 3 → native
+ └── block 4 → VM
+
+같은 구조가 발생할 수 있다.
+이러면 bridge가:
+text
+native function entry
+
+가 아니라 중간 주소를 필요로 할 수 있다.
+
+───
+
+34. bridge_to_function_entries는 이 문제의 일부를 해결한다
+좋은 점이다.
+native target이 발견되면:
+text
+target inside function
+ ↓
+function entry
+
+로 redirect한다.
+하지만 이것은:
+모든 VM/native edge가 안전하다는 증명이 아니다.
+특히:
+text
+indirect jump
+indirect call
+return
+exception
+tail call
+
+은 별도의 분석이 필요하다.
+
+───
+
+35. detect_fp_return_functions
+이건 꽤 흥미로운 보정이다.
+native function이:
+text
+XMM0
+
+로 float를 반환하는지 휴리스틱으로 찾아:
+text
+SetNativeFpReturn
+
+을 주입한다.
+이건 실제 ABI correctness 문제를 인식하고 있다는 증거다.
+다만 heuristic 기반이라:
+text
+false positive
+false negative
+
+가능성이 있다.
+상용 제품이라면 symbol/debug metadata가 아니라 machine-level calling convention analysis로 강화해야 한다.
+
+───
+
+36. RISC coverage는 실제 상용 VM의 핵심 병목
+현재 block_poly_liftable():
+text
+RiscLifter
+ ↓
+VirtualIsaSpec::is_encodable
+
+를 확인한다.
+즉 RISC에서 lift할 수 있어도 poly ISA에서 encode할 수 없으면 전체 block을 reject한다.
+이건 정확하다.
+하지만 결국:
+text
+supported instructions
+
+가 commercial coverage를 결정한다.
+
+───
+
+37. 현재 지원되지 않는 계열이 여전히 존재한다
+코드와 주석을 보면:
+• 일부 SSE
+• packed operations
+• 일부 system instructions
+• 일부 special register semantics
+• 일부 complex addressing
+• 일부 control-flow
+• 특정 FP semantics
+등이 fallback으로 남는다.
+즉 whole-program VM은 이름 그대로 “모든 프로그램을 VM화”하는 엔진은 아니다.
+현재 정확한 표현은:
+가능한 함수/블록을 최대한 상용 RISC VM으로 가상화하고, 지원하지 않는 함수는 native fallback하는 hybrid virtualizer
+다.
+
+───
+
+38. pipeline 전체 구조 분석
+pipeline은:
+text
+pass1_slice
+ ↓
+pass2_shuffle
+ ↓
+pass3_encode
+ ↓
+pass4_section
+ ↓
+patch_data
+ ↓
+crypto
+ ↓
+iat
+ ↓
+validation
+
+이다.
+이건 전형적인 binary transformation pipeline으로 잘 분리되어 있다.
+
+───
+
+39. Pass1
+CFG와 micro slicing을 통해:
+text
+BasicBlock
+ ↓
+TriggerBlock
+
+으로 변환한다.
+이 부분은 기존 BTG 아이디어와 직접 연결된다.
+좋은 점:
+• CFG 기반
+• block ownership
+• VA mapping
+이 있다.
+
+───
+
+40. Pass2
+block shuffle.
+즉 원본:
+text
+A → B → C → D
+
+가 physical layout에서:
+text
+C
+A
+D
+B
+
+등으로 재배치될 수 있다.
+이건 static layout 분석을 어렵게 한다.
+하지만 control-flow semantics가 이미 branch fixup으로 정확하게 유지되므로 난독화이지 암호화는 아니다.
+
+───
+
+41. Pass3
+실제 block encoding과 relocation/fixup이 들어간다.
+여기서 중요한 것은:
+text
+RIP-relative
+
+이다.
+이 프로젝트 전체에서 반복해서 등장하는 가장 중요한 native transformation 문제다.
+
+───
+
+42. Pass4
+섹션 생성/boot area/dispatcher placement가 들어간다.
+특히:
+text
+BOOT_AREA_RESERVE = 64 MiB
+
+라는 상당히 큰 예약 영역이 있다.
+이건 기능상 편하지만:
+output PE 구조가 지나치게 큰 보호 영역을 갖게 될 가능성
+이 있다.
+상용 제품이라면 target-specific sizing이 필요하다.
+
+───
+
+43. Crypto pipeline
+현재:
+text
+RC4
+BTG-C1
+ChaCha20
+Poly1305
+MAC
+
+이 여러 계층이 있다.
+이 부분은 기능이 너무 많아서 오히려 설계가 복잡해진 상태다.
+
+───
+
+44. 가장 중요한 crypto 결론
+BTG-C1은:
+연구용 custom stream cipher
+로 취급해야 한다.
+암호학적 안전성을 주장하면 안 된다.
+ChaCha20/Poly1305가 들어간 것은 방향이 맞다.
+
+───
+
+45. 그런데 crypto가 VM과 완전히 하나로 통합된 것은 아니다
+현재 CLI상:
+text
+--crypto-mode
+
+가 있고:
+text
+rc4
+c1
+chacha20
+
+을 선택할 수 있다.
+하지만 주석상:
+text
+chained
+reencrypt
+vm
+vm-oep
+
+등에서는 fallback이 발생한다.
+즉 사용자가:
+text
+--crypto-mode chacha20
+
+를 지정했다고 해서 모든 runtime path가 ChaCha20으로 통일되는 것은 아니다.
+이건 반드시 ResolvedConfig 수준에서 명확히 보여줘야 한다.
+
+───
+
+46. PipelineContext 자체가 너무 거대하다
+현재 필드가 매우 많다.
+text
+rng
+target_info
+dispatcher
+blocks
+shuffle
+crypto
+payload
+iat
+anti_debug
+m8
+m7
+vm_oep
+vm_commercial
+poly seed
+poly regions
+...
+
+즉 하나의 구조체가:
+text
+configuration
++
+intermediate representation
++
+build output
++
+runtime metadata
+
+를 모두 들고 있다.
+이건 유지보수에 상당히 위험하다.
+
+───
+
+47. PipelineContext는 3개로 분리하는 것이 좋다
+예:
+text
+BuildConfig
+BuildState
+BuildArtifacts
+
+처럼.
+현재:
+text
+PipelineContext
+
+가 너무 많은 책임을 가진다.
+이건 실제 버그를 만드는 요소다.
+
+───
+
+48. CLI도 같은 문제를 갖고 있다
+옵션이 매우 많다.
+현재:
+text
+--vm
+--vm-oep
+--vm-commercial
+--m7
+--m8
+--iat-hide
+--mem-harden
+--dispatcher-reencrypt
+--payload-relocate
+--rsrc-register
+--chained-crypto
+--integrity
+--crypto-mode
+...
+
+이 조합이 많다.
+따라서:
+text
+RequestedConfig
+
+를:
+text
+ResolvedConfig
+
+로 정규화해야 한다.
+
+───
+
+49. 현재 코드도 이미 conflict resolution을 일부 하고 있다
+예:
+text
+effective_obf_level()
+
+같은 것이 있다.
+하지만 이게 전체 configuration graph를 관리하는 중앙 정책 엔진은 아니다.
+상용화하려면:
+text
+requested
+ ↓
+validate
+ ↓
+resolve conflicts
+ ↓
+capability manifest
+ ↓
+pipeline
+
+로 가야 한다.
+
+───
+
+50. IAT hide
+iat_hide.rs는 실제 PE import directory를 재구성하는 코드다.
+방향은:
+text
+original imports
+ ↓
+remove
+ ↓
+minimal loader imports
+ ↓
+runtime resolution
+
+이다.
+이건 보호 효과가 있다.
+하지만 runtime failure가 발생하면:
+text
+API resolution
+
+에 의해 프로그램이 아예 실행되지 않을 수 있다.
+따라서 QA가 매우 중요하다.
+
+───
+
+51. PE validator
+pipeline/validate는 꽤 좋은 부분이다.
+검증 대상:
+text
+section bounds
+PE directories
+imports
+TLS
+resources
+payload
+relocations
+pdata
+
+등이다.
+binary protector에서 이런 post-build validator가 있다는 건 장점이다.
+
+───
+
+52. 하지만 static PE validator ≠ Windows Loader validation
+이건 매우 중요하다.
+소스 검증은:
+text
+PE 구조가 논리적으로 맞음
+
+을 확인한다.
+하지만 실제 Windows loader는:
+text
+ASLR
+CFG
+CET
+VBS
+Memory Integrity
+TLS
+SEH
+DLL loading
+
+등을 모두 고려한다.
+따라서 Windows VM farm이 필요하다.
+
+───
+
+53. crypto/memharden.rs
+여기는 RWX→RX transition을 위해 NtProtectVirtualMemory를 사용한다.
+좋은 점:
+• API resolution 실패를 감지
+• protection transition을 수행
+하지만 전체 VM runtime에서는:
+text
+code
+handler
+state
+bytecode
+
+가 한 page group에 섞일 수 있기 때문에 W^X가 완전히 해결된 것은 아니다.
+
+───
+
+54. 특히 .btgvm RWX가 이 문제를 명확하게 보여준다
+앞서 말했듯:
+text
+0xE0000020
+
+이므로:
+text
+R
+W
+X
+
+가 동시에 있다.
+따라서 현재:
+--mem-harden이 존재한다
+와:
+전체 commercial VM이 W^X compliant다
+는 다른 이야기다.
+현재는 후자가 아니다.
+
+───
+
+55. Anti-debug
+dispatcher/antidebug.rs는 정책이:
+text
+Trap
+Hang
+Warn
+
+으로 분리돼 있다.
+이건 설계적으로 좋다.
+특히 Warn이 fail-open이라는 점을 명확하게 문서화한 것도 좋다.
+다만 제품 기본값이 무엇인지와 build profile별 정책이 명확해야 한다.
+
+───
+
+56. bootstub
+bootstub은 현재:
+text
+KSA
+C1
+ChaCha
+decrypt
+self-wipe
+dispatcher entry
+anti-debug
+
+등을 하나의 native bootstrap으로 조합한다.
+이 부분은 사실상 보호기의 실제 loader다.
+여기서 버그가 발생하면 VM이 아무리 정확해도 프로그램 전체가 죽는다.
+
+───
+
+57. bootstub의 가장 큰 문제는 너무 많은 역할을 한다는 것
+현재 bootstub이:
+text
+crypto initialization
++
+key derivation
++
+anti-debug
++
+memory protection
++
+payload decryption
++
+VM entry
+
+를 모두 한다.
+따라서 bootstrap failure surface가 크다.
+상용화하려면 stage를 분리하는 게 좋다.
+
+───
+
+58. manifest.rs
+이건 좋은 기반이다.
+build metadata를 기록할 수 있다.
+다만 실제 release artifact에는:
+text
+source revision
+toolchain
+profile
+seed
+resolved capabilities
+crypto mode
+VM ABI
+
+가 반드시 기록되어야 한다.
+재현성 문제 때문에 중요하다.
+
+───
+
+59. deterministic build에 중요한 문제
+PipelineContext는:
+text
+StdRng
+
+를 사용한다.
+좋다.
+그런데 코드 전반에 별도 random source가 남아 있는지 계속 검사해야 한다.
+현재 문서에도 과거:
+text
+thread_rng()
+
+사용 문제가 기록돼 있다.
+현재 build_vm_module_mba는 rng를 인자로 받도록 수정돼 있어 그 부분은 개선됐다.
+이런 수정은 좋다.
+
+───
+
+60. 하지만 poly VM seed 자체의 lifecycle은 다시 봐야 한다
+PipelineContext:
+text
+poly_vm_seed
+poly_vm_seed_masked
+
+를 가진다.
+그런데 poly_embed에서는:
+text
+RegionDesc.seed
+
+가 다시 평문으로 들어간다.
+즉:
+text
+seed masking
+
+을 해놓고 최종 PE에 다시 plaintext seed가 들어갈 가능성이 있다.
+이건 실제 설계상 중요한 불일치다.
+
+───
+
+61. 이 부분은 현재 가장 명확한 hardening 대상
+현재:
+text
+build-time seed concealment
+
+과:
+text
+runtime embedded seed
+
+가 충돌한다.
+최종 binary에서 seed가 필요하므로 완전히 없애는 게 목적은 아니지만:
+text
+seed
+
+를:
+text
+VM domain key
++
+runtime derivation
++
+per-region salt
+
+로 분리하는 편이 좋다.
+
+───
+
+62. mapper.rs
+이건 개발/디버깅에는 매우 유용하다.
+text
+VM bytecode offset
+↔
+original VA
+↔
+disassembly
+
+를 기록한다.
+하지만 release binary에는 이 정보가 절대 들어가면 안 된다.
+다행히 현재 CLI가 opt-in이다.
+
+───
+
+63. sym_map
+이건 더 민감하다.
+text
+bytecode
+↔
+basic block
+↔
+function
+↔
+.pdata
+
+를 연결한다.
+개발 build에서는 좋지만:
+release profile에서 확실히 제거되어야 한다.
+
+───
+
+64. Self-test는 양이 상당하다
+439개 test attribute가 있다는 것은 상당히 좋은 신호다.
+특히:
+text
+flags
+mem
+stack
+SSE
+muldiv
+branch
+ABI
+bridge
+nested
+poly
+threaded
+
+가 분리되어 있다.
+
+───
+
+65. 하지만 테스트 수가 실제 coverage와 같지는 않다
+현재 가장 중요한 missing test는:
+text
+multi-block VM
++
+VM/native transition
++
+SEH
++
+thread
++
+ASLR
++
+real Windows loader
++
+runtime exception
+
+이다.
+특히:
+text
+RiscProgram::eval_state
+=
+poly interpreter
+=
+native runner
+
+가 linear block에 집중돼 있다.
+
+───
+
+66. 가장 큰 테스트 gap
+현재 README가 직접:
+선형 블록 단위 동치
+라고 말한다.
+그러면:
+text
+A
+ ↓
+branch
+ ├── B
+ └── C
+      ↓
+      D
+
+전체 CFG에 대해:
+text
+reference
+=
+native VM
+
+를 증명한 것은 아니다.
+이게 commercial VM의 가장 큰 QA gap이다.
+
+───
+
+67. self_test/cross_path.rs와 multiblock.rs가 있어서 방향은 좋다
+즉 개발자가 이 문제를 이미 알고 있다.
+하지만 이것을:
+text
+random CFG generator
+
+로 확장해야 한다.
+
+───
+
+68. Fuzzing도 이미 있다
+self_test/fuzz.rs가 있다.
+좋다.
+하지만 가장 중요한 fuzz 대상은:
+text
+RISC semantic generator
+
+와:
+text
+native handler generator
+
+간 differential fuzz다.
+
+───
+
+69. 내가 보기엔 현재 가장 좋은 테스트 oracle
+세 가지를 동시에 실행해야 한다.
+text
+Original x86
+      │
+      ├── Native CPU
+      │
+      ├── RiscProgram::eval_state
+      │
+      ├── PolyInterpreter
+      │
+      └── NativeThreadedVM
+
+그리고:
+text
+registers
+flags
+memory
+stack
+FP state
+return value
+
+를 비교한다.
+이게 현재 프로젝트에서 가장 중요한 자동 검증이다.
+
+───
+
+70. 현재 코드에서 발견되는 안정성 문제
+전체 source에서 unwrap/expect가 매우 많다.
+약 3,784개 패턴이 검색됐다.
+물론 상당수가:
+text
+Instruction::with...
+
+같은 테스트/정적 생성에서 실패하지 않는다고 알고 있는 API에 쓰인 것이다.
+따라서 3,784개가 모두 문제라는 뜻은 아니다.
+하지만:
+text
+packer input
+PE parsing
+binary mutation
+
+경로의 unwrap은 release robustness에 위험하다.
+
+───
+
+71. 특히 PE 처리 코드
+예:
+text
+imports.rs
+validate/pe_dirs.rs
+iat_hide.rs
+build.rs
+
+등에서 raw slice → integer 변환에 unwrap()이 많다.
+현재는 preceding bounds check에 의존한다.
+이건 내부 invariant가 확실하면 괜찮지만:
+malformed PE가 panic이 아니라 clean Err로 끝나야 하는 제품
+이라면 정리해야 한다.
+
+───
+
+72. 현재 source에는 개발자 환경 경로가 남아 있다
+실제:
+text
+C:\Users\uzoki\Desktop\asdfsadfecwecc\_poly_dump.txt
+
+같은 하드코딩 경로가 발견됐다.
+이건 반드시 제거해야 한다.
+특히 release artifact에서:
+text
+developer username
+desktop path
+
+가 노출될 수 있다.
+
+───
+
+73. 이것은 보안상도 좋지 않다
+단순 cosmetic 문제가 아니다.
+PE에 해당 string이 들어갈 경우:
+text
+username
+directory
+project layout
+
+이 노출될 수 있다.
+release build에서는:
+text
+debug dump disabled
+
+로 만들거나:
+text
+configurable path
+
+로 바꿔야 한다.
+
+───
+
+74. unsafe 사용
+약 35개 수준이고, VM arena/Windows FFI 등에 집중돼 있다.
+이건 예상 가능한 수준이다.
+특히:
+text
+VirtualAlloc
+VirtualFree
+extern "C"
+
+등은 VM native execution 때문에 필요하다.
+다만:
+text
+RWX arena
+
+는 테스트용으로만 제한하는 게 맞다.
+
+───
+
+75. Arena는 production runtime과 분리해야 한다
+현재:
+text
+run_native_poly_direct
+
+에서:
+text
+RWX arena
+
+를 사용한다.
+테스트에는 괜찮다.
+하지만 이 코드를 production embedding path와 혼동하면 안 된다.
+상용 path는:
+text
+RX code
+RW state
+R data
+
+로 분리해야 한다.
+
+───
+
+76. 가장 큰 구조적 문제를 하나로 요약하면
+현재는:
+text
+Build
+                      │
+         ┌────────────┼────────────┐
+         ▼            ▼            ▼
+       Legacy       Commercial    Crypto
+         │            │            │
+         ▼            ▼            ▼
+      VM code       VM code      encrypted
+         │            │            │
+         └────────────┼────────────┘
+                      ▼
+                    PE
+
+인데,
+각 단계가 서로 다른 metadata/key/state 모델을 갖는다.
+그래서 코드가 계속 커질수록:
+text
+VM A
+VM B
+VM C
+Crypto A
+Crypto B
+Crypto C
+
+의 조합 버그가 늘어난다.
+
+───
+
+77. 따라서 가장 먼저 해야 할 리팩터링
+현재 PipelineContext를:
+text
+RequestedConfig
+ResolvedConfig
+BuildState
+VmArtifact
+CryptoArtifact
+PeArtifact
+
+로 나누는 것이다.
+이것만 해도 프로젝트 복잡도가 상당히 내려간다.
+
+───
+
+78. 두 번째는 VM ABI를 하나로 만들어야 한다
+현재:
+text
+legacy VM ABI
+commercial VM ABI
+nested VM ABI
+native bridge ABI
+
+가 조금씩 다르다.
+최종적으로:
+text
+VmExecutionContext
+
+를 정의하고:
+text
+registers
+flags
+vsp
+vip
+decoder
+domain
+native bridge
+exception
+
+를 표준화하는 게 좋다.
+
+───
+
+79. 세 번째는 semantic source를 하나로
+현재:
+text
+legacy interpreter
+RiscProgram eval
+poly interpreter
+native handler
+
+각각 semantic logic을 가지고 있다.
+이 구조는 drift가 생길 수 있다.
+목표:
+text
+Canonical VM Semantics
+        │
+ ┌──────┼──────┐
+ ▼      ▼      ▼
+Interp Poly Native
+
+로 해야 한다.
+
+───
+
+80. 이걸 안 하면 flag bug가 계속 발생한다
+예를 들어:
+text
+RISC ADD
+
+의 semantics가:
+text
+RiscProgram
+
+에서는 맞는데:
+text
+native handler
+
+에서는 AF가 다르면:
+text
+CMP
+ ↓
+Jcc
+
+에서 조용히 프로그램이 틀어진다.
+따라서 canonical semantics는 정말 중요하다.
+
+───
+
+81. Commercial VM의 최종 구조는 이렇게 만드는 것이 가장 좋다
+text
+x86 decoder
+     │
+     ▼
+Canonical IR
+     │
+     ├───────────────┐
+     ▼               ▼
+Semantic optimizer   VM compiler
+                     │
+                     ▼
+                VM Domain
+                     │
+          ┌──────────┼──────────┐
+          ▼          ▼          ▼
+       bytecode   decoder    handler
+          │          │          │
+          └──────────┼──────────┘
+                     ▼
+                  VM State
+                     │
+                     ▼
+                Native bridge
+
+
+───
+
+82. Themida급과 비교했을 때 가장 부족한 부분
+소스 전체를 다시 보고 순위를 매기면:
+🔴 1위 — Handler polymorphism
+현재 가장 부족하다.
+opcode permutation은 있는데:
+semantic이 같은 handler의 native implementation 자체를 build마다 크게 바꾸는 기능
+이 부족하다.
+
+───
+
+🔴 2위 — Runtime metadata minimization
+현재:
+text
+handler table
+operand table
+cond table
+branch map
+region descriptor
+seed
+
+가 너무 잘 정리되어 있다.
+이건 VM compiler에는 좋지만 protector에는 좋지 않다.
+
+───
+
+🔴 3위 — Function atomicity
+현재 개선됐지만 완전하지 않다.
+
+───
+
+🔴 4위 — Nested VM production integration
+기반은 있지만 실제 핵심 경로에 강제되지 않는다.
+
+───
+
+🔴 5위 — Whole-CFG differential execution
+현재 linear equivalence 중심이다.
+
+───
+
+🟠 6위 — W^X / memory separation
+특히 .btgvm의 RWX.
+
+───
+
+🟠 7위 — Runtime integrity
+handler checksum은 있지만 전체 VM artifact에 대한 authenticated integrity와는 다르다.
+
+───
+
+🟠 8위 — ASLR + encrypted payload
+현재 trade-off가 있다.
+
+───
+
+🟠 9위 — SEH/exception completeness
+상당히 개선됐지만 commercial path가 완전히 끝난 것은 아니다.
+
+───
+
+🟠 10위 — Build configuration complexity
+기능은 많지만 조합이 너무 많다.
+
+───
+
+83. 반대로 잘된 부분
+냉정하게 말해도 좋은 부분은 많다.
+매우 좋은 것
+text
+RISC intermediate representation
++
+canonical flags
++
+differential testing
++
+native handler generation
++
+polymorphic ISA
++
+rolling key
++
+direct threading
++
+super-op framework
++
+nested VM abstraction
++
+function ownership
++
+PE validation
++
+deterministic RNG
++
+ABI tests
++
+SEH-aware exclusions
+
+이건 그냥 장난 수준의 VM 패커는 아니다.
+
+───
+
+84. 현재 프로젝트의 정확한 기술적 수준
+내가 실제 코드 기준으로 다시 등급을 주면:
+
+영역
+평가
+
+PE parser/builder
+8/10
+
+Legacy VM
+8/10
+
+RISC IR
+8/10
+
+x86 lifting
+7/10
+
+Poly ISA
+7/10
+
+Native threaded VM
+7/10
+
+Handler polymorphism
+4~5/10
+
+Nested VM
+4~5/10
+
+State concealment
+5/10
+
+Runtime metadata hiding
+4/10
+
+Function atomicity
+6/10
+
+SEH
+5~6/10
+
+Crypto integration
+5~6/10
+
+W^X
+4~5/10
+
+ASLR compatibility
+5/10
+
+Differential QA
+7/10
+
+Production robustness
+5/10
+
+
+종합
+연구/개발 VM protector로서는 상당히 높은 수준.
+하지만:
+Themida/VMProtect급 상용 보호기 완성도는 아직 아니다.
+
+───
+
+85. 특히 중요한 발견 하나
+앞에서 네가 물었던:
+“왜 packed-1.exe는 VM 복구가 쉬웠냐?”
+와 이번 소스를 직접 비교하면 이유가 더 명확해졌다.
+현재 프로젝트에도 아직:
+text
+VM entry
+ ↓
+seed
+ ↓
+ISA spec
+ ↓
+decoder
+ ↓
+handler table
+ ↓
+branch map
+ ↓
+VM state
+
+이라는 명확한 conceptual chain이 존재한다.
+packed-1.exe에서 발견했던 것과 본질적으로 같은 문제다.
+다만 현재 프로젝트는:
+text
+permutation
+rolling key
+per-op key
+MBA
+integrity
+direct threading
+
+이 추가돼서 한 단계 더 어렵게 만든 상태다.
+
+───
+
+86. 그런데 poly_embed.rs 때문에 보호 수준이 다시 떨어진다
+이게 이번 전체 소스 분석에서 가장 중요한 결론 중 하나다.
+Commercial self-decoder:
+text
+P6-3 hardening
+
+을 만들어놓고,
+실제 embed path에서는:
+text
+RegionDesc
+seed
+handler table
+
+을 평문으로 넣는다.
+즉:
+text
+build_self_decoding_parts
+                       │
+                       ▼
+               hardened VM
+                       │
+                       │
+                 commercial_build
+                       │
+                       ▼
+                 VmModule
+                       │
+                       ▼
+                 place/embed
+                       │
+                       ▼
+               poly_embed path
+                       │
+                       ▼
+              plaintext metadata
+
+가 될 가능성이 있다.
+이건 보호 계층 간 mismatch다.
+
+───
+
+87. 그래서 현재 코드에서 가장 먼저 고쳐야 할 5개
+1.
+poly_embed.rs를 commercial hardened runtime과 완전히 통일
+특히:
+text
+seed
+handler table
+region descriptor
+branch metadata
+
+를 그대로 노출하지 않도록 runtime artifact format을 하나로 통합.
+
+───
+
+2.
+handler generation을 seed-dependent polymorphic codegen으로 변경
+단순:
+text
+opcode permutation
+
+에서:
+text
+semantic → randomized native realization
+
+으로.
+
+───
+
+3.
+metadata를 하나의 table blob에 몰아넣지 않기
+현재:
+text
++0x800
++0x900
++0xA00
++0xB00
+
+처럼 너무 규칙적이다.
+
+───
+
+4.
+VM/native function ownership을 강제
+block 단위 fallback이 아니라:
+text
+function
+ └── all VM
+
+또는:
+text
+function
+ └── all native
+
+정책을 우선.
+
+───
+
+5.
+전체 CFG differential runner
+text
+Original
+vs
+RISC
+vs
+Poly
+vs
+Native threaded
+vs
+Packed Windows execution
+
+까지 자동화.
+
+───
+
+88. 최종 결론
+이번에는 실제 ZIP 전체를 기준으로 보면, 네 프로젝트는 내가 앞에서 평가했던 것보다 구조적으로 더 많이 만들어져 있다.
+특히 RISC → Poly → Direct Threaded → Native 파이프라인과 text_lift/commercial, nested, conceal, native_abi, poly_direct까지 실제 코드가 존재한다.
+하지만 동시에 코드가 많아진 만큼 “각 기능이 실제 최종 패킹 경로에서 어떤 보안 수준으로 연결되는가”가 가장 큰 문제가 됐다.
+가장 중요한 것은:
+text
+[현재]
+
+많은 보호 기능
+      +
+많은 VM 기능
+      +
+많은 테스트
+      ↓
+서로 연결된 거대한 pipeline
+
+에서
+text
+[목표]
+
+Canonical Semantics
+       ↓
+VM Compiler
+       ↓
+Per-Build VM Domain
+       ↓
+Polymorphic Handler
+       ↓
+Concealed Runtime State
+       ↓
+Authenticated VM Artifact
+       ↓
+W^X Runtime
+       ↓
+Function-Atomic Native Bridge
+       ↓
+Windows differential validation
+
+로 구조를 정리하는 것이다.
+특히 이번 전체 코드 분석에서 가장 명확하게 드러난 것은 poly_direct 자체보다 poly_embed → commercial_build → place 사이의 보안 수준 불일치다.poly_direct에는 상당한 hardening이 들어갔는데, 최종 embedding 계층에는 여전히 평문 metadata/RWX/region descriptor가 남아 있다.
+그리고 현재 소스의 실제 규모상, 다음 단계는 “또 기능 하나 추가”가 아니라 각 파일을 입력 → 상태 변경 → 출력 → 호출자 → 최종 PE에서 실제 사용되는가 기준으로 추적해서 production path를 하나 확정하는 것이다. 이걸 하면 지금 있는 7만 줄 중 실제로 최종 보호 수준에 기여하는 코드와 사실상 legacy/test/dead path인 코드를 명확하게 분리할 수 있다.

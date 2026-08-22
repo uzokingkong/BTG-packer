@@ -116,7 +116,10 @@ pub fn parse(
         instrs[idx].label = Some(label);
         label_to_idx.insert(label, idx);
     }
-    Ok(VProg { instrs, label_to_idx })
+    Ok(VProg {
+        instrs,
+        label_to_idx,
+    })
 }
 
 /// Encode the VProg back to bytecode, resolving branch offsets. Any rel8
@@ -132,7 +135,13 @@ pub fn emit(prog: &VProg) -> Result<Vec<u8>> {
                 .branch
                 .map(|b| (b.rel_off, b.width, b.label))
                 .unwrap_or((0, 0, 0));
-            (ins.op, ins.operands[..ins.olen].to_vec(), rel_off, width, label)
+            (
+                ins.op,
+                ins.operands[..ins.olen].to_vec(),
+                rel_off,
+                width,
+                label,
+            )
         })
         .collect();
 
@@ -168,7 +177,11 @@ pub fn emit(prog: &VProg) -> Result<Vec<u8>> {
                 OP_CALL8 => (OP_CALL32, vec![0, 0, 0, 0], 1, 4, label),
                 OP_JB8 => (OP_JCC32, vec![COND_JB, 0, 0, 0, 0], 2, 4, label),
                 OP_JCC8 => (OP_JCC32, vec![ops[i].1[0], 0, 0, 0, 0], 2, 4, label),
-                other => return Err(anyhow!("ir::emit: cannot widen branch opcode 0x{other:02X}")),
+                other => {
+                    return Err(anyhow!(
+                        "ir::emit: cannot widen branch opcode 0x{other:02X}"
+                    ))
+                }
             };
             widened = true;
             break;
@@ -239,9 +252,7 @@ fn mov_family_rw(ins: &VInstr) -> Option<([u8; 2], usize, [u8; 2], usize)> {
         | OP_PSRLQ_XMM_IMM8 | OP_PSLLQ_XMM_IMM8 | OP_XORPS_XMM | OP_UNPCKLPD_XMM
         | OP_UNPCKLPS_XMM | OP_PAND_XMM | OP_POR_XMM | OP_PANDN_XMM | OP_ADDSS_XMM
         | OP_ADDSD_XMM | OP_SUBSS_XMM | OP_SUBSD_XMM | OP_MULSS_XMM | OP_MULSD_XMM
-        | OP_DIVSS_XMM | OP_DIVSD_XMM | OP_CVTSS2SD_XMM | OP_CVTSD2SS_XMM => {
-            ([0; 2], 0, [0; 2], 0)
-        }
+        | OP_DIVSS_XMM | OP_DIVSD_XMM | OP_CVTSS2SD_XMM | OP_CVTSD2SS_XMM => ([0; 2], 0, [0; 2], 0),
         _ => return None,
     };
     Some(rw)
@@ -277,7 +288,8 @@ fn const_copy_prop(prog: &mut VProg) {
         for i in s..e {
             match prog.instrs[i].op {
                 OP_MOV_R_IMM32 => {
-                    let v = u32::from_le_bytes(prog.instrs[i].operands[1..5].try_into().unwrap()) as u64;
+                    let v = u32::from_le_bytes(prog.instrs[i].operands[1..5].try_into().unwrap())
+                        as u64;
                     konst.insert(prog.instrs[i].operands[0], v);
                 }
                 OP_MOV_R_IMM64 => {
@@ -394,7 +406,10 @@ pub fn run_ir_pipeline(
 
 /// Count instructions still alive after the passes (for diagnostics/tests).
 pub fn live_count(prog: &VProg) -> usize {
-    prog.instrs.iter().filter(|i| i.op != OP_NOP || i.olen != 0).count()
+    prog.instrs
+        .iter()
+        .filter(|i| i.op != OP_NOP || i.olen != 0)
+        .count()
 }
 
 /// The set of vregs read/written by an instruction — exposed for the IR

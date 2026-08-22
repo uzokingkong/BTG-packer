@@ -10,10 +10,7 @@
 // boot stub no longer shows the key derivation as plain inline arithmetic.
 // ==============================================================================
 
-
-use crate::vm::bytecode::{
-    OP_ADD_R_R, OP_AND_R_R, OP_XOR_R_IMM32, OP_XOR_R_R, BytecodeBuilder,
-};
+use crate::vm::bytecode::{BytecodeBuilder, OP_ADD_R_R, OP_AND_R_R, OP_XOR_R_IMM32, OP_XOR_R_R};
 
 /// Reference implementation (pure Rust) — the value the VM bytecode must produce.
 pub fn reference_import_key(master: u32, idx: u32, c: u32) -> u32 {
@@ -45,14 +42,17 @@ pub fn build_import_key_bytecode(master: u32, c: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::interp;
     use crate::mba::MbaGenerator;
+    use crate::vm::interp;
 
     #[test]
     fn import_key_matches_mba() {
         let (m, c) = (0xDEADBEEFu32, 0x9E37_79B9u32);
         for idx in [0u32, 1, 3, 7, 0x1234_5678, 0xFFFF_FFFF] {
-            assert_eq!(reference_import_key(m, idx, c), MbaGenerator::compute_key(m, idx, c, 2));
+            assert_eq!(
+                reference_import_key(m, idx, c),
+                MbaGenerator::compute_key(m, idx, c, 2)
+            );
         }
     }
 

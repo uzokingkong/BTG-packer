@@ -6,12 +6,11 @@
 // bodies are byte-identical to the pre-split monolith; only imports and module
 // wiring changed.
 
-use anyhow::{Result, anyhow};
+use crate::vm::arena::Arena;
+use crate::vm::build_vm_module;
+use crate::vm::encode::encode_trampoline;
 use crate::vm::{bytecode, handlers, interp, lifter};
-use crate::vm::{build_vm_module};
-use crate::vm::arena::{Arena};
-use crate::vm::encode::{encode_trampoline};
-
+use anyhow::{anyhow, Result};
 
 /// M3 self-test: stack (push/pop) + subroutine call/ret. Cross-checks the
 /// interpreter against the native x86-64 handlers.
@@ -83,14 +82,22 @@ pub(crate) fn run_m3_stack_test() -> Result<()> {
     let mut st = vec![0u8; interp::STATE_SIZE];
     let mut mem = vec![0u8; 0x8000];
     // vreg4 = RSP points at the architectural stack TOP in mem space.
-    st[interp::STATE_VREGS + 4 * 8..interp::STATE_VREGS + 4 * 8 + 8].copy_from_slice(&0x4000u64.to_le_bytes());
+    st[interp::STATE_VREGS + 4 * 8..interp::STATE_VREGS + 4 * 8 + 8]
+        .copy_from_slice(&0x4000u64.to_le_bytes());
     // Two-stack model: init the dedicated VM bytecode return-IP stack.
-    st[interp::STATE_PTR_CALL_STACK..interp::STATE_PTR_CALL_STACK + 8].copy_from_slice(&0x1000u64.to_le_bytes());
-    st[interp::STATE_CALL_SP..interp::STATE_CALL_SP + 8].copy_from_slice(&(interp::CALL_STACK_SIZE as u64).to_le_bytes());
-    interp::interpret(&mut st, &mut mem, &prog).map_err(|e| anyhow!("M3 stack interp failed: {:?}", e))?;
+    st[interp::STATE_PTR_CALL_STACK..interp::STATE_PTR_CALL_STACK + 8]
+        .copy_from_slice(&0x1000u64.to_le_bytes());
+    st[interp::STATE_CALL_SP..interp::STATE_CALL_SP + 8]
+        .copy_from_slice(&(interp::CALL_STACK_SIZE as u64).to_le_bytes());
+    interp::interpret(&mut st, &mut mem, &prog)
+        .map_err(|e| anyhow!("M3 stack interp failed: {:?}", e))?;
     let mut vi = [0u64; 16];
     for i in 0..16 {
-        vi[i] = u64::from_le_bytes(st[interp::STATE_VREGS + i * 8..interp::STATE_VREGS + i * 8 + 8].try_into().unwrap());
+        vi[i] = u64::from_le_bytes(
+            st[interp::STATE_VREGS + i * 8..interp::STATE_VREGS + i * 8 + 8]
+                .try_into()
+                .unwrap(),
+        );
     }
 
     // Native
@@ -113,7 +120,11 @@ pub(crate) fn run_m3_stack_test() -> Result<()> {
     let b = arena.bytes();
     let mut vn = [0u64; 16];
     for i in 0..16 {
-        vn[i] = u64::from_le_bytes(b[0x6000 + interp::STATE_VREGS + i * 8..0x6000 + interp::STATE_VREGS + i * 8 + 8].try_into().unwrap());
+        vn[i] = u64::from_le_bytes(
+            b[0x6000 + interp::STATE_VREGS + i * 8..0x6000 + interp::STATE_VREGS + i * 8 + 8]
+                .try_into()
+                .unwrap(),
+        );
     }
     // Compare data vregs. Skip index 3 (return address — bytecode index in interp,
     // VA in native) and index 4 (RSP stack pointer — mem-offset in interp, absolute
@@ -122,7 +133,11 @@ pub(crate) fn run_m3_stack_test() -> Result<()> {
         if i == 3 || i == 4 {
             continue;
         }
-        assert_eq!(vi[i], vn[i], "M3 stack/call/ret: interp vs native vreg {} mismatch (interp=0x{:X} native=0x{:X})", i, vi[i], vn[i]);
+        assert_eq!(
+            vi[i], vn[i],
+            "M3 stack/call/ret: interp vs native vreg {} mismatch (interp=0x{:X} native=0x{:X})",
+            i, vi[i], vn[i]
+        );
     }
     // Expected: a+b=12 in v2 and v6
     assert_eq!(vi[2], 12, "M3 subroutine result v2 wrong");

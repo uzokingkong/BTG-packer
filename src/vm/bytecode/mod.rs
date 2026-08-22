@@ -31,9 +31,9 @@
 // `mod.rs` is a re-export layer; external callers use `bytecode::*` unchanged.
 // ==============================================================================
 
-pub mod registry;
 pub mod builder;
 pub mod disasm;
+pub mod registry;
 #[cfg(test)]
 mod tests;
 

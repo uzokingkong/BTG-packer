@@ -18,7 +18,6 @@ pub(crate) struct StringRun {
     pub(crate) va: u64,
 }
 
-
 fn is_printable_ascii(b: u8) -> bool {
     (0x20..=0x7E).contains(&b) || b == b'\t'
 }
@@ -67,7 +66,16 @@ pub(crate) fn scan_string_runs(
                 let ws = (wide_start + 3) & !3;
                 let we = w & !3;
                 if we > ws && (we - ws) >= 8 {
-                    push_run(&mut runs, &mut total, sec_idx, ws, we - ws, image_base, sec, protected);
+                    push_run(
+                        &mut runs,
+                        &mut total,
+                        sec_idx,
+                        ws,
+                        we - ws,
+                        image_base,
+                        sec,
+                        protected,
+                    );
                     i = w;
                     continue;
                 }
@@ -86,7 +94,16 @@ pub(crate) fn scan_string_runs(
             let ast = (ascii_start + 3) & !3;
             let ae = i & !3;
             if nul_terminated && ascii_len >= 8 && ae > ast && (ae - ast) >= 8 {
-                push_run(&mut runs, &mut total, sec_idx, ast, ae - ast, image_base, sec, protected);
+                push_run(
+                    &mut runs,
+                    &mut total,
+                    sec_idx,
+                    ast,
+                    ae - ast,
+                    image_base,
+                    sec,
+                    protected,
+                );
             }
             if i == ascii_start {
                 // 비-프린터블 바이트: wide도 ASCII도 아니면 1바이트 건너뜀 (무한 루프 방지)
@@ -94,7 +111,10 @@ pub(crate) fn scan_string_runs(
             }
         }
         if total >= MAX_STRING_TOTAL {
-            println!("[!] v3 Crypto: string run total reached cap ({} bytes).", MAX_STRING_TOTAL);
+            println!(
+                "[!] v3 Crypto: string run total reached cap ({} bytes).",
+                MAX_STRING_TOTAL
+            );
             break;
         }
     }
@@ -185,29 +205,46 @@ pub(crate) fn gather_runs(
             println!("[+] --vm-oep: skipping full .rdata/.rodata boot-decrypt runs (lifted program reads data pointers as plaintext)");
         } else {
             for data_name in [".rdata", ".rodata"] {
-            let Some(ti) = ctx.patched_sections.iter().position(|s| s.name == data_name) else {
-                continue;
-            };
-            let tsec = &ctx.patched_sections[ti];
-            if tsec.bytes.is_empty() {
-                continue;
-            }
-            let sec_start = tsec.virtual_address;
-            let sec_end = sec_start + tsec.bytes.len() as u32;
-            // protected 범위와 교차하는 것만 [sec_start, sec_end)로 클리핑 후 정렬/병합
-            let mut pv: Vec<(u32, u32)> = protected
-                .iter()
-                .filter(|&&(st, en)| en > sec_start && st < sec_end)
-                .map(|&(st, en)| (st.max(sec_start), en.min(sec_end)))
-                .collect();
-            pv.sort_unstable();
-            pv.dedup();
-            let mut pos = sec_start;
-            let mut n_runs = 0usize;
-            for (ps, pe) in pv {
-                if ps > pos {
+                let Some(ti) = ctx
+                    .patched_sections
+                    .iter()
+                    .position(|s| s.name == data_name)
+                else {
+                    continue;
+                };
+                let tsec = &ctx.patched_sections[ti];
+                if tsec.bytes.is_empty() {
+                    continue;
+                }
+                let sec_start = tsec.virtual_address;
+                let sec_end = sec_start + tsec.bytes.len() as u32;
+                // protected 범위와 교차하는 것만 [sec_start, sec_end)로 클리핑 후 정렬/병합
+                let mut pv: Vec<(u32, u32)> = protected
+                    .iter()
+                    .filter(|&&(st, en)| en > sec_start && st < sec_end)
+                    .map(|&(st, en)| (st.max(sec_start), en.min(sec_end)))
+                    .collect();
+                pv.sort_unstable();
+                pv.dedup();
+                let mut pos = sec_start;
+                let mut n_runs = 0usize;
+                for (ps, pe) in pv {
+                    if ps > pos {
+                        let off = (pos - sec_start) as usize;
+                        let len = (ps - pos) as usize;
+                        runs.push(StringRun {
+                            sec_idx: ti,
+                            offset: off,
+                            len,
+                            va: image_base + pos as u64,
+                        });
+                        n_runs += 1;
+                    }
+                    pos = pos.max(pe);
+                }
+                if pos < sec_end {
                     let off = (pos - sec_start) as usize;
-                    let len = (ps - pos) as usize;
+                    let len = (sec_end - pos) as usize;
                     runs.push(StringRun {
                         sec_idx: ti,
                         offset: off,
@@ -216,28 +253,15 @@ pub(crate) fn gather_runs(
                     });
                     n_runs += 1;
                 }
-                pos = pos.max(pe);
-            }
-            if pos < sec_end {
-                let off = (pos - sec_start) as usize;
-                let len = (sec_end - pos) as usize;
-                runs.push(StringRun {
-                    sec_idx: ti,
-                    offset: off,
-                    len,
-                    va: image_base + pos as u64,
-                });
-                n_runs += 1;
-            }
-            if n_runs > 0 {
-                println!(
+                if n_runs > 0 {
+                    println!(
                     "[+] v14: {} {} bytes registered as {} boot-decrypt run(s) (loader-critical dirs excluded)",
                     data_name,
                     tsec.bytes.len(),
                     n_runs
                 );
+                }
             }
-        }
         }
     }
 

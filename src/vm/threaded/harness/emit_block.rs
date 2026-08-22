@@ -2,7 +2,8 @@
 // BTG - Direct-Threaded Native Harness: per-opcode block emitter - split from harness.rs
 // ==============================================================================
 
-use super::layout::{FLAG_MASK, FLAGS_OFF, REGS_OFF, TEMPS_OFF, VSP_OFF};
+use super::cond_helpers::{cond_to_cmov_code, cond_to_setcc_code};
+use super::layout::{FLAGS_OFF, FLAG_MASK, REGS_OFF, TEMPS_OFF, VSP_OFF};
 use super::NativeVmHarness;
 use crate::vm::risc::{BranchCondition, MicroInstr, MicroOperand, RiscOp};
 use anyhow::{anyhow, Result};
@@ -35,25 +36,54 @@ impl NativeVmHarness {
             )
         };
 
-        let load = |instrs: &mut Vec<Instruction>, op: Option<MicroOperand>, reg: Register| -> Result<()> {
+        let load = |instrs: &mut Vec<Instruction>,
+                    op: Option<MicroOperand>,
+                    reg: Register|
+         -> Result<()> {
             match op {
                 Some(MicroOperand::VReg(i)) => {
-                    instrs.push(Instruction::with2(Code::Mov_r64_rm64, reg, mem((REGS_OFF + i as usize * 8) as i64)).map_err(|e| anyhow!("{e}"))?);
+                    instrs.push(
+                        Instruction::with2(
+                            Code::Mov_r64_rm64,
+                            reg,
+                            mem((REGS_OFF + i as usize * 8) as i64),
+                        )
+                        .map_err(|e| anyhow!("{e}"))?,
+                    );
                 }
                 Some(MicroOperand::Temp(t)) => {
-                    instrs.push(Instruction::with2(Code::Mov_r64_rm64, reg, mem((TEMPS_OFF + t as usize * 8) as i64)).map_err(|e| anyhow!("{e}"))?);
+                    instrs.push(
+                        Instruction::with2(
+                            Code::Mov_r64_rm64,
+                            reg,
+                            mem((TEMPS_OFF + t as usize * 8) as i64),
+                        )
+                        .map_err(|e| anyhow!("{e}"))?,
+                    );
                 }
                 Some(MicroOperand::Imm64(v)) => {
-                    instrs.push(Instruction::with2(Code::Mov_r64_imm64, reg, v).map_err(|e| anyhow!("{e}"))?);
+                    instrs.push(
+                        Instruction::with2(Code::Mov_r64_imm64, reg, v)
+                            .map_err(|e| anyhow!("{e}"))?,
+                    );
                 }
                 Some(MicroOperand::Vsp) => {
-                    instrs.push(Instruction::with2(Code::Mov_r64_rm64, reg, mem(VSP_OFF as i64)).map_err(|e| anyhow!("{e}"))?);
+                    instrs.push(
+                        Instruction::with2(Code::Mov_r64_rm64, reg, mem(VSP_OFF as i64))
+                            .map_err(|e| anyhow!("{e}"))?,
+                    );
                 }
                 Some(MicroOperand::Vflags) => {
-                    instrs.push(Instruction::with2(Code::Mov_r64_rm64, reg, mem(FLAGS_OFF as i64)).map_err(|e| anyhow!("{e}"))?);
+                    instrs.push(
+                        Instruction::with2(Code::Mov_r64_rm64, reg, mem(FLAGS_OFF as i64))
+                            .map_err(|e| anyhow!("{e}"))?,
+                    );
                 }
                 _ => {
-                    instrs.push(Instruction::with2(Code::Xor_r64_rm64, reg, reg).map_err(|e| anyhow!("{e}"))?);
+                    instrs.push(
+                        Instruction::with2(Code::Xor_r64_rm64, reg, reg)
+                            .map_err(|e| anyhow!("{e}"))?,
+                    );
                 }
             }
             Ok(())
@@ -62,10 +92,24 @@ impl NativeVmHarness {
         let store = |instrs: &mut Vec<Instruction>, dst: Option<MicroOperand>| -> Result<()> {
             match dst {
                 Some(MicroOperand::VReg(i)) => {
-                    instrs.push(Instruction::with2(Code::Mov_rm64_r64, mem((REGS_OFF + i as usize * 8) as i64), Register::R10).map_err(|e| anyhow!("{e}"))?);
+                    instrs.push(
+                        Instruction::with2(
+                            Code::Mov_rm64_r64,
+                            mem((REGS_OFF + i as usize * 8) as i64),
+                            Register::R10,
+                        )
+                        .map_err(|e| anyhow!("{e}"))?,
+                    );
                 }
                 Some(MicroOperand::Temp(t)) => {
-                    instrs.push(Instruction::with2(Code::Mov_rm64_r64, mem((TEMPS_OFF + t as usize * 8) as i64), Register::R10).map_err(|e| anyhow!("{e}"))?);
+                    instrs.push(
+                        Instruction::with2(
+                            Code::Mov_rm64_r64,
+                            mem((TEMPS_OFF + t as usize * 8) as i64),
+                            Register::R10,
+                        )
+                        .map_err(|e| anyhow!("{e}"))?,
+                    );
                 }
                 _ => {}
             }
@@ -75,54 +119,125 @@ impl NativeVmHarness {
         // ?占쎈옒占??占쎈’???占쎌옱 x86 ?占쎈옒洹몄쓽 CF|ZF|SF|OF 占?蹂묓빀 (PF/AF??蹂댁〈).
         let store_flags = |instrs: &mut Vec<Instruction>| -> Result<()> {
             instrs.push(Instruction::with(Code::Pushfq));
-            instrs.push(Instruction::with1(Code::Pop_r64, Register::RAX).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, FLAG_MASK as u32).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, mem(FLAGS_OFF as i64)).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!FLAG_MASK) as i32).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::Mov_rm64_r64, mem(FLAGS_OFF as i64), Register::RAX).map_err(|e| anyhow!("{e}"))?);
+            instrs.push(
+                Instruction::with1(Code::Pop_r64, Register::RAX).map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::And_rm64_imm32, Register::RAX, FLAG_MASK as u32)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::Mov_r64_rm64, Register::RCX, mem(FLAGS_OFF as i64))
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!FLAG_MASK) as i32)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::Mov_rm64_r64, mem(FLAGS_OFF as i64), Register::RAX)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
             Ok(())
         };
 
         // CF|OF 占??占쎈’??蹂묓빀 (MUL/IMUL ??ZF/SF/PF 蹂댁〈).
         let store_cf_of = |instrs: &mut Vec<Instruction>| -> Result<()> {
             instrs.push(Instruction::with(Code::Pushfq));
-            instrs.push(Instruction::with1(Code::Pop_r64, Register::RAX).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x801).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, mem(FLAGS_OFF as i64)).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x801i32)).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::Mov_rm64_r64, mem(FLAGS_OFF as i64), Register::RAX).map_err(|e| anyhow!("{e}"))?);
+            instrs.push(
+                Instruction::with1(Code::Pop_r64, Register::RAX).map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x801)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::Mov_r64_rm64, Register::RCX, mem(FLAGS_OFF as i64))
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x801i32))
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::Mov_rm64_r64, mem(FLAGS_OFF as i64), Register::RAX)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
             Ok(())
         };
 
         // ZF 占??占쎈’??蹂묓빀 (BSF/BSR).
         let store_zf = |instrs: &mut Vec<Instruction>| -> Result<()> {
             instrs.push(Instruction::with(Code::Pushfq));
-            instrs.push(Instruction::with1(Code::Pop_r64, Register::RAX).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x40).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, mem(FLAGS_OFF as i64)).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x40i32)).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::Mov_rm64_r64, mem(FLAGS_OFF as i64), Register::RAX).map_err(|e| anyhow!("{e}"))?);
+            instrs.push(
+                Instruction::with1(Code::Pop_r64, Register::RAX).map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x40)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::Mov_r64_rm64, Register::RCX, mem(FLAGS_OFF as i64))
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x40i32))
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::Mov_rm64_r64, mem(FLAGS_OFF as i64), Register::RAX)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
             Ok(())
         };
 
         // CF|ZF 蹂묓빀 (TZCNT/LZCNT).
         let store_cf_zf = |instrs: &mut Vec<Instruction>| -> Result<()> {
             instrs.push(Instruction::with(Code::Pushfq));
-            instrs.push(Instruction::with1(Code::Pop_r64, Register::RAX).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x41).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, mem(FLAGS_OFF as i64)).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x41i32)).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).map_err(|e| anyhow!("{e}"))?);
-            instrs.push(Instruction::with2(Code::Mov_rm64_r64, mem(FLAGS_OFF as i64), Register::RAX).map_err(|e| anyhow!("{e}"))?);
+            instrs.push(
+                Instruction::with1(Code::Pop_r64, Register::RAX).map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x41)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::Mov_r64_rm64, Register::RCX, mem(FLAGS_OFF as i64))
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x41i32))
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            instrs.push(
+                Instruction::with2(Code::Mov_rm64_r64, mem(FLAGS_OFF as i64), Register::RAX)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
             Ok(())
         };
 
         // ?占쏀깭 ?占쎈’???占쎈옒洹몌옙? ?占쎌젣 x86 ?占쎈옒洹몃줈 蹂듭썝 (setcc/cmovcc/遺꾧린 ?占쎌슜).
         let load_flags_to_hw = |instrs: &mut Vec<Instruction>| -> Result<()> {
-            instrs.push(Instruction::with1(Code::Push_rm64, mem(FLAGS_OFF as i64)).map_err(|e| anyhow!("{e}"))?);
+            instrs.push(
+                Instruction::with1(Code::Push_rm64, mem(FLAGS_OFF as i64))
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
             instrs.push(Instruction::with(Code::Popfq));
             Ok(())
         };
@@ -130,7 +245,10 @@ impl NativeVmHarness {
         // 議곌굔 ?占쏙옙? ??R8L = 0/1. (CounterZero ??regs[1] 寃?? 占????占쎈뱶?占쎌뼱 setcc.)
         let eval_cond = |instrs: &mut Vec<Instruction>, cond: BranchCondition| -> Result<()> {
             if cond == BranchCondition::Always {
-                instrs.push(Instruction::with2(Code::Mov_r64_imm64, Register::R8, 1).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(
+                    Instruction::with2(Code::Mov_r64_imm64, Register::R8, 1)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
                 return Ok(());
             }
             load_flags_to_hw(instrs)?;
@@ -140,12 +258,29 @@ impl NativeVmHarness {
                     4 => 0xFFFF_FFFF,
                     _ => u64::MAX,
                 };
-                instrs.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, mem((REGS_OFF + 8) as i64)).map_err(|e| anyhow!("{e}"))?);
-                instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::R9, mask as i32).map_err(|e| anyhow!("{e}"))?);
-                instrs.push(Instruction::with2(Code::Test_rm64_r64, Register::R9, Register::R9).map_err(|e| anyhow!("{e}"))?);
-                instrs.push(Instruction::with1(Code::Sete_rm8, Register::R8L).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(
+                    Instruction::with2(
+                        Code::Mov_r64_rm64,
+                        Register::R9,
+                        mem((REGS_OFF + 8) as i64),
+                    )
+                    .map_err(|e| anyhow!("{e}"))?,
+                );
+                instrs.push(
+                    Instruction::with2(Code::And_rm64_imm32, Register::R9, mask as i32)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+                instrs.push(
+                    Instruction::with2(Code::Test_rm64_r64, Register::R9, Register::R9)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+                instrs.push(
+                    Instruction::with1(Code::Sete_rm8, Register::R8L)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
             } else {
-                let cc = cond_to_setcc_code(cond).ok_or_else(|| anyhow!("no setcc code for {cond:?}"))?;
+                let cc = cond_to_setcc_code(cond)
+                    .ok_or_else(|| anyhow!("no setcc code for {cond:?}"))?;
                 instrs.push(Instruction::with1(cc, Register::R8L).map_err(|e| anyhow!("{e}"))?);
             }
             Ok(())
@@ -289,6 +424,37 @@ impl NativeVmHarness {
                 store_flags(instrs)?;
                 store(instrs, ins.dst)?;
             }
+            RiscOp::Adc { width } | RiscOp::Sbb { width } => {
+                load(instrs, ins.src1, Register::R10)?;
+                load(instrs, ins.src2, Register::R11)?;
+                load(instrs, Some(MicroOperand::Vflags), Register::RAX)?;
+                instrs.push(Instruction::with2(Code::Bt_rm64_imm8, Register::RAX, 0u32).map_err(|e| anyhow!("{e}"))?);
+                let adc = matches!(ins.op, RiscOp::Adc { .. });
+                let code = match (adc, width) {
+                    (true, 1) => Code::Adc_rm8_r8,
+                    (true, 2) => Code::Adc_rm16_r16,
+                    (true, 4) => Code::Adc_rm32_r32,
+                    (true, _) => Code::Adc_rm64_r64,
+                    (false, 1) => Code::Sbb_rm8_r8,
+                    (false, 2) => Code::Sbb_rm16_r16,
+                    (false, 4) => Code::Sbb_rm32_r32,
+                    (false, _) => Code::Sbb_rm64_r64,
+                };
+                let (dst, src) = match width {
+                    1 => (Register::R10L, Register::R11L),
+                    2 => (Register::R10W, Register::R11W),
+                    4 => (Register::R10D, Register::R11D),
+                    _ => (Register::R10, Register::R11),
+                };
+                instrs.push(Instruction::with2(code, dst, src).map_err(|e| anyhow!("{e}"))?);
+                if width == 1 {
+                    instrs.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).map_err(|e| anyhow!("{e}"))?);
+                } else if width == 2 {
+                    instrs.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R10D, Register::R10W).map_err(|e| anyhow!("{e}"))?);
+                }
+                store_flags(instrs)?;
+                store(instrs, ins.dst)?;
+            }
             RiscOp::Inc { width } => {
                 load(instrs, ins.src1, Register::R10)?;
                 match width {
@@ -389,6 +555,27 @@ impl NativeVmHarness {
                 store_flags(instrs)?;
                 instrs.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R11D, Register::R11L).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with2(Code::Or_rm64_r64, mem(FLAGS_OFF as i64), Register::R11).map_err(|e| anyhow!("{e}"))?);
+                store(instrs, ins.dst)?;
+            }
+            RiscOp::RotateLeft { width } => {
+                load(instrs, ins.src1, Register::R10)?;
+                load(instrs, ins.src2, Register::RCX)?;
+                load(instrs, Some(MicroOperand::Vflags), Register::RAX)?;
+                instrs.push(Instruction::with1(Code::Push_r64, Register::RAX).map_err(|e| anyhow!("{e}"))?);
+                instrs.push(Instruction::with(Code::Popfq));
+                let (code, dst) = match width {
+                    1 => (Code::Rol_rm8_CL, Register::R10L),
+                    2 => (Code::Rol_rm16_CL, Register::R10W),
+                    4 => (Code::Rol_rm32_CL, Register::R10D),
+                    _ => (Code::Rol_rm64_CL, Register::R10),
+                };
+                instrs.push(Instruction::with2(code, dst, Register::CL).map_err(|e| anyhow!("{e}"))?);
+                store_flags(instrs)?;
+                if width == 1 {
+                    instrs.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).map_err(|e| anyhow!("{e}"))?);
+                } else if width == 2 {
+                    instrs.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R10D, Register::R10W).map_err(|e| anyhow!("{e}"))?);
+                }
                 store(instrs, ins.dst)?;
             }
             RiscOp::VirtualPush => {
@@ -740,6 +927,9 @@ RiscOp::NativeCallBridge => {
 RiscOp::Halt => {
                 // ret (caller?占占쎌꽌 泥섎━)
             }
+            RiscOp::Trap => {
+                instrs.push(Instruction::with(Code::Ud2));
+            }
             // P0-1: VirtualRet — 블록 단위 하네스에서는 최상위 복귀가 블록 종료와
             // 동일하므로 no-op (상용 self-decoding 디스패처가 pop→branch-map 복귀를
             // 정확히 처리). 참조 eval_state 는 빈 스택/미가상화 복귀에서 Halt 로 종료.
@@ -766,56 +956,17 @@ RiscOp::Halt => {
             | RiscOp::PackedAnd
             | RiscOp::PackedOr
             | RiscOp::PackedAndNot
-            | RiscOp::PackedCmpEq { .. } => {}
+            | RiscOp::PackedCmpEq { .. }
+            | RiscOp::PackedCmpGt { .. }
+            | RiscOp::PackedUnpack { .. }
+            | RiscOp::PackedShiftRightQ
+            | RiscOp::PackedShuffle { .. } => {}
+            RiscOp::DoubleShiftLeft { .. } => {}
+            RiscOp::BitTest { .. } => {}
+            RiscOp::PackedMovMaskBytes | RiscOp::PackedMovMaskPs | RiscOp::PackedInsertWord => {}
+            RiscOp::CpuId | RiscOp::XGetBv => {}
+            RiscOp::ReadSegmentBase { .. } => {}
         }
         Ok(())
-    }
-}
-
-/// BranchCondition ??SETcc rm8 肄붾뱶 (CounterZero ?占쎌쇅 ??蹂꾨룄 泥섎━).
-fn cond_to_setcc_code(cond: BranchCondition) -> Option<Code> {
-    match cond {
-        BranchCondition::Zero => Some(Code::Sete_rm8),
-        BranchCondition::NotZero => Some(Code::Setne_rm8),
-        BranchCondition::Carry | BranchCondition::Below => Some(Code::Setb_rm8),
-        BranchCondition::NotCarry | BranchCondition::AboveOrEqual => Some(Code::Setae_rm8),
-        BranchCondition::Sign => Some(Code::Sets_rm8),
-        BranchCondition::NotSign => Some(Code::Setns_rm8),
-        BranchCondition::Overflow => Some(Code::Seto_rm8),
-        BranchCondition::NotOverflow => Some(Code::Setno_rm8),
-        BranchCondition::Greater => Some(Code::Setg_rm8),
-        BranchCondition::Less => Some(Code::Setl_rm8),
-        BranchCondition::GreaterOrEqual => Some(Code::Setge_rm8),
-        BranchCondition::LessOrEqual => Some(Code::Setle_rm8),
-        BranchCondition::Above => Some(Code::Seta_rm8),
-        BranchCondition::BelowOrEqual => Some(Code::Setbe_rm8),
-        BranchCondition::Parity => Some(Code::Setp_rm8),
-        BranchCondition::NotParity => Some(Code::Setnp_rm8),
-        BranchCondition::CounterZero(_) => None,
-        BranchCondition::Always => Some(Code::Sete_rm8),
-    }
-}
-
-/// BranchCondition ??CMOVcc r64, r/m64 肄붾뱶 (CounterZero ?占쎌쇅).
-fn cond_to_cmov_code(cond: BranchCondition) -> Option<Code> {
-    match cond {
-        BranchCondition::Zero => Some(Code::Cmove_r64_rm64),
-        BranchCondition::NotZero => Some(Code::Cmovne_r64_rm64),
-        BranchCondition::Carry | BranchCondition::Below => Some(Code::Cmovb_r64_rm64),
-        BranchCondition::NotCarry | BranchCondition::AboveOrEqual => Some(Code::Cmovae_r64_rm64),
-        BranchCondition::Sign => Some(Code::Cmovs_r64_rm64),
-        BranchCondition::NotSign => Some(Code::Cmovns_r64_rm64),
-        BranchCondition::Overflow => Some(Code::Cmovo_r64_rm64),
-        BranchCondition::NotOverflow => Some(Code::Cmovno_r64_rm64),
-        BranchCondition::Greater => Some(Code::Cmovg_r64_rm64),
-        BranchCondition::Less => Some(Code::Cmovl_r64_rm64),
-        BranchCondition::GreaterOrEqual => Some(Code::Cmovge_r64_rm64),
-        BranchCondition::LessOrEqual => Some(Code::Cmovle_r64_rm64),
-        BranchCondition::Above => Some(Code::Cmova_r64_rm64),
-        BranchCondition::BelowOrEqual => Some(Code::Cmovbe_r64_rm64),
-        BranchCondition::Parity => Some(Code::Cmovp_r64_rm64),
-        BranchCondition::NotParity => Some(Code::Cmovnp_r64_rm64),
-        BranchCondition::CounterZero(_) => None,
-        BranchCondition::Always => Some(Code::Cmovne_r64_rm64),
     }
 }

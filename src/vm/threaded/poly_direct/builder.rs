@@ -1,116 +1,16 @@
-// ==============================================================================
-// BTG - Commercial-Grade VM: Native Self-Decoding Rolling-Key Dispatcher (T1-4)
-// ==============================================================================
-// `run_native_poly_direct` — the native runtime **itself** decodes the
-// rolling-key polymorphic bytecode stream while executing (no Rust pre-pass).
-//
-// vs. `run_native_poly` (Rust `PolymorphicDecoder` → specialized blocks), this
-// path places the **encrypted** stream in the arena and generates native code
-// that, at runtime:
-//   1. computes the rolling-key keystream byte for the current VIP,
-//   2. XORs it with the stream byte to recover the plaintext opcode/operand,
-//   3. advances the rolling-key state (`step`) exactly like the interpreter,
-//   4. dispatches on the decrypted opcode byte through a 256-entry table,
-//   5. decodes operands (register permutation + immediates) and executes.
-//
-// Differential test: native(self-decoding) == PolymorphicInterpreter ==
-// `RiscProgram::eval_state` across multiple seeds.
-// ==============================================================================
-
-use crate::vm::arena::Arena;
 use crate::vm::poly::{PolymorphicDecoder, PolymorphicEncoder, VirtualIsaSpec};
-use crate::vm::risc::{BranchCondition, MicroInstr, MicroOperand, RiscEvalState, RiscOp, RiscProgram};
+use crate::vm::risc::{BranchCondition, MicroInstr, MicroOperand, RiscOp, RiscProgram};
+use crate::vm::table_layout::TableLayout;
+use crate::vm::threaded::{AssignedSuperOp, SuperOpBuildMetadata, VmRuntimeLayout};
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
 use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, MemoryOperand, Register,
 };
+use std::collections::HashMap;
 
-mod codegen_util;
-
-pub(crate) use codegen_util::{
-    cond_code, emit_read_imm8, m, m8, mov_m, movi, movzx8_m, store_m, CodeBuilder,
-    ARENA_SIZE, C1, C2, C3, C4, C5, DEC_CIN, DEC_DST, DEC_IMM1, DEC_IMM2, DEC_SRC1, DEC_SRC2, DEC_COND,
-    FLAG_MASK, FLAGS_OFF, K_IMM, K_NONE, K_REG, OFF_BRANCH_MAP, OFF_BYTECODE, OFF_COND_CODES, OFF_CODE,
-    OFF_OP_FLAGS, OFF_OP_OFFS, OFF_STACK_BASE, OFF_STATE, OFF_TABLE, REGS_OFF, STATE_END,
-    TEMPS_OFF, VSP_OFF, XMM_OFF, XMM_SLOTS, FP_RET_OFF,
-    COND_ABOVE, COND_ABOVE_OR_EQUAL, COND_ALWAYS, COND_BELOW, COND_BELOW_OR_EQUAL, COND_CARRY,
-    COND_COUNTER_ZERO_2, COND_COUNTER_ZERO_4, COND_COUNTER_ZERO_8, COND_GREATER,
-    COND_GREATER_OR_EQUAL, COND_INVALID, COND_LESS, COND_LESS_OR_EQUAL, COND_NOT_CARRY,
-    COND_NOT_OVERFLOW, COND_NOT_PARITY, COND_NOT_SIGN, COND_NOT_ZERO, COND_OVERFLOW,
-    COND_PARITY, COND_SIGN, COND_ZERO,
-};
-#[cfg(test)]
-mod poly_direct_tests;
-
-/// P2 (G3): 폭별 ALU 네이티브 핸들러 종류 (Add/SubWithBorrow/Inc/Dec/Not).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WidthAluOp {
-    Add,
-    Sub,
-    Inc,
-    Dec,
-    Not,
-}
-
-/// R4: SSE/FPU 스칼라 unary 변환 핸들러 종류 (IntToFloat/FloatToInt/FloatToFloat).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FloatCvtMode {
-    IntToFloat,
-    FloatToInt,
-    FloatToFloat,
-}
-
-/// P3 (G1): assembled self-decoding dispatcher pieces (machine code + tables).
-pub struct SelfDecodingParts {
-    pub code: Vec<u8>,
-    /// 256 x u64 handler table (decrypted opcode byte -> handler VA).
-    pub table: Vec<u64>,
-    /// P6-1: handler 테이블 마스터 키 (시드 유래). P6-3 부터 단일 XOR 상수가 아니라
-    /// per-opcode 파생 키 `key(op) = (op*C1) ^ (op<<17) ^ master` 의 마스터로 쓰인다
-    /// (dispatch 가 opcode byte 로 파생 키를 다시 계산해 `table[op] ^ key(op)` 로
-    /// 복호화). 마스터 K 자체는 평문 상수로 코드에 없고 MBA(a,b)로 런타임 유도된다 —
-    /// 평문 테이블/덤프로부터 opcode↔handler 매핑 복원을 막는다.
-    pub table_key: u64,
-    /// P6-3: 테이블 무결성 셀프체크 값 (빌드 시 암호화된 256 항목 checksum). 엔트리
-    /// 스텁이 매 VM 진입마다 재계산해 비교하며, 변조/복원된 테이블은 ud2로 실패한다.
-    pub table_checksum: u64,
-    /// 256 x u8 operand-offset table (operand-encoding -> state offset).
-    pub offs_tab: Vec<u8>,
-    /// 256 x u8 operand-kind table (0=reg/temp/vsp/flags, 1=imm, 2=none).
-    pub flags_tab: Vec<u8>,
-    /// 256 x u8 cond-code table (decrypted cond byte -> canonical COND_* code, 0xFF invalid).
-    pub cond_codes: Vec<u8>,
-    /// Branch-resolution table (u32 count + count x (u64 target_value, u64 byte_offset)),
-    /// embedded at OFF_BRANCH_MAP / table_va+0xB00. The VirtualBranch handler scans it
-    /// to map a target (source-IP via ip_map, or direct micro-op index) to a bytecode
-    /// byte offset for the rolling-key re-sync.
-    pub branch_map: Vec<u8>,
-}
-
-/// P6-3: opcode byte 별 파생 테이블 키 — `key(op) = (op*C1) ^ (op<<17) ^ C4 ^ master`.
-/// dispatch loop 가 이 파생식을 재현해 `table[op] ^ key(op)` 로 handler VA 를
-/// 복호화한다. 단일 XOR 상수(master)로는 256개 항목을 일괄 복호화할 수 없다 —
-/// 항목마다 opcode byte 에 의존하는 서로 다른 키를 쓴다 (Themida식 테이블
-/// 재구성 방지). C4 상수를 섞어 opcode 0 의 키도 master 와 같아지지 않게 한다
-/// (master 단독 XOR 로 특정 항목이 복호화되는 것을 방지). master 는 MBA(a,b)로
-/// 런타임 유도되므로 평문 상수로 노출되지 않는다.
-fn per_op_key(master: u64, op: u8) -> u64 {
-    (op as u64).wrapping_mul(C1) ^ ((op as u64) << 17) ^ C4 ^ master
-}
-
-/// P6-3: 암호화된 256개 handler 테이블 항목의 무결성 checksum.
-/// 엔트리 스텁이 매 VM 진입마다 재계산해 빌드 시 값(`parts.table_checksum`)과
-/// 비교한다 — 테이블이 패치/복원되면 ud2로 즉시 실패 (anti-tamper / 복원 감지).
-fn table_checksum(table: &[u64]) -> u64 {
-    let mut h: u64 = 0x811C9DC5;
-    for &v in table {
-        h = h.wrapping_add(v).wrapping_mul(0x0100_0000_01B3);
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    }
-    h
-}
+use super::checksum::*;
+use super::codegen_util::*;
+use super::types::*;
 
 /// P3 (G1): build the self-decoding rolling-key dispatcher machine code and its
 /// handler/operand tables, parameterized by the VAs the caller will place them
@@ -133,7 +33,14 @@ pub fn build_self_decoding_parts(
     stack_base: u64,
 ) -> Result<SelfDecodingParts> {
     build_self_decoding_parts_with(
-        bytecode, seed, code_base, table_base, bytecode_base, state_base, stack_base, None,
+        bytecode,
+        seed,
+        code_base,
+        table_base,
+        bytecode_base,
+        state_base,
+        stack_base,
+        None,
     )
 }
 
@@ -149,6 +56,131 @@ pub fn build_self_decoding_parts_with(
     stack_base: u64,
     ip_map: Option<&HashMap<u64, usize>>,
 ) -> Result<SelfDecodingParts> {
+    build_self_decoding_parts_with_layout(
+        bytecode,
+        seed,
+        code_base,
+        table_base,
+        bytecode_base,
+        state_base,
+        stack_base,
+        ip_map,
+        TableLayout::legacy(),
+    )
+}
+
+/// Commercial production builder with a per-build metadata ABI.  The native
+/// dispatcher receives the offsets as code-generation inputs, so the handler,
+/// operand, condition, and branch tables no longer have fixed relative
+/// positions in a packed PE.
+pub fn build_self_decoding_parts_with_layout(
+    bytecode: &[u8],
+    seed: u64,
+    code_base: u64,
+    table_base: u64,
+    bytecode_base: u64,
+    state_base: u64,
+    stack_base: u64,
+    ip_map: Option<&HashMap<u64, usize>>,
+    layout: TableLayout,
+) -> Result<SelfDecodingParts> {
+    build_self_decoding_parts_with_layouts(
+        bytecode,
+        seed,
+        code_base,
+        table_base,
+        bytecode_base,
+        state_base,
+        stack_base,
+        ip_map,
+        layout,
+        VmRuntimeLayout::legacy(),
+    )
+}
+
+/// Fully parameterized production builder. Metadata and state ABIs are passed
+/// together so every generated consumer uses one immutable build contract.
+pub fn build_self_decoding_parts_with_layouts(
+    bytecode: &[u8],
+    seed: u64,
+    code_base: u64,
+    table_base: u64,
+    bytecode_base: u64,
+    state_base: u64,
+    stack_base: u64,
+    ip_map: Option<&HashMap<u64, usize>>,
+    layout: TableLayout,
+    runtime_layout: VmRuntimeLayout,
+) -> Result<SelfDecodingParts> {
+    build_self_decoding_parts_with_superops(
+        bytecode,
+        seed,
+        code_base,
+        table_base,
+        bytecode_base,
+        state_base,
+        stack_base,
+        ip_map,
+        layout,
+        runtime_layout,
+        &[],
+        None,
+    )
+}
+
+/// Production builder with build-local super-op extension handlers. Existing
+/// callers retain the canonical ISA through `build_self_decoding_parts_with_layouts`.
+pub fn build_self_decoding_parts_with_superops(
+    bytecode: &[u8],
+    seed: u64,
+    code_base: u64,
+    table_base: u64,
+    bytecode_base: u64,
+    state_base: u64,
+    stack_base: u64,
+    ip_map: Option<&HashMap<u64, usize>>,
+    layout: TableLayout,
+    runtime_layout: VmRuntimeLayout,
+    superops: &[AssignedSuperOp],
+    superop_metadata: Option<&SuperOpBuildMetadata>,
+) -> Result<SelfDecodingParts> {
+    build_self_decoding_parts_with_superops_and_chunks(
+        bytecode,
+        seed,
+        code_base,
+        table_base,
+        bytecode_base,
+        state_base,
+        stack_base,
+        ip_map,
+        layout,
+        runtime_layout,
+        superops,
+        superop_metadata,
+        &[],
+    )
+}
+
+pub fn build_self_decoding_parts_with_superops_and_chunks(
+    bytecode: &[u8],
+    seed: u64,
+    code_base: u64,
+    table_base: u64,
+    bytecode_base: u64,
+    state_base: u64,
+    stack_base: u64,
+    ip_map: Option<&HashMap<u64, usize>>,
+    layout: TableLayout,
+    runtime_layout: VmRuntimeLayout,
+    superops: &[AssignedSuperOp],
+    superop_metadata: Option<&SuperOpBuildMetadata>,
+    chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
+) -> Result<SelfDecodingParts> {
+    // P1 migration: every state access now passes through the runtime-layout
+    // translator. Keep the legacy contract until the embed/bridge initializers
+    // consume the same layout value, then production can switch to `from_seed`.
+    runtime_layout.validate()?;
+    let _runtime_layout_guard = install_runtime_layout(&runtime_layout);
     let spec = VirtualIsaSpec::from_seed(seed);
     let init_key = seed.wrapping_mul(C1) ^ 0x517CC1B727220A95;
     // P6-1: handler 테이블 마스터 키 — dispatch loop 코드와 테이블 build 시 동일
@@ -174,14 +206,17 @@ pub fn build_self_decoding_parts_with(
         let (off, flag) = match kind {
             0x80 => {
                 let idx = spec.decode_reg(payload) as usize;
-                (REGS_OFF as u8 + (idx as u8) * 8, K_REG)
+                (state_disp(REGS_OFF + (idx as i32) * 8) as u8, K_REG)
             }
-            0xC0 => (TEMPS_OFF as u8 + (payload & 7) * 8, K_REG),
+            0xC0 => (
+                state_disp(TEMPS_OFF + ((payload & 7) as i32) * 8) as u8,
+                K_REG,
+            ),
             0x40 => {
                 if payload == 0x01 {
-                    (FLAGS_OFF as u8, K_REG)
+                    (state_disp(FLAGS_OFF) as u8, K_REG)
                 } else {
-                    (VSP_OFF as u8, K_REG)
+                    (state_disp(VSP_OFF) as u8, K_REG)
                 }
             }
             _ => {
@@ -218,18 +253,33 @@ pub fn build_self_decoding_parts_with(
     // ip_map is optional; when absent, absolute-index VirtualBranch targets fall
     // back to direct micro-op index resolution (matching `resolve_target`).
     let ip_map: Option<&HashMap<u64, usize>> = ip_map;
-    let mut dec = PolymorphicDecoder::new(seed);
-    let prog = dec.decode_full(bytecode, false)?;
-    let mut reenc = PolymorphicEncoder::new(seed);
-    let (re_bc, op_offsets) = reenc.encode_with_offsets(&prog)?;
-    if re_bc != bytecode {
-        return Err(anyhow!(
-            "self-decoding branch-map: decode+re-encode diverged from the placed bytecode ({} vs {} bytes); \
-             branch-map offsets would be invalid",
-            re_bc.len(),
-            bytecode.len()
-        ));
-    }
+    let (prog, op_offsets) = if let Some(metadata) = superop_metadata {
+        if metadata.source_program.instrs.len() != metadata.original_byte_offsets.len() {
+            return Err(anyhow!(
+                "P5 super-op metadata length mismatch: program={} offsets={}",
+                metadata.source_program.instrs.len(),
+                metadata.original_byte_offsets.len()
+            ));
+        }
+        (
+            metadata.source_program.clone(),
+            metadata.original_byte_offsets.clone(),
+        )
+    } else {
+        let mut dec = PolymorphicDecoder::new(seed);
+        let prog = dec.decode_full(bytecode, false)?;
+        let mut reenc = PolymorphicEncoder::new(seed);
+        let (re_bc, op_offsets) = reenc.encode_with_offsets(&prog)?;
+        if re_bc != bytecode {
+            return Err(anyhow!(
+                "self-decoding branch-map: decode+re-encode diverged from the placed bytecode ({} vs {} bytes); \
+                 branch-map offsets would be invalid",
+                re_bc.len(),
+                bytecode.len()
+            ));
+        }
+        (prog, op_offsets)
+    };
     for (i, &off) in op_offsets.iter().enumerate() {
         if off >= bytecode.len() {
             return Err(anyhow!(
@@ -238,17 +288,18 @@ pub fn build_self_decoding_parts_with(
             ));
         }
     }
-    let resolve_off = |tgt: u64, op_offsets: &[usize], ip_map: &Option<&HashMap<u64, usize>>| -> Option<u64> {
-        if let Some(im) = ip_map {
-            if let Some(&idx) = im.get(&tgt) {
-                return op_offsets.get(idx).copied().map(|o| o as u64);
+    let resolve_off =
+        |tgt: u64, op_offsets: &[usize], ip_map: &Option<&HashMap<u64, usize>>| -> Option<u64> {
+            if let Some(im) = ip_map {
+                if let Some(&idx) = im.get(&tgt) {
+                    return op_offsets.get(idx).copied().map(|o| o as u64);
+                }
             }
-        }
-        if (tgt as usize) < op_offsets.len() {
-            return Some(op_offsets[tgt as usize] as u64);
-        }
-        None
-    };
+            if (tgt as usize) < op_offsets.len() {
+                return Some(op_offsets[tgt as usize] as u64);
+            }
+            None
+        };
     let mut entries: Vec<(u64, u64)> = Vec::new();
     for ins in &prog.instrs {
         if let RiscOp::VirtualBranch { .. } = ins.op {
@@ -268,20 +319,41 @@ pub fn build_self_decoding_parts_with(
     }
     entries.sort_unstable_by_key(|e| e.0);
     entries.dedup_by_key(|e| e.0);
+    // P6: branch metadata is encoded independently from the handler table.
+    // The two domains use distinct seed-derived keys so target values and byte
+    // offsets cannot be correlated directly in the embedded metadata blob.
+    let branch_target_key = seed.rotate_left(21) ^ 0xC6BC_2796_92B5_C323;
+    let branch_offset_key = seed.rotate_right(17) ^ 0xD6E8_FEB8_6659_FD93;
     let mut branch_map = Vec::new();
     branch_map.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for (k, off) in entries {
-        branch_map.extend_from_slice(&k.to_le_bytes());
-        branch_map.extend_from_slice(&off.to_le_bytes());
+        branch_map.extend_from_slice(&(k ^ branch_target_key).to_le_bytes());
+        branch_map.extend_from_slice(&(off ^ branch_offset_key).to_le_bytes());
     }
 
     let mut b = CodeBuilder::new();
 
-    // Entry is emitted later in this function; place a jump at the very start
-    // (arena.call(OFF_CODE) targets index 0) that transfers control to it.
+    // The Win64 unwindable entry prologue must begin at module RVA 0.  Keeping
+    // these pushes behind the old leading JMP made vm_entry_unwind_ops see a
+    // leaf function, so an exception in any dispatcher/helper frame caused
+    // RtlVirtualUnwind to skip 64 bytes of saved nonvolatiles.
+    for r in [
+        Register::R12,
+        Register::R13,
+        Register::R14,
+        Register::R15,
+        Register::RDI,
+        Register::RSI,
+        Register::RBX,
+        Register::RBP,
+    ] {
+        b.push(Instruction::with1(Code::Push_r64, r).unwrap());
+    }
+    // The entry body is emitted later; transfer to it after the contiguous
+    // prologue. Helpers located between this jump and the body execute with the
+    // same entry frame active and are therefore covered by one RUNTIME_FUNCTION.
     let start_jmp = b.len();
     b.br(Code::Jmp_rel32_64, 0); // placeholder target, patched below to `entry`
-
 
     // decrypt_byte subroutine
     // in:  R8=bytecode_base, R12=vip, R14=current_key
@@ -324,11 +396,114 @@ pub fn build_self_decoding_parts_with(
         b.push(Instruction::with2(Code::Xor_rm32_r32, Register::ECX, Register::R9D).unwrap());
         b.push(Instruction::with2(Code::Xor_rm32_r32, Register::ECX, Register::R10D).unwrap());
         b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::CL).unwrap()); // al = ks
-        // enc = [R8 + R12]; orig = enc ^ ks
-        let enc_mem = MemoryOperand::with_base_index_scale_displ_size(Register::R8, Register::R12, 1, 0, 1);
+                                                                                               // enc = [R8 + R12]; orig = enc ^ ks
+        let enc_mem =
+            MemoryOperand::with_base_index_scale_displ_size(Register::R8, Register::R12, 1, 0, 1);
         b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, enc_mem).unwrap());
+        if !chunks.is_empty() {
+            // P1-4 outer chunk cipher: preserve the polymorphic keystream and
+            // ciphertext while selecting the VIP's instruction-aligned chunk.
+            // Only the fetched byte is unmasked in a register; bytecode memory
+            // remains encrypted for the entire process lifetime.
+            b.push(Instruction::with1(Code::Push_r64, Register::RAX).unwrap());
+            b.push(Instruction::with1(Code::Push_r64, Register::RCX).unwrap());
+            // Boundaries are emitted as independently masked descriptors.  In
+            // particular, do not emit `cmp vip, imm32`: that instruction form
+            // turned the helper into a plaintext chunk-map oracle.
+            let descriptor_domain = crate::vm::seed_lifecycle::derive_seed(
+                seed,
+                0x5032_2D39_2D44_4553, // "P2-9-DES"
+            );
+            for (index, chunk) in chunks.iter().enumerate() {
+                let end = chunk.offset.saturating_add(chunk.len);
+                let boundary_mask = crate::vm::seed_lifecycle::derive_seed(
+                    descriptor_domain,
+                    0x424F_554E_4441_5259u64 ^ index as u64,
+                );
+                movi(&mut b, Register::R11, (end as u64) ^ boundary_mask);
+                movi(&mut b, Register::R10, boundary_mask);
+                b.push(
+                    Instruction::with2(Code::Xor_rm64_r64, Register::R11, Register::R10).unwrap(),
+                );
+                b.push(
+                    Instruction::with2(Code::Cmp_r64_rm64, Register::R12, Register::R11).unwrap(),
+                );
+                b.br(Code::Jb_rel32_64, 0xD000_0000usize + index);
+            }
+            b.push(Instruction::with(Code::Ud2));
+            let chunk_module_key = crate::vm::chunk_crypto::module_key(seed);
+            for (index, chunk) in chunks.iter().enumerate() {
+                let label = b.len();
+                let offset_mask = crate::vm::seed_lifecycle::derive_seed(
+                    descriptor_domain,
+                    0x4F46_4653_4554_2D31u64 ^ index as u64,
+                );
+                movi(&mut b, Register::R10, index as u64);
+                movi(&mut b, Register::R11, (chunk.offset as u64) ^ offset_mask);
+                movi(&mut b, Register::R9, offset_mask);
+                b.push(
+                    Instruction::with2(Code::Xor_rm64_r64, Register::R11, Register::R9).unwrap(),
+                );
+                b.br(Code::Jmp_rel32_64, 0xE100_0000);
+                for &mut (_, ref mut target) in b.branches.iter_mut() {
+                    if *target == 0xD000_0000usize + index {
+                        *target = label;
+                    }
+                }
+            }
+            let derive = b.len();
+            for &mut (_, ref mut target) in b.branches.iter_mut() {
+                if *target == 0xE100_0000 {
+                    *target = derive;
+                }
+            }
+            // Derive the operational key once, out of line from descriptor
+            // selection. R10 enters as chunk index; R11 is the decoded start.
+            movi(&mut b, Register::R9, 0x4348_554E_4B2D_4B31);
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R9, Register::R10).unwrap());
+            b.push(Instruction::with2(Code::Rol_rm64_imm8, Register::R9, 17).unwrap());
+            movi(&mut b, Register::R10, chunk_module_key);
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R10, Register::R9).unwrap());
+            movi(&mut b, Register::R9, 0x517C_C1B7_2722_0A95);
+            b.push(Instruction::with2(Code::Imul_r64_rm64, Register::R10, Register::R9).unwrap());
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::R10).unwrap());
+            b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::R9, 31).unwrap());
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R10, Register::R9).unwrap());
+            movi(&mut b, Register::R9, 0x4A55_816D_97C6_D67B);
+            b.push(Instruction::with2(Code::Imul_r64_rm64, Register::R10, Register::R9).unwrap());
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::R10).unwrap());
+            b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::R9, 27).unwrap());
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R10, Register::R9).unwrap());
+            // local_offset = vip - decoded chunk start, without changing VIP.
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::R12).unwrap());
+            b.push(Instruction::with2(Code::Sub_rm64_r64, Register::R9, Register::R11).unwrap());
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::R9).unwrap());
+            // mask = high8(mix(key ^ local_offset*C)). Keep this sequence in
+            // sync with vm::chunk_crypto::byte_mask.
+            movi(&mut b, Register::R9, 0x9E37_79B1_85EB_CA87);
+            b.push(Instruction::with2(Code::Imul_r64_rm64, Register::R11, Register::R9).unwrap());
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R10, Register::R11).unwrap());
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::R10).unwrap());
+            b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::R11, 33).unwrap());
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R10, Register::R11).unwrap());
+            movi(&mut b, Register::R9, 0xFF51_AFD7_ED55_8CCD);
+            b.push(Instruction::with2(Code::Imul_r64_rm64, Register::R10, Register::R9).unwrap());
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::R10).unwrap());
+            b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::R11, 29).unwrap());
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R10, Register::R11).unwrap());
+            b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::R10, 56).unwrap());
+            b.push(Instruction::with1(Code::Pop_r64, Register::RCX).unwrap());
+            b.push(Instruction::with2(Code::Xor_rm32_r32, Register::ECX, Register::R10D).unwrap());
+            // Operational chunk key/mix state is dead after the fetched byte
+            // has been unmasked. Clear all three scratch registers before the
+            // polymorphic decoder continues.
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R9, Register::R9).unwrap());
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R10, Register::R10).unwrap());
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R11, Register::R11).unwrap());
+            b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
+        }
         b.push(Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::ECX).unwrap()); // al = orig
-        // save orig in R11D (low byte)
+                                                                                               // save orig in R11D (low byte)
         b.push(Instruction::with2(Code::Mov_r32_rm32, Register::R11D, Register::EAX).unwrap());
         // step(orig, vip): update R14
         // mixed = (k ^ orig*C2 ^ vip*C3) * C1 ; rol 17 ; + C4
@@ -346,7 +521,7 @@ pub fn build_self_decoding_parts_with(
         b.push(Instruction::with2(Code::Rol_rm64_imm8, Register::R9, 17).unwrap());
         movi(&mut b, Register::RCX, C4);
         b.push(Instruction::with2(Code::Add_rm64_r64, Register::R9, Register::RCX).unwrap()); // mixed
-        // rot = ((vip as u32) ^ (k>>32 as u32)) & 63
+                                                                                              // rot = ((vip as u32) ^ (k>>32 as u32)) & 63
         b.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R12D).unwrap());
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R14).unwrap());
         b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RAX, 32).unwrap());
@@ -372,17 +547,23 @@ pub fn build_self_decoding_parts_with(
     let sub_dec_ops = b.len();
     {
         b.call(sub_decrypt);
-        b.push(Instruction::with2(Code::Mov_rm8_r8, m8(DEC_DST), Register::AL).unwrap());
+        store_decoded_al(&mut b, DEC_DST, (seed >> 3) as u8);
         b.call(sub_decrypt);
-        b.push(Instruction::with2(Code::Mov_rm8_r8, m8(DEC_SRC1), Register::AL).unwrap());
+        store_decoded_al(&mut b, DEC_SRC1, (seed >> 19) as u8);
         b.call(sub_decrypt);
-        b.push(Instruction::with2(Code::Mov_rm8_r8, m8(DEC_SRC2), Register::AL).unwrap());
+        store_decoded_al(&mut b, DEC_SRC2, (seed >> 37) as u8);
         // imm1 if src1 == 0x01
         movzx8_m(&mut b, Register::EAX, DEC_SRC1);
         b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 0x01).unwrap());
         let after_imm1 = b.len() + 1;
         b.jne(after_imm1);
-        emit_read_imm8(&mut b, DEC_IMM1, sub_decrypt, spec.operand_mask);
+        emit_read_imm8(
+            &mut b,
+            DEC_IMM1,
+            sub_decrypt,
+            spec.operand_mask,
+            (seed >> 7) as u8,
+        );
         let t1 = b.len();
         for &mut (bi, ref mut ti) in b.branches.iter_mut() {
             if *ti == after_imm1 {
@@ -394,7 +575,13 @@ pub fn build_self_decoding_parts_with(
         b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 0x01).unwrap());
         let after_imm2 = b.len() + 1;
         b.jne(after_imm2);
-        emit_read_imm8(&mut b, DEC_IMM2, sub_decrypt, spec.operand_mask);
+        emit_read_imm8(
+            &mut b,
+            DEC_IMM2,
+            sub_decrypt,
+            spec.operand_mask,
+            (seed >> 29) as u8,
+        );
         let t2 = b.len();
         for &mut (bi, ref mut ti) in b.branches.iter_mut() {
             if *ti == after_imm2 {
@@ -416,10 +603,16 @@ pub fn build_self_decoding_parts_with(
     {
         b.call(sub_decrypt); // AL = decrypted cond byte (stream advanced)
         b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::AL).unwrap());
-        let cm = MemoryOperand::with_base_index_scale_displ_size(Register::R15, Register::RAX, 1, (OFF_COND_CODES - OFF_TABLE) as i64, 1);
+        let cm = MemoryOperand::with_base_index_scale_displ_size(
+            Register::R15,
+            Register::RAX,
+            1,
+            layout.cond_codes_off as i64,
+            1,
+        );
         b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, cm).unwrap());
-        b.push(Instruction::with2(Code::Mov_rm8_r8, m8(DEC_COND), Register::CL).unwrap());
         b.push(Instruction::with2(Code::Mov_r32_rm32, Register::EAX, Register::ECX).unwrap());
+        store_decoded_al(&mut b, DEC_COND, (seed >> 53) as u8);
         b.push(Instruction::with(Code::Retnq));
     }
 
@@ -451,8 +644,16 @@ pub fn build_self_decoding_parts_with(
                 // CounterZero(w): virtual RCX (regs[1]) low w bytes == 0. Load the
                 // full 64-bit regs[1] (qword memory operand) and isolate the low w
                 // bytes with shifts (avoids iced's 16-bit MemoryOperand quirks).
-                let width = if k == 19 { 2 } else if k == 20 { 4 } else { 8 };
-                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(REGS_OFF + 8)).unwrap());
+                let width = if k == 19 {
+                    2
+                } else if k == 20 {
+                    4
+                } else {
+                    8
+                };
+                b.push(
+                    Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(REGS_OFF + 8)).unwrap(),
+                );
                 if width == 2 {
                     b.push(Instruction::with2(Code::Shl_rm64_imm8, Register::RAX, 48).unwrap());
                     b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RAX, 48).unwrap());
@@ -460,14 +661,20 @@ pub fn build_self_decoding_parts_with(
                     b.push(Instruction::with2(Code::Shl_rm64_imm8, Register::RAX, 32).unwrap());
                     b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RAX, 32).unwrap());
                 }
-                b.push(Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap());
+                b.push(
+                    Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(),
+                );
                 b.push(Instruction::with1(Code::Sete_rm8, Register::AL).unwrap());
-                b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::AL).unwrap());
+                b.push(
+                    Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::AL).unwrap(),
+                );
             } else {
                 // flag-based: the FLAGS slot uses x86 RFLAGS bit layout (CF=1,ZF=0x40,
                 // SF=0x80,OF=0x800,PF=4), so load it into RFLAGS and use the setcc
                 // matching the x86 condition code semantics.
-                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(FLAGS_OFF)).unwrap());
+                b.push(
+                    Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(FLAGS_OFF)).unwrap(),
+                );
                 b.push(Instruction::with1(Code::Push_r64, Register::RAX).unwrap());
                 b.push(Instruction::with(Code::Popfq));
                 let setcc = match k {
@@ -491,7 +698,9 @@ pub fn build_self_decoding_parts_with(
                     _ => Code::Setnp_rm8,
                 };
                 b.push(Instruction::with1(setcc, Register::AL).unwrap());
-                b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::AL).unwrap());
+                b.push(
+                    Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::AL).unwrap(),
+                );
             }
             b.br(Code::Jmp_rel32_64, 0x9000);
         }
@@ -519,7 +728,7 @@ pub fn build_self_decoding_parts_with(
         b.br(Code::Je_rel32_64, 0x9100); // equal -> done
         b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::R12, Register::RBX).unwrap());
         b.br(Code::Ja_rel32_64, 0x9101); // R12 > RBX -> reverse
-        // forward: fall through to the loop
+                                         // forward: fall through to the loop
         let loop_top = b.len();
         {
             b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::R12, Register::RBX).unwrap());
@@ -547,7 +756,13 @@ pub fn build_self_decoding_parts_with(
     let sub_resolve = b.len();
     {
         b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::AL).unwrap());
-        let fm = MemoryOperand::with_base_index_scale_displ_size(Register::R15, Register::RAX, 1, (OFF_OP_FLAGS - OFF_TABLE) as i64, 1);
+        let fm = MemoryOperand::with_base_index_scale_displ_size(
+            Register::R15,
+            Register::RAX,
+            1,
+            layout.operand_flags_off as i64,
+            1,
+        );
         b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, fm).unwrap());
         b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::ECX, K_IMM as u32).unwrap());
         let l_imm = b.len() + 2;
@@ -555,9 +770,28 @@ pub fn build_self_decoding_parts_with(
         b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::ECX, K_NONE as u32).unwrap());
         let l_none = b.len() + 2;
         b.je(l_none);
-        let om = MemoryOperand::with_base_index_scale_displ_size(Register::R15, Register::RAX, 1, (OFF_OP_OFFS - OFF_TABLE) as i64, 1);
+        let om = MemoryOperand::with_base_index_scale_displ_size(
+            Register::R15,
+            Register::RAX,
+            1,
+            layout.operand_offs_off as i64,
+            1,
+        );
         b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, om).unwrap());
-        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, MemoryOperand::with_base_index_scale_displ_size(Register::RDX, Register::RCX, 1, 0, 8)).unwrap());
+        b.push(
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base_index_scale_displ_size(
+                    Register::RDX,
+                    Register::RCX,
+                    1,
+                    0,
+                    8,
+                ),
+            )
+            .unwrap(),
+        );
         b.push(Instruction::with(Code::Retnq));
         let l_done_imm = b.len();
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R11).unwrap());
@@ -579,14 +813,39 @@ pub fn build_self_decoding_parts_with(
     let sub_store = b.len();
     {
         movzx8_m(&mut b, Register::ECX, DEC_DST);
-        let fm = MemoryOperand::with_base_index_scale_displ_size(Register::R15, Register::RCX, 1, (OFF_OP_FLAGS - OFF_TABLE) as i64, 1);
+        let fm = MemoryOperand::with_base_index_scale_displ_size(
+            Register::R15,
+            Register::RCX,
+            1,
+            layout.operand_flags_off as i64,
+            1,
+        );
         b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R9D, fm).unwrap());
         b.push(Instruction::with2(Code::Test_rm64_r64, Register::R9, Register::R9).unwrap());
         let l_skip = b.len() + 1;
         b.jne(l_skip);
-        let om = MemoryOperand::with_base_index_scale_displ_size(Register::R15, Register::RCX, 1, (OFF_OP_OFFS - OFF_TABLE) as i64, 1);
+        let om = MemoryOperand::with_base_index_scale_displ_size(
+            Register::R15,
+            Register::RCX,
+            1,
+            layout.operand_offs_off as i64,
+            1,
+        );
         b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::ECX, om).unwrap());
-        b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_index_scale_displ_size(Register::RDX, Register::RCX, 1, 0, 8), Register::RAX).unwrap());
+        b.push(
+            Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_index_scale_displ_size(
+                    Register::RDX,
+                    Register::RCX,
+                    1,
+                    0,
+                    8,
+                ),
+                Register::RAX,
+            )
+            .unwrap(),
+        );
         let l_done = b.len();
         b.push(Instruction::with(Code::Retnq));
         for &mut (bi, ref mut ti) in b.branches.iter_mut() {
@@ -602,7 +861,9 @@ pub fn build_self_decoding_parts_with(
         b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
         b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, FLAG_MASK as u32).unwrap());
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(FLAGS_OFF)).unwrap());
-        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!FLAG_MASK) as i32).unwrap());
+        b.push(
+            Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!FLAG_MASK) as i32).unwrap(),
+        );
         b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap());
         store_m(b, FLAGS_OFF, Register::RAX);
     }
@@ -613,12 +874,17 @@ pub fn build_self_decoding_parts_with(
     fn emit_store_flags_incdec(b: &mut CodeBuilder) {
         b.push(Instruction::with(Code::Pushfq));
         b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
-        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, (FLAG_MASK & !1) as u32).unwrap()); // CF 제외
+        b.push(
+            Instruction::with2(Code::And_rm64_imm32, Register::RAX, (FLAG_MASK & !1) as u32)
+                .unwrap(),
+        ); // CF 제외
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(FLAGS_OFF)).unwrap());
         b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, 1).unwrap()); // 기존 CF
         b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap());
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(FLAGS_OFF)).unwrap());
-        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!FLAG_MASK) as i32).unwrap());
+        b.push(
+            Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!FLAG_MASK) as i32).unwrap(),
+        );
         b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap());
         store_m(b, FLAGS_OFF, Register::RAX);
     }
@@ -654,7 +920,9 @@ pub fn build_self_decoding_parts_with(
         b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xC4).unwrap()); // ZF|SF|PF
         b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::R9).unwrap()); // +CF
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(FLAGS_OFF)).unwrap());
-        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x8D5i64) as i32).unwrap());
+        b.push(
+            Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x8D5i64) as i32).unwrap(),
+        );
         b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap());
         store_m(b, FLAGS_OFF, Register::RAX);
     }
@@ -700,20 +968,8 @@ pub fn build_self_decoding_parts_with(
     // with the real table checksum after assembly (table VAs are only known then).
     let csum_placeholder_idx;
     {
-        b.push(Instruction::with1(Code::Push_r64, Register::R12).unwrap());
-        b.push(Instruction::with1(Code::Push_r64, Register::R13).unwrap());
-        b.push(Instruction::with1(Code::Push_r64, Register::R14).unwrap());
-        b.push(Instruction::with1(Code::Push_r64, Register::R15).unwrap());
-        // FIX(ABI): the dispatcher is invoked via an `extern "C"` call (arena.call
-        // / boot stub), which requires the callee to preserve ALL Win64
-        // callee-saved registers (RDI, RSI, RBX, RBP in addition to R12-R15).
-        // Handlers (CompareExchange uses RBX, others use RDI/RSI/RBX/RBP) clobber
-        // them; without saving here the Rust caller's state is corrupted after the
-        // call returns (AV in the differential tests). HALT pops them in reverse.
-        b.push(Instruction::with1(Code::Push_r64, Register::RDI).unwrap());
-        b.push(Instruction::with1(Code::Push_r64, Register::RSI).unwrap());
-        b.push(Instruction::with1(Code::Push_r64, Register::RBX).unwrap());
-        b.push(Instruction::with1(Code::Push_r64, Register::RBP).unwrap());
+        // The eight Win64 nonvolatile registers were saved by the RVA-0
+        // prologue above. HALT restores them in reverse order.
         movi(&mut b, Register::R8, bytecode_base);
         b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R12, Register::R12).unwrap());
         movi(&mut b, Register::R13, stack_base);
@@ -728,7 +984,20 @@ pub fn build_self_decoding_parts_with(
         movi(&mut b, Register::R10, 0x811C9DC5);
         let csum_loop = b.len();
         {
-            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, MemoryOperand::with_base_index_scale_displ_size(Register::R15, Register::R9, 8, 0, 8)).unwrap());
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R11,
+                    MemoryOperand::with_base_index_scale_displ_size(
+                        Register::R15,
+                        Register::R9,
+                        8,
+                        0,
+                        8,
+                    ),
+                )
+                .unwrap(),
+            );
             b.push(Instruction::with2(Code::Add_rm64_r64, Register::R10, Register::R11).unwrap());
             movi(&mut b, Register::RCX, 0x0100_0000_01B3);
             b.push(Instruction::with2(Code::Imul_r64_rm64, Register::R10, Register::RCX).unwrap());
@@ -743,7 +1012,8 @@ pub fn build_self_decoding_parts_with(
         }
         // placeholder expected checksum — patched below with the real value once the
         // (VA-dependent) encrypted table is built. mov r64, imm64 is fixed 10 bytes.
-        csum_placeholder_idx = b.push(Instruction::with2(Code::Mov_r64_imm64, Register::R11, 0x1234_5678).unwrap());
+        csum_placeholder_idx =
+            b.push(Instruction::with2(Code::Mov_r64_imm64, Register::R11, 0x1234_5678).unwrap());
         b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::R10, Register::R11).unwrap());
         let csum_je = b.br(Code::Je_rel32_64, 0);
         b.push(Instruction::with(Code::Ud2));
@@ -755,6 +1025,8 @@ pub fn build_self_decoding_parts_with(
         }
     }
 
+    // P2-3: select the actual dispatch control-flow topology per build.
+    let dispatcher_plan = crate::vm::dispatch_perm::DispatcherPlan::from_seed(seed);
     // dispatch loop
     let dispatch = b.len();
     {
@@ -763,7 +1035,8 @@ pub fn build_self_decoding_parts_with(
         // P6-3: keep the decrypted opcode byte in R9 — it drives the per-opcode
         // table key below. (R9 is scratch here; no handler relies on it at entry.)
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::RAX).unwrap());
-        let tbl = MemoryOperand::with_base_index_scale_displ_size(Register::R15, Register::RAX, 8, 0, 8);
+        let tbl =
+            MemoryOperand::with_base_index_scale_displ_size(Register::R15, Register::RAX, 8, 0, 8);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, tbl).unwrap());
         // P6-3: derive the master key K = a + b via the MBA identity
         // `a + b == (a ^ b) + 2 * (a & b)`. K is never a plaintext constant in the
@@ -790,7 +1063,70 @@ pub fn build_self_decoding_parts_with(
         b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RCX, Register::R10).unwrap());
         b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RCX, Register::R11).unwrap());
         b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RCX).unwrap());
-        b.push(Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap());
+        // Seed-sized, reachable instruction-selection prelude. These are true
+        // architectural NOPs, so neither native flags nor the VM state changes.
+        for n in 0..dispatcher_plan.island_count {
+            let kind = (dispatcher_plan.table_lane_rotation.wrapping_add(n)) % 3;
+            b.push(Instruction::with(match kind {
+                0 => Code::Nopd,
+                1 => Code::Nopw,
+                _ => Code::Nopq,
+            }));
+        }
+        use crate::vm::dispatch_perm::DispatcherTopology;
+        match dispatcher_plan.topology {
+            DispatcherTopology::DirectThreaded => {
+                b.push(Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap());
+            }
+            DispatcherTopology::IndirectThreaded => {
+                b.push(
+                    Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap(),
+                );
+                b.push(Instruction::with1(Code::Jmp_rm64, Register::R10).unwrap());
+            }
+            DispatcherTopology::CallRet => {
+                b.push(Instruction::with1(Code::Push_r64, Register::RAX).unwrap());
+                b.push(Instruction::with(Code::Retnq));
+            }
+            DispatcherTopology::SwitchSplit => {
+                b.push(
+                    Instruction::with2(
+                        Code::Test_rm64_imm32,
+                        Register::R9,
+                        dispatcher_plan.split_selector as i32,
+                    )
+                    .unwrap(),
+                );
+                let alternate_branch = b.br(Code::Je_rel32_64, 0);
+                b.push(
+                    Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap(),
+                );
+                b.push(Instruction::with1(Code::Jmp_rm64, Register::R10).unwrap());
+                let alternate = b.len();
+                b.push(Instruction::with1(Code::Push_r64, Register::RAX).unwrap());
+                b.push(Instruction::with(Code::Retnq));
+                if let Some((_, target)) = b
+                    .branches
+                    .iter_mut()
+                    .find(|(branch, _)| *branch == alternate_branch)
+                {
+                    *target = alternate;
+                }
+            }
+            DispatcherTopology::Distributed => {
+                let island_branch = b.br(Code::Jmp_rel32_64, 0);
+                let island = b.len();
+                b.push(Instruction::with(Code::Nopw));
+                b.push(Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap());
+                if let Some((_, target)) = b
+                    .branches
+                    .iter_mut()
+                    .find(|(branch, _)| *branch == island_branch)
+                {
+                    *target = island;
+                }
+            }
+        }
     }
 
     // helper: resolve src1 -> R10, src2 -> R11 (inline per handler)
@@ -823,12 +1159,46 @@ pub fn build_self_decoding_parts_with(
         mov_m(&mut b, Register::R11, DEC_IMM2);
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
-        // P6-2: NOR 시그니처 제거 — `~(a|b)` 를 `(~a) & (~b)` 로 재표현해
-        // 원시 NOR(OR+NOT) 패턴을 노출하지 않는다. De Morgan 등가이며 플래그
-        // 의미(NOR 결과 기준 ZF/SF/PF)는 동일하다.
-        b.push(Instruction::with1(Code::Not_rm64, Register::R10).unwrap());
-        b.push(Instruction::with1(Code::Not_rm64, Register::R11).unwrap());
-        b.push(Instruction::with2(Code::And_rm64_r64, Register::R10, Register::R11).unwrap());
+        // P5: seed-derived, equivalent NOR recipes. Flags are normalized by the
+        // final TEST below, so intermediate recipe flags are intentionally dead.
+        let nor_plan = crate::vm::handler_poly::HandlerSynthesisPlan::synthesize(
+            seed,
+            spec.opcode_for(RiscOp::Nor).unwrap_or_default(),
+        );
+        match nor_plan.recipe {
+            crate::vm::handler_poly::SemanticRecipe::DeMorgan
+            | crate::vm::handler_poly::SemanticRecipe::CarrySplit => {
+                // De Morgan: ~(a|b) == (~a)&(~b)
+                b.push(Instruction::with1(Code::Not_rm64, Register::R10).unwrap());
+                b.push(Instruction::with1(Code::Not_rm64, Register::R11).unwrap());
+                b.push(
+                    Instruction::with2(Code::And_rm64_r64, Register::R10, Register::R11).unwrap(),
+                );
+            }
+            crate::vm::handler_poly::SemanticRecipe::Native => {
+                b.push(
+                    Instruction::with2(Code::Or_rm64_r64, Register::R10, Register::R11).unwrap(),
+                );
+                b.push(Instruction::with1(Code::Not_rm64, Register::R10).unwrap());
+            }
+            crate::vm::handler_poly::SemanticRecipe::BooleanBasis
+            | crate::vm::handler_poly::SemanticRecipe::MbaIdentity => {
+                // a|b == (a^b)|(a&b), with RAX as a dead scratch here.
+                b.push(
+                    Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap(),
+                );
+                b.push(
+                    Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R11).unwrap(),
+                );
+                b.push(
+                    Instruction::with2(Code::And_rm64_r64, Register::R10, Register::R11).unwrap(),
+                );
+                b.push(
+                    Instruction::with2(Code::Or_rm64_r64, Register::R10, Register::RAX).unwrap(),
+                );
+                b.push(Instruction::with1(Code::Not_rm64, Register::R10).unwrap());
+            }
+        }
         b.push(Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).unwrap());
         emit_store_flags(&mut b);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
@@ -852,7 +1222,13 @@ pub fn build_self_decoding_parts_with(
         b.push(Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 0x01).unwrap());
         let no_cin2 = b.len() + 1;
         b.je(no_cin2);
-        emit_read_imm8(&mut b, DEC_CIN, sub_decrypt, spec.operand_mask);
+        emit_read_imm8(
+            &mut b,
+            DEC_CIN,
+            sub_decrypt,
+            spec.operand_mask,
+            (seed >> 43) as u8,
+        );
         let cin_done = b.len();
         for &mut (bi, ref mut ti) in b.branches.iter_mut() {
             if *ti == no_cin || *ti == no_cin2 {
@@ -871,25 +1247,25 @@ pub fn build_self_decoding_parts_with(
         // save a in RBX, b in R9 for OF
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::R10).unwrap()); // a
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::R11).unwrap()); // b
-        // res = a+b ; capture CF (c1)
+                                                                                              // res = a+b ; capture CF (c1)
         b.push(Instruction::with2(Code::Add_rm64_r64, Register::R10, Register::R11).unwrap());
         b.push(Instruction::with(Code::Pushfq));
         b.push(Instruction::with1(Code::Pop_r64, Register::RCX).unwrap());
         b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, 1).unwrap()); // c1
-        // res += cin ; capture CF (c2)
+                                                                                     // res += cin ; capture CF (c2)
         b.push(Instruction::with2(Code::Add_rm64_r64, Register::R10, Register::RAX).unwrap());
         b.push(Instruction::with(Code::Pushfq));
         b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
         b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 1).unwrap());
         b.push(Instruction::with2(Code::Or_rm64_r64, Register::RCX, Register::RAX).unwrap()); // CF = c1|c2
-        // ZF|SF|PF from res (test sets x86 PF = parity of low byte, matching the
-        // reference update_add64 which recomputes PF from the result)
+                                                                                              // ZF|SF|PF from res (test sets x86 PF = parity of low byte, matching the
+                                                                                              // reference update_add64 which recomputes PF from the result)
         b.push(Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).unwrap());
         b.push(Instruction::with(Code::Pushfq));
         b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
         b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xC4).unwrap()); // ZF|SF|PF
         b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap()); // +CF
-        // OF = ((a^res)&(b^res))>>63, placed at bit 11
+                                                                                              // OF = ((a^res)&(b^res))>>63, placed at bit 11
         b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RBX, Register::R10).unwrap()); // a^res
         b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R9, Register::R10).unwrap()); // b^res
         b.push(Instruction::with2(Code::And_rm64_r64, Register::RBX, Register::R9).unwrap());
@@ -898,7 +1274,9 @@ pub fn build_self_decoding_parts_with(
         b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RBX).unwrap());
         // merge with slot preserving PF/AF
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(FLAGS_OFF)).unwrap());
-        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!FLAG_MASK) as i32).unwrap());
+        b.push(
+            Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!FLAG_MASK) as i32).unwrap(),
+        );
         b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap());
         store_m(&mut b, FLAGS_OFF, Register::RAX);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
@@ -1026,41 +1404,80 @@ pub fn build_self_decoding_parts_with(
     //    a taken branch resolves the target to a bytecode byte offset via the branch
     //    map (OFF_BRANCH_MAP, built from ip_map) and re-syncs the rolling key (forward
     //    or reverse) before dispatching to the target instruction.
+    let native_bridge_instr_begin: usize;
+    let native_bridge_instr_end: usize;
     let h_branch = b.len();
     {
         b.call(sub_dec_ops_cond); // cond byte -> DEC_COND
-        b.call(sub_dec_ops);      // dst/src1/src2 + imms (consumes the stream)
-        // absolute-index target (src1 == 0x00): read the 8B target into DEC_IMM1.
-        // This must be consumed even when not-taken so the key stays in sync.
+        b.call(sub_dec_ops); // dst/src1/src2 + imms (consumes the stream)
+                             // absolute-index target (src1 == 0x00): read the 8B target into DEC_IMM1.
+                             // This must be consumed even when not-taken so the key stays in sync.
         movzx8_m(&mut b, Register::EAX, DEC_SRC1);
         b.push(Instruction::with2(Code::Test_rm32_r32, Register::EAX, Register::EAX).unwrap());
         b.br(Code::Je_rel32_64, 0xA100); // src1 == 0x00 -> absolute target read
-        // dynamic target: resolve src1 into DEC_IMM1 (indirect branch).
+                                         // dynamic target: resolve src1 into DEC_IMM1 (indirect branch).
         movzx8_m(&mut b, Register::EAX, DEC_SRC1);
         mov_m(&mut b, Register::R11, DEC_IMM1);
         b.call(sub_resolve);
         store_m(&mut b, DEC_IMM1, Register::RAX);
         b.br(Code::Jmp_rel32_64, 0xA200); // -> after_all
         let abs_read = b.len();
-        emit_read_imm8(&mut b, DEC_IMM1, sub_decrypt, spec.operand_mask);
+        emit_read_imm8(
+            &mut b,
+            DEC_IMM1,
+            sub_decrypt,
+            spec.operand_mask,
+            (seed >> 57) as u8,
+        );
         let after_all = b.len();
         // evaluate the condition (AL = taken).
         b.call(sub_eval_cond);
         b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, Register::AL).unwrap());
         b.push(Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap());
         b.br(Code::Je_rel32_64, 0x9300); // not taken -> dispatch (fall through)
-        // taken: target value = [DEC_IMM1] -> R10.
+                                         // taken: target value = [DEC_IMM1] -> R10.
         mov_m(&mut b, Register::R10, DEC_IMM1);
-        // branch-map base = R15 + (OFF_BRANCH_MAP - OFF_TABLE); linear-scan for R10.
+        // branch-map base is build-specific relative to R15; linear-scan for R10.
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::R15).unwrap());
-        b.push(Instruction::with2(Code::Add_rm64_imm32, Register::RBX, (OFF_BRANCH_MAP - OFF_TABLE) as i32).unwrap());
-        b.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, MemoryOperand::with_base(Register::RBX)).unwrap()); // count
+        b.push(
+            Instruction::with2(
+                Code::Add_rm64_imm32,
+                Register::RBX,
+                layout.branch_map_off as i32,
+            )
+            .unwrap(),
+        );
+        b.push(
+            Instruction::with2(
+                Code::Mov_r32_rm32,
+                Register::ECX,
+                MemoryOperand::with_base(Register::RBX),
+            )
+            .unwrap(),
+        ); // count
         b.push(Instruction::with2(Code::Test_rm64_r64, Register::RCX, Register::RCX).unwrap());
         b.br(Code::Je_rel32_64, 0x9400); // count == 0 -> not found
-        b.push(Instruction::with2(Code::Lea_r64_m, Register::R11, MemoryOperand::with_base_displ_size(Register::RBX, 4, 8)).unwrap());
+        b.push(
+            Instruction::with2(
+                Code::Lea_r64_m,
+                Register::R11,
+                MemoryOperand::with_base_displ_size(Register::RBX, 4, 8),
+            )
+            .unwrap(),
+        );
         let scan_top = b.len();
         {
-            b.push(Instruction::with2(Code::Cmp_rm64_r64, MemoryOperand::with_base(Register::R11), Register::R10).unwrap());
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RAX,
+                    MemoryOperand::with_base(Register::R11),
+                )
+                .unwrap(),
+            );
+            movi(&mut b, Register::R9, branch_target_key);
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R9).unwrap());
+            b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::RAX, Register::R10).unwrap());
             b.br(Code::Je_rel32_64, 0x9401); // found
             b.push(Instruction::with2(Code::Add_rm64_imm32, Register::R11, 16).unwrap());
             b.push(Instruction::with1(Code::Dec_rm64, Register::RCX).unwrap());
@@ -1086,131 +1503,290 @@ pub fn build_self_decoding_parts_with(
         //   RDI = target, R12 = state_base, R14 = bytecode_base.
         //   R13 (vstack top) / R15 (table) stay intact throughout.
         let nf_real = b.len();
+        native_bridge_instr_begin = nf_real;
         {
+            // P1-2 diagnostic: snapshot the first unresolved VM→native transfer
+            // into the otherwise external call-stack buffer, then park the
+            // process so ReadProcessMemory can inspect it. This is build-time
+            // opt-in and emits no instructions in production modules.
+            if let Some(trace_n) = std::env::var("BTG_TRACE_NATIVE_BRIDGE")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|n| *n > 0)
+            {
+                const SNAP: i64 = crate::vm::interp::STATE_CALL_STACK_BUF as i64;
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_r64_rm64,
+                        Register::RAX,
+                        MemoryOperand::with_base_displ_size(Register::RDX, SNAP + 48, 8),
+                    )
+                    .unwrap(),
+                );
+                b.push(Instruction::with1(Code::Inc_rm64, Register::RAX).unwrap());
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_rm64_r64,
+                        MemoryOperand::with_base_displ_size(Register::RDX, SNAP + 48, 8),
+                        Register::RAX,
+                    )
+                    .unwrap(),
+                );
+                b.push(Instruction::with2(Code::Cmp_rm64_imm32, Register::RAX, trace_n).unwrap());
+                b.br(Code::Jne_rel32_64, 0xBC10);
+                // target, guest RSP, RCX, RDX, R8, R9
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_rm64_r64,
+                        MemoryOperand::with_base_displ_size(Register::RDX, SNAP, 8),
+                        Register::R10,
+                    )
+                    .unwrap(),
+                );
+                for (slot, state_off) in [
+                    (1i64, state_disp(REGS_OFF + 4 * 8) as i64),
+                    (2, state_disp(REGS_OFF + 1 * 8) as i64),
+                    (3, state_disp(REGS_OFF + 2 * 8) as i64),
+                    (4, state_disp(REGS_OFF + 8 * 8) as i64),
+                    (5, state_disp(REGS_OFF + 9 * 8) as i64),
+                ] {
+                    b.push(
+                        Instruction::with2(
+                            Code::Mov_r64_rm64,
+                            Register::RAX,
+                            MemoryOperand::with_base_displ_size(Register::RDX, state_off, 8),
+                        )
+                        .unwrap(),
+                    );
+                    b.push(
+                        Instruction::with2(
+                            Code::Mov_rm64_r64,
+                            MemoryOperand::with_base_displ_size(Register::RDX, SNAP + slot * 8, 8),
+                            Register::RAX,
+                        )
+                        .unwrap(),
+                    );
+                }
+                let park = b.len();
+                b.br(Code::Jmp_rel32_64, park);
+                let trace_continue = b.len();
+                for &mut (_, ref mut target) in b.branches.iter_mut() {
+                    if *target == 0xBC10 {
+                        *target = trace_continue;
+                    }
+                }
+            }
             // 1. pop ret_ip from the virtual stack (R13 top).
-            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBP, MemoryOperand::with_base(Register::R13)).unwrap());
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RBP,
+                    MemoryOperand::with_base(Register::R13),
+                )
+                .unwrap(),
+            );
             b.push(Instruction::with2(Code::Add_rm64_imm8, Register::R13, 8).unwrap());
             mov_m(&mut b, Register::RAX, VSP_OFF);
             b.push(Instruction::with2(Code::Add_rm64_imm8, Register::RAX, 8).unwrap());
             store_m(&mut b, VSP_OFF, Register::RAX);
 
-            // 2. stage infra in callee-saved regs.
+            // 2. Stage VM infrastructure, then construct a private bridge frame.
+            // The native callee must observe every non-RSP program register exactly
+            // as it would in the original code.  Keeping RBX/RBP/RSI/RDI/R12-R15 as
+            // VM scratch (the old implementation) leaked dispatcher values into a
+            // native callee and caused deterministic corruption across VM/native
+            // boundaries.  The frame lives above the call's shadow/argument area,
+            // so it remains caller-owned for the duration of the call.
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R12, Register::RDX).unwrap()); // state_base
-            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::R8).unwrap());  // bytecode_base
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::R8).unwrap()); // bytecode_base
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RDI, Register::R10).unwrap()); // target
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::RSP).unwrap()); // original S
 
-            // 3. load the program's real GPRs from the state buffer (R12 = state_base).
-            //    RAX/RCX/RDX/R8/R9/R10/R11 are the call args + return + volatile scratch.
-            //    RBX/RBP/RSI/RDI/R12..R15 are NOT loaded (they hold the VM infra /
-            //    bridge scratch); regs[3,5,6,7,12..15] keep their pre-call values in
-            //    the state buffer, which is correct — they are callee-saved.
-            let sl = |b: &mut CodeBuilder, dst: Register, off: i32| {
-                b.push(Instruction::with2(
-                    Code::Mov_r64_rm64,
-                    dst,
-                    MemoryOperand::with_base_displ_size(Register::R12, off as i64, 8),
-                ).unwrap());
-            };
-            sl(&mut b, Register::RAX, 0x00);
-            sl(&mut b, Register::RCX, 0x08);
-            sl(&mut b, Register::RDX, 0x10);
-            sl(&mut b, Register::R8, 0x40);
-            sl(&mut b, Register::R9, 0x48);
-            sl(&mut b, Register::R10, 0x50);
-            sl(&mut b, Register::R11, 0x58);
+            // Frame [rsp+0x00..0x6F] = Win64 shadow space + eight stack args;
+            // [rsp+0x70..0xA7] = state, bytecode, vstack, table, ret-ip, old-rsp,
+            // target.  0xB0 preserves the required pre-call 16-byte alignment.
+            // Entry RSP is 8 mod 16 and the eight entry pushes preserve that
+            // alignment. A fixed 0xB8 allocation produces the required 0-mod-16
+            // pre-call RSP while remaining exactly representable by x64 unwind
+            // metadata (unlike the former dynamic `and rsp,-16; sub rsp,0xB0`).
+            b.push(Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, 0xB8).unwrap());
+            for (off, reg) in [
+                (0x70, Register::R12),
+                (0x78, Register::R14),
+                (0x80, Register::R13),
+                (0x88, Register::R15),
+                (0x90, Register::RBP),
+                (0x98, Register::RBX),
+                (0xA0, Register::RDI),
+            ] {
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_rm64_r64,
+                        MemoryOperand::with_base_displ_size(Register::RSP, off, 8),
+                        reg,
+                    )
+                    .unwrap(),
+                );
+            }
 
-            // 3b. F1: Win64 FP/vector ABI — FP 인자를 XMM0-3 으로 positional 미러링.
-            //   Win64 규칙: i 번째 인자가 FP 이면 XMM[i-1] 로 전달된다 (정수 인자는
-            //   RCX/RDX/R8/R9). FP 값은 VM 레지스터(regs[1..4] = RCX/RDX/R8/R9)에
-            //   IEEE 비트패턴으로 있으므로, 해당 레지스터를 XMM 슬롯으로 **위치 그대로**
-            //   복사하면 FP 인자가 정확히 전달되고, 정수 인자가 차지한 XMM 슬롯은
-            //   callee 가 읽지 않는 가비지로 무해하다. `movq xmm, r64` 는 low 64 비트만
-            //   복사(상위 zero) — f64 는 64-bit IEEE 비트 전체, f32 는 low 32 비트가
-            //   값이므로 정확하다. (기존 XMM_OFF 슬롯 로드는 실제 FP 값을 담지 않아
-            //   무의미했다 — 이 위치 미러링으로 대체.)
-            for (i, gpr) in [
+            // 3. Forward the caller's real stack-argument area (args 5..12).
+            // `VSP_OFF` is the VM's own Push/Pop stack, not the x64 ABI stack;
+            // using it here both lost ordinary stack arguments and placed them
+            // one slot too high.  The guest RSP points at the original caller
+            // frame, where the first stack argument is [RSP+0x20] before CALL.
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R10,
+                    MemoryOperand::with_base_displ_size(
+                        Register::R12,
+                        state_disp(REGS_OFF + 4 * 8) as i64,
+                        8,
+                    ),
+                )
+                .unwrap(),
+            );
+            for i in 0..8i32 {
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_r64_rm64,
+                        Register::R11,
+                        MemoryOperand::with_base_displ_size(
+                            Register::R10,
+                            (0x20 + i * 8) as i64,
+                            8,
+                        ),
+                    )
+                    .unwrap(),
+                );
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_rm64_r64,
+                        MemoryOperand::with_base_displ_size(
+                            Register::RSP,
+                            (0x20 + i * 8) as i64,
+                            8,
+                        ),
+                        Register::R11,
+                    )
+                    .unwrap(),
+                );
+            }
+
+            // 4. Materialize all program GPRs except RSP.  R11 carries state_base
+            // until the final load; virtual RSP is data in the state buffer and
+            // must never replace the physical call stack pointer.
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::R12).unwrap());
+            for (index, reg) in [
+                (0, Register::RAX),
+                (1, Register::RCX),
+                (2, Register::RDX),
+                (3, Register::RBX),
+                (5, Register::RBP),
+                (6, Register::RSI),
+                (7, Register::RDI),
+                (8, Register::R8),
+                (9, Register::R9),
+                (10, Register::R10),
+                (12, Register::R12),
+                (13, Register::R13),
+                (14, Register::R14),
+                (15, Register::R15),
+            ] {
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_r64_rm64,
+                        reg,
+                        MemoryOperand::with_base_displ_size(
+                            Register::R11,
+                            state_disp(REGS_OFF + index * 8) as i64,
+                            8,
+                        ),
+                    )
+                    .unwrap(),
+                );
+            }
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R11,
+                    MemoryOperand::with_base_displ_size(
+                        Register::R11,
+                        state_disp(REGS_OFF + 11 * 8) as i64,
+                        8,
+                    ),
+                )
+                .unwrap(),
+            );
+            // Mirror positional FP arguments for the Win64 ABI.
+            for (xmm, gpr) in [
                 (Register::XMM0, Register::RCX),
                 (Register::XMM1, Register::RDX),
                 (Register::XMM2, Register::R8),
                 (Register::XMM3, Register::R9),
             ] {
-                b.push(Instruction::with2(Code::Movq_xmm_rm64, i, gpr).unwrap());
+                b.push(Instruction::with2(Code::Movq_xmm_rm64, xmm, gpr).unwrap());
             }
 
-            // 4. native frame: align RSP to 16, allocate 0x70 (ret + 0x20 home +
-            //    0x40 stack args). RSI = align remainder for the restore.
-            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSI, Register::RBX).unwrap());
-            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RSI, 15).unwrap());
-            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RSP, -16).unwrap());
-            b.push(Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, 0x70).unwrap());
+            // 5. Indirect call through the bridge frame: RDI now contains the
+            // program's virtual value, not a dispatcher scratch value.
+            b.push(
+                Instruction::with1(
+                    Code::Call_rm64,
+                    MemoryOperand::with_base_displ_size(Register::RSP, 0xA0, 8),
+                )
+                .unwrap(),
+            );
 
-            // 5. forward stack args (5..12) from the virtual stack to [RSP+0x28..].
-            //    pending = |VSP|/8 (after the ret_ip pop) capped at 8; VSP >= 0 → none.
-            //    NOTE: RDX no longer holds state_base here (it was loaded with regs[2]),
-            //    so the VSP slot is read via R12.
-            b.push(Instruction::with2(
-                Code::Mov_r64_rm64,
-                Register::RAX,
-                MemoryOperand::with_base_displ_size(Register::R12, VSP_OFF as i64, 8),
-            ).unwrap());
-            b.push(Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap());
-            b.br(Code::Jns_rel32_64, 0xB0FF); // VSP >= 0 -> no pending entries
-            b.push(Instruction::with1(Code::Neg_rm64, Register::RAX).unwrap());
-            b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RAX, 3).unwrap());
-            // cap pending at 8: RAX = min(RAX, 8).
-            b.push(Instruction::with2(Code::Mov_r64_imm64, Register::RCX, 8).unwrap());
-            b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::RAX, Register::RCX).unwrap());
-            b.push(Instruction::with2(Code::Cmova_r64_rm64, Register::RAX, Register::RCX).unwrap());
-            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::RAX).unwrap());
-            let fwd_top = b.len();
-            {
-                b.push(Instruction::with2(Code::Test_rm64_r64, Register::RCX, Register::RCX).unwrap());
-                let fwd_done = b.len() + 1;
-                b.je(fwd_done);
-                // index = RCX-1 (forward from the top of the virtual stack).
-                b.push(Instruction::with2(Code::Lea_r64_m, Register::R10, MemoryOperand::with_base_index_scale_displ_size(Register::R13, Register::RCX, 8, -8, 8)).unwrap());
-                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, MemoryOperand::with_base(Register::R10)).unwrap());
-                // slot = RSP + 0x28 + (RCX-1)*8
-                b.push(Instruction::with2(Code::Lea_r64_m, Register::R11, MemoryOperand::with_base_index_scale_displ_size(Register::RSP, Register::RCX, 8, 0x20, 8)).unwrap());
-                b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base(Register::R11), Register::R10).unwrap());
-                b.push(Instruction::with1(Code::Dec_rm64, Register::RCX).unwrap());
-                b.jmp(fwd_top);
-                let loop_end = b.len();
-                for &mut (bi, ref mut ti) in b.branches.iter_mut() {
-                    if *ti == fwd_done {
-                        *ti = loop_end;
-                    }
-                }
-            }
-            let after_fwd = b.len();
-            for &mut (bi, ref mut ti) in b.branches.iter_mut() {
-                if *ti == 0xB0FF {
-                    *ti = after_fwd;
-                }
-            }
-
-            // 6. Win64 call target (RDI). args are already in RCX/RDX/R8/R9, stack
-            //    args 5..12 in [RSP+0x28..0x68], home space at [RSP+0x08..0x28].
-            b.push(Instruction::with1(Code::Call_rm64, Register::RDI).unwrap());
-
-            // 7. after the call: RSP == RSP_call. Sync volatile GPRs + RFLAGS back.
+            // 6. After the call, recover state_base from the private frame and sync
+            // volatile GPRs + RFLAGS back. Nonvolatile GPRs were materialized and
+            // are Win64-preserved, so their state slots remain authoritative.
             // F1: regs[0] 동기화는 FP 리턴 여부에 따라 달라진다 — `SetNativeFpReturn`
             // 핸들러가 FP_RET_OFF(0=FALSE, 4=f32, 8=f64)를 기록한다. FP 면 XMM0 의
             // low 폭 바이트를 regs[0] 으로, 아니면 RAX(기존)를 그대로 쓴다. RBX 는
             // orig-RSP 스크래치라 sync-back 대상이 아니므로 스크래치로 안전하다
             // (step 9가 RBX=R15로 다시 적재). sentinel: 0xBC00=int, 0xBC01=f32, 0xBC02=store.
-            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, MemoryOperand::with_base_displ_size(Register::R12, FP_RET_OFF as i64, 8)).unwrap());
-            b.push(Instruction::with2(Code::Test_rm64_r64, Register::RBX, Register::RBX).unwrap());
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RBX,
+                    MemoryOperand::with_base_displ_size(Register::RSP, 0x70, 8),
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RDI,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RBX,
+                        state_disp(FP_RET_OFF) as i64,
+                        8,
+                    ),
+                )
+                .unwrap(),
+            );
+            b.push(Instruction::with2(Code::Test_rm64_r64, Register::RDI, Register::RDI).unwrap());
             b.br(Code::Je_rel32_64, 0xBC00); // width == 0 -> integer return (RAX 그대로)
-            b.push(Instruction::with2(Code::Cmp_rm64_imm8, Register::RBX, 4).unwrap());
+            b.push(Instruction::with2(Code::Cmp_rm64_imm8, Register::RDI, 4).unwrap());
             b.br(Code::Je_rel32_64, 0xBC01); // width == 4 -> f32
             b.push(Instruction::with2(Code::Movq_rm64_xmm, Register::RAX, Register::XMM0).unwrap()); // f64
             b.br(Code::Jmp_rel32_64, 0xBC02);
             let fp4_ret = b.len();
             b.push(Instruction::with2(Code::Movd_rm32_xmm, Register::EAX, Register::XMM0).unwrap()); // f32 (low 32)
             let store_r0 = b.len();
-            b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x00, 8), Register::RAX).unwrap());
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RBX,
+                        state_disp(REGS_OFF) as i64,
+                        8,
+                    ),
+                    Register::RAX,
+                )
+                .unwrap(),
+            );
             for &mut (bi, ref mut ti) in b.branches.iter_mut() {
                 if *ti == 0xBC00 {
                     *ti = store_r0;
@@ -1220,17 +1796,94 @@ pub fn build_self_decoding_parts_with(
                     *ti = store_r0;
                 }
             }
-            b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x08, 8), Register::RCX).unwrap());
-            b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x10, 8), Register::RDX).unwrap());
-            b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x40, 8), Register::R8).unwrap());
-            b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x48, 8), Register::R9).unwrap());
-            b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x50, 8), Register::R10).unwrap());
-            b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0x58, 8), Register::R11).unwrap());
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RBX,
+                        state_disp(REGS_OFF + 8) as i64,
+                        8,
+                    ),
+                    Register::RCX,
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RBX,
+                        state_disp(REGS_OFF + 16) as i64,
+                        8,
+                    ),
+                    Register::RDX,
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RBX,
+                        state_disp(REGS_OFF + 64) as i64,
+                        8,
+                    ),
+                    Register::R8,
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RBX,
+                        state_disp(REGS_OFF + 72) as i64,
+                        8,
+                    ),
+                    Register::R9,
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RBX,
+                        state_disp(REGS_OFF + 80) as i64,
+                        8,
+                    ),
+                    Register::R10,
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RBX,
+                        state_disp(REGS_OFF + 88) as i64,
+                        8,
+                    ),
+                    Register::R11,
+                )
+                .unwrap(),
+            );
             // RFLAGS (whatever the callee left) → FLAGS slot.
             b.push(Instruction::with(Code::Pushfq));
             b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
             b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x8D5).unwrap());
-            b.push(Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base_displ_size(Register::R12, 0xC0, 8), Register::RAX).unwrap());
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RBX,
+                        state_disp(FLAGS_OFF) as i64,
+                        8,
+                    ),
+                    Register::RAX,
+                )
+                .unwrap(),
+            );
             // P1-8: callee 가 clobber 한 XMM0-5 를 VM XMM 슬롯으로 동기화 (반환값/
             // 변경된 FP 상태 보존).
             for i in 0..XMM_SLOTS {
@@ -1242,39 +1895,136 @@ pub fn build_self_decoding_parts_with(
                     4 => Register::XMM4,
                     _ => Register::XMM5,
                 };
-                b.push(Instruction::with2(
-                    Code::Movups_xmmm128_xmm,
-                    MemoryOperand::with_base_displ_size(Register::R12, (XMM_OFF + (i as i32) * 16) as i64, 16),
-                    xmm,
-                ).unwrap());
+                b.push(
+                    Instruction::with2(
+                        Code::Movups_xmmm128_xmm,
+                        MemoryOperand::with_base_displ_size(
+                            Register::RBX,
+                            (XMM_OFF + (i as i32) * 16) as i64,
+                            16,
+                        ),
+                        xmm,
+                    )
+                    .unwrap(),
+                );
             }
 
-            // 8. restore the VM real stack (RSP = original S) and infra.
-            b.push(Instruction::with2(Code::Add_rm64_imm32, Register::RSP, 0x70).unwrap());
-            b.push(Instruction::with2(Code::Add_rm64_r64, Register::RSP, Register::RSI).unwrap());
-            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::R12).unwrap()); // state_base
-            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R8, Register::R14).unwrap());  // bytecode_base
+            // 7. Restore the VM infra from the bridge frame before restoring RSP.
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RDX,
+                    MemoryOperand::with_base_displ_size(Register::RSP, 0x70, 8),
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R8,
+                    MemoryOperand::with_base_displ_size(Register::RSP, 0x78, 8),
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R13,
+                    MemoryOperand::with_base_displ_size(Register::RSP, 0x80, 8),
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R15,
+                    MemoryOperand::with_base_displ_size(Register::RSP, 0x88, 8),
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RBP,
+                    MemoryOperand::with_base_displ_size(Register::RSP, 0x90, 8),
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RSP,
+                    MemoryOperand::with_base_displ_size(Register::RSP, 0x98, 8),
+                )
+                .unwrap(),
+            );
 
             // 9. resume at ret_ip (RBP): branch-map lookup -> byte offset.
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::R15).unwrap());
-            b.push(Instruction::with2(Code::Add_rm64_imm32, Register::RBX, (OFF_BRANCH_MAP - OFF_TABLE) as i32).unwrap());
-            b.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, MemoryOperand::with_base(Register::RBX)).unwrap());
+            b.push(
+                Instruction::with2(
+                    Code::Add_rm64_imm32,
+                    Register::RBX,
+                    layout.branch_map_off as i32,
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r32_rm32,
+                    Register::ECX,
+                    MemoryOperand::with_base(Register::RBX),
+                )
+                .unwrap(),
+            );
             b.push(Instruction::with2(Code::Test_rm64_r64, Register::RCX, Register::RCX).unwrap());
             b.br(Code::Je_rel32_64, 0xB100); // count == 0 -> not found
-            b.push(Instruction::with2(Code::Lea_r64_m, Register::R11, MemoryOperand::with_base_displ_size(Register::RBX, 4, 8)).unwrap());
+            b.push(
+                Instruction::with2(
+                    Code::Lea_r64_m,
+                    Register::R11,
+                    MemoryOperand::with_base_displ_size(Register::RBX, 4, 8),
+                )
+                .unwrap(),
+            );
             let rscan_top = b.len();
             {
-                b.push(Instruction::with2(Code::Cmp_rm64_r64, MemoryOperand::with_base(Register::R11), Register::RBP).unwrap());
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_r64_rm64,
+                        Register::RAX,
+                        MemoryOperand::with_base(Register::R11),
+                    )
+                    .unwrap(),
+                );
+                movi(&mut b, Register::R9, branch_target_key);
+                b.push(
+                    Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R9).unwrap(),
+                );
+                b.push(
+                    Instruction::with2(Code::Cmp_rm64_r64, Register::RAX, Register::RBP).unwrap(),
+                );
                 b.br(Code::Je_rel32_64, 0xB101); // found
                 b.push(Instruction::with2(Code::Add_rm64_imm32, Register::R11, 16).unwrap());
                 b.push(Instruction::with1(Code::Dec_rm64, Register::RCX).unwrap());
-                b.push(Instruction::with2(Code::Test_rm64_r64, Register::RCX, Register::RCX).unwrap());
+                b.push(
+                    Instruction::with2(Code::Test_rm64_r64, Register::RCX, Register::RCX).unwrap(),
+                );
                 b.jne(rscan_top);
                 b.br(Code::Jmp_rel32_64, 0xB100); // not found
             }
             // found: RBX = [R11+8] (byte offset).
             let resume_found_real = b.len();
-            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, MemoryOperand::with_base_displ_size(Register::R11, 8, 8)).unwrap());
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RBX,
+                    MemoryOperand::with_base_displ_size(Register::R11, 8, 8),
+                )
+                .unwrap(),
+            );
+            movi(&mut b, Register::R9, branch_offset_key);
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RBX, Register::R9).unwrap());
             b.br(Code::Jmp_rel32_64, 0xB200);
             // not found: fall back to treating ret_ip as a direct byte offset.
             let resume_nf_real = b.len();
@@ -1298,7 +2048,17 @@ pub fn build_self_decoding_parts_with(
         }
         // found: byte offset = [R11 + 8].
         let found_real = b.len();
-        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, MemoryOperand::with_base_displ_size(Register::R11, 8, 8)).unwrap());
+        native_bridge_instr_end = found_real;
+        b.push(
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RBX,
+                MemoryOperand::with_base_displ_size(Register::R11, 8, 8),
+            )
+            .unwrap(),
+        );
+        movi(&mut b, Register::R9, branch_offset_key);
+        b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RBX, Register::R9).unwrap());
         b.br(Code::Jmp_rel32_64, 0x9500);
         // re-sync the rolling key to the target byte offset, then dispatch.
         let resync = b.len();
@@ -1338,6 +2098,8 @@ pub fn build_self_decoding_parts_with(
         b.push(Instruction::with1(Code::Pop_r64, Register::R12).unwrap());
         b.push(Instruction::with(Code::Retnq));
     }
+    let h_trap = b.len();
+    b.push(Instruction::with(Code::Ud2));
 
     // ── P0-1: VIRTUAL_RET — x86 RET. 가상 스택에서 복귀 주소를 pop 해 branch-map
     //    (ip_map 기반: source-IP → byte offset)에서 찾으면 rolling-key 재동기 후 해당
@@ -1351,8 +2113,15 @@ pub fn build_self_decoding_parts_with(
         mov_m(&mut b, Register::RAX, VSP_OFF);
         b.push(Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap());
         b.br(Code::Jns_rel32_64, 0xD200); // VSP >= 0 -> empty -> halt
-        // 1. pop ret_ip (R13 top) -> R10, update VSP slot.
-        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, MemoryOperand::with_base(Register::R13)).unwrap());
+                                          // 1. pop ret_ip (R13 top) -> R10, update VSP slot.
+        b.push(
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::R10,
+                MemoryOperand::with_base(Register::R13),
+            )
+            .unwrap(),
+        );
         b.push(Instruction::with2(Code::Add_rm64_imm8, Register::R13, 8).unwrap());
         mov_m(&mut b, Register::RAX, VSP_OFF);
         b.push(Instruction::with2(Code::Add_rm64_imm8, Register::RAX, 8).unwrap());
@@ -1360,14 +2129,45 @@ pub fn build_self_decoding_parts_with(
 
         // 2. branch-map scan for R10 (target_value -> byte_offset).
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::R15).unwrap());
-        b.push(Instruction::with2(Code::Add_rm64_imm32, Register::RBX, (OFF_BRANCH_MAP - OFF_TABLE) as i32).unwrap());
-        b.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, MemoryOperand::with_base(Register::RBX)).unwrap());
+        b.push(
+            Instruction::with2(
+                Code::Add_rm64_imm32,
+                Register::RBX,
+                layout.branch_map_off as i32,
+            )
+            .unwrap(),
+        );
+        b.push(
+            Instruction::with2(
+                Code::Mov_r32_rm32,
+                Register::ECX,
+                MemoryOperand::with_base(Register::RBX),
+            )
+            .unwrap(),
+        );
         b.push(Instruction::with2(Code::Test_rm64_r64, Register::RCX, Register::RCX).unwrap());
         b.br(Code::Je_rel32_64, 0xD100); // count == 0 -> not found (halt)
-        b.push(Instruction::with2(Code::Lea_r64_m, Register::R11, MemoryOperand::with_base_displ_size(Register::RBX, 4, 8)).unwrap());
+        b.push(
+            Instruction::with2(
+                Code::Lea_r64_m,
+                Register::R11,
+                MemoryOperand::with_base_displ_size(Register::RBX, 4, 8),
+            )
+            .unwrap(),
+        );
         let scan_top = b.len();
         {
-            b.push(Instruction::with2(Code::Cmp_rm64_r64, MemoryOperand::with_base(Register::R11), Register::R10).unwrap());
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RAX,
+                    MemoryOperand::with_base(Register::R11),
+                )
+                .unwrap(),
+            );
+            movi(&mut b, Register::R9, branch_target_key);
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R9).unwrap());
+            b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::RAX, Register::R10).unwrap());
             b.br(Code::Je_rel32_64, 0xD101); // found
             b.push(Instruction::with2(Code::Add_rm64_imm32, Register::R11, 16).unwrap());
             b.push(Instruction::with1(Code::Dec_rm64, Register::RCX).unwrap());
@@ -1378,7 +2178,16 @@ pub fn build_self_decoding_parts_with(
         b.br(Code::Jmp_rel32_64, 0xD100);
         // found: byte offset = [R11 + 8]; re-sync rolling key, then dispatch.
         let ret_found = b.len();
-        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, MemoryOperand::with_base_displ_size(Register::R11, 8, 8)).unwrap());
+        b.push(
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RBX,
+                MemoryOperand::with_base_displ_size(Register::R11, 8, 8),
+            )
+            .unwrap(),
+        );
+        movi(&mut b, Register::R9, branch_offset_key);
+        b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RBX, Register::R9).unwrap());
         let ret_resync = b.len();
         b.call(sub_resync);
         b.jmp(dispatch);
@@ -1440,6 +2249,83 @@ pub fn build_self_decoding_parts_with(
         b.jmp(dispatch);
     }
 
+    // Translate the lifter's synthetic XMM address window to the VM state's
+    // physical XMM backing store. Ordinary process addresses pass unchanged.
+    fn translate_xmm_addr(b: &mut CodeBuilder) {
+        const XMM_VA: u64 = 0xF000_0000_0000_0000;
+        let passthrough = 0x7FFF_FF10usize;
+        movi(b, Register::RAX, XMM_VA);
+        b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::R10, Register::RAX).unwrap());
+        b.br(Code::Jb_rel32_64, passthrough);
+        movi(b, Register::RCX, XMM_VA + 16 * 16);
+        b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::R10, Register::RCX).unwrap());
+        b.br(Code::Jae_rel32_64, passthrough);
+        b.push(Instruction::with2(Code::Sub_rm64_r64, Register::R10, Register::RAX).unwrap());
+        b.push(Instruction::with2(Code::Add_rm64_r64, Register::R10, Register::RDX).unwrap());
+        b.push(
+            Instruction::with2(Code::Add_rm64_imm32, Register::R10, state_disp(XMM_OFF)).unwrap(),
+        );
+        let done = b.len();
+        for &mut (_, ref mut target) in b.branches.iter_mut() {
+            if *target == passthrough {
+                *target = done;
+            }
+        }
+    }
+
+    fn trace_memory_write(b: &mut CodeBuilder) {
+        let Ok(raw) = std::env::var("BTG_TRACE_MEMORY_WRITE") else {
+            return;
+        };
+        let stop_at = raw.parse::<u32>().unwrap_or(1);
+        const SNAP: i64 = crate::vm::interp::STATE_CALL_STACK_BUF as i64;
+        b.push(
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base_displ_size(Register::RDX, SNAP + 32, 8),
+            )
+            .unwrap(),
+        );
+        b.push(Instruction::with1(Code::Inc_rm64, Register::RAX).unwrap());
+        b.push(
+            Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_displ_size(Register::RDX, SNAP + 32, 8),
+                Register::RAX,
+            )
+            .unwrap(),
+        );
+        for (off, reg) in [
+            (0i64, Register::R10),
+            (8, Register::R11),
+            (16, Register::R12),
+            (24, Register::R14),
+        ] {
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ_size(Register::RDX, SNAP + off, 8),
+                    reg,
+                )
+                .unwrap(),
+            );
+        }
+        if stop_at == 0 {
+            return;
+        }
+        b.push(Instruction::with2(Code::Cmp_rm64_imm32, Register::RAX, stop_at).unwrap());
+        b.br(Code::Jne_rel32_64, 0xBC11);
+        let park = b.len();
+        b.br(Code::Jmp_rel32_64, park);
+        let trace_continue = b.len();
+        for &mut (_, ref mut target) in b.branches.iter_mut() {
+            if *target == 0xBC11 {
+                *target = trace_continue;
+            }
+        }
+    }
+
     // ── P3: MEMORY_READ{width} — R10 = addr; R10 = *(addr, width); store dst. ──
     let h_memrd8 = b.len();
     {
@@ -1448,6 +2334,7 @@ pub fn build_self_decoding_parts_with(
         mov_m(&mut b, Register::R11, DEC_IMM1);
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        translate_xmm_addr(&mut b);
         let m = MemoryOperand::with_base(Register::R10);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m).unwrap());
         b.call(sub_store);
@@ -1460,6 +2347,7 @@ pub fn build_self_decoding_parts_with(
         mov_m(&mut b, Register::R11, DEC_IMM1);
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        translate_xmm_addr(&mut b);
         let m = MemoryOperand::with_base(Register::R10);
         // Writing R10D zero-extends into R10 (x86-64 semantics).
         b.push(Instruction::with2(Code::Mov_r32_rm32, Register::R10D, m).unwrap());
@@ -1474,6 +2362,7 @@ pub fn build_self_decoding_parts_with(
         mov_m(&mut b, Register::R11, DEC_IMM1);
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        translate_xmm_addr(&mut b);
         let m = MemoryOperand::with_base(Register::R10);
         b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::EAX, m).unwrap());
         b.call(sub_store);
@@ -1486,6 +2375,7 @@ pub fn build_self_decoding_parts_with(
         mov_m(&mut b, Register::R11, DEC_IMM1);
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        translate_xmm_addr(&mut b);
         let m = MemoryOperand::with_base(Register::R10);
         b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, m).unwrap());
         b.call(sub_store);
@@ -1503,8 +2393,11 @@ pub fn build_self_decoding_parts_with(
         movzx8_m(&mut b, Register::EAX, DEC_SRC2);
         mov_m(&mut b, Register::R11, DEC_IMM2);
         b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
+        translate_xmm_addr(&mut b);
+        trace_memory_write(&mut b);
         let m = MemoryOperand::with_base(Register::R10);
-        b.push(Instruction::with2(Code::Mov_rm64_r64, m, Register::RAX).unwrap());
+        b.push(Instruction::with2(Code::Mov_rm64_r64, m, Register::R11).unwrap());
         b.jmp(dispatch);
     }
     let h_memwr4 = b.len();
@@ -1517,8 +2410,11 @@ pub fn build_self_decoding_parts_with(
         movzx8_m(&mut b, Register::EAX, DEC_SRC2);
         mov_m(&mut b, Register::R11, DEC_IMM2);
         b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
+        translate_xmm_addr(&mut b);
+        trace_memory_write(&mut b);
         let m = MemoryOperand::with_base(Register::R10);
-        b.push(Instruction::with2(Code::Mov_rm32_r32, m, Register::EAX).unwrap());
+        b.push(Instruction::with2(Code::Mov_rm32_r32, m, Register::R11D).unwrap());
         b.jmp(dispatch);
     }
     let h_memwr2 = b.len();
@@ -1531,8 +2427,11 @@ pub fn build_self_decoding_parts_with(
         movzx8_m(&mut b, Register::EAX, DEC_SRC2);
         mov_m(&mut b, Register::R11, DEC_IMM2);
         b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
+        translate_xmm_addr(&mut b);
+        trace_memory_write(&mut b);
         let m = MemoryOperand::with_base(Register::R10);
-        b.push(Instruction::with2(Code::Mov_rm16_r16, m, Register::AX).unwrap());
+        b.push(Instruction::with2(Code::Mov_rm16_r16, m, Register::R11W).unwrap());
         b.jmp(dispatch);
     }
     let h_memwr1 = b.len();
@@ -1545,8 +2444,481 @@ pub fn build_self_decoding_parts_with(
         movzx8_m(&mut b, Register::EAX, DEC_SRC2);
         mov_m(&mut b, Register::R11, DEC_IMM2);
         b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
+        translate_xmm_addr(&mut b);
+        trace_memory_write(&mut b);
         let m = MemoryOperand::with_base(Register::R10);
-        b.push(Instruction::with2(Code::Mov_rm8_r8, m, Register::AL).unwrap());
+        b.push(Instruction::with2(Code::Mov_rm8_r8, m, Register::R11L).unwrap());
+        b.jmp(dispatch);
+    }
+
+    // Packed SSE handlers operate directly on 16-byte XMM backing-store ranges.
+    // `translate_xmm_addr` makes the lifter's synthetic XMM addresses valid in
+    // the native VM while leaving ordinary process-memory operands unchanged.
+    fn emit_packed_handler(
+        b: &mut CodeBuilder,
+        sub_dec_ops: usize,
+        sub_resolve: usize,
+        dispatch: usize,
+        op: RiscOp,
+    ) {
+        b.call(sub_dec_ops);
+        // Resolve and translate sources, then preserve them on the physical
+        // stack. R8 is the bytecode-base register and must never be borrowed by
+        // a handler: corrupting it desynchronizes the next opcode decrypt and
+        // previously surfaced as STATUS_ILLEGAL_INSTRUCTION.
+        movzx8_m(b, Register::EAX, DEC_SRC1);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        translate_xmm_addr(b);
+        b.push(Instruction::with1(Code::Push_r64, Register::R10).unwrap());
+        let needs_src2 = !matches!(op, RiscOp::PackedMove);
+        if needs_src2 {
+            movzx8_m(b, Register::EAX, DEC_SRC2);
+            mov_m(b, Register::R11, DEC_IMM2);
+            b.call(sub_resolve);
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+            translate_xmm_addr(b);
+            b.push(Instruction::with1(Code::Push_r64, Register::R10).unwrap());
+        }
+        // Translate destination last, after all operand resolution.
+        movzx8_m(b, Register::EAX, DEC_DST);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        translate_xmm_addr(b);
+        if needs_src2 {
+            b.push(Instruction::with1(Code::Pop_r64, Register::R9).unwrap());
+        }
+        b.push(Instruction::with1(Code::Pop_r64, Register::R11).unwrap());
+        b.push(
+            Instruction::with2(
+                Code::Movups_xmm_xmmm128,
+                Register::XMM0,
+                MemoryOperand::with_base(Register::R11),
+            )
+            .unwrap(),
+        );
+        if needs_src2 {
+            b.push(
+                Instruction::with2(
+                    Code::Movups_xmm_xmmm128,
+                    Register::XMM1,
+                    MemoryOperand::with_base(Register::R9),
+                )
+                .unwrap(),
+            );
+        }
+        let code = match op {
+            RiscOp::PackedMove => None,
+            RiscOp::PackedAdd { elem_width: 1, .. } => Some(Code::Paddb_xmm_xmmm128),
+            RiscOp::PackedAdd { elem_width: 2, .. } => Some(Code::Paddw_xmm_xmmm128),
+            RiscOp::PackedAdd { elem_width: 4, .. } => Some(Code::Paddd_xmm_xmmm128),
+            RiscOp::PackedAdd { .. } => Some(Code::Paddq_xmm_xmmm128),
+            RiscOp::PackedSub { elem_width: 1, .. } => Some(Code::Psubb_xmm_xmmm128),
+            RiscOp::PackedSub { elem_width: 2, .. } => Some(Code::Psubw_xmm_xmmm128),
+            RiscOp::PackedSub { elem_width: 4, .. } => Some(Code::Psubd_xmm_xmmm128),
+            RiscOp::PackedSub { .. } => Some(Code::Psubq_xmm_xmmm128),
+            RiscOp::PackedXor => Some(Code::Pxor_xmm_xmmm128),
+            RiscOp::PackedAnd => Some(Code::Pand_xmm_xmmm128),
+            RiscOp::PackedOr => Some(Code::Por_xmm_xmmm128),
+            RiscOp::PackedAndNot => Some(Code::Pandn_xmm_xmmm128),
+            RiscOp::PackedCmpEq { elem_width: 1, .. } => Some(Code::Pcmpeqb_xmm_xmmm128),
+            RiscOp::PackedCmpEq { elem_width: 2, .. } => Some(Code::Pcmpeqw_xmm_xmmm128),
+            RiscOp::PackedCmpEq { elem_width: 4, .. } => Some(Code::Pcmpeqd_xmm_xmmm128),
+            RiscOp::PackedCmpEq { .. } => Some(Code::Pcmpeqq_xmm_xmmm128),
+            RiscOp::PackedCmpGt { elem_width: 1, .. } => Some(Code::Pcmpgtb_xmm_xmmm128),
+            RiscOp::PackedCmpGt { elem_width: 2, .. } => Some(Code::Pcmpgtw_xmm_xmmm128),
+            RiscOp::PackedCmpGt { elem_width: 4, .. } => Some(Code::Pcmpgtd_xmm_xmmm128),
+            RiscOp::PackedCmpGt { .. } => Some(Code::Pcmpgtq_xmm_xmmm128),
+            RiscOp::PackedUnpack {
+                elem_width: 1,
+                high: false,
+            } => Some(Code::Punpcklbw_xmm_xmmm128),
+            RiscOp::PackedUnpack {
+                elem_width: 2,
+                high: false,
+            } => Some(Code::Punpcklwd_xmm_xmmm128),
+            RiscOp::PackedUnpack {
+                elem_width: 4,
+                high: false,
+            } => Some(Code::Punpckldq_xmm_xmmm128),
+            RiscOp::PackedUnpack {
+                elem_width: 8,
+                high: false,
+            } => Some(Code::Punpcklqdq_xmm_xmmm128),
+            RiscOp::PackedUnpack {
+                elem_width: 1,
+                high: true,
+            } => Some(Code::Punpckhbw_xmm_xmmm128),
+            RiscOp::PackedUnpack {
+                elem_width: 2,
+                high: true,
+            } => Some(Code::Punpckhwd_xmm_xmmm128),
+            RiscOp::PackedUnpack {
+                elem_width: 4,
+                high: true,
+            } => Some(Code::Punpckhdq_xmm_xmmm128),
+            RiscOp::PackedUnpack {
+                elem_width: 8,
+                high: true,
+            } => Some(Code::Punpckhqdq_xmm_xmmm128),
+            _ => unreachable!("non-packed RiscOp passed to packed handler"),
+        };
+        if let Some(code) = code {
+            b.push(Instruction::with2(code, Register::XMM0, Register::XMM1).unwrap());
+        }
+        b.push(
+            Instruction::with2(
+                Code::Movups_xmmm128_xmm,
+                MemoryOperand::with_base(Register::R10),
+                Register::XMM0,
+            )
+            .unwrap(),
+        );
+        b.jmp(dispatch);
+    }
+
+    fn emit_packed_shift_right_q_handler(
+        b: &mut CodeBuilder,
+        sub_dec_ops: usize,
+        sub_resolve: usize,
+        dispatch: usize,
+    ) {
+        b.call(sub_dec_ops);
+        // Source address.
+        movzx8_m(b, Register::EAX, DEC_SRC1);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        translate_xmm_addr(b);
+        b.push(Instruction::with1(Code::Push_r64, Register::R10).unwrap());
+        // Dynamic count (the poly record preserves the original imm8 value).
+        movzx8_m(b, Register::EAX, DEC_SRC2);
+        mov_m(b, Register::R11, DEC_IMM2);
+        b.call(sub_resolve);
+        b.push(Instruction::with1(Code::Push_r64, Register::RAX).unwrap());
+        // Destination address.
+        movzx8_m(b, Register::EAX, DEC_DST);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        translate_xmm_addr(b);
+        b.push(Instruction::with1(Code::Pop_r64, Register::R9).unwrap());
+        b.push(Instruction::with1(Code::Pop_r64, Register::R11).unwrap());
+        b.push(
+            Instruction::with2(
+                Code::Movups_xmm_xmmm128,
+                Register::XMM0,
+                MemoryOperand::with_base(Register::R11),
+            )
+            .unwrap(),
+        );
+        b.push(Instruction::with2(Code::Movq_xmm_rm64, Register::XMM1, Register::R9).unwrap());
+        b.push(
+            Instruction::with2(Code::Psrlq_xmm_xmmm128, Register::XMM0, Register::XMM1).unwrap(),
+        );
+        b.push(
+            Instruction::with2(
+                Code::Movups_xmmm128_xmm,
+                MemoryOperand::with_base(Register::R10),
+                Register::XMM0,
+            )
+            .unwrap(),
+        );
+        b.jmp(dispatch);
+    }
+
+    fn emit_packed_shuffle_handler(
+        b: &mut CodeBuilder,
+        sub_dec_ops: usize,
+        sub_resolve: usize,
+        dispatch: usize,
+        low_words: bool,
+    ) {
+        b.call(sub_dec_ops);
+        movzx8_m(b, Register::EAX, DEC_SRC1);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        translate_xmm_addr(b);
+        b.push(Instruction::with1(Code::Push_r64, Register::R10).unwrap());
+        movzx8_m(b, Register::EAX, DEC_SRC2);
+        mov_m(b, Register::R11, DEC_IMM2);
+        b.call(sub_resolve);
+        b.push(Instruction::with1(Code::Push_r64, Register::RAX).unwrap());
+        movzx8_m(b, Register::EAX, DEC_DST);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        translate_xmm_addr(b);
+        b.push(Instruction::with1(Code::Pop_r64, Register::R9).unwrap());
+        b.push(Instruction::with1(Code::Pop_r64, Register::R11).unwrap());
+        // Snapshot the complete input so in-place shuffles cannot overwrite a
+        // lane which a later selector still needs.
+        b.push(Instruction::with2(Code::Sub_rm64_imm8, Register::RSP, 16).unwrap());
+        b.push(
+            Instruction::with2(
+                Code::Movups_xmm_xmmm128,
+                Register::XMM0,
+                MemoryOperand::with_base(Register::R11),
+            )
+            .unwrap(),
+        );
+        b.push(
+            Instruction::with2(
+                Code::Movups_xmmm128_xmm,
+                MemoryOperand::with_base(Register::RSP),
+                Register::XMM0,
+            )
+            .unwrap(),
+        );
+        if low_words {
+            b.push(
+                Instruction::with2(
+                    Code::Movups_xmmm128_xmm,
+                    MemoryOperand::with_base(Register::R10),
+                    Register::XMM0,
+                )
+                .unwrap(),
+            );
+        }
+        let width = if low_words { 2 } else { 4 };
+        for lane in 0..4i64 {
+            b.push(Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R9D).unwrap());
+            if lane != 0 {
+                b.push(
+                    Instruction::with2(Code::Shr_rm32_imm8, Register::ECX, (lane * 2) as i32)
+                        .unwrap(),
+                );
+            }
+            b.push(Instruction::with2(Code::And_rm32_imm8, Register::ECX, 3).unwrap());
+            let src = MemoryOperand::with_base_index_scale_displ_size(
+                Register::RSP,
+                Register::RCX,
+                width,
+                0,
+                1,
+            );
+            let dst = MemoryOperand::with_base_displ(Register::R10, lane * width as i64);
+            if low_words {
+                b.push(Instruction::with2(Code::Mov_r16_rm16, Register::AX, src).unwrap());
+                b.push(Instruction::with2(Code::Mov_rm16_r16, dst, Register::AX).unwrap());
+            } else {
+                b.push(Instruction::with2(Code::Mov_r32_rm32, Register::EAX, src).unwrap());
+                b.push(Instruction::with2(Code::Mov_rm32_r32, dst, Register::EAX).unwrap());
+            }
+        }
+        b.push(Instruction::with2(Code::Add_rm64_imm8, Register::RSP, 16).unwrap());
+        b.jmp(dispatch);
+    }
+
+    fn emit_shld_handler(
+        b: &mut CodeBuilder,
+        sub_dec_ops: usize,
+        sub_resolve: usize,
+        sub_store: usize,
+        dispatch: usize,
+        width: u8,
+    ) {
+        b.call(sub_dec_ops);
+        // Current destination value is resolved from DEC_DST.
+        movzx8_m(b, Register::EAX, DEC_DST);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        movzx8_m(b, Register::EAX, DEC_SRC1);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
+        b.push(Instruction::with1(Code::Push_r64, Register::R11).unwrap());
+        movzx8_m(b, Register::EAX, DEC_SRC2);
+        mov_m(b, Register::R11, DEC_IMM2);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::RAX).unwrap());
+        b.push(Instruction::with1(Code::Pop_r64, Register::R11).unwrap());
+        // Restore guest flags so count==0 preserves them exactly.
+        mov_m(b, Register::RAX, FLAGS_OFF);
+        b.push(Instruction::with1(Code::Push_r64, Register::RAX).unwrap());
+        b.push(Instruction::with(Code::Popfq));
+        match width {
+            2 => b.push(
+                Instruction::with3(
+                    Code::Shld_rm16_r16_CL,
+                    Register::R10W,
+                    Register::R11W,
+                    Register::CL,
+                )
+                .unwrap(),
+            ),
+            4 => b.push(
+                Instruction::with3(
+                    Code::Shld_rm32_r32_CL,
+                    Register::R10D,
+                    Register::R11D,
+                    Register::CL,
+                )
+                .unwrap(),
+            ),
+            _ => b.push(
+                Instruction::with3(
+                    Code::Shld_rm64_r64_CL,
+                    Register::R10,
+                    Register::R11,
+                    Register::CL,
+                )
+                .unwrap(),
+            ),
+        };
+        b.push(Instruction::with(Code::Pushfq));
+        b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
+        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, FLAG_MASK as i32).unwrap());
+        store_m(b, FLAGS_OFF, Register::RAX);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
+        b.call(sub_store);
+        b.jmp(dispatch);
+    }
+
+    fn emit_bit_test_handler(
+        b: &mut CodeBuilder,
+        sub_dec_ops: usize,
+        sub_resolve: usize,
+        sub_store: usize,
+        dispatch: usize,
+        width: u8,
+        modify: u8,
+        memory: bool,
+    ) {
+        b.call(sub_dec_ops);
+        movzx8_m(b, Register::EAX, DEC_SRC1);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        movzx8_m(b, Register::EAX, DEC_SRC2);
+        mov_m(b, Register::R11, DEC_IMM2);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
+        if memory {
+            translate_xmm_addr(b);
+        }
+        mov_m(b, Register::RAX, FLAGS_OFF);
+        b.push(Instruction::with1(Code::Push_r64, Register::RAX).unwrap());
+        b.push(Instruction::with(Code::Popfq));
+        let code = match (modify, width) {
+            (0, 4) => Code::Bt_rm32_r32,
+            (0, _) => Code::Bt_rm64_r64,
+            (1, 4) => Code::Btr_rm32_r32,
+            (1, _) => Code::Btr_rm64_r64,
+            (2, 4) => Code::Bts_rm32_r32,
+            _ => Code::Bts_rm64_r64,
+        };
+        if memory {
+            b.push(
+                Instruction::with2(
+                    code,
+                    MemoryOperand::with_base(Register::R10),
+                    if width == 4 {
+                        Register::R11D
+                    } else {
+                        Register::R11
+                    },
+                )
+                .unwrap(),
+            );
+        } else {
+            b.push(
+                Instruction::with2(
+                    code,
+                    if width == 4 {
+                        Register::R10D
+                    } else {
+                        Register::R10
+                    },
+                    if width == 4 {
+                        Register::R11D
+                    } else {
+                        Register::R11
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        b.push(Instruction::with(Code::Pushfq));
+        b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
+        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, FLAG_MASK as i32).unwrap());
+        store_m(b, FLAGS_OFF, Register::RAX);
+        if !memory {
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
+            b.call(sub_store);
+        }
+        b.jmp(dispatch);
+    }
+
+    fn emit_movmask_handler(
+        b: &mut CodeBuilder,
+        sub_dec_ops: usize,
+        sub_resolve: usize,
+        sub_store: usize,
+        dispatch: usize,
+        ps: bool,
+    ) {
+        b.call(sub_dec_ops);
+        movzx8_m(b, Register::EAX, DEC_SRC1);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        translate_xmm_addr(b);
+        b.push(
+            Instruction::with2(
+                Code::Movups_xmm_xmmm128,
+                Register::XMM0,
+                MemoryOperand::with_base(Register::R10),
+            )
+            .unwrap(),
+        );
+        b.push(
+            Instruction::with2(
+                if ps {
+                    Code::Movmskps_r32_xmm
+                } else {
+                    Code::Pmovmskb_r32_xmm
+                },
+                Register::EAX,
+                Register::XMM0,
+            )
+            .unwrap(),
+        );
+        b.call(sub_store);
+        b.jmp(dispatch);
+    }
+
+    fn emit_insert_word_handler(
+        b: &mut CodeBuilder,
+        sub_dec_ops: usize,
+        sub_resolve: usize,
+        dispatch: usize,
+    ) {
+        b.call(sub_dec_ops);
+        movzx8_m(b, Register::EAX, DEC_DST);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        translate_xmm_addr(b);
+        b.push(Instruction::with1(Code::Push_r64, Register::R10).unwrap());
+        movzx8_m(b, Register::EAX, DEC_SRC1);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with1(Code::Push_r64, Register::RAX).unwrap());
+        movzx8_m(b, Register::EAX, DEC_SRC2);
+        mov_m(b, Register::R11, DEC_IMM2);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 7).unwrap());
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::RAX).unwrap());
+        b.push(Instruction::with1(Code::Pop_r64, Register::R11).unwrap());
+        b.push(Instruction::with1(Code::Pop_r64, Register::R10).unwrap());
+        let dst = MemoryOperand::with_base_index_scale(Register::R10, Register::RCX, 2);
+        b.push(Instruction::with2(Code::Mov_rm16_r16, dst, Register::R11W).unwrap());
         b.jmp(dispatch);
     }
 
@@ -1571,7 +2943,11 @@ pub fn build_self_decoding_parts_with(
         dispatch: usize,
     ) {
         let bits = width as u32 * 8;
-        let mask: u64 = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let mask: u64 = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
         b.call(sub_dec_ops);
         // src1 -> R10
         movzx8_m(b, Register::EAX, DEC_SRC1);
@@ -1589,29 +2965,65 @@ pub fn build_self_decoding_parts_with(
         match width {
             1 => {
                 if signed {
-                    b.push(Instruction::with2(Code::Movsx_r64_rm8, Register::R10, Register::R10L).unwrap());
-                    b.push(Instruction::with2(Code::Movsx_r64_rm8, Register::R11, Register::R11L).unwrap());
+                    b.push(
+                        Instruction::with2(Code::Movsx_r64_rm8, Register::R10, Register::R10L)
+                            .unwrap(),
+                    );
+                    b.push(
+                        Instruction::with2(Code::Movsx_r64_rm8, Register::R11, Register::R11L)
+                            .unwrap(),
+                    );
                 } else {
-                    b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).unwrap());
-                    b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R11D, Register::R11L).unwrap());
+                    b.push(
+                        Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L)
+                            .unwrap(),
+                    );
+                    b.push(
+                        Instruction::with2(Code::Movzx_r32_rm8, Register::R11D, Register::R11L)
+                            .unwrap(),
+                    );
                 }
             }
             2 => {
                 if signed {
-                    b.push(Instruction::with2(Code::Movsx_r64_rm16, Register::R10, Register::R10W).unwrap());
-                    b.push(Instruction::with2(Code::Movsx_r64_rm16, Register::R11, Register::R11W).unwrap());
+                    b.push(
+                        Instruction::with2(Code::Movsx_r64_rm16, Register::R10, Register::R10W)
+                            .unwrap(),
+                    );
+                    b.push(
+                        Instruction::with2(Code::Movsx_r64_rm16, Register::R11, Register::R11W)
+                            .unwrap(),
+                    );
                 } else {
-                    b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R10D, Register::R10W).unwrap());
-                    b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R11D, Register::R11W).unwrap());
+                    b.push(
+                        Instruction::with2(Code::Movzx_r32_rm16, Register::R10D, Register::R10W)
+                            .unwrap(),
+                    );
+                    b.push(
+                        Instruction::with2(Code::Movzx_r32_rm16, Register::R11D, Register::R11W)
+                            .unwrap(),
+                    );
                 }
             }
             4 => {
                 if signed {
-                    b.push(Instruction::with2(Code::Movsxd_r64_rm32, Register::R10, Register::R10D).unwrap());
-                    b.push(Instruction::with2(Code::Movsxd_r64_rm32, Register::R11, Register::R11D).unwrap());
+                    b.push(
+                        Instruction::with2(Code::Movsxd_r64_rm32, Register::R10, Register::R10D)
+                            .unwrap(),
+                    );
+                    b.push(
+                        Instruction::with2(Code::Movsxd_r64_rm32, Register::R11, Register::R11D)
+                            .unwrap(),
+                    );
                 } else {
-                    b.push(Instruction::with2(Code::Mov_r32_rm32, Register::R10D, Register::R10D).unwrap());
-                    b.push(Instruction::with2(Code::Mov_r32_rm32, Register::R11D, Register::R11D).unwrap());
+                    b.push(
+                        Instruction::with2(Code::Mov_r32_rm32, Register::R10D, Register::R10D)
+                            .unwrap(),
+                    );
+                    b.push(
+                        Instruction::with2(Code::Mov_r32_rm32, Register::R11D, Register::R11D)
+                            .unwrap(),
+                    );
                 }
             }
             _ => {}
@@ -1623,7 +3035,11 @@ pub fn build_self_decoding_parts_with(
         // unsigned `mul` 을 쓰면 -1×2 의 high 가 0xFFFFFFFFFFFFFFFF 가 아닌 1 이 된다.
         // 8/16/32비트 signed 는 movsx 로 64비트 부호 확장 후 low-64 를 마스크/시프트로
         // 정합하지만 64비트는 RDX(high)를 그대로 쓰므로 반드시 `imul` 을 사용해야 한다.
-        let mcode = if signed { Code::Imul_rm64 } else { Code::Mul_rm64 };
+        let mcode = if signed {
+            Code::Imul_rm64
+        } else {
+            Code::Mul_rm64
+        };
         b.push(Instruction::with1(mcode, Register::R11).unwrap());
         // high = (full>>bits)&mask -> R9 (low = RAX). signed/64비트 곱은 low 64비트
         // = RAX, high = RDX. bits<64 는 high 를 폭 마스크로 잘라 상위 가비지(부호
@@ -1635,7 +3051,9 @@ pub fn build_self_decoding_parts_with(
             b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::R9, bits as i32).unwrap());
             if mask != u64::MAX {
                 movi(b, Register::R10, mask);
-                b.push(Instruction::with2(Code::And_rm64_r64, Register::R9, Register::R10).unwrap());
+                b.push(
+                    Instruction::with2(Code::And_rm64_r64, Register::R9, Register::R10).unwrap(),
+                );
             }
         }
         // low half 정합: 2w-bit 곱의 하위 half로 마스크해 signed 부호 확장 잔여
@@ -1657,7 +3075,9 @@ pub fn build_self_decoding_parts_with(
         if signed {
             // sign_ext = (low>>(bits-1) & 1) ? mask : 0 ; ovf = high != sign_ext
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::RAX).unwrap()); // low
-            b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RCX, (bits - 1) as i32).unwrap());
+            b.push(
+                Instruction::with2(Code::Shr_rm64_imm8, Register::RCX, (bits - 1) as i32).unwrap(),
+            );
             b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, 1).unwrap());
             b.push(Instruction::with1(Code::Neg_rm64, Register::RCX).unwrap()); // 0 or all-ones
             movi(b, Register::R10, mask);
@@ -1665,11 +3085,15 @@ pub fn build_self_decoding_parts_with(
             b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R9, Register::RCX).unwrap()); // high ^ sign_ext
             b.push(Instruction::with2(Code::Test_rm64_r64, Register::R9, Register::R9).unwrap());
             b.push(Instruction::with1(Code::Setne_rm8, Register::R10L).unwrap());
-            b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).unwrap());
+            b.push(
+                Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).unwrap(),
+            );
         } else {
             b.push(Instruction::with2(Code::Test_rm64_r64, Register::R9, Register::R9).unwrap());
             b.push(Instruction::with1(Code::Setne_rm8, Register::R10L).unwrap());
-            b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).unwrap());
+            b.push(
+                Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).unwrap(),
+            );
         }
         // store CF=OF=ovf into FLAGS, preserving ZF/SF/PF/AF (0x801 = CF|OF).
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, m(FLAGS_OFF)).unwrap());
@@ -1707,13 +3131,21 @@ pub fn build_self_decoding_parts_with(
         // width-mask divisor.
         match width {
             1 => {
-                b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).unwrap());
+                b.push(
+                    Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L)
+                        .unwrap(),
+                );
             }
             2 => {
-                b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R10D, Register::R10W).unwrap());
+                b.push(
+                    Instruction::with2(Code::Movzx_r32_rm16, Register::R10D, Register::R10W)
+                        .unwrap(),
+                );
             }
             4 => {
-                b.push(Instruction::with2(Code::Mov_r32_rm32, Register::R10D, Register::R10D).unwrap());
+                b.push(
+                    Instruction::with2(Code::Mov_r32_rm32, Register::R10D, Register::R10D).unwrap(),
+                );
             }
             _ => {}
         }
@@ -1725,24 +3157,89 @@ pub fn build_self_decoding_parts_with(
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::RDX).unwrap());
         let rbxmem = |disp: i64, _sz: u32| -> MemoryOperand {
             let a = disp.unsigned_abs();
-            let dsz = if a == 0 { 0 } else if a <= 0x7F { 1 } else if a <= 0x7FFF { 2 } else if a <= 0x7FFFFFFF { 4 } else { 8 };
-            MemoryOperand::with_base_index_scale_displ_size(Register::RBX, Register::None, 1, disp, dsz)
+            let dsz = if a == 0 {
+                0
+            } else if a <= 0x7F {
+                1
+            } else if a <= 0x7FFF {
+                2
+            } else if a <= 0x7FFFFFFF {
+                4
+            } else {
+                8
+            };
+            MemoryOperand::with_base_index_scale_displ_size(
+                Register::RBX,
+                Register::None,
+                1,
+                disp,
+                dsz,
+            )
         };
         match width {
             1 => {
-                b.push(Instruction::with2(Code::Mov_r16_rm16, Register::AX, rbxmem(REGS_OFF as i64, 0)).unwrap());
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_r16_rm16,
+                        Register::AX,
+                        rbxmem(REGS_OFF as i64, 0),
+                    )
+                    .unwrap(),
+                );
             }
             2 => {
-                b.push(Instruction::with2(Code::Mov_r16_rm16, Register::DX, rbxmem((REGS_OFF + 16) as i64, 4)).unwrap());
-                b.push(Instruction::with2(Code::Mov_r16_rm16, Register::AX, rbxmem(REGS_OFF as i64, 0)).unwrap());
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_r16_rm16,
+                        Register::DX,
+                        rbxmem((REGS_OFF + 16) as i64, 4),
+                    )
+                    .unwrap(),
+                );
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_r16_rm16,
+                        Register::AX,
+                        rbxmem(REGS_OFF as i64, 0),
+                    )
+                    .unwrap(),
+                );
             }
             4 => {
-                b.push(Instruction::with2(Code::Mov_r32_rm32, Register::EDX, rbxmem((REGS_OFF + 16) as i64, 4)).unwrap());
-                b.push(Instruction::with2(Code::Mov_r32_rm32, Register::EAX, rbxmem(REGS_OFF as i64, 4)).unwrap());
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_r32_rm32,
+                        Register::EDX,
+                        rbxmem((REGS_OFF + 16) as i64, 4),
+                    )
+                    .unwrap(),
+                );
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_r32_rm32,
+                        Register::EAX,
+                        rbxmem(REGS_OFF as i64, 4),
+                    )
+                    .unwrap(),
+                );
             }
             _ => {
-                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RDX, rbxmem((REGS_OFF + 16) as i64, 8)).unwrap());
-                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, rbxmem(REGS_OFF as i64, 8)).unwrap());
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_r64_rm64,
+                        Register::RDX,
+                        rbxmem((REGS_OFF + 16) as i64, 8),
+                    )
+                    .unwrap(),
+                );
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_r64_rm64,
+                        Register::RAX,
+                        rbxmem(REGS_OFF as i64, 8),
+                    )
+                    .unwrap(),
+                );
             }
         }
         let (c, reg) = match (signed, width) {
@@ -1759,19 +3256,33 @@ pub fn build_self_decoding_parts_with(
         // extract quotient -> R10, remainder -> R9 (w>=2). width 1: AX holds (r<<8)|q.
         match width {
             1 => {
-                b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R10D, Register::AX).unwrap());
+                b.push(
+                    Instruction::with2(Code::Movzx_r32_rm16, Register::R10D, Register::AX).unwrap(),
+                );
             }
             2 => {
-                b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R10D, Register::AX).unwrap());
-                b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R9D, Register::DX).unwrap());
+                b.push(
+                    Instruction::with2(Code::Movzx_r32_rm16, Register::R10D, Register::AX).unwrap(),
+                );
+                b.push(
+                    Instruction::with2(Code::Movzx_r32_rm16, Register::R9D, Register::DX).unwrap(),
+                );
             }
             4 => {
-                b.push(Instruction::with2(Code::Mov_r32_rm32, Register::R10D, Register::EAX).unwrap());
-                b.push(Instruction::with2(Code::Mov_r32_rm32, Register::R9D, Register::EDX).unwrap());
+                b.push(
+                    Instruction::with2(Code::Mov_r32_rm32, Register::R10D, Register::EAX).unwrap(),
+                );
+                b.push(
+                    Instruction::with2(Code::Mov_r32_rm32, Register::R9D, Register::EDX).unwrap(),
+                );
             }
             _ => {
-                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
-                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::RDX).unwrap());
+                b.push(
+                    Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap(),
+                );
+                b.push(
+                    Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::RDX).unwrap(),
+                );
             }
         }
         // restore state_base.
@@ -1818,42 +3329,160 @@ pub fn build_self_decoding_parts_with(
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
         // src2 -> R11 (Add/Sub만; Inc/Dec/Not는 src1 단일)
-        if op == WidthAluOp::Add || op == WidthAluOp::Sub {
+        if matches!(
+            op,
+            WidthAluOp::Add | WidthAluOp::Sub | WidthAluOp::Adc | WidthAluOp::Sbb
+        ) {
             movzx8_m(b, Register::EAX, DEC_SRC2);
             mov_m(b, Register::R11, DEC_IMM2);
             b.call(sub_resolve);
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
         }
+        // ADC/SBB consume the guest CF. Operand resolution calls clobber host
+        // flags, so restore only CF from the guest flag word immediately before
+        // executing the hardware instruction.
+        if matches!(op, WidthAluOp::Adc | WidthAluOp::Sbb) {
+            mov_m(b, Register::RAX, FLAGS_OFF);
+            b.push(Instruction::with2(Code::Bt_rm64_imm8, Register::RAX, 0u32).unwrap());
+        }
         // 폭별 연산 (x86 부분-쓰기: 8/16비트는 상위 비트 보존 — eval_state의
         // preserve_upper와 동치).
         match (op, width) {
-            (WidthAluOp::Add, 1) => b.push(Instruction::with2(Code::Add_rm8_r8, Register::R10L, Register::R11L).unwrap()),
-            (WidthAluOp::Add, 2) => b.push(Instruction::with2(Code::Add_rm16_r16, Register::R10W, Register::R11W).unwrap()),
-            (WidthAluOp::Add, 4) => b.push(Instruction::with2(Code::Add_rm32_r32, Register::R10D, Register::R11D).unwrap()),
-            (WidthAluOp::Add, _) => b.push(Instruction::with2(Code::Add_rm64_r64, Register::R10, Register::R11).unwrap()),
-            (WidthAluOp::Sub, 1) => b.push(Instruction::with2(Code::Sub_rm8_r8, Register::R10L, Register::R11L).unwrap()),
-            (WidthAluOp::Sub, 2) => b.push(Instruction::with2(Code::Sub_rm16_r16, Register::R10W, Register::R11W).unwrap()),
-            (WidthAluOp::Sub, 4) => b.push(Instruction::with2(Code::Sub_rm32_r32, Register::R10D, Register::R11D).unwrap()),
-            (WidthAluOp::Sub, _) => b.push(Instruction::with2(Code::Sub_rm64_r64, Register::R10, Register::R11).unwrap()),
-            (WidthAluOp::Inc, 1) => b.push(Instruction::with1(Code::Inc_rm8, Register::R10L).unwrap()),
-            (WidthAluOp::Inc, 2) => b.push(Instruction::with1(Code::Inc_rm16, Register::R10W).unwrap()),
-            (WidthAluOp::Inc, 4) => b.push(Instruction::with1(Code::Inc_rm32, Register::R10D).unwrap()),
-            (WidthAluOp::Inc, _) => b.push(Instruction::with1(Code::Inc_rm64, Register::R10).unwrap()),
-            (WidthAluOp::Dec, 1) => b.push(Instruction::with1(Code::Dec_rm8, Register::R10L).unwrap()),
-            (WidthAluOp::Dec, 2) => b.push(Instruction::with1(Code::Dec_rm16, Register::R10W).unwrap()),
-            (WidthAluOp::Dec, 4) => b.push(Instruction::with1(Code::Dec_rm32, Register::R10D).unwrap()),
-            (WidthAluOp::Dec, _) => b.push(Instruction::with1(Code::Dec_rm64, Register::R10).unwrap()),
-            (WidthAluOp::Not, 1) => b.push(Instruction::with1(Code::Not_rm8, Register::R10L).unwrap()),
-            (WidthAluOp::Not, 2) => b.push(Instruction::with1(Code::Not_rm16, Register::R10W).unwrap()),
-            (WidthAluOp::Not, 4) => b.push(Instruction::with1(Code::Not_rm32, Register::R10D).unwrap()),
-            (WidthAluOp::Not, _) => b.push(Instruction::with1(Code::Not_rm64, Register::R10).unwrap()),
+            (WidthAluOp::Add, 1) => b.push(
+                Instruction::with2(Code::Add_rm8_r8, Register::R10L, Register::R11L).unwrap(),
+            ),
+            (WidthAluOp::Add, 2) => b.push(
+                Instruction::with2(Code::Add_rm16_r16, Register::R10W, Register::R11W).unwrap(),
+            ),
+            (WidthAluOp::Add, 4) => b.push(
+                Instruction::with2(Code::Add_rm32_r32, Register::R10D, Register::R11D).unwrap(),
+            ),
+            (WidthAluOp::Add, _) => b.push(
+                Instruction::with2(Code::Add_rm64_r64, Register::R10, Register::R11).unwrap(),
+            ),
+            (WidthAluOp::Sub, 1) => b.push(
+                Instruction::with2(Code::Sub_rm8_r8, Register::R10L, Register::R11L).unwrap(),
+            ),
+            (WidthAluOp::Sub, 2) => b.push(
+                Instruction::with2(Code::Sub_rm16_r16, Register::R10W, Register::R11W).unwrap(),
+            ),
+            (WidthAluOp::Sub, 4) => b.push(
+                Instruction::with2(Code::Sub_rm32_r32, Register::R10D, Register::R11D).unwrap(),
+            ),
+            (WidthAluOp::Sub, _) => b.push(
+                Instruction::with2(Code::Sub_rm64_r64, Register::R10, Register::R11).unwrap(),
+            ),
+            (WidthAluOp::Adc, 1) => b.push(
+                Instruction::with2(Code::Adc_rm8_r8, Register::R10L, Register::R11L).unwrap(),
+            ),
+            (WidthAluOp::Adc, 2) => b.push(
+                Instruction::with2(Code::Adc_rm16_r16, Register::R10W, Register::R11W).unwrap(),
+            ),
+            (WidthAluOp::Adc, 4) => b.push(
+                Instruction::with2(Code::Adc_rm32_r32, Register::R10D, Register::R11D).unwrap(),
+            ),
+            (WidthAluOp::Adc, _) => b.push(
+                Instruction::with2(Code::Adc_rm64_r64, Register::R10, Register::R11).unwrap(),
+            ),
+            (WidthAluOp::Sbb, 1) => b.push(
+                Instruction::with2(Code::Sbb_rm8_r8, Register::R10L, Register::R11L).unwrap(),
+            ),
+            (WidthAluOp::Sbb, 2) => b.push(
+                Instruction::with2(Code::Sbb_rm16_r16, Register::R10W, Register::R11W).unwrap(),
+            ),
+            (WidthAluOp::Sbb, 4) => b.push(
+                Instruction::with2(Code::Sbb_rm32_r32, Register::R10D, Register::R11D).unwrap(),
+            ),
+            (WidthAluOp::Sbb, _) => b.push(
+                Instruction::with2(Code::Sbb_rm64_r64, Register::R10, Register::R11).unwrap(),
+            ),
+            (WidthAluOp::Inc, 1) => {
+                b.push(Instruction::with1(Code::Inc_rm8, Register::R10L).unwrap())
+            }
+            (WidthAluOp::Inc, 2) => {
+                b.push(Instruction::with1(Code::Inc_rm16, Register::R10W).unwrap())
+            }
+            (WidthAluOp::Inc, 4) => {
+                b.push(Instruction::with1(Code::Inc_rm32, Register::R10D).unwrap())
+            }
+            (WidthAluOp::Inc, _) => {
+                b.push(Instruction::with1(Code::Inc_rm64, Register::R10).unwrap())
+            }
+            (WidthAluOp::Dec, 1) => {
+                b.push(Instruction::with1(Code::Dec_rm8, Register::R10L).unwrap())
+            }
+            (WidthAluOp::Dec, 2) => {
+                b.push(Instruction::with1(Code::Dec_rm16, Register::R10W).unwrap())
+            }
+            (WidthAluOp::Dec, 4) => {
+                b.push(Instruction::with1(Code::Dec_rm32, Register::R10D).unwrap())
+            }
+            (WidthAluOp::Dec, _) => {
+                b.push(Instruction::with1(Code::Dec_rm64, Register::R10).unwrap())
+            }
+            (WidthAluOp::Not, 1) => {
+                b.push(Instruction::with1(Code::Not_rm8, Register::R10L).unwrap())
+            }
+            (WidthAluOp::Not, 2) => {
+                b.push(Instruction::with1(Code::Not_rm16, Register::R10W).unwrap())
+            }
+            (WidthAluOp::Not, 4) => {
+                b.push(Instruction::with1(Code::Not_rm32, Register::R10D).unwrap())
+            }
+            (WidthAluOp::Not, _) => {
+                b.push(Instruction::with1(Code::Not_rm64, Register::R10).unwrap())
+            }
         };
         // 플래그: Add/Sub → 폭별 하드웨어 플래그(CF|PF|ZF|SF|OF). Inc/Dec → CF
         // 보존(emit_store_flags_incdec). Not → 플래그 불변 (x86 NOT).
         match op {
-            WidthAluOp::Add | WidthAluOp::Sub => emit_store_flags(b),
+            WidthAluOp::Add | WidthAluOp::Sub | WidthAluOp::Adc | WidthAluOp::Sbb => {
+                emit_store_flags(b)
+            }
             WidthAluOp::Inc | WidthAluOp::Dec => emit_store_flags_incdec(b),
             WidthAluOp::Not => {}
+        }
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
+        b.call(sub_store);
+        b.jmp(dispatch);
+    }
+
+    fn emit_rotate_left_handler(
+        b: &mut CodeBuilder,
+        sub_dec_ops: usize,
+        sub_resolve: usize,
+        sub_store: usize,
+        dispatch: usize,
+        width: u8,
+    ) {
+        b.call(sub_dec_ops);
+        movzx8_m(b, Register::EAX, DEC_SRC1);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+        movzx8_m(b, Register::EAX, DEC_SRC2);
+        mov_m(b, Register::R11, DEC_IMM2);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::RAX).unwrap());
+        mov_m(b, Register::RAX, FLAGS_OFF);
+        b.push(Instruction::with1(Code::Push_r64, Register::RAX).unwrap());
+        b.push(Instruction::with(Code::Popfq));
+        let (code, dst) = match width {
+            1 => (Code::Rol_rm8_CL, Register::R10L),
+            2 => (Code::Rol_rm16_CL, Register::R10W),
+            4 => (Code::Rol_rm32_CL, Register::R10D),
+            _ => (Code::Rol_rm64_CL, Register::R10),
+        };
+        b.push(Instruction::with2(code, dst, Register::CL).unwrap());
+        emit_store_flags(b);
+        if width == 1 {
+            b.push(
+                Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).unwrap(),
+            );
+        } else if width == 2 {
+            b.push(
+                Instruction::with2(Code::Movzx_r32_rm16, Register::R10D, Register::R10W).unwrap(),
+            );
         }
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
         b.call(sub_store);
@@ -1889,10 +3518,16 @@ pub fn build_self_decoding_parts_with(
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
         // XMM0 = src1 bits, XMM1 = src2 bits, op, result bits -> R10.
         if width == 4 {
-            b.push(Instruction::with2(Code::Movd_xmm_rm32, Register::XMM0, Register::R10D).unwrap());
-            b.push(Instruction::with2(Code::Movd_xmm_rm32, Register::XMM1, Register::R11D).unwrap());
+            b.push(
+                Instruction::with2(Code::Movd_xmm_rm32, Register::XMM0, Register::R10D).unwrap(),
+            );
+            b.push(
+                Instruction::with2(Code::Movd_xmm_rm32, Register::XMM1, Register::R11D).unwrap(),
+            );
             b.push(Instruction::with2(op32, Register::XMM0, Register::XMM1).unwrap());
-            b.push(Instruction::with2(Code::Movd_rm32_xmm, Register::R10D, Register::XMM0).unwrap());
+            b.push(
+                Instruction::with2(Code::Movd_rm32_xmm, Register::R10D, Register::XMM0).unwrap(),
+            );
         } else {
             b.push(Instruction::with2(Code::Movq_xmm_rm64, Register::XMM0, Register::R10).unwrap());
             b.push(Instruction::with2(Code::Movq_xmm_rm64, Register::XMM1, Register::R11).unwrap());
@@ -1936,24 +3571,44 @@ pub fn build_self_decoding_parts_with(
                     (Code::Cvtsi2ss_xmm_rm64, false)
                 };
                 let load_code = if dst_bits == 8 {
-                    if use_32 { Code::Cvtsi2sd_xmm_rm32 } else { Code::Cvtsi2sd_xmm_rm64 }
+                    if use_32 {
+                        Code::Cvtsi2sd_xmm_rm32
+                    } else {
+                        Code::Cvtsi2sd_xmm_rm64
+                    }
                 } else {
                     load_code
                 };
-                let src_reg = if use_32 { Register::R10D } else { Register::R10 };
+                let src_reg = if use_32 {
+                    Register::R10D
+                } else {
+                    Register::R10
+                };
                 b.push(Instruction::with2(load_code, Register::XMM0, src_reg).unwrap());
                 if dst_bits == 4 {
-                    b.push(Instruction::with2(Code::Movd_rm32_xmm, Register::R10D, Register::XMM0).unwrap());
+                    b.push(
+                        Instruction::with2(Code::Movd_rm32_xmm, Register::R10D, Register::XMM0)
+                            .unwrap(),
+                    );
                 } else {
-                    b.push(Instruction::with2(Code::Movq_rm64_xmm, Register::R10, Register::XMM0).unwrap());
+                    b.push(
+                        Instruction::with2(Code::Movq_rm64_xmm, Register::R10, Register::XMM0)
+                            .unwrap(),
+                    );
                 }
             }
             // FloatToInt: src 는 float bits, dst 는 정수 (indefinite 포함).
             FloatCvtMode::FloatToInt => {
                 if src_bits == 4 {
-                    b.push(Instruction::with2(Code::Movd_xmm_rm32, Register::XMM0, Register::R10D).unwrap());
+                    b.push(
+                        Instruction::with2(Code::Movd_xmm_rm32, Register::XMM0, Register::R10D)
+                            .unwrap(),
+                    );
                 } else {
-                    b.push(Instruction::with2(Code::Movq_xmm_rm64, Register::XMM0, Register::R10).unwrap());
+                    b.push(
+                        Instruction::with2(Code::Movq_xmm_rm64, Register::XMM0, Register::R10)
+                            .unwrap(),
+                    );
                 }
                 let (cvt_code, dst_reg) = match (src_bits, dst_bits, truncate) {
                     (4, 4, true) => (Code::Cvttss2si_r32_xmmm32, Register::R10D),
@@ -1970,13 +3625,39 @@ pub fn build_self_decoding_parts_with(
             // FloatToFloat: f32↔f64 변환.
             FloatCvtMode::FloatToFloat => {
                 if src_bits == 4 {
-                    b.push(Instruction::with2(Code::Movd_xmm_rm32, Register::XMM0, Register::R10D).unwrap());
-                    b.push(Instruction::with2(Code::Cvtss2sd_xmm_xmmm32, Register::XMM0, Register::XMM0).unwrap());
-                    b.push(Instruction::with2(Code::Movq_rm64_xmm, Register::R10, Register::XMM0).unwrap());
+                    b.push(
+                        Instruction::with2(Code::Movd_xmm_rm32, Register::XMM0, Register::R10D)
+                            .unwrap(),
+                    );
+                    b.push(
+                        Instruction::with2(
+                            Code::Cvtss2sd_xmm_xmmm32,
+                            Register::XMM0,
+                            Register::XMM0,
+                        )
+                        .unwrap(),
+                    );
+                    b.push(
+                        Instruction::with2(Code::Movq_rm64_xmm, Register::R10, Register::XMM0)
+                            .unwrap(),
+                    );
                 } else {
-                    b.push(Instruction::with2(Code::Movq_xmm_rm64, Register::XMM0, Register::R10).unwrap());
-                    b.push(Instruction::with2(Code::Cvtsd2ss_xmm_xmmm64, Register::XMM0, Register::XMM0).unwrap());
-                    b.push(Instruction::with2(Code::Movd_rm32_xmm, Register::R10D, Register::XMM0).unwrap());
+                    b.push(
+                        Instruction::with2(Code::Movq_xmm_rm64, Register::XMM0, Register::R10)
+                            .unwrap(),
+                    );
+                    b.push(
+                        Instruction::with2(
+                            Code::Cvtsd2ss_xmm_xmmm64,
+                            Register::XMM0,
+                            Register::XMM0,
+                        )
+                        .unwrap(),
+                    );
+                    b.push(
+                        Instruction::with2(Code::Movd_rm32_xmm, Register::R10D, Register::XMM0)
+                            .unwrap(),
+                    );
                 }
             }
         }
@@ -2002,11 +3683,15 @@ pub fn build_self_decoding_parts_with(
     fn emit_cond_block_body(b: &mut CodeBuilder, c: u8) {
         let setne = |b: &mut CodeBuilder| {
             b.push(Instruction::with1(Code::Setne_rm8, Register::R10L).unwrap());
-            b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).unwrap());
+            b.push(
+                Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).unwrap(),
+            );
         };
         let sete = |b: &mut CodeBuilder| {
             b.push(Instruction::with1(Code::Sete_rm8, Register::R10L).unwrap());
-            b.push(Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).unwrap());
+            b.push(
+                Instruction::with2(Code::Movzx_r32_rm8, Register::R10D, Register::R10L).unwrap(),
+            );
         };
         // delta = SF^OF (0 iff SF==OF) computed in RAX.
         let emit_delta = |b: &mut CodeBuilder| {
@@ -2059,33 +3744,49 @@ pub fn build_self_decoding_parts_with(
                 emit_delta(b);
                 b.push(Instruction::with2(Code::Xor_rm64_imm32, Register::RAX, 1).unwrap()); // e = SF==OF
                 b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 1).unwrap());
-                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::R11).unwrap());
+                b.push(
+                    Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::R11).unwrap(),
+                );
                 b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RCX, 6).unwrap());
                 b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, 1).unwrap());
                 b.push(Instruction::with2(Code::Xor_rm64_imm32, Register::RCX, 1).unwrap()); // nz = !ZF
-                b.push(Instruction::with2(Code::And_rm64_r64, Register::RAX, Register::RCX).unwrap());
-                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+                b.push(
+                    Instruction::with2(Code::And_rm64_r64, Register::RAX, Register::RCX).unwrap(),
+                );
+                b.push(
+                    Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap(),
+                );
             }
             COND_LESS => {
                 // L = SF!=OF = delta
                 emit_delta(b);
-                b.push(Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap());
+                b.push(
+                    Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(),
+                );
                 setne(b);
             }
             COND_GREATER_OR_EQUAL => {
                 // GE = SF==OF = !delta
                 emit_delta(b);
-                b.push(Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap());
+                b.push(
+                    Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(),
+                );
                 sete(b);
             }
             COND_LESS_OR_EQUAL => {
                 // LE = ZF || (SF!=OF) = z | delta
                 emit_delta(b);
-                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::R11).unwrap());
+                b.push(
+                    Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::R11).unwrap(),
+                );
                 b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RCX, 6).unwrap());
                 b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, 1).unwrap());
-                b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap());
-                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+                b.push(
+                    Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap(),
+                );
+                b.push(
+                    Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap(),
+                );
             }
             COND_ABOVE => {
                 // A = !CF && !ZF
@@ -2115,21 +3816,31 @@ pub fn build_self_decoding_parts_with(
                 sete(b);
             }
             COND_COUNTER_ZERO_2 => {
-                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R9).unwrap());
+                b.push(
+                    Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R9).unwrap(),
+                );
                 b.push(Instruction::with2(Code::Shl_rm64_imm8, Register::RAX, 48).unwrap());
                 b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RAX, 48).unwrap());
-                b.push(Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap());
+                b.push(
+                    Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(),
+                );
                 sete(b);
             }
             COND_COUNTER_ZERO_4 => {
-                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R9).unwrap());
+                b.push(
+                    Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R9).unwrap(),
+                );
                 b.push(Instruction::with2(Code::Shl_rm64_imm8, Register::RAX, 32).unwrap());
                 b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::RAX, 32).unwrap());
-                b.push(Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap());
+                b.push(
+                    Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(),
+                );
                 sete(b);
             }
             COND_COUNTER_ZERO_8 => {
-                b.push(Instruction::with2(Code::Test_rm64_r64, Register::R9, Register::R9).unwrap());
+                b.push(
+                    Instruction::with2(Code::Test_rm64_r64, Register::R9, Register::R9).unwrap(),
+                );
                 sete(b);
             }
             _ => {
@@ -2159,11 +3870,28 @@ pub fn build_self_decoding_parts_with(
             movzx8_m(b, Register::ECX, DEC_COND);
             // dispatch chain over the canonical cond codes.
             let conds: [u8; 22] = [
-                COND_ALWAYS, COND_ZERO, COND_NOT_ZERO, COND_CARRY, COND_NOT_CARRY,
-                COND_SIGN, COND_NOT_SIGN, COND_OVERFLOW, COND_NOT_OVERFLOW, COND_GREATER,
-                COND_LESS, COND_GREATER_OR_EQUAL, COND_LESS_OR_EQUAL, COND_ABOVE,
-                COND_ABOVE_OR_EQUAL, COND_BELOW, COND_BELOW_OR_EQUAL, COND_PARITY,
-                COND_NOT_PARITY, COND_COUNTER_ZERO_2, COND_COUNTER_ZERO_4, COND_COUNTER_ZERO_8,
+                COND_ALWAYS,
+                COND_ZERO,
+                COND_NOT_ZERO,
+                COND_CARRY,
+                COND_NOT_CARRY,
+                COND_SIGN,
+                COND_NOT_SIGN,
+                COND_OVERFLOW,
+                COND_NOT_OVERFLOW,
+                COND_GREATER,
+                COND_LESS,
+                COND_GREATER_OR_EQUAL,
+                COND_LESS_OR_EQUAL,
+                COND_ABOVE,
+                COND_ABOVE_OR_EQUAL,
+                COND_BELOW,
+                COND_BELOW_OR_EQUAL,
+                COND_PARITY,
+                COND_NOT_PARITY,
+                COND_COUNTER_ZERO_2,
+                COND_COUNTER_ZERO_4,
+                COND_COUNTER_ZERO_8,
             ];
             let mut je_bi: Vec<(u8, usize)> = Vec::with_capacity(conds.len());
             for c in conds {
@@ -2173,7 +3901,9 @@ pub fn build_self_decoding_parts_with(
             // continuation (unknown cond falls through here with R10 = 0).
             let cont = b.len();
             if is_cmov {
-                b.push(Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).unwrap());
+                b.push(
+                    Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).unwrap(),
+                );
                 let skip_guess = b.len() + 1;
                 b.je(skip_guess);
                 movzx8_m(b, Register::EAX, DEC_SRC1);
@@ -2188,7 +3918,9 @@ pub fn build_self_decoding_parts_with(
                     }
                 }
             } else {
-                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap());
+                b.push(
+                    Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R10).unwrap(),
+                );
                 b.call(sub_store);
                 b.jmp(dispatch);
             }
@@ -2212,22 +3944,291 @@ pub fn build_self_decoding_parts_with(
     for (si, signed) in [false, true].iter().enumerate() {
         for (wi, w) in [1u8, 2, 4, 8].iter().enumerate() {
             mul_h[si][wi] = b.len();
-            emit_mul_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, *signed, *w, true, dispatch);
+            emit_mul_handler(
+                &mut b,
+                sub_dec_ops,
+                sub_resolve,
+                sub_store,
+                *signed,
+                *w,
+                true,
+                dispatch,
+            );
         }
     }
     let mut mullow_h: [[usize; 3]; 2] = [[0; 3]; 2];
     for (si, signed) in [false, true].iter().enumerate() {
         for (wi, w) in [2u8, 4, 8].iter().enumerate() {
             mullow_h[si][wi] = b.len();
-            emit_mul_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, *signed, *w, false, dispatch);
+            emit_mul_handler(
+                &mut b,
+                sub_dec_ops,
+                sub_resolve,
+                sub_store,
+                *signed,
+                *w,
+                false,
+                dispatch,
+            );
         }
     }
     let mut div_h: [[usize; 4]; 2] = [[0; 4]; 2];
     for (si, signed) in [false, true].iter().enumerate() {
         for (wi, w) in [1u8, 2, 4, 8].iter().enumerate() {
             div_h[si][wi] = b.len();
-            emit_div_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, *signed, *w, dispatch);
+            emit_div_handler(
+                &mut b,
+                sub_dec_ops,
+                sub_resolve,
+                sub_store,
+                *signed,
+                *w,
+                dispatch,
+            );
         }
+    }
+
+    // P1: packed SSE handlers. Keep the exact RiscOp beside its offset so the
+    // randomized ISA and handler table are populated from one canonical list.
+    let packed_ops = [
+        RiscOp::PackedMove,
+        RiscOp::PackedAdd {
+            elem_width: 1,
+            lanes: 16,
+        },
+        RiscOp::PackedAdd {
+            elem_width: 2,
+            lanes: 8,
+        },
+        RiscOp::PackedAdd {
+            elem_width: 4,
+            lanes: 4,
+        },
+        RiscOp::PackedAdd {
+            elem_width: 8,
+            lanes: 2,
+        },
+        RiscOp::PackedSub {
+            elem_width: 1,
+            lanes: 16,
+        },
+        RiscOp::PackedSub {
+            elem_width: 2,
+            lanes: 8,
+        },
+        RiscOp::PackedSub {
+            elem_width: 4,
+            lanes: 4,
+        },
+        RiscOp::PackedSub {
+            elem_width: 8,
+            lanes: 2,
+        },
+        RiscOp::PackedXor,
+        RiscOp::PackedAnd,
+        RiscOp::PackedOr,
+        RiscOp::PackedAndNot,
+        RiscOp::PackedCmpEq {
+            elem_width: 1,
+            lanes: 16,
+        },
+        RiscOp::PackedCmpEq {
+            elem_width: 2,
+            lanes: 8,
+        },
+        RiscOp::PackedCmpEq {
+            elem_width: 4,
+            lanes: 4,
+        },
+        RiscOp::PackedCmpEq {
+            elem_width: 8,
+            lanes: 2,
+        },
+        RiscOp::PackedCmpGt {
+            elem_width: 1,
+            lanes: 16,
+        },
+        RiscOp::PackedCmpGt {
+            elem_width: 2,
+            lanes: 8,
+        },
+        RiscOp::PackedCmpGt {
+            elem_width: 4,
+            lanes: 4,
+        },
+        RiscOp::PackedCmpGt {
+            elem_width: 8,
+            lanes: 2,
+        },
+        RiscOp::PackedUnpack {
+            elem_width: 1,
+            high: false,
+        },
+        RiscOp::PackedUnpack {
+            elem_width: 2,
+            high: false,
+        },
+        RiscOp::PackedUnpack {
+            elem_width: 4,
+            high: false,
+        },
+        RiscOp::PackedUnpack {
+            elem_width: 8,
+            high: false,
+        },
+        RiscOp::PackedUnpack {
+            elem_width: 1,
+            high: true,
+        },
+        RiscOp::PackedUnpack {
+            elem_width: 2,
+            high: true,
+        },
+        RiscOp::PackedUnpack {
+            elem_width: 4,
+            high: true,
+        },
+        RiscOp::PackedUnpack {
+            elem_width: 8,
+            high: true,
+        },
+    ];
+    let mut packed_h = Vec::with_capacity(packed_ops.len());
+    for op in packed_ops {
+        let off = b.len();
+        emit_packed_handler(&mut b, sub_dec_ops, sub_resolve, dispatch, op);
+        packed_h.push((op, off));
+    }
+    let packed_shr_q_h = b.len();
+    emit_packed_shift_right_q_handler(&mut b, sub_dec_ops, sub_resolve, dispatch);
+    let packed_shufd_h = b.len();
+    emit_packed_shuffle_handler(&mut b, sub_dec_ops, sub_resolve, dispatch, false);
+    let packed_shuflw_h = b.len();
+    emit_packed_shuffle_handler(&mut b, sub_dec_ops, sub_resolve, dispatch, true);
+    let mut shld_h = [0usize; 3];
+    for (i, width) in [2u8, 4, 8].iter().enumerate() {
+        shld_h[i] = b.len();
+        emit_shld_handler(
+            &mut b,
+            sub_dec_ops,
+            sub_resolve,
+            sub_store,
+            dispatch,
+            *width,
+        );
+    }
+    let mut bit_test_h: HashMap<RiscOp, usize> = HashMap::new();
+    for width in [4u8, 8] {
+        for modify in [0u8, 1, 2] {
+            for memory in [false, true] {
+                let op = RiscOp::BitTest {
+                    width,
+                    modify,
+                    memory,
+                };
+                let off = b.len();
+                emit_bit_test_handler(
+                    &mut b,
+                    sub_dec_ops,
+                    sub_resolve,
+                    sub_store,
+                    dispatch,
+                    width,
+                    modify,
+                    memory,
+                );
+                bit_test_h.insert(op, off);
+            }
+        }
+    }
+    let movmask_bytes_h = b.len();
+    emit_movmask_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, false);
+    let movmask_ps_h = b.len();
+    emit_movmask_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, true);
+    let insert_word_h = b.len();
+    emit_insert_word_handler(&mut b, sub_dec_ops, sub_resolve, dispatch);
+    let cpuid_h = b.len();
+    {
+        b.call(sub_dec_ops);
+        mov_m(&mut b, Register::RAX, REGS_OFF);
+        mov_m(&mut b, Register::RCX, REGS_OFF + 8);
+        b.push(Instruction::with1(Code::Push_r64, Register::RDX).unwrap());
+        b.push(Instruction::with(Code::Cpuid));
+        b.push(Instruction::with1(Code::Push_r64, Register::RAX).unwrap());
+        b.push(Instruction::with1(Code::Push_r64, Register::RBX).unwrap());
+        b.push(Instruction::with1(Code::Push_r64, Register::RCX).unwrap());
+        b.push(Instruction::with1(Code::Push_r64, Register::RDX).unwrap());
+        b.push(
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::R10,
+                MemoryOperand::with_base_displ(Register::RSP, 32),
+            )
+            .unwrap(),
+        );
+        for (off, disp) in [(0i64, 24i64), (8, 8), (16, 0), (24, 16)] {
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RAX,
+                    MemoryOperand::with_base_displ(Register::RSP, disp),
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ(
+                        Register::R10,
+                        state_disp(REGS_OFF + off as i32) as i64,
+                    ),
+                    Register::RAX,
+                )
+                .unwrap(),
+            );
+        }
+        b.push(Instruction::with2(Code::Add_rm64_imm8, Register::RSP, 40).unwrap());
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::R10).unwrap());
+        b.jmp(dispatch);
+    }
+    let xgetbv_h = b.len();
+    {
+        b.call(sub_dec_ops);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RDX).unwrap());
+        mov_m(&mut b, Register::RCX, REGS_OFF + 8);
+        b.push(Instruction::with(Code::Xgetbv));
+        b.push(
+            Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_displ(Register::R10, state_disp(REGS_OFF) as i64),
+                Register::RAX,
+            )
+            .unwrap(),
+        );
+        b.push(
+            Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_displ(Register::R10, state_disp(REGS_OFF + 16) as i64),
+                Register::RDX,
+            )
+            .unwrap(),
+        );
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::R10).unwrap());
+        b.jmp(dispatch);
+    }
+    let mut segment_base_h = [0usize; 2];
+    for (idx, (seg, off)) in [(Register::FS, 0x18i64), (Register::GS, 0x30i64)]
+        .iter()
+        .enumerate()
+    {
+        segment_base_h[idx] = b.len();
+        b.call(sub_dec_ops);
+        let mem = MemoryOperand::with_displ(*off as u64, 4);
+        let mut load = Instruction::with2(Code::Mov_r64_rm64, Register::RAX, mem).unwrap();
+        load.set_segment_prefix(*seg);
+        b.push(load);
+        b.call(sub_store);
+        b.jmp(dispatch);
     }
 
     // ── P2 (G3): width-aware ALU 핸들러 (Add/SubWithBorrow/Inc/Dec/Not {width}) ──
@@ -2240,20 +4241,85 @@ pub fn build_self_decoding_parts_with(
     // 실행한다.
     let mut addw_h = [0usize; 4];
     let mut subw_h = [0usize; 4];
+    let mut adcw_h = [0usize; 4];
+    let mut sbbw_h = [0usize; 4];
     let mut incw_h = [0usize; 4];
     let mut decw_h = [0usize; 4];
     let mut notw_h = [0usize; 4];
+    let mut rolw_h = [0usize; 4];
     for (wi, w) in [1u8, 2, 4, 8].iter().enumerate() {
         addw_h[wi] = b.len();
-        emit_width_alu_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, WidthAluOp::Add, *w);
+        emit_width_alu_handler(
+            &mut b,
+            sub_dec_ops,
+            sub_resolve,
+            sub_store,
+            dispatch,
+            WidthAluOp::Add,
+            *w,
+        );
         subw_h[wi] = b.len();
-        emit_width_alu_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, WidthAluOp::Sub, *w);
+        emit_width_alu_handler(
+            &mut b,
+            sub_dec_ops,
+            sub_resolve,
+            sub_store,
+            dispatch,
+            WidthAluOp::Sub,
+            *w,
+        );
+        adcw_h[wi] = b.len();
+        emit_width_alu_handler(
+            &mut b,
+            sub_dec_ops,
+            sub_resolve,
+            sub_store,
+            dispatch,
+            WidthAluOp::Adc,
+            *w,
+        );
+        sbbw_h[wi] = b.len();
+        emit_width_alu_handler(
+            &mut b,
+            sub_dec_ops,
+            sub_resolve,
+            sub_store,
+            dispatch,
+            WidthAluOp::Sbb,
+            *w,
+        );
         incw_h[wi] = b.len();
-        emit_width_alu_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, WidthAluOp::Inc, *w);
+        emit_width_alu_handler(
+            &mut b,
+            sub_dec_ops,
+            sub_resolve,
+            sub_store,
+            dispatch,
+            WidthAluOp::Inc,
+            *w,
+        );
         decw_h[wi] = b.len();
-        emit_width_alu_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, WidthAluOp::Dec, *w);
+        emit_width_alu_handler(
+            &mut b,
+            sub_dec_ops,
+            sub_resolve,
+            sub_store,
+            dispatch,
+            WidthAluOp::Dec,
+            *w,
+        );
         notw_h[wi] = b.len();
-        emit_width_alu_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, WidthAluOp::Not, *w);
+        emit_width_alu_handler(
+            &mut b,
+            sub_dec_ops,
+            sub_resolve,
+            sub_store,
+            dispatch,
+            WidthAluOp::Not,
+            *w,
+        );
+        rolw_h[wi] = b.len();
+        emit_rotate_left_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, *w);
     }
 
     // ── R4: SSE/FPU 스칼라 핸들러 세트 — FloatAdd/Sub/Mul/Div{4,8} +
@@ -2267,13 +4333,49 @@ pub fn build_self_decoding_parts_with(
     let mut fdiv_h = [0usize; 2];
     for (wi, w) in [4u8, 8].iter().enumerate() {
         fadd_h[wi] = b.len();
-        emit_float_bin_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, *w, Code::Addss_xmm_xmmm32, Code::Addsd_xmm_xmmm64);
+        emit_float_bin_handler(
+            &mut b,
+            sub_dec_ops,
+            sub_resolve,
+            sub_store,
+            dispatch,
+            *w,
+            Code::Addss_xmm_xmmm32,
+            Code::Addsd_xmm_xmmm64,
+        );
         fsub_h[wi] = b.len();
-        emit_float_bin_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, *w, Code::Subss_xmm_xmmm32, Code::Subsd_xmm_xmmm64);
+        emit_float_bin_handler(
+            &mut b,
+            sub_dec_ops,
+            sub_resolve,
+            sub_store,
+            dispatch,
+            *w,
+            Code::Subss_xmm_xmmm32,
+            Code::Subsd_xmm_xmmm64,
+        );
         fmul_h[wi] = b.len();
-        emit_float_bin_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, *w, Code::Mulss_xmm_xmmm32, Code::Mulsd_xmm_xmmm64);
+        emit_float_bin_handler(
+            &mut b,
+            sub_dec_ops,
+            sub_resolve,
+            sub_store,
+            dispatch,
+            *w,
+            Code::Mulss_xmm_xmmm32,
+            Code::Mulsd_xmm_xmmm64,
+        );
         fdiv_h[wi] = b.len();
-        emit_float_bin_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, *w, Code::Divss_xmm_xmmm32, Code::Divsd_xmm_xmmm64);
+        emit_float_bin_handler(
+            &mut b,
+            sub_dec_ops,
+            sub_resolve,
+            sub_store,
+            dispatch,
+            *w,
+            Code::Divss_xmm_xmmm32,
+            Code::Divsd_xmm_xmmm64,
+        );
     }
     let mut fi2f_h = [[0usize; 2]; 2]; // [src_bits_idx][dst_bits_idx]
     let mut ff2i_h = [[[0usize; 2]; 2]; 2]; // [src][dst][truncate]
@@ -2281,12 +4383,42 @@ pub fn build_self_decoding_parts_with(
     for (si, sb) in [4u8, 8].iter().enumerate() {
         for (di, db) in [4u8, 8].iter().enumerate() {
             fi2f_h[si][di] = b.len();
-            emit_float_cvt_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, *sb, *db, false, FloatCvtMode::IntToFloat);
+            emit_float_cvt_handler(
+                &mut b,
+                sub_dec_ops,
+                sub_resolve,
+                sub_store,
+                dispatch,
+                *sb,
+                *db,
+                false,
+                FloatCvtMode::IntToFloat,
+            );
             ff2f_h[si][di] = b.len();
-            emit_float_cvt_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, *sb, *db, false, FloatCvtMode::FloatToFloat);
+            emit_float_cvt_handler(
+                &mut b,
+                sub_dec_ops,
+                sub_resolve,
+                sub_store,
+                dispatch,
+                *sb,
+                *db,
+                false,
+                FloatCvtMode::FloatToFloat,
+            );
             for (ti, tr) in [false, true].iter().enumerate() {
                 ff2i_h[si][di][ti] = b.len();
-                emit_float_cvt_handler(&mut b, sub_dec_ops, sub_resolve, sub_store, dispatch, *sb, *db, *tr, FloatCvtMode::FloatToInt);
+                emit_float_cvt_handler(
+                    &mut b,
+                    sub_dec_ops,
+                    sub_resolve,
+                    sub_store,
+                    dispatch,
+                    *sb,
+                    *db,
+                    *tr,
+                    FloatCvtMode::FloatToInt,
+                );
             }
         }
     }
@@ -2326,7 +4458,9 @@ pub fn build_self_decoding_parts_with(
             if let Some(mk) = mask {
                 b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, mk as i32).unwrap());
             }
-            let mut ci = Instruction::with2(cmp_code, MemoryOperand::with_base(Register::R10), regx).unwrap();
+            let mut ci =
+                Instruction::with2(cmp_code, MemoryOperand::with_base(Register::R10), regx)
+                    .unwrap();
             ci.set_has_lock_prefix(true);
             b.push(ci);
             // P1-6: CMPXCHG 는 ZF 뿐 아니라 CMP(acc - old) 의 전체 상태 플래그를 set
@@ -2342,7 +4476,10 @@ pub fn build_self_decoding_parts_with(
             b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
             b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x8D5).unwrap());
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(FLAGS_OFF)).unwrap());
-            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x8D5i64) as i32).unwrap());
+            b.push(
+                Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x8D5i64) as i32)
+                    .unwrap(),
+            );
             b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap());
             store_m(&mut b, FLAGS_OFF, Register::RAX);
             b.jmp(dispatch);
@@ -2357,8 +4494,18 @@ pub fn build_self_decoding_parts_with(
     for (w, xchg_code, regx, zext) in [
         (8u8, Code::Xchg_rm64_r64, Register::R11, None),
         (4u8, Code::Xchg_rm32_r32, Register::R11D, None),
-        (2u8, Code::Xchg_rm16_r16, Register::R11W, Some(Code::Movzx_r64_rm16)),
-        (1u8, Code::Xchg_rm8_r8, Register::R11L, Some(Code::Movzx_r64_rm8)),
+        (
+            2u8,
+            Code::Xchg_rm16_r16,
+            Register::R11W,
+            Some(Code::Movzx_r64_rm16),
+        ),
+        (
+            1u8,
+            Code::Xchg_rm8_r8,
+            Register::R11L,
+            Some(Code::Movzx_r64_rm8),
+        ),
     ] {
         let h = b.len();
         {
@@ -2374,7 +4521,10 @@ pub fn build_self_decoding_parts_with(
             b.call(sub_resolve);
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
             // atomic xchg [r10], r11 — R11 = old [r10], [r10] = old R11.
-            b.push(Instruction::with2(xchg_code, MemoryOperand::with_base(Register::R10), regx).unwrap());
+            b.push(
+                Instruction::with2(xchg_code, MemoryOperand::with_base(Register::R10), regx)
+                    .unwrap(),
+            );
             // 폭별 zero-extend (하드웨어는 상위 비트를 보존하므로 vreg 모델 정합).
             if let Some(zc) = zext {
                 b.push(Instruction::with2(zc, Register::R11, regx).unwrap());
@@ -2394,8 +4544,18 @@ pub fn build_self_decoding_parts_with(
     for (w, xadd_code, regx, zext) in [
         (8u8, Code::Xadd_rm64_r64, Register::R11, None),
         (4u8, Code::Xadd_rm32_r32, Register::R11D, None),
-        (2u8, Code::Xadd_rm16_r16, Register::R11W, Some(Code::Movzx_r64_rm16)),
-        (1u8, Code::Xadd_rm8_r8, Register::R11L, Some(Code::Movzx_r64_rm8)),
+        (
+            2u8,
+            Code::Xadd_rm16_r16,
+            Register::R11W,
+            Some(Code::Movzx_r64_rm16),
+        ),
+        (
+            1u8,
+            Code::Xadd_rm8_r8,
+            Register::R11L,
+            Some(Code::Movzx_r64_rm8),
+        ),
     ] {
         let h = b.len();
         {
@@ -2411,7 +4571,9 @@ pub fn build_self_decoding_parts_with(
             b.call(sub_resolve);
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX).unwrap());
             // lock xadd [r10], r11 — R11 = old [r10]; [r10] += old addend.
-            let mut xi = Instruction::with2(xadd_code, MemoryOperand::with_base(Register::R10), regx).unwrap();
+            let mut xi =
+                Instruction::with2(xadd_code, MemoryOperand::with_base(Register::R10), regx)
+                    .unwrap();
             xi.set_has_lock_prefix(true);
             b.push(xi);
             // flags: 참조 `update_add(old, addend, width)` 는 폭별 CF/OF/AF/SF/ZF/PF
@@ -2422,7 +4584,10 @@ pub fn build_self_decoding_parts_with(
             b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
             b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x8D5).unwrap());
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, m(FLAGS_OFF)).unwrap());
-            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x8D5i64) as i32).unwrap());
+            b.push(
+                Instruction::with2(Code::And_rm64_imm32, Register::RCX, (!0x8D5i64) as i32)
+                    .unwrap(),
+            );
             b.push(Instruction::with2(Code::Or_rm64_r64, Register::RAX, Register::RCX).unwrap());
             store_m(&mut b, FLAGS_OFF, Register::RAX);
             // 폭별 zero-extend (R11 = old 값, 상위 비트 정화) 후 dst 저장.
@@ -2618,8 +4783,24 @@ pub fn build_self_decoding_parts_with(
     }
 
     // ── P3: SETCC / CONDITIONAL_MOVE handler sets (cond byte via DEC_COND). ────
-    let h_setcc = emit_setcc_cmov_handler(&mut b, sub_dec_ops_cond, sub_dec_ops, sub_resolve, sub_store, dispatch, false);
-    let h_cmov = emit_setcc_cmov_handler(&mut b, sub_dec_ops_cond, sub_dec_ops, sub_resolve, sub_store, dispatch, true);
+    let h_setcc = emit_setcc_cmov_handler(
+        &mut b,
+        sub_dec_ops_cond,
+        sub_dec_ops,
+        sub_resolve,
+        sub_store,
+        dispatch,
+        false,
+    );
+    let h_cmov = emit_setcc_cmov_handler(
+        &mut b,
+        sub_dec_ops_cond,
+        sub_dec_ops,
+        sub_resolve,
+        sub_store,
+        dispatch,
+        true,
+    );
 
     let handlers: std::collections::HashMap<RiscOp, usize> = {
         use std::collections::HashMap;
@@ -2634,7 +4815,10 @@ pub fn build_self_decoding_parts_with(
         h.insert(RiscOp::VirtualPop, h_pop);
         h.insert(RiscOp::SetFlag, h_setflag);
         for w in [0u8, 4, 8] {
-            h.insert(RiscOp::SetNativeFpReturn { width: w }, h_set_fp_ret[&RiscOp::SetNativeFpReturn { width: w }]);
+            h.insert(
+                RiscOp::SetNativeFpReturn { width: w },
+                h_set_fp_ret[&RiscOp::SetNativeFpReturn { width: w }],
+            );
         }
         h.insert(RiscOp::MemoryRead { width: 8 }, h_memrd8);
         h.insert(RiscOp::MemoryRead { width: 4 }, h_memrd4);
@@ -2664,33 +4848,88 @@ pub fn build_self_decoding_parts_with(
         h.insert(RiscOp::CountLeadingZeros { width: 4 }, h_lzcnt4);
         h.insert(RiscOp::CountLeadingZeros { width: 8 }, h_lzcnt8);
         h.insert(RiscOp::PopCount, h_popcnt);
-        h.insert(RiscOp::Setcc { cond: BranchCondition::Always }, h_setcc);
-        h.insert(RiscOp::ConditionalMove { cond: BranchCondition::Always }, h_cmov);
-        h.insert(RiscOp::VirtualBranch { cond: BranchCondition::Always }, h_branch);
+        h.insert(
+            RiscOp::Setcc {
+                cond: BranchCondition::Always,
+            },
+            h_setcc,
+        );
+        h.insert(
+            RiscOp::ConditionalMove {
+                cond: BranchCondition::Always,
+            },
+            h_cmov,
+        );
+        h.insert(
+            RiscOp::VirtualBranch {
+                cond: BranchCondition::Always,
+            },
+            h_branch,
+        );
         h.insert(RiscOp::VirtualRet, h_ret);
         for (si, signed) in [false, true].iter().enumerate() {
             for (wi, w) in [1u8, 2, 4, 8].iter().enumerate() {
-                h.insert(RiscOp::Multiply { signed: *signed, width: *w }, mul_h[si][wi]);
+                h.insert(
+                    RiscOp::Multiply {
+                        signed: *signed,
+                        width: *w,
+                    },
+                    mul_h[si][wi],
+                );
             }
         }
         for (si, signed) in [false, true].iter().enumerate() {
             for (wi, w) in [2u8, 4, 8].iter().enumerate() {
-                h.insert(RiscOp::MultiplyLow { signed: *signed, width: *w }, mullow_h[si][wi]);
+                h.insert(
+                    RiscOp::MultiplyLow {
+                        signed: *signed,
+                        width: *w,
+                    },
+                    mullow_h[si][wi],
+                );
             }
         }
         for (si, signed) in [false, true].iter().enumerate() {
             for (wi, w) in [1u8, 2, 4, 8].iter().enumerate() {
-                h.insert(RiscOp::Divide { signed: *signed, width: *w }, div_h[si][wi]);
+                h.insert(
+                    RiscOp::Divide {
+                        signed: *signed,
+                        width: *w,
+                    },
+                    div_h[si][wi],
+                );
             }
         }
         // P2 (G3): width-aware ALU — Add/SubWithBorrow/Inc/Dec/Not {width} 핸들러.
         for (wi, w) in [1u8, 2, 4, 8].iter().enumerate() {
             h.insert(RiscOp::Add { width: *w }, addw_h[wi]);
             h.insert(RiscOp::SubWithBorrow { width: *w }, subw_h[wi]);
+            h.insert(RiscOp::Adc { width: *w }, adcw_h[wi]);
+            h.insert(RiscOp::Sbb { width: *w }, sbbw_h[wi]);
             h.insert(RiscOp::Inc { width: *w }, incw_h[wi]);
             h.insert(RiscOp::Dec { width: *w }, decw_h[wi]);
             h.insert(RiscOp::Not { width: *w }, notw_h[wi]);
+            h.insert(RiscOp::RotateLeft { width: *w }, rolw_h[wi]);
         }
+        for &(op, off) in &packed_h {
+            h.insert(op, off);
+        }
+        h.insert(RiscOp::PackedShiftRightQ, packed_shr_q_h);
+        h.insert(RiscOp::PackedShuffle { low_words: false }, packed_shufd_h);
+        h.insert(RiscOp::PackedShuffle { low_words: true }, packed_shuflw_h);
+        for (i, width) in [2u8, 4, 8].iter().enumerate() {
+            h.insert(RiscOp::DoubleShiftLeft { width: *width }, shld_h[i]);
+        }
+        for (&op, &off) in &bit_test_h {
+            h.insert(op, off);
+        }
+        h.insert(RiscOp::PackedMovMaskBytes, movmask_bytes_h);
+        h.insert(RiscOp::PackedMovMaskPs, movmask_ps_h);
+        h.insert(RiscOp::PackedInsertWord, insert_word_h);
+        h.insert(RiscOp::CpuId, cpuid_h);
+        h.insert(RiscOp::XGetBv, xgetbv_h);
+        h.insert(RiscOp::ReadSegmentBase { gs: false }, segment_base_h[0]);
+        h.insert(RiscOp::ReadSegmentBase { gs: true }, segment_base_h[1]);
         // R4: SSE/FPU 스칼라 — FloatAdd/Sub/Mul/Div{4,8} + IntToFloat/FloatToInt/
         // FloatToFloat 네이티브 핸들러 등록 (플래그 불변, eval_state와 동치).
         for (wi, w) in [4u8, 8].iter().enumerate() {
@@ -2701,17 +4940,34 @@ pub fn build_self_decoding_parts_with(
         }
         for (si, sb) in [4u8, 8].iter().enumerate() {
             for (di, db) in [4u8, 8].iter().enumerate() {
-                h.insert(RiscOp::IntToFloat { src_bits: *sb, dst_bits: *db }, fi2f_h[si][di]);
-                h.insert(RiscOp::FloatToFloat { src_bits: *sb, dst_bits: *db }, ff2f_h[si][di]);
+                h.insert(
+                    RiscOp::IntToFloat {
+                        src_bits: *sb,
+                        dst_bits: *db,
+                    },
+                    fi2f_h[si][di],
+                );
+                h.insert(
+                    RiscOp::FloatToFloat {
+                        src_bits: *sb,
+                        dst_bits: *db,
+                    },
+                    ff2f_h[si][di],
+                );
                 for (ti, tr) in [false, true].iter().enumerate() {
                     h.insert(
-                        RiscOp::FloatToInt { src_bits: *sb, dst_bits: *db, truncate: *tr },
+                        RiscOp::FloatToInt {
+                            src_bits: *sb,
+                            dst_bits: *db,
+                            truncate: *tr,
+                        },
                         ff2i_h[si][di][ti],
                     );
                 }
             }
         }
         h.insert(RiscOp::Halt, h_halt);
+        h.insert(RiscOp::Trap, h_trap);
         // NativeCallBridge — reference/interpreter는 no-op(스트림 소비, 상태 불변).
         // h_nop과 동일 의미이므로 명시 등록해 [P2-HANDLER-GAP] 감사를 깨끗하게 한다.
         h.insert(RiscOp::NativeCallBridge, h_nop);
@@ -2730,25 +4986,94 @@ pub fn build_self_decoding_parts_with(
             }
         }
         if !unhandled.is_empty() {
-            println!(
-                "[P2-HANDLER-GAP] {} encodable op(s) have NO native handler (h_nop no-op fallback):",
-                unhandled.len()
-            );
-            for u in unhandled {
-                println!("    - {}", u);
-            }
-        } else {
-            println!("[P2-HANDLER-GAP] all encodable ops have native handlers");
+            unhandled.sort();
+            return Err(anyhow!(
+                "[P2-HANDLER-GAP] {} encodable op(s) have no native handler: {}",
+                unhandled.len(),
+                unhandled.join(", ")
+            ));
         }
     }
+
+    // P5: compose build-local extension handlers from the verified primitive
+    // bodies. Handler boundaries are frozen before cloning; every copied exit
+    // to dispatch is retargeted to the next body by CodeBuilder.
+    let mut extension_handlers: HashMap<u8, usize> = HashMap::new();
+    if !superops.is_empty() {
+        let canonical = |op: RiscOp| match op {
+            RiscOp::VirtualBranch { .. } => RiscOp::VirtualBranch {
+                cond: BranchCondition::Always,
+            },
+            RiscOp::Setcc { .. } => RiscOp::Setcc {
+                cond: BranchCondition::Always,
+            },
+            RiscOp::ConditionalMove { .. } => RiscOp::ConditionalMove {
+                cond: BranchCondition::Always,
+            },
+            other => other,
+        };
+        let original_end = b.len();
+        let mut starts: Vec<usize> = handlers.values().copied().collect();
+        starts.sort_unstable();
+        starts.dedup();
+        let mut ends = HashMap::new();
+        for (i, &start) in starts.iter().enumerate() {
+            ends.insert(start, starts.get(i + 1).copied().unwrap_or(original_end));
+        }
+
+        for assigned in superops {
+            if spec.reverse_opcode_map.contains_key(&assigned.opcode)
+                || extension_handlers.contains_key(&assigned.opcode)
+            {
+                return Err(anyhow!(
+                    "P5 extension opcode {:#04x} collides or is duplicated",
+                    assigned.opcode
+                ));
+            }
+            let mut ranges = Vec::with_capacity(assigned.plan.candidate.ops.len());
+            for op in assigned.plan.candidate.ops.iter().copied() {
+                let op = canonical(op);
+                let &start = handlers.get(&op).ok_or_else(|| {
+                    anyhow!("P5 super-op primitive {:?} has no production handler", op)
+                })?;
+                let &end = ends
+                    .get(&start)
+                    .ok_or_else(|| anyhow!("P5 cannot determine handler boundary for {:?}", op))?;
+                ranges.push((start, end));
+            }
+            let entry = b.clone_handler_chain(&ranges, dispatch)?;
+            extension_handlers.insert(assigned.opcode, entry);
+        }
+    }
+
+    // P3: distribute identical handler `jmp dispatch` tails over seed-derived,
+    // semantics-neutral tail islands before final branch layout.
+    let diversified_tails = b.diversify_direct_tails(dispatch, seed);
+    if diversified_tails < 2 {
+        return Err(anyhow!(
+            "dispatcher tail diversification found only {diversified_tails} tail(s)"
+        ));
+    }
+
+    // P2: apply the seed-derived persistent-role assignment after semantic
+    // emission and before branch layout. R8/RDX and scratch/ABI registers stay
+    // pinned; R12-R15 (VIP/VStack/Key/Table) are rewritten consistently in
+    // register operands and memory base/index operands.
+    let role_assignment =
+        crate::vm::threaded::reg_permutation::RegisterAssignment::production_from_seed(seed);
+    role_assignment
+        .validate()
+        .map_err(|e| anyhow!("invalid VM role assignment: {e}"))?;
+    b.remap_legacy_carriers(&role_assignment);
 
     // Assemble; use the true per-instruction IPs for handler VAs.
     let (mut code, ips) = b.assemble(code_base)?;
     let va_of = |idx: usize| -> u64 { ips[idx] };
 
-    if std::env::var("BTG_DUMP_POLY").is_ok() {
+    if let Some(dump_path) = std::env::var_os("BTG_DUMP_POLY") {
         let mut s = String::new();
-        let mut dec = iced_x86::Decoder::with_ip(64, &code, code_base, iced_x86::DecoderOptions::NONE);
+        let mut dec =
+            iced_x86::Decoder::with_ip(64, &code, code_base, iced_x86::DecoderOptions::NONE);
         let mut n = 0;
         while dec.can_decode() && n < 4000 {
             let ins = dec.decode();
@@ -2759,7 +5084,17 @@ pub fn build_self_decoding_parts_with(
             s.push_str(&format!("0x{:08x}  {:?}\n", ins.ip(), ins));
             n += 1;
         }
-        let _ = std::fs::write("C:\\Users\\uzoki\\Desktop\\asdfsadfecwecc\\_poly_dump.txt", s);
+        let dump_path = if dump_path.is_empty() {
+            std::path::PathBuf::from("_poly_dump.txt")
+        } else {
+            std::path::PathBuf::from(dump_path)
+        };
+        std::fs::write(&dump_path, s).map_err(|e| {
+            anyhow!(
+                "failed to write BTG_DUMP_POLY output {}: {e}",
+                dump_path.display()
+            )
+        })?;
     }
 
     // Handler table: decrypted opcode byte -> handler VA.
@@ -2777,6 +5112,9 @@ pub fn build_self_decoding_parts_with(
         if let Some(&hidx) = handlers.get(op) {
             table[*byte as usize] = va_of(hidx) ^ per_op_key(table_key, *byte as u8);
         }
+    }
+    for (&byte, &hidx) in &extension_handlers {
+        table[byte as usize] = va_of(hidx) ^ per_op_key(table_key, byte);
     }
     // P6-3: 엔트리 스텁의 무결성 셀프체크를 위한 테이블 checksum.
     let table_checksum = table_checksum(&table);
@@ -2799,90 +5137,25 @@ pub fn build_self_decoding_parts_with(
         }
     }
 
-    Ok(SelfDecodingParts { code, table, table_key, table_checksum, offs_tab, flags_tab, cond_codes, branch_map })
+    let parts = SelfDecodingParts {
+        code,
+        native_bridge_range: Some((
+            (ips[native_bridge_instr_begin] - code_base) as usize,
+            (ips[native_bridge_instr_end] - code_base) as usize,
+        )),
+        table,
+        table_key,
+        table_checksum,
+        offs_tab,
+        flags_tab,
+        cond_codes,
+        branch_map,
+        branch_target_key,
+        branch_offset_key,
+        layout,
+        runtime_layout,
+        dispatcher_plan,
+    };
+    parts.validate(code_base, bytecode.len())?;
+    Ok(parts)
 }
-
-/// Run the self-decoding dispatcher in an RWX arena (host-side test/bench path):
-/// build the parts at arena-relative VAs, copy them in, set the initial regs in
-/// the state buffer and jump to the dispatcher entry.
-/// Backward-compatible 3-arg runner (no ip_map) — delegates to `_with` with None.
-pub fn run_native_poly_direct(
-    bytecode: &[u8],
-    seed: u64,
-    init_regs: &[u64; 16],
-) -> Result<RiscEvalState> {
-    run_native_poly_direct_with(bytecode, seed, init_regs, None)
-}
-
-/// Full runner with optional ip_map (source-IP -> program index) for VirtualBranch
-/// branch resolution.
-pub fn run_native_poly_direct_with(
-    bytecode: &[u8],
-    seed: u64,
-    init_regs: &[u64; 16],
-    ip_map: Option<&HashMap<u64, usize>>,
-) -> Result<RiscEvalState> {
-    let mut arena = Arena::new(ARENA_SIZE)?;
-    let code_base = (arena.base + OFF_CODE) as u64;
-    let state_base = (arena.base + OFF_STATE) as u64;
-    let table_base = (arena.base + OFF_TABLE) as u64;
-    let bytecode_base = (arena.base + OFF_BYTECODE) as u64;
-    let stack_base = (arena.base + OFF_STACK_BASE) as u64;
-    let parts = build_self_decoding_parts_with(
-        bytecode, seed, code_base, table_base, bytecode_base, state_base, stack_base, ip_map,
-    )?;
-
-    // Copy into arena.
-    {
-        let buf = arena.bytes();
-        buf[OFF_CODE..OFF_CODE + parts.code.len()].copy_from_slice(&parts.code);
-        for (i, v) in parts.table.iter().enumerate() {
-            buf[OFF_TABLE + i * 8..OFF_TABLE + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
-        }
-        buf[OFF_OP_OFFS..OFF_OP_OFFS + 256].copy_from_slice(&parts.offs_tab);
-        buf[OFF_OP_FLAGS..OFF_OP_FLAGS + 256].copy_from_slice(&parts.flags_tab);
-        buf[OFF_COND_CODES..OFF_COND_CODES + 256].copy_from_slice(&parts.cond_codes);
-        assert!(
-            OFF_BRANCH_MAP + parts.branch_map.len() <= OFF_BYTECODE,
-            "branch map overflowed into bytecode region: {}",
-            parts.branch_map.len()
-        );
-        buf[OFF_BRANCH_MAP..OFF_BRANCH_MAP + parts.branch_map.len()]
-            .copy_from_slice(&parts.branch_map);
-        buf[OFF_BYTECODE..OFF_BYTECODE + bytecode.len()].copy_from_slice(bytecode);
-        buf[OFF_STATE..OFF_STATE + STATE_END as usize].fill(0);
-        buf[OFF_STACK_BASE - 0x2000..OFF_STACK_BASE].fill(0);
-        for (i, v) in init_regs.iter().enumerate() {
-            buf[OFF_STATE + REGS_OFF as usize + i * 8..OFF_STATE + REGS_OFF as usize + i * 8 + 8]
-                .copy_from_slice(&v.to_le_bytes());
-        }
-    }
-
-    arena.call(OFF_CODE);
-
-    let buf = arena.bytes();
-    let s = OFF_STATE;
-    let mut st = RiscEvalState::default();
-    for i in 0..16 {
-        st.regs[i] = u64::from_le_bytes(buf[s + REGS_OFF as usize + i * 8..s + REGS_OFF as usize + i * 8 + 8].try_into().unwrap());
-    }
-    for i in 0..8 {
-        st.temps[i] = u64::from_le_bytes(buf[s + TEMPS_OFF as usize + i * 8..s + TEMPS_OFF as usize + i * 8 + 8].try_into().unwrap());
-    }
-    st.flags = u64::from_le_bytes(buf[s + FLAGS_OFF as usize..s + FLAGS_OFF as usize + 8].try_into().unwrap());
-    st.vsp = u64::from_le_bytes(buf[s + VSP_OFF as usize..s + VSP_OFF as usize + 8].try_into().unwrap());
-    let pending = if (st.vsp as i64) < 0 { (-(st.vsp as i64) as u64) / 8 } else { 0 };
-    let mut stack = Vec::new();
-    for k in 0..pending as usize {
-        let base = OFF_STACK_BASE as isize - ((k + 1) as isize) * 8;
-        let base = base as usize;
-        let v = u64::from_le_bytes(buf[base..base + 8].try_into().unwrap());
-        stack.push(v);
-    }
-    st.stack = stack;
-    Ok(st)
-}
-
-// ==============================================================================
-// Tests
-// ==============================================================================

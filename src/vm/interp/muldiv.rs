@@ -9,7 +9,7 @@
 // pass through unchanged (undefined on x86) — matching the RISC reference and
 // the native handlers. DIV/IDIV leave ALL flags unchanged (undefined on x86).
 
-use super::state::{VmError, flags_of, set_flags, set_vreg64, vreg32, vreg64};
+use super::state::{flags_of, set_flags, set_vreg64, vreg32, vreg64, VmError};
 use crate::vm::bytecode::*;
 use crate::vm::flags;
 

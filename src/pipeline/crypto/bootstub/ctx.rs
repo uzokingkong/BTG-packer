@@ -4,14 +4,24 @@
 
 #[derive(Clone, Copy)]
 pub(crate) struct BootStubCtx {
-    pub(crate) boot_va: u64,          // 부트 스텁 시작 VA
+    pub(crate) boot_va: u64, // 부트 스텁 시작 VA
     pub(crate) anti_debug: bool,
-    pub(crate) dispatcher_va: u64,    // 디스패처 본체 (섹션 + 0x20)
+    pub(crate) dispatcher_va: u64, // 디스패처 본체 (섹션 + 0x20)
     pub(crate) code_va: u64,
     pub(crate) code_len: u32,
     pub(crate) runs_va: u64,
     pub(crate) num_runs: u32,
     pub(crate) seed_va: u64,
+    /// Decrypt-descriptor (M11): 정적 decrypt target/size/bytecode/table 주소를
+    /// 부트 스텁 imm으로 박지 않고, 이 메타데이터를 부트 데이터 영역에 파생 키
+    /// (RC4 keystream, 키 유도 계층)로 암호화해 저장하고 런타임에 복호화해 쓴다.
+    /// desc_va = 암호화된 디스크립터 VA, desc_size = 복호화할 바이트 수.
+    pub(crate) desc_va: u64,
+    pub(crate) desc_size: u32,
+    /// (M12) true = 순수 RC4 비-chained/비-reencrypt/비-vm 경로가 정적 imm 대신
+    /// 암호화 디크립트 디스크립터(desc_va)를 런타임 복호화해 decrypt target/size를
+    /// 얻는다. 그 외 모드(chained/C1/ChaCha/vm)는 기존 imm 경로를 유지(무회귀).
+    pub(crate) desc_used: bool,
     pub(crate) k1: u32,
     pub(crate) k2: u32,
     pub(crate) k3: u32,
@@ -38,6 +48,9 @@ pub(crate) struct BootStubCtx {
     pub(crate) vm_prog_entry_va: u64,
     /// 프로그램 VM 상태 버퍼 VA (부트 스텁이 초기화 후 디스패치)
     pub(crate) vm_prog_state_va: u64,
+    /// Commercial program VM state ABI seed. `None` keeps the legacy fixed
+    /// offsets used by the classic program VM.
+    pub(crate) vm_prog_runtime_layout_seed: Option<u64>,
     /// true = 원본 프로그램 entry 블록이 제외(네이티브 유지)되어, 부트 스텁이
     /// 프로그램 VM 디스패처 대신 로더가 준 레지스터/RFLAGS/RSP를 정확히 복원한 뒤
     /// 네이티브 OEP로 tail-jump한다.
@@ -82,6 +95,16 @@ pub(crate) struct BootStubCtx {
     /// 저장된 CRC32 값의 VA (4바이트, seed 뒤)
     pub(crate) crc_va: u64,
     pub(crate) mac_va: u64,
+    /// S2(멀티사이트): 두 번째 저장 CRC2 값의 VA (4바이트, mac 뒤 — crc ^ W32).
+    pub(crate) crc2_va: u64,
+    /// S3/S4(멀티사이트 확장): crc2 뒤의 세 번째/네 번째 CRC 검증 사이트 저장 값 VA.
+    /// 사이트 3는 IAT 리졸브 직후, 사이트 4는 디스패처 진입 직전에 실행 — 부트
+    /// 스텁 전체에 걸쳐 검증 지점을 분산해 한 위치의 단일 바이트 패치로 무력화 불가.
+    pub(crate) crc3_va: u64,
+    pub(crate) crc4_va: u64,
+    /// MAC 프리엠블에서 유도한 W32(runtime-derived whiten)를 저장하는 스크래치 슬롯 VA.
+    /// 사이트 3/4가 R15가 클로버된 뒤에도 W32를 재사용하도록 보존한다 (4B).
+    pub(crate) w32_slot_va: u64,
     // ── v6 IAT hiding (--iat-hide) ───────────────────────────────────────────
     /// true = 복호화 후 리졸브 테이블을 따라 원본 IAT 슬롯을 채운다
     pub(crate) iat_enabled: bool,
@@ -99,6 +122,10 @@ pub(crate) struct BootStubCtx {
     /// 보호할 .textb 영역 (페이지 정렬 base / 페이지 라운드업 크기)
     pub(crate) mem_code_base: u64,
     pub(crate) mem_code_size: u64,
+    /// Mutable tail (Program-VM state/call stack/bootstrap data), sealed RW so
+    /// no page remains writable+executable after bootstrap.
+    pub(crate) mem_state_base: u64,
+    pub(crate) mem_state_size: u64,
     /// 스택 프레임 크기 — 외부 API 호출 시 16B 정렬 보장(0x138), 아니면 0x118
     pub(crate) stack_frame: u32,
     // ── v14: import 이름 per-entry MBA 키 (다층 2단계) ─────────────────────
@@ -129,11 +156,27 @@ pub(crate) struct BootStubCtx {
     pub(crate) chacha_aead: bool,
     /// Poly1305 네이티브 verify blob 엔트리 VA (rel32 call 타깃).
     pub(crate) poly_blob_va: u64,
-    /// 32B ChaCha20-Poly1305 one-time 키 VA (패커가 seed에서 파생해 기록).
+    /// 32B volatile scratch for the runtime-derived ChaCha20-Poly1305 one-time key.
     pub(crate) poly_key_va: u64,
     /// 16B Poly1305 AEAD 태그 VA (패커가 암호문+AAD로 계산해 기록).
     pub(crate) poly_tag_va: u64,
 }
+
+/// (M12) 부트 스텁 스택 프레임 내 디크립트 디스크립터 스테이지 레이아웃.
+/// RBX(=RSP, S-box base) 기준:
+///   [RBX+0x000..0x100] = 주 RC4 S-box (기존)
+///   [RBX+DESC_SBOX_OFF..+0x100] = 디스크립터 전용 제2 RC4 S-box
+///   [RBX+DESC_STG_OFF..+0x40]  = 복호화된 디스크립터 스태깅 (8 x u64 LE)
+pub(crate) const DESC_SBOX_OFF: u32 = 0x100;
+pub(crate) const DESC_STG_OFF: u32 = 0x200;
+pub(crate) const DESC_STG_CODE_VA: u32 = 0x200;
+pub(crate) const DESC_STG_CODE_LEN: u32 = 0x208;
+pub(crate) const DESC_STG_RUNS_VA: u32 = 0x210;
+pub(crate) const DESC_STG_NUM_RUNS: u32 = 0x218;
+pub(crate) const DESC_STG_BC_VA: u32 = 0x220;
+pub(crate) const DESC_STG_BC_LEN: u32 = 0x228;
+pub(crate) const DESC_STG_TEXT_RUNS_VA: u32 = 0x230;
+pub(crate) const DESC_STG_TEXT_RUNS_COUNT: u32 = 0x238;
 
 impl BootStubCtx {
     /// true = BTG-C1 상태형 키스트림 blob 사용 (v60 --custom-cipher).
@@ -174,6 +217,29 @@ pub(crate) enum Label {
     MacDataLoop,
     MacDone,
     MacOk,
+    // S2 (--integrity multi-site hardening): whiten-key 유도 + 두 번째 CRC 사이트
+    WhitenLoop,
+    Crc2Loop,
+    Crc2Bit,
+    Crc2Skip,
+    Crc2Done,
+    Crc2Ok,
+    // S3/S4 (멀티사이트 확장) — IAT 리졸브 직후 / 디스패처 진입 직전의 독립 CRC 검증
+    Crc3Loop,
+    Crc3Bit,
+    Crc3Skip,
+    Crc3Done,
+    Crc3Ok,
+    Crc4Loop,
+    Crc4Bit,
+    Crc4Skip,
+    Crc4Done,
+    Crc4Ok,
+    // S1 runtime-derived poison interlock (emit_run_decrypt) — tamper 시 런/리졸브 손상
+    PoisonLoop,
+    PoisonDone,
+    // TrashFormer 부트 정크의 real-looking mixing loop (길이=0 dead path 제거)
+    JunkMixLoop,
     // ── v6 IAT resolve ──
     DllLoop,
     FuncLoop,
@@ -212,6 +278,11 @@ pub(crate) enum Label {
     UxFuncDone,
     // ── v60: BTG-C1 상태 초기화 (키/카운터/nonce/ks_off 기록) ──
     C1KeyLoop,
+    // ── M12: 디크립트 디스크립터 스테이지 (제2 S-box KSA + PRGA) ──
+    DescInit,
+    DescKsa,
+    DescPrga,
+    DescDone,
     // ── v63: ChaCha20 상태 초기화 (키[32]/ctr/nonce[12]/ks_off 기록) ──
     ChaKeyLoop,
     // ── T3-1 Phase D: Poly1305 AEAD 인증 통과 (ud2 우회) ──
