@@ -52,7 +52,7 @@ impl Default for RequestedConfig {
         Self {
             seed: None,
             obf_level: 2,
-            crypto_mode: CryptoMode::Rc4,
+            crypto_mode: CryptoMode::C1,
             custom_cipher: false,
             anti_debug: false,
             iat_hide: false,
@@ -81,12 +81,12 @@ impl RequestedConfig {
             self.obf_level.clamp(1, 3)
         };
 
-        // Crypto mode resolution: custom_cipher flag maps to C1
-        let crypto_mode = if self.custom_cipher && self.crypto_mode == CryptoMode::Rc4 {
-            CryptoMode::C1
-        } else {
-            self.crypto_mode
-        };
+        if self.crypto_mode == CryptoMode::Rc4 {
+            return Err(anyhow!(
+                "RC4 has been retired; select CryptoMode::C1 or CryptoMode::ChaCha20"
+            ));
+        }
+        let crypto_mode = self.crypto_mode;
 
         // Commercial VM requires basic VM flags enabled
         let vm_commercial = self.vm_commercial && (self.vm || self.vm_oep);
@@ -125,13 +125,13 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_cipher_promotes_rc4_to_c1() {
+    fn test_rc4_is_rejected_instead_of_silently_promoted() {
         let req = RequestedConfig {
             custom_cipher: true,
             crypto_mode: CryptoMode::Rc4,
             ..Default::default()
         };
-        let resolved = req.resolve().unwrap();
-        assert_eq!(resolved.crypto_mode, CryptoMode::C1);
+        let error = req.resolve().unwrap_err();
+        assert!(error.to_string().contains("RC4 has been retired"));
     }
 }

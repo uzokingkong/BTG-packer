@@ -17,7 +17,7 @@
 //  * `--dispatcher-reencrypt`는 `--mem-harden`을 무력화 (재암호화는 .textb 쓰기 필요).
 //  * `--m7`(on-demand 재암호화)는 crypto + 비-VM일 때만 유효.
 //  * crypto off면 `--vm`/`--vm-oep`/`--m7`/`--chained-crypto`/`--integrity` 비활성.
-//  * `--rc4`는 `--custom-cipher`(기본 BTG-C1)보다 우선.
+//  * 제거된 `--rc4` 요청은 다른 암호로 폴백하지 않고 하드 에러.
 //
 // 모든 경고는 `Vec<String>`으로 모아 main.rs 가 출력한다 (stdout 순서 보존).
 // 하드 에러(`--rsrc-register`→`--payload-relocate` 필요, `--dispatcher-reencrypt`
@@ -111,10 +111,9 @@ pub struct ResolvedConfig {
     pub vm_oep: bool,
     /// `--vm-commercial && --vm-oep && vm_enabled` — 상용 RISC 엔진 백엔드.
     pub vm_commercial: bool,
-    /// `!--rc4` — BTG-C1 (기본) / RC4 폴백.
+    /// 현대 암호 경로 사용 여부. RC4 요청은 해석 전에 거부된다.
     pub custom_cipher: bool,
-    /// v63 (T3-1 Phase B): 선택된 crypto primitive (RC4/C1/ChaCha20).
-    /// `--crypto-mode` 명시 → 우선, 없으면 `!--rc4` → C1.
+    /// 선택된 crypto primitive (C1/ChaCha20).
     pub crypto_mode: CryptoMode,
     /// `--m8 && vm_enabled` — VM 핸들러 테이블 MBA 난독화.
     pub m8: bool,
@@ -129,6 +128,8 @@ pub enum ResolveError {
     RsrcRegisterRequiresPayloadRelocate,
     /// `--dispatcher-reencrypt` 는 crypto 레이어를 요구한다.
     DispatcherReencryptRequiresCrypto,
+    /// RC4는 제거됐으며 다른 primitive로 묵시 변환하지 않는다.
+    Rc4Retired,
 }
 
 impl ResolveError {
@@ -139,6 +140,9 @@ impl ResolveError {
             }
             ResolveError::DispatcherReencryptRequiresCrypto => {
                 "--dispatcher-reencrypt requires the crypto layer (remove --no-crypto)"
+            }
+            ResolveError::Rc4Retired => {
+                "RC4 has been retired; remove --rc4 and select --crypto-mode c1 or --crypto-mode chacha20"
             }
         }
     }
@@ -202,25 +206,19 @@ pub fn resolve(req: &RequestedConfig) -> ResolveOutcome {
     // Native M7 reuses the shuffled-block dispatcher. Program-VM M7 has its
     // own bytecode chunk lifecycle and must not disable vm_effective below.
     let reencrypt = dispatcher_reencrypt || native_m7;
-    // v63 (T3-1 Phase B): --crypto-mode 명시 시 우선, 없으면 레거시 플래그로 파생.
-    // custom_cipher도 명시 선택과 일치시켜, 재암호화/m7 등 커스텀 암호 경로가
-    // 사용자가 선택한 primitive와 어긋나지 않게 한다.
+    // RC4는 안전한 기본값으로 조용히 바꾸지 않는다. 오래된 --rc4 플래그는
+    // 파싱하되 하드 에러로 남겨 CI/배포 스크립트가 명시적으로 마이그레이션하게 한다.
+    if req.rc4 {
+        errors.push(ResolveError::Rc4Retired);
+    }
     let custom_cipher = match req.crypto_mode {
-        Some(CryptoModeCli::Rc4) => false,
         Some(CryptoModeCli::C1) | Some(CryptoModeCli::ChaCha20) => true,
-        None => !req.rc4,
+        None => true,
     };
     let crypto_mode = match req.crypto_mode {
-        Some(CryptoModeCli::Rc4) => CryptoMode::Rc4,
         Some(CryptoModeCli::C1) => CryptoMode::C1,
         Some(CryptoModeCli::ChaCha20) => CryptoMode::ChaCha20,
-        None => {
-            if req.rc4 {
-                CryptoMode::Rc4
-            } else {
-                CryptoMode::C1
-            }
-        }
+        None => CryptoMode::C1,
     };
     let m8 = req.m8 && vm_enabled;
     let needs_boot_stub = crypto_enabled || iat_hide || mem_harden || payload_relocate;
@@ -267,27 +265,6 @@ pub fn resolve(req: &RequestedConfig) -> ResolveOutcome {
             "--m7 requires crypto and either native mode or --vm --vm-oep --vm-commercial; ignored for this profile".into(),
         );
     }
-    if req.rc4 && req.custom_cipher {
-        warnings.push("--rc4 takes precedence over --custom-cipher (BTG-C1 is the default cipher; --rc4 forces RC4-256)".into());
-    }
-    if let Some(m) = req.crypto_mode {
-        let mode_name = match m {
-            CryptoModeCli::Rc4 => "rc4",
-            CryptoModeCli::C1 => "c1",
-            CryptoModeCli::ChaCha20 => "chacha20",
-        };
-        if req.rc4 && m != CryptoModeCli::Rc4 {
-            warnings.push(format!(
-                "--crypto-mode {mode_name} takes precedence over --rc4 (explicit crypto primitive selection wins)"
-            ));
-        }
-        if req.custom_cipher && m == CryptoModeCli::Rc4 {
-            warnings.push(
-                "--crypto-mode rc4 takes precedence over --custom-cipher (BTG-C1 disabled; RC4-256 forced)".into(),
-            );
-        }
-    }
-
     ResolveOutcome {
         config: ResolvedConfig {
             full,
@@ -561,18 +538,14 @@ mod tests {
             .contains(&ResolveError::DispatcherReencryptRequiresCrypto));
     }
 
-    /// --rc4 → custom_cipher=false, --custom-cipher 동시 지정 시 경고.
+    /// --rc4 is a hard error and never silently maps to C1.
     #[test]
     fn resolve_rc4() {
         let mut r = base();
         r.rc4 = true;
-        r.custom_cipher = true;
         let o = resolve(&r);
-        assert!(!o.config.custom_cipher, "--rc4 forces RC4");
-        assert!(o
-            .warnings
-            .iter()
-            .any(|w| w.contains("--rc4 takes precedence")));
+        assert!(o.errors.contains(&ResolveError::Rc4Retired));
+        assert_eq!(o.config.crypto_mode, CryptoMode::C1);
     }
 
     /// --m8 는 vm_enabled 일 때만 유효.
@@ -589,37 +562,17 @@ mod tests {
         assert!(o2.config.m8);
     }
 
-    /// --crypto-mode chacha20 → ChaCha20 primitive, --rc4보다 우선.
+    /// --crypto-mode chacha20 selects ChaCha20.
     #[test]
     fn resolve_crypto_mode_chacha20() {
         let mut r = base();
         r.crypto_mode = Some(CryptoModeCli::ChaCha20);
-        r.rc4 = true; // 레거시 플래그와 충돌 — --crypto-mode가 우선
         let o = resolve(&r);
         assert_eq!(o.config.crypto_mode, CryptoMode::ChaCha20);
         assert!(
             o.config.custom_cipher,
             "custom_cipher stays true (chacha는 custom path 아님 — 평문 bulk 전용)"
         );
-        assert!(o
-            .warnings
-            .iter()
-            .any(|w| w.contains("--crypto-mode chacha20 takes precedence over --rc4")));
-    }
-
-    /// --crypto-mode rc4 → RC4, --custom-cipher보다 우선 + 경고.
-    #[test]
-    fn resolve_crypto_mode_rc4() {
-        let mut r = base();
-        r.crypto_mode = Some(CryptoModeCli::Rc4);
-        r.custom_cipher = true;
-        let o = resolve(&r);
-        assert_eq!(o.config.crypto_mode, CryptoMode::Rc4);
-        assert!(!o.config.custom_cipher, "--crypto-mode rc4 forces RC4");
-        assert!(o
-            .warnings
-            .iter()
-            .any(|w| w.contains("--crypto-mode rc4 takes precedence over --custom-cipher")));
     }
 
     /// 기본 (플래그 없음) → C1 (기본 cipher).
@@ -629,12 +582,13 @@ mod tests {
         assert_eq!(o.config.crypto_mode, CryptoMode::C1);
     }
 
-    /// --rc4 (레거시) → RC4 (crypto_mode=None 파생).
+    /// Legacy --rc4 remains rejected even without --crypto-mode.
     #[test]
     fn resolve_crypto_mode_derived_from_rc4() {
         let mut r = base();
         r.rc4 = true;
         let o = resolve(&r);
-        assert_eq!(o.config.crypto_mode, CryptoMode::Rc4);
+        assert!(o.errors.contains(&ResolveError::Rc4Retired));
+        assert_eq!(o.config.crypto_mode, CryptoMode::C1);
     }
 }

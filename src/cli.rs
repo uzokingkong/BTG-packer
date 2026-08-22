@@ -229,21 +229,19 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false)]
     pub block_ring: bool,
 
-    /// v62 (기본): BTG-C1 커스텀 512-bit 스트림 사이퍼를 기본 암호로 사용한다.
-    /// (plan.txt 4~6단계 완료 — 벌크/스테이트풀 per-block/재암호화/VM 경로 배선.
-    ///  이 플래그는 이제 기본값이므로 명시적으로만 의미가 있고, 해제는 --rc4.)
+    /// BTG-C1 호환 경로를 명시한다. 기본값이므로 일반적으로 지정할 필요가 없다.
     #[arg(long, default_value_t = false)]
     pub custom_cipher: bool,
 
-    /// v62: RC4-256으로 되돌린다 (--custom-cipher 해제). C1 비호환 경로
-    /// (chained/--vm-oep)의 폴백/디버그/테스트용 — 기본은 BTG-C1.
+    /// 제거된 RC4 호환 플래그. 지정하면 패킹을 시작하기 전에 명시적으로 실패한다.
+    /// 오래된 빌드 스크립트가 조용히 다른 암호를 사용하지 않도록 파싱만 유지한다.
     #[arg(long, default_value_t = false)]
     pub rc4: bool,
 
-    /// v63 (T3-1 Phase B): crypto primitive 선택 — `rc4` | `c1` | `chacha20`.
+    /// crypto primitive 선택 — `c1` | `chacha20`.
     /// `chacha20` = ChaCha20 (RFC 8439) 스트림 — 코드/문자열 영역 at-rest 암호화를
     /// 검증된 현대 암호로 전환 (평문 bulk 경로 전용; chained/reencrypt/--vm/--vm-oep
-    /// 조합에서는 폴백). 지정 시 `--rc4`/`--custom-cipher`보다 우선한다.
+    /// 조합에서는 폴백). 지정 시 `--custom-cipher`보다 우선한다.
     #[arg(long, value_enum)]
     pub crypto_mode: Option<CryptoModeCli>,
 }
@@ -251,13 +249,30 @@ pub struct CliArgs {
 /// v63: `--crypto-mode` 선택지.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CryptoModeCli {
-    /// RC4-256 (레거시).
-    #[value(name = "rc4")]
-    Rc4,
     /// BTG-C1 커스텀 512-bit 스트림 사이퍼 (기본).
     #[value(name = "c1")]
     C1,
     /// ChaCha20 (RFC 8439) — T3-1.
     #[value(name = "chacha20")]
     ChaCha20,
+}
+
+#[cfg(test)]
+mod crypto_cli_tests {
+    use super::*;
+
+    #[test]
+    fn crypto_mode_rc4_is_not_a_parseable_value() {
+        let error = CliArgs::try_parse_from(["btg-packer", "--crypto-mode", "rc4"])
+            .expect_err("retired RC4 must not remain a selectable crypto mode");
+        let rendered = error.to_string();
+        assert!(rendered.contains("invalid value 'rc4'"));
+        assert!(rendered.contains("possible values: c1, chacha20"));
+    }
+
+    #[test]
+    fn legacy_rc4_flag_is_preserved_for_explicit_policy_rejection() {
+        let args = CliArgs::try_parse_from(["btg-packer", "--rc4"]).unwrap();
+        assert!(args.rc4);
+    }
 }

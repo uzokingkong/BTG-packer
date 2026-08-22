@@ -348,7 +348,7 @@ fn main() -> error::Result<()> {
 
     if crypto_enabled {
         let mode_str = match cfg.crypto_mode {
-            btg_packer::crypto::CryptoMode::Rc4 => "RC4",
+            btg_packer::crypto::CryptoMode::Rc4 => "RC4 (RETIRED/INVALID)",
             btg_packer::crypto::CryptoMode::C1 => "BTG-C1",
             btg_packer::crypto::CryptoMode::ChaCha20 => "ChaCha20 (RFC 8439)",
         };
@@ -465,10 +465,9 @@ fn main() -> error::Result<()> {
     ctx.keep_pdata = args.keep_pdata;
     // v13.4d diag: 디스패처 ring-buffer (마지막 32개 block id) 주입 여부
     ctx.block_ring = args.block_ring;
-    // v62: BTG-C1을 기본 암호로 (--rc4로 RC4 복귀). --custom-cipher는 기본값이라
-    // 명시적 동의에만 쓰이고, --rc4와 함께 주면 --rc4가 우선한다.
+    // RC4 requests are rejected by protection_profile::resolve; no implicit fallback.
     ctx.custom_cipher = cfg.custom_cipher;
-    // v63 (T3-1 Phase B): --crypto-mode 선택 (RC4/C1/ChaCha20) — 커스텀 암호 경로
+    // --crypto-mode 선택 (C1/ChaCha20) — 커스텀 암호 경로
     // (재암호화/VM)는 계속 custom_cipher를 쓰고, 평문 bulk at-rest 경로만 crypto_mode.
     ctx.crypto_mode = cfg.crypto_mode;
     // M6 Phase-2: OEP→VM entry 전환 — 부트 스텁이 원본 .text를 평문 복호화하지
@@ -694,7 +693,9 @@ fn main() -> error::Result<()> {
                 // policy, W^X memory contract.
                 .with_capabilities(
                     match cfg.crypto_mode {
-                        btg_packer::crypto::CryptoMode::Rc4 => "rc4",
+                        btg_packer::crypto::CryptoMode::Rc4 => unreachable!(
+                            "RC4 must be rejected by protection profile before manifest emission"
+                        ),
                         btg_packer::crypto::CryptoMode::C1 => "c1",
                         btg_packer::crypto::CryptoMode::ChaCha20 => "chacha20",
                     },

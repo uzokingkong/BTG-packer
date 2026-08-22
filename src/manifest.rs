@@ -21,8 +21,7 @@ use std::path::Path;
 
 /// VM ISA version this packer emits (roadmap v31 — full ISA milestone line).
 pub const VM_VERSION: u32 = 31;
-/// Composite VM crypto engine version (BTG-C1 default, v62).
-/// v63 (T3-1 Phase B): --crypto-mode chacha20 추가.
+/// Crypto capability manifest ABI. RC4 is no longer a valid emitted mode.
 pub const CRYPTO_VERSION: u32 = 63;
 
 /// A fully-qualified description of one pack run.
@@ -40,7 +39,7 @@ pub struct BuildManifest {
     pub crypto_version: u32,
     /// Effective feature flags (ordered, CSV in `render`).
     pub feature_flags: Vec<String>,
-    /// v63/P3-2: effective crypto primitive (`rc4`/`c1`/`chacha20`) used by the
+    /// Effective crypto primitive (`c1`/`chacha20`) used by the
     /// boot stub at-rest decryption (readccc.md §6.1 capability manifest).
     pub crypto_mode: String,
     pub crypto_construction: String,
@@ -188,6 +187,10 @@ impl BuildManifest {
         anti_debug_policy: &str,
         wx_contract: &str,
     ) -> Self {
+        assert!(
+            matches!(crypto_mode, "c1" | "chacha20" | "region-context-v1"),
+            "retired or unknown crypto mode must not be written to a build manifest: {crypto_mode}"
+        );
         self.crypto_mode = crypto_mode.to_string();
         if crypto_mode == "chacha20" {
             self.crypto_construction = "rfc8439-chacha20-poly1305".to_string();
@@ -495,6 +498,13 @@ pub fn sha256_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "retired or unknown crypto mode")]
+    fn manifest_rejects_retired_rc4_capability() {
+        let _ = BuildManifest::new(None, vec![], "ab".repeat(16), "cd".repeat(16))
+            .with_capabilities("rc4", true, false, true, 100, "trap", "rx-after-verify");
+    }
 
     #[test]
     fn sha256_known_vectors() {
