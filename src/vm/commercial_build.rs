@@ -31,10 +31,6 @@
 // ==============================================================================
 
 use crate::vm::table_layout::TableLayout;
-use crate::vm::threaded::poly_direct::{
-    build_self_decoding_parts_with_superops_and_chunks,
-    build_self_decoding_parts_with_superops_and_chunks_for_family,
-};
 use crate::vm::threaded::{PreparedSuperOpProgram, VmRuntimeLayout};
 use crate::vm::VmModule;
 use anyhow::Result;
@@ -150,6 +146,34 @@ pub fn build_program_vm_commercial_with_superops_and_chunks_for_family(
     prepared: Option<&PreparedSuperOpProgram>,
     chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
 ) -> Result<VmModule> {
+    build_program_vm_commercial_with_routes_for_family(
+        code_va,
+        table_va,
+        bytecode_va,
+        bytecode,
+        state_va,
+        seed,
+        family,
+        ip_map,
+        prepared,
+        chunks,
+        &[],
+    )
+}
+
+pub fn build_program_vm_commercial_with_routes_for_family(
+    code_va: u64,
+    table_va: u64,
+    bytecode_va: u64,
+    bytecode: Vec<u8>,
+    state_va: u64,
+    seed: u64,
+    family: crate::vm::poly::VmArchitectureFamily,
+    ip_map: Option<&HashMap<u64, usize>>,
+    prepared: Option<&PreparedSuperOpProgram>,
+    chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
+    routes: &[crate::vm::threaded::poly_direct::NativeCrossFamilyRoute],
+) -> Result<VmModule> {
     // Virtual stack top: right after the state buffer (COMMERCIAL_STATE_SIZE),
     // growing down into the reserved VIRTUAL_STACK_SIZE region. Keeps the
     // dispatcher's R13-based push/pop isolated from both state and bytecode.
@@ -167,7 +191,7 @@ pub fn build_program_vm_commercial_with_superops_and_chunks_for_family(
         }
     }
     let parts = if let Some(prepared) = prepared {
-        build_self_decoding_parts_with_superops_and_chunks_for_family(
+        crate::vm::threaded::poly_direct::build_self_decoding_parts_with_superops_chunks_family_and_routes(
             &bytecode,
             seed,
             family,
@@ -182,9 +206,10 @@ pub fn build_program_vm_commercial_with_superops_and_chunks_for_family(
             &prepared.assigned,
             Some(&prepared.metadata),
             chunks,
+            routes,
         )?
     } else {
-        build_self_decoding_parts_with_superops_and_chunks_for_family(
+        crate::vm::threaded::poly_direct::build_self_decoding_parts_with_superops_chunks_family_and_routes(
             &bytecode,
             seed,
             family,
@@ -199,6 +224,7 @@ pub fn build_program_vm_commercial_with_superops_and_chunks_for_family(
             &[],
             None,
             chunks,
+            routes,
         )?
     };
 
@@ -235,7 +261,7 @@ mod tests {
     use super::*;
     use crate::vm::arena::Arena;
     use crate::vm::poly::PolymorphicEncoder;
-    use crate::vm::risc::{MicroInstr, MicroOperand, RiscDesynthesizer, RiscOp};
+    use crate::vm::risc::{MicroInstr, MicroOperand, RiscDesynthesizer, RiscOp, RiscProgram};
 
     /// P3 (G1): the module produced by `build_program_vm_commercial` — its
     /// self-decoding rolling-key dispatcher code — when embedded at the VAs it
@@ -468,5 +494,148 @@ mod tests {
         // Operand byte 0x01 represents an immediate.  Its kind must be stored
         // at the generated location, not the legacy +0x900 signature.
         assert_eq!(module.table[layout.operand_flags_off + 1], 1);
+    }
+
+    #[test]
+    fn native_cross_family_route_calls_child_and_resumes_parent() {
+        use crate::vm::poly::VmArchitectureFamily;
+        use crate::vm::threaded::poly_direct::NativeCrossFamilyRoute;
+
+        let parent_seed = 0x1111_2222_3333_4444;
+        let child_seed = 0x9999_AAAA_BBBB_CCCC;
+        let parent_layout = VmRuntimeLayout::from_seed(parent_seed);
+        let child_layout = VmRuntimeLayout::from_seed(child_seed);
+        let parent = RiscProgram::with_ip_map(
+            vec![
+                MicroInstr::new(RiscOp::VirtualPush).with_src1(MicroOperand::Imm64(0x1002)),
+                MicroInstr::new(RiscOp::VirtualBranch {
+                    cond: crate::vm::risc::BranchCondition::Always,
+                })
+                .with_imm(0x2000),
+                MicroInstr::new(RiscOp::Mov)
+                    .with_dst(MicroOperand::VReg(1))
+                    .with_src1(MicroOperand::VReg(0)),
+                MicroInstr::new(RiscOp::Halt),
+            ],
+            HashMap::from([(0x1000, 0), (0x1002, 2)]),
+        );
+        let child = RiscProgram::with_ip_map(
+            vec![
+                MicroInstr::new(RiscOp::Mov)
+                    .with_dst(MicroOperand::VReg(0))
+                    .with_src1(MicroOperand::Imm64(42)),
+                MicroInstr::new(RiscOp::VirtualRet),
+            ],
+            HashMap::from([(0x2000, 0)]),
+        );
+        let mut parent_encoder =
+            PolymorphicEncoder::new_for_family(parent_seed, VmArchitectureFamily::Stack);
+        let parent_bc = parent_encoder.encode(&parent).unwrap();
+        let mut child_encoder =
+            PolymorphicEncoder::new_for_family(child_seed, VmArchitectureFamily::Register);
+        let child_bc = child_encoder.encode(&child).unwrap();
+
+        let mut arena = Arena::new(0xA0000).unwrap();
+        let base = arena.base as u64;
+        let parent_code = base + 0x1000;
+        let parent_table = base + 0x12000;
+        let parent_bytecode = base + 0x16000;
+        let parent_state = base + 0x18000;
+        let parent_call_stack = base + 0x19000;
+        let child_code = base + 0x30000;
+        let child_table = base + 0x42000;
+        let child_bytecode = base + 0x46000;
+        let child_state = base + 0x48000;
+        let child_call_stack = base + 0x49000;
+
+        let child_module = build_program_vm_commercial_with_routes_for_family(
+            child_code,
+            child_table,
+            child_bytecode,
+            child_bc,
+            child_state,
+            child_seed,
+            VmArchitectureFamily::Register,
+            child.ip_map(),
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let routes = [NativeCrossFamilyRoute {
+            target_va: 0x2000,
+            target_entry_va: child_code,
+            target_state_va: child_state,
+            target_byte_offset: 0,
+            target_layout: child_layout.clone(),
+            tail_jump_resume_offset: None,
+        }];
+        let parent_module = build_program_vm_commercial_with_routes_for_family(
+            parent_code,
+            parent_table,
+            parent_bytecode,
+            parent_bc,
+            parent_state,
+            parent_seed,
+            VmArchitectureFamily::Stack,
+            parent.ip_map(),
+            None,
+            &[],
+            &routes,
+        )
+        .unwrap();
+
+        let buf = arena.bytes();
+        for (module, code, table, bytecode) in [
+            (&parent_module, parent_code, parent_table, parent_bytecode),
+            (&child_module, child_code, child_table, child_bytecode),
+        ] {
+            let code = (code - base) as usize;
+            let table = (table - base) as usize;
+            let bytecode = (bytecode - base) as usize;
+            buf[code..code + module.code.len()].copy_from_slice(&module.code);
+            buf[table..table + module.table.len()].copy_from_slice(&module.table);
+            buf[bytecode..bytecode + module.bytecode.len()].copy_from_slice(&module.bytecode);
+        }
+        for (state, call_stack, layout) in [
+            (parent_state, parent_call_stack, &parent_layout),
+            (child_state, child_call_stack, &child_layout),
+        ] {
+            let state = (state - base) as usize;
+            buf[state..state + 0x260].fill(0);
+            buf[state + crate::vm::interp::STATE_PTR_CALL_STACK
+                ..state + crate::vm::interp::STATE_PTR_CALL_STACK + 8]
+                .copy_from_slice(&call_stack.to_le_bytes());
+            let guest_rsp = base + 0x90000;
+            let rsp_off = layout.vregs[4] as usize;
+            buf[state + rsp_off..state + rsp_off + 8].copy_from_slice(&guest_rsp.to_le_bytes());
+        }
+
+        arena.call((parent_code - base) as usize);
+        let buf = arena.bytes();
+        let child_state_off = (child_state - base) as usize;
+        let child_rax_off = child_layout.vregs[0] as usize;
+        assert_eq!(
+            u64::from_le_bytes(
+                buf[child_state_off + child_rax_off..child_state_off + child_rax_off + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            42,
+            "child module must execute at the routed local VIP"
+        );
+        let parent_state = (parent_state - base) as usize;
+        for reg in [0usize, 1] {
+            let off = parent_layout.vregs[reg] as usize;
+            assert_eq!(
+                u64::from_le_bytes(
+                    buf[parent_state + off..parent_state + off + 8]
+                        .try_into()
+                        .unwrap()
+                ),
+                42,
+                "parent vreg {reg} must observe child return and resume"
+            );
+        }
     }
 }

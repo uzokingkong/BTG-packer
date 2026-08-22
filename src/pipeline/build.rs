@@ -159,7 +159,7 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
             ctx.vm_prog_rva,
             ctx.vm_prog_total,
             vm_prog_unwind.as_ref().map(|v| v.as_slice()),
-            ctx.vm_prog_native_bridge,
+            &ctx.vm_prog_native_bridges,
         );
     }
 
@@ -602,7 +602,7 @@ fn update_pdata_seh(
     vm_prog_rva: u32,
     vm_prog_total: u32,
     vm_prog_unwind: Option<&[u8]>,
-    vm_native_bridge: Option<(u32, u32)>,
+    vm_native_bridges: &[(u32, u32)],
 ) {
     if let Some(pdata_sec) = relayed_sections.iter_mut().find(|s| s.name == ".pdata") {
         // ?癒?궚 `.text`??域밸챶?嚥?鈺곕똻???랁???쇱뵠?怨뺥닏 野껋럥以?癒?퐣 ??쎈뻬???嚥??袁? 癰귣똻???뺣뼄.
@@ -639,8 +639,7 @@ fn update_pdata_seh(
         let mut native_bridge_unwind: Vec<u8> = Vec::new();
         let mut vm_begin = 0u32;
         let mut vm_end = 0u32;
-        let mut native_bridge_begin = 0u32;
-        let mut native_bridge_end = 0u32;
+        let mut native_bridge_ranges = Vec::new();
         if vm_prog_rva > 0 && vm_prog_total > 0 {
             vm_begin = vm_prog_rva;
             vm_end = vm_prog_rva.saturating_add(vm_prog_total);
@@ -663,17 +662,29 @@ fn update_pdata_seh(
                     vm_begin, vm_end, vm_prog_total
                 );
             }
-            if let Some((rel_begin, rel_end)) =
-                vm_native_bridge.filter(|(s, e)| s < e && *e <= vm_prog_total)
-            {
-                native_bridge_begin = vm_begin + rel_begin;
-                native_bridge_end = vm_begin + rel_end;
+            native_bridge_ranges = vm_native_bridges
+                .iter()
+                .copied()
+                .filter(|(start, end)| start < end && *end <= vm_prog_total)
+                .map(|(start, end)| (vm_begin + start, vm_begin + end))
+                .collect();
+            native_bridge_ranges.sort_unstable();
+            if !native_bridge_ranges.is_empty() {
                 native_bridge_unwind = build_native_call_bridge_unwind_info();
-                for (begin, end) in [
-                    (vm_begin, native_bridge_begin),
-                    (native_bridge_begin, native_bridge_end),
-                    (native_bridge_end, vm_end),
-                ] {
+                let mut cursor = vm_begin;
+                for (bridge_begin, bridge_end) in &native_bridge_ranges {
+                    for (begin, end) in [(cursor, *bridge_begin), (*bridge_begin, *bridge_end)] {
+                        if begin < end {
+                            rf_list.push(RuntimeFunction {
+                                begin_address: begin,
+                                end_address: end,
+                                unwind_info_address: 0,
+                            });
+                        }
+                    }
+                    cursor = *bridge_end;
+                }
+                for (begin, end) in [(cursor, vm_end)] {
                     if begin < end {
                         rf_list.push(RuntimeFunction {
                             begin_address: begin,
@@ -710,15 +721,22 @@ fn update_pdata_seh(
         if vm_begin > 0 && !vm_unwind.is_empty() {
             let vm_unwind_rva = unwind_rva + unwind_info.len() as u32;
             for rf in rf_list.iter_mut() {
-                if rf.begin_address == vm_begin || rf.begin_address == native_bridge_end {
+                if rf.begin_address == vm_begin
+                    || native_bridge_ranges
+                        .iter()
+                        .any(|(_, end)| rf.begin_address == *end)
+                {
                     rf.unwind_info_address = vm_unwind_rva;
                 }
             }
         }
-        if native_bridge_begin > 0 {
+        if !native_bridge_ranges.is_empty() {
             let native_unwind_rva = unwind_rva + unwind_info.len() as u32 + vm_unwind.len() as u32;
             for rf in rf_list.iter_mut() {
-                if rf.begin_address == native_bridge_begin {
+                if native_bridge_ranges
+                    .iter()
+                    .any(|(begin, _)| rf.begin_address == *begin)
+                {
                     rf.unwind_info_address = native_unwind_rva;
                 }
             }

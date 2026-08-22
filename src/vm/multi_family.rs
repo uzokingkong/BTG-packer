@@ -11,6 +11,9 @@ pub struct EncodedFamilyPartition {
     /// Family-separated domains used by the module builder for state layout,
     /// handler table, fetch topology, and runtime key derivation.
     pub module_domain: u64,
+    /// Dedicated local continuation used when a cross-family tail jump returns
+    /// from its target module.
+    pub exit_byte_offset: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +23,7 @@ pub struct CrossFamilyRouteRecord {
     pub source_local_op: usize,
     pub resume_local_op: Option<usize>,
     pub target_family: VmArchitectureFamily,
+    pub target_va: u64,
     pub target_local_op: usize,
     pub kind: CrossFamilyRouteKind,
 }
@@ -167,19 +171,27 @@ impl MultiFamilyProgramPlan {
     pub fn materialize(&self, seed: u64) -> Result<MaterializedMultiFamilyProgram, String> {
         let mut modules = Vec::with_capacity(self.partitions.len());
         for partition in &self.partitions {
+            let mut routed_program = partition.program.clone();
+            routed_program
+                .instrs
+                .push(crate::vm::risc::MicroInstr::new(RiscOp::Halt));
             let mut encoder = crate::vm::poly::PolymorphicEncoder::new_for_family(
                 seed ^ family_domain(partition.family),
                 partition.family,
             );
             let (bytecode, instruction_offsets) = encoder
-                .encode_with_offsets(&partition.program)
+                .encode_with_offsets(&routed_program)
                 .map_err(|error| error.to_string())?;
+            let exit_byte_offset = *instruction_offsets
+                .last()
+                .ok_or_else(|| "family partition emitted no exit offset".to_string())?;
             modules.push(EncodedFamilyPartition {
                 family: partition.family,
                 bytecode,
                 instruction_offsets,
                 ip_map: partition.program.ip_map().cloned().unwrap_or_default(),
                 module_domain: seed ^ family_domain(partition.family),
+                exit_byte_offset,
             });
         }
 
@@ -214,6 +226,7 @@ impl MultiFamilyProgramPlan {
                 resume_local_op: (route.kind == CrossFamilyRouteKind::Call)
                     .then_some(source_local_op + 1),
                 target_family: route.target_family,
+                target_va: route.target_va,
                 target_local_op,
                 kind: route.kind,
             });

@@ -17,7 +17,9 @@ mod lift;
 mod vm_build;
 
 use lift::lift_program;
-use vm_build::{build_prog_vm_mod, build_vm_mod};
+use vm_build::{
+    build_multi_family_prog_mod, build_prog_vm_mod, build_vm_mod, MULTI_FAMILY_STATE_STRIDE,
+};
 
 /// BTG-C1 상태 버퍼 크기 (key[32] + ctr[8] + nonce[4] + pad + ks[64] + ks_off[4] = 0x80).
 const C1_STATE_SIZE: usize = 0x80;
@@ -186,7 +188,19 @@ pub(crate) fn place_boot_stub(
         vm_oep: vm_oep_effective,
         vm_prog_entry_va: if vm_oep_effective { dispatcher_va } else { 0 },
         vm_prog_state_va: 0, // imm64 라 길이 불변 — 0으로 두고 아래에서 채움
-        vm_prog_runtime_layout_seed: vm_commercial.then_some(ctx.poly_vm_seed),
+        vm_prog_runtime_layout_seed: vm_commercial.then_some(
+            ctx.vm_multi_family
+                .as_ref()
+                .and_then(|multi| {
+                    let entry = ctx.vm_family_plan.as_ref()?.entry_family;
+                    multi
+                        .modules
+                        .iter()
+                        .find(|module| module.family == entry)
+                        .map(|module| module.module_domain)
+                })
+                .unwrap_or(ctx.poly_vm_seed),
+        ),
         vm_oep_native_entry: vm_oep_native_entry,
         vm_oep_native_va: oep_va,
         // M6 Phase-2.3 at-rest: VM bytecode VA/길이 (imm — 최종 패스에서 채움)
@@ -308,7 +322,34 @@ pub(crate) fn place_boot_stub(
     } else {
         None
     };
-    let vm_prog_mod: Option<vm::VmModule> = if let Some(ref bc) = vm_prog_plain_bc {
+    let vm_multi_family_active = vm_commercial
+        && ctx
+            .vm_multi_family
+            .as_ref()
+            .is_some_and(|multi| !multi.modules.is_empty());
+    if vm_multi_family_active && !ctx.vm_prog_chunks.is_empty() {
+        println!(
+            "[+] P2-10 multi-family modules use independent bytecode domains; disabling the legacy single-stream M7 chunk plan"
+        );
+        ctx.vm_prog_chunks.clear();
+    }
+    let vm_multi_family_sizing = if vm_multi_family_active {
+        let plan = ctx.vm_family_plan.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("multi-family materialization is missing its family plan")
+        })?;
+        Some(build_multi_family_prog_mod(
+            ctx.vm_multi_family.as_ref().unwrap(),
+            plan.entry_family,
+            plan.entry_function,
+            0,
+            0,
+        )?)
+    } else {
+        None
+    };
+    let vm_prog_mod: Option<vm::VmModule> = if let Some(multi) = &vm_multi_family_sizing {
+        Some(multi.module.clone())
+    } else if let Some(ref bc) = vm_prog_plain_bc {
         // use the lift computed above (before the 1st-pass stub) so the entry
         // decision and the module bytecode come from the same single lift.
         let m = build_prog_vm_mod(
@@ -489,14 +530,19 @@ pub(crate) fn place_boot_stub(
         (
             dispatcher_va + vm_prog_off as u64,
             sva,
-            state_off - vm_prog_off + vm::VM_STATE_SIZE,
+            state_off - vm_prog_off
+                + if let Some(multi) = &vm_multi_family_sizing {
+                    multi.families.len() * MULTI_FAMILY_STATE_STRIDE
+                } else {
+                    vm::VM_STATE_SIZE
+                },
         )
     } else {
         (0, 0, 0)
     };
     // reserve the dedicated bytecode return-IP stack (CALL_STACK_SIZE) for the program VM
     cursor += vm_prog_total
-        + if vm_prog_mod.is_some() {
+        + if vm_prog_mod.is_some() && !vm_multi_family_active {
             crate::vm::interp::CALL_STACK_SIZE
         } else {
             0
@@ -515,6 +561,15 @@ pub(crate) fn place_boot_stub(
     ctx.vm_prog_native_bridge = vm_prog_mod
         .as_ref()
         .and_then(|m| m.native_bridge_range.map(|(s, e)| (s as u32, e as u32)));
+    ctx.vm_prog_native_bridges = if let Some(multi) = &vm_multi_family_sizing {
+        multi
+            .native_bridge_ranges
+            .iter()
+            .map(|(start, end)| (*start as u32, *end as u32))
+            .collect()
+    } else {
+        ctx.vm_prog_native_bridge.into_iter().collect()
+    };
 
     // ── M6 Phase-2.3: at-rest 암호화 대상 확정 ──────────────────────────────
     // Program VM bytecode offset/len (boot area — .textb는 이미 RWX라 in-place 복호화 가능)
@@ -843,7 +898,7 @@ pub(crate) fn place_boot_stub(
     // 잘라버려 vm_prog_bc_off 이후가 모두 0x00이 되는 silent corruption이 발생했다.
     // CALL_STACK_SIZE(0x2000): 부트 스텁 vm_embed.rs가 Program VM state 직후에 예약하는
     // return-IP 스택 영역 — truncate가 이를 포함해야 한다.
-    let vm_prog_call_stack = if vm_prog_mod.is_some() {
+    let vm_prog_call_stack = if vm_prog_mod.is_some() && !vm_multi_family_active {
         crate::vm::interp::CALL_STACK_SIZE
     } else {
         0
@@ -1141,23 +1196,38 @@ pub(crate) fn place_boot_stub(
     // ── M6 Phase-2: 프로그램 VM 모듈 배치 (최종 VA로 재생성 후 복사) ──────────
     if let Some(m) = vm_prog_mod {
         let prva = dispatcher_va + vm_prog_off as u64;
-        let plain_bc =
-            vm_prog_plain_bc.expect("vm_prog_plain_bc must be present when vm_prog_mod is Some");
-        let prmod = build_prog_vm_mod(
-            vm_commercial,
-            ctx.poly_vm_seed,
-            prva,
-            prva + m.code.len() as u64,
-            prva + (m.code.len() + m.table.len()) as u64,
-            plain_bc,
-            vm_prog_state_va,
-            vm_prog_ip_map.as_ref(),
-            vm_prog_superops.as_ref(),
-            &ctx.vm_prog_chunks,
-            ctx.vm_family_plan.as_ref().map(|plan| plan.entry_family),
-            m8_mod,
-            rng,
-        )?;
+        let multi_built = if vm_multi_family_active {
+            Some(build_multi_family_prog_mod(
+                ctx.vm_multi_family.as_ref().unwrap(),
+                ctx.vm_family_plan.as_ref().unwrap().entry_family,
+                ctx.vm_family_plan.as_ref().unwrap().entry_function,
+                prva,
+                vm_prog_state_va,
+            )?)
+        } else {
+            None
+        };
+        let prmod = if let Some(multi) = &multi_built {
+            multi.module.clone()
+        } else {
+            let plain_bc = vm_prog_plain_bc
+                .expect("vm_prog_plain_bc must be present when vm_prog_mod is Some");
+            build_prog_vm_mod(
+                vm_commercial,
+                ctx.poly_vm_seed,
+                prva,
+                prva + m.code.len() as u64,
+                prva + (m.code.len() + m.table.len()) as u64,
+                plain_bc,
+                vm_prog_state_va,
+                vm_prog_ip_map.as_ref(),
+                vm_prog_superops.as_ref(),
+                &ctx.vm_prog_chunks,
+                ctx.vm_family_plan.as_ref().map(|plan| plan.entry_family),
+                m8_mod,
+                rng,
+            )?
+        };
         let prend = vm_prog_off + prmod.total_len();
         println!(
             "[DEBUG pass2 prmod] code={} table={} bc={} total={} prend={} btg_len={}",
@@ -1187,6 +1257,28 @@ pub(crate) fn place_boot_stub(
             btg.bytes.len()
         );
         btg.bytes[b..b + prmod.bytecode.len()].copy_from_slice(&prmod.bytecode);
+        if let Some(multi) = &multi_built {
+            for (index, state_delta) in multi.state_offsets.iter().copied().enumerate() {
+                let state_off = (vm_prog_state_va - dispatcher_va) as usize + state_delta;
+                let call_stack_va = vm_prog_state_va
+                    + state_delta as u64
+                    + (MULTI_FAMILY_STATE_STRIDE - crate::vm::interp::CALL_STACK_SIZE) as u64;
+                btg.bytes[state_off..state_off + 0x268].fill(0);
+                btg.bytes[state_off + 0x5000..state_off + 0x5010].fill(0);
+                if index == 0 {
+                    btg.bytes[state_off + 0x5000..state_off + 0x5008]
+                        .copy_from_slice(&(multi.entry_byte_offset as u64).to_le_bytes());
+                }
+                let ptr = state_off + crate::vm::interp::STATE_PTR_CALL_STACK;
+                btg.bytes[ptr..ptr + 8].copy_from_slice(&call_stack_va.to_le_bytes());
+                println!(
+                    "[+] P2-10 family module #{index} {:?}: state_va=0x{:X} call_stack_va=0x{:X}",
+                    multi.families[index],
+                    vm_prog_state_va + state_delta as u64,
+                    call_stack_va,
+                );
+            }
+        }
         println!(
             "[+] M6 Phase-2 Program VM: module @0x{:X} (code {}B table {}B bytecode {}B state {}B) entry_va=0x{:X} state_va=0x{:X}",
             vm_prog_off,

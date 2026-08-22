@@ -4,6 +4,15 @@
 
 ## 진행 기록
 
+### 2026-08-22 — P2-10 실제 multi-family module/state/table 및 call/return routing 완료
+
+- production placer가 entry family를 첫 module로 정렬하고 4개 family의 code, handler/operand/condition/branch table, bytecode를 각각 독립 생성한다. mutable state, virtual stack, cross-family control slots, return-IP stack은 family마다 `0x8000` stride로 격리한다.
+- cross-family branch-map miss는 target VA별 native route를 조회한다. caller의 seed-permuted GPR/RFLAGS/VSP/XMM state를 target family layout으로 변환하고, target module의 로컬 bytecode VIP에서 rolling key를 resync해 진입한다. CALL은 기존 canonical native-call ABI로 child RAX와 memory side effect를 반환하고 caller continuation을 재개한다. tail JUMP는 family별 전용 Halt continuation으로 종료 의미를 보존한다. 같은-family edge는 기존 로컬 branch-map fast path만 사용한다.
+- entry module은 VIP 0이 아니라 실제 OEP function의 local byte offset에서 시작한다. target-only family도 routed entry를 활성화하며, op partition이 없는 초소형 프로그램은 검증된 단일-module 경로로 fail-safe fallback한다.
+- family 전용 stream의 branch-map 검증 decoder/re-encoder가 기본 family를 쓰던 결함을 수정해 명시된 family ISA를 일관되게 소비한다. route 제어 슬롯과 return-IP stack의 `state+0x258` 충돌도 독립 `state+0x5000` 영역으로 제거했다.
+- `.pdata` 생성기는 모든 family module의 native bridge range를 개별 RUNTIME_FUNCTION 구간으로 분할하고 동일한 private-frame UNWIND_INFO를 연결한다. 첫 module만 unwind 처리되던 단일-range 계약을 제거했다.
+- native 2-family call→return→parent-resume 회귀 테스트와 전체 library 555/555가 통과했다. `corpus/o1.exe`, seed 31010 production 실측은 621 VM 함수, 4 실제 module, 513 canonical runtime route, 771,534B aggregate bytecode이며 일반/M7 최대 조합 모두 exit 0, stdout 1,460B, stderr 0B 동치 및 PE 구조 검증을 통과했다. SHA-256은 `de559ee06eb8953a505b58e249a393a247c11275fd9bb649eba8419ee1acd415`다.
+
 ### 2026-08-22 — P2-10 independent bytecode 및 canonical route table materialization
 
 - `MultiFamilyProgramPlan`이 검증된 function-op partition을 family별 독립 `RiscProgram`/로컬 `ip_map`으로 절단한다. 중복 op ownership과 누락된 source/target ownership은 fail-closed한다.

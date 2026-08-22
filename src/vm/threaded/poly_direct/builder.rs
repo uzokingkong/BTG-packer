@@ -13,6 +13,11 @@ use super::codegen_util::*;
 use super::types::*;
 
 const CHUNK_LEAF_LABEL_BASE: usize = 0xD000_0000;
+/// Fixed control slot outside the seed-permuted architectural state. A
+/// cross-family router writes a bytecode offset here before entering a child
+/// module; ordinary boot entry observes zero.
+const STATE_CROSS_FAMILY_ENTRY_VIP: i64 = 0x5000;
+const STATE_CROSS_FAMILY_RETURN_PTR: i64 = 0x5008;
 
 fn emit_masked_chunk_value(
     b: &mut CodeBuilder,
@@ -254,6 +259,42 @@ pub fn build_self_decoding_parts_with_superops_and_chunks_for_family(
     superop_metadata: Option<&SuperOpBuildMetadata>,
     chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
 ) -> Result<SelfDecodingParts> {
+    build_self_decoding_parts_with_superops_chunks_family_and_routes(
+        bytecode,
+        seed,
+        family,
+        code_base,
+        table_base,
+        bytecode_base,
+        state_base,
+        stack_base,
+        ip_map,
+        layout,
+        runtime_layout,
+        superops,
+        superop_metadata,
+        chunks,
+        &[],
+    )
+}
+
+pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
+    bytecode: &[u8],
+    seed: u64,
+    family: crate::vm::poly::VmArchitectureFamily,
+    code_base: u64,
+    table_base: u64,
+    bytecode_base: u64,
+    state_base: u64,
+    stack_base: u64,
+    ip_map: Option<&HashMap<u64, usize>>,
+    layout: TableLayout,
+    runtime_layout: VmRuntimeLayout,
+    superops: &[AssignedSuperOp],
+    superop_metadata: Option<&SuperOpBuildMetadata>,
+    chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
+    cross_family_routes: &[NativeCrossFamilyRoute],
+) -> Result<SelfDecodingParts> {
     // P1 migration: every state access now passes through the runtime-layout
     // translator. Keep the legacy contract until the embed/bridge initializers
     // consume the same layout value, then production can switch to `from_seed`.
@@ -344,9 +385,9 @@ pub fn build_self_decoding_parts_with_superops_and_chunks_for_family(
             metadata.original_byte_offsets.clone(),
         )
     } else {
-        let mut dec = PolymorphicDecoder::new(seed);
+        let mut dec = PolymorphicDecoder::new_for_family(seed, family);
         let prog = dec.decode_full(bytecode, false)?;
-        let mut reenc = PolymorphicEncoder::new(seed);
+        let mut reenc = PolymorphicEncoder::new_for_family(seed, family);
         let (re_bc, op_offsets) = reenc.encode_with_offsets(&prog)?;
         if re_bc != bytecode {
             return Err(anyhow!(
@@ -1084,6 +1125,35 @@ pub fn build_self_decoding_parts_with_superops_and_chunks_for_family(
         movi(&mut b, Register::R14, init_key);
         movi(&mut b, Register::R15, table_base);
         movi(&mut b, Register::RDX, state_base);
+        if cross_family_routes.is_empty() {
+            b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RBX, Register::RBX).unwrap());
+        } else {
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RBX,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RDX,
+                        STATE_CROSS_FAMILY_ENTRY_VIP,
+                        8,
+                    ),
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_imm32,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RDX,
+                        STATE_CROSS_FAMILY_ENTRY_VIP,
+                        8,
+                    ),
+                    0,
+                )
+                .unwrap(),
+            );
+        }
+        b.call(sub_resync);
         // P6-3: handler-table integrity self-check — recompute the checksum over the
         // 256 encrypted entries and compare with the build-time value. A patched /
         // restored table (e.g. a dumped-and-rewritten handler table) trips `ud2`.
@@ -1610,7 +1680,149 @@ pub fn build_self_decoding_parts_with_superops_and_chunks_for_family(
         //   RBX = original RSP, RBP = ret_ip, RSI = align remainder,
         //   RDI = target, R12 = state_base, R14 = bytecode_base.
         //   R13 (vstack top) / R15 (table) stay intact throughout.
+        // Cross-family routes are deliberately checked only after the local
+        // branch map misses. They therefore cannot slow or perturb same-family
+        // control flow. A matched route snapshots the caller's architectural
+        // state into the independently permuted child state, selects the child
+        // bytecode entry offset, and then reuses the canonical native-call ABI
+        // below for call/return and volatile-register synchronization.
+        for (route_index, route) in cross_family_routes.iter().enumerate() {
+            movi(&mut b, Register::RAX, route.target_va);
+            b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::R10, Register::RAX).unwrap());
+            let next_route = 0xE000_0000usize + route_index;
+            b.br(Code::Jne_rel32_64, next_route);
+            movi(&mut b, Register::RCX, route.target_state_va);
+            for index in 0..16 {
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_r64_rm64,
+                        Register::RAX,
+                        MemoryOperand::with_base_displ_size(
+                            Register::RDX,
+                            runtime_layout.vregs[index] as i64,
+                            8,
+                        ),
+                    )
+                    .unwrap(),
+                );
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_rm64_r64,
+                        MemoryOperand::with_base_displ_size(
+                            Register::RCX,
+                            route.target_layout.vregs[index] as i64,
+                            8,
+                        ),
+                        Register::RAX,
+                    )
+                    .unwrap(),
+                );
+            }
+            for (source_off, target_off) in [
+                (runtime_layout.flags, route.target_layout.flags),
+                (runtime_layout.vsp, route.target_layout.vsp),
+            ] {
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_r64_rm64,
+                        Register::RAX,
+                        MemoryOperand::with_base_displ_size(Register::RDX, source_off as i64, 8),
+                    )
+                    .unwrap(),
+                );
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_rm64_r64,
+                        MemoryOperand::with_base_displ_size(Register::RCX, target_off as i64, 8),
+                        Register::RAX,
+                    )
+                    .unwrap(),
+                );
+            }
+            for slot in 0..runtime_layout.xmm_slots.min(route.target_layout.xmm_slots) {
+                for lane in [0i64, 8] {
+                    let source_off = runtime_layout.xmm as i64 + slot as i64 * 16 + lane;
+                    let target_off = route.target_layout.xmm as i64 + slot as i64 * 16 + lane;
+                    b.push(
+                        Instruction::with2(
+                            Code::Mov_r64_rm64,
+                            Register::RAX,
+                            MemoryOperand::with_base_displ_size(Register::RDX, source_off, 8),
+                        )
+                        .unwrap(),
+                    );
+                    b.push(
+                        Instruction::with2(
+                            Code::Mov_rm64_r64,
+                            MemoryOperand::with_base_displ_size(Register::RCX, target_off, 8),
+                            Register::RAX,
+                        )
+                        .unwrap(),
+                    );
+                }
+            }
+            movi(&mut b, Register::RAX, route.target_byte_offset);
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RCX,
+                        STATE_CROSS_FAMILY_ENTRY_VIP,
+                        8,
+                    ),
+                    Register::RAX,
+                )
+                .unwrap(),
+            );
+            movi(
+                &mut b,
+                Register::RAX,
+                route
+                    .target_state_va
+                    .wrapping_add(route.target_layout.vregs[0] as u64),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RDX,
+                        STATE_CROSS_FAMILY_RETURN_PTR,
+                        8,
+                    ),
+                    Register::RAX,
+                )
+                .unwrap(),
+            );
+            if let Some(resume_offset) = route.tail_jump_resume_offset {
+                b.push(Instruction::with2(Code::Sub_rm64_imm8, Register::R13, 8).unwrap());
+                movi(&mut b, Register::RAX, resume_offset);
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_rm64_r64,
+                        MemoryOperand::with_base(Register::R13),
+                        Register::RAX,
+                    )
+                    .unwrap(),
+                );
+                mov_m(&mut b, Register::RAX, VSP_OFF);
+                b.push(Instruction::with2(Code::Sub_rm64_imm8, Register::RAX, 8).unwrap());
+                store_m(&mut b, VSP_OFF, Register::RAX);
+            }
+            movi(&mut b, Register::R10, route.target_entry_va);
+            b.br(Code::Jmp_rel32_64, 0xEFFF_FFFE);
+            let next = b.len();
+            for &mut (_, ref mut target) in b.branches.iter_mut() {
+                if *target == next_route {
+                    *target = next;
+                }
+            }
+        }
         let nf_real = b.len();
+        for &mut (_, ref mut target) in b.branches.iter_mut() {
+            if *target == 0xEFFF_FFFE {
+                *target = nf_real;
+            }
+        }
         native_bridge_instr_begin = nf_real;
         {
             // P1-2 diagnostic: snapshot the first unresolved VM→native transfer
@@ -1862,6 +2074,46 @@ pub fn build_self_decoding_parts_with_superops_and_chunks_for_family(
                 )
                 .unwrap(),
             );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RDI,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RBX,
+                        STATE_CROSS_FAMILY_RETURN_PTR,
+                        8,
+                    ),
+                )
+                .unwrap(),
+            );
+            b.push(Instruction::with2(Code::Test_rm64_r64, Register::RDI, Register::RDI).unwrap());
+            b.br(Code::Je_rel32_64, 0xBC03);
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RAX,
+                    MemoryOperand::with_base(Register::RDI),
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_imm32,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RBX,
+                        STATE_CROSS_FAMILY_RETURN_PTR,
+                        8,
+                    ),
+                    0,
+                )
+                .unwrap(),
+            );
+            let integer_result_ready = b.len();
+            for &mut (_, ref mut target) in b.branches.iter_mut() {
+                if *target == 0xBC03 {
+                    *target = integer_result_ready;
+                }
+            }
             b.push(
                 Instruction::with2(
                     Code::Mov_r64_rm64,

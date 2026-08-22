@@ -1,6 +1,18 @@
 use crate::vm::risc::RiscOp;
 use anyhow::{anyhow, Result};
 
+/// Build-time description of an unresolved branch that must enter another
+/// independently built commercial VM module instead of native code.
+#[derive(Debug, Clone)]
+pub struct NativeCrossFamilyRoute {
+    pub target_va: u64,
+    pub target_entry_va: u64,
+    pub target_state_va: u64,
+    pub target_byte_offset: u64,
+    pub target_layout: crate::vm::threaded::VmRuntimeLayout,
+    pub tail_jump_resume_offset: Option<u64>,
+}
+
 /// P2 (G3): 폭별 ALU 네이티브 핸들러 종류 (Add/SubWithBorrow/Inc/Dec/Not).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WidthAluOp {
