@@ -169,6 +169,26 @@ fn scan_literal_objects(data: &[u8], data_rva: u32) -> Vec<LiteralObject> {
     let mut objects = Vec::new();
     let mut offset = 0usize;
     while offset < data.len() {
+        // UTF-16LE must be recognized before the byte-oriented NUL scan below;
+        // otherwise every high zero byte splits `w\0i\0d\0e\0` into one-byte
+        // fragments and no production object is ever formed.
+        if offset % 2 == 0 {
+            let mut end = offset;
+            while end + 1 < data.len() && data[end].is_ascii_graphic() && data[end + 1] == 0 {
+                end += 2;
+            }
+            let payload_len = end.saturating_sub(offset);
+            if payload_len >= 8 && end + 1 < data.len() && data[end] == 0 && data[end + 1] == 0 {
+                objects.push(LiteralObject {
+                    class: DataClass::Utf16,
+                    rva: data_rva.saturating_add(offset as u32),
+                    len: (payload_len + 2) as u32,
+                    references: Vec::new(),
+                });
+                offset = end + 2;
+                continue;
+            }
+        }
         let start = offset;
         while offset < data.len() && data[offset] != 0 {
             offset += 1;
@@ -451,6 +471,38 @@ mod tests {
         assert_eq!(
             section_object_bytes(std::slice::from_ref(&section), &object).unwrap(),
             before
+        );
+    }
+
+    #[test]
+    fn production_graph_recognizes_wide_literal_as_one_object() {
+        let base = 0x1400_0000_0u64;
+        let text_rva = 0x1000;
+        let data_rva = 0x3000;
+        let instructions = [
+            Instruction::with2(
+                Code::Lea_r64_m,
+                Register::RCX,
+                MemoryOperand::with_base_displ(Register::RIP, (base + data_rva as u64) as i64),
+            )
+            .unwrap(),
+            Instruction::with_branch(Code::Call_rel32_64, base + 0x2000).unwrap(),
+        ];
+        let code = BlockEncoder::encode(
+            64,
+            InstructionBlock::new(&instructions, base + text_rva as u64),
+            BlockEncoderOptions::NONE,
+        )
+        .unwrap()
+        .code_buffer;
+        let data = b"w\0i\0d\0e\0\0\0tail\0";
+        let objects = analyze_referenced_literals(&code, text_rva, data, data_rva, base);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].class, DataClass::Utf16);
+        assert_eq!(objects[0].len, 10);
+        assert_eq!(
+            select_call_scoped_literals(&code, text_rva, base, &objects).len(),
+            1
         );
     }
 }

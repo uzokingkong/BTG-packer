@@ -19,6 +19,12 @@
 - strict scope proof가 `LEA→call`뿐 아니라 VM instruction의 RIP-relative direct literal/constant read를 포함한다. direct access는 해당 instruction 직전 복호화하고 직후 재암호화한다.
 - 객체의 모든 참조가 call/direct-access scope로 증명되고 모든 참조 block이 VM 소유일 때만 at-rest ciphertext로 승격한다. `corpus/o1.exe` 최대 조합에서 보호 객체가 45개에서 46개로 증가했고 실행 동치가 통과했다.
 
+### 2026-08-22 — P2-5 UTF-16 production object scanner 확대
+
+- byte-oriented NUL scanner가 UTF-16LE를 한 글자씩 분절하던 결함을 제거했다. wide literal을 ASCII보다 먼저 검사하고 2-byte terminator까지 단일 객체로 reference graph에 등록한다.
+- `corpus/o1.exe`에서 후보 객체 170→172, strict scope 객체 104→106으로 증가했다. 추가 wide 객체는 최종 VM 소유권 gate에서 제외되어 활성 ciphertext 객체는 46개로 유지됐고 최대 조합 실행 동치는 통과했다.
+- 동일 객체를 여러 thread/family가 동시에 toggle하는 race는 전역 lock/state storage가 필요하므로 P2-14 shared-state splitting과 함께 닫는다. lock 없는 공유 `.rdata` mutation을 억지로 활성화하지 않는다.
+
 ### 2026-08-22 — P2-10 실제 multi-family module/state/table 및 call/return routing 완료
 
 - production placer가 entry family를 첫 module로 정렬하고 4개 family의 code, handler/operand/condition/branch table, bytecode를 각각 독립 생성한다. mutable state, virtual stack, cross-family control slots, return-IP stack은 family마다 `0x8000` stride로 격리한다.
