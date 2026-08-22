@@ -7,7 +7,7 @@
 
 1. clap이 42개 CLI field를 `CliArgs`로 parse합니다.
 2. `protection_profile::RequestedConfig::from_cli`가 보호 관련 요청을 snapshot합니다.
-3. `resolve()`가 `--full`, crypto/VM 전제, M7 backend, cipher 우선순위,
+3. `resolve()`가 `--full`, crypto/VM 전제, M7 backend, 허용된 cipher 선택,
    reencrypt/mem-harden 충돌을 effective config로 정규화합니다.
 4. hard error는 즉시 종료하고 warning은 출력합니다.
 5. `--strict-profile`은 warning도 오류로 승격합니다.
@@ -42,7 +42,7 @@ polymorphic VM으로 lift해 `poly_vm_regions`에 보존하고, 실패 region은
 
 `pipeline::crypto::run`이 effective profile을 소비해 다음을 선택적으로 합성합니다.
 
-- bulk C1/RC4/ChaCha20 encryption;
+- bulk C1/ChaCha20 encryption과 아직 이전되지 않은 legacy RC4 내부 경로;
 - chained crypto 또는 native per-block reencrypt/M7 dispatcher;
 - anti-debug and integrity boot stages;
 - payload relocation, import resolution, memory hardening metadata;
@@ -79,6 +79,18 @@ anti-debug / base bind / key setup
 Program-VM M7의 persistent family chunk와 object-lifetime toggle은 native M7 dispatcher와
 다른 runtime입니다.
 
+### RC1 이전 경계
+
+현재 RC1에는 region-context ABI/provider와 M7 data-lifetime simulation이 구현돼 있습니다.
+context는 region, family, function, predecessor와 integrity epoch를 분리해 서로 다른
+키/nonce 문맥을 만듭니다. 이것은 production boot 경로 전체의 이전 완료를 뜻하지
+않습니다. boot/native emitter에는 legacy RC4 KSA/PRGA가 남아 있고 `vm-oep` 및 chained
+crypto 소비자도 아직 RC1 production ABI로 완전히 연결되지 않았습니다.
+
+따라서 CLI에서는 새 RC4 선택을 차단하지만, 기존 내부 runtime 코드는 소비자 이전이
+끝날 때까지 남아 있습니다. 문서와 manifest에서 이 상태를 "RC4 완전 제거" 또는
+"모든 `.text`/VM bytecode가 RC1로 보호됨"으로 표시하지 않습니다.
+
 ## 7. 후속 section 처리와 PE build
 
 1. `--rsrc-register`이면 relocated payload용 resource tree를 재구성합니다.
@@ -109,6 +121,8 @@ commercial VM, QA, maps와 모든 CLI 조합을 직접 노출하지 않습니다
 
 ## 현재 미완료
 
+- boot/native KSA·PRGA 소비자의 RC1 이전과 legacy RC4 구현 삭제;
+- `vm-oep` 및 chained crypto production wiring의 RC1 전환;
 - lifetime exception/unwind cleanup과 복합 memory proof;
 - P2-11 handler body recipe execution-weight 확대;
 - P2-12 RIP-relative runtime bundle과 N=20 signature gate;

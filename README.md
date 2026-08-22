@@ -16,7 +16,7 @@ whole-program multi-family Program-VM, QA·재현·진단 산출물을 하나의
 |---|---|---|
 | Native CFG packer | 구현됨 | CFG slicing, shuffle, RIP fixup, dispatcher와 PE section 재합성 |
 | PE/platform | 구현됨 | parse/build, import/resource/reloc/`.pdata`, structural validator |
-| Crypto/runtime | 구현됨 | C1/RC4/ChaCha20, boot/chained/per-block 경로, IAT/memory hardening |
+| Crypto/runtime | 이전 진행 중 | RC1 region-context ABI/provider와 M7 lifetime simulation 구현. 신규 RC4 선택은 차단됐지만 boot/native KSA·PRGA 및 vm-oep/chained production 소비자는 아직 이전 중 |
 | Selective SDK VM | 구현됨 | marker scan, poly VM embed, entry trampoline patch |
 | Program VM | 구현됨 | x86 → RISC → family ISA → native threaded runtime |
 | Multi-family | 구현됨 | Stack/Register/MixedRisc/FusedCisc 4개 독립 module/state/table/bytecode |
@@ -116,7 +116,7 @@ stdout 1,460B, stderr 0B입니다. 검증 범위와 재현 명령은
 | `--mem-harden` | runtime memory-protection 전환 |
 | `--anti-debug` | 부트 안티디버그 검사 |
 | `--map --sym-map` | VM/source 진단 매핑 생성 |
-| `--crypto-mode` | `rc4`, `c1`, `chacha20` 선택 |
+| `--crypto-mode` | `c1`, `chacha20` 선택. `rc4` 값은 파싱 거부 |
 
 `--full`은 native CFG 보호 bundle이며 commercial Program-VM을 자동으로 켜지 않습니다.
 Commercial 경로는 `--vm --vm-oep --vm-commercial`을 명시하세요.
@@ -136,6 +136,12 @@ Commercial 경로는 `--vm --vm-oep --vm-commercial`을 명시하세요.
 - 일부 TLS, unwind, panic, setjmp/longjmp, loader-critical 함수는 안전을 위해
   native로 유지됩니다.
 - at-rest 암호화와 relocation/ASLR 정책은 선택한 profile에 따라 제한됩니다.
+- RC1은 region/family/function/predecessor/integrity epoch를 분리하는 ABI와 provider,
+  M7 data-lifetime simulation까지 구현됐습니다. 아직 boot/native 내부의 legacy RC4
+  KSA/PRGA와 `vm-oep`/chained production 소비자는 RC1으로 완전히 이전되지 않았으므로
+  저장소 전체에서 RC4가 제거됐거나 production 경로가 모두 RC1이라고 간주하면 안 됩니다.
+- 신규 설정에서 `--crypto-mode rc4`는 허용되지 않으며, 호환용 `--rc4` 플래그도
+  조용히 다른 암호로 대체하지 않고 profile 해석 단계에서 오류로 종료합니다.
 - BTG-C1은 자체 연구용 cipher이며 독립적인 암호학 감사를 받지 않았습니다.
 - 최신 변경 전체에 대한 hostile corpus/20-seed release gate는 다시 수행해야 합니다.
 

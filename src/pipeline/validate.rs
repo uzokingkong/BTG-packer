@@ -28,6 +28,7 @@
 // the packer now verifies its own resource directory from inside.
 // ==============================================================================
 
+use crate::crypto::{BlockCryptoMeta, CryptoProvider, RegionCipherProvider};
 use crate::mba::MbaGenerator;
 use crate::pipeline::PipelineContext;
 use anyhow::{anyhow, bail, Result};
@@ -42,6 +43,46 @@ const RT_RCDATA: u32 = 10;
 const ALT_TYPE_ID: u32 = 0x40;
 /// per-resource chunk size (mirrors rsrc_register.rs)
 const CHUNK_SIZE: u32 = 0x10000;
+
+/// Decrypt one dispatcher block exactly as the production consumer does.
+///
+/// The legacy length-table mask remains the 32-bit MBA value because it is a
+/// compact metadata sentinel, not cipher key material.  Payload bytes use the
+/// 44-byte BTG-RC1 provider ABI (`key[32] || nonce[12]`).  The independently
+/// deployed BTG-C1 dispatcher remains supported while that production mode is
+/// active; importantly, there is no RC4 validation fallback here.
+fn decrypt_dispatcher_block(
+    mba_constant: u32,
+    custom_cipher: bool,
+    id: u32,
+    offset: u64,
+    encrypted: &[u8],
+) -> Result<Vec<u8>> {
+    let mut plain = encrypted.to_vec();
+    let meta = BlockCryptoMeta::new(id, offset, plain.len() as u32);
+    if custom_cipher {
+        let seed = MbaGenerator::seed_for(mba_constant, id);
+        let key = MbaGenerator::compute_key(seed, id, mba_constant, 2);
+        let key32 = crate::pipeline::crypto::cipher::repeat4(key);
+        let mut provider = crate::crypto::BtgCipher::new(&key32, 0);
+        provider
+            .decrypt_block(&meta, &mut plain)
+            .map_err(|e| anyhow!("BTG-C1 block {id} validation failed: {e}"))?;
+    } else {
+        let material = RegionCipherProvider::derive_block_key(&mba_constant.to_le_bytes(), &meta);
+        if material.len() != 44 {
+            bail!(
+                "BTG-RC1 block {id} provider ABI drift: {} bytes, expected 44",
+                material.len()
+            );
+        }
+        let mut provider = RegionCipherProvider::from_key(&material);
+        provider
+            .decrypt_block(&meta, &mut plain)
+            .map_err(|e| anyhow!("BTG-RC1 block {id} validation failed: {e}"))?;
+    }
+    Ok(plain)
+}
 /// max number of RT_RCDATA resources (mirrors rsrc_register.rs)
 const MAX_CHUNKS: usize = 64;
 
@@ -305,9 +346,10 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
         );
     }
 
-    // 3c. v8 (Phase 0.3): --dispatcher-reencrypt — 파일의 각 블록이 블록별 MBA
-    //     키로 개별 RC4 암호화되어 있고, 길이 테이블이 같은 키로 복호화되면
-    //     실제 길이와 일치하는지 검증한다. (패커 암호화 ↔ 디스패처 복호화 동치성)
+    // 3c. v8 (Phase 0.3): --dispatcher-reencrypt — each non-call-target
+    //     block is independently encrypted with BTG-RC1's 44-byte provider
+    //     record (or BTG-C1 when that explicit production mode is selected).
+    //     The compact length metadata continues to use the MBA mask.
     if ctx.reencrypt {
         let tb = sections
             .iter()
@@ -390,24 +432,19 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
                     );
                 }
             } else {
-                // v61: reencrypt/m7 + --custom-cipher면 per-block 키를 BTG-C1
-                // (repeat4)로 복호화해 패커 암호화 ↔ C1 디스패처 복호화 동치를
-                // 검증한다.
                 let c1 = ctx.custom_cipher && ctx.reencrypt;
-                let mut dec = out[file_off..file_off + len].to_vec();
-                if c1 {
-                    let key32 = crate::pipeline::crypto::cipher::repeat4(key);
-                    let mut c1b = crate::crypto::BtgCipher::new(&key32, 0);
-                    c1b.crypt(&mut dec);
-                } else {
-                    let mut rc4 = crate::pipeline::crypto::Rc4::new(&key.to_le_bytes());
-                    rc4.crypt(&mut dec);
-                }
+                let dec = decrypt_dispatcher_block(
+                    ctx.mba_constant,
+                    c1,
+                    id,
+                    off as u64,
+                    &out[file_off..file_off + len],
+                )?;
                 if dec != block.instructions {
                     bail!(
                         "Phase 0.3: block {} per-block decrypt roundtrip mismatch ({}) (dispatcher would execute garbage)",
                         id,
-                        if c1 { "BTG-C1" } else { "RC4" }
+                        if c1 { "BTG-C1" } else { "BTG-RC1/44B" }
                     );
                 }
             }

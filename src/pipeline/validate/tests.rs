@@ -1,6 +1,45 @@
 use super::*;
 
 #[test]
+fn dispatcher_validator_accepts_rc1_44_byte_provider_record() {
+    let mba_constant = 0xA5C3_197Du32;
+    let id = 17;
+    let offset = 0x2A40u64;
+    let plain = b"independent region ciphertext";
+    let meta = BlockCryptoMeta::new(id, offset, plain.len() as u32);
+    let material = RegionCipherProvider::derive_block_key(&mba_constant.to_le_bytes(), &meta);
+    assert_eq!(material.len(), 44, "RC1 key+nonce record ABI");
+
+    let mut encrypted = plain.to_vec();
+    let mut producer = RegionCipherProvider::from_key(&material);
+    producer.encrypt_block(&meta, &mut encrypted).unwrap();
+    assert_ne!(encrypted, plain);
+
+    let recovered = decrypt_dispatcher_block(mba_constant, false, id, offset, &encrypted).unwrap();
+    assert_eq!(recovered, plain);
+}
+
+#[test]
+fn dispatcher_validator_rc1_context_mismatch_does_not_recover_plaintext() {
+    let mba_constant = 0x41B2_09EFu32;
+    let id = 5;
+    let offset = 0x880u64;
+    let plain = b"context-bound block";
+    let meta = BlockCryptoMeta::new(id, offset, plain.len() as u32);
+    let material = RegionCipherProvider::derive_block_key(&mba_constant.to_le_bytes(), &meta);
+    let mut encrypted = plain.to_vec();
+    RegionCipherProvider::from_key(&material)
+        .encrypt_block(&meta, &mut encrypted)
+        .unwrap();
+
+    let wrong = decrypt_dispatcher_block(mba_constant, false, id + 1, offset, &encrypted).unwrap();
+    assert_ne!(
+        wrong, plain,
+        "block identity must domain-separate the RC1 stream"
+    );
+}
+
+#[test]
 fn test_expected_chunks_basic() {
     // 545 bytes -> single chunk (fits in 0x10000)
     let c = expected_chunks(0x8000, 545);

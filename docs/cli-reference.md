@@ -79,11 +79,11 @@ btg-packer.exe -i app.exe -o app.protected.exe `
 | 옵션 | 기본값 | 실제 동작 |
 |---|---:|---|
 | `--no-crypto` | off | 기본 활성 crypto layer를 끕니다. VM/M7/chained/integrity 요청도 비활성 또는 오류가 됩니다. |
-| `--crypto-mode <rc4|c1|chacha20>` | `c1` | 명시 선택이 `--rc4`/`--custom-cipher`보다 우선합니다. ChaCha20은 지원되는 bulk at-rest 경로에 적용됩니다. |
+| `--crypto-mode <c1|chacha20>` | `c1` | RC4는 선택 목록에서 제거됐습니다. ChaCha20은 지원되는 bulk at-rest 경로에 적용됩니다. |
 | `--custom-cipher` | 사실상 기본 | C1 선택을 명시합니다. 현재 기본이 C1이므로 단독으로는 변화가 없습니다. |
-| `--rc4` | off | 기본 C1 대신 legacy RC4-256을 강제합니다. |
+| `--rc4` | off | 이전 스크립트 탐지용 호환 플래그입니다. 지정하면 profile 해석 단계에서 하드 오류가 나며 다른 암호로 묵시 전환하지 않습니다. |
 | `--crypto-coverage <0..100>` | `100` | bulk code 암호화 비율입니다. dispatcher reencrypt는 100으로 덮어씁니다. |
-| `--chained-crypto` | off | 256B chained RC4와 seed/S-box/source zeroization 경로입니다. crypto 필요, dispatcher reencrypt보다 우선순위가 낮습니다. |
+| `--chained-crypto` | off | 256B chained legacy crypto 경로입니다. crypto 필요, dispatcher reencrypt보다 우선순위가 낮으며 RC1 production 소비자 이전은 아직 완료되지 않았습니다. |
 | `--dispatcher-reencrypt` | off | native shuffled block을 실행 전 decrypt/직후 reencrypt합니다. crypto 필요, writable `.textb` 때문에 mem-harden을 끕니다. |
 | `--integrity` | off | boot CRC/multisite 및 적용 가능한 Program-VM BTGI 검증을 활성화합니다. crypto 필요. |
 | `--iat-hide` | off | original imports를 runtime LoadLibraryA/GetProcAddress resolver table로 전환합니다. |
@@ -120,9 +120,16 @@ btg-packer.exe -i app.exe -o app.protected.exe `
 | `--m7` + commercial Program-VM | Program-VM chunk/data-lifetime M7 유지; native `ctx.reencrypt`로 취급하지 않음 |
 | `--m8` without effective VM | 무시 |
 | `--rsrc-register` without payload relocation | 하드 오류 |
-| `--rc4 --custom-cipher` | RC4 우선 + 경고 |
-| explicit `--crypto-mode` + legacy cipher flags | `--crypto-mode` 우선 + 경고 |
+| `--rc4` (다른 cipher 옵션 유무와 무관) | RC4 retired 하드 오류; 묵시 fallback 없음 |
+| explicit `--crypto-mode` + `--custom-cipher` | 명시 `--crypto-mode`가 effective 선택의 기준 |
 | `--strict-profile` + 경고 발생 | 패킹 전 오류 |
 
 CLI 설명과 resolver가 충돌할 경우 `src/protection_profile.rs`의 effective config가 실제
 동작의 기준입니다.
+
+### RC1/RC4 migration 상태
+
+RC1 region-context ABI/provider와 M7 data-lifetime simulation은 구현돼 있습니다. 그러나
+boot/native emitter의 legacy KSA/PRGA와 `vm-oep`/chained production 소비자는 아직 RC1로
+완전히 이전되지 않았습니다. 따라서 RC4는 신규 CLI 선택에서는 퇴출됐지만 저장소의
+내부 production 코드에서 완전히 삭제된 상태는 아닙니다.
