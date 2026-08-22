@@ -121,7 +121,7 @@ pub(crate) fn place_boot_stub(
     }
     if !data_lifetime_objects.is_empty() {
         println!(
-            "[+] P2-5 data lifetime active: {} object(s) encrypted at rest with call-scoped VM toggles",
+            "[+] P2-5 data lifetime active: {} object(s) encrypted at rest with scoped VM toggles",
             data_lifetime_objects.len()
         );
     }

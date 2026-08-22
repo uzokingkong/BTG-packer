@@ -616,6 +616,37 @@ pub fn lift_program_cfg_commercial(
                 i.flow_control(),
                 FlowControl::Call | FlowControl::IndirectCall
             );
+            let direct_scope =
+                if !is_call && i.is_ip_rel_memory_operand() && i.code() != Code::Lea_r64_m {
+                    let target = i.ip_rel_memory_address();
+                    eligible_lifetime_objects
+                        .iter()
+                        .find(|object| {
+                            target >= image_base + object.rva as u64
+                                && target
+                                    < image_base + object.rva.saturating_add(object.len) as u64
+                        })
+                        .cloned()
+                } else {
+                    None
+                };
+            if let Some(object) = direct_scope {
+                emit_lifetime_toggle(&mut lifter, &object, image_base, lifetime_key);
+                if lifter.lift_instruction(i).is_err() {
+                    ok = false;
+                    break;
+                }
+                emit_lifetime_toggle(&mut lifter, &object, image_base, lifetime_key);
+                applied_lifetime_references
+                    .entry(object.rva)
+                    .or_default()
+                    .insert((i.ip() - image_base) as u32);
+                let destination = i.op0_register().full_register();
+                if destination != Register::None {
+                    pending_lifetime.remove(&destination);
+                }
+                continue;
+            }
             if is_call {
                 let mut scoped: Vec<_> = pending_lifetime.values().cloned().collect();
                 scoped.sort_by_key(|(object, _)| object.rva);

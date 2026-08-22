@@ -197,7 +197,7 @@ pub(crate) fn gather_runs(
         );
         let references: usize = objects.iter().map(|object| object.references.len()).sum();
         println!(
-            "[+] P2-5 data-lifetime graph: {candidate_count} candidate object(s)/{candidate_references} reference(s), {} strict LEA-to-call scope object(s)/{} reference(s)",
+            "[+] P2-5 data-lifetime graph: {candidate_count} candidate object(s)/{candidate_references} reference(s), {} strict call/direct-access scope object(s)/{} reference(s)",
             objects.len(), references,
         );
         ctx.vm_data_lifetime_objects = objects;

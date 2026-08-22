@@ -14,6 +14,11 @@
 - 최신 검증: library 557/557, `corpus/o1.exe` 일반 및 `--m7 --m8 --integrity` 실행 동치 exit 0/stdout 1,460B/stderr 0B. 최신 data-lifetime 변경 이후 20-seed/전체 hostile corpus는 다시 수행해야 한다.
 - 다음 구현 순서: (1) data-lifetime 직접 메모리·wide/format·동시성 확대, (2) P2-11 handler 본체 synthesis 강화, (3) distributed integrity production descriptor/runtime wiring, (4) P2-12 runtime anchor 분산, P2-13 grammar polymorphism, P2-14 state splitting/lazy flags, P2-15 bridge oracle 감소, (5) 최신 20-seed 및 hostile/tamper release gate.
 
+### 2026-08-22 — P2-5 direct-access lifetime 확대
+
+- strict scope proof가 `LEA→call`뿐 아니라 VM instruction의 RIP-relative direct literal/constant read를 포함한다. direct access는 해당 instruction 직전 복호화하고 직후 재암호화한다.
+- 객체의 모든 참조가 call/direct-access scope로 증명되고 모든 참조 block이 VM 소유일 때만 at-rest ciphertext로 승격한다. `corpus/o1.exe` 최대 조합에서 보호 객체가 45개에서 46개로 증가했고 실행 동치가 통과했다.
+
 ### 2026-08-22 — P2-10 실제 multi-family module/state/table 및 call/return routing 완료
 
 - production placer가 entry family를 첫 module로 정렬하고 4개 family의 code, handler/operand/condition/branch table, bytecode를 각각 독립 생성한다. mutable state, virtual stack, cross-family control slots, return-IP stack은 family마다 `0x8000` stride로 격리한다.

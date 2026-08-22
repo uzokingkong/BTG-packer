@@ -84,6 +84,24 @@ pub fn select_call_scoped_literals(
     let mut instruction = Instruction::default();
     while decoder.can_decode() {
         decoder.decode_out(&mut instruction);
+        if instruction.is_ip_rel_memory_operand() && instruction.code() != Code::Lea_r64_m {
+            let target = instruction.ip_rel_memory_address();
+            if let (Some(target_rva), Some(reference_rva)) = (
+                target
+                    .checked_sub(image_base)
+                    .and_then(|v| u32::try_from(v).ok()),
+                instruction
+                    .ip()
+                    .checked_sub(image_base)
+                    .and_then(|v| u32::try_from(v).ok()),
+            ) {
+                if let Some(object) = objects.iter().find(|object| {
+                    target_rva >= object.rva && target_rva < object.rva.saturating_add(object.len)
+                }) {
+                    proven.entry(object.rva).or_default().insert(reference_rva);
+                }
+            }
+        }
         let is_call = matches!(
             instruction.flow_control(),
             FlowControl::Call | FlowControl::IndirectCall
