@@ -159,6 +159,47 @@ impl VirtualIsaSpec {
         self.operand_mask.rotate_left(11) ^ self.family_profile.isa_domain ^ 0xB7E1_5162_8AED_2A6B
     }
 
+    /// Family-local marker order for compact absolute branch targets (1/2/4/8B).
+    pub fn branch_target_markers(&self) -> [u8; 4] {
+        self.immediate_markers().map(|marker| marker + 0x0F)
+    }
+
+    pub fn branch_target_marker(&self, width: usize) -> u8 {
+        let index = match width {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            _ => unreachable!(),
+        };
+        self.branch_target_markers()[index]
+    }
+
+    pub fn branch_target_width(&self, marker: u8) -> Option<usize> {
+        self.branch_target_markers()
+            .iter()
+            .position(|&candidate| candidate == marker)
+            .map(|index| [1, 2, 4, 8][index])
+    }
+
+    pub fn encode_compact_branch_target(&self, target: u64) -> (u8, u64, usize) {
+        let width = Self::immediate_width_for_value(target);
+        (self.branch_target_marker(width), target, width)
+    }
+
+    pub fn decode_compact_branch_target(&self, marker: u8, token: u64) -> Option<u64> {
+        let width = self.branch_target_width(marker)?;
+        let bits = width * 8;
+        Some(
+            token
+                & if bits == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << bits) - 1
+                },
+        )
+    }
+
     /// Family-local representation of an absolute branch instruction index.
     pub fn encode_branch_target(&self, target: u64) -> u64 {
         let key = self.branch_target_key();
@@ -603,6 +644,26 @@ mod tests {
         }
         assert_eq!(enc_bytes.len(), spec.branch_cond_map.len());
         assert_eq!(spec.decode_cond(0xFF), None, "unknown cond must be None");
+    }
+
+    #[test]
+    fn compact_branch_target_markers_cover_all_widths_and_families() {
+        let targets = [0x7Fu64, 0x1234, 0x1234_5678, 0x1122_3344_5566_7788];
+        let mut marker_orders = std::collections::HashSet::new();
+        for family in VmArchitectureFamily::ALL {
+            let spec = VirtualIsaSpec::from_seed_and_family(0xB12A_6C01, family);
+            assert!(marker_orders.insert(spec.branch_target_markers()));
+            for (target, expected_width) in targets.into_iter().zip([1, 2, 4, 8]) {
+                let (marker, token, width) = spec.encode_compact_branch_target(target);
+                assert_eq!(width, expected_width);
+                assert_eq!(spec.branch_target_width(marker), Some(width));
+                assert_eq!(
+                    spec.decode_compact_branch_target(marker, token),
+                    Some(target)
+                );
+            }
+        }
+        assert_eq!(marker_orders.len(), VmArchitectureFamily::ALL.len());
     }
 
     #[test]

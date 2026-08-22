@@ -156,18 +156,38 @@ impl PolymorphicDecoder {
             // 부호화되므로 `op_src1 == 0x00` 이 곧 "src1 없음" 과 동치다.
             let branch_target =
                 if matches!(risc_op, RiscOp::VirtualBranch { .. }) && op_src1 == 0x00 {
-                    if vip + 8 > bytecode.len() {
+                    if vip >= bytecode.len() {
+                        return Err(anyhow!(super::DecodeError::TruncatedBranchTarget {
+                            at: vip
+                        }));
+                    }
+                    let marker = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
+                    vip += 1;
+                    let width = self.spec.branch_target_width(marker).ok_or_else(|| {
+                        anyhow!("invalid compact branch marker {marker:#04x} at {vip:#x}")
+                    })?;
+                    if vip + width > bytecode.len() {
                         return Err(anyhow!(super::DecodeError::TruncatedBranchTarget {
                             at: vip
                         }));
                     }
                     let mut b = [0u8; 8];
-                    for i in 0..8 {
-                        b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
+                    for byte in b.iter_mut().take(width) {
+                        *byte = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
                         vip += 1;
                     }
                     self.spec
-                        .decode_branch_target(u64::from_le_bytes(b) ^ self.spec.operand_mask)
+                        .decode_compact_branch_target(
+                            marker,
+                            u64::from_le_bytes(b)
+                                ^ (self.spec.operand_mask
+                                    & if width == 8 {
+                                        u64::MAX
+                                    } else {
+                                        (1u64 << (width * 8)) - 1
+                                    }),
+                        )
+                        .unwrap()
                 } else {
                     0
                 };

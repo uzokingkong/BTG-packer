@@ -88,14 +88,18 @@ impl PolymorphicEncoder {
                 self.push_encrypted(out, vip, byte);
             }
         }
-        let trailing = if matches!(ins.op, RiscOp::VirtualBranch { .. }) && ins.src1.is_none() {
-            Some(self.spec.encode_branch_target(ins.imm))
+        if matches!(ins.op, RiscOp::VirtualBranch { .. }) && ins.src1.is_none() {
+            let (marker, token, width) = self.spec.encode_compact_branch_target(ins.imm);
+            self.push_encrypted(out, vip, marker);
+            for byte in (token ^ self.spec.operand_mask)
+                .to_le_bytes()
+                .into_iter()
+                .take(width)
+            {
+                self.push_encrypted(out, vip, byte);
+            }
         } else if ins.op == RiscOp::AddWithCarry && imm1.is_none() && imm2.is_none() {
-            Some(ins.imm)
-        } else {
-            None
-        };
-        if let Some(value) = trailing {
+            let value = ins.imm;
             for byte in (value ^ self.spec.operand_mask).to_le_bytes() {
                 self.push_encrypted(out, vip, byte);
             }
@@ -231,8 +235,11 @@ impl PolymorphicEncoder {
             let is_abs_branch =
                 matches!(ins.op, RiscOp::VirtualBranch { .. }) && ins.src1.is_none();
             if is_abs_branch {
-                let enc = self.spec.encode_branch_target(ins.imm) ^ self.spec.operand_mask;
-                for b in enc.to_le_bytes() {
+                let (marker, token, width) = self.spec.encode_compact_branch_target(ins.imm);
+                out.push(self.rolling.encrypt_byte(marker, vip));
+                vip += 1;
+                let enc = token ^ self.spec.operand_mask;
+                for b in enc.to_le_bytes().into_iter().take(width) {
                     out.push(self.rolling.encrypt_byte(b, vip));
                     vip += 1;
                 }
@@ -612,6 +619,26 @@ mod tests {
                 program.instrs
             );
         }
+    }
+
+    #[test]
+    fn malformed_compact_branch_marker_is_rejected() {
+        let seed = 0xB12A_6C02;
+        let program = RiscProgram::new(vec![MicroInstr::new(RiscOp::VirtualBranch {
+            cond: BranchCondition::Always,
+        })
+        .with_imm(0)]);
+        let mut encoder = PolymorphicEncoder::new_for_family(seed, VmArchitectureFamily::Stack);
+        let mut stream = encoder.encode(&program).unwrap();
+        // opcode + condition + three descriptors precede the compact target marker.
+        let marker_vip = 5usize;
+        let mut rolling = RollingKeyEngine::new(seed);
+        for vip in 0..marker_vip {
+            let _ = rolling.decrypt_byte(stream[vip], vip as u64);
+        }
+        stream[marker_vip] = rolling.encrypt_byte(0xFE, marker_vip as u64);
+        let mut decoder = PolymorphicDecoder::new_for_family(seed, VmArchitectureFamily::Stack);
+        assert!(decoder.decode_full(&stream, false).is_err());
     }
 }
 

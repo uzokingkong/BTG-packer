@@ -360,6 +360,8 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             _ => {
                 if let Some(width) = spec.immediate_width(raw) {
                     (width as u8, K_IMM)
+                } else if let Some(width) = spec.branch_target_width(raw) {
+                    (width as u8, K_NONE)
                 } else {
                     (0, K_NONE)
                 }
@@ -737,6 +739,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             sub_decrypt,
             spec.operand_mask,
             layout.operand_offs_off,
+            true,
         );
         let t1 = b.len();
         for &mut (bi, ref mut ti) in b.branches.iter_mut() {
@@ -757,6 +760,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             sub_decrypt,
             spec.operand_mask,
             layout.operand_offs_off,
+            true,
         );
         let t2 = b.len();
         for &mut (bi, ref mut ti) in b.branches.iter_mut() {
@@ -1631,7 +1635,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
     {
         b.call(sub_dec_ops_cond); // cond byte -> DEC_COND
         b.call(sub_dec_ops); // dst/src1/src2 + imms (consumes the stream)
-                             // absolute-index target (src1 == 0x00): read the 8B target into DEC_IMM1.
+                             // absolute-index target (src1 == 0x00): read compact marker+payload.
                              // This must be consumed even when not-taken so the key stays in sync.
         movzx8_m(&mut b, Register::EAX, DEC_SRC1);
         b.push(Instruction::with2(Code::Test_rm32_r32, Register::EAX, Register::EAX).unwrap());
@@ -1643,45 +1647,17 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         store_m(&mut b, DEC_IMM1, Register::RAX);
         b.br(Code::Jmp_rel32_64, 0xA200); // -> after_all
         let abs_read = b.len();
-        emit_read_imm8(
+        b.call(sub_decrypt);
+        store_decoded_al(&mut b, DEC_SRC2, (seed >> 57) as u8);
+        emit_read_compact_imm(
             &mut b,
+            DEC_SRC2,
             DEC_IMM1,
             sub_decrypt,
             spec.operand_mask,
-            (seed >> 57) as u8,
+            layout.operand_offs_off,
+            false,
         );
-        if family != crate::vm::poly::VmArchitectureFamily::Stack {
-            mov_m(&mut b, Register::RAX, DEC_IMM1);
-            let target_key = spec.branch_target_key();
-            match family {
-                crate::vm::poly::VmArchitectureFamily::Register => {
-                    movi(&mut b, Register::RCX, target_key);
-                    b.push(
-                        Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RCX)
-                            .unwrap(),
-                    );
-                    b.push(Instruction::with2(Code::Ror_rm64_imm8, Register::RAX, 17).unwrap());
-                }
-                crate::vm::poly::VmArchitectureFamily::MixedRisc => {
-                    movi(&mut b, Register::RCX, target_key);
-                    b.push(
-                        Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RCX)
-                            .unwrap(),
-                    );
-                    b.push(Instruction::with1(Code::Bswap_r64, Register::RAX).unwrap());
-                }
-                crate::vm::poly::VmArchitectureFamily::FusedCisc => {
-                    b.push(Instruction::with2(Code::Ror_rm64_imm8, Register::RAX, 29).unwrap());
-                    movi(&mut b, Register::RCX, target_key);
-                    b.push(
-                        Instruction::with2(Code::Sub_rm64_r64, Register::RAX, Register::RCX)
-                            .unwrap(),
-                    );
-                }
-                crate::vm::poly::VmArchitectureFamily::Stack => unreachable!(),
-            }
-            store_m(&mut b, DEC_IMM1, Register::RAX);
-        }
         let after_all = b.len();
         // evaluate the condition (AL = taken).
         b.call(sub_eval_cond);

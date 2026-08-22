@@ -58,17 +58,18 @@ branch는 local branch map fast path를 유지합니다.
 
 | Family | Operand descriptor 순서 | Absolute branch target |
 |---|---|---|
-| Stack | dst, src1, src2 | direct index |
-| Register | src1, src2, dst | rotate/XOR token |
-| MixedRisc | src2, dst, src1 | byte-swap/XOR token |
-| FusedCisc | src1, dst, src2 | add/rotate token |
+| Stack | dst, src1, src2 | Stack-local compact marker |
+| Register | src1, src2, dst | Register-local compact marker |
+| MixedRisc | src2, dst, src1 | MixedRisc-local compact marker |
+| FusedCisc | src1, dst, src2 | FusedCisc-local compact marker |
 
 ordinary immediate는 값에 맞는 최소 unsigned/signed 1/2/4/8-byte masked payload를
 사용합니다. unsigned marker `0x01..0x04`와 signed marker `0x05..0x08`의 width 의미는
 family마다 순열화되며 encoder, static decoder, interpreter, native self-decoder가 같은
 family-local 표를 소비합니다. signed payload는 mask 복원 직후 해당 폭에서 64비트로
-sign-extend합니다. 절대 branch token과 AddWithCarry의 별도 carry payload는 기존 고정
-8-byte ABI를 유지합니다.
+sign-extend합니다. 절대 branch target도 별도 family-local marker와 최소 1/2/4/8-byte
+masked payload를 사용합니다. AddWithCarry의 별도 carry payload만 고정 8-byte ABI를
+유지합니다.
 
 ## Runtime entry와 integrity
 

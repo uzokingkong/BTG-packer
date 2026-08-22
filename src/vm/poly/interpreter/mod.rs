@@ -162,15 +162,33 @@ impl PolymorphicInterpreter {
             // src1 은 `None`이면 0x00 으로 부호화되므로 `op_src1_raw == 0x00` 이 곧 "src1 없음".
             let branch_target =
                 if matches!(risc_op, RiscOp::VirtualBranch { .. }) && op_src1_raw == 0x00 {
+                    if vip >= bytecode.len() {
+                        break;
+                    }
+                    let marker = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
+                    vip += 1;
+                    let width = self.spec.branch_target_width(marker).ok_or_else(|| {
+                        anyhow!("poly interp: invalid branch marker 0x{marker:02X}")
+                    })?;
                     let mut b = [0u8; 8];
-                    for i in 0..8 {
+                    for byte in b.iter_mut().take(width) {
                         if vip < bytecode.len() {
-                            b[i] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
+                            *byte = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
                             vip += 1;
                         }
                     }
                     self.spec
-                        .decode_branch_target(u64::from_le_bytes(b) ^ self.spec.operand_mask)
+                        .decode_compact_branch_target(
+                            marker,
+                            u64::from_le_bytes(b)
+                                ^ (self.spec.operand_mask
+                                    & if width == 8 {
+                                        u64::MAX
+                                    } else {
+                                        (1u64 << (width * 8)) - 1
+                                    }),
+                        )
+                        .unwrap()
                 } else {
                     0
                 };
@@ -1830,7 +1848,18 @@ impl PolymorphicInterpreter {
                 take8(&mut vip, &mut rolling, bytecode);
             }
             if matches!(risc_op, RiscOp::VirtualBranch { .. }) && op_src1 == 0x00 {
-                take8(&mut vip, &mut rolling, bytecode);
+                if vip < bytecode.len() {
+                    let marker = rolling.decrypt_byte(bytecode[vip], vip as u64);
+                    vip += 1;
+                    if let Some(width) = self.spec.branch_target_width(marker) {
+                        for _ in 0..width {
+                            if vip < bytecode.len() {
+                                let _ = rolling.decrypt_byte(bytecode[vip], vip as u64);
+                                vip += 1;
+                            }
+                        }
+                    }
+                }
             }
             if risc_op == RiscOp::Halt {
                 break;

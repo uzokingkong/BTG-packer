@@ -11,7 +11,7 @@
 - P2-10은 4개 독립 code/handler-table/bytecode/state module, canonical cross-family CALL/tail-JUMP/return routing, family별 unwind range까지 production 배치 완료다.
 - P2-11은 canonical ISA와 super-op extension의 모든 최종 handler-table target에 seed/opcode-derived synthesis wrapper를 적용했다. 전체 ISA production reachability는 완료됐지만 handler 본체의 micro-op decomposition/MBA/register allocation/control split 다양성은 추가 강화 대상으로 유지한다.
 - P2-5는 helper-only 상태를 종료했다. PE literal reference graph와 strict `LEA literal → Win64 argument → call` proof를 production에 연결하고, VM 소유권까지 재검증된 45개 객체를 at-rest ciphertext로 저장한다. call 직전 RISC toggle로 복호화하고 복귀 직후 재암호화하며 flags를 복원한다. 일부 참조/native 참조/loader-critical 객체는 fail-closed 제외한다.
-- 최신 검증: library 565/565(P2-13 compact immediate 회귀 포함), `corpus/o1.exe` 일반 및 `--m7 --m8 --integrity` 실행 동치 exit 0/stdout 1,460B/stderr 0B. 최신 data-lifetime/handler-body 변경 이후 20-seed/전체 hostile corpus는 다시 수행해야 한다.
+- 최신 검증: library 567/567(P2-13 compact control target/malformed marker 회귀 포함), `corpus/o1.exe` 일반 및 `--m7 --m8 --integrity` 실행 동치 exit 0/stdout 1,460B/stderr 0B. 최신 data-lifetime/handler-body 변경 이후 20-seed/전체 hostile corpus는 다시 수행해야 한다.
 - 다음 구현 순서: (1) P2-13 block-local/control grammar 확대, (2) P2-14 state splitting/lazy flags와 data-lifetime 동시성, (3) P2-15 bridge oracle 감소, (4) 최신 20-seed 및 hostile/tamper release gate 확대.
 
 ### 2026-08-22 — P2-13 family별 operand record grammar 분리
@@ -37,6 +37,12 @@
 - `Imm64`의 비트 패턴을 `i64`로 해석했을 때 i8/i16/i32 sign-extension으로 정확히 복원 가능하고 unsigned 표현보다 짧으면 signed compact marker를 선택한다. `-1`, `-129`, `-32769`은 각각 1/2/4바이트가 되며 그 외 값은 기존 unsigned 최소 폭 또는 8바이트 fallback을 유지한다.
 - unsigned marker는 `0x01..0x04`, signed marker는 `0x05..0x08` 영역을 사용하고 두 집합 모두 family별 width 순열을 따른다. static decoder/interpreter와 production native reader는 mask 복원 뒤 signed marker만 산술 sign-extension하며 operand resolver는 두 marker 집합을 동일한 immediate kind로 취급한다.
 - 네 family의 unsigned/signed 전 폭 roundtrip, stream boundary, native signed arithmetic/divide 차등을 통과했다. 다음 P2-13 범위는 block-local delta/table indirection/continuation token 기반 control-flow variable-length grammar다.
+
+### 2026-08-22 — P2-13 compact absolute branch-target ABI
+
+- `VirtualBranch`의 `src1=None` 절대 target tail을 고정 8바이트에서 `family-local marker + 1/2/4/8-byte masked payload`로 변경했다. 작은 instruction index는 실제 stream에서 1바이트 payload만 소비하며 네 family는 서로 다른 marker→width 순열을 사용한다.
+- encoder/super-op encoder, static decoder, interpreter boundary scanner, production native branch handler가 marker를 소비하고 동일한 폭만큼 rolling-key를 전진한다. native handler는 compact payload를 canonical target index로 복원한 뒤 기존 branch-map/resync 경로를 그대로 사용한다.
+- 네 family 전 폭 marker roundtrip, 잘못된 marker fail-closed, forward/backward native branch, 전체 library 567개와 `corpus/o1.exe --m7 --m8 --integrity --verify-output` 실행 동치를 통과했다. 다음 control grammar는 block-local delta/table-indirection/continuation token이다.
 
 ### 2026-08-22 — P2-12 family별 runtime integrity anchor 분산
 
