@@ -77,12 +77,55 @@ pub(crate) fn place_boot_stub(
         vm_family_plan,
         vm_family_partitions,
         vm_multi_family,
+        data_lifetime_objects,
     ) = lift_program(ctx, image_base, vm_oep_effective, vm_commercial)?;
     ctx.vm_coverage = vm_coverage;
     ctx.vm_prog_chunks = vm_prog_chunks;
     ctx.vm_family_plan = vm_family_plan;
     ctx.vm_family_partitions = vm_family_partitions;
     ctx.vm_multi_family = vm_multi_family;
+    for object in &data_lifetime_objects {
+        let plaintext =
+            crate::vm::data_lifetime::section_object_bytes(&ctx.patched_sections, object)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "P2-5 lifetime object RVA 0x{:X} is outside relayed sections",
+                        object.rva
+                    )
+                })?
+                .to_vec();
+        if !crate::vm::data_lifetime::toggle_section_object(
+            &mut ctx.patched_sections,
+            object,
+            ctx.poly_vm_seed,
+        ) {
+            anyhow::bail!(
+                "P2-5 lifetime object RVA 0x{:X} is outside relayed sections",
+                object.rva
+            );
+        }
+        let ciphertext =
+            crate::vm::data_lifetime::section_object_bytes(&ctx.patched_sections, object)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "P2-5 lifetime object RVA 0x{:X} disappeared after encryption",
+                        object.rva
+                    )
+                })?;
+        if ciphertext == plaintext.as_slice() {
+            anyhow::bail!(
+                "P2-5 lifetime object RVA 0x{:X} remained plaintext",
+                object.rva
+            );
+        }
+    }
+    if !data_lifetime_objects.is_empty() {
+        println!(
+            "[+] P2-5 data lifetime active: {} object(s) encrypted at rest with call-scoped VM toggles",
+            data_lifetime_objects.len()
+        );
+    }
+    ctx.vm_data_lifetime_objects = data_lifetime_objects;
 
     let btg = ctx
         .btg_section_data

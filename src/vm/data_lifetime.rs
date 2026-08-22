@@ -245,6 +245,48 @@ fn crypt(bytes: &mut [u8], key: u64, nonce: u64) {
     }
 }
 
+pub fn scoped_mask_byte(build_key: u64, object_rva: u32, index: u32) -> u8 {
+    let object_key = derive_seed(build_key, 0x5343_4F50_4544_4154 ^ object_rva as u64);
+    let lane = derive_seed(object_key, (index / 8) as u64);
+    (lane >> ((index & 7) * 8)) as u8
+}
+
+pub fn toggle_section_object(
+    sections: &mut [crate::pe::builder::SectionData],
+    object: &LiteralObject,
+    build_key: u64,
+) -> bool {
+    let Some(section) = sections.iter_mut().find(|section| {
+        object.rva >= section.virtual_address
+            && object.rva.saturating_add(object.len)
+                <= section
+                    .virtual_address
+                    .saturating_add(section.bytes.len() as u32)
+    }) else {
+        return false;
+    };
+    let offset = (object.rva - section.virtual_address) as usize;
+    for index in 0..object.len as usize {
+        section.bytes[offset + index] ^= scoped_mask_byte(build_key, object.rva, index as u32);
+    }
+    true
+}
+
+pub fn section_object_bytes<'a>(
+    sections: &'a [crate::pe::builder::SectionData],
+    object: &LiteralObject,
+) -> Option<&'a [u8]> {
+    let section = sections.iter().find(|section| {
+        object.rva >= section.virtual_address
+            && object.rva.saturating_add(object.len)
+                <= section
+                    .virtual_address
+                    .saturating_add(section.bytes.len() as u32)
+    })?;
+    let offset = (object.rva - section.virtual_address) as usize;
+    Some(&section.bytes[offset..offset + object.len as usize])
+}
+
 /// Conservative literal classifier used before relocating selected objects.
 pub fn classify_literal(bytes: &[u8]) -> Option<DataClass> {
     if bytes.len() >= 4
@@ -353,6 +395,44 @@ mod tests {
         assert_eq!(
             select_call_scoped_literals(&code, text_rva, base, &[object]).len(),
             1
+        );
+    }
+
+    #[test]
+    fn production_section_toggle_is_ciphertext_at_rest_and_roundtrips() {
+        let object = LiteralObject {
+            class: DataClass::Ascii,
+            rva: 0x2004,
+            len: 12,
+            references: vec![0x1000],
+        };
+        let mut section = crate::pe::builder::SectionData {
+            name: ".rdata".into(),
+            virtual_address: 0x2000,
+            virtual_size: 0x100,
+            characteristics: 0x4000_0040,
+            bytes: b"pad!secret-data\0tail".to_vec(),
+        };
+        let before = section_object_bytes(std::slice::from_ref(&section), &object)
+            .unwrap()
+            .to_vec();
+        assert!(toggle_section_object(
+            std::slice::from_mut(&mut section),
+            &object,
+            0x1234
+        ));
+        assert_ne!(
+            section_object_bytes(std::slice::from_ref(&section), &object).unwrap(),
+            before
+        );
+        assert!(toggle_section_object(
+            std::slice::from_mut(&mut section),
+            &object,
+            0x1234
+        ));
+        assert_eq!(
+            section_object_bytes(std::slice::from_ref(&section), &object).unwrap(),
+            before
         );
     }
 }

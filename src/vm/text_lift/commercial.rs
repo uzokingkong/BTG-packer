@@ -18,10 +18,59 @@ use super::{
 };
 use crate::graph::CfgExtractor;
 use crate::vm::poly::isa_spec::VirtualIsaSpec;
-use crate::vm::risc::{BranchCondition, MicroInstr, RiscLifter, RiscOp, RiscProgram};
+use crate::vm::risc::{BranchCondition, MicroInstr, MicroOperand, RiscLifter, RiscOp, RiscProgram};
 use anyhow::Result;
-use iced_x86::{Code, Instruction};
+use iced_x86::{Code, FlowControl, Instruction, Register};
 use std::collections::{HashMap, HashSet};
+
+fn emit_lifetime_toggle(
+    lifter: &mut RiscLifter,
+    object: &crate::vm::data_lifetime::LiteralObject,
+    image_base: u64,
+    build_key: u64,
+) {
+    let flags = MicroOperand::Temp(7);
+    let address = MicroOperand::Temp(6);
+    let value = MicroOperand::Temp(5);
+    lifter.desynth.instrs.push(
+        MicroInstr::new(RiscOp::Mov)
+            .with_dst(flags)
+            .with_src1(MicroOperand::Vflags),
+    );
+    for index in 0..object.len {
+        lifter
+            .desynth
+            .instrs
+            .push(
+                MicroInstr::new(RiscOp::Mov)
+                    .with_dst(address)
+                    .with_src1(MicroOperand::Imm64(
+                        image_base + object.rva as u64 + index as u64,
+                    )),
+            );
+        lifter.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryRead { width: 1 })
+                .with_dst(value)
+                .with_src1(address),
+        );
+        lifter.desynth.emit_xor(
+            value,
+            value,
+            MicroOperand::Imm64(crate::vm::data_lifetime::scoped_mask_byte(
+                build_key, object.rva, index,
+            ) as u64),
+        );
+        lifter.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryWrite { width: 1 })
+                .with_src1(address)
+                .with_src2(value),
+        );
+    }
+    lifter
+        .desynth
+        .instrs
+        .push(MicroInstr::new(RiscOp::SetFlag).with_src1(flags));
+}
 
 /// 블록의 모든 명령이 RISC lift 되고, 생성된 RISC op 가 전부 **폴리 인코딩 가능**한지.
 ///
@@ -153,6 +202,7 @@ pub struct ProgramLiftCommercial {
     pub virtualized_function_ids: Vec<u64>,
     /// Contiguous RISC micro-op ownership ranges for VM-owned functions.
     pub function_op_ranges: Vec<crate::vm::poly::FunctionOpRange>,
+    pub data_lifetime_objects: Vec<crate::vm::data_lifetime::LiteralObject>,
     pub hot_path_profiled: bool,
     pub hot_vm_weight: u64,
     pub hot_total_weight: u64,
@@ -233,6 +283,8 @@ pub fn lift_program_cfg_commercial(
     entry_point_va: u64,
     relayed_sections: &[crate::pe::builder::SectionData],
     image_base: u64,
+    lifetime_objects: &[crate::vm::data_lifetime::LiteralObject],
+    lifetime_key: u64,
 ) -> Result<ProgramLiftCommercial> {
     let marker_regions = crate::sdk::MarkerScanner::scan_markers(text_bytes);
     let mut marker_normalized;
@@ -278,6 +330,7 @@ pub fn lift_program_cfg_commercial(
             virtualized_functions: 0,
             virtualized_function_ids: Vec::new(),
             function_op_ranges: Vec::new(),
+            data_lifetime_objects: Vec::new(),
             hot_path_profiled: false,
             hot_vm_weight: 0,
             hot_total_weight: 0,
@@ -498,6 +551,23 @@ pub fn lift_program_cfg_commercial(
     // 2nd pass: 포함(비제외) 블록을 실제로 RISC lift해 프로그램 + ip_map 구성.
     let mut instrs: Vec<MicroInstr> = Vec::new();
     let mut ip_map: HashMap<u64, usize> = HashMap::new();
+    let eligible_lifetime_objects: Vec<_> = lifetime_objects
+        .iter()
+        .filter(|object| {
+            object.references.iter().all(|reference| {
+                let va = image_base + *reference as u64;
+                blocks.iter().any(|block| {
+                    !excluded_blocks.contains(&block.start_va)
+                        && block
+                            .instructions
+                            .iter()
+                            .any(|instruction| instruction.ip() == va)
+                })
+            })
+        })
+        .cloned()
+        .collect();
+    let mut applied_lifetime_references: HashMap<u32, HashSet<u32>> = HashMap::new();
     // P3 (G1): CfgExtractor는 블록을 주소 순으로 나열하므로 OEP가 바이트코드[0]이
     // 아니다. 레거시 `lift_cfg_switch(.., Some(entry_va))`의 entry-jump와 동일하게,
     // OEP가 VM화(비제외)되면 프로그램 맨 앞에 `VirtualBranch(Always) → OEP`를
@@ -535,12 +605,60 @@ pub fn lift_program_cfg_commercial(
         // 전량-리프트: 블록 전체가 성공해야만 포함. 실패하면 해당 블록을 네이티브로.
         let mut lifter = RiscLifter::new();
         let mut local_ip: Vec<(u64, usize)> = Vec::new();
+        let mut pending_lifetime: HashMap<
+            Register,
+            (crate::vm::data_lifetime::LiteralObject, u32),
+        > = HashMap::new();
         let mut ok = true;
         for i in &real {
             local_ip.push((i.ip(), lifter.desynth.instrs.len()));
+            let is_call = matches!(
+                i.flow_control(),
+                FlowControl::Call | FlowControl::IndirectCall
+            );
+            if is_call {
+                let mut scoped: Vec<_> = pending_lifetime.values().cloned().collect();
+                scoped.sort_by_key(|(object, _)| object.rva);
+                scoped.dedup_by_key(|(object, _)| object.rva);
+                for (object, _) in &scoped {
+                    emit_lifetime_toggle(&mut lifter, object, image_base, lifetime_key);
+                }
+                if lifter.lift_instruction(i).is_err() {
+                    ok = false;
+                    break;
+                }
+                for (object, reference) in &scoped {
+                    emit_lifetime_toggle(&mut lifter, object, image_base, lifetime_key);
+                    applied_lifetime_references
+                        .entry(object.rva)
+                        .or_default()
+                        .insert(*reference);
+                }
+                pending_lifetime.clear();
+                continue;
+            }
             if lifter.lift_instruction(i).is_err() {
                 ok = false;
                 break;
+            }
+            let destination = i.op0_register().full_register();
+            if destination != Register::None {
+                pending_lifetime.remove(&destination);
+            }
+            if i.code() == Code::Lea_r64_m && i.is_ip_rel_memory_operand() {
+                if matches!(
+                    destination,
+                    Register::RCX | Register::RDX | Register::R8 | Register::R9
+                ) {
+                    let target = i.ip_rel_memory_address();
+                    if let Some(object) = eligible_lifetime_objects.iter().find(|object| {
+                        target >= image_base + object.rva as u64
+                            && target < image_base + object.rva.saturating_add(object.len) as u64
+                    }) {
+                        pending_lifetime
+                            .insert(destination, (object.clone(), (i.ip() - image_base) as u32));
+                    }
+                }
             }
         }
         if ok {
@@ -896,6 +1014,20 @@ pub fn lift_program_cfg_commercial(
         }
     }
 
+    let data_lifetime_objects: Vec<_> = eligible_lifetime_objects
+        .into_iter()
+        .filter(|object| {
+            applied_lifetime_references
+                .get(&object.rva)
+                .is_some_and(|references| {
+                    object
+                        .references
+                        .iter()
+                        .all(|reference| references.contains(reference))
+                })
+        })
+        .collect();
+
     Ok(ProgramLiftCommercial {
         program,
         entry_va: entry_block,
@@ -910,6 +1042,7 @@ pub fn lift_program_cfg_commercial(
         virtualized_functions,
         virtualized_function_ids,
         function_op_ranges,
+        data_lifetime_objects,
         hot_path_profiled: hot_profile.is_some(),
         hot_vm_weight: hot_vm,
         hot_total_weight: hot_total,
@@ -956,7 +1089,7 @@ mod tests {
         let lift_legacy =
             crate::vm::text_lift::lift_program_cfg(&text, base_va, entry, &[], 0x140000000, &[])
                 .expect("legacy lift");
-        let lift_com = lift_program_cfg_commercial(&text, base_va, entry, &[], 0x140000000)
+        let lift_com = lift_program_cfg_commercial(&text, base_va, entry, &[], 0x140000000, &[], 0)
             .expect("commercial lift");
 
         // 레거시 리프터는 세 함수 모두 lift 가능 → 모두 포함 (블록 수 동일).
@@ -1094,7 +1227,7 @@ mod tests {
         let base_va = 0x140001000u64;
         let entry = base_va;
 
-        let lift = lift_program_cfg_commercial(&f0, base_va, entry, &[], 0x140000000)
+        let lift = lift_program_cfg_commercial(&f0, base_va, entry, &[], 0x140000000, &[], 0)
             .expect("commercial program lift");
         // OEP가 RISC로 온전히 lift되므로 VM화(entry_native=false)되어야 한다.
         assert!(!lift.entry_native, "OEP virtualized (entry_native=false)");

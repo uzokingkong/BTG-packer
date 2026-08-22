@@ -24,6 +24,7 @@ pub(crate) fn lift_program(
     Option<vm::poly::ProductionFamilyPlan>,
     Option<Vec<vm::poly::FamilyOpPartition>>,
     Option<vm::multi_family::MaterializedMultiFamilyProgram>,
+    Vec<crate::vm::data_lifetime::LiteralObject>,
 )> {
     // P3 (G1): 상용 프로그램 리프트의 ip_map (source-IP -> micro-op index) — the
     // VirtualBranch native handler uses it to resolve branch targets to bytecode
@@ -35,6 +36,7 @@ pub(crate) fn lift_program(
     let mut vm_family_plan = None;
     let mut vm_family_partitions = None;
     let mut vm_multi_family = None;
+    let mut data_lifetime_objects = Vec::new();
 
     let (vm_prog_bytecode, vm_oep_native_entry, oep_va): (Vec<u8>, bool, u64) = if vm_oep_effective
     {
@@ -47,7 +49,10 @@ pub(crate) fn lift_program(
                 ep_va,
                 &ctx.target_info.relayed_sections,
                 image_base,
+                &ctx.vm_data_lifetime_objects,
+                ctx.poly_vm_seed,
             )?;
+            data_lifetime_objects = lift.data_lifetime_objects.clone();
             vm_prog_ip_map = lift.program.ip_map().cloned();
             let plan = vm::poly::ProductionFamilyPlan::new(
                 ctx.poly_vm_seed,
@@ -205,5 +210,6 @@ pub(crate) fn lift_program(
         vm_family_plan,
         vm_family_partitions,
         vm_multi_family,
+        data_lifetime_objects,
     ))
 }
