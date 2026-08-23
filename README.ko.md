@@ -1,4 +1,4 @@
-﻿# Ouroboros
+# Ouroboros
 
 **Windows x86-64 PE Transformation, Program Virtualization & Runtime Hardening Framework — written in Rust**
 
@@ -863,4 +863,4 @@ BTG Packer is intended for binary-protection research, compiler/virtual-machine 
 
 Do not use it to protect or distribute software you do not own or have permission to modify.
 
-MIT License는 `LICENSE`, 보안 관련 제보 방법은 `SECURITY.md`를 참고하세요.
+Apache 2.0 License는 `LICENSE`, 보안 관련 제보 방법은 `SECURITY.md`를 참고하세요.

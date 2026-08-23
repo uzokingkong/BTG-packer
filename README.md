@@ -9,7 +9,7 @@
 ![Binary Format](https://img.shields.io/badge/format-PE32%2B-informational)
 ![Architecture](https://img.shields.io/badge/architecture-x86--64-lightgrey)
 ![Status](https://img.shields.io/badge/status-research%20prototype-yellow)
-![License](https://img.shields.io/badge/license-MIT-green)
+![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 
 **BTG Packer** is a research-oriented Windows x86-64 binary protection framework written in Rust.
 
@@ -2204,7 +2204,7 @@ Do not use the project to modify, conceal, distribute or protect software withou
 
 # License
 
-BTG Packer is distributed under the **MIT License**.
+BTG Packer is distributed under the **Apache License, Version 2.0**.
 
 See:
 

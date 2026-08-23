@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 authors = ["BTG Security Research Team"]
 description = "Bidirectional Trigger Graph (BTG) Binary Protection & Obfuscation Packer"
-license = "MIT"
+license = "Apache-2.0"
 [profile.dev]
 debug = true
 
