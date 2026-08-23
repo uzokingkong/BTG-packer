@@ -1,4 +1,4 @@
-# BTG Packer
+# BTG Program Virtualizer
 
 **Windows x86-64 PE Transformation, Program Virtualization & Runtime Hardening Framework — written in Rust**
 
