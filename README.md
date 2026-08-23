@@ -40,36 +40,31 @@ For the implementation-level explanation, see the [documentation index](docs/REA
 
 ## Architecture at a glance
 
-```text
-Input PE32+
-    |
-    v
-PE + Program Analysis
-    |
-    v
-ProgramModel / CFG / Functions
-    |
-    +-------------------------+
-    |                         |
-    v                         v
-Native CFG path          Program-VM path
-slice / shuffle          x86 -> RISC
-fixups / encode          ownership / families
-    |                    polymorphic bytecode
-    |                         |
-    +------------+------------+
-                 |
-                 v
-         Runtime Protection
-                 |
-                 v
-          PE Reconstruction
-                 |
-                 v
-             Validation
+```mermaid
+flowchart LR
+    A["Input PE32+"] --> B["PE + Program Analysis"]
+    B --> C["ProgramModel / CFG / Functions"]
+    C --> D{"Transformation path"}
+
+    D -->|Native| E["Native CFG\nSlice · Shuffle · Fixups"]
+    D -->|Program-VM| F["x86-64 → RISC IR"]
+
+    F --> G["Ownership + VM Family Planning"]
+    G --> H["Polymorphic ISA + Rolling-Key Bytecode"]
+
+    E --> I["Runtime Protection"]
+    H --> I
+    I --> J["PE Reconstruction"]
+    J --> K["Structural + Coverage Validation"]
+    K --> L["Protected PE32+"]
 ```
 
-Detailed architecture: [docs/architecture.md](docs/architecture.md)
+The Program-VM path is deliberately not just a fixed `x86 opcode → VM opcode` translator. Supported native semantics are lifted into an internal RISC layer, assigned through ownership/family planning, encoded into build-local VM representations, and executed by generated native runtime components.
+
+Detailed architecture: [docs/architecture.md](docs/architecture.md) · [Program-VM internals](docs/program-vm.md)
+
+> [!NOTE]
+> BTG's next experimental design direction is a graph-driven cooperative VM execution model built on top of the existing multi-family infrastructure. It is documented separately as a **planned design**, not as a claim about current production behavior: [Bidirectional Trigger Graph VM design](docs/design/btg-trigger-graph.md).
 
 ## Build
 
@@ -144,6 +139,7 @@ The commercial path normally requires measured full VM coverage. `--allow-partia
 | PE parsing, rewriting, relocations, TLS and unwind | [PE Transformation Pipeline](docs/pe-pipeline.md) |
 | Crypto and runtime hardening features | [Runtime Protection](docs/runtime-protection.md) |
 | Coverage gates, QA, verification and debugging | [Validation and Development](docs/validation-development.md) |
+| Planned graph-driven VM identity | [Bidirectional Trigger Graph design](docs/design/btg-trigger-graph.md) |
 
 ## Library use
 
