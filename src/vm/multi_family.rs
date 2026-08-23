@@ -325,7 +325,20 @@ impl MultiFamilyProgramPlan {
         }
 
         let mut route_table = Vec::with_capacity(self.routes.len());
-        for (route_id, route) in self.routes.iter().enumerate() {
+
+        // The generated native route scanner is keyed by (source family, target VA),
+        // not by the individual source callsite. Multiple callsites in the same
+        // family can legitimately target the same function, so emitting one route
+        // record per callsite creates duplicate runtime keys and is rejected later
+        // by `validate_native_cross_family_routes()`. Canonicalize equivalent
+        // destinations here while still failing closed if the same runtime key
+        // would require different semantics (for example CALL vs tail JUMP).
+        let mut runtime_targets: HashMap<
+            (VmArchitectureFamily, u64),
+            (VmArchitectureFamily, usize, CrossFamilyRouteKind),
+        > = HashMap::new();
+
+        for route in &self.routes {
             let source = self
                 .partitions
                 .iter()
@@ -347,9 +360,26 @@ impl MultiFamilyProgramPlan {
                 .and_then(|map| map.get(&route.target_va))
                 .copied()
                 .ok_or_else(|| format!("missing local target VA {:#x}", route.target_va))?;
+
+            let runtime_key = (route.source_family, route.target_va);
+            let runtime_destination = (route.target_family, target_local_op, route.kind);
+            if let Some(existing) = runtime_targets.get(&runtime_key) {
+                if *existing != runtime_destination {
+                    return Err(format!(
+                        "ambiguous cross-family runtime target {:#x} from {:?}: existing {:?}, new {:?}",
+                        route.target_va, route.source_family, existing, runtime_destination
+                    ));
+                }
+                // Equivalent route from another source callsite. The runtime scanner
+                // only needs one entry for this target.
+                continue;
+            }
+            runtime_targets.insert(runtime_key, runtime_destination);
+
+            let route_id = u32::try_from(route_table.len())
+                .map_err(|_| "cross-family route table exceeds u32".to_string())?;
             route_table.push(CrossFamilyRouteRecord {
-                route_id: u32::try_from(route_id)
-                    .map_err(|_| "cross-family route table exceeds u32".to_string())?,
+                route_id,
                 source_family: route.source_family,
                 source_local_op,
                 resume_local_op: (route.kind == CrossFamilyRouteKind::Call)

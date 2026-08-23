@@ -74,17 +74,32 @@ pub(crate) fn build_multi_family_prog_mod(
         })
         .collect();
 
+    // The first build below is a sizing-only pass.  Cross-family routes still
+    // flow through the production route validator, so their address fields must
+    // satisfy the same non-null contract even though final per-module code VAs
+    // are not known until all module sizes have been measured.
+    //
+    // Use deterministic, non-zero synthetic addresses here instead of null
+    // placeholders. `movi()` always emits an imm64, so the concrete values do
+    // not affect generated code size.  The final build later replaces these
+    // values with the real code/state addresses.
+    const SIZING_ENTRY_BASE: u64 = 0x0000_0001_0000_0000;
+    const SIZING_STATE_BASE: u64 = 0x0000_0002_0000_0000;
+
     let dummy_routes = |source_family| {
         materialized
             .route_table
             .iter()
             .filter(|route| route.source_family == source_family)
             .map(|route| {
-                let target = modules[index_by_family[&route.target_family]];
+                let target_index = index_by_family[&route.target_family];
+                let target = modules[target_index];
                 vm::threaded::poly_direct::NativeCrossFamilyRoute {
                     target_va: route.target_va,
-                    target_entry_va: 0,
-                    target_state_va: 0,
+                    target_entry_va: SIZING_ENTRY_BASE
+                        + (target_index as u64) * MULTI_FAMILY_STATE_STRIDE as u64,
+                    target_state_va: SIZING_STATE_BASE
+                        + (target_index as u64) * MULTI_FAMILY_STATE_STRIDE as u64,
                     target_byte_offset: target.instruction_offsets[route.target_local_op] as u64,
                     target_layout: vm::threaded::VmRuntimeLayout::from_seed(target.module_domain),
                     tail_jump_resume_offset: (route.kind
@@ -101,10 +116,15 @@ pub(crate) fn build_multi_family_prog_mod(
     for (module_index, module) in modules.iter().enumerate() {
         let mut routes = dummy_routes(module.family);
         if routes.is_empty() {
+            // Keep one unreachable route so the sizing pass and final pass use
+            // the same generated route-scan shape.  It must still satisfy the
+            // production validator's non-null address contract.
             routes.push(vm::threaded::poly_direct::NativeCrossFamilyRoute {
                 target_va: u64::MAX,
-                target_entry_va: 0,
-                target_state_va: 0,
+                target_entry_va: SIZING_ENTRY_BASE
+                    + (module_index as u64) * MULTI_FAMILY_STATE_STRIDE as u64,
+                target_state_va: SIZING_STATE_BASE
+                    + (module_index as u64) * MULTI_FAMILY_STATE_STRIDE as u64,
                 target_byte_offset: 0,
                 target_layout: vm::threaded::VmRuntimeLayout::from_seed(module.module_domain),
                 tail_jump_resume_offset: None,

@@ -120,10 +120,15 @@ pub fn parse_tls_directory64(
         None
     } else {
         let rva = va_to_rva(index, image_base)?;
-        let b = bytes_at(sections, rva, 4)?;
+        // AddressOfIndex points to a loader-owned DWORD. It may legally live
+        // in a section's zero-filled virtual tail (for example .bss), where
+        // the RVA is valid in the mapped image but has no raw file bytes.
+        // Read it as the Windows loader would see it: raw bytes where present,
+        // zeroes for the remainder of a valid mapped section.
+        let initial_value = mapped_u32_at(sections, rva)?;
         Some(TlsIndex {
             address: index_typed,
-            initial_value: read_u32(b, 0),
+            initial_value,
         })
     };
 
@@ -203,6 +208,41 @@ fn bytes_at(sections: &[SectionData], rva: u32, len: usize) -> Result<&[u8]> {
         }
     }
     bail!("RVA 0x{rva:X} length 0x{len:X} is not file-backed")
+}
+
+/// Read one DWORD as it appears in the mapped PE image.
+///
+/// PE sections may have `VirtualSize > SizeOfRawData`; Windows zero-fills that
+/// virtual tail. TLS `AddressOfIndex` commonly points into such loader-writable
+/// storage, so requiring four file-backed bytes rejects valid PE32+ images.
+fn mapped_u32_at(sections: &[SectionData], rva: u32) -> Result<u32> {
+    const LEN: usize = 4;
+
+    for section in sections {
+        let Some(offset_u32) = rva.checked_sub(section.virtual_address) else {
+            continue;
+        };
+        let offset = offset_u32 as usize;
+        let Some(end) = offset.checked_add(LEN) else {
+            break;
+        };
+
+        // A section is mapped at least through its virtual extent. `max` also
+        // preserves validity for unusual images whose raw data is larger.
+        let mapped_len = (section.virtual_size as usize).max(section.bytes.len());
+        if end > mapped_len {
+            continue;
+        }
+
+        let mut value = [0u8; LEN];
+        if offset < section.bytes.len() {
+            let raw_end = end.min(section.bytes.len());
+            value[..raw_end - offset].copy_from_slice(&section.bytes[offset..raw_end]);
+        }
+        return Ok(u32::from_le_bytes(value));
+    }
+
+    bail!("RVA 0x{rva:X} length 0x4 is outside mapped PE sections")
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
@@ -298,6 +338,24 @@ mod tests {
         sections[0].bytes.truncate(0xA8); // first entry present, terminator absent
         let err = parse_tls_directory64(BASE, dir, &sections, &[]).unwrap_err();
         assert!(err.to_string().contains("not file-backed"));
+    }
+
+    #[test]
+    fn accepts_tls_index_in_zero_filled_virtual_tail() {
+        let (dir, mut sections) = fixture();
+
+        // Keep the TLS directory itself file-backed, but move AddressOfIndex
+        // into the section's zero-filled virtual tail.
+        put64(&mut sections[0].bytes, 0x10, BASE + 0x2200);
+        sections[0].bytes.truncate(0x180);
+        sections[0].virtual_size = 0x300;
+
+        let tls = parse_tls_directory64(BASE, dir, &sections, &[])
+            .unwrap()
+            .unwrap();
+        let index = tls.index.unwrap();
+        assert_eq!(index.address.rva, Some(0x2200));
+        assert_eq!(index.initial_value, 0);
     }
 
     #[test]
