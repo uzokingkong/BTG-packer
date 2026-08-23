@@ -12,6 +12,7 @@ The repository root `README.md` is intentionally kept short: project summary, im
 - [PE Transformation Pipeline](pe-pipeline.md) — parsing, CFG reconstruction, block rewriting, PE rebuilding, relocations, TLS, exception metadata, resources and import handling.
 - [Runtime Protection](runtime-protection.md) — crypto modes, payload relocation, integrity, anti-debugging, IAT hiding, memory hardening, M7/M8 and dispatcher re-encryption.
 - [Validation and Development](validation-development.md) — coverage gates, deterministic builds, differential execution verification, QA, VM diagnostics and debugging artifacts.
+- [Bidirectional Trigger Graph VM Design](design/btg-trigger-graph.md) — **planned/experimental** graph-driven cooperative multi-family execution identity.
 
 ## Source-oriented map
 
@@ -40,5 +41,7 @@ The binary front-end in `src/main.rs` parses CLI arguments, resolves the protect
 ## Reading order
 
 For a first pass, read `getting-started.md`, then `architecture.md`. If you are interested primarily in virtualization, continue with `program-vm.md`. If you are working on executable compatibility, PE reconstruction or Windows loader behavior, continue with `pe-pipeline.md` and `validation-development.md`.
+
+The design document under `design/` is intentionally separated from current implementation documentation so future architectural ideas are not confused with validated production behavior.
 
 > BTG Packer is a security-research prototype. Use it only on software you own or are explicitly authorized to transform or analyze.
