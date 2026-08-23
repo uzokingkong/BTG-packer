@@ -30,36 +30,31 @@ BTG Packer는 Windows x86-64 PE32+ 실행 파일을 분석하고 변환하는 �
 
 ## 전체 구조
 
-```text
-Input PE32+
-    |
-    v
-PE + Program Analysis
-    |
-    v
-ProgramModel / CFG / Functions
-    |
-    +-------------------------+
-    |                         |
-    v                         v
-Native CFG               Program-VM
-slice / shuffle          x86 -> RISC
-fixup / encode           ownership / families
-    |                    polymorphic bytecode
-    |                         |
-    +------------+------------+
-                 |
-                 v
-         Runtime Protection
-                 |
-                 v
-          PE Reconstruction
-                 |
-                 v
-             Validation
+```mermaid
+flowchart LR
+    A["Input PE32+"] --> B["PE + Program Analysis"]
+    B --> C["ProgramModel / CFG / Functions"]
+    C --> D{"Transformation path"}
+
+    D -->|Native| E["Native CFG\nSlice · Shuffle · Fixups"]
+    D -->|Program-VM| F["x86-64 → RISC IR"]
+
+    F --> G["Ownership + VM Family Planning"]
+    G --> H["Polymorphic ISA + Rolling-Key Bytecode"]
+
+    E --> I["Runtime Protection"]
+    H --> I
+    I --> J["PE Reconstruction"]
+    J --> K["Structural + Coverage Validation"]
+    K --> L["Protected PE32+"]
 ```
 
-자세한 구조: [docs/architecture.md](docs/architecture.md)
+Program-VM 경로는 단순한 `x86 opcode → 고정 VM opcode` 변환기가 아닙니다. 지원되는 x86-64 의미를 내부 RISC 계층으로 lift하고, ownership/family planning을 거쳐 build별 VM 표현으로 인코딩한 뒤 생성된 native runtime으로 실행합니다.
+
+자세한 구조: [docs/architecture.md](docs/architecture.md) · [Program-VM 내부 구조](docs/program-vm.md)
+
+> [!NOTE]
+> 기존 multi-family 기반을 확장하는 **graph-driven cooperative VM**은 현재 차세대 실험 설계로 분리해 문서화하고 있습니다. 현재 production 동작이라고 과장하지 않고 `Planned / Experimental design`으로 명확히 구분합니다: [Bidirectional Trigger Graph VM 설계](docs/design/btg-trigger-graph.md).
 
 ## 빌드
 
@@ -132,6 +127,7 @@ Commercial 경로는 기본적으로 측정된 VM coverage 정책을 통과해�
 | PE 파싱/재구성, relocation, TLS, unwind | [PE Transformation Pipeline](docs/pe-pipeline.md) |
 | Crypto 및 runtime hardening | [Runtime Protection](docs/runtime-protection.md) |
 | Coverage, QA, 검증, 디버깅 | [Validation and Development](docs/validation-development.md) |
+| 차세대 graph-driven VM 정체성 | [Bidirectional Trigger Graph 설계](docs/design/btg-trigger-graph.md) |
 
 ## Library API
 
