@@ -1,7 +1,8 @@
 # BTG Packer
 
 ### Windows x86-64 PE Transformation & Program Virtualization Framework
-<span style="color:red">**Bug reports are very welcome!**</span>
+> **Bug reports and contributions are always welcome!**
+
 [🇰🇷 한국어 문서 보기](README.ko.md)
 
 ![Language](https://img.shields.io/badge/language-Rust-orange)
