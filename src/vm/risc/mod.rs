@@ -1,25 +1,40 @@
 pub mod desynth;
 pub mod eval;
 pub mod flags;
+pub mod high_byte;
 pub mod lifter;
 pub mod math_util;
 pub mod native_abi;
+pub mod op_registry;
 pub mod opcodes;
 pub mod opt;
 pub mod semantic_splice;
+pub mod unsupported_report;
 pub mod virtual_cfg_explosion;
 
 pub(crate) use math_util::*;
 use std::collections::HashMap;
 
 pub use desynth::RiscDesynthesizer;
+pub use eval::{MemoryPolicy, MemoryRegion, VmFault, VmFaultKind};
 pub use flags::VirtualFlags;
 pub use flags::{mask_for_width, VFLAG_CF, VFLAG_DF};
+pub use high_byte::{
+    certify_high_byte_instruction, has_rex_prefix, HighByteCertificationError,
+    HighByteInstructionCertification, LegacyHighByte,
+};
 pub use lifter::RiscLifter;
+pub use op_registry::{
+    assert_commercial_capabilities, capabilities, CommercialCapability, CommercialCapabilityError,
+    RiscOpCapabilities, RiscOpKind,
+};
 pub use opcodes::{BranchCondition, MicroInstr, MicroOperand, RiscOp};
 pub use opt::RiscOptimizer;
 pub use semantic_splice::{
     SemanticSplicer, SplicedAluOp, SplicedFlagKind, SplicedMicroOp, SplicedNoiseKind,
+};
+pub use unsupported_report::{
+    UnsupportedInstruction, UnsupportedInstructionReport, UnsupportedReportError, UnsupportedStage,
 };
 pub use virtual_cfg_explosion::{
     BranchlessVipResolver, OpaqueInvariantKind, OpaquePredicateForest, PhantomBasicBlock,
@@ -75,6 +90,9 @@ impl Default for RiscEvalState {
 
 #[cfg(test)]
 mod bridge_abi_tests;
+
+#[cfg(test)]
+mod fault_parity_tests;
 
 #[cfg(test)]
 mod tests {
@@ -408,11 +426,10 @@ mod tests {
         assert_eq!(cvt_f64_int(-1.9, 8, true), (-1i64) as u64);
     }
 
-    /// P1-3 (exception-adjacent): x86 DIV/IDIV divisor-0(#DE) — VM 참조는 크래시
-    /// 대신 결정적 0을 반환한다. eval_state가 이 정책을 지키는지 + 폴리 인터프리터
-    /// (동일 VirtualFlags/div_wide)와 동치인지 검증한다.
+    /// P1-3 (exception-adjacent): x86 DIV/IDIV divisor-0(#DE)는 evaluator에서
+    /// typed guest fault로 관측되며 fault-before-commit을 지킨다.
     #[test]
-    fn div_by_zero_returns_deterministic_zero_not_crash() {
+    fn div_by_zero_is_typed_and_does_not_commit() {
         // RDX:RAX = 0x... : 100, divisor = 0 (reg[5]) → 몫/나머지 0
         let mut d = RiscDesynthesizer::new();
         d.emit_add(
@@ -436,35 +453,25 @@ mod tests {
         d.instrs.push(MicroInstr::new(RiscOp::Halt));
         let prog = RiscProgram::new(d.instrs);
 
-        // eval_state: divisor 0 → #DE 회피(결정적 0)
         let regs = [0u64; 16];
-        let st = prog.eval_state(&regs);
-        assert_eq!(st.regs[0], 0, "RAX(quotient) must be 0 on div-by-zero");
-        assert_eq!(st.regs[2], 0, "RDX(remainder) must be 0 on div-by-zero");
+        let fault = prog.try_eval_state(&regs).unwrap_err();
+        assert_eq!(fault.kind, VmFaultKind::DivideByZero);
+        assert_eq!(fault.state.regs[0], 100, "fault must not commit quotient");
+        assert_eq!(fault.state.regs[2], 0, "fault must not commit remainder");
 
-        // 폴리 인터프리터와 동치 (동일 reference 경로)
+        // 기존 poly backend 완화 계약은 별도로 유지한다.
         use crate::vm::poly::{PolymorphicEncoder, PolymorphicInterpreter};
         let seed = 0x12345678u64;
         let mut enc = PolymorphicEncoder::new(seed);
         let bc = enc.encode(&prog).unwrap();
         let mut interp = PolymorphicInterpreter::new(seed);
-        interp.run(&bc).unwrap();
-        assert_eq!(
-            interp.regs[0], 0,
-            "poly interp: RAX must be 0 on div-by-zero"
-        );
-        assert_eq!(
-            interp.regs[2], 0,
-            "poly interp: RDX must be 0 on div-by-zero"
-        );
+        assert!(interp.run(&bc).is_err(), "poly backend must surface #DE");
     }
 
     /// P1-7: x86 DIV/IDIV 몫이 destination 폭을 초과하면 #DE — 참조 eval_state 는
-    /// 조용히 잘라 저장하지 않고 명시적으로 실패(panic)해야 한다 (네이티브 하드웨어
-    /// div 의 #DE 크래시와 동일한 '조용한 오답 방지').
+    /// 조용히 잘라 저장하지 않고 typed guest fault를 반환해야 한다.
     #[test]
-    #[should_panic(expected = "x86 #DE")]
-    fn div_quotient_overflow_panics_reference() {
+    fn div_quotient_overflow_is_typed_reference_fault() {
         // 64비트 unsigned DIV: RDX:RAX = 0x1_0000_0000 (2^32), divisor = 1.
         // 몫 = 0x1_0000_0000 > 0xFFFF_FFFF → 32비트 폭엔 안 맞음 → #DE.
         let mut d = RiscDesynthesizer::new();
@@ -488,7 +495,8 @@ mod tests {
         );
         d.instrs.push(MicroInstr::new(RiscOp::Halt));
         let prog = RiscProgram::new(d.instrs);
-        let _ = prog.eval_state(&[0u64; 16]); // must panic (#DE)
+        let fault = prog.try_eval_state(&[0u64; 16]).unwrap_err();
+        assert_eq!(fault.kind, VmFaultKind::QuotientOverflow);
     }
 
     // ── P1 (③): VM→VM 콜 브릿지 — 서브 VM 레지스트리 기반 nested-VM 참조 의미론 ──

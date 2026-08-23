@@ -5,7 +5,14 @@
 use super::bootstub::{BootStubCtx, Label};
 use iced_x86::{Code, Instruction, MemoryOperand, Register};
 
-pub(crate) fn emit_mem_harden(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
+fn emit_mem_protect(
+    seq: &mut Vec<(Instruction, Option<Label>)>,
+    stub: &BootStubCtx,
+    protection: u32,
+    seal_state: bool,
+    fail_label: Label,
+    done_label: Label,
+) {
     // ── v6 --mem-harden: ntdll!NtProtectVirtualMemory로 .textb RWX->RX ──────
     // S3: fail-open 제거 — LoadLibraryA("ntdll.dll")/GetProcAddress(
     // "NtProtectVirtualMemory") 해석 실패 및 NtProtectVirtualMemory의
@@ -38,7 +45,7 @@ pub(crate) fn emit_mem_harden(seq: &mut Vec<(Instruction, Option<Label>)>, stub:
         ));
         seq.push((
             Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(),
-            Some(Label::MemFail),
+            Some(fail_label),
         )); // LoadLibraryA 슬롯 없음 → 거부
         seq.push((
             Instruction::with1(Code::Call_rm64, Register::RAX).unwrap(),
@@ -50,7 +57,7 @@ pub(crate) fn emit_mem_harden(seq: &mut Vec<(Instruction, Option<Label>)>, stub:
         ));
         seq.push((
             Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(),
-            Some(Label::MemFail),
+            Some(fail_label),
         )); // ntdll 로드 실패 → 거부
         seq.push((
             Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RAX).unwrap(),
@@ -85,7 +92,7 @@ pub(crate) fn emit_mem_harden(seq: &mut Vec<(Instruction, Option<Label>)>, stub:
         ));
         seq.push((
             Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(),
-            Some(Label::MemFail),
+            Some(fail_label),
         )); // GetProcAddress 슬롯 없음 → 거부
         seq.push((
             Instruction::with1(Code::Call_rm64, Register::RAX).unwrap(),
@@ -97,7 +104,7 @@ pub(crate) fn emit_mem_harden(seq: &mut Vec<(Instruction, Option<Label>)>, stub:
         ));
         seq.push((
             Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(),
-            Some(Label::MemFail),
+            Some(fail_label),
         )); // proc 해석 실패 → 거부
         seq.push((
             Instruction::with2(Code::Mov_r64_rm64, Register::R12, Register::RAX).unwrap(),
@@ -163,7 +170,7 @@ pub(crate) fn emit_mem_harden(seq: &mut Vec<(Instruction, Option<Label>)>, stub:
             None,
         ));
         seq.push((
-            Instruction::with2(Code::Mov_r32_imm32, Register::R9D, 0x20).unwrap(),
+            Instruction::with2(Code::Mov_r32_imm32, Register::R9D, protection).unwrap(),
             None,
         )); // PAGE_EXECUTE_READ
         seq.push((
@@ -195,13 +202,13 @@ pub(crate) fn emit_mem_harden(seq: &mut Vec<(Instruction, Option<Label>)>, stub:
         ));
         seq.push((
             Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
-            Some(Label::MemFail),
+            Some(fail_label),
         )); // NTSTATUS != 0 → 거부
 
         // P1-5: the remainder of the original RWX section owns mutable VM
         // state/call-stack/bootstrap data. Remove execute permission from that
         // tail explicitly, yielding RX immutable pages + RW mutable pages.
-        if stub.vm_oep {
+        if seal_state && stub.vm_oep {
             seq.push((
                 Instruction::with2(Code::Mov_r64_imm64, Register::R11, stub.mem_state_base)
                     .unwrap(),
@@ -293,16 +300,40 @@ pub(crate) fn emit_mem_harden(seq: &mut Vec<(Instruction, Option<Label>)>, stub:
             ));
             seq.push((
                 Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
-                Some(Label::MemFail),
+                Some(fail_label),
             ));
         }
         seq.push((
             Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap(),
-            Some(Label::MemDone),
+            Some(done_label),
         )); // 성공 → 정상 경로
             // MemFail: 명시적 거부 (ud2 — 절대 fall-through 금지)
-        seq.push((Instruction::with(Code::Ud2), Some(Label::MemFail)));
+        seq.push((Instruction::with(Code::Ud2), Some(fail_label)));
         // MemDone: 정상 경로 종점 (NOP)
-        seq.push((Instruction::with(Code::Nopd), Some(Label::MemDone)));
+        seq.push((Instruction::with(Code::Nopd), Some(done_label)));
     }
+}
+
+/// Open the initially RX runtime just long enough for bootstrap copy/decrypt.
+pub(crate) fn emit_mem_unseal(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
+    emit_mem_protect(
+        seq,
+        stub,
+        0x40, // PAGE_EXECUTE_READWRITE
+        false,
+        Label::MemOpenFail,
+        Label::MemOpenDone,
+    );
+}
+
+/// Close the transient write window and split immutable RX from mutable RW.
+pub(crate) fn emit_mem_harden(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
+    emit_mem_protect(
+        seq,
+        stub,
+        0x20, // PAGE_EXECUTE_READ
+        true,
+        Label::MemFail,
+        Label::MemDone,
+    );
 }

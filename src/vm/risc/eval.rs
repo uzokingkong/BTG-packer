@@ -7,6 +7,84 @@ use super::math_util::*;
 use super::opcodes::{BranchCondition, MicroInstr, MicroOperand, RiscOp};
 use super::{RiscEvalState, RiscProgram};
 
+/// A guest-visible evaluator failure. `state` is the precise state before the
+/// faulting instruction commits any result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmFault {
+    pub kind: VmFaultKind,
+    /// Micro-instruction index in the RISC program.
+    pub vip: usize,
+    /// Original guest instruction address when an `ip_map` is available.
+    pub guest_rip: Option<u64>,
+    pub state: RiscEvalState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VmFaultKind {
+    DivideByZero,
+    QuotientOverflow,
+    Trap,
+    UnknownIndirectRoute {
+        target: u64,
+    },
+    UnknownReturnRoute {
+        target: u64,
+    },
+    MemoryAccess {
+        address: u64,
+        width: u8,
+        write: bool,
+    },
+}
+
+/// Optional address-space policy for checked evaluator memory accesses.
+///
+/// The legacy evaluator APIs do not install a policy and therefore retain the
+/// sparse, zero-filled `HashMap` behavior. When a policy is supplied, every
+/// byte of a `MemoryRead`/`MemoryWrite` must fit in one region with the
+/// requested permission.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryPolicy {
+    regions: Vec<MemoryRegion>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryRegion {
+    pub start: u64,
+    pub len: u64,
+    pub readable: bool,
+    pub writable: bool,
+}
+
+impl MemoryPolicy {
+    pub fn new(regions: Vec<MemoryRegion>) -> Self {
+        Self { regions }
+    }
+
+    pub fn regions(&self) -> &[MemoryRegion] {
+        &self.regions
+    }
+
+    fn permits(&self, address: u64, width: u8, write: bool) -> bool {
+        let Some(end) = address.checked_add(width as u64) else {
+            return false;
+        };
+        width != 0
+            && self.regions.iter().any(|region| {
+                let Some(region_end) = region.start.checked_add(region.len) else {
+                    return false;
+                };
+                address >= region.start
+                    && end <= region_end
+                    && if write {
+                        region.writable
+                    } else {
+                        region.readable
+                    }
+            })
+    }
+}
+
 enum ExecResult {
     /// ???깅쾳 嶺뚮ㅏ援앲???怨쀬Ŧ 嶺뚯쉳?듸쭛?
     Next,
@@ -14,6 +92,63 @@ enum ExecResult {
     Jump(usize),
     /// Halt ???熬곣뫁夷?윜諛몄굡????リ턁筌?
     Halt,
+}
+
+fn div_wide_fallible(
+    st: &mut RiscEvalState,
+    divisor: u64,
+    signed: bool,
+    width: u8,
+    dst: Option<MicroOperand>,
+) -> Result<(), VmFaultKind> {
+    let bits = width as u32 * 8;
+    let mask = width_mask(bits);
+    let (dividend, dividend_bits) = if width == 1 {
+        ((st.regs[0] & 0xffff) as u128, 16)
+    } else {
+        (
+            ((st.regs[2] & mask) as u128) << bits | (st.regs[0] & mask) as u128,
+            bits * 2,
+        )
+    };
+    let raw_divisor = (divisor & mask) as u128;
+    if raw_divisor == 0 {
+        return Err(VmFaultKind::DivideByZero);
+    }
+
+    let (quotient, remainder) = if signed {
+        let dividend = sign_extend_i128(dividend, dividend_bits);
+        let divisor = sign_extend_i128(raw_divisor, bits);
+        let Some(quotient) = dividend.checked_div(divisor) else {
+            return Err(VmFaultKind::QuotientOverflow);
+        };
+        let remainder = dividend % divisor;
+        let min = -(1i128 << (bits - 1));
+        let max = (1i128 << (bits - 1)) - 1;
+        if quotient < min || quotient > max {
+            return Err(VmFaultKind::QuotientOverflow);
+        }
+        (quotient as u128, remainder as u128)
+    } else {
+        let quotient = dividend / raw_divisor;
+        let max = mask as u128;
+        if quotient > max {
+            return Err(VmFaultKind::QuotientOverflow);
+        }
+        (quotient, dividend % raw_divisor)
+    };
+
+    if width == 1 {
+        store_dst(
+            st,
+            dst,
+            ((remainder as u64) & 0xff) << 8 | ((quotient as u64) & 0xff),
+        );
+    } else {
+        store_dst(st, dst, (quotient as u64) & mask);
+        st.regs[2] = (remainder as u64) & mask;
+    }
+    Ok(())
 }
 
 impl RiscProgram {
@@ -260,7 +395,12 @@ impl RiscProgram {
     ///                      ip_map?????깅さ嶺???濚???? IP ???筌뤾퍓????댁Ŧ ?곌떠???
     /// * `NativeCallBridge` : ?????類ｋ츎 ??쒕샍???筌뤾쑬裕???袁⑸츋? ???????ｌ뫒筌?嶺?援??.
     pub fn eval_state(&self, init_regs: &[u64; 16]) -> RiscEvalState {
-        self.eval_state_impl(init_regs, &HashMap::new())
+        self.try_eval_state(init_regs)
+            .unwrap_or_else(|fault| fault.state)
+    }
+
+    pub fn try_eval_state(&self, init_regs: &[u64; 16]) -> Result<RiscEvalState, VmFault> {
+        self.eval_state_impl(init_regs, &HashMap::new(), None)
     }
 
     /// 嶺뚮∥???꾨뎨?? ?????貫?껆뵳??됀????⑤객臾?????嶺뚣볦굣????????깅턄?????덈뺄.
@@ -270,10 +410,43 @@ impl RiscProgram {
         init_regs: &[u64; 16],
         mem: HashMap<u64, u8>,
     ) -> RiscEvalState {
-        self.eval_state_impl(init_regs, &mem)
+        self.try_eval_state_with_mem(init_regs, mem)
+            .unwrap_or_else(|fault| fault.state)
     }
 
-    fn eval_state_impl(&self, init_regs: &[u64; 16], mem_seed: &HashMap<u64, u8>) -> RiscEvalState {
+    pub fn try_eval_state_with_mem(
+        &self,
+        init_regs: &[u64; 16],
+        mem: HashMap<u64, u8>,
+    ) -> Result<RiscEvalState, VmFault> {
+        self.eval_state_impl(init_regs, &mem, None)
+    }
+
+    pub fn eval_state_with_mem_policy(
+        &self,
+        init_regs: &[u64; 16],
+        mem: HashMap<u64, u8>,
+        policy: &MemoryPolicy,
+    ) -> RiscEvalState {
+        self.try_eval_state_with_mem_policy(init_regs, mem, policy)
+            .unwrap_or_else(|fault| fault.state)
+    }
+
+    pub fn try_eval_state_with_mem_policy(
+        &self,
+        init_regs: &[u64; 16],
+        mem: HashMap<u64, u8>,
+        policy: &MemoryPolicy,
+    ) -> Result<RiscEvalState, VmFault> {
+        self.eval_state_impl(init_regs, &mem, Some(policy))
+    }
+
+    fn eval_state_impl(
+        &self,
+        init_regs: &[u64; 16],
+        mem_seed: &HashMap<u64, u8>,
+        memory_policy: Option<&MemoryPolicy>,
+    ) -> Result<RiscEvalState, VmFault> {
         let mut st = RiscEvalState::default();
         st.regs = *init_regs;
         st.mem = mem_seed.clone();
@@ -302,6 +475,21 @@ impl RiscProgram {
         let mut vip = 0usize;
         while vip < self.instrs.len() {
             let ins = &self.instrs[vip];
+            let fault = |kind: VmFaultKind, st: &RiscEvalState, flags_raw: u64| {
+                let mut state = st.clone();
+                state.flags = flags_raw;
+                VmFault {
+                    kind,
+                    vip,
+                    guest_rip: self.ip_map.as_ref().and_then(|map| {
+                        map.iter()
+                            .filter(|(_, mapped_vip)| **mapped_vip == vip)
+                            .map(|(rip, _)| *rip)
+                            .min()
+                    }),
+                    state,
+                }
+            };
             match ins.op {
                 RiscOp::Nor => {
                     let a = get_val(ins.src1, &st, flags.raw);
@@ -420,12 +608,34 @@ impl RiscProgram {
                 }
                 RiscOp::MemoryRead { width } => {
                     let addr = get_val(ins.src1, &st, flags.raw);
+                    if memory_policy.is_some_and(|policy| !policy.permits(addr, width, false)) {
+                        return Err(fault(
+                            VmFaultKind::MemoryAccess {
+                                address: addr,
+                                width,
+                                write: false,
+                            },
+                            &st,
+                            flags.raw,
+                        ));
+                    }
                     let val = mem_read(&st.mem, addr, width);
                     store(ins.dst, &mut st, val);
                 }
                 RiscOp::MemoryWrite { width } => {
                     let addr = get_val(ins.src1, &st, flags.raw);
                     let val = get_val(ins.src2, &st, flags.raw);
+                    if memory_policy.is_some_and(|policy| !policy.permits(addr, width, true)) {
+                        return Err(fault(
+                            VmFaultKind::MemoryAccess {
+                                address: addr,
+                                width,
+                                write: true,
+                            },
+                            &st,
+                            flags.raw,
+                        ));
+                    }
                     mem_write(&mut st.mem, addr, width, val);
                 }
                 RiscOp::SetFlag => {
@@ -451,7 +661,21 @@ impl RiscProgram {
                         continue;
                     }
                 }
-                RiscOp::Halt | RiscOp::Trap => break,
+                RiscOp::VirtualIndirectCall | RiscOp::VirtualIndirectJump => {
+                    let target = get_val(ins.src1, &st, flags.raw);
+                    let Some(idx) = self.ip_map.as_ref().and_then(|m| m.get(&target)).copied()
+                    else {
+                        return Err(fault(
+                            VmFaultKind::UnknownIndirectRoute { target },
+                            &st,
+                            flags.raw,
+                        ));
+                    };
+                    vip = idx;
+                    continue;
+                }
+                RiscOp::Halt => break,
+                RiscOp::Trap => return Err(fault(VmFaultKind::Trap, &st, flags.raw)),
                 RiscOp::VirtualRet => {
                     // P0-1: 가상 스택에서 복귀 주소를 pop. ip_map(가상화 블록)에 있으면
                     // VM 내부 복귀 분기, 없으면(빈 스택/네이티브 복귀) Halt 로 종료.
@@ -486,7 +710,11 @@ impl RiscProgram {
                         let saved_flags = flags.raw;
                         let saved_vsp = st.vsp;
                         let saved_stack = std::mem::take(&mut st.stack);
-                        let sub_state = sub.eval_state_impl(&saved_regs, &st.mem);
+                        let sub_state =
+                            match sub.eval_state_impl(&saved_regs, &st.mem, memory_policy) {
+                                Ok(state) => state,
+                                Err(fault) => return Err(fault),
+                            };
                         // 호출자 상태 복원 (스택 포인터·플래그·temps 유지).
                         st.regs = saved_regs;
                         st.temps = saved_temps;
@@ -512,7 +740,9 @@ impl RiscProgram {
                 }
                 RiscOp::Divide { signed, width } => {
                     let divisor = get_val(ins.src1, &st, flags.raw);
-                    div_wide(&mut st, divisor, signed, width, ins.dst);
+                    if let Err(kind) = div_wide_fallible(&mut st, divisor, signed, width, ins.dst) {
+                        return Err(fault(kind, &st, flags.raw));
+                    }
                 }
                 RiscOp::BSwap { width } => {
                     let a = get_val(ins.src1, &st, flags.raw);
@@ -986,7 +1216,7 @@ impl RiscProgram {
         }
 
         st.flags = flags.raw;
-        st
+        Ok(st)
     }
 
     /// ??濡る룎??micro-instruction??(??寃? ??⑤객臾?????????덈뺄??類ｋ펲. `eval_state_impl`
@@ -1181,6 +1411,13 @@ impl RiscProgram {
                     return ExecResult::Jump(idx);
                 }
                 ExecResult::Next
+            }
+            RiscOp::VirtualIndirectCall | RiscOp::VirtualIndirectJump => {
+                let target = get_val(ins.src1, st, flags.raw);
+                match self.ip_map.as_ref().and_then(|m| m.get(&target)).copied() {
+                    Some(idx) => ExecResult::Jump(idx),
+                    None => ExecResult::Halt,
+                }
             }
             RiscOp::Halt | RiscOp::Trap => ExecResult::Halt,
             RiscOp::VirtualRet => {
@@ -1778,5 +2015,114 @@ impl RiscProgram {
         xors(&mut st, &mut flags, key);
         st.flags = flags.raw;
         st
+    }
+}
+
+#[cfg(test)]
+mod checked_memory_tests {
+    use super::*;
+
+    fn region(start: u64, len: u64, readable: bool, writable: bool) -> MemoryRegion {
+        MemoryRegion {
+            start,
+            len,
+            readable,
+            writable,
+        }
+    }
+
+    #[test]
+    fn checked_read_preserves_fault_context_and_does_not_commit_destination() {
+        let instrs = vec![
+            MicroInstr::new(RiscOp::MemoryRead { width: 8 })
+                .with_dst(MicroOperand::VReg(1))
+                .with_src1(MicroOperand::VReg(0)),
+            MicroInstr::new(RiscOp::Halt),
+        ];
+        let program = RiscProgram::with_ip_map(instrs, HashMap::from([(0x401000, 0)]));
+        let policy = MemoryPolicy::new(vec![region(0x2000, 8, true, false)]);
+        let mut regs = [0u64; 16];
+        regs[0] = 0x2004; // the full eight-byte read crosses the region end
+        regs[1] = 0xfeed_face;
+
+        let fault = program
+            .try_eval_state_with_mem_policy(&regs, HashMap::new(), &policy)
+            .unwrap_err();
+
+        assert_eq!(
+            fault.kind,
+            VmFaultKind::MemoryAccess {
+                address: 0x2004,
+                width: 8,
+                write: false,
+            }
+        );
+        assert_eq!(fault.vip, 0);
+        assert_eq!(fault.guest_rip, Some(0x401000));
+        assert_eq!(fault.state.regs[1], 0xfeed_face);
+    }
+
+    #[test]
+    fn checked_write_requires_permission_and_does_not_mutate_memory() {
+        let program = RiscProgram::new(vec![
+            MicroInstr::new(RiscOp::MemoryWrite { width: 4 })
+                .with_src1(MicroOperand::VReg(0))
+                .with_src2(MicroOperand::VReg(1)),
+            MicroInstr::new(RiscOp::Halt),
+        ]);
+        let policy = MemoryPolicy::new(vec![region(0x3000, 4, true, false)]);
+        let mut regs = [0u64; 16];
+        regs[0] = 0x3000;
+        regs[1] = 0x1122_3344;
+        let seed = HashMap::from([(0x3000, 0xaa)]);
+
+        let fault = program
+            .try_eval_state_with_mem_policy(&regs, seed.clone(), &policy)
+            .unwrap_err();
+
+        assert_eq!(
+            fault.kind,
+            VmFaultKind::MemoryAccess {
+                address: 0x3000,
+                width: 4,
+                write: true,
+            }
+        );
+        assert_eq!(fault.state.mem, seed);
+    }
+
+    #[test]
+    fn checked_access_keeps_sparse_zero_fill_inside_permitted_region() {
+        let program = RiscProgram::new(vec![
+            MicroInstr::new(RiscOp::MemoryRead { width: 4 })
+                .with_dst(MicroOperand::VReg(1))
+                .with_src1(MicroOperand::VReg(0)),
+            MicroInstr::new(RiscOp::Halt),
+        ]);
+        let policy = MemoryPolicy::new(vec![region(0x5000, 0x10, true, true)]);
+        let mut regs = [0u64; 16];
+        regs[0] = 0x5004;
+
+        let state = program
+            .try_eval_state_with_mem_policy(&regs, HashMap::new(), &policy)
+            .unwrap();
+        assert_eq!(state.regs[1], 0);
+    }
+
+    #[test]
+    fn legacy_memory_api_remains_unrestricted() {
+        let program = RiscProgram::new(vec![
+            MicroInstr::new(RiscOp::MemoryWrite { width: 1 })
+                .with_src1(MicroOperand::VReg(0))
+                .with_src2(MicroOperand::VReg(1)),
+            MicroInstr::new(RiscOp::Halt),
+        ]);
+        let mut regs = [0u64; 16];
+        regs[0] = u64::MAX;
+        regs[1] = 0x5a;
+        let state = program
+            .try_eval_state_with_mem(&regs, HashMap::new())
+            .unwrap();
+        assert_eq!(state.mem.get(&u64::MAX), Some(&0x5a));
     }
 }

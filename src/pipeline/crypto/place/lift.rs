@@ -20,11 +20,13 @@ pub(crate) fn lift_program(
     Option<std::collections::HashMap<u64, usize>>,
     Option<vm::threaded::PreparedSuperOpProgram>,
     Option<crate::pipeline::VmCoverageMetrics>,
+    Vec<crate::pipeline::ownership::FunctionOwnershipDiagnostic>,
     Vec<vm::chunk_crypto::BytecodeChunk>,
     Option<vm::poly::ProductionFamilyPlan>,
     Option<Vec<vm::poly::FamilyOpPartition>>,
     Option<vm::multi_family::MaterializedMultiFamilyProgram>,
     Vec<crate::vm::data_lifetime::LiteralObject>,
+    crate::pipeline::reports::UnsupportedInstructionReport,
 )> {
     // P3 (G1): 상용 프로그램 리프트의 ip_map (source-IP -> micro-op index) — the
     // VirtualBranch native handler uses it to resolve branch targets to bytecode
@@ -32,11 +34,13 @@ pub(crate) fn lift_program(
     let mut vm_prog_ip_map: Option<std::collections::HashMap<u64, usize>> = None;
     let mut vm_prog_superops: Option<vm::threaded::PreparedSuperOpProgram> = None;
     let mut vm_coverage = None;
+    let mut ownership_report = Vec::new();
     let mut vm_prog_chunks = Vec::new();
     let mut vm_family_plan = None;
     let mut vm_family_partitions = None;
     let mut vm_multi_family = None;
     let mut data_lifetime_objects = Vec::new();
+    let mut unsupported_report = crate::pipeline::reports::UnsupportedInstructionReport::new();
 
     let (vm_prog_bytecode, vm_oep_native_entry, oep_va): (Vec<u8>, bool, u64) = if vm_oep_effective
     {
@@ -53,6 +57,7 @@ pub(crate) fn lift_program(
                 ctx.poly_vm_seed,
             )?;
             data_lifetime_objects = lift.data_lifetime_objects.clone();
+            unsupported_report = lift.unsupported_report.clone();
             vm_prog_ip_map = lift.program.ip_map().cloned();
             let plan = vm::poly::ProductionFamilyPlan::new(
                 ctx.poly_vm_seed,
@@ -144,11 +149,23 @@ pub(crate) fn lift_program(
                 total_instructions: lift.total_instructions,
                 vm_functions: lift.virtualized_functions,
                 total_functions: lift.total_functions,
+                unresolved_internal_edges: ctx.program_model.as_ref().map(|model| {
+                    model
+                        .indirect_targets
+                        .edge_metrics()
+                        .unresolved_internal_edges
+                }),
+                unsupported_instructions: Some(lift.unsupported_report.occurrence_count()),
+                // Multi-family materialization above crosses the production
+                // encoder capability gate, so reaching this point is measured
+                // zero rather than an unmeasured default.
+                capability_mismatches: Some(0),
                 hot_path_profiled: lift.hot_path_profiled,
                 hot_vm_weight: lift.hot_vm_weight,
                 hot_total_weight: lift.hot_total_weight,
                 sensitive_regions: lift.sensitive_regions,
             });
+            ownership_report = lift.ownership_report.clone();
             let prepared =
                 vm::threaded::SuperOperatorSynthesizer::prepare_commercial_program_for_family(
                     &lift.program,
@@ -246,10 +263,12 @@ pub(crate) fn lift_program(
         vm_prog_ip_map,
         vm_prog_superops,
         vm_coverage,
+        ownership_report,
         vm_prog_chunks,
         vm_family_plan,
         vm_family_partitions,
         vm_multi_family,
         data_lifetime_objects,
+        unsupported_report,
     ))
 }

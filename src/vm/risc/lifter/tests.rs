@@ -28,6 +28,107 @@ fn regs(st: &RiscEvalState) -> [u64; 16] {
 }
 
 #[test]
+fn unsupported_opcode_error_preserves_guest_diagnostic() {
+    let raw = [0xF4]; // HLT is intentionally kept native.
+    let ip = 0x1400_0123_4;
+    let mut decoder = Decoder::with_ip(64, &raw, ip, DecoderOptions::NONE);
+    let inst = decoder.decode();
+    let mut lifter = RiscLifter::new();
+
+    let error = lifter
+        .lift_instruction_with_bytes(&inst, &raw)
+        .expect_err("HLT must remain unsupported");
+    let diagnostic = error
+        .downcast_ref::<RiscLiftError>()
+        .expect("typed lift diagnostic");
+    assert_eq!(diagnostic.ip, ip);
+    assert_eq!(diagnostic.raw_bytes.as_deref(), Some(raw.as_slice()));
+    assert_eq!(diagnostic.code, Code::Hlt);
+    assert!(diagnostic.operands.to_ascii_lowercase().contains("hlt"));
+    assert!(diagnostic.reason.contains("unsupported opcode"));
+
+    let rendered = error.to_string();
+    assert!(rendered.contains("ip=0x0000000140001234"));
+    assert!(rendered.contains("bytes=[F4]"));
+    assert!(rendered.contains("code=Hlt"));
+}
+
+#[test]
+fn operand_error_keeps_location_without_raw_byte_api() {
+    let raw = [0x88, 0xC4]; // mov ah, al; high-byte destinations are rejected.
+    let ip = 0x1800_0040_0;
+    let mut decoder = Decoder::with_ip(64, &raw, ip, DecoderOptions::NONE);
+    let inst = decoder.decode();
+    let mut lifter = RiscLifter::new();
+
+    let error = lifter
+        .lift_instruction(&inst)
+        .expect_err("AH cannot be represented by the vreg model");
+    let diagnostic = error
+        .downcast_ref::<RiscLiftError>()
+        .expect("operand failure is wrapped at the instruction boundary");
+    assert_eq!(diagnostic.ip, ip);
+    assert_eq!(diagnostic.raw_bytes, None);
+    assert_eq!(diagnostic.code, Code::Mov_rm8_r8);
+    assert!(diagnostic.operands.to_ascii_lowercase().contains("ah"));
+    assert!(diagnostic.reason.contains("invalid dst"));
+    assert!(error.to_string().contains("bytes=[<unavailable>]"));
+}
+
+#[test]
+fn test_lift_trap_instruction_parity() {
+    for (name, raw, expected_code) in [
+        ("int3", &[0xCC][..], Code::Int3),
+        ("ud2", &[0x0F, 0x0B][..], Code::Ud2),
+        ("int imm8", &[0xCD, 0x29][..], Code::Int_imm8),
+    ] {
+        let mut decoder = Decoder::with_ip(64, raw, 0x140001000, DecoderOptions::NONE);
+        let inst = decoder.decode();
+        assert_eq!(inst.code(), expected_code, "{name}: decoded opcode");
+
+        let mut lifter = RiscLifter::new();
+        lifter.lift_instruction(&inst).unwrap();
+        assert_eq!(lifter.desynth.instrs.len(), 1, "{name}: one micro-op");
+        let trap = &lifter.desynth.instrs[0];
+        assert_eq!(trap.op, RiscOp::Trap, "{name}: exact trap lowering");
+        assert_eq!(trap.dst, None, "{name}: trap has no destination");
+        assert_eq!(trap.src1, None, "{name}: trap has no source");
+        assert_eq!(trap.src2, None, "{name}: trap has no second source");
+    }
+}
+
+#[test]
+fn test_lift_trap_preserves_registers_and_flags() {
+    // mov rax, 0x1234; cmp rax, rax establishes ZF; trap; mov rax, 0x5678
+    // The post-trap write must not execute, and trap itself must not alter state.
+    let prefix = [
+        0x48, 0xC7, 0xC0, 0x34, 0x12, 0x00, 0x00, // mov rax, 0x1234
+        0x48, 0x39, 0xC0, // cmp rax, rax
+    ];
+    let suffix = [0x48, 0xC7, 0xC0, 0x78, 0x56, 0x00, 0x00]; // mov rax, 0x5678
+    let cases: [(&str, &[u8]); 3] = [
+        ("int3", &[0xCC]),
+        ("ud2", &[0x0F, 0x0B]),
+        ("int imm8", &[0xCD, 0x29]),
+    ];
+
+    let mut baseline_raw = prefix.to_vec();
+    baseline_raw.push(0xC3); // RET lowers to Halt without changing state.
+    let baseline = run(&baseline_raw, 0x140001000, [0u64; 16]);
+
+    for (name, trap_bytes) in cases {
+        let mut raw = prefix.to_vec();
+        raw.extend_from_slice(trap_bytes);
+        raw.extend_from_slice(&suffix);
+        let trapped = run(&raw, 0x140001000, [0u64; 16]);
+
+        assert_eq!(trapped.regs, baseline.regs, "{name}: registers unchanged");
+        assert_eq!(trapped.flags, baseline.flags, "{name}: flags unchanged");
+        assert_eq!(trapped.regs[0], 0x1234, "{name}: execution stops at trap");
+    }
+}
+
+#[test]
 fn test_lift_rip_relative_lea_without_memory_access() {
     // 0x140001000: lea rax,[rip+0x1234]
     // next IP is 0x140001007, therefore RAX = 0x14000223B.
@@ -128,6 +229,8 @@ fn test_lift_call_indirect_register() {
     ];
     let mut init = [0u64; 16];
     init[0] = 0x14000100A; // rax = callee
+    let lifted = lift(&raw, 0x140001000);
+    assert_eq!(lifted.instrs[1].op, RiscOp::VirtualIndirectCall);
     let st = run(&raw, 0x140001000, init);
     assert_eq!(regs(&st)[3], 0x2A, "indirect callee executed");
     // P0-1: 간접 call 도 복귀해 fallthrough 실행.
@@ -137,6 +240,24 @@ fn test_lift_call_indirect_register() {
         "fallthrough executed after indirect call return"
     );
     assert_eq!(st.stack.len(), 0, "return address popped by callee ret");
+}
+
+#[test]
+fn test_lift_indirect_jump_is_typed_and_unknown_target_fails_closed() {
+    // jmp rax; mov rbx, 0x2a. An unregistered runtime target must not be
+    // interpreted as a micro-instruction index and must not fall through.
+    let raw = [
+        0xFF, 0xE0, // jmp rax
+        0x48, 0xC7, 0xC3, 0x2A, 0x00, 0x00, 0x00, // mov rbx, 0x2a
+        0xC3, // ret
+    ];
+    let prog = lift(&raw, 0x140001000);
+    assert_eq!(prog.instrs[0].op, RiscOp::VirtualIndirectJump);
+
+    let mut init = [0u64; 16];
+    init[0] = 1; // Previously this could be treated as instruction index 1.
+    let st = prog.eval_state(&init);
+    assert_eq!(st.regs[3], 0, "unknown route halts before fallthrough");
 }
 
 /// B: JE taken / JE not-taken / JNE taken.
@@ -878,7 +999,11 @@ fn test_lift_mov_mem_bh_preserves_flags() {
     init[4] = 0x2000;
     let st = lift(&raw, 0x140001000).eval_state_with_mem(&init, HashMap::new());
     assert_eq!(st.mem.get(&0x202a), Some(&0xa5), "BH byte stored");
-    assert_ne!(st.flags & crate::vm::risc::flags::VFLAG_ZF, 0, "MOV must preserve ZF");
+    assert_ne!(
+        st.flags & crate::vm::risc::flags::VFLAG_ZF,
+        0,
+        "MOV must preserve ZF"
+    );
 }
 
 /// BlockEncoder 嚥?x86 筌뤿굝議??됰뗀以??獄쏅뗄??紐껋쨮 ?紐꾪맜??

@@ -26,6 +26,12 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false)]
     pub strict_profile: bool,
 
+    /// Permit a commercial Program-VM build whose measured function, block, or
+    /// instruction coverage is below 100%. This is a development-only escape
+    /// hatch and cannot be combined with --strict-profile.
+    #[arg(long, default_value_t = false, conflicts_with = "strict_profile")]
+    pub allow_partial_vm: bool,
+
     /// Execute the original and protected binaries after packing and fail when
     /// exit code, stdout, or stderr differ byte-for-byte.
     #[arg(long, default_value_t = false)]

@@ -17,6 +17,7 @@ pub mod pass4_section;
 pub mod patch_data;
 pub mod poly_embed;
 pub mod rdata_strip;
+pub mod reports;
 pub mod rsrc_register;
 pub mod selective_vm;
 pub mod validate;
@@ -40,6 +41,16 @@ pub struct VmCoverageMetrics {
     pub total_instructions: usize,
     pub vm_functions: usize,
     pub total_functions: usize,
+    /// Canonical internal indirect edges which analysis could not resolve.
+    /// `None` means the ProgramModel edge analysis was not available; `Some(0)`
+    /// is the measured-zero evidence required by full commercial VM policy.
+    pub unresolved_internal_edges: Option<u64>,
+    /// Instructions rejected by the production VM lifting pipeline.
+    /// `None` is deliberately distinct from a measured zero.
+    pub unsupported_instructions: Option<u64>,
+    /// Registry/encoder capability disagreements found during production validation.
+    /// Commercial full-coverage builds require explicit `Some(0)` evidence.
+    pub capability_mismatches: Option<u64>,
     pub hot_path_profiled: bool,
     pub hot_vm_weight: u64,
     pub hot_total_weight: u64,
@@ -64,6 +75,11 @@ pub struct PipelineContext {
     // ── Pass 1 출력 ─────────────────────────────────────────────────────────────
     /// CfgExtractor가 추출한 원본 기본 블록 목록
     pub basic_blocks: Vec<BasicBlock>,
+    /// M1 canonical authority for discovered functions, blocks, metadata seeds,
+    /// and executable-byte ownership. Native TriggerBlocks remain a derived view.
+    pub program_model: Option<crate::analysis::program_model::ProgramModel>,
+    /// Deterministic evidence accumulated by decode/registry/lift/encode stages.
+    pub unsupported_instructions: reports::UnsupportedInstructionReport,
     /// MicroSlicer가 생성한 Trigger Block 목록
     pub trigger_blocks: Vec<TriggerBlock>,
     /// 원본 `.text` VA → Trigger Block ID 매핑 (정렬 BTreeMap)
@@ -92,8 +108,27 @@ pub struct PipelineContext {
     pub crypto_enabled: bool,
     /// P0-⑦: at-rest 암호화가 실제로 적용됐는지 (코드 블록/데이터 런 암호화).
     pub at_rest_encrypted: bool,
+    /// Exact ciphertext RVA ranges which the Windows loader must never mutate.
+    /// Plain boot/runtime address operands outside these ranges remain eligible
+    /// for DIR64 relocation, including protected images.
+    pub at_rest_cipher_ranges: Vec<(u32, u32)>,
     /// v4: --payload-relocate 시 암호화된 코드 페이로드를 담는 데이터 섹션
     pub payload_section_data: Option<SectionData>,
+    /// Loader-populated bootstrap imports. Windows writes these slots before
+    /// OEP, so they must not share the executable `.textb` mapping.
+    pub bootstrap_iat_section_data: Option<SectionData>,
+    /// Page-aligned mutable VM state/call-stack tail split from `.textb` for
+    /// static W^X: RW and non-executable from the loader's first mapping.
+    pub mutable_state_section_data: Option<SectionData>,
+    /// Canonical VM route image. This is immutable runtime metadata and is
+    /// emitted in its own read-only, non-executable PE section.
+    pub route_metadata_section_data: Option<SectionData>,
+    /// Authoritative original RVA inventory serialized into `.vmroute`.
+    pub route_required_original_targets: Vec<crate::vm::route_table::OriginalTargetRva>,
+    /// Authoritative generated target RVAs produced by VM code placement.
+    pub route_generated_destinations: Vec<crate::vm::route_metadata::GeneratedRouteDestination>,
+    /// Final generated-code spans that are expected to be executable.
+    pub route_generated_executable_ranges: Vec<crate::vm::route_metadata::RvaSpan>,
     /// 페이로드 섹션 RVA (rsrc_register가 리소스 데이터 엔트리로 사용)
     pub payload_rva: u32,
     /// 페이로드 길이
@@ -163,6 +198,10 @@ pub struct PipelineContext {
     pub vm_prog_lifetime_cleanup_handler_rva: u32,
     /// P1-3: commercial Program-VM ownership metrics persisted to the manifest.
     pub vm_coverage: Option<VmCoverageMetrics>,
+    /// Authoritative ownership decisions emitted by the commercial lifter.
+    /// Validation and artifact writers must consume this instead of deriving
+    /// ownership from the rewritten PE layout.
+    pub ownership_report: Vec<ownership::FunctionOwnershipDiagnostic>,
     /// P1-4: instruction-aligned Program-VM bytecode chunks for M7 runtime.
     pub vm_prog_chunks: Vec<crate::vm::chunk_crypto::BytecodeChunk>,
     /// P2-10 function-stable production family ownership plan.
@@ -229,6 +268,8 @@ impl PipelineContext {
             obf_complexity,
             rng: StdRng::from_entropy(),
             basic_blocks: Vec::new(),
+            program_model: None,
+            unsupported_instructions: reports::UnsupportedInstructionReport::new(),
             trigger_blocks: Vec::new(),
             va_to_trigger_id: BTreeMap::new(),
             shuffled_layout: None,
@@ -239,7 +280,14 @@ impl PipelineContext {
             boot_entry_offset: 0,
             crypto_enabled: false,
             at_rest_encrypted: false,
+            at_rest_cipher_ranges: Vec::new(),
             payload_section_data: None,
+            bootstrap_iat_section_data: None,
+            mutable_state_section_data: None,
+            route_metadata_section_data: None,
+            route_required_original_targets: Vec::new(),
+            route_generated_destinations: Vec::new(),
+            route_generated_executable_ranges: Vec::new(),
             payload_rva: 0,
             payload_len: 0,
             rsrc_dir_rva: 0,
@@ -272,6 +320,7 @@ impl PipelineContext {
             vm_prog_native_bridges: Vec::new(),
             vm_prog_lifetime_cleanup_handler_rva: 0,
             vm_coverage: None,
+            ownership_report: Vec::new(),
             vm_prog_chunks: Vec::new(),
             vm_family_plan: None,
             vm_family_partitions: None,

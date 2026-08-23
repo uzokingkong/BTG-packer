@@ -244,6 +244,10 @@ pub(crate) fn build_boot_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
         None,
     ));
 
+    // The PE maps .textb RX. Open a bounded transient write window before any
+    // seed/payload self-modification; the matching harden call closes it later.
+    memharden::emit_mem_unseal(&mut seq, stub);
+
     // v17 (TrashFormer-기반): 프로시저 서문에 데드 레지스터 정크 명령을 삽입해,
     // 부트 스텁 바이트가 **빌드마다 달라지게** 한다. 이 지점에선 rax/rcx/rdx/rsi/rdi/
     // r8..r11 이 전부 아직 라이브가 아니므로(KSA/복호화가 뒤에서 덮어씀) 마음대로

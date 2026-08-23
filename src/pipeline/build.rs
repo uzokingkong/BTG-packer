@@ -63,6 +63,14 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
             virtual_address: ctx.iat_dir_rva,
             size: ctx.iat_dir_size,
         };
+        // IMAGE_DIRECTORY_ENTRY_IAT must describe the loader-written thunk
+        // array in the dedicated RW section, not the erased original IAT.
+        if clean_data_dirs.len() > 12 && ctx.iat_ll_slot_rva > 0 {
+            clean_data_dirs[12] = DataDirectory {
+                virtual_address: ctx.iat_ll_slot_rva,
+                size: 24, // LoadLibraryA, GetProcAddress, NULL
+            };
+        }
     }
 
     // ???? DLL Characteristics: DYNAMIC_BASE(0x0040), HIGH_ENTROPY_VA(0x0020), GUARD_CF(0x4000) ??볤탢 ????
@@ -186,10 +194,10 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     // 로더가 부트 스텁 복호화 전에 .reloc을 적용하더라도 암호문 슬롯은 skip되어
     // 암호문이 다치지 않는다. 부트 스텁 imm64들(모듈 엔트리 VA 등)은 평문이라
     // reloc되어도 안전하다.
-    // FIX(T0-3): boot stub/VM runtime is not ASLR-safe (hand-assembled preferred-base
-    // absolute addresses), so the at-rest-encrypted (protected) path disables ASLR/
-    // .reloc entirely. The no-crypto path installs no boot stub and no at-rest
-    // ciphertext, so it keeps the relocation-aware output (ASLR preserved).
+    // The protected runtime still contains absolute address forms which are not
+    // all covered by the relocation scanner. Keep ASLR disabled until every
+    // generated address has explicit relocation ownership; enabling this early
+    // produces a load-time access violation under a randomized base.
     let reloc_aware = !ctx.at_rest_encrypted;
 
     let mut preserve_aslr_bits = false;
@@ -219,12 +227,34 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
         };
         let btg_end =
             btg_va + align_sec(btg_section.virtual_size.max(btg_section.bytes.len() as u32));
-        let payload_end = match &ctx.payload_section_data {
-            Some(p) => {
-                let p_va = align_sec(btg_end);
-                p_va + align_sec(p.virtual_size.max(p.bytes.len() as u32))
+        let iat_end = match &ctx.bootstrap_iat_section_data {
+            Some(i) => {
+                let i_va = i.virtual_address.max(align_sec(btg_end));
+                i_va + align_sec(i.virtual_size.max(i.bytes.len() as u32))
             }
             None => btg_end,
+        };
+        let state_end = ctx
+            .mutable_state_section_data
+            .as_ref()
+            .map(|state| {
+                state.virtual_address + align_sec(state.virtual_size.max(state.bytes.len() as u32))
+            })
+            .unwrap_or(iat_end)
+            .max(iat_end);
+        let payload_end = match &ctx.payload_section_data {
+            Some(p) => {
+                let p_va = align_sec(state_end);
+                p_va + align_sec(p.virtual_size.max(p.bytes.len() as u32))
+            }
+            None => state_end,
+        };
+        let route_end = match &ctx.route_metadata_section_data {
+            Some(route) => {
+                let route_va = align_sec(payload_end);
+                route_va + align_sec(route.virtual_size.max(route.bytes.len() as u32))
+            }
+            None => payload_end,
         };
 
         // T0-3: 암호화된 RVA 범위를 파앙한다.
@@ -238,42 +268,15 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
         // OK임).
         let mut encrypted_rva_ranges: Vec<(u32, u32)> = Vec::new();
         if ctx.at_rest_encrypted {
-            // .textb 코드 블록 영역 (dispatcher부터 코드 끝까지)
-            let code_block_rva = ctx.dispatcher_rva + ctx.first_block_offset as u32;
-            let code_block_len =
-                (btg_section.bytes.len() as u32).saturating_sub(ctx.first_block_offset as u32);
-            if code_block_len > 0 {
-                encrypted_rva_ranges.push((code_block_rva, code_block_len));
-            }
-            // .text 섹션 at-rest 런 (vm-oep 경로에서 암호화된 영역)
-            // 소스: patched_sections 중 .text 섹션 전체를 보수적으로 포함
-            // (at-rest 런 정보를 파이프라인에서 전달하지 않는 트레이드오프)
-            if ctx.vm_oep {
-                for sec in &relayed_sections {
-                    if sec.name == ".text" {
-                        // .text 셀션 전체를 알려진 범위로 포함
-                        // (실제 at-rest 런 정보는 place.rs에서만 알므로
-                        //  섹션 전체를 보수적 exclusion으로 등록)
-                        let len = sec.bytes.len() as u32;
-                        if len > 0 {
-                            encrypted_rva_ranges.push((sec.virtual_address, len));
-                        }
-                        break;
-                    }
-                }
-            }
+            encrypted_rva_ranges.extend_from_slice(&ctx.at_rest_cipher_ranges);
             println!(
-                "[+] T0-3 ASLR: at_rest_encrypted path — excluding {} encrypted range(s) from .reloc \
-                 (code_block RVA=0x{:X}/{}B{}). \
-                 Boot-stub imm64 slots (plaintext) will still get reloc entries.",
+                "[+] T0-3 ASLR: excluding {} exact ciphertext range(s) from .reloc; plaintext boot/runtime operands remain relocatable.",
                 encrypted_rva_ranges.len(),
-                code_block_rva, code_block_len,
-                if ctx.vm_oep { " + .text at-rest" } else { "" }
             );
         }
 
         let image_base = ctx.target_info.image_base;
-        let size_of_image = payload_end;
+        let size_of_image = route_end;
 
         // 모든 최종 섹션 목록 (VA 확정본) — .reloc 자체는 제외하고 스캔.
         let mut final_sections: Vec<SectionData> = relayed_sections.clone();
@@ -282,10 +285,23 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
             btg_final.virtual_address = btg_va;
             final_sections.push(btg_final);
         }
+        if let Some(i) = &ctx.bootstrap_iat_section_data {
+            let mut inf = i.clone();
+            inf.virtual_address = inf.virtual_address.max(align_sec(btg_end));
+            final_sections.push(inf);
+        }
+        if let Some(state) = &ctx.mutable_state_section_data {
+            final_sections.push(state.clone());
+        }
         if let Some(p) = &ctx.payload_section_data {
             let mut pf = p.clone();
-            pf.virtual_address = align_sec(btg_end);
+            pf.virtual_address = align_sec(state_end);
             final_sections.push(pf);
+        }
+        if let Some(route) = &ctx.route_metadata_section_data {
+            let mut placed = route.clone();
+            placed.virtual_address = align_sec(payload_end);
+            final_sections.push(placed);
         }
 
         let reloc = build_reloc_directory(
@@ -296,7 +312,7 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
         );
 
         if let Some(mut ro) = reloc {
-            let reloc_va = align_sec(payload_end);
+            let reloc_va = align_sec(route_end);
             ro.section.virtual_address = reloc_va;
             if clean_data_dirs.len() > 5 {
                 clean_data_dirs[5] = DataDirectory {
@@ -342,6 +358,9 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     );
     // P0-⑦: relocation-aware 경로만 ASLR 비트 보존 (다른 경로는 기존 스트립 유지).
     let mut multi_builder = multi_builder;
+    multi_builder.bootstrap_iat_section = ctx.bootstrap_iat_section_data.clone();
+    multi_builder.mutable_state_section = ctx.mutable_state_section_data.clone();
+    multi_builder.route_metadata_section = ctx.route_metadata_section_data.clone();
     multi_builder.preserve_aslr_bits = preserve_aslr_bits;
     multi_builder.reloc_section = reloc_section;
 

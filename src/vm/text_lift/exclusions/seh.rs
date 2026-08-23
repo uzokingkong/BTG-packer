@@ -265,20 +265,23 @@ pub(crate) fn parse_pdata_functions(
     relayed_sections: &[crate::pe::builder::SectionData],
     image_base: u64,
 ) -> Vec<(u64, u64, u32)> {
-    let mut funcs: Vec<(u64, u64, u32)> = Vec::new();
-    if let Some(pd) = relayed_sections.iter().find(|s| s.name == ".pdata") {
-        for chunk in pd.bytes.chunks_exact(12) {
-            if chunk.len() < 12 {
-                break;
-            }
-            let s0 = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
-            let e0 = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
-            let u0 = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
-            if s0 > 0 && e0 > s0 {
-                funcs.push((image_base + s0 as u64, image_base + e0 as u64, u0));
-            }
-        }
-    }
+    let mut funcs: Vec<(u64, u64, u32)> = relayed_sections
+        .iter()
+        .find(|section| section.name == ".pdata")
+        .into_iter()
+        .flat_map(|section| section.bytes.chunks_exact(12))
+        // Parse each record independently to preserve the legacy consumer's
+        // tolerance of one malformed entry without duplicating PE decoding.
+        .filter_map(|record| crate::pe::unwind::parse_runtime_functions(record).ok())
+        .flatten()
+        .map(|function| {
+            (
+                image_base + function.begin_address as u64,
+                image_base + function.end_address as u64,
+                function.unwind_info_address,
+            )
+        })
+        .collect();
     funcs.sort_by_key(|f| f.0);
     funcs
 }
@@ -294,37 +297,23 @@ pub(crate) fn unwind_info_flags(
     unwind_rva: u32,
     relayed_sections: &[crate::pe::builder::SectionData],
 ) -> Option<u8> {
-    let locate = |rva: u32| -> Option<(&[u8], usize)> {
-        for sec in relayed_sections {
-            let sva = sec.virtual_address as u64;
-            let svs = sec.virtual_size.max(sec.bytes.len() as u32) as u64;
-            let r = rva as u64;
-            if r >= sva && r < sva + svs {
-                let off = (r - sva) as usize;
-                if off + 4 <= sec.bytes.len() {
-                    return Some((&sec.bytes, off));
-                }
-                return None;
-            }
-        }
-        None
-    };
-    let mut rva = unwind_rva;
-    for _ in 0..8 {
-        let (bytes, off) = locate(rva)?;
-        let byte0 = bytes[off];
-        let flags_field = byte0 >> 3;
-        if flags_field & (0x01 | 0x02) != 0 {
-            return Some(byte0); // EHANDLER or UHANDLER present
-        }
-        if flags_field & 0x04 != 0 && off + 8 <= bytes.len() {
-            // CHAININFO: the next UNWIND_INFO RVA is at header offset 4.
-            rva = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
-            continue;
-        }
-        return Some(byte0);
-    }
-    None
+    use crate::pe::unwind::{parse_unwind_chain, RvaSection, UNW_FLAG_EHANDLER, UNW_FLAG_UHANDLER};
+
+    let sections: Vec<RvaSection<'_>> = relayed_sections
+        .iter()
+        .map(|section| RvaSection {
+            virtual_address: section.virtual_address,
+            virtual_size: section.virtual_size,
+            bytes: &section.bytes,
+        })
+        .collect();
+    let chain = parse_unwind_chain(unwind_rva, &sections, 8).ok()?;
+    let info = chain
+        .iter()
+        .map(|(_, info)| info)
+        .find(|info| info.flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) != 0)
+        .unwrap_or(&chain[0].1);
+    Some((info.flags << 3) | info.version)
 }
 
 /// Detect the functions that must stay NATIVE in the block-shuffle pipeline so
@@ -589,4 +578,52 @@ pub fn detect_seh_native_functions(
     }
 
     SehNativeExclusion { func_ranges }
+}
+
+#[cfg(test)]
+mod typed_unwind_adapter_tests {
+    use super::*;
+    use crate::pe::builder::SectionData;
+    use crate::pe::unwind::{UNW_FLAG_CHAININFO, UNW_FLAG_EHANDLER};
+
+    fn section(name: &str, virtual_address: u32, bytes: Vec<u8>) -> SectionData {
+        SectionData {
+            name: name.to_owned(),
+            virtual_address,
+            virtual_size: bytes.len() as u32,
+            characteristics: 0,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn pdata_adapter_preserves_absolute_legacy_shape_and_skips_invalid_records() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x2000u32.to_le_bytes());
+        bytes.extend_from_slice(&0x2040u32.to_le_bytes());
+        bytes.extend_from_slice(&0x5000u32.to_le_bytes());
+        bytes.extend_from_slice(&0x3000u32.to_le_bytes());
+        bytes.extend_from_slice(&0x2ff0u32.to_le_bytes());
+        bytes.extend_from_slice(&0x5010u32.to_le_bytes());
+
+        assert_eq!(
+            parse_pdata_functions(&[section(".pdata", 0x4000, bytes)], 0x140000000),
+            vec![(0x140002000, 0x140002040, 0x5000)]
+        );
+    }
+
+    #[test]
+    fn unwind_flags_adapter_follows_typed_aligned_chain_trailer() {
+        let mut bytes = vec![(UNW_FLAG_CHAININFO << 3) | 1, 0, 0, 0];
+        bytes.extend_from_slice(&0x2000u32.to_le_bytes());
+        bytes.extend_from_slice(&0x2040u32.to_le_bytes());
+        bytes.extend_from_slice(&0x5010u32.to_le_bytes());
+        bytes.extend_from_slice(&[(UNW_FLAG_EHANDLER << 3) | 1, 0, 0, 0]);
+        bytes.extend_from_slice(&0x12345678u32.to_le_bytes());
+
+        assert_eq!(
+            unwind_info_flags(0x5000, &[section(".xdata", 0x5000, bytes)]),
+            Some((UNW_FLAG_EHANDLER << 3) | 1)
+        );
+    }
 }

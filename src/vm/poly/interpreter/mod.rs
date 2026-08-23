@@ -31,6 +31,9 @@ pub struct PolymorphicInterpreter {
     /// 가상 메모리 (주소 → 바이트, `MemoryRead`/`MemoryWrite` 대상).
     /// `RiscEvalState.mem`과 동일 계약: 미기입 주소는 0으로 취급.
     pub mem: HashMap<u64, u8>,
+    /// Proven source-IP route used exclusively by typed indirect transfers.
+    /// Absence and misses are both fail-closed.
+    ip_map: Option<HashMap<u64, usize>>,
 }
 
 impl PolymorphicInterpreter {
@@ -44,7 +47,15 @@ impl PolymorphicInterpreter {
             stack: Vec::with_capacity(1024),
             vsp: 0,
             mem: HashMap::new(),
+            ip_map: None,
         }
+    }
+
+    /// Install the canonical source-IP to micro-instruction route used by
+    /// `VirtualIndirectCall` and `VirtualIndirectJump`.
+    pub fn with_ip_map(mut self, ip_map: HashMap<u64, usize>) -> Self {
+        self.ip_map = Some(ip_map);
+        self
     }
 
     /// 사전 초기화된 가상 메모리로 인터프리터를 만든다.
@@ -65,6 +76,7 @@ impl PolymorphicInterpreter {
         let (instr_starts, key_snapshots) = self.instr_starts(bytecode);
 
         while vip < bytecode.len() {
+            let guest_vip = vip;
             // 1. Decrypt Opcode
             let enc_op = bytecode[vip];
             let raw_op = self.rolling.decrypt_byte(enc_op, vip as u64);
@@ -76,9 +88,10 @@ impl PolymorphicInterpreter {
                 .get(&raw_op)
                 .cloned()
                 .ok_or_else(|| {
-                    anyhow!(
-                        "poly interp: unknown decrypted opcode 0x{raw_op:02X} at offset 0x{vip:X}"
-                    )
+                    anyhow!(super::GuestFault::UnknownOpcode {
+                        vip: guest_vip,
+                        byte: raw_op,
+                    })
                 })?;
 
             // 1b. 조건 바이트 — VirtualBranch·Setcc·ConditionalMove (decoder 와 동일 계약)
@@ -92,9 +105,11 @@ impl PolymorphicInterpreter {
                     let raw_cond = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
                     vip += 1;
                     let cond = self.spec.decode_cond(raw_cond).ok_or_else(|| {
-                        anyhow!(
-                            "poly interp: unknown branch cond 0x{raw_cond:02X} at offset 0x{vip:X}"
-                        )
+                        anyhow!(super::GuestFault::UnknownCondition {
+                            vip: guest_vip,
+                            op: format!("{risc_op:?}"),
+                            byte: raw_cond,
+                        })
                     })?;
                     match risc_op {
                         RiscOp::VirtualBranch { .. } => RiscOp::VirtualBranch { cond },
@@ -704,7 +719,9 @@ impl PolymorphicInterpreter {
                         signed,
                         width,
                         op_dst_raw,
-                    );
+                        guest_vip,
+                        &RiscOp::Divide { signed, width },
+                    )?;
                 }
                 RiscOp::BSwap { width } => {
                     let a = get_operand_val(
@@ -922,8 +939,14 @@ impl PolymorphicInterpreter {
                     mem_write(&mut self.mem, addr, width, newv);
                     self.store_operand(op_dst_raw, old & mask);
                 }
-                RiscOp::Halt | RiscOp::Trap => {
+                RiscOp::Halt => {
                     break;
+                }
+                RiscOp::Trap => {
+                    return Err(anyhow!(super::GuestFault::Trap {
+                        vip: guest_vip,
+                        op: format!("{:?}", RiscOp::Trap),
+                    }));
                 }
                 RiscOp::VirtualRet => {
                     // P0-1: eval_state `VirtualRet` 와 동일 — 가상 스택 pop 후,
@@ -939,9 +962,19 @@ impl PolymorphicInterpreter {
                             continue;
                         }
                     };
+                    let return_index = match &self.ip_map {
+                        Some(routes) => match routes.get(&ret_ip).copied() {
+                            Some(index) => index,
+                            None => {
+                                vip = bytecode.len();
+                                continue;
+                            }
+                        },
+                        None => ret_ip as usize,
+                    };
                     let Some((&target_off, &target_key)) = instr_starts
-                        .get(ret_ip as usize)
-                        .zip(key_snapshots.get(ret_ip as usize))
+                        .get(return_index)
+                        .zip(key_snapshots.get(return_index))
                     else {
                         vip = bytecode.len();
                         continue;
@@ -1754,6 +1787,43 @@ impl PolymorphicInterpreter {
                     self.regs[2] = 0;
                 }
                 RiscOp::ReadSegmentBase { .. } => self.store_operand(op_dst_raw, 0),
+                op @ (RiscOp::VirtualIndirectCall | RiscOp::VirtualIndirectJump) => {
+                    let target = get_operand_val(
+                        op_src1_raw,
+                        &self.spec,
+                        &self.regs,
+                        &self.temps,
+                        self.flags.raw,
+                        self.vsp,
+                        imm1,
+                    );
+                    let target_index = self
+                        .ip_map
+                        .as_ref()
+                        .and_then(|routes| routes.get(&target))
+                        .copied()
+                        .ok_or_else(|| {
+                            anyhow!(super::GuestFault::RouteMiss {
+                                vip: guest_vip,
+                                op: format!("{op:?}"),
+                                target,
+                            })
+                        })?;
+                    let (&target_off, &target_key) = instr_starts
+                        .get(target_index)
+                        .zip(key_snapshots.get(target_index))
+                        .ok_or_else(|| {
+                            anyhow!(super::GuestFault::RouteOutsideProgram {
+                                vip: guest_vip,
+                                op: format!("{op:?}"),
+                                target,
+                                target_index,
+                            })
+                        })?;
+                    self.rolling.current_key = target_key;
+                    vip = target_off;
+                    continue;
+                }
             }
         }
 

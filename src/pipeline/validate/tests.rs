@@ -1,6 +1,164 @@
 use super::*;
 
 #[test]
+fn final_route_gate_accepts_absent_disabled_metadata() {
+    validate_route_metadata_inventory(None, &[], &[], &[], &[], &[]).unwrap();
+}
+
+fn route_gate_fixture() -> (
+    Vec<u8>,
+    Vec<SectionInfo>,
+    Vec<crate::vm::route_table::OriginalTargetRva>,
+    Vec<crate::vm::route_metadata::GeneratedRouteDestination>,
+    Vec<crate::vm::route_metadata::RvaSpan>,
+) {
+    use crate::analysis::program_model::FunctionId;
+    use crate::vm::poly::VmArchitectureFamily;
+    use crate::vm::route_table::{
+        EntryVip, FunctionRoute, GatewayKind, MaterializedRouteTable, OriginalTargetRva,
+    };
+    let original = OriginalTargetRva(0x2100);
+    let table = MaterializedRouteTable::from_sorted_entries(vec![(
+        original,
+        FunctionRoute {
+            function_id: FunctionId(7),
+            family: VmArchitectureFamily::Register,
+            entry_vip: EntryVip(0),
+            gateway: GatewayKind::CrossFamily,
+        },
+    )]);
+    let bytes = table.to_metadata().unwrap().bytes;
+    let sections = vec![SectionInfo {
+        name: ".vmroute".into(),
+        rva: 0x5000,
+        virtual_size: bytes.len() as u32,
+        raw_ptr: 0,
+        raw_size: bytes.len() as u32,
+        characteristics: 0x4000_0040,
+    }];
+    (
+        bytes,
+        sections,
+        vec![original],
+        vec![crate::vm::route_metadata::GeneratedRouteDestination {
+            original,
+            destination_rva: 0x3100,
+        }],
+        vec![crate::vm::route_metadata::RvaSpan {
+            start: 0x3000,
+            end: 0x4000,
+        }],
+    )
+}
+
+#[test]
+fn final_route_gate_accepts_enabled_authoritative_inventory() {
+    let (bytes, sections, originals, destinations, ranges) = route_gate_fixture();
+    validate_route_metadata_inventory(
+        Some(bytes.len()),
+        &originals,
+        &destinations,
+        &ranges,
+        &bytes,
+        &sections,
+    )
+    .unwrap();
+}
+
+#[test]
+fn final_route_gate_rejects_malformed_metadata() {
+    let (mut bytes, sections, originals, destinations, ranges) = route_gate_fixture();
+    bytes[0] ^= 0xff;
+    let error = validate_route_metadata_inventory(
+        Some(bytes.len()),
+        &originals,
+        &destinations,
+        &ranges,
+        &bytes,
+        &sections,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("InvalidMagic"));
+}
+
+#[test]
+fn complete_vm_coverage_requires_exact_nonzero_totals() {
+    let full = crate::pipeline::VmCoverageMetrics {
+        vm_blocks: 12,
+        total_blocks: 12,
+        vm_instructions: 51,
+        total_instructions: 51,
+        vm_functions: 7,
+        total_functions: 7,
+        unresolved_internal_edges: Some(0),
+        unsupported_instructions: Some(0),
+        capability_mismatches: Some(0),
+        ..Default::default()
+    };
+    let (complete, evidence) = complete_vm_coverage(Some(&full));
+    assert!(complete);
+    assert_eq!(
+        evidence,
+        "functions=7/7,blocks=12/12,instructions=51/51,unresolved_internal_edges=0,unsupported_instructions=0,capability_mismatches=0"
+    );
+
+    let partial = crate::pipeline::VmCoverageMetrics {
+        vm_instructions: 50,
+        ..full.clone()
+    };
+    assert!(!complete_vm_coverage(Some(&partial)).0);
+    let unresolved = crate::pipeline::VmCoverageMetrics {
+        unresolved_internal_edges: Some(1),
+        ..full.clone()
+    };
+    assert!(!complete_vm_coverage(Some(&unresolved)).0);
+    assert!(complete_vm_coverage(Some(&unresolved))
+        .1
+        .contains("unresolved_internal_edges=1"));
+    let unmeasured = crate::pipeline::VmCoverageMetrics {
+        unresolved_internal_edges: None,
+        ..full.clone()
+    };
+    assert!(!complete_vm_coverage(Some(&unmeasured)).0);
+    assert!(complete_vm_coverage(Some(&unmeasured))
+        .1
+        .contains("unresolved_internal_edges=unmeasured"));
+    let unsupported = crate::pipeline::VmCoverageMetrics {
+        unsupported_instructions: Some(1),
+        ..full.clone()
+    };
+    assert!(!complete_vm_coverage(Some(&unsupported)).0);
+    assert!(complete_vm_coverage(Some(&unsupported))
+        .1
+        .contains("unsupported_instructions=1"));
+    let capability_unmeasured = crate::pipeline::VmCoverageMetrics {
+        capability_mismatches: None,
+        ..full
+    };
+    assert!(!complete_vm_coverage(Some(&capability_unmeasured)).0);
+    assert!(complete_vm_coverage(Some(&capability_unmeasured))
+        .1
+        .contains("capability_mismatches=unmeasured"));
+    assert!(!complete_vm_coverage(None).0);
+}
+
+#[test]
+fn strict_report_rejects_partial_vm_coverage_with_exact_evidence() {
+    let report = EffectiveProfileReport {
+        ineffective_features: vec![
+            "vm_commercial:incomplete-coverage;functions=6/7,blocks=11/12,instructions=50/51"
+                .to_string(),
+        ],
+        vm_coverage_evidence: Some("functions=6/7,blocks=11/12,instructions=50/51".to_string()),
+        ..Default::default()
+    };
+    let error = report.ensure_vm_full_coverage().unwrap_err().to_string();
+    assert!(error.contains("functions=6/7"));
+    assert!(report.ensure_strict().is_err());
+}
+
+#[test]
 fn dispatcher_validator_accepts_rc1_44_byte_provider_record() {
     let mba_constant = 0xA5C3_197Du32;
     let id = 17;

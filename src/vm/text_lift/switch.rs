@@ -7,30 +7,11 @@
 // never ran), causing 0xC0000005 on the exit path.
 // ==============================================================================
 
+use crate::analysis::program_model::RvaRange;
+use crate::analysis::switch_targets::{
+    resolve_switch_targets, SwitchEntryEncoding, SwitchSection, SwitchTableLayout,
+};
 use iced_x86::{Code, Decoder, DecoderOptions, OpKind, Register};
-
-/// Read `len` bytes from the original image at absolute VA `va`.
-fn read_image(
-    relayed: &[crate::pe::builder::SectionData],
-    image_base: u64,
-    va: u64,
-    len: usize,
-) -> Option<Vec<u8>> {
-    for s in relayed {
-        let start = image_base + s.virtual_address as u64;
-        if va >= start && va + len as u64 <= start + s.bytes.len() as u64 {
-            let off = (va - start) as usize;
-            return Some(s.bytes[off..off + len].to_vec());
-        }
-    }
-    None
-}
-fn read_u32(relayed: &[crate::pe::builder::SectionData], image_base: u64, va: u64) -> Option<u32> {
-    read_image(relayed, image_base, va, 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-}
-fn read_u64(relayed: &[crate::pe::builder::SectionData], image_base: u64, va: u64) -> Option<u64> {
-    read_image(relayed, image_base, va, 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-}
 
 /// Absolute target of a RIP-relative `lea` (or a `mov r64,imm64` absolute load).
 fn lea_target(inst: &iced_x86::Instruction) -> Option<u64> {
@@ -105,7 +86,6 @@ fn resolve_one(
         }
     }
     let inst = &insts[i];
-    let jmp_va = inst.ip();
     let mut key_va = inst.ip();
     let mut idx_reg = Register::None;
     let mut table = None;
@@ -201,30 +181,147 @@ fn resolve_one(
     let Ok(idx_vreg) = crate::vm::lifter::vreg(idx_reg) else {
         return;
     };
-    let mut cases = Vec::new();
-    let mut idx = 0i64;
-    loop {
-        let entry_va = table.wrapping_add((idx as u64).wrapping_mul(scale as u64));
-        let target = if relative {
-            read_u32(relayed, image_base, entry_va)
-                .map(|v| table.wrapping_add((v as i32 as i64) as u64))
-        } else if scale == 8 {
-            read_u64(relayed, image_base, entry_va)
-        } else {
-            read_u32(relayed, image_base, entry_va).map(|v| v as u64)
-        };
-        match target {
-            Some(t) if t >= base_va && t < text_end => {
-                cases.push((idx, t));
-                idx += 1;
-            }
-            _ => break,
+    // Compatibility bridge: instruction-shape recovery above remains legacy,
+    // but table reads and executable-range checks are delegated to the typed,
+    // bounds-checked resolver.  Project only the dense prefix back to the old
+    // public `(case_value, target_va)` shape.
+    let Some(table_rva) = table
+        .checked_sub(image_base)
+        .and_then(|v| u32::try_from(v).ok())
+    else {
+        return;
+    };
+    let Some(site_rva) = key_va
+        .checked_sub(image_base)
+        .and_then(|v| u32::try_from(v).ok())
+    else {
+        return;
+    };
+    let Some(text_start_rva) = base_va
+        .checked_sub(image_base)
+        .and_then(|v| u32::try_from(v).ok())
+    else {
+        return;
+    };
+    let Some(text_end_rva) = text_end
+        .checked_sub(image_base)
+        .and_then(|v| u32::try_from(v).ok())
+    else {
+        return;
+    };
+    let sections: Vec<_> = relayed
+        .iter()
+        .map(|s| SwitchSection {
+            name: &s.name,
+            rva: s.virtual_address,
+            bytes: &s.bytes,
+        })
+        .collect();
+    let Some(entry_count) = relayed.iter().find_map(|s| {
+        let end = s
+            .virtual_address
+            .checked_add(u32::try_from(s.bytes.len()).ok()?)?;
+        (s.virtual_address <= table_rva && table_rva < end)
+            .then(|| ((end - table_rva) / scale).min(4097))
+    }) else {
+        return;
+    };
+    let encoding = if relative {
+        SwitchEntryEncoding::Rel32 {
+            base_rva: table_rva,
         }
-        if idx > 4096 {
+    } else if scale == 8 {
+        SwitchEntryEncoding::Va64
+    } else {
+        SwitchEntryEncoding::Rva32
+    };
+    let Ok(targets) = resolve_switch_targets(
+        site_rva,
+        SwitchTableLayout::Direct {
+            table_rva,
+            encoding,
+        },
+        entry_count,
+        image_base,
+        &sections,
+        &[RvaRange {
+            start: text_start_rva,
+            end: text_end_rva,
+        }],
+    ) else {
+        return;
+    };
+    let mut cases = Vec::new();
+    for target in targets.targets {
+        if target.case_value != cases.len() as u32 {
             break;
         }
+        cases.push((
+            i64::from(target.case_value),
+            image_base + u64::from(target.target_rva),
+        ));
     }
     if !cases.is_empty() {
         out.push((key_va, idx_vreg, cases));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pe::builder::SectionData;
+
+    const IMAGE_BASE: u64 = 0x140000000;
+    const TEXT_RVA: u32 = 0x1000;
+    const TABLE_RVA: u32 = 0x3000;
+
+    fn section(bytes: Vec<u8>) -> SectionData {
+        SectionData {
+            name: ".rdata".to_owned(),
+            virtual_address: TABLE_RVA,
+            virtual_size: bytes.len() as u32,
+            characteristics: 0,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn legacy_shape_uses_typed_va64_dense_prefix() {
+        let base = IMAGE_BASE + u64::from(TEXT_RVA);
+        let table = IMAGE_BASE + u64::from(TABLE_RVA);
+        let mut text = vec![0u8; 0x40];
+        // lea rbx,[rip+table]; jmp qword ptr [rbx+rax*8]
+        text[..10].copy_from_slice(&[0x48, 0x8d, 0x1d, 0xf9, 0x1f, 0x00, 0x00, 0xff, 0x24, 0xc3]);
+        let mut data = Vec::new();
+        data.extend_from_slice(&(base + 0x20).to_le_bytes());
+        data.extend_from_slice(&(base + 0x30).to_le_bytes());
+        data.extend_from_slice(&(table + 0x100).to_le_bytes());
+
+        let got = resolve_switch_cases(&text, base, &[section(data)], IMAGE_BASE);
+        assert_eq!(
+            got,
+            vec![(base + 7, 0, vec![(0, base + 0x20), (1, base + 0x30)])]
+        );
+    }
+
+    #[test]
+    fn legacy_shape_uses_typed_signed_rel32_targets() {
+        let base = IMAGE_BASE + u64::from(TEXT_RVA);
+        let mut text = vec![0u8; 0x40];
+        // lea rbx,[rip+table]; movsxd rcx,[rbx+rax*4]; add rcx,rbx; jmp rcx
+        text[..16].copy_from_slice(&[
+            0x48, 0x8d, 0x1d, 0xf9, 0x1f, 0x00, 0x00, 0x48, 0x63, 0x0c, 0x83, 0x48, 0x01, 0xd9,
+            0xff, 0xe1,
+        ]);
+        let mut data = Vec::new();
+        data.extend_from_slice(&(-0x1fe0i32).to_le_bytes());
+        data.extend_from_slice(&(-0x1fd0i32).to_le_bytes());
+        data.extend_from_slice(&(0x100i32).to_le_bytes());
+
+        let got = resolve_switch_cases(&text, base, &[section(data)], IMAGE_BASE);
+        assert_eq!(
+            got,
+            vec![(base + 7, 0, vec![(0, base + 0x20), (1, base + 0x30)])]
+        );
     }
 }

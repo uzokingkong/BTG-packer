@@ -17,7 +17,7 @@ pub use architecture_family::{
     FamilyOpPartition, FlagModel, FunctionFamilyAssignment, FunctionOpRange, ProductionFamilyPlan,
     VmArchitectureFamily, VmCallConvention, VmFamilyProfile,
 };
-pub use decode_error::DecodeError;
+pub use decode_error::{DecodeError, GuestFault};
 pub use decoder::PolymorphicDecoder;
 pub use encoder::PolymorphicEncoder;
 pub use interpreter::PolymorphicInterpreter;

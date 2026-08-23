@@ -122,6 +122,71 @@ fn collect_sections(pe: &PE) -> Vec<SectionInfo> {
         .collect()
 }
 
+fn validate_route_metadata(
+    ctx: &PipelineContext,
+    out: &[u8],
+    sections: &[SectionInfo],
+) -> Result<()> {
+    validate_route_metadata_inventory(
+        ctx.route_metadata_section_data
+            .as_ref()
+            .map(|metadata| metadata.bytes.len()),
+        &ctx.route_required_original_targets,
+        &ctx.route_generated_destinations,
+        &ctx.route_generated_executable_ranges,
+        out,
+        sections,
+    )
+}
+
+fn validate_route_metadata_inventory(
+    staged_len: Option<usize>,
+    required_original_targets: &[crate::vm::route_table::OriginalTargetRva],
+    generated_destinations: &[crate::vm::route_metadata::GeneratedRouteDestination],
+    generated_executable_ranges: &[crate::vm::route_metadata::RvaSpan],
+    out: &[u8],
+    sections: &[SectionInfo],
+) -> Result<()> {
+    let placed = sections.iter().find(|section| section.name == ".vmroute");
+    if staged_len.is_none() {
+        if placed.is_some()
+            || !required_original_targets.is_empty()
+            || !generated_destinations.is_empty()
+            || !generated_executable_ranges.is_empty()
+        {
+            bail!("VM route metadata placement/inventory exists without staged metadata");
+        }
+        return Ok(());
+    }
+    let section =
+        placed.ok_or_else(|| anyhow!("staged VM route metadata is absent from final PE"))?;
+    let start = section.raw_ptr as usize;
+    let staged_len = staged_len.unwrap_or(0);
+    let end = start
+        .checked_add(staged_len)
+        .ok_or_else(|| anyhow!("VM route metadata raw range overflow"))?;
+    if staged_len == 0 || end > out.len() || staged_len > section.raw_size as usize {
+        bail!("VM route metadata bytes are absent or truncated in final PE");
+    }
+    if required_original_targets.is_empty()
+        || generated_destinations.is_empty()
+        || generated_executable_ranges.is_empty()
+    {
+        bail!("VM route metadata authoritative placement inventory is incomplete");
+    }
+    crate::vm::route_metadata::validate_placed_route_metadata(
+        &out[start..end],
+        section.characteristics,
+        required_original_targets,
+        generated_destinations,
+        generated_executable_ranges,
+        required_original_targets.len(),
+        staged_len,
+    )
+    .map_err(|error| anyhow!("final VM route metadata validation failed: {error}"))?;
+    Ok(())
+}
+
 pub(crate) fn section_for_rva<'a>(
     sections: &'a [SectionInfo],
     rva: u32,
@@ -141,6 +206,280 @@ pub(crate) use crate::pipeline::ownership::{
 pub(crate) use dirs::{report_pe_diff, validate_all_directories};
 pub(crate) use pe::validate_pe_structure;
 pub(crate) use rsrc::{expected_chunks, validate_rsrc, walk_dir, walk_resource_tree, ResDataEntry};
+
+/// Materialized protection facts derived from the final PE and pipeline state.
+/// This deliberately lives after policy resolution: a requested/resolved flag
+/// is not considered effective until its output invariant is observable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectiveProfileReport {
+    pub effective_features: Vec<String>,
+    pub ineffective_features: Vec<String>,
+    pub aslr_preserved: bool,
+    /// True only when every measured original function, block, and instruction
+    /// is owned by the commercial Program-VM.
+    pub vm_full_coverage: bool,
+    /// Stable, human-readable coverage evidence for diagnostics/manifests.
+    pub vm_coverage_evidence: Option<String>,
+    /// Executable bytes still covered by the original application's `.text`
+    /// RVA interval. `Some(0)` is required by the strict 100% VM contract.
+    pub original_text_exec_bytes: Option<u64>,
+}
+
+impl EffectiveProfileReport {
+    fn effective(&mut self, feature: &str) {
+        self.effective_features.push(feature.to_string());
+    }
+
+    fn ineffective(&mut self, feature: &str, reason: impl AsRef<str>) {
+        self.ineffective_features
+            .push(format!("{}:{}", feature, reason.as_ref()));
+    }
+
+    pub fn ensure_strict(&self) -> Result<()> {
+        if self.ineffective_features.is_empty() {
+            Ok(())
+        } else {
+            bail!(
+                "strict-profile effective protection check failed ({}): {}",
+                self.ineffective_features.len(),
+                self.ineffective_features.join("; ")
+            )
+        }
+    }
+
+    pub fn ensure_vm_full_coverage(&self) -> Result<()> {
+        if self.vm_full_coverage && self.original_text_exec_bytes == Some(0) {
+            Ok(())
+        } else {
+            bail!(
+                "commercial Program-VM requires 100% measured coverage; {} (use --allow-partial-vm only for development builds)",
+                self.vm_coverage_evidence
+                    .as_deref()
+                    .unwrap_or("coverage evidence is absent")
+            )
+        }
+    }
+}
+
+fn complete_vm_coverage(coverage: Option<&crate::pipeline::VmCoverageMetrics>) -> (bool, String) {
+    let Some(coverage) = coverage else {
+        return (false, "coverage evidence is absent".to_string());
+    };
+    let complete = coverage.total_functions > 0
+        && coverage.total_blocks > 0
+        && coverage.total_instructions > 0
+        && coverage.vm_functions == coverage.total_functions
+        && coverage.vm_blocks == coverage.total_blocks
+        && coverage.vm_instructions == coverage.total_instructions
+        && coverage.unresolved_internal_edges == Some(0)
+        && coverage.unsupported_instructions == Some(0)
+        && coverage.capability_mismatches == Some(0);
+    (
+        complete,
+        format!(
+            "functions={}/{},blocks={}/{},instructions={}/{},unresolved_internal_edges={},unsupported_instructions={},capability_mismatches={}",
+            coverage.vm_functions,
+            coverage.total_functions,
+            coverage.vm_blocks,
+            coverage.total_blocks,
+            coverage.vm_instructions,
+            coverage.total_instructions,
+            coverage
+                .unresolved_internal_edges
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unmeasured".to_string()),
+            coverage
+                .unsupported_instructions
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unmeasured".to_string()),
+            coverage
+                .capability_mismatches
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unmeasured".to_string())
+        ),
+    )
+}
+
+/// Measure how much of the original `.text` RVA interval is still mapped by an
+/// executable output section. This uses section provenance, not byte matching.
+pub fn original_text_exec_bytes(ctx: &PipelineContext, out: &[u8]) -> Result<u64> {
+    let pe = PE::parse(out).map_err(|e| anyhow!("original .text measurement: {e}"))?;
+    let original_start = ctx.target_info.text_rva as u64;
+    let original_end = original_start.saturating_add(ctx.target_info.text_vsize as u64);
+    let mut covered = 0u64;
+    for section in pe
+        .sections
+        .iter()
+        .filter(|section| section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0)
+    {
+        let section_start = section.virtual_address as u64;
+        let section_end = section_start.saturating_add(section.virtual_size as u64);
+        covered = covered.saturating_add(
+            original_end
+                .min(section_end)
+                .saturating_sub(original_start.max(section_start)),
+        );
+    }
+    Ok(covered)
+}
+
+/// Validate that resolved protection capabilities were actually materialized.
+/// Unlike `run`, this checks feature semantics rather than generic PE shape.
+pub fn validate_effective_profile(
+    ctx: &PipelineContext,
+    cfg: &crate::protection_profile::ResolvedConfig,
+    out: &[u8],
+) -> Result<EffectiveProfileReport> {
+    let pe = PE::parse(out).map_err(|e| anyhow!("effective profile: PE parse failed: {e}"))?;
+    let sections = collect_sections(&pe);
+    let mut report = EffectiveProfileReport::default();
+    report.aslr_preserved = pe.header.optional_header.as_ref().is_some_and(|optional| {
+        let dll = optional.windows_fields.dll_characteristics;
+        let reloc = optional
+            .data_directories
+            .get_base_relocation_table()
+            .is_some_and(|directory| directory.virtual_address > 0 && directory.size > 0);
+        dll & 0x0040 != 0 && reloc
+    });
+
+    if cfg.crypto_enabled {
+        // `--crypto-mode c1` explicitly requests the C1 protection layer; it
+        // does not request AEAD. Strict mode must validate the selected
+        // primitive instead of treating every enabled crypto path as an AEAD
+        // claim. Authentication for C1 is independently materialized by the
+        // `integrity` capability below.
+        match cfg.crypto_mode {
+            crate::crypto::CryptoMode::ChaCha20 => report.effective("aead"),
+            crate::crypto::CryptoMode::C1 => report.effective("c1"),
+            crate::crypto::CryptoMode::Rc4 => report.ineffective("crypto", "retired-rc4-selected"),
+        }
+    }
+
+    if cfg.vm_commercial {
+        let (coverage_complete, evidence) = complete_vm_coverage(ctx.vm_coverage.as_ref());
+        let original_exec = original_text_exec_bytes(ctx, out)?;
+        report.vm_full_coverage = coverage_complete;
+        report.original_text_exec_bytes = Some(original_exec);
+        let evidence = format!("{evidence},original_text_exec_bytes={original_exec}");
+        report.vm_coverage_evidence = Some(evidence.clone());
+        if ctx.vm_prog_bytecode_len > 0 && coverage_complete && original_exec == 0 {
+            report.effective("vm_commercial");
+        } else {
+            report.ineffective(
+                "vm_commercial",
+                if ctx.vm_prog_bytecode_len == 0 {
+                    format!("missing-bytecode;{evidence}")
+                } else if !coverage_complete {
+                    format!("incomplete-coverage;{evidence}")
+                } else {
+                    format!("original-text-still-executable;{evidence}")
+                },
+            );
+        }
+    }
+
+    if cfg.m7 {
+        if cfg.vm_commercial {
+            let covered = ctx
+                .vm_prog_chunks
+                .iter()
+                .try_fold(0u32, |end, chunk| {
+                    (chunk.offset == end && chunk.len > 0).then_some(end.saturating_add(chunk.len))
+                })
+                .is_some_and(|end| end == ctx.vm_prog_bytecode_len);
+            if !ctx.vm_prog_chunks.is_empty() && covered {
+                report.effective("m7");
+            } else {
+                report.ineffective("m7", "program-vm-bytecode-chunks-absent-or-not-covering");
+            }
+        } else if ctx.reencrypt {
+            report.effective("m7");
+        } else {
+            report.ineffective("m7", "no-runtime-reencryption-path");
+        }
+    }
+
+    if cfg.payload_relocate {
+        let payload_ok = ctx.payload_len > 0
+            && ctx.payload_rva > 0
+            && sections.iter().any(|section| {
+                section.contains_rva(ctx.payload_rva)
+                    && section.contains_rva(
+                        ctx.payload_rva
+                            .saturating_add(ctx.payload_len)
+                            .saturating_sub(1),
+                    )
+                    && !section.is_executable()
+            });
+        if payload_ok {
+            report.effective("payload_relocate");
+        } else {
+            report.ineffective("payload_relocate", "non-executable-payload-section-absent");
+        }
+    }
+
+    if cfg.rsrc_register {
+        let resource_dir = pe.header.optional_header.as_ref().and_then(|optional| {
+            optional
+                .data_directories
+                .get_resource_table()
+                .map(|directory| (directory.virtual_address, directory.size))
+        });
+        let rsrc_ok = ctx.rsrc_dir_rva > 0
+            && ctx.rsrc_dir_size > 0
+            && resource_dir.is_some_and(|(rva, size)| rva == ctx.rsrc_dir_rva && size > 0);
+        if rsrc_ok {
+            report.effective("rsrc_register");
+        } else {
+            report.ineffective("rsrc_register", "resource-directory-or-rcdata-absent");
+        }
+    }
+
+    if cfg.iat_hide {
+        if ctx.iat_dir_rva > 0 && ctx.iat_dir_size > 0 && ctx.iat_table_len > 0 {
+            report.effective("iat_hide");
+        } else {
+            report.ineffective("iat_hide", "resolver-import-or-runtime-table-absent");
+        }
+    }
+
+    if cfg.integrity {
+        if !ctx.vm_integrity_descriptors.is_empty() && ctx.vm_integrity_table_len > 0 {
+            report.effective("integrity");
+        } else {
+            report.ineffective("integrity", "runtime-integrity-descriptors-absent");
+        }
+    }
+
+    if cfg.mem_harden {
+        let rwx = sections
+            .iter()
+            .filter(|section| {
+                section.characteristics & 0x2000_0000 != 0
+                    && section.characteristics & 0x8000_0000 != 0
+            })
+            .map(|section| section.name.clone())
+            .collect::<Vec<_>>();
+        if rwx.is_empty() {
+            report.effective("mem_harden");
+        } else {
+            report.ineffective(
+                "mem_harden",
+                format!("static-rwx-sections={}", rwx.join("+")),
+            );
+        }
+    }
+
+    if cfg.anti_debug {
+        if ctx.anti_debug {
+            report.effective("anti_debug");
+        } else {
+            report.ineffective("anti_debug", "boot-check-not-materialized");
+        }
+    }
+
+    Ok(report)
+}
 
 /// Post-build structural self-validation of the synthesized output PE.
 pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
@@ -181,6 +520,9 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
     println!(
         "[VALIDATE] OK  PE structural/loader-compat (headers, alignments, sections, 16 data dirs)"
     );
+
+    validate_route_metadata(ctx, out, &sections)?;
+    println!("[VALIDATE] OK  canonical VM route metadata placement");
 
     // 2. Entry point inside an executable section.
     let entry_rva = if (pe.entry as u64) >= pe.image_base as u64 {
@@ -231,15 +573,19 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
         }
     }
 
-    // 2c. v5 (안정성): crypto 활성 시 .textb는 쓰기 가능이어야 한다 (in-place 복호화).
+    // 2c. Crypto normally needs writable staging. mem-harden images instead
+    // start RX and open a fail-closed transient write window in the boot stub.
     if ctx.crypto_enabled {
         let tb = sections
             .iter()
             .rev()
             .find(|s| s.name == ".textb")
             .ok_or_else(|| anyhow!("packed section '.textb' missing from output"))?;
-        if tb.characteristics & 0x8000_0000 == 0 {
+        if !ctx.mem_harden && tb.characteristics & 0x8000_0000 == 0 {
             bail!("packed section '.textb' missing WRITE (needed for in-place decryption)");
+        }
+        if ctx.mem_harden && tb.characteristics & 0x8000_0000 != 0 {
+            bail!("mem-harden contract violated: '.textb' is statically writable+executable");
         }
         // readccc §4.4: W^X 메모리 계약 — .textb는 파일에서 RWX(in-place 부트
         // 복호화용)로 매핑되지만, --mem-harden이 유효하면 부트 스텁이 복호화+
@@ -260,6 +606,37 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
             } else {
                 "disabled (stays RWX)"
             }
+        );
+    }
+
+    if ctx.mem_harden && ctx.vm_oep {
+        let textb = sections
+            .iter()
+            .find(|section| section.name == ".textb")
+            .ok_or_else(|| anyhow!("mem-harden Program-VM missing .textb"))?;
+        let state = sections
+            .iter()
+            .find(|section| section.name == ".vstate")
+            .ok_or_else(|| anyhow!("mem-harden Program-VM missing RW/NX .vstate"))?;
+        if state.characteristics & 0x2000_0000 != 0
+            || state.characteristics & 0x8000_0000 == 0
+            || state.characteristics & 0x4000_0000 == 0
+        {
+            bail!(
+                "Program-VM state section must be RW/NX, got characteristics 0x{:08X}",
+                state.characteristics
+            );
+        }
+        if textb.rva.saturating_add(textb.virtual_size) != state.rva {
+            bail!(
+                "Program-VM W^X split is not contiguous: .textb end=0x{:X}, .vstate=0x{:X}",
+                textb.rva.saturating_add(textb.virtual_size),
+                state.rva
+            );
+        }
+        println!(
+            "[VALIDATE] OK  Program-VM state split: .textb RX -> .vstate RW/NX @0x{:X}",
+            state.rva
         );
     }
 
@@ -288,8 +665,38 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
                 dd.virtual_address
             )
         })?;
+        if sec.characteristics & 0x2000_0000 != 0 {
+            bail!(
+                "loader-written dummy import/IAT is in executable section '{}'",
+                sec.name
+            );
+        }
+        if sec.characteristics & 0x8000_0000 == 0 {
+            bail!(
+                "loader-written dummy import/IAT section '{}' is not writable",
+                sec.name
+            );
+        }
+        let iat = pe
+            .header
+            .optional_header
+            .as_ref()
+            .and_then(|oh| {
+                oh.data_directories.data_directories[12]
+                    .as_ref()
+                    .map(|(_, directory)| *directory)
+            })
+            .ok_or_else(|| anyhow!("dummy IAT directory missing from output"))?;
+        if iat.virtual_address != ctx.iat_ll_slot_rva || iat.size < 24 {
+            bail!(
+                "dummy IAT directory mismatch: got RVA 0x{:X}/{}B, expected 0x{:X}/24B",
+                iat.virtual_address,
+                iat.size,
+                ctx.iat_ll_slot_rva
+            );
+        }
         println!(
-            "[VALIDATE] OK  dummy import dir @0x{:X} in '{}' (LoadLibraryA/GetProcAddress only)",
+            "[VALIDATE] OK  dummy import/IAT @0x{:X} in RW/non-exec '{}' (LoadLibraryA/GetProcAddress only)",
             dd.virtual_address, sec.name
         );
     }
@@ -608,7 +1015,10 @@ fn derive_ownership_model(
                 end_rva: rf.end_rva,
                 owned_by_vm: false,
                 enforce_entry_begin: false,
-                reason: "native-seh-or-plain",
+                // Until the lift analysis supplies a more specific typed
+                // blocker, fail closed as an explicit analysis failure. Never
+                // collapse unrelated causes into the historical catch-all.
+                reason: "analysis-failure",
             });
         }
     }
@@ -618,7 +1028,25 @@ fn derive_ownership_model(
 /// WS2.1: run the function-ownership ↔ .pdata consistency check. Bails on the
 /// first inconsistency (validate becomes a hard gate on program-VM paths).
 pub(crate) fn validate_function_ownership(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
-    let (model, runtime_functions) = derive_ownership_model(ctx, out)?;
+    let (derived_model, runtime_functions) = derive_ownership_model(ctx, out)?;
+    let authoritative = !ctx.ownership_report.is_empty();
+    let mut model = if !authoritative {
+        derived_model
+    } else {
+        ctx.ownership_report
+            .iter()
+            .map(|record| record.function)
+            .collect::<Vec<_>>()
+    };
+    if authoritative && ctx.vm_prog_rva > 0 && ctx.vm_prog_total > 0 {
+        model.push(FunctionOwnership {
+            start_rva: ctx.vm_prog_rva,
+            end_rva: ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total),
+            owned_by_vm: true,
+            enforce_entry_begin: false,
+            reason: "program-vm-module",
+        });
+    }
     let report = check_ownership(&model, &runtime_functions).map_err(|e| anyhow!("{}", e))?;
     println!(
         "[VALIDATE] OK  function-ownership ↔ .pdata: {} fn ({} VM, {} native), {} RUNTIME_FUNCTION — clean",
@@ -698,6 +1126,11 @@ pub(crate) fn validate_function_ownership(ctx: &PipelineContext, out: &[u8]) -> 
 pub fn ownership_csv(ctx: &PipelineContext, out: &[u8]) -> Result<Option<String>> {
     if !ctx.vm_oep {
         return Ok(None);
+    }
+    if !ctx.ownership_report.is_empty() {
+        return Ok(Some(crate::pipeline::ownership::render_diagnostic_csv(
+            &ctx.ownership_report,
+        )));
     }
     let (model, _) = derive_ownership_model(ctx, out)?;
     Ok(Some(render_csv(&model)))

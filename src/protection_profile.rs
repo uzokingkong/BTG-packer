@@ -218,7 +218,7 @@ pub fn resolve(req: &RequestedConfig) -> ResolveOutcome {
     let crypto_mode = match req.crypto_mode {
         Some(CryptoModeCli::C1) => CryptoMode::C1,
         Some(CryptoModeCli::ChaCha20) => CryptoMode::ChaCha20,
-        None => CryptoMode::C1,
+        None => CryptoMode::ChaCha20,
     };
     let m8 = req.m8 && vm_enabled;
     let needs_boot_stub = crypto_enabled || iat_hide || mem_harden || payload_relocate;
@@ -545,7 +545,7 @@ mod tests {
         r.rc4 = true;
         let o = resolve(&r);
         assert!(o.errors.contains(&ResolveError::Rc4Retired));
-        assert_eq!(o.config.crypto_mode, CryptoMode::C1);
+        assert_eq!(o.config.crypto_mode, CryptoMode::ChaCha20);
     }
 
     /// --m8 는 vm_enabled 일 때만 유효.
@@ -575,11 +575,11 @@ mod tests {
         );
     }
 
-    /// 기본 (플래그 없음) → C1 (기본 cipher).
+    /// 기본 (플래그 없음) → RFC 8439 ChaCha20-Poly1305 경로.
     #[test]
-    fn resolve_crypto_mode_default_c1() {
+    fn resolve_crypto_mode_default_chacha20() {
         let o = resolve(&base());
-        assert_eq!(o.config.crypto_mode, CryptoMode::C1);
+        assert_eq!(o.config.crypto_mode, CryptoMode::ChaCha20);
     }
 
     /// Legacy --rc4 remains rejected even without --crypto-mode.
@@ -589,6 +589,6 @@ mod tests {
         r.rc4 = true;
         let o = resolve(&r);
         assert!(o.errors.contains(&ResolveError::Rc4Retired));
-        assert_eq!(o.config.crypto_mode, CryptoMode::C1);
+        assert_eq!(o.config.crypto_mode, CryptoMode::ChaCha20);
     }
 }

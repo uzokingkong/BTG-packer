@@ -257,6 +257,8 @@ pub(crate) enum Label {
     // ── v6 mem-harden ──
     MemDone,
     MemFail,
+    MemOpenDone,
+    MemOpenFail,
     // ── v4 payload-relocate: .vdata → 코드 영역 복사 루프 ──
     PayloadCopyLoop,
     PayloadCopyDone,
@@ -300,5 +302,9 @@ pub(crate) enum Label {
 /// 상대 분기는 rel32 형태이므로 타깃 값과 무관하게 길이가 고정된다.
 
 pub(crate) fn base_bind_byte(base: u64) -> u8 {
-    (((base >> 16) ^ (base >> 24) ^ (base >> 32)) & 0xFF) as u8
+    // Load addresses are intentionally excluded from cryptographic identity:
+    // ASLR changes them before the boot stub runs. Region AAD/build identity
+    // provides stable domain separation instead.
+    let _ = base;
+    0
 }

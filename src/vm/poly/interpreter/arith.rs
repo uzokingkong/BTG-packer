@@ -3,7 +3,7 @@
 // ==============================================================================
 
 use crate::vm::poly::isa_spec::VirtualIsaSpec;
-use crate::vm::risc::VirtualFlags;
+use crate::vm::risc::{RiscOp, VirtualFlags};
 
 /// `width`바이트 폭의 비트 마스크.
 pub(crate) fn width_mask_interp(bits: u32) -> u64 {
@@ -203,7 +203,9 @@ pub(crate) fn div_wide_interp(
     signed: bool,
     width: u8,
     op_dst: u8,
-) {
+    guest_vip: usize,
+    op: &RiscOp,
+) -> Result<(), super::super::GuestFault> {
     let bits = width as u32 * 8;
     let mask = width_mask_interp(bits);
     // 폭 1(8비트)은 AX(reg0 low16)가 피제수 — RDX 미사용.
@@ -217,16 +219,26 @@ pub(crate) fn div_wide_interp(
     };
     let dv = (divisor & mask) as u128;
     if dv == 0 {
-        interp_store(regs, temps, spec, op_dst, 0);
-        if width != 1 {
-            regs[2] = 0;
-        }
-        return;
+        return Err(super::super::GuestFault::DivideByZero {
+            vip: guest_vip,
+            op: format!("{op:?}"),
+        });
     }
     let (q, r) = if signed {
         let d = sign_extend_i128_interp(dividend, dvbits);
         let s = sign_extend_i128_interp(dv as u64 as u128, bits);
-        let (q, r) = (d / s, d % s);
+        let q = d
+            .checked_div(s)
+            .ok_or_else(|| super::super::GuestFault::DivideOverflow {
+                vip: guest_vip,
+                op: format!("{op:?}"),
+            })?;
+        let r = d
+            .checked_rem(s)
+            .ok_or_else(|| super::super::GuestFault::DivideOverflow {
+                vip: guest_vip,
+                op: format!("{op:?}"),
+            })?;
         (q as u128, r as u128)
     } else {
         (dividend / dv, dividend % dv)
@@ -246,10 +258,10 @@ pub(crate) fn div_wide_interp(
         q > qmax
     };
     if overflow {
-        panic!(
-            "RISC DIV/IDIV interp: x86 #DE — quotient does not fit destination width {} bits (dividend 0x{dividend:X}, divisor 0x{dv:X})",
-            bits
-        );
+        return Err(super::super::GuestFault::DivideOverflow {
+            vip: guest_vip,
+            op: format!("{op:?}"),
+        });
     }
     if width == 1 {
         interp_store(
@@ -263,4 +275,5 @@ pub(crate) fn div_wide_interp(
         interp_store(regs, temps, spec, op_dst, (q as u64) & mask);
         regs[2] = (r as u64) & mask;
     }
+    Ok(())
 }

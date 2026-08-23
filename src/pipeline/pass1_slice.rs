@@ -14,6 +14,16 @@ use anyhow::Result;
 /// - `ctx.trigger_blocks`
 /// - `ctx.va_to_trigger_id`
 pub fn run(ctx: &mut PipelineContext) -> Result<()> {
+    run_with_indirect_resolutions(ctx, &[])
+}
+
+/// Pass-1 entry point for analysis drivers that have proven indirect targets.
+/// The canonical model is not installed in `ctx` unless the entire batch maps
+/// successfully.
+pub fn run_with_indirect_resolutions(
+    ctx: &mut PipelineContext,
+    indirect_resolutions: &[crate::analysis::indirect_resolver::IndirectResolution],
+) -> Result<()> {
     let target_base_va = ctx.target_info.image_base + ctx.target_info.text_rva as u64;
     let target_ep_va = ctx.target_info.image_base + ctx.target_info.entry_point_rva as u64;
 
@@ -24,6 +34,23 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         &ctx.target_info.relayed_sections,
         ctx.target_info.image_base,
     )?;
+
+    let program_model =
+        crate::analysis::program_model_builder::ProgramModelBuilder::new(&ctx.target_info)
+            .build_with_basic_blocks_and_auto_indirect_resolutions(
+                &basic_blocks,
+                indirect_resolutions,
+            )
+            .map_err(|error| anyhow::anyhow!(error))?;
+    println!(
+        "[+] Canonical ProgramModel: {} executable range(s), {} function(s), {} block(s), {} edge(s), {} unknown range(s).",
+        program_model.executable_ranges.len(),
+        program_model.functions.len(),
+        program_model.blocks.len(),
+        program_model.edges.len(),
+        program_model.unknown_ranges.len()
+    );
+    ctx.program_model = Some(program_model);
 
     println!(
         "[+] Extracted {} Basic Blocks from target CFG.",

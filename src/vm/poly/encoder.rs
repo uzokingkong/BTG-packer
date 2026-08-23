@@ -5,7 +5,9 @@
 use super::architecture_family::VmArchitectureFamily;
 use super::isa_spec::VirtualIsaSpec;
 use super::rolling_key::RollingKeyEngine;
-use crate::vm::risc::{MicroInstr, MicroOperand, RiscOp, RiscProgram};
+use crate::vm::risc::{
+    assert_commercial_capabilities, MicroInstr, MicroOperand, RiscOp, RiscProgram,
+};
 use crate::vm::threaded::{SuperOpRewrite, SuperOpStreamInstr};
 use anyhow::{anyhow, Result};
 
@@ -136,6 +138,16 @@ impl PolymorphicEncoder {
         &mut self,
         rewrite: &SuperOpRewrite,
     ) -> Result<(Vec<u8>, Vec<usize>)> {
+        let flattened: Vec<MicroInstr> = rewrite
+            .instrs
+            .iter()
+            .flat_map(|item| match item {
+                SuperOpStreamInstr::Primitive(ins) => std::slice::from_ref(ins),
+                SuperOpStreamInstr::Fused { body, .. } => body.as_slice(),
+            })
+            .cloned()
+            .collect();
+        assert_commercial_capabilities(&flattened)?;
         let mut out = Vec::new();
         let mut offsets = Vec::with_capacity(rewrite.instrs.len());
         let mut vip = 0u64;
@@ -182,6 +194,7 @@ impl PolymorphicEncoder {
     /// 폴리 바이트코드 오프셋" 매핑을 기록하는 데 쓴다. [`encode`]는 오프셋을
     /// 버리고 동일한 바이트코드만 반환한다.
     pub fn encode_with_offsets(&mut self, prog: &RiscProgram) -> Result<(Vec<u8>, Vec<usize>)> {
+        assert_commercial_capabilities(&prog.instrs)?;
         let mut out = Vec::new();
         let mut offsets = Vec::with_capacity(prog.instrs.len());
         let mut vip = 0u64;
@@ -298,6 +311,39 @@ mod tests {
     use super::*;
     use crate::vm::poly::PolymorphicDecoder;
     use crate::vm::risc::{BranchCondition, MicroOperand, RiscOp, RiscProgram};
+
+    #[test]
+    fn encoder_rejects_capability_mismatch_before_emitting_output() {
+        let program = RiscProgram::new(vec![MicroInstr::new(RiscOp::VmCallBridge)]);
+        let err = PolymorphicEncoder::new(7).encode(&program).unwrap_err();
+        let typed = err
+            .downcast_ref::<crate::vm::risc::CommercialCapabilityError>()
+            .expect("typed commercial capability error");
+        assert_eq!(typed.op_name, "vm_call_bridge");
+        assert!(typed
+            .missing
+            .contains(&crate::vm::risc::CommercialCapability::ProductionThreaded));
+    }
+
+    #[test]
+    fn typed_indirect_ops_roundtrip_with_distinct_opcodes() {
+        let seed = 0x1D1E_EC7C_0DEC_0DE5;
+        let program = RiscProgram::new(vec![
+            MicroInstr::new(RiscOp::VirtualIndirectCall).with_src1(MicroOperand::VReg(3)),
+            MicroInstr::new(RiscOp::VirtualIndirectJump)
+                .with_src1(MicroOperand::Imm64(0x1400_0010_00)),
+            MicroInstr::new(RiscOp::Halt),
+        ]);
+        let spec = VirtualIsaSpec::from_seed(seed);
+        assert_ne!(
+            spec.opcode_for(RiscOp::VirtualIndirectCall),
+            spec.opcode_for(RiscOp::VirtualIndirectJump)
+        );
+
+        let bytes = PolymorphicEncoder::new(seed).encode(&program).unwrap();
+        let decoded = PolymorphicDecoder::new(seed).decode(&bytes).unwrap();
+        assert_eq!(decoded.instrs, program.instrs);
+    }
 
     /// 전체 신규 op (메모리 폭별 · 산술시프트 · 브랜치(모든 조건/CounterZero 폭 포함,
     /// 절대/간접 타깃) · 네이티브 콜 브리지)를 인코딩하고 디코더로 라운드트립해

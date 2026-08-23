@@ -3,8 +3,29 @@
 // ==============================================================================
 
 use crate::pe::builder::{DataDirectory, SectionData};
+use crate::pe::{exports::ExportDirectory, load_config::LoadConfig64, tls::TlsDirectory64, unwind};
 use anyhow::{Context, Result};
 use goblin::pe::PE;
+
+const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+
+/// A file-backed section that the PE loader maps executable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutableSection {
+    pub name: String,
+    pub virtual_address: u32,
+    pub virtual_size: u32,
+    pub characteristics: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// One exception-directory function together with its decoded unwind chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedUnwindFunction {
+    pub function: unwind::RuntimeFunction,
+    /// `(unwind-info RVA, decoded record)` from the function outward.
+    pub chain: Vec<(u32, unwind::UnwindInfo)>,
+}
 
 #[derive(Debug, Clone)]
 pub struct TargetPeInfo {
@@ -35,6 +56,18 @@ pub struct TargetPeInfo {
     pub section_alignment: u32,
     pub data_directories: Vec<DataDirectory>,
     pub relayed_sections: Vec<SectionData>,
+    /// Every section carrying IMAGE_SCN_MEM_EXECUTE, in input section order.
+    pub executable_sections: Vec<ExecutableSection>,
+    /// Typed x64 exception-directory records and their complete unwind chains.
+    pub unwind_functions: Vec<ParsedUnwindFunction>,
+    /// Typed PE32+ TLS metadata, when the TLS directory is present.
+    pub tls: Option<TlsDirectory64>,
+    /// Typed PE32+ load-config metadata, when the directory is present.
+    pub load_config: Option<LoadConfig64>,
+    /// Typed PE export metadata, including forwarded and executable exports.
+    pub exports: Option<ExportDirectory>,
+    /// Exact RVAs of input IMAGE_REL_BASED_DIR64 slots.
+    pub dir64_relocations: Vec<u32>,
     pub original_headers_bytes: Vec<u8>,
     pub original_pdata_entries: Vec<RuntimeFunction>,
     /// 원본 입력 PE 바이트 전체 (import-name 기반 검출 — setjmp/longjmp 경계 등).
@@ -42,6 +75,30 @@ pub struct TargetPeInfo {
 }
 
 impl TargetPeInfo {
+    pub fn executable_sections(&self) -> &[ExecutableSection] {
+        &self.executable_sections
+    }
+
+    pub fn unwind_functions(&self) -> &[ParsedUnwindFunction] {
+        &self.unwind_functions
+    }
+
+    pub fn tls(&self) -> Option<&TlsDirectory64> {
+        self.tls.as_ref()
+    }
+
+    pub fn load_config(&self) -> Option<&LoadConfig64> {
+        self.load_config.as_ref()
+    }
+
+    pub fn exports(&self) -> Option<&ExportDirectory> {
+        self.exports.as_ref()
+    }
+
+    pub fn dir64_relocations(&self) -> &[u32] {
+        &self.dir64_relocations
+    }
+
     pub fn parse(pe_bytes: &[u8]) -> Result<Self> {
         let pe = PE::parse(pe_bytes).context("Failed to parse target binary as PE32+")?;
 
@@ -264,6 +321,92 @@ impl TargetPeInfo {
             });
         }
 
+        let executable_sections = relayed_sections
+            .iter()
+            .filter(|section| section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0)
+            .map(|section| ExecutableSection {
+                name: section.name.clone(),
+                virtual_address: section.virtual_address,
+                virtual_size: section.virtual_size,
+                characteristics: section.characteristics,
+                bytes: section.bytes.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        // `data_directories` intentionally clears the security/relocation
+        // entries for legacy output building. Typed input metadata must instead
+        // use the untouched source directories (notably TLS relocation proof).
+        let mut source_directories = vec![
+            DataDirectory {
+                virtual_address: 0,
+                size: 0
+            };
+            16
+        ];
+        for (index, entry) in optional
+            .data_directories
+            .data_directories
+            .iter()
+            .enumerate()
+        {
+            if index < source_directories.len() {
+                if let Some((_, directory)) = entry {
+                    source_directories[index] = DataDirectory {
+                        virtual_address: directory.virtual_address,
+                        size: directory.size,
+                    };
+                }
+            }
+        }
+
+        let unwind_sections = relayed_sections
+            .iter()
+            .map(|section| unwind::RvaSection {
+                virtual_address: section.virtual_address,
+                virtual_size: section.virtual_size,
+                bytes: &section.bytes,
+            })
+            .collect::<Vec<_>>();
+        let exception_bytes = directory_bytes(&relayed_sections, source_directories[3])?;
+        let typed_runtime_functions = unwind::parse_runtime_functions(exception_bytes)
+            .context("invalid x64 exception directory")?;
+        let mut unwind_functions = Vec::with_capacity(typed_runtime_functions.len());
+        for function in typed_runtime_functions {
+            let chain = if function.unwind_info_address == 0 {
+                Vec::new()
+            } else {
+                unwind::parse_unwind_chain(function.unwind_info_address, &unwind_sections, 64)
+                    .context("invalid x64 unwind chain")?
+            };
+            unwind_functions.push(ParsedUnwindFunction { function, chain });
+        }
+
+        let dir64_relocations =
+            parse_dir64_relocations(directory_bytes(&relayed_sections, source_directories[5])?)?;
+        let tls = crate::pe::tls::parse_tls_directory64(
+            image_base,
+            source_directories[9],
+            &relayed_sections,
+            &dir64_relocations,
+        )
+        .context("invalid PE32+ TLS directory")?;
+        let load_config_bytes = directory_bytes(&relayed_sections, source_directories[10])?;
+        let load_config = if load_config_bytes.is_empty() {
+            None
+        } else {
+            Some(
+                LoadConfig64::parse(
+                    load_config_bytes,
+                    image_base,
+                    optional.windows_fields.size_of_image,
+                )
+                .context("invalid PE32+ load-config directory")?,
+            )
+        };
+        let exports =
+            crate::pe::exports::parse_export_directory(source_directories[0], &relayed_sections)
+                .context("invalid PE export directory")?;
+
         let size_of_headers = if let Some(opt) = pe.header.optional_header {
             opt.windows_fields.size_of_headers as usize
         } else {
@@ -323,11 +466,81 @@ impl TargetPeInfo {
             section_alignment,
             data_directories,
             relayed_sections,
+            executable_sections,
+            unwind_functions,
+            tls,
+            load_config,
+            exports,
+            dir64_relocations,
             original_headers_bytes,
             original_pdata_entries,
             original_pe_bytes: pe_bytes.to_vec(),
         })
     }
+}
+
+fn directory_bytes<'a>(sections: &'a [SectionData], directory: DataDirectory) -> Result<&'a [u8]> {
+    if directory.virtual_address == 0 && directory.size == 0 {
+        return Ok(&[]);
+    }
+    let size = usize::try_from(directory.size).context("PE directory size does not fit usize")?;
+    for section in sections {
+        let Some(offset) = directory
+            .virtual_address
+            .checked_sub(section.virtual_address)
+        else {
+            continue;
+        };
+        let offset = offset as usize;
+        let Some(end) = offset.checked_add(size) else {
+            continue;
+        };
+        if end <= section.bytes.len() {
+            return Ok(&section.bytes[offset..end]);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "PE directory RVA 0x{:X} size 0x{:X} is not file-backed",
+        directory.virtual_address,
+        directory.size
+    ))
+}
+
+fn parse_dir64_relocations(bytes: &[u8]) -> Result<Vec<u32>> {
+    let mut result = Vec::new();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        if bytes[offset..].iter().all(|&byte| byte == 0) {
+            break;
+        }
+        if bytes.len() - offset < 8 {
+            return Err(anyhow::anyhow!("truncated base-relocation block"));
+        }
+        let page = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let block_size =
+            u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        if block_size < 8
+            || block_size % 2 != 0
+            || offset
+                .checked_add(block_size)
+                .is_none_or(|end| end > bytes.len())
+        {
+            return Err(anyhow::anyhow!(
+                "invalid base-relocation block size 0x{block_size:X}"
+            ));
+        }
+        for entry in bytes[offset + 8..offset + block_size].chunks_exact(2) {
+            let entry = u16::from_le_bytes(entry.try_into().unwrap());
+            if entry >> 12 == 10 {
+                result.push(
+                    page.checked_add((entry & 0x0fff) as u32)
+                        .context("base-relocation RVA overflow")?,
+                );
+            }
+        }
+        offset += block_size;
+    }
+    Ok(result)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -426,5 +639,37 @@ mod tests {
         pe[0x96..0x98].copy_from_slice(&0x2022u16.to_le_bytes());
         let err = TargetPeInfo::parse(&pe).unwrap_err().to_string();
         assert!(err.contains("DLL"), "{err}");
+    }
+
+    #[test]
+    fn dir64_relocations_are_decoded_from_typed_blocks() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x3000u32.to_le_bytes());
+        bytes.extend_from_slice(&12u32.to_le_bytes());
+        bytes.extend_from_slice(&(0xA000u16 | 0x120).to_le_bytes());
+        bytes.extend_from_slice(&(0x3000u16 | 0x220).to_le_bytes());
+        assert_eq!(parse_dir64_relocations(&bytes).unwrap(), vec![0x3120]);
+    }
+
+    #[test]
+    fn executable_section_api_preserves_all_loader_executable_sections() {
+        let pe = crate::pe::dummy_gen::generate_dummy_target_pe().unwrap();
+        let info = TargetPeInfo::parse(&pe).unwrap();
+        assert!(!info.executable_sections().is_empty());
+        assert!(info
+            .executable_sections()
+            .iter()
+            .any(|section| section.name == ".text"));
+        assert!(info
+            .executable_sections()
+            .iter()
+            .all(|section| section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0));
+        for typed in info.unwind_functions() {
+            assert!(info.original_pdata_entries.iter().any(|legacy| {
+                legacy.begin_address == typed.function.begin_address
+                    && legacy.end_address == typed.function.end_address
+                    && legacy.unwind_info_address == typed.function.unwind_info_address
+            }));
+        }
     }
 }

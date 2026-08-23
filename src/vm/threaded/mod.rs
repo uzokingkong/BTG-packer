@@ -6,6 +6,7 @@ pub mod direct_tail;
 pub mod harness;
 pub mod inline_mba;
 pub mod micro_dispatcher;
+pub mod native_fault_runner;
 pub mod native_runner;
 pub mod poly_direct;
 pub mod reg_permutation;
@@ -15,6 +16,10 @@ pub mod super_ops;
 pub use direct_tail::DirectTailEmitter;
 pub use inline_mba::InlineMbaObfuscator;
 pub use micro_dispatcher::{MicroDispatchStrategy, MicroDispatcher};
+pub use native_fault_runner::{
+    classify_native_exit, run_native_isolated, NativeGuestContext, NativeGuestFault,
+    NativeGuestFaultKind, NativeIsolatedResult,
+};
 pub use native_runner::DirectThreadedNativeRunner;
 pub use poly_direct::run_native_poly_direct;
 pub use reg_permutation::{ContextOffsetScrambler, RegisterAssignment, VmRole};

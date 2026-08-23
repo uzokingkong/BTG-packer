@@ -66,6 +66,9 @@ pub struct PeMultiSectionBuilder {
     pub relayed_sections: Vec<SectionData>,
     pub btg_section: SectionData,
     pub payload_section: Option<SectionData>,
+    pub bootstrap_iat_section: Option<SectionData>,
+    pub mutable_state_section: Option<SectionData>,
+    pub route_metadata_section: Option<SectionData>,
     pub original_headers_bytes: Vec<u8>,
     /// P0-⑦: relocation-aware 출력 — `.reloc` data directory(idx 5)가 제공되면
     /// ASLR(DYNAMIC_BASE 0x0040)/HIGH_ENTROPY_VA(0x0020) 비트를 보존한다.
@@ -112,6 +115,9 @@ impl PeMultiSectionBuilder {
             relayed_sections,
             btg_section,
             payload_section,
+            bootstrap_iat_section: None,
+            mutable_state_section: None,
+            route_metadata_section: None,
             original_headers_bytes,
             // P0-⑦: 기본값은 기존 동작(ASLR 스트립) 유지. relocation-aware 경로가
             // .reloc data directory를 채우고 이 플래그를 켠다.
@@ -136,6 +142,9 @@ impl PeMultiSectionBuilder {
 
         let num_sections = (self.relayed_sections.len()
             + 1
+            + usize::from(self.bootstrap_iat_section.is_some())
+            + usize::from(self.mutable_state_section.is_some())
+            + usize::from(self.route_metadata_section.is_some())
             + usize::from(self.payload_section.is_some())
             + usize::from(self.reloc_section.is_some())) as u16;
         let original_e_lfanew = self
@@ -217,37 +226,75 @@ impl PeMultiSectionBuilder {
                 align_config.align_size(max_existing_va, AlignmentType::Section);
         }
 
-        // v4: --payload-relocate — 암호화된 코드 페이로드 섹션(.vdata)을 .textb 직후에 배치
+        // Keep loader-written bootstrap IAT data out of executable `.textb`.
+        let mut adjusted_bootstrap_iat_section = self.bootstrap_iat_section;
+        let btg_end_va = adjusted_btg_section.virtual_address
+            + align_config.align_size(
+                adjusted_btg_section
+                    .virtual_size
+                    .max(adjusted_btg_section.bytes.len() as u32),
+                AlignmentType::Section,
+            );
+        let after_iat_va = if let Some(ref mut isec) = adjusted_bootstrap_iat_section {
+            isec.virtual_address = isec
+                .virtual_address
+                .max(align_config.align_size(btg_end_va, AlignmentType::Section));
+            isec.virtual_address
+                + align_config.align_size(
+                    isec.virtual_size.max(isec.bytes.len() as u32),
+                    AlignmentType::Section,
+                )
+        } else {
+            btg_end_va
+        };
+
+        // `.vstate` has a generated-code-owned fixed RVA. Account for it when
+        // placing subsequent automatically positioned data sections.
+        let after_state_va = self
+            .mutable_state_section
+            .as_ref()
+            .map(|state| {
+                state.virtual_address
+                    + align_config.align_size(
+                        state.virtual_size.max(state.bytes.len() as u32),
+                        AlignmentType::Section,
+                    )
+            })
+            .unwrap_or(after_iat_va)
+            .max(after_iat_va);
+
+        // v4: --payload-relocate — 암호화된 코드 페이로드 섹션(.vdata)을 뒤에 배치
         let mut adjusted_payload_section = self.payload_section;
         let payload_end_va = if let Some(ref mut psec) = adjusted_payload_section {
-            let btg_end = adjusted_btg_section.virtual_address
-                + align_config.align_size(
-                    adjusted_btg_section
-                        .virtual_size
-                        .max(adjusted_btg_section.bytes.len() as u32),
-                    AlignmentType::Section,
-                );
-            let p_va = align_config.align_size(btg_end, AlignmentType::Section);
+            let p_va = align_config.align_size(after_state_va, AlignmentType::Section);
             psec.virtual_address = p_va;
             p_va + align_config.align_size(
                 psec.virtual_size.max(psec.bytes.len() as u32),
                 AlignmentType::Section,
             )
         } else {
-            adjusted_btg_section.virtual_address
+            after_state_va
+        };
+
+        // Canonical route metadata is always placed after other VM data and
+        // before relocations. Its caller-supplied RVA is intentionally ignored.
+        let mut adjusted_route_metadata_section = self.route_metadata_section;
+        let route_end_va = if let Some(ref mut route) = adjusted_route_metadata_section {
+            route.virtual_address = align_config.align_size(payload_end_va, AlignmentType::Section);
+            route.virtual_address
                 + align_config.align_size(
-                    adjusted_btg_section
-                        .virtual_size
-                        .max(adjusted_btg_section.bytes.len() as u32),
+                    route.virtual_size.max(route.bytes.len() as u32),
                     AlignmentType::Section,
                 )
+        } else {
+            payload_end_va
         };
 
         // P0-⑦: 별도 .reloc 섹션을 payload/btg 뒤에 배치 (relayed에 넣으면 .textb가
         // 밀려 entry point/절대 VA 기준이 깨지므로 여기서 붙인다).
         let mut adjusted_reloc_section = self.reloc_section;
         if let Some(ref mut rsec) = adjusted_reloc_section {
-            rsec.virtual_address = align_config.align_size(payload_end_va, AlignmentType::Section);
+            rsec.virtual_address = align_config.align_size(route_end_va, AlignmentType::Section);
         }
 
         // Write Section Headers
@@ -265,8 +312,17 @@ impl PeMultiSectionBuilder {
 
         let mut all_sections = self.relayed_sections.clone();
         all_sections.push(adjusted_btg_section);
+        if let Some(state) = self.mutable_state_section {
+            all_sections.push(state);
+        }
+        if let Some(is) = adjusted_bootstrap_iat_section {
+            all_sections.push(is);
+        }
         if let Some(ps) = adjusted_payload_section {
             all_sections.push(ps);
+        }
+        if let Some(route) = adjusted_route_metadata_section {
+            all_sections.push(route);
         }
         if let Some(rs) = adjusted_reloc_section {
             all_sections.push(rs);
@@ -529,5 +585,62 @@ mod tests {
             checksum > 0,
             "PE OptionalHeader.CheckSum must be populated and > 0"
         );
+    }
+
+    #[test]
+    fn route_metadata_is_placed_read_only_after_vm_data() {
+        let text = SectionData {
+            name: ".textb".into(),
+            virtual_address: 0x1000,
+            virtual_size: 1,
+            characteristics: 0x6000_0020,
+            bytes: vec![0xC3],
+        };
+        let mut builder = PeMultiSectionBuilder::new(
+            0x140000000,
+            0x1000,
+            3,
+            0,
+            0x100000,
+            0x1000,
+            0x100000,
+            0x1000,
+            0x200,
+            0x1000,
+            vec![],
+            vec![],
+            text,
+            None,
+            Vec::new(),
+        );
+        builder.mutable_state_section = Some(SectionData {
+            name: ".vstate".into(),
+            virtual_address: 0x3000,
+            virtual_size: 1,
+            characteristics: 0xC000_0040,
+            bytes: vec![0],
+        });
+        builder.route_metadata_section = Some(SectionData {
+            name: ".vmroute".into(),
+            virtual_address: 0,
+            virtual_size: 4,
+            characteristics: 0x4000_0040,
+            bytes: vec![1, 2, 3, 4],
+        });
+        let pe = builder.build().unwrap();
+        let nt = u32::from_le_bytes(pe[0x3C..0x40].try_into().unwrap()) as usize;
+        let count = u16::from_le_bytes(pe[nt + 6..nt + 8].try_into().unwrap()) as usize;
+        let table = nt + 4 + 20 + 240;
+        let route = (0..count)
+            .map(|i| &pe[table + i * 40..table + (i + 1) * 40])
+            .find(|header| &header[..8] == b".vmroute")
+            .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(route[12..16].try_into().unwrap()),
+            0x4000
+        );
+        let characteristics = u32::from_le_bytes(route[36..40].try_into().unwrap());
+        assert_eq!(characteristics, 0x4000_0040);
+        assert_eq!(characteristics & IMAGE_SCN_MEM_EXECUTE, 0);
     }
 }

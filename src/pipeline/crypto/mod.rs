@@ -243,7 +243,17 @@ pub fn run(
     let k2 = ((image_base >> 32) as u32).wrapping_add(salt2);
     let k3 = salt3;
 
-    let runs = scan::gather_runs(ctx, no_crypto, vm_oep_effective);
+    let mut runs = scan::gather_runs(ctx, no_crypto, vm_oep_effective);
+    if ctx.mem_harden {
+        // Never require writes to an executable input section. Sensitive data
+        // in those pages is handled by VM/payload protection; data-run crypto
+        // remains confined to non-executable sections under the W^X profile.
+        runs.retain(|run| {
+            ctx.patched_sections
+                .get(run.sec_idx)
+                .is_some_and(|section| section.characteristics & 0x2000_0000 == 0)
+        });
+    }
 
     println!(
         "[+] v3 Crypto: code region 0x{:X}..0x{:X} ({} bytes), {} string runs encrypted.",

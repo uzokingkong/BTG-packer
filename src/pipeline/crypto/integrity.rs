@@ -499,110 +499,11 @@ pub(crate) fn emit_integrity_mac(seq: &mut Vec<(Instruction, Option<Label>)>, st
             Instruction::with2(Code::Xor_rm32_imm32, Register::R15D, 0xA5A5_5A5Au32).unwrap(),
             None,
         ));
-        // S3/S4 multi-factor fold: PEB.ImageBaseAddress low/high bind 바이트를 W32에
-        // 폴드 (w ^= rol(bind*PHI32, bind&31)) — 패커 derive_integrity_key와 lockstep.
-        // (ASLR-off에서 actual base == preferred base 이므로 일치.) RAX/RCX/RDX/R11은
-        // 스크래치 — R11D는 Phase A에서 bind_byte로 재계산되므로 안전.
-        seq.push((
-            Instruction::with2(
-                Code::Mov_r64_rm64,
-                Register::RAX,
-                M::with_base_displ_bcst_seg(Register::None, 0x60, false, Register::GS),
-            )
-            .unwrap(),
-            None,
-        )); // PEB
-        seq.push((
-            Instruction::with2(
-                Code::Mov_r64_rm64,
-                Register::RAX,
-                M::with_base_displ(Register::RAX, 0x10),
-            )
-            .unwrap(),
-            None,
-        )); // PEB.ImageBaseAddress
-        seq.push((
-            Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 16).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Mov_r32_rm32, Register::R11D, Register::EDX).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::And_rm32_imm32, Register::R11D, 0xFF).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 24).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EDX).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Xor_rm32_r32, Register::R11D, Register::ECX).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 32).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EDX).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Xor_rm32_r32, Register::R11D, Register::ECX).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::And_rm32_imm32, Register::R11D, 0xFF).unwrap(),
-            None,
-        ));
-        // ecx = bind & 31 (회전 횟수 — imul 전에 캡처)
-        seq.push((
-            Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::R11D).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::And_rm32_imm32, Register::ECX, 31).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with3(
-                Code::Imul_r32_rm32_imm32,
-                Register::R11D,
-                Register::R11D,
-                0x9E37_79B9u32 as i32,
-            )
-            .unwrap(),
-            None,
-        )); // bind*PHI32
-        seq.push((
-            Instruction::with2(Code::Rol_rm32_CL, Register::R11D, Register::CL).unwrap(),
-            None,
-        )); // rol(bind*PHI, bind&31)
-        seq.push((
-            Instruction::with2(Code::Xor_rm32_r32, Register::R15D, Register::R11D).unwrap(),
-            None,
-        )); // W32 ^= fold
-            // S3/S4 확장: W32(R15)를 스크래치 슬롯(w32_slot)에 저장 — 사이트 3/4가
-            // R15가 IAT 리졸브 등에서 클로버된 뒤에도 같은 runtime-derived whiten을
-            // 재사용한다. RAX는 직후 bind_byte 유도에서 즉시 덮어쓰므로 안전.
+        // Load address is deliberately absent from W32. ASLR changes it before
+        // bootstrap, while the authenticated image/region identity is stable.
+        // S3/S4 확장: W32(R15)를 스크래치 슬롯(w32_slot)에 저장 — 사이트 3/4가
+        // R15가 IAT 리졸브 등에서 클로버된 뒤에도 같은 runtime-derived whiten을
+        // 재사용한다. RAX는 직후 bind_byte 유도에서 즉시 덮어쓰므로 안전.
         seq.push((
             Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.w32_slot_va).unwrap(),
             None,
@@ -632,81 +533,12 @@ pub(crate) fn emit_integrity_mac(seq: &mut Vec<(Instruction, Option<Label>)>, st
             None,
         ));
 
-        // ── bind_byte 재계산 (base_bind_loop와 동일 유도) → R11b ──────────────
+        // Cryptographic identity is based on the preferred image identity and
+        // therefore remains stable when ASLR changes the runtime load address.
         seq.push((
-            Instruction::with2(
-                Code::Mov_r64_rm64,
-                Register::RAX,
-                M::with_base_displ_bcst_seg(Register::None, 0x60, false, Register::GS),
-            )
-            .unwrap(),
-            None,
-        )); // PEB
-        seq.push((
-            Instruction::with2(
-                Code::Mov_r64_rm64,
-                Register::RAX,
-                M::with_base_displ(Register::RAX, 0x10),
-            )
-            .unwrap(),
-            None,
-        )); // PEB.ImageBaseAddress
-            // (base>>16) & 0xFF
-        seq.push((
-            Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap(),
+            Instruction::with2(Code::Mov_r32_imm32, Register::R11D, 0).unwrap(),
             None,
         ));
-        seq.push((
-            Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 16).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Mov_r32_rm32, Register::R11D, Register::EDX).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::And_rm32_imm32, Register::R11D, 0xFF).unwrap(),
-            None,
-        ));
-        // ^ (base>>24)
-        seq.push((
-            Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 24).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EDX).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Xor_rm32_r32, Register::R11D, Register::ECX).unwrap(),
-            None,
-        ));
-        // ^ (base>>32)
-        seq.push((
-            Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 32).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EDX).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Xor_rm32_r32, Register::R11D, Register::ECX).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::And_rm32_imm32, Register::R11D, 0xFF).unwrap(),
-            None,
-        ));
-        // R11b = bind_byte
 
         // ── Phase A: 키(seed_stored) 흡수 — 256바이트 루프 ────────────────────
         // R9 = init i-계수 0x100000001B3 (Phase A — must match packer BtgKeyedMac::new)

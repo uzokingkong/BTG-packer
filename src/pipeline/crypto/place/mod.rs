@@ -13,6 +13,7 @@ use anyhow::Result;
 use rand::RngCore;
 
 mod lift;
+mod route_orchestration;
 mod vm_build;
 
 use lift::lift_program;
@@ -23,6 +24,31 @@ use vm_build::{
 /// BTG-C1 상태 버퍼 크기 (key[32] + ctr[8] + nonce[4] + pad + ks[64] + ks_off[4] = 0x80).
 const C1_STATE_SIZE: usize = 0x80;
 
+/// Serialize and stage the canonical route table for final PE synthesis.
+/// The PE builder owns the final RVA so this remains deterministic even when
+/// optional payload/state sections change size.
+pub(crate) fn stage_route_metadata(
+    ctx: &mut PipelineContext,
+    routes: &crate::vm::route_table::MaterializedRouteTable,
+) -> Result<()> {
+    ctx.route_metadata_section_data = Some(route_metadata_section(routes)?);
+    ctx.route_required_original_targets = routes.entries().iter().map(|(rva, _)| *rva).collect();
+    Ok(())
+}
+
+fn route_metadata_section(
+    routes: &crate::vm::route_table::MaterializedRouteTable,
+) -> Result<crate::pe::builder::SectionData> {
+    let metadata = routes.to_metadata()?;
+    Ok(crate::pe::builder::SectionData {
+        name: ".vmroute".to_string(),
+        virtual_address: 0,
+        virtual_size: metadata.bytes.len() as u32,
+        characteristics: 0x4000_0040, // INITIALIZED_DATA | READ
+        bytes: metadata.bytes,
+    })
+}
+
 pub(crate) fn place_boot_stub(
     ctx: &mut PipelineContext,
     stream: &mut BootStreamCipher,
@@ -30,7 +56,7 @@ pub(crate) fn place_boot_stub(
     seed_masked: &[u8],
     seed_stored: &[u8],
     crc_source: Option<Vec<u8>>,
-    payload_bytes: Vec<u8>,
+    mut payload_bytes: Vec<u8>,
     no_crypto: bool,
     anti_debug: bool,
     anti_debug_policy: crate::dispatcher::antidebug::AntiDebugPolicy,
@@ -72,17 +98,39 @@ pub(crate) fn place_boot_stub(
         vm_prog_ip_map,
         vm_prog_superops,
         vm_coverage,
+        ownership_report,
         vm_prog_chunks,
         vm_family_plan,
         vm_family_partitions,
         vm_multi_family,
         data_lifetime_objects,
+        unsupported_instructions,
     ) = lift_program(ctx, image_base, vm_oep_effective, vm_commercial)?;
     ctx.vm_coverage = vm_coverage;
+    ctx.ownership_report = ownership_report;
     ctx.vm_prog_chunks = vm_prog_chunks;
     ctx.vm_family_plan = vm_family_plan;
     ctx.vm_family_partitions = vm_family_partitions;
     ctx.vm_multi_family = vm_multi_family;
+    ctx.unsupported_instructions = unsupported_instructions;
+    ctx.route_metadata_section_data = None;
+    if vm_commercial {
+        if let (Some(program), Some(plan), Some(multi)) = (
+            ctx.program_model.as_ref(),
+            ctx.vm_family_plan.as_ref(),
+            ctx.vm_multi_family.as_ref(),
+        ) {
+            if let Some(routes) =
+                route_orchestration::build_commercial_routes(program, plan, multi, image_base)?
+            {
+                println!(
+                    "[+] Canonical indirect routing: {} proven target(s) staged in .vmroute",
+                    routes.len()
+                );
+                stage_route_metadata(ctx, &routes)?;
+            }
+        }
+    }
     for object in &data_lifetime_objects {
         let plaintext =
             crate::vm::data_lifetime::section_object_bytes(&ctx.patched_sections, object)
@@ -249,7 +297,11 @@ pub(crate) fn place_boot_stub(
         vm_oep_text_runs_count: 0,
         // payload_va/crc_va는 imm64라 길이 불변 — 최종 패스(stub3)에서 채운다.
         payload_va: 0,
-        payload_len: if payload_relocate { code_len } else { 0 },
+        payload_len: if payload_relocate && (code_len > 0 || !vm_prog_bytecode.is_empty()) {
+            code_len.max(1)
+        } else {
+            0
+        },
         integrity: integrity_effective,
         crc_va: 0,
         mac_va: 0,
@@ -626,6 +678,70 @@ pub(crate) fn place_boot_stub(
         0
     };
     ctx.vm_prog_total = vm_prog_total as u32;
+    ctx.route_generated_executable_ranges = if ctx.vm_prog_rva != 0 && ctx.vm_prog_total != 0 {
+        vec![crate::vm::route_metadata::RvaSpan {
+            start: ctx.vm_prog_rva,
+            end: ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total),
+        }]
+    } else {
+        Vec::new()
+    };
+    ctx.route_generated_destinations.clear();
+    if !ctx.route_required_original_targets.is_empty() {
+        let sizing = vm_multi_family_sizing.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("canonical route metadata has no placed multi-family VM module")
+        })?;
+        let program = ctx.vm_multi_family.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("canonical route metadata has no materialized multi-family program")
+        })?;
+        let metadata = ctx.route_metadata_section_data.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("canonical route inventory exists without serialized metadata")
+        })?;
+        let routes = crate::vm::route_table::MaterializedRouteTable::from_metadata(
+            &metadata.bytes,
+            ctx.route_required_original_targets.len(),
+            metadata.bytes.len(),
+        )?;
+        for original in &ctx.route_required_original_targets {
+            let route = routes.lookup(*original)?;
+            let family_index = sizing
+                .families
+                .iter()
+                .position(|family| *family == route.family)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("route target {:?} has no placed family", original)
+                })?;
+            let module = program
+                .modules
+                .iter()
+                .find(|module| module.family == route.family)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("route target {:?} has no encoded family", original)
+                })?;
+            let local_op = usize::try_from(route.entry_vip.0).map_err(|_| {
+                anyhow::anyhow!("route target {:?} entry VIP overflows usize", original)
+            })?;
+            let byte_offset = *module.instruction_offsets.get(local_op).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "route target {:?} entry VIP is outside encoded family",
+                    original
+                )
+            })?;
+            let destination_rva = ctx
+                .vm_prog_rva
+                .checked_add(sizing.code_ranges[family_index].0 as u32)
+                .and_then(|rva| rva.checked_add(byte_offset as u32))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("route target {:?} destination RVA overflow", original)
+                })?;
+            ctx.route_generated_destinations.push(
+                crate::vm::route_metadata::GeneratedRouteDestination {
+                    original: *original,
+                    destination_rva,
+                },
+            );
+        }
+    }
     ctx.vm_prog_native_bridge = vm_prog_mod
         .as_ref()
         .and_then(|m| m.native_bridge_range.map(|(s, e)| (s as u32, e as u32)));
@@ -710,7 +826,7 @@ pub(crate) fn place_boot_stub(
     // program-VM bytecode. No TLS callbacks -> a single run over the whole
     // `.text` (identical to the previous whole-region behaviour).
     let mut text_enc_runs: Vec<(u64, u32)> = Vec::new(); // (VA, len)
-    if vm_oep_effective {
+    if vm_oep_effective && !ctx.mem_harden {
         let base_va = image_base + ctx.target_info.text_rva as u64;
         let excl = crate::vm::text_lift::detect_tls_callback_ranges(
             &ctx.target_info.text_bytes,
@@ -757,6 +873,8 @@ pub(crate) fn place_boot_stub(
                 "[+] --vm-oep at-rest: preserved .text encrypted in {} run(s), {}B total (TLS-callback funcs kept plaintext)",
                 text_enc_runs.len(), text_enc_total
             );
+        } else if ctx.mem_harden {
+            println!("[+] --mem-harden: preserved .text remains RX; at-rest encryption is confined to relocated Program-VM payload");
         } else if has_tls_cb {
             println!("[!] --vm-oep at-rest: preserved .text fully TLS-reachable; no .text runs encrypted");
         }
@@ -851,10 +969,13 @@ pub(crate) fn place_boot_stub(
     } else {
         (Vec::new(), 0, 0, 0, 0)
     };
-    let dummy_off = iat_cursor;
-    iat_cursor += dummy_blob0.len();
-    // 2nd pass: 배치 RVA 반영 (내부 RVA는 u32 고정 길이 — 길이 불변)
-    let dummy_base_rva = dispatcher_rva + dummy_off as u32;
+    // The Windows loader populates the bootstrap IAT before OEP.  Put it in a
+    // dedicated RW, non-executable section instead of the RX `.textb` image.
+    let dummy_off = 0usize;
+    let section_alignment = ctx.target_info.section_alignment.max(0x1000);
+    let align_section = |value: u32| value.div_ceil(section_alignment) * section_alignment;
+    let dummy_base_rva =
+        align_section(dispatcher_rva.saturating_add(btg.bytes.len().max(1) as u32));
     let (dummy_blob, dummy_dir_rva, dummy_dir_size, iat_ll_slot_rva, iat_gpa_slot_rva) =
         if needs_dummy_bootstrap {
             crate::pipeline::iat_hide::build_dummy_import_block(dummy_base_rva)
@@ -864,6 +985,17 @@ pub(crate) fn place_boot_stub(
             (Vec::new(), 0, 0, ll, gpa)
         };
     debug_assert_eq!(dummy_blob.len(), dummy_blob0.len());
+    ctx.bootstrap_iat_section_data = if dummy_blob.is_empty() {
+        None
+    } else {
+        Some(crate::pe::builder::SectionData {
+            name: ".idata".to_string(),
+            virtual_address: dummy_base_rva,
+            virtual_size: dummy_blob.len() as u32,
+            characteristics: 0xC000_0040, // INITIALIZED_DATA | READ | WRITE
+            bytes: dummy_blob.clone(),
+        })
+    };
     let table_off = if !iat_table_blob.is_empty() {
         let off = iat_cursor;
         iat_cursor += iat_table_blob.len();
@@ -1009,6 +1141,37 @@ pub(crate) fn place_boot_stub(
         old_section_len.saturating_sub(new_section_len)
     );
 
+    // Finalize the loader-owned import section only after `.textb` trimming.
+    // Basing this RVA on pass4's large reservation left a ~63 MiB virtual gap;
+    // Windows rejected that synthesized image before OEP with ERROR_BAD_EXE_FORMAT.
+    let final_dummy_base_rva =
+        align_section(dispatcher_rva.saturating_add(btg.bytes.len().max(1) as u32));
+    let (dummy_blob, dummy_dir_rva, dummy_dir_size, iat_ll_slot_rva, iat_gpa_slot_rva) =
+        if needs_dummy_bootstrap {
+            crate::pipeline::iat_hide::build_dummy_import_block(final_dummy_base_rva)
+        } else {
+            (
+                dummy_blob,
+                dummy_dir_rva,
+                dummy_dir_size,
+                iat_ll_slot_rva,
+                iat_gpa_slot_rva,
+            )
+        };
+    if needs_dummy_bootstrap {
+        ctx.iat_dir_rva = dummy_dir_rva;
+        ctx.iat_dir_size = dummy_dir_size;
+        ctx.iat_ll_slot_rva = iat_ll_slot_rva;
+        ctx.iat_gpa_slot_rva = iat_gpa_slot_rva;
+        ctx.bootstrap_iat_section_data = Some(crate::pe::builder::SectionData {
+            name: ".idata".to_string(),
+            virtual_address: final_dummy_base_rva,
+            virtual_size: dummy_blob.len() as u32,
+            characteristics: 0xC000_0040, // INITIALIZED_DATA | READ | WRITE
+            bytes: dummy_blob.clone(),
+        });
+    }
+
     // `.textb`의 Rust TLS guard와 fast-fail 바이트도 그대로 둔다. 조건 분기를
     // 삭제하거나 noreturn fast-fail을 `ret`으로 바꾸면 종료 상태가 손상된다.
 
@@ -1031,14 +1194,23 @@ pub(crate) fn place_boot_stub(
     // (The per-block ud2 neutralization in pass4_section.rs is removed likewise.)
 
     // ── v4: .vdata 페이로드 섹션 VA (빌더와 동일한 정렬 규칙 — 잘린 .textb 직후) ──
-    let payload_va: u64 = if payload_relocate && code_len > 0 {
+    let relocated_payload_len = if code_len > 0 {
+        code_len
+    } else {
+        vm_prog_bc_len
+    };
+    let payload_va: u64 = if payload_relocate && relocated_payload_len > 0 {
         let sa = if ctx.target_info.section_alignment == 0 {
             0x1000
         } else {
             ctx.target_info.section_alignment
         } as u64;
         let align = |x: u64| ((x + sa - 1) / sa) * sa;
-        dispatcher_va + align(btg.bytes.len() as u64)
+        if !dummy_blob.is_empty() {
+            image_base + align(final_dummy_base_rva as u64 + dummy_blob.len() as u64)
+        } else {
+            dispatcher_va + align(btg.bytes.len() as u64)
+        }
     } else {
         0
     };
@@ -1052,6 +1224,11 @@ pub(crate) fn place_boot_stub(
     let crc4_va = dispatcher_va + (seed_off + 280) as u64;
     let stub3 = BootStubCtx {
         payload_va,
+        payload_len: if payload_relocate {
+            relocated_payload_len
+        } else {
+            0
+        },
         crc_va,
         mac_va,
         crc2_va,
@@ -1060,7 +1237,7 @@ pub(crate) fn place_boot_stub(
         w32_slot_va,
         // RC4 Program-VM mode reuses the otherwise inactive Poly1305 tag
         // pointer as the BTGI runtime-table carrier.
-        poly_tag_va: if vm_integrity_table_capacity > 0 {
+        poly_tag_va: if vm_integrity_table_capacity > 0 && !chacha_mode {
             dispatcher_va + vm_integrity_table_off as u64
         } else {
             stub2.poly_tag_va
@@ -1487,6 +1664,23 @@ pub(crate) fn place_boot_stub(
             ctx.vm_prog_chunks.len()
         );
     }
+    // Multi-family chunks use offsets local to each family stream while the
+    // manifest/strict-profile contract describes the concatenated bytecode
+    // region. Publish a flattened, ordered view only after encryption so it
+    // cannot accidentally enter the legacy single-stream encryption path.
+    if ctx.m7 && !vm_multi_family_chunks.is_empty() {
+        ctx.vm_prog_chunks = vm_multi_family_chunks
+            .iter()
+            .map(
+                |(module_bytecode_start, chunk)| vm::chunk_crypto::BytecodeChunk {
+                    offset: (*module_bytecode_start as u32).saturating_add(chunk.offset),
+                    len: chunk.len,
+                    key: chunk.key,
+                },
+            )
+            .collect();
+        ctx.vm_prog_chunks.sort_by_key(|chunk| chunk.offset);
+    }
 
     // Distributed integrity is sealed after the persistent M7 layer is in its
     // final runtime representation, but before the transient boot RC4 wrapper.
@@ -1627,7 +1821,12 @@ pub(crate) fn place_boot_stub(
     // 이 디스크립터에 저장한다. 부트 스텁 emit_desc_decrypt가 KSA(키 유도) 직후 이
     // 디스크립터를 PRGA로 복호화하고, 이어지는 코드/런/바이트코드 복호화가 그 값들을
     // 메모리에서 읽는다 → 정적 분석으로 target/size가 노출되지 않는다.
-    let code_va = dispatcher_va + code_start as u64;
+    let payload_target_off = if code_len > 0 {
+        code_start
+    } else {
+        vm_prog_bc_off
+    };
+    let code_va = dispatcher_va + payload_target_off as u64;
     let mut desc = [0u8; DESC_SIZE];
     desc[DESC_OFF_CODE_VA..DESC_OFF_CODE_VA + 8].copy_from_slice(&code_va.to_le_bytes());
     desc[DESC_OFF_CODE_LEN..DESC_OFF_CODE_LEN + 8]
@@ -1713,9 +1912,7 @@ pub(crate) fn place_boot_stub(
 
     // ── v6: 더미 import / 리졸브 테이블 / mem 문자열 기록 ────────────────────
     if ctx.iat_hide || ctx.mem_harden {
-        if !dummy_blob.is_empty() {
-            btg.bytes[dummy_off..dummy_off + dummy_blob.len()].copy_from_slice(&dummy_blob);
-        }
+        // dummy_blob lives in the dedicated bootstrap IAT section.
         if !iat_table_blob.is_empty() {
             btg.bytes[table_off..table_off + iat_table_blob.len()].copy_from_slice(&iat_table_blob);
             // v9: crypto-on에서만 리졸브 테이블을 마지막 run으로 암호화한다.
@@ -1748,6 +1945,42 @@ pub(crate) fn place_boot_stub(
         sec.characteristics |= 0x8000_0000; // IMAGE_SCN_MEM_WRITE
     }
 
+    // Publish the exact on-disk ciphertext ownership map for PE relocation.
+    // The previous build stage excluded everything from the first encrypted
+    // block through the end of .textb, which also excluded the later plaintext
+    // boot stub and caused its absolute operands to miss DIR64 fixups.
+    ctx.at_rest_cipher_ranges.clear();
+    if !no_crypto {
+        if code_len > 0 {
+            ctx.at_rest_cipher_ranges
+                .push((ctx.dispatcher_rva + code_start as u32, code_len));
+        }
+        for run in runs {
+            if run.len > 0 && run.va >= image_base {
+                ctx.at_rest_cipher_ranges
+                    .push(((run.va - image_base) as u32, run.len as u32));
+            }
+        }
+        if table_is_run && !iat_table_blob.is_empty() {
+            ctx.at_rest_cipher_ranges.push((
+                ctx.dispatcher_rva + table_off as u32,
+                iat_table_blob.len() as u32,
+            ));
+        }
+        if ctx.vm_oep && vm_prog_bc_len > 0 {
+            ctx.at_rest_cipher_ranges
+                .push((ctx.dispatcher_rva + vm_prog_bc_off as u32, vm_prog_bc_len));
+        }
+        for &(va, len) in &text_enc_runs {
+            if len > 0 && va >= image_base {
+                ctx.at_rest_cipher_ranges
+                    .push(((va - image_base) as u32, len as u32));
+            }
+        }
+        ctx.at_rest_cipher_ranges.sort_unstable();
+        ctx.at_rest_cipher_ranges.dedup();
+    }
+
     println!(
         "[+] v3 Crypto: boot stub @0x{:X} ({} bytes), runs @0x{:X}, seed @0x{:X}, entry=0x{:X}",
         boot_off,
@@ -1758,10 +1991,28 @@ pub(crate) fn place_boot_stub(
     );
 
     // ── v4: .vdata 페이로드 섹션 등록 (빌더가 .textb 직후 배치) ───────────────
+    if payload_relocate && payload_bytes.is_empty() && vm_prog_bc_len > 0 {
+        let start = vm_prog_bc_off;
+        let end = start + vm_prog_bc_len as usize;
+        if end > btg.bytes.len() {
+            anyhow::bail!("Program-VM payload relocation source exceeds .textb");
+        }
+        payload_bytes = btg.bytes[start..end].to_vec();
+        btg.bytes[start..end].fill(0);
+        println!(
+            "[+] Program-VM payload relocate: {} byte ciphertext moved out of executable section",
+            vm_prog_bc_len
+        );
+    }
     if payload_relocate && !payload_bytes.is_empty() {
         let payload_rva = (payload_va - image_base) as u32;
         ctx.payload_rva = payload_rva;
-        ctx.payload_len = code_len;
+        ctx.payload_len = payload_bytes.len() as u32;
+        ctx.at_rest_cipher_ranges.retain(|&(rva, len)| {
+            !(rva == ctx.dispatcher_rva + payload_target_off as u32 && len == ctx.payload_len)
+        });
+        ctx.at_rest_cipher_ranges
+            .push((payload_rva, ctx.payload_len));
         ctx.payload_section_data = Some(crate::pe::builder::SectionData {
             name: ".vdata".to_string(),
             virtual_address: payload_rva,
@@ -1771,8 +2022,33 @@ pub(crate) fn place_boot_stub(
         });
         println!(
             "[+] v4 Payload Relocate: .vdata section @RVA 0x{:X} ({} bytes) registered",
-            payload_rva, code_len
+            payload_rva, ctx.payload_len
         );
+    }
+
+    // The Program-VM state is written at the very first boot instructions,
+    // before the transient NtProtect window can be opened.  Materialize its
+    // page-aligned tail as a separate RW/NX PE section while preserving every
+    // generated absolute VA.  The split RVA is unchanged; only section
+    // ownership and loader permissions differ.
+    if ctx.mem_harden && vm_prog_state_va > dispatcher_va {
+        let split_off = (vm_prog_state_va - dispatcher_va) as usize;
+        if split_off == 0 || split_off >= btg.bytes.len() || split_off & 0xFFF != 0 {
+            anyhow::bail!(
+                "invalid Program-VM state split: offset=0x{:X}, textb_len=0x{:X}",
+                split_off,
+                btg.bytes.len()
+            );
+        }
+        let state_bytes = btg.bytes.split_off(split_off);
+        btg.virtual_size = btg.bytes.len() as u32;
+        ctx.mutable_state_section_data = Some(crate::pe::builder::SectionData {
+            name: ".vstate".to_string(),
+            virtual_address: ctx.dispatcher_rva + split_off as u32,
+            virtual_size: state_bytes.len() as u32,
+            characteristics: 0xC000_0040, // INITIALIZED_DATA | READ | WRITE
+            bytes: state_bytes,
+        });
     }
 
     Ok(())

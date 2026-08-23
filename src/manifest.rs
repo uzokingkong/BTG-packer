@@ -24,6 +24,50 @@ pub const VM_VERSION: u32 = 31;
 /// Crypto capability manifest ABI. RC4 is no longer a valid emitted mode.
 pub const CRYPTO_VERSION: u32 = 63;
 
+/// M0-2 measurements over the original application's code domain.
+///
+/// These values are deliberately optional: older manifest call sites can keep
+/// using [`BuildManifest::new`] until the ownership analysis has produced an
+/// authoritative measurement. `Some(0)` means "measured and zero", while
+/// `None` means "not measured"; the distinction is required for strict-profile
+/// validation to avoid treating missing evidence as a successful zero count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VmOriginalMetrics {
+    /// Number of canonical original application functions in the VM denominator.
+    pub vm_original_functions: Option<u64>,
+    /// Number of canonical original application basic blocks in the VM denominator.
+    pub vm_original_blocks: Option<u64>,
+    /// Number of canonical original application instructions in the VM denominator.
+    pub vm_original_instructions: Option<u64>,
+    /// Original application functions that remain natively owned in the output.
+    pub native_original_functions: Option<u64>,
+    /// Original application `.text` bytes that remain executable in the output.
+    pub original_text_exec_bytes: Option<u64>,
+    /// Internal control-flow edges whose targets remain unresolved.
+    pub unresolved_edges: Option<u64>,
+}
+
+impl VmOriginalMetrics {
+    /// Construct a complete M0-2 measurement set.
+    pub const fn measured(
+        vm_original_functions: u64,
+        vm_original_blocks: u64,
+        vm_original_instructions: u64,
+        native_original_functions: u64,
+        original_text_exec_bytes: u64,
+        unresolved_edges: u64,
+    ) -> Self {
+        Self {
+            vm_original_functions: Some(vm_original_functions),
+            vm_original_blocks: Some(vm_original_blocks),
+            vm_original_instructions: Some(vm_original_instructions),
+            native_original_functions: Some(native_original_functions),
+            original_text_exec_bytes: Some(original_text_exec_bytes),
+            unresolved_edges: Some(unresolved_edges),
+        }
+    }
+}
+
 /// A fully-qualified description of one pack run.
 #[derive(Debug, Clone)]
 pub struct BuildManifest {
@@ -39,6 +83,10 @@ pub struct BuildManifest {
     pub crypto_version: u32,
     /// Effective feature flags (ordered, CSV in `render`).
     pub feature_flags: Vec<String>,
+    /// P0-1: resolved flags with observable output evidence.
+    pub effective_features: Vec<String>,
+    /// P0-1: resolved flags which failed their materialization invariant.
+    pub ineffective_features: Vec<String>,
     /// Effective crypto primitive (`c1`/`chacha20`) used by the
     /// boot stub at-rest decryption (readccc.md §6.1 capability manifest).
     pub crypto_mode: String,
@@ -78,6 +126,8 @@ pub struct BuildManifest {
     pub verified_stdout_len: Option<usize>,
     pub verified_stderr_len: Option<usize>,
     pub vm_coverage: Option<crate::pipeline::VmCoverageMetrics>,
+    /// M0-2: exact measurements over the original application's code domain.
+    pub vm_original_metrics: VmOriginalMetrics,
     /// Generated VM→native machine-code bridge ranges as RVA half-open ranges.
     pub native_bridge_ranges: Vec<(u32, u32)>,
     pub vm_bytecode_chunks: usize,
@@ -107,6 +157,8 @@ impl BuildManifest {
             vm_version: VM_VERSION,
             crypto_version: CRYPTO_VERSION,
             feature_flags,
+            effective_features: Vec::new(),
+            ineffective_features: Vec::new(),
             crypto_mode: "c1".to_string(),
             crypto_construction: "btg-c1".to_string(),
             payload_initial_counter: 0,
@@ -125,6 +177,7 @@ impl BuildManifest {
             verified_stdout_len: None,
             verified_stderr_len: None,
             vm_coverage: None,
+            vm_original_metrics: VmOriginalMetrics::default(),
             native_bridge_ranges: Vec::new(),
             vm_bytecode_chunks: 0,
             vm_bytecode_chunk_max: 0,
@@ -132,6 +185,15 @@ impl BuildManifest {
             vm_bytecode_len: 0,
             vm_runtime_cipher_hash: None,
         }
+    }
+
+    pub fn with_effective_profile(
+        mut self,
+        report: &crate::pipeline::validate::EffectiveProfileReport,
+    ) -> Self {
+        self.effective_features = report.effective_features.clone();
+        self.ineffective_features = report.ineffective_features.clone();
+        self
     }
 
     pub fn with_vm_ownership(
@@ -156,6 +218,15 @@ impl BuildManifest {
         self.vm_bytecode_rva = bytecode_rva;
         self.vm_bytecode_len = bytecode_len;
         self.vm_runtime_cipher_hash = runtime_cipher_hash.map(str::to_string);
+        self
+    }
+
+    /// Attach exact M0-2 measurements produced by ownership/CFG analysis.
+    ///
+    /// Keeping this separate from [`Self::with_vm_ownership`] lets existing
+    /// callers compile unchanged while the analysis pipeline is migrated.
+    pub fn with_vm_original_metrics(mut self, metrics: VmOriginalMetrics) -> Self {
+        self.vm_original_metrics = metrics;
         self
     }
 
@@ -228,6 +299,22 @@ impl BuildManifest {
             "feature_flags = {}\n",
             self.feature_flags.join(",")
         ));
+        out.push_str(&format!(
+            "effective_features = {}\n",
+            if self.effective_features.is_empty() {
+                "none".to_string()
+            } else {
+                self.effective_features.join(",")
+            }
+        ));
+        out.push_str(&format!(
+            "ineffective_features = {}\n",
+            if self.ineffective_features.is_empty() {
+                "none".to_string()
+            } else {
+                self.ineffective_features.join(";")
+            }
+        ));
         out.push_str(&format!("crypto_mode = {}\n", self.crypto_mode));
         out.push_str(&format!(
             "crypto_construction = {}\n",
@@ -292,9 +379,46 @@ impl BuildManifest {
                 }
             ));
             out.push_str(&format!("vm_sensitive_regions = {}\n", c.sensitive_regions));
+            out.push_str(&format!(
+                "unresolved_internal_edges = {}\n",
+                render_optional_metric(c.unresolved_internal_edges)
+            ));
+            out.push_str(&format!(
+                "unsupported_instructions = {}\n",
+                render_optional_metric(c.unsupported_instructions)
+            ));
+            out.push_str(&format!(
+                "capability_mismatches = {}\n",
+                render_optional_metric(c.capability_mismatches)
+            ));
         } else {
-            out.push_str("vm_blocks = none\nvm_instructions = none\nvm_functions = none\nvm_hot_path = unprofiled\nvm_sensitive_regions = 0\n");
+            out.push_str("vm_blocks = none\nvm_instructions = none\nvm_functions = none\nvm_hot_path = unprofiled\nvm_sensitive_regions = 0\nunresolved_internal_edges = none\nunsupported_instructions = none\ncapability_mismatches = none\n");
         }
+        let original = &self.vm_original_metrics;
+        out.push_str(&format!(
+            "vm_original_functions = {}\n",
+            render_optional_metric(original.vm_original_functions)
+        ));
+        out.push_str(&format!(
+            "vm_original_blocks = {}\n",
+            render_optional_metric(original.vm_original_blocks)
+        ));
+        out.push_str(&format!(
+            "vm_original_instructions = {}\n",
+            render_optional_metric(original.vm_original_instructions)
+        ));
+        out.push_str(&format!(
+            "native_original_functions = {}\n",
+            render_optional_metric(original.native_original_functions)
+        ));
+        out.push_str(&format!(
+            "original_text_exec_bytes = {}\n",
+            render_optional_metric(original.original_text_exec_bytes)
+        ));
+        out.push_str(&format!(
+            "unresolved_edges = {}\n",
+            render_optional_metric(original.unresolved_edges)
+        ));
         out.push_str(&format!(
             "native_bridge_ranges = {}\n",
             if self.native_bridge_ranges.is_empty() {
@@ -336,6 +460,12 @@ impl BuildManifest {
     pub fn write_manifest(&self, path: &Path) -> io::Result<()> {
         std::fs::write(path, self.render().as_bytes())
     }
+}
+
+fn render_optional_metric(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
 }
 
 /// Collect the feature flags that were actually active into an ordered list.
@@ -540,6 +670,58 @@ mod tests {
         assert!(body.contains("input_hash = "));
         assert!(body.contains("output_hash = "));
         assert!(body.contains("feature_flags = vm,m8"));
+        assert!(body.contains("vm_original_functions = none"));
+        assert!(body.contains("vm_original_blocks = none"));
+        assert!(body.contains("vm_original_instructions = none"));
+        assert!(body.contains("native_original_functions = none"));
+        assert!(body.contains("original_text_exec_bytes = none"));
+        assert!(body.contains("unresolved_edges = none"));
+        assert!(body.contains("unresolved_internal_edges = none"));
+        assert!(body.contains("unsupported_instructions = none"));
+        assert!(body.contains("capability_mismatches = none"));
+    }
+
+    #[test]
+    fn render_distinguishes_measured_zero_capability_metrics() {
+        let coverage = crate::pipeline::VmCoverageMetrics {
+            unsupported_instructions: Some(0),
+            capability_mismatches: Some(0),
+            ..Default::default()
+        };
+        let mut m = BuildManifest::new(None, vec![], "ab".repeat(16), "cd".repeat(16));
+        m.vm_coverage = Some(coverage);
+        let body = m.render();
+        assert!(body.contains("unsupported_instructions = 0"));
+        assert!(body.contains("capability_mismatches = 0"));
+    }
+
+    #[test]
+    fn render_contains_measured_original_vm_metrics() {
+        let m = BuildManifest::new(None, vec![], "ab".repeat(16), "cd".repeat(16))
+            .with_vm_original_metrics(VmOriginalMetrics::measured(
+                748, 12_283, 51_171, 228, 186_872, 7,
+            ));
+
+        let body = m.render();
+        assert!(body.contains("vm_original_functions = 748\n"));
+        assert!(body.contains("vm_original_blocks = 12283\n"));
+        assert!(body.contains("vm_original_instructions = 51171\n"));
+        assert!(body.contains("native_original_functions = 228\n"));
+        assert!(body.contains("original_text_exec_bytes = 186872\n"));
+        assert!(body.contains("unresolved_edges = 7\n"));
+    }
+
+    #[test]
+    fn original_vm_metrics_distinguish_unmeasured_from_measured_zero() {
+        let unmeasured = BuildManifest::new(None, vec![], "ab".repeat(16), "cd".repeat(16));
+        let measured = BuildManifest::new(None, vec![], "ab".repeat(16), "cd".repeat(16))
+            .with_vm_original_metrics(VmOriginalMetrics::measured(0, 0, 0, 0, 0, 0));
+
+        assert!(unmeasured.render().contains("unresolved_edges = none\n"));
+        assert!(measured.render().contains("unresolved_edges = 0\n"));
+        assert!(measured
+            .render()
+            .contains("native_original_functions = 0\n"));
     }
 
     #[test]

@@ -16,12 +16,539 @@ use super::{
     detect_seh_native_functions, detect_setjmp_longjmp_functions, is_zero_padding,
     resolve_switch_cases,
 };
-use crate::graph::CfgExtractor;
+use crate::graph::{BasicBlock, CfgExtractor};
+use crate::pipeline::ownership::{
+    FunctionOwnership, FunctionOwnershipDiagnostic, OwnershipBlocker, OwnershipReason,
+    RuntimeFunction,
+};
 use crate::vm::poly::isa_spec::VirtualIsaSpec;
+use crate::vm::risc::unsupported_report::MAX_X86_INSTRUCTION_BYTES;
 use crate::vm::risc::{BranchCondition, MicroInstr, MicroOperand, RiscLifter, RiscOp, RiscProgram};
+use crate::vm::risc::{UnsupportedInstruction, UnsupportedInstructionReport, UnsupportedStage};
 use anyhow::Result;
 use iced_x86::{Code, FlowControl, Instruction, Register};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+
+/// Stable, machine-readable reason why a commercial-VM function remains native.
+///
+/// Variant order is also the deterministic report order.  Keep `as_str()` values
+/// stable because build logs and downstream ownership tooling consume them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CommercialExclusionReason {
+    SehOrPanicPolicy,
+    SetjmpLongjmpPolicy,
+    LegacyHighByteRegister,
+    SemanticDependencyClosure,
+    IntegrationQuarantine,
+    AmbiguousFunctionBoundary,
+    UnsupportedInstruction,
+    UnsupportedVmOpcode,
+    AnalysisFailure,
+}
+
+impl CommercialExclusionReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SehOrPanicPolicy => "seh-or-panic-policy",
+            Self::SetjmpLongjmpPolicy => "setjmp-longjmp-policy",
+            Self::LegacyHighByteRegister => "legacy-high-byte-register",
+            Self::SemanticDependencyClosure => "semantic-dependency-closure",
+            Self::IntegrationQuarantine => "integration-quarantine",
+            Self::AmbiguousFunctionBoundary => "ambiguous-function-boundary",
+            Self::UnsupportedInstruction => "unsupported-instruction",
+            Self::UnsupportedVmOpcode => "unsupported-vm-opcode",
+            Self::AnalysisFailure => "analysis-failure",
+        }
+    }
+}
+
+/// First concrete blocker that caused a function-level native decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommercialFirstBlocker {
+    pub rva: u64,
+    pub code: Code,
+    pub detail: String,
+}
+
+/// One canonical function (or an unbounded CFG block) excluded from VM ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommercialFunctionExclusion {
+    pub function_start: u64,
+    pub function_end: u64,
+    pub reason: CommercialExclusionReason,
+    pub excluded_blocks: usize,
+    /// Sibling blocks excluded solely to preserve all-or-error function ownership.
+    pub function_atomic_blocks: usize,
+    pub first_blocker: Option<CommercialFirstBlocker>,
+}
+
+/// Deterministic aggregate row for build logs and future manifest/CSV wiring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommercialExclusionSummary {
+    pub reason: CommercialExclusionReason,
+    pub functions: usize,
+    pub blocks: usize,
+    pub function_atomic_blocks: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CommercialExclusionReport {
+    pub functions: Vec<CommercialFunctionExclusion>,
+    pub summary: Vec<CommercialExclusionSummary>,
+    pub total_blocks: usize,
+}
+
+/// One statically resolved call edge considered by the semantic-dependency
+/// quarantine.  `target_is_entry == false` is deliberately surfaced: an
+/// interior-function call cannot be treated as an ordinary Win64 ABI call
+/// without a separate proof for the target state.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CommercialDependencyEdge {
+    pub caller_start: u64,
+    pub callee_start: u64,
+    pub call_site: u64,
+    pub target: u64,
+    pub target_is_entry: bool,
+    /// Minimum number of direct-call edges from a high-byte root to `callee`.
+    pub root_distance: usize,
+}
+
+/// A call whose target cannot be represented as a certified function-entry
+/// edge.  These remain visible instead of silently disappearing from the
+/// dependency analysis.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CommercialUnresolvedCall {
+    pub caller_start: u64,
+    pub call_site: u64,
+    pub code: Code,
+    pub detail: &'static str,
+}
+
+/// Strongly connected component in the root-reachable direct-call graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommercialDependencyScc {
+    pub functions: Vec<u64>,
+    pub blocks: usize,
+    pub root_functions: usize,
+    pub internal_edges: usize,
+    pub outgoing_edges: usize,
+}
+
+/// Deterministic evidence explaining semantic-dependency-closure expansion.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CommercialSemanticDependencyReport {
+    pub roots: Vec<u64>,
+    pub reachable_functions: usize,
+    pub reachable_blocks: usize,
+    pub closure_functions: usize,
+    pub closure_blocks: usize,
+    pub max_root_distance: usize,
+    pub edges: Vec<CommercialDependencyEdge>,
+    pub unresolved_calls: Vec<CommercialUnresolvedCall>,
+    pub sccs: Vec<CommercialDependencyScc>,
+}
+
+impl CommercialExclusionReport {
+    fn from_functions(mut functions: Vec<CommercialFunctionExclusion>) -> Self {
+        functions.sort_by_key(|item| (item.function_start, item.function_end, item.reason));
+        let mut totals: BTreeMap<CommercialExclusionReason, (usize, usize, usize)> =
+            BTreeMap::new();
+        for item in &functions {
+            let row = totals.entry(item.reason).or_default();
+            row.0 += 1;
+            row.1 += item.excluded_blocks;
+            row.2 += item.function_atomic_blocks;
+        }
+        let summary = totals
+            .into_iter()
+            .map(|(reason, (functions, blocks, function_atomic_blocks))| {
+                CommercialExclusionSummary {
+                    reason,
+                    functions,
+                    blocks,
+                    function_atomic_blocks,
+                }
+            })
+            .collect();
+        let total_blocks = functions.iter().map(|item| item.excluded_blocks).sum();
+        Self {
+            functions,
+            summary,
+            total_blocks,
+        }
+    }
+}
+
+fn build_ownership_report(
+    function_ranges: &[(u64, u64)],
+    blocks: &[BasicBlock],
+    exclusions: &CommercialExclusionReport,
+    dependencies: &CommercialSemanticDependencyReport,
+    image_base: u64,
+) -> Result<Vec<FunctionOwnershipDiagnostic>> {
+    let mut ranges = function_ranges.to_vec();
+    for excluded in &exclusions.functions {
+        if !ranges
+            .iter()
+            .any(|range| *range == (excluded.function_start, excluded.function_end))
+        {
+            ranges.push((excluded.function_start, excluded.function_end));
+        }
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+
+    let to_rva = |va: u64| -> Result<u32> {
+        let relative = va.checked_sub(image_base).ok_or_else(|| {
+            anyhow::anyhow!("commercial ownership VA 0x{va:X} precedes image base 0x{image_base:X}")
+        })?;
+        u32::try_from(relative).map_err(|_| {
+            anyhow::anyhow!("commercial ownership VA 0x{va:X} does not fit a PE32+ RVA")
+        })
+    };
+
+    let mut report = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        let exclusion = exclusions
+            .functions
+            .iter()
+            .find(|item| item.function_start == start && item.function_end == end);
+        let start_rva = to_rva(start)?;
+        let end_rva = to_rva(end)?;
+        let function_blocks = blocks
+            .iter()
+            .filter(|block| start <= block.start_va && block.start_va < end)
+            .collect::<Vec<_>>();
+        let instruction_count = function_blocks
+            .iter()
+            .map(|block| {
+                block
+                    .instructions
+                    .iter()
+                    .filter(|i| !is_zero_padding(i))
+                    .count()
+            })
+            .sum::<usize>();
+        let owned_by_vm = exclusion.is_none();
+        let (mut reason, mut legacy_reason) = match exclusion.map(|item| item.reason) {
+            None => (OwnershipReason::VmOwned, "vm-owned"),
+            Some(CommercialExclusionReason::SehOrPanicPolicy) => {
+                (OwnershipReason::SehOrPanicPolicy, "seh-or-panic-policy")
+            }
+            Some(CommercialExclusionReason::SetjmpLongjmpPolicy) => (
+                OwnershipReason::SetjmpLongjmpPolicy,
+                "setjmp-longjmp-policy",
+            ),
+            Some(CommercialExclusionReason::LegacyHighByteRegister) => (
+                OwnershipReason::LegacyHighByteRegister,
+                "legacy-high-byte-register",
+            ),
+            Some(CommercialExclusionReason::SemanticDependencyClosure) => (
+                OwnershipReason::SemanticDependencyPropagation,
+                "semantic-dependency-propagation",
+            ),
+            Some(CommercialExclusionReason::IntegrationQuarantine) => (
+                OwnershipReason::IntegrationQuarantine,
+                "integration-quarantine",
+            ),
+            Some(CommercialExclusionReason::AmbiguousFunctionBoundary) => (
+                OwnershipReason::AmbiguousFunctionBoundary,
+                "ambiguous-function-boundary",
+            ),
+            Some(CommercialExclusionReason::UnsupportedInstruction) => (
+                OwnershipReason::UnsupportedInstruction,
+                "unsupported-instruction",
+            ),
+            Some(CommercialExclusionReason::UnsupportedVmOpcode) => (
+                OwnershipReason::UnsupportedVmOpcode,
+                "unsupported-vm-opcode",
+            ),
+            Some(CommercialExclusionReason::AnalysisFailure) => {
+                (OwnershipReason::AnalysisFailure, "analysis-failure")
+            }
+        };
+        if exclusion.is_some_and(|item| {
+            item.reason != CommercialExclusionReason::SemanticDependencyClosure
+                && item.first_blocker.is_none()
+                && item.excluded_blocks > 0
+                && item.function_atomic_blocks == item.excluded_blocks
+        }) {
+            reason = OwnershipReason::FunctionAtomicityPropagation;
+            legacy_reason = "function-atomicity-propagation";
+        }
+        let function = FunctionOwnership {
+            start_rva,
+            end_rva,
+            owned_by_vm,
+            enforce_entry_begin: true,
+            reason: legacy_reason,
+        };
+        let mut diagnostic = FunctionOwnershipDiagnostic::new(function, reason)
+            .with_counts(function_blocks.len() as u64, instruction_count as u64);
+        if let Some(exclusion) = exclusion {
+            let mut blocker = exclusion
+                .first_blocker
+                .as_ref()
+                .map(|first| {
+                    OwnershipBlocker::new(to_rva(first.rva).unwrap_or(start_rva), Some(first.code))
+                })
+                .unwrap_or_else(|| OwnershipBlocker::new(start_rva, None));
+            blocker.pdata_range = function_ranges
+                .iter()
+                .any(|range| *range == (start, end))
+                .then_some(RuntimeFunction {
+                    begin_rva: start_rva,
+                    end_rva,
+                });
+            for edge in &dependencies.edges {
+                if edge.callee_start == start {
+                    if let Ok(rva) = to_rva(edge.caller_start) {
+                        blocker.caller_rvas.push(rva);
+                    }
+                }
+                if edge.caller_start == start {
+                    if let Ok(rva) = to_rva(edge.callee_start) {
+                        blocker.callee_rvas.push(rva);
+                    }
+                }
+            }
+            diagnostic = diagnostic.with_first_blocker(blocker);
+        }
+        report.push(diagnostic);
+    }
+    Ok(report)
+}
+
+fn dependency_dfs_order(
+    node: u64,
+    adjacency: &BTreeMap<u64, Vec<u64>>,
+    visited: &mut HashSet<u64>,
+    order: &mut Vec<u64>,
+) {
+    if !visited.insert(node) {
+        return;
+    }
+    if let Some(next) = adjacency.get(&node) {
+        for &callee in next {
+            dependency_dfs_order(callee, adjacency, visited, order);
+        }
+    }
+    order.push(node);
+}
+
+fn dependency_dfs_collect(
+    node: u64,
+    reverse: &BTreeMap<u64, Vec<u64>>,
+    visited: &mut HashSet<u64>,
+    component: &mut Vec<u64>,
+) {
+    if !visited.insert(node) {
+        return;
+    }
+    component.push(node);
+    if let Some(next) = reverse.get(&node) {
+        for &caller in next {
+            dependency_dfs_collect(caller, reverse, visited, component);
+        }
+    }
+}
+
+fn build_semantic_dependency_report(
+    all_function_ranges: &[(u64, u64)],
+    blocks: &[BasicBlock],
+    roots: &HashSet<(u64, u64)>,
+) -> CommercialSemanticDependencyReport {
+    let owner_of = |va: u64| {
+        all_function_ranges
+            .iter()
+            .copied()
+            .find(|(start, end)| *start <= va && va < *end)
+    };
+    let block_counts: BTreeMap<u64, usize> = all_function_ranges
+        .iter()
+        .map(|&(start, end)| {
+            (
+                start,
+                blocks
+                    .iter()
+                    .filter(|block| start <= block.start_va && block.start_va < end)
+                    .count(),
+            )
+        })
+        .collect();
+
+    let mut raw_edges = BTreeSet::new();
+    let mut raw_unresolved = BTreeSet::new();
+    for block in blocks {
+        let Some((caller_start, _)) = owner_of(block.start_va) else {
+            continue;
+        };
+        for instruction in &block.instructions {
+            match instruction.flow_control() {
+                FlowControl::Call => {
+                    let target = instruction.near_branch_target();
+                    if let Some((callee_start, _)) = owner_of(target) {
+                        raw_edges.insert((
+                            caller_start,
+                            callee_start,
+                            instruction.ip(),
+                            target,
+                            target == callee_start,
+                        ));
+                    } else if blocks.iter().any(|candidate| candidate.start_va == target) {
+                        raw_unresolved.insert(CommercialUnresolvedCall {
+                            caller_start,
+                            call_site: instruction.ip(),
+                            code: instruction.code(),
+                            detail: "internal direct-call target has no .pdata function owner",
+                        });
+                    }
+                }
+                FlowControl::IndirectCall => {
+                    raw_unresolved.insert(CommercialUnresolvedCall {
+                        caller_start,
+                        call_site: instruction.ip(),
+                        code: instruction.code(),
+                        detail: "indirect call target/state dependency is not statically resolved",
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut adjacency: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for &(caller, callee, _, _, _) in &raw_edges {
+        adjacency.entry(caller).or_default().push(callee);
+    }
+    for next in adjacency.values_mut() {
+        next.sort_unstable();
+        next.dedup();
+    }
+
+    let mut root_starts: Vec<u64> = roots.iter().map(|range| range.0).collect();
+    root_starts.sort_unstable();
+    let mut distances = BTreeMap::new();
+    let mut queue = VecDeque::new();
+    for &root in &root_starts {
+        distances.insert(root, 0usize);
+        queue.push_back(root);
+    }
+    while let Some(caller) = queue.pop_front() {
+        let next_distance = distances[&caller] + 1;
+        for &callee in adjacency.get(&caller).into_iter().flatten() {
+            if let std::collections::btree_map::Entry::Vacant(slot) = distances.entry(callee) {
+                slot.insert(next_distance);
+                queue.push_back(callee);
+            }
+        }
+    }
+    let reachable: BTreeSet<u64> = distances.keys().copied().collect();
+    let edges: Vec<_> = raw_edges
+        .into_iter()
+        .filter(|(caller, callee, _, _, _)| {
+            reachable.contains(caller) && reachable.contains(callee)
+        })
+        .map(
+            |(caller_start, callee_start, call_site, target, target_is_entry)| {
+                CommercialDependencyEdge {
+                    caller_start,
+                    callee_start,
+                    call_site,
+                    target,
+                    target_is_entry,
+                    root_distance: distances[&callee_start],
+                }
+            },
+        )
+        .collect();
+    let unresolved_calls = raw_unresolved
+        .into_iter()
+        .filter(|call| reachable.contains(&call.caller_start))
+        .collect::<Vec<_>>();
+
+    let mut reachable_adjacency: BTreeMap<u64, Vec<u64>> =
+        reachable.iter().map(|&node| (node, Vec::new())).collect();
+    let mut reverse = reachable_adjacency.clone();
+    for edge in &edges {
+        reachable_adjacency
+            .entry(edge.caller_start)
+            .or_default()
+            .push(edge.callee_start);
+        reverse
+            .entry(edge.callee_start)
+            .or_default()
+            .push(edge.caller_start);
+    }
+    for next in reachable_adjacency.values_mut().chain(reverse.values_mut()) {
+        next.sort_unstable();
+        next.dedup();
+    }
+
+    let mut order = Vec::new();
+    let mut visited = HashSet::new();
+    for &node in &reachable {
+        dependency_dfs_order(node, &reachable_adjacency, &mut visited, &mut order);
+    }
+    visited.clear();
+    let mut components = Vec::new();
+    for &node in order.iter().rev() {
+        let mut functions = Vec::new();
+        dependency_dfs_collect(node, &reverse, &mut visited, &mut functions);
+        if functions.is_empty() {
+            continue;
+        }
+        functions.sort_unstable();
+        let members: HashSet<u64> = functions.iter().copied().collect();
+        components.push(CommercialDependencyScc {
+            blocks: functions
+                .iter()
+                .map(|start| block_counts.get(start).copied().unwrap_or(0))
+                .sum(),
+            root_functions: functions
+                .iter()
+                .filter(|start| root_starts.binary_search(start).is_ok())
+                .count(),
+            internal_edges: edges
+                .iter()
+                .filter(|edge| {
+                    members.contains(&edge.caller_start) && members.contains(&edge.callee_start)
+                })
+                .count(),
+            outgoing_edges: edges
+                .iter()
+                .filter(|edge| {
+                    members.contains(&edge.caller_start) && !members.contains(&edge.callee_start)
+                })
+                .count(),
+            functions,
+        });
+    }
+    components.sort_by_key(|component| component.functions[0]);
+
+    let root_set: HashSet<u64> = root_starts.iter().copied().collect();
+    CommercialSemanticDependencyReport {
+        roots: root_starts,
+        reachable_functions: reachable.len(),
+        reachable_blocks: reachable
+            .iter()
+            .map(|start| block_counts.get(start).copied().unwrap_or(0))
+            .sum(),
+        closure_functions: reachable
+            .iter()
+            .filter(|start| !root_set.contains(start))
+            .count(),
+        closure_blocks: reachable
+            .iter()
+            .filter(|start| !root_set.contains(start))
+            .map(|start| block_counts.get(start).copied().unwrap_or(0))
+            .sum(),
+        max_root_distance: distances.values().copied().max().unwrap_or(0),
+        edges,
+        unresolved_calls,
+        sccs: components,
+    }
+}
 
 fn emit_lifetime_toggle(
     lifter: &mut RiscLifter,
@@ -89,9 +616,28 @@ fn emit_lifetime_sync(lifter: &mut RiscLifter, index: usize, acquire: bool) {
 /// ISA(opcode 집합)에는 그런 op 가 없다. 그대로 두면 `PolymorphicEncoder::encode`가
 /// `opcode mapping missing` 오류를 내므로, 인코딩 불가 op 를 포함한 함수는 네이티브로
 /// 유지한다 (절반 lift 금지 — RISC-unliftable 과 동일한 전량-거부 규칙).
-fn block_poly_liftable(real: &[Instruction]) -> bool {
+fn first_poly_blocker(
+    real: &[Instruction],
+) -> Option<(CommercialExclusionReason, CommercialFirstBlocker)> {
     let mut lifter = RiscLifter::new();
     for i in real {
+        // INT3 is representable as a VM Trap, but this corpus uses long INT3
+        // runs as linker padding between functions. CFG/function discovery has
+        // not yet proven those bytes are live code. Treating every padding run
+        // as an owned function made control flow enter the trap path and broke
+        // differential execution. Keep it outside VM ownership until M1
+        // boundary analysis proves reachability.
+        if i.code() == Code::Int3 {
+            return Some((
+                CommercialExclusionReason::AmbiguousFunctionBoundary,
+                CommercialFirstBlocker {
+                    rva: i.ip(),
+                    code: i.code(),
+                    detail: "INT3 is VM-liftable but belongs to an unproven code/padding boundary"
+                        .to_string(),
+                },
+            ));
+        }
         // Legacy high-byte registers alias bits 8..15 of RAX..RBX.  The RISC
         // reference lifter preserves their value and flags, but that aliasing
         // contract is not yet certified across every commercial native handler
@@ -103,20 +649,46 @@ fn block_poly_liftable(real: &[Instruction]) -> bool {
                 Register::AH | Register::BH | Register::CH | Register::DH
             )
         }) {
-            return false;
+            return Some((
+                CommercialExclusionReason::LegacyHighByteRegister,
+                CommercialFirstBlocker {
+                    rva: i.ip(),
+                    code: i.code(),
+                    detail: "legacy high-byte register alias is not certified across commercial handlers"
+                        .to_string(),
+                },
+            ));
         }
         let before = lifter.desynth.instrs.len();
-        if lifter.lift_instruction(i).is_err() {
-            return false;
+        if let Err(err) = lifter.lift_instruction(i) {
+            return Some((
+                CommercialExclusionReason::UnsupportedInstruction,
+                CommercialFirstBlocker {
+                    rva: i.ip(),
+                    code: i.code(),
+                    detail: err.to_string(),
+                },
+            ));
         }
-        if lifter.desynth.instrs[before..]
+        if let Some(op) = lifter.desynth.instrs[before..]
             .iter()
-            .any(|op| !VirtualIsaSpec::is_encodable(op.op))
+            .find(|op| !VirtualIsaSpec::is_encodable(op.op))
         {
-            return false;
+            return Some((
+                CommercialExclusionReason::UnsupportedVmOpcode,
+                CommercialFirstBlocker {
+                    rva: i.ip(),
+                    code: i.code(),
+                    detail: format!("commercial ISA cannot encode {:?}", op.op),
+                },
+            ));
         }
     }
-    true
+    None
+}
+
+fn block_poly_liftable(real: &[Instruction]) -> bool {
+    first_poly_blocker(real).is_none()
 }
 
 /// F1: 네이티브 유지(제외) 함수 중 **FP 리턴** 함수를 감지 — VA → (4=f32, 8=f64).
@@ -235,6 +807,18 @@ pub struct ProgramLiftCommercial {
     pub lifted_ops: usize,
     /// RISC 리프터가 처리 못 하는 명령 진단 (실패 지점 노출).
     pub unsupported: Vec<(String, Code)>,
+    /// Structured evidence produced from the same failed lift occurrences as
+    /// `unsupported`. This is the authoritative source for reports and metrics.
+    pub unsupported_report: UnsupportedInstructionReport,
+    /// Typed, deterministic explanation of every commercial ownership exclusion.
+    pub exclusion_report: CommercialExclusionReport,
+    /// Authoritative per-original-function ownership artifact. This is built
+    /// from the exact exclusion set used by lowering, rather than re-inferred
+    /// later from the output PE.
+    pub ownership_report: Vec<FunctionOwnershipDiagnostic>,
+    /// Direct-call reachability, SCC, and unresolved ABI/state-edge evidence
+    /// behind `semantic-dependency-closure`.
+    pub semantic_dependency_report: CommercialSemanticDependencyReport,
 }
 
 impl ProgramLiftCommercial {
@@ -361,6 +945,10 @@ pub fn lift_program_cfg_commercial(
             sensitive_regions: 0,
             lifted_ops: 0,
             unsupported: Vec::new(),
+            unsupported_report: UnsupportedInstructionReport::new(),
+            exclusion_report: CommercialExclusionReport::default(),
+            ownership_report: Vec::new(),
+            semantic_dependency_report: CommercialSemanticDependencyReport::default(),
         });
     }
 
@@ -394,13 +982,11 @@ pub fn lift_program_cfg_commercial(
     // non-local-jump boundary was historically applied.  Static MSVC
     // setjmp/longjmp signatures do not need PE imports, so enforce that policy
     // here as well.
-    excl.func_ranges.extend(detect_setjmp_longjmp_functions(
-        &[],
-        text_bytes,
-        base_va,
-        image_base,
-        relayed_sections,
-    ));
+    let mut setjmp_func_ranges =
+        detect_setjmp_longjmp_functions(&[], text_bytes, base_va, image_base, relayed_sections);
+    setjmp_func_ranges.sort_by_key(|range| range.0);
+    setjmp_func_ranges.dedup();
+    excl.func_ranges.extend(setjmp_func_ranges.iter().copied());
     excl.func_ranges.sort_by_key(|range| range.0);
     excl.func_ranges.dedup();
     let mut excluded_blocks: HashSet<u64> = blocks
@@ -427,10 +1013,13 @@ pub fn lift_program_cfg_commercial(
     // native function body without its prologue/ABI state.  Track the complete
     // native-function set independently from the SEH policy so every later
     // bridge and return-value decision sees the same ownership boundary.
-    let all_function_ranges: Vec<(u64, u64)> = parse_pdata_functions(relayed_sections, image_base)
-        .into_iter()
-        .map(|(start, end, _)| (start, end))
-        .collect();
+    let mut all_function_ranges: Vec<(u64, u64)> =
+        parse_pdata_functions(relayed_sections, image_base)
+            .into_iter()
+            .map(|(start, end, _)| (start, end))
+            .collect();
+    all_function_ranges.sort_by_key(|range| (range.0, range.1));
+    all_function_ranges.dedup();
     let mut native_function_ranges = excl.func_ranges.clone();
 
     // A function that uses a legacy high-byte register is kept native together
@@ -447,17 +1036,16 @@ pub fn lift_program_cfg_commercial(
             )
         })
     };
-    let mut semantic_quarantine: HashSet<(u64, u64)> = all_function_ranges
+    let semantic_quarantine_roots: HashSet<(u64, u64)> = all_function_ranges
         .iter()
         .copied()
         .filter(|(s, e)| {
             blocks.iter().any(|bb| {
-                *s <= bb.start_va
-                    && bb.start_va < *e
-                    && bb.instructions.iter().any(has_high_byte)
+                *s <= bb.start_va && bb.start_va < *e && bb.instructions.iter().any(has_high_byte)
             })
         })
         .collect();
+    let mut semantic_quarantine = semantic_quarantine_roots.clone();
     loop {
         let mut discovered = Vec::new();
         for &(s, e) in &semantic_quarantine {
@@ -484,6 +1072,35 @@ pub fn lift_program_cfg_commercial(
         }
         semantic_quarantine.extend(discovered);
     }
+    let semantic_dependency_report =
+        build_semantic_dependency_report(&all_function_ranges, &blocks, &semantic_quarantine_roots);
+    debug_assert_eq!(
+        semantic_dependency_report.reachable_functions,
+        semantic_quarantine.len(),
+        "semantic dependency report must describe the exact closure used for ownership"
+    );
+    let interior_edges = semantic_dependency_report
+        .edges
+        .iter()
+        .filter(|edge| !edge.target_is_entry)
+        .count();
+    let cyclic_sccs = semantic_dependency_report
+        .sccs
+        .iter()
+        .filter(|scc| scc.functions.len() > 1 || scc.internal_edges > 0)
+        .count();
+    println!(
+        "[+] --vm-commercial semantic dependency evidence: roots={} closure={} function(s)/{} block(s), edges={}, max-depth={}, SCCs={} (cyclic={}), interior-targets={}, unresolved-calls={}",
+        semantic_dependency_report.roots.len(),
+        semantic_dependency_report.closure_functions,
+        semantic_dependency_report.closure_blocks,
+        semantic_dependency_report.edges.len(),
+        semantic_dependency_report.max_root_distance,
+        semantic_dependency_report.sccs.len(),
+        cyclic_sccs,
+        interior_edges,
+        semantic_dependency_report.unresolved_calls.len(),
+    );
     for range in &semantic_quarantine {
         if !native_function_ranges.contains(range) {
             native_function_ranges.push(*range);
@@ -532,9 +1149,9 @@ pub fn lift_program_cfg_commercial(
         })
         .collect();
     let mut integration_quarantine_blocks = HashSet::new();
-    for range in quarantine_ranges {
-        if !native_function_ranges.contains(&range) {
-            native_function_ranges.push(range);
+    for range in &quarantine_ranges {
+        if !native_function_ranges.contains(range) {
+            native_function_ranges.push(*range);
         }
         for bb in &blocks {
             if range.0 <= bb.start_va && bb.start_va < range.1 {
@@ -592,16 +1209,6 @@ pub fn lift_program_cfg_commercial(
             break;
         }
     }
-    println!(
-        "[+] --vm-commercial ownership exclusions: total={} SEH/panic={} integration-quarantine={} other/function-atomic={}",
-        excluded_blocks.len(),
-        seh_policy_blocks.len(),
-        integration_quarantine_blocks.len(),
-        excluded_blocks
-            .len()
-            .saturating_sub(seh_policy_blocks.union(&integration_quarantine_blocks).count())
-    );
-
     // OEP-force (lift_program_cfg와 동일): entry 블록이 RISC로 온전히 lift되고
     // 폴리 인코딩 가능하면 OEP를 VM에 포함해 entry_native=false를 만든다.
     // 아니면 네이티브 OEP 유지.
@@ -632,6 +1239,183 @@ pub fn lift_program_cfg_commercial(
                 "[!] --vm-commercial: OEP function is not fully RISC-liftable -- keeping entry_native=true (native OEP)"
             );
         }
+    }
+
+    // M0-1/M3: preserve the root cause before function atomicity turns one
+    // failing block into a whole-function native decision.  Every excluded
+    // block is assigned exactly once, and both function and summary order are
+    // address/reason stable rather than HashSet traversal dependent.
+    let mut exclusion_functions = Vec::new();
+    let mut attributed_blocks = HashSet::new();
+    for &(function_start, function_end) in &all_function_ranges {
+        let function_blocks: Vec<_> = blocks
+            .iter()
+            .filter(|bb| function_start <= bb.start_va && bb.start_va < function_end)
+            .collect();
+        let excluded_in_function: Vec<_> = function_blocks
+            .iter()
+            .copied()
+            .filter(|bb| {
+                excluded_blocks.contains(&bb.start_va) && !attributed_blocks.contains(&bb.start_va)
+            })
+            .collect();
+        if excluded_in_function.is_empty() {
+            continue;
+        }
+        attributed_blocks.extend(excluded_in_function.iter().map(|bb| bb.start_va));
+
+        let (reason, first_blocker, direct_failure_blocks) = if seh_func_ranges
+            .contains(&(function_start, function_end))
+        {
+            (CommercialExclusionReason::SehOrPanicPolicy, None, 0)
+        } else if setjmp_func_ranges.contains(&(function_start, function_end)) {
+            (CommercialExclusionReason::SetjmpLongjmpPolicy, None, 0)
+        } else if semantic_quarantine_roots.contains(&(function_start, function_end)) {
+            let mut failures: Vec<_> = function_blocks
+                    .iter()
+                    .flat_map(|bb| bb.instructions.iter())
+                    .filter(|instruction| has_high_byte(instruction))
+                    .map(|instruction| CommercialFirstBlocker {
+                        rva: instruction.ip(),
+                        code: instruction.code(),
+                        detail: "legacy high-byte register alias is not certified across commercial handlers"
+                            .to_string(),
+                    })
+                    .collect();
+            failures.sort_by_key(|failure| failure.rva);
+            let direct = function_blocks
+                .iter()
+                .filter(|bb| bb.instructions.iter().any(has_high_byte))
+                .count();
+            (
+                CommercialExclusionReason::LegacyHighByteRegister,
+                failures.into_iter().next(),
+                direct,
+            )
+        } else if semantic_quarantine.contains(&(function_start, function_end)) {
+            (
+                CommercialExclusionReason::SemanticDependencyClosure,
+                None,
+                0,
+            )
+        } else if quarantine_ranges.contains(&(function_start, function_end)) {
+            let mut failures: Vec<_> = function_blocks
+                .iter()
+                .flat_map(|bb| bb.instructions.iter())
+                .filter(|instruction| integration_sensitive(instruction))
+                .map(|instruction| CommercialFirstBlocker {
+                    rva: instruction.ip(),
+                    code: instruction.code(),
+                    detail: "instruction family selected by BTG_VM_INTEGRATION_QUARANTINE"
+                        .to_string(),
+                })
+                .collect();
+            failures.sort_by_key(|failure| failure.rva);
+            let direct = function_blocks
+                .iter()
+                .filter(|bb| bb.instructions.iter().any(integration_sensitive))
+                .count();
+            (
+                CommercialExclusionReason::IntegrationQuarantine,
+                failures.into_iter().next(),
+                direct,
+            )
+        } else {
+            let mut failures = Vec::new();
+            let mut direct = 0usize;
+            for bb in &function_blocks {
+                let real: Vec<_> = bb
+                    .instructions
+                    .iter()
+                    .copied()
+                    .filter(|instruction| !is_zero_padding(instruction))
+                    .collect();
+                if let Some(failure) = first_poly_blocker(&real) {
+                    direct += 1;
+                    failures.push(failure);
+                }
+            }
+            failures.sort_by_key(|(_, failure)| failure.rva);
+            if let Some((reason, blocker)) = failures.into_iter().next() {
+                (reason, Some(blocker), direct)
+            } else {
+                (CommercialExclusionReason::AnalysisFailure, None, 0)
+            }
+        };
+
+        let excluded_count = excluded_in_function.len();
+        let function_atomic_blocks = match reason {
+            CommercialExclusionReason::LegacyHighByteRegister
+            | CommercialExclusionReason::SemanticDependencyClosure
+            | CommercialExclusionReason::IntegrationQuarantine
+            | CommercialExclusionReason::AmbiguousFunctionBoundary
+            | CommercialExclusionReason::UnsupportedInstruction
+            | CommercialExclusionReason::UnsupportedVmOpcode => {
+                excluded_count.saturating_sub(direct_failure_blocks)
+            }
+            _ => 0,
+        };
+        exclusion_functions.push(CommercialFunctionExclusion {
+            function_start,
+            function_end,
+            reason,
+            excluded_blocks: excluded_count,
+            function_atomic_blocks,
+            first_blocker,
+        });
+    }
+
+    // Leaf/unwind-less blocks have no .pdata interval.  Keep them visible as
+    // one-block synthetic functions so the report total still exactly matches
+    // the final exclusion set.
+    for bb in blocks.iter().filter(|bb| {
+        excluded_blocks.contains(&bb.start_va) && !attributed_blocks.contains(&bb.start_va)
+    }) {
+        let real: Vec<_> = bb
+            .instructions
+            .iter()
+            .copied()
+            .filter(|instruction| !is_zero_padding(instruction))
+            .collect();
+        let (reason, first_blocker) = first_poly_blocker(&real)
+            .map(|(reason, blocker)| (reason, Some(blocker)))
+            .unwrap_or((CommercialExclusionReason::AnalysisFailure, None));
+        let function_end = bb
+            .instructions
+            .last()
+            .map(|instruction| instruction.next_ip())
+            .unwrap_or(bb.start_va);
+        exclusion_functions.push(CommercialFunctionExclusion {
+            function_start: bb.start_va,
+            function_end,
+            reason,
+            excluded_blocks: 1,
+            function_atomic_blocks: 0,
+            first_blocker,
+        });
+    }
+    let exclusion_report = CommercialExclusionReport::from_functions(exclusion_functions);
+    let ownership_report = build_ownership_report(
+        &all_function_ranges,
+        &blocks,
+        &exclusion_report,
+        &semantic_dependency_report,
+        image_base,
+    )?;
+    debug_assert_eq!(exclusion_report.total_blocks, excluded_blocks.len());
+    println!(
+        "[+] --vm-commercial ownership exclusions: total={} typed-reasons={}",
+        exclusion_report.total_blocks,
+        exclusion_report.summary.len()
+    );
+    for row in &exclusion_report.summary {
+        println!(
+            "    - {}: {} block(s), {} function(s), {} function-atomic sibling block(s)",
+            row.reason.as_str(),
+            row.blocks,
+            row.functions,
+            row.function_atomic_blocks
+        );
     }
 
     // 2nd pass: 포함(비제외) 블록을 실제로 RISC lift해 프로그램 + ip_map 구성.
@@ -938,6 +1722,7 @@ pub fn lift_program_cfg_commercial(
     let seh_block = seh_policy_blocks;
     let mut risc_unliftable_blocks = 0usize;
     let mut unsupported = Vec::new();
+    let mut unsupported_report = UnsupportedInstructionReport::new();
     let mut unsupported_reasons: Vec<(u64, String)> = Vec::new();
     for bb in &blocks {
         if seh_block.contains(&bb.start_va) {
@@ -956,6 +1741,52 @@ pub fn lift_program_cfg_commercial(
                 failed = true;
                 unsupported.push((format!("0x{:X}", i.ip()), i.code()));
                 unsupported_reasons.push((i.ip(), err.to_string()));
+
+                let function_va = all_function_ranges
+                    .iter()
+                    .find(|(start, end)| *start <= i.ip() && i.ip() < *end)
+                    .map(|(start, _)| *start)
+                    // Unwind-less leaf functions have no .pdata interval. The
+                    // CFG block start is their stable synthetic function ID.
+                    .unwrap_or(bb.start_va);
+                let function_rva =
+                    u32::try_from(function_va.checked_sub(image_base).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unsupported function VA 0x{function_va:X} is below image base"
+                        )
+                    })?)?;
+                let instruction_rva =
+                    u32::try_from(i.ip().checked_sub(image_base).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unsupported instruction VA 0x{:X} is below image base",
+                            i.ip()
+                        )
+                    })?)?;
+                let text_offset =
+                    usize::try_from(i.ip().checked_sub(base_va).ok_or_else(|| {
+                        anyhow::anyhow!("unsupported instruction VA 0x{:X} is below .text", i.ip())
+                    })?)?;
+                let raw_len = i.len().min(MAX_X86_INSTRUCTION_BYTES);
+                let raw_end = text_offset.checked_add(raw_len).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unsupported instruction byte range overflow at 0x{:X}",
+                        i.ip()
+                    )
+                })?;
+                let raw_bytes = text_bytes.get(text_offset..raw_end).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unsupported instruction bytes at 0x{:X} exceed .text",
+                        i.ip()
+                    )
+                })?;
+                unsupported_report.record(UnsupportedInstruction::new(
+                    function_rva,
+                    instruction_rva,
+                    i,
+                    raw_bytes,
+                    UnsupportedStage::Lift,
+                    err.to_string(),
+                )?)?;
             }
         }
         if failed {
@@ -1217,12 +2048,147 @@ pub fn lift_program_cfg_commercial(
         sensitive_regions: marker_regions.len(),
         lifted_ops,
         unsupported,
+        unsupported_report,
+        exclusion_report,
+        ownership_report,
+        semantic_dependency_report,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exclusion_report_becomes_authoritative_ownership_with_dependency_evidence() {
+        let exclusions = CommercialExclusionReport::from_functions(vec![
+            CommercialFunctionExclusion {
+                function_start: 0x140002000,
+                function_end: 0x140002040,
+                reason: CommercialExclusionReason::LegacyHighByteRegister,
+                excluded_blocks: 1,
+                function_atomic_blocks: 0,
+                first_blocker: Some(CommercialFirstBlocker {
+                    rva: 0x140002010,
+                    code: Code::Syscall,
+                    detail: "root".into(),
+                }),
+            },
+            CommercialFunctionExclusion {
+                function_start: 0x140003000,
+                function_end: 0x140003040,
+                reason: CommercialExclusionReason::SemanticDependencyClosure,
+                excluded_blocks: 1,
+                function_atomic_blocks: 1,
+                first_blocker: None,
+            },
+        ]);
+        let dependencies = CommercialSemanticDependencyReport {
+            edges: vec![CommercialDependencyEdge {
+                caller_start: 0x140002000,
+                callee_start: 0x140003000,
+                call_site: 0x140002020,
+                target: 0x140003000,
+                target_is_entry: true,
+                root_distance: 1,
+            }],
+            ..Default::default()
+        };
+        let report = build_ownership_report(
+            &[
+                (0x140001000, 0x140001040),
+                (0x140002000, 0x140002040),
+                (0x140003000, 0x140003040),
+            ],
+            &[],
+            &exclusions,
+            &dependencies,
+            0x140000000,
+        )
+        .unwrap();
+
+        assert_eq!(report.len(), 3);
+        assert_eq!(report[0].reason, OwnershipReason::VmOwned);
+        assert_eq!(report[1].reason, OwnershipReason::LegacyHighByteRegister);
+        assert_eq!(
+            report[2].reason,
+            OwnershipReason::SemanticDependencyPropagation
+        );
+        assert_eq!(
+            report[2].first_blocker.as_ref().unwrap().caller_rvas,
+            vec![0x2000]
+        );
+    }
+
+    #[test]
+    fn exclusion_report_is_deterministic_and_counts_atomic_siblings() {
+        let report = CommercialExclusionReport::from_functions(vec![
+            CommercialFunctionExclusion {
+                function_start: 0x3000,
+                function_end: 0x3040,
+                reason: CommercialExclusionReason::UnsupportedInstruction,
+                excluded_blocks: 4,
+                function_atomic_blocks: 3,
+                first_blocker: Some(CommercialFirstBlocker {
+                    rva: 0x3010,
+                    code: Code::Syscall,
+                    detail: "unsupported".to_string(),
+                }),
+            },
+            CommercialFunctionExclusion {
+                function_start: 0x1000,
+                function_end: 0x1020,
+                reason: CommercialExclusionReason::SehOrPanicPolicy,
+                excluded_blocks: 2,
+                function_atomic_blocks: 0,
+                first_blocker: None,
+            },
+            CommercialFunctionExclusion {
+                function_start: 0x2000,
+                function_end: 0x2020,
+                reason: CommercialExclusionReason::UnsupportedInstruction,
+                excluded_blocks: 3,
+                function_atomic_blocks: 2,
+                first_blocker: Some(CommercialFirstBlocker {
+                    rva: 0x2008,
+                    code: Code::Syscall,
+                    detail: "unsupported".to_string(),
+                }),
+            },
+        ]);
+
+        assert_eq!(report.total_blocks, 9);
+        assert_eq!(report.functions[0].function_start, 0x1000);
+        assert_eq!(report.functions[1].function_start, 0x2000);
+        assert_eq!(report.functions[2].function_start, 0x3000);
+        assert_eq!(report.summary.len(), 2);
+        assert_eq!(report.summary[0].reason.as_str(), "seh-or-panic-policy");
+        assert_eq!(report.summary[0].blocks, 2);
+        assert_eq!(
+            report.summary[1],
+            CommercialExclusionSummary {
+                reason: CommercialExclusionReason::UnsupportedInstruction,
+                functions: 2,
+                blocks: 7,
+                function_atomic_blocks: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn first_poly_blocker_preserves_first_rva_opcode_and_typed_reason() {
+        use iced_x86::{Decoder, DecoderOptions};
+
+        let raw = [0x48, 0x31, 0xC0, 0x0F, 0x05, 0x0F, 0x05]; // xor rax,rax; syscall; syscall
+        let mut decoder = Decoder::with_ip(64, &raw, 0x140001000, DecoderOptions::NONE);
+        let instructions: Vec<_> = decoder.iter().collect();
+        let (reason, blocker) = first_poly_blocker(&instructions).expect("syscall must block");
+
+        assert_eq!(reason, CommercialExclusionReason::UnsupportedInstruction);
+        assert_eq!(blocker.rva, 0x140001003);
+        assert_eq!(blocker.code, Code::Syscall);
+        assert!(!blocker.detail.is_empty());
+    }
 
     #[test]
     fn lifetime_scope_emits_balanced_global_sync_ops() {
@@ -1293,6 +2259,32 @@ mod tests {
         assert!(
             !lift_com.unsupported.is_empty(),
             "unsupported diagnostics should list syscall"
+        );
+        assert_eq!(
+            lift_com.unsupported_report.occurrence_count(),
+            lift_com.unsupported.len() as u64
+        );
+        let unsupported_csv = lift_com.unsupported_report.render_csv();
+        assert!(unsupported_csv
+            .contains("0x00001013,0x00001013,0x0000000140001013,Syscall,,0F05,1,lift,"));
+        assert!(unsupported_csv.contains("unsupported opcode Syscall"));
+        let syscall_exclusion = lift_com
+            .exclusion_report
+            .functions
+            .iter()
+            .find(|item| {
+                item.first_blocker
+                    .as_ref()
+                    .is_some_and(|b| b.code == Code::Syscall)
+            })
+            .expect("typed syscall exclusion");
+        assert_eq!(
+            syscall_exclusion.reason,
+            CommercialExclusionReason::UnsupportedInstruction
+        );
+        assert_eq!(
+            syscall_exclusion.first_blocker.as_ref().unwrap().rva,
+            base_va + 19
         );
     }
 

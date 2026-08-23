@@ -48,6 +48,166 @@ fn test_polymorphic_encoder_and_interpreter_roundtrip() {
     assert_eq!(interp.regs[1], 450);
 }
 
+#[test]
+fn typed_indirect_transfers_resolve_only_through_ip_map() {
+    for op in [RiscOp::VirtualIndirectCall, RiscOp::VirtualIndirectJump] {
+        let seed = 0x71CE_D1EC_7000_0000 ^ (op == RiscOp::VirtualIndirectJump) as u64;
+        let target_va = 0x1400_0020_00;
+        let program = RiscProgram::new(vec![
+            MicroInstr::new(op).with_src1(MicroOperand::VReg(0)),
+            MicroInstr::new(RiscOp::Mov)
+                .with_dst(MicroOperand::VReg(1))
+                .with_src1(MicroOperand::Imm64(0xBAD)),
+            MicroInstr::new(RiscOp::Mov)
+                .with_dst(MicroOperand::VReg(1))
+                .with_src1(MicroOperand::Imm64(0x2A)),
+            MicroInstr::new(RiscOp::Halt),
+        ]);
+        let bytecode = PolymorphicEncoder::new(seed).encode(&program).unwrap();
+        let mut routes = HashMap::new();
+        routes.insert(target_va, 2);
+        let mut interp = PolymorphicInterpreter::new(seed).with_ip_map(routes);
+        interp.regs[0] = target_va;
+        interp.run(&bytecode).unwrap();
+        assert_eq!(interp.regs[1], 0x2A, "{op:?} did not take proven route");
+    }
+}
+
+#[test]
+fn typed_indirect_route_miss_is_fail_closed() {
+    let seed = 0xFA11_C105_ED00_0001;
+    let program = RiscProgram::new(vec![
+        MicroInstr::new(RiscOp::VirtualIndirectJump).with_src1(MicroOperand::Imm64(1)),
+        MicroInstr::new(RiscOp::Mov)
+            .with_dst(MicroOperand::VReg(1))
+            .with_src1(MicroOperand::Imm64(0xBAD)),
+        MicroInstr::new(RiscOp::Halt),
+    ]);
+    let bytecode = PolymorphicEncoder::new(seed).encode(&program).unwrap();
+    let mut interp = PolymorphicInterpreter::new(seed);
+    let error = interp.run(&bytecode).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<crate::vm::poly::GuestFault>(),
+        Some(&crate::vm::poly::GuestFault::RouteMiss {
+            vip: 0,
+            op: "VirtualIndirectJump".into(),
+            target: 1,
+        })
+    );
+    assert_eq!(interp.regs[1], 0, "route miss executed fallthrough");
+}
+
+#[test]
+fn malformed_opcode_and_condition_are_typed_guest_faults() {
+    let seed = 0xFA17_0000_0000_0001;
+    let spec = crate::vm::poly::VirtualIsaSpec::from_seed(seed);
+    let invalid_op = (0u8..=u8::MAX)
+        .find(|byte| !spec.reverse_opcode_map.contains_key(byte))
+        .unwrap();
+    let mut rolling = crate::vm::poly::RollingKeyEngine::new(seed);
+    let bytes = [rolling.encrypt_byte(invalid_op, 0)];
+    let error = PolymorphicInterpreter::new(seed).run(&bytes).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<crate::vm::poly::GuestFault>(),
+        Some(&crate::vm::poly::GuestFault::UnknownOpcode {
+            vip: 0,
+            byte: invalid_op,
+        })
+    );
+
+    let branch = RiscOp::VirtualBranch {
+        cond: crate::vm::risc::BranchCondition::Always,
+    };
+    let raw_op = spec.opcode_for(branch).unwrap();
+    let invalid_cond = (0u8..=u8::MAX)
+        .find(|byte| spec.decode_cond(*byte).is_none())
+        .unwrap();
+    let mut rolling = crate::vm::poly::RollingKeyEngine::new(seed);
+    let bytes = [
+        rolling.encrypt_byte(raw_op, 0),
+        rolling.encrypt_byte(invalid_cond, 1),
+    ];
+    let error = PolymorphicInterpreter::new(seed).run(&bytes).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<crate::vm::poly::GuestFault>(),
+        Some(crate::vm::poly::GuestFault::UnknownCondition { vip: 0, byte, .. })
+            if *byte == invalid_cond
+    ));
+}
+
+#[test]
+fn trap_and_divide_errors_are_typed_guest_faults() {
+    let seed = 0xFA17_0000_0000_0002;
+    let trap = RiscProgram::new(vec![MicroInstr::new(RiscOp::Trap)]);
+    let bytes = PolymorphicEncoder::new(seed).encode(&trap).unwrap();
+    let error = PolymorphicInterpreter::new(seed).run(&bytes).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<crate::vm::poly::GuestFault>(),
+        Some(&crate::vm::poly::GuestFault::Trap {
+            vip: 0,
+            op: "Trap".into(),
+        })
+    );
+
+    let divide = RiscProgram::new(vec![MicroInstr::new(RiscOp::Divide {
+        signed: false,
+        width: 8,
+    })
+    .with_dst(MicroOperand::VReg(0))
+    .with_src1(MicroOperand::Imm64(0))]);
+    let bytes = PolymorphicEncoder::new(seed).encode(&divide).unwrap();
+    let error = PolymorphicInterpreter::new(seed).run(&bytes).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<crate::vm::poly::GuestFault>(),
+        Some(crate::vm::poly::GuestFault::DivideByZero { vip: 0, .. })
+    ));
+
+    let overflow = RiscProgram::new(vec![MicroInstr::new(RiscOp::Divide {
+        signed: false,
+        width: 1,
+    })
+    .with_dst(MicroOperand::VReg(0))
+    .with_src1(MicroOperand::Imm64(1))]);
+    let bytes = PolymorphicEncoder::new(seed).encode(&overflow).unwrap();
+    let mut interp = PolymorphicInterpreter::new(seed);
+    interp.regs[0] = 0x100;
+    let error = interp.run(&bytes).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<crate::vm::poly::GuestFault>(),
+        Some(crate::vm::poly::GuestFault::DivideOverflow { vip: 0, .. })
+    ));
+}
+
+#[test]
+fn typed_indirect_call_returns_via_source_ip_route() {
+    let seed = 0xCA11_5EED_1A57_0001;
+    let callee_va = 0x1400_0030_00;
+    let return_va = 0x1400_0010_05;
+    let program = RiscProgram::new(vec![
+        MicroInstr::new(RiscOp::VirtualBranch {
+            cond: crate::vm::risc::BranchCondition::Always,
+        })
+        .with_imm(3),
+        MicroInstr::new(RiscOp::Mov)
+            .with_dst(MicroOperand::VReg(1))
+            .with_src1(MicroOperand::Imm64(0x11)),
+        MicroInstr::new(RiscOp::VirtualRet),
+        MicroInstr::new(RiscOp::VirtualPush).with_src1(MicroOperand::Imm64(return_va)),
+        MicroInstr::new(RiscOp::VirtualIndirectCall).with_src1(MicroOperand::Imm64(callee_va)),
+        MicroInstr::new(RiscOp::Mov)
+            .with_dst(MicroOperand::VReg(2))
+            .with_src1(MicroOperand::Imm64(0x22)),
+        MicroInstr::new(RiscOp::Halt),
+    ]);
+    let bytecode = PolymorphicEncoder::new(seed).encode(&program).unwrap();
+    let mut routes = HashMap::new();
+    routes.insert(callee_va, 1);
+    routes.insert(return_va, 5);
+    let mut interp = PolymorphicInterpreter::new(seed).with_ip_map(routes);
+    interp.run(&bytecode).unwrap();
+    assert_eq!((interp.regs[1], interp.regs[2]), (0x11, 0x22));
+}
+
 /// T1-4 차등 검증: 인터프리터(폴리모픽) == 참조 시뮬레이터(eval_state).
 /// 두 구현이 같은 프로그램에 대해 동일한 레지스터/스택/플래그 상태를 내야 한다.
 #[test]

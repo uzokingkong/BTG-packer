@@ -12,6 +12,7 @@ use super::desynth::RiscDesynthesizer;
 use super::opcodes::{BranchCondition, MicroInstr, MicroOperand, RiscOp};
 use anyhow::{anyhow, Result};
 use iced_x86::{Code, Instruction, OpKind, Register};
+use std::fmt;
 
 mod arith;
 mod sse;
@@ -105,6 +106,44 @@ enum FPArith {
 pub struct RiscLifter {
     pub desynth: RiscDesynthesizer,
 }
+
+/// Structured diagnostic returned when an x86 instruction cannot be lifted.
+///
+/// `lift_instruction()` cannot recover the original encoded bytes from an
+/// iced-x86 `Instruction`, so `raw_bytes` is optional. Call
+/// `lift_instruction_with_bytes()` at decoder boundaries that still own the
+/// input slice to retain them in the diagnostic.
+#[derive(Debug)]
+pub struct RiscLiftError {
+    pub ip: u64,
+    pub raw_bytes: Option<Vec<u8>>,
+    pub code: Code,
+    pub operands: String,
+    pub reason: String,
+}
+
+impl fmt::Display for RiscLiftError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let bytes = self
+            .raw_bytes
+            .as_deref()
+            .map(|bytes| {
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_else(|| "<unavailable>".to_string());
+        write!(
+            f,
+            "risc lift failed at ip=0x{:016X}, bytes=[{}], code={:?}, operands=\"{}\": {}",
+            self.ip, bytes, self.code, self.operands, self.reason
+        )
+    }
+}
+
+impl std::error::Error for RiscLiftError {}
 
 /// SETcc 16 鈺곌퀗援???BranchCondition.
 fn cond_for_setcc(code: Code) -> Option<BranchCondition> {
@@ -448,7 +487,42 @@ impl RiscLifter {
     /// ADD/SUB/XOR/AND/OR ???????쎄숲夷뚳쭖遺얇걟??猷뱀ケ????깅염?怨쀬쁽 ?⑤벏??筌ｌ꼶??
     /// op0揶쎛 筌롫뗀?덄뵳???read-modify-write, op0揶쎛 ?????쎄숲筌?op1(筌롫뗀?덄뵳?揶쎛?????酉釉??
 
+    /// Lift an instruction while preserving its guest location and decoded
+    /// shape in every error. Encoded bytes are unavailable at this API layer;
+    /// decoder callers should prefer `lift_instruction_with_bytes`.
     pub fn lift_instruction(&mut self, inst: &Instruction) -> Result<()> {
+        self.lift_instruction_diagnostic(inst, None)
+    }
+
+    /// Lift an instruction and attach the exact encoded bytes to any error.
+    /// This keeps the existing `anyhow::Result` API while making the underlying
+    /// `RiscLiftError` available through `Error::downcast_ref`.
+    pub fn lift_instruction_with_bytes(
+        &mut self,
+        inst: &Instruction,
+        raw_bytes: &[u8],
+    ) -> Result<()> {
+        self.lift_instruction_diagnostic(inst, Some(raw_bytes))
+    }
+
+    fn lift_instruction_diagnostic(
+        &mut self,
+        inst: &Instruction,
+        raw_bytes: Option<&[u8]>,
+    ) -> Result<()> {
+        self.lift_instruction_inner(inst).map_err(|error| {
+            RiscLiftError {
+                ip: inst.ip(),
+                raw_bytes: raw_bytes.map(<[u8]>::to_vec),
+                code: inst.code(),
+                operands: inst.to_string(),
+                reason: format!("{error:#}"),
+            }
+            .into()
+        })
+    }
+
+    fn lift_instruction_inner(&mut self, inst: &Instruction) -> Result<()> {
         let code = inst.code();
 
         match code {
@@ -456,8 +530,9 @@ impl RiscLifter {
             // 커버리지를 높이고(코드베이스 NOP/멀티바이트 NOP 다수) 실행 의미도
             // 그대로다. (Pause는 스핀 루프 힌트일 뿐 단일 스레드 의미론 무연산.)
             Code::Nopw | Code::Nopd | Code::Nop_rm16 | Code::Nop_rm32 | Code::Nop_rm64 | Code::Pause => {}
-            Code::Ud2 => self.desynth.instrs.push(MicroInstr::new(RiscOp::Trap)),
-            Code::Int_imm8 => self.desynth.instrs.push(MicroInstr::new(RiscOp::Trap)),
+            Code::Int3 | Code::Ud2 | Code::Int_imm8 => {
+                self.desynth.instrs.push(MicroInstr::new(RiscOp::Trap))
+            }
             Code::Cpuid => self.desynth.instrs.push(MicroInstr::new(RiscOp::CpuId)),
             Code::Xgetbv => self.desynth.instrs.push(MicroInstr::new(RiscOp::XGetBv)),
             // ???? MOV ?④쑴肉?????????????????????????????????????????????????????????????????????????????????????????????????????????????????
@@ -813,10 +888,7 @@ impl RiscLifter {
                 self.desynth.emit_push(MicroOperand::Imm64(ret_ip));
                 let target = self.operand_value(inst, 0)?; // ?????쎄숲 ?癒?뮉 筌롫뗀?덄뵳?揶?
                 self.desynth.instrs.push(
-                    MicroInstr::new(RiscOp::VirtualBranch {
-                        cond: BranchCondition::Always,
-                    })
-                    .with_src1(target),
+                    MicroInstr::new(RiscOp::VirtualIndirectCall).with_src1(target),
                 );
             }
 
@@ -833,10 +905,7 @@ impl RiscLifter {
             Code::Jmp_rm64 | Code::Jmp_rm32 => {
                 let target = self.operand_value(inst, 0)?;
                 self.desynth.instrs.push(
-                    MicroInstr::new(RiscOp::VirtualBranch {
-                        cond: BranchCondition::Always,
-                    })
-                    .with_src1(target),
+                    MicroInstr::new(RiscOp::VirtualIndirectJump).with_src1(target),
                 );
             }
             Code::Je_rel32_64 | Code::Je_rel8_64 => {

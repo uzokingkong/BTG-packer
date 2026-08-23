@@ -1,5 +1,10 @@
 use crate::vm::risc::RiscOp;
 use anyhow::{anyhow, Result};
+use std::collections::BTreeSet;
+
+/// Hard ceiling keeps generated route scans and code size bounded even when
+/// upstream analysis is malformed or attacker-controlled.
+pub const MAX_NATIVE_CROSS_FAMILY_ROUTES: usize = 4096;
 
 /// Build-time description of an unresolved branch that must enter another
 /// independently built commercial VM module instead of native code.
@@ -11,6 +16,34 @@ pub struct NativeCrossFamilyRoute {
     pub target_byte_offset: u64,
     pub target_layout: crate::vm::threaded::VmRuntimeLayout,
     pub tail_jump_resume_offset: Option<u64>,
+}
+
+pub(crate) fn validate_native_cross_family_routes(routes: &[NativeCrossFamilyRoute]) -> Result<()> {
+    if routes.len() > MAX_NATIVE_CROSS_FAMILY_ROUTES {
+        return Err(anyhow!(
+            "commercial VM cross-family route limit exceeded: {} > {}",
+            routes.len(),
+            MAX_NATIVE_CROSS_FAMILY_ROUTES
+        ));
+    }
+    let mut targets = BTreeSet::new();
+    for (index, route) in routes.iter().enumerate() {
+        if route.target_va == 0 || route.target_entry_va == 0 || route.target_state_va == 0 {
+            return Err(anyhow!(
+                "commercial VM cross-family route {index} has a null address"
+            ));
+        }
+        if !targets.insert(route.target_va) {
+            return Err(anyhow!(
+                "commercial VM duplicate cross-family target {:#x}",
+                route.target_va
+            ));
+        }
+        route.target_layout.validate().map_err(|error| {
+            anyhow!("commercial VM cross-family route {index} has invalid state layout: {error}")
+        })?;
+    }
+    Ok(())
 }
 
 /// P2 (G3): 폭별 ALU 네이티브 핸들러 종류 (Add/SubWithBorrow/Inc/Dec/Not).
@@ -180,5 +213,38 @@ impl SelfDecodingParts {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod route_validation_tests {
+    use super::*;
+
+    fn route(target_va: u64) -> NativeCrossFamilyRoute {
+        NativeCrossFamilyRoute {
+            target_va,
+            target_entry_va: 0x2000,
+            target_state_va: 0x3000,
+            target_byte_offset: 0,
+            target_layout: crate::vm::threaded::VmRuntimeLayout::legacy(),
+            tail_jump_resume_offset: None,
+        }
+    }
+
+    #[test]
+    fn duplicate_runtime_target_is_rejected_before_codegen() {
+        let routes = [route(0x1000), route(0x1000)];
+        assert!(validate_native_cross_family_routes(&routes)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate cross-family target"));
+    }
+
+    #[test]
+    fn null_runtime_destination_is_rejected_before_codegen() {
+        assert!(validate_native_cross_family_routes(&[route(0)])
+            .unwrap_err()
+            .to_string()
+            .contains("null address"));
     }
 }

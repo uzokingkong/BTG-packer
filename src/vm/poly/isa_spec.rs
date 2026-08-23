@@ -272,6 +272,12 @@ impl VirtualIsaSpec {
         ops.push(RiscOp::VirtualBranch {
             cond: BranchCondition::Always,
         });
+        // Typed runtime-computed control flow has its own opcode identity.  It
+        // uses the ordinary src1 operand record; resolution is deliberately a
+        // runtime concern and never falls back to treating the value as an
+        // instruction index.
+        ops.push(RiscOp::VirtualIndirectCall);
+        ops.push(RiscOp::VirtualIndirectJump);
         ops.push(RiscOp::NativeCallBridge);
         ops.push(RiscOp::SetFlag);
         ops.push(RiscOp::Halt);

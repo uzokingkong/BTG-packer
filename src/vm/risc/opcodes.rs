@@ -51,6 +51,15 @@ pub enum RiscOp {
         cond: BranchCondition,
     },
 
+    /// Runtime-computed CALL target. `src1` carries the original target VA/RVA.
+    /// Unlike `VirtualBranch`, execution must resolve the target through the
+    /// program route (`ip_map`); an unknown target is not an instruction index.
+    VirtualIndirectCall,
+
+    /// Runtime-computed JMP target. `src1` carries the original target VA/RVA.
+    /// Resolution is fail-closed through the program route (`ip_map`).
+    VirtualIndirectJump,
+
     /// 네이티브 API 및 런타임 콜 브릿지
     NativeCallBridge,
 

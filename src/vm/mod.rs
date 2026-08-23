@@ -45,6 +45,8 @@ pub mod ownership_verifier;
 pub mod poly;
 pub mod prga;
 pub mod risc;
+pub mod route_metadata;
+pub mod route_table;
 pub mod seed_lifecycle;
 pub mod semantic_obf;
 pub mod semantics;

@@ -356,3 +356,100 @@ fn vtable_indirect_dispatch_at_boundary() {
         "callee B add is carry-free"
     );
 }
+
+// =============================================================================
+// Legacy high-byte register certification (AH/BH/CH/DH).
+// =============================================================================
+
+#[test]
+fn legacy_high_byte_alias_matrix_preserves_parent_and_flags() {
+    use crate::vm::risc::LegacyHighByte;
+
+    let parents = [
+        0,
+        u64::MAX,
+        0x0123_4567_89ab_cdef,
+        0xfedc_ba98_7654_3210,
+        0x00ff_00ff_00ff_00ff,
+    ];
+    let original_flags = 0x8d5u64;
+
+    for alias in LegacyHighByte::ALL {
+        for parent in parents {
+            for value in 0u8..=u8::MAX {
+                let expected = (parent & !0xff00) | ((value as u64) << 8);
+                let written = alias.write_parent(parent, value);
+                assert_eq!(written, expected, "{alias:?} write mismatch");
+                assert_eq!(alias.read_parent(written), value, "{alias:?} read mismatch");
+                assert_eq!(
+                    written & !0xff00,
+                    parent & !0xff00,
+                    "{alias:?} modified one of the upper/lower 56 non-alias bits"
+                );
+
+                let mut regs = [0xaaaa_5555_aaaa_5555; 16];
+                regs[alias.parent_vreg()] = parent;
+                let flags = original_flags;
+                alias.write_register(&mut regs, value);
+                assert_eq!(regs[alias.parent_vreg()], expected);
+                assert_eq!(alias.read_register(&regs), value);
+                assert_eq!(flags, original_flags, "alias helper must not alter flags");
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_high_byte_parent_mapping_matches_x86_aliases() {
+    use crate::vm::risc::LegacyHighByte;
+    use iced_x86::Register;
+
+    let expected = [
+        (LegacyHighByte::Ah, Register::AH, 0usize),
+        (LegacyHighByte::Ch, Register::CH, 1usize),
+        (LegacyHighByte::Dh, Register::DH, 2usize),
+        (LegacyHighByte::Bh, Register::BH, 3usize),
+    ];
+    for (alias, register, parent) in expected {
+        assert_eq!(LegacyHighByte::from_register(register), Some(alias));
+        assert_eq!(alias.register(), register);
+        assert_eq!(alias.parent_vreg(), parent);
+    }
+    assert_eq!(LegacyHighByte::from_register(Register::AL), None);
+    assert_eq!(LegacyHighByte::from_register(Register::SPL), None);
+}
+
+#[test]
+fn legacy_high_byte_certificate_enforces_rex_rule() {
+    use crate::vm::risc::{
+        certify_high_byte_instruction, has_rex_prefix, HighByteCertificationError, LegacyHighByte,
+    };
+    use iced_x86::{Code, Instruction, Register};
+
+    let instruction = Instruction::with2(Code::Mov_rm8_r8, Register::AH, Register::BL).unwrap();
+    let certificate = certify_high_byte_instruction(&instruction, &[0x88, 0xdc])
+        .unwrap()
+        .expect("AH instruction must produce a certificate");
+    assert!(certificate.is_certified());
+    assert_eq!(certificate.aliases, vec![LegacyHighByte::Ah]);
+    assert!(certificate.flags_preserved);
+    assert!(certificate.upper_56_bits_preserved);
+    assert!(certificate.rex_prefix_absent);
+
+    assert!(has_rex_prefix(&[0x66, 0x67, 0x48, 0x89, 0xc0]));
+    assert!(!has_rex_prefix(&[0x66, 0x88, 0xdc]));
+    assert_eq!(
+        certify_high_byte_instruction(&instruction, &[0x40, 0x88, 0xdc]),
+        Err(HighByteCertificationError::RexPrefixWithLegacyHighByte)
+    );
+    assert_eq!(
+        certify_high_byte_instruction(&instruction, &[]),
+        Err(HighByteCertificationError::MissingOriginalEncoding)
+    );
+
+    let no_alias = Instruction::with2(Code::Mov_rm8_r8, Register::AL, Register::BL).unwrap();
+    assert_eq!(
+        certify_high_byte_instruction(&no_alias, &[0x88, 0xd8]).unwrap(),
+        None
+    );
+}

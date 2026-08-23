@@ -52,7 +52,7 @@ impl Default for RequestedConfig {
         Self {
             seed: None,
             obf_level: 2,
-            crypto_mode: CryptoMode::C1,
+            crypto_mode: CryptoMode::ChaCha20,
             custom_cipher: false,
             anti_debug: false,
             iat_hide: false,

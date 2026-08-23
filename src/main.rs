@@ -48,6 +48,12 @@ fn main() -> error::Result<()> {
     }
     let cfg = &profile.config;
 
+    if args.strict_profile && args.allow_partial_vm {
+        return Err(error::BtgError::Anyhow(anyhow::anyhow!(
+            "--allow-partial-vm cannot be combined with --strict-profile"
+        )));
+    }
+
     // 하드 에러 (정책 위반 → 조기 종료) — resolve 가 수집한 내용을 Err 로 승격.
     for e in &profile.errors {
         return Err(error::BtgError::Anyhow(anyhow::anyhow!("{}", e.message())));
@@ -592,13 +598,23 @@ fn main() -> error::Result<()> {
 
     // ── Build: PE 합성 + 파일 기록 ───────────────────────────────────────────────
     let output_path = args.output;
-    let output_pe_bytes = pipeline::build::run(&ctx, Some(&output_path))?;
+    // Build in memory first. A strict-profile artifact is not committed to its
+    // final path until both structural and effective-capability checks pass.
+    let output_pe_bytes = pipeline::build::run(&ctx, None)?;
 
     // ── v4: 섹션별 엔트로피 리포트 (탐지 도구의 엔트로피 지표 확인용) ─────────────
     btg_packer::analysis::entropy::print_entropy_report(&output_pe_bytes);
 
     // ── v5: 자체검증 — 출력 PE를 다시 파싱해 구조적 불변식 검증 ──────────────────
     pipeline::validate::run(&ctx, &output_pe_bytes)?;
+    let effective_profile =
+        pipeline::validate::validate_effective_profile(&ctx, cfg, &output_pe_bytes)?;
+    if args.strict_profile {
+        effective_profile.ensure_strict()?;
+    } else if cfg.vm_commercial && !args.allow_partial_vm {
+        effective_profile.ensure_vm_full_coverage()?;
+    }
+    std::fs::write(&output_path, &output_pe_bytes)?;
     let verification_report = if args.verify_output {
         match btg_packer::differential::verify_equivalent(
             &input_path,
@@ -627,6 +643,13 @@ fn main() -> error::Result<()> {
     } else {
         None
     };
+    let evidence = pipeline::reports::EvidenceReportBundle::render(&ctx.unsupported_instructions);
+    let evidence_artifacts = evidence.artifacts_for(&output_path);
+    pipeline::reports::write_evidence_artifacts(&evidence_artifacts)?;
+    println!(
+        "[+] unsupported-instruction evidence written: {}",
+        evidence_artifacts[0].path.display()
+    );
     // WS2.1: emit the function-ownership ↔ .pdata mapping CSV on program-VM paths.
     if let Some(own_csv) = pipeline::validate::ownership_csv(&ctx, &output_pe_bytes)? {
         let mut own_path = output_path.clone();
@@ -700,13 +723,14 @@ fn main() -> error::Result<()> {
                         btg_packer::crypto::CryptoMode::ChaCha20 => "chacha20",
                     },
                     ctx.at_rest_encrypted,
-                    !ctx.at_rest_encrypted,
+                    effective_profile.aslr_preserved,
                     integrity,
                     args.crypto_coverage,
                     anti_debug_policy.as_str(),
                     &wx_contract,
                 )
                 .with_execution_verification(args.verify_output, verification_report.as_ref())
+                .with_effective_profile(&effective_profile)
                 .with_vm_ownership(
                     ctx.vm_coverage.as_ref(),
                     ctx.vm_prog_rva,
@@ -715,7 +739,24 @@ fn main() -> error::Result<()> {
                     ctx.vm_prog_bytecode_rva,
                     ctx.vm_prog_bytecode_len,
                     ctx.vm_prog_runtime_cipher_hash.as_deref(),
-                );
+                )
+                .with_vm_original_metrics(if let Some(coverage) = ctx.vm_coverage.as_ref() {
+                    btg_packer::manifest::VmOriginalMetrics {
+                        vm_original_functions: Some(coverage.total_functions as u64),
+                        vm_original_blocks: Some(coverage.total_blocks as u64),
+                        vm_original_instructions: Some(coverage.total_instructions as u64),
+                        native_original_functions: Some(
+                            coverage
+                                .total_functions
+                                .saturating_sub(coverage.vm_functions)
+                                as u64,
+                        ),
+                        original_text_exec_bytes: effective_profile.original_text_exec_bytes,
+                        unresolved_edges: coverage.unresolved_internal_edges,
+                    }
+                } else {
+                    btg_packer::manifest::VmOriginalMetrics::default()
+                });
         println!("[+] Build manifest (P3-2):");
         for line in manifest.render().lines() {
             println!("      {}", line);

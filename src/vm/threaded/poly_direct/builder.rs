@@ -1,5 +1,7 @@
 use crate::vm::poly::{PolymorphicDecoder, PolymorphicEncoder, VirtualIsaSpec};
-use crate::vm::risc::{BranchCondition, MicroInstr, MicroOperand, RiscOp, RiscProgram};
+use crate::vm::risc::{
+    assert_commercial_capabilities, BranchCondition, MicroInstr, MicroOperand, RiscOp, RiscProgram,
+};
 use crate::vm::table_layout::TableLayout;
 use crate::vm::threaded::{AssignedSuperOp, SuperOpBuildMetadata, VmRuntimeLayout};
 use anyhow::{anyhow, Result};
@@ -323,6 +325,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
     // translator. Keep the legacy contract until the embed/bridge initializers
     // consume the same layout value, then production can switch to `from_seed`.
     runtime_layout.validate()?;
+    validate_native_cross_family_routes(cross_family_routes)?;
     let _runtime_layout_guard = install_runtime_layout(&runtime_layout);
     let spec = VirtualIsaSpec::from_seed_and_family(seed, family);
     let init_key = seed.wrapping_mul(C1) ^ 0x517CC1B727220A95;
@@ -390,6 +393,9 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         }
         (prog, op_offsets)
     };
+    // The native builder is a separate trust boundary: reject decoded or
+    // metadata-provided streams unless every production execution stage agrees.
+    assert_commercial_capabilities(&prog.instrs)?;
     for (i, &off) in op_offsets.iter().enumerate() {
         if off >= bytecode.len() {
             return Err(anyhow!(
@@ -2626,6 +2632,100 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             }
         }
     }
+
+    // Typed indirect transfers are deliberately separate from VirtualBranch.
+    // VirtualBranch retains its legacy VM->native bridge for statically lifted
+    // direct calls, whereas a runtime-computed target is allowed to land only
+    // on an entry proven by ip_map and consequently present in branch_map.
+    // A miss executes UD2 instead of interpreting attacker-controlled input as
+    // a native function pointer.
+    let mut emit_indirect_transfer = |b: &mut CodeBuilder| -> usize {
+        let handler = b.len();
+        b.call(sub_dec_ops);
+
+        // src1 is the runtime target VA/RVA.
+        movzx8_m(b, Register::EAX, DEC_SRC1);
+        mov_m(b, Register::R11, DEC_IMM1);
+        b.call(sub_resolve);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+
+        // Resolve exclusively through the immutable branch map.
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::R15).unwrap());
+        b.push(
+            Instruction::with2(
+                Code::Add_rm64_imm32,
+                Register::RBX,
+                layout.branch_map_off as i32,
+            )
+            .unwrap(),
+        );
+        b.push(
+            Instruction::with2(
+                Code::Mov_r32_rm32,
+                Register::ECX,
+                MemoryOperand::with_base(Register::RBX),
+            )
+            .unwrap(),
+        );
+        b.push(Instruction::with2(Code::Test_rm64_r64, Register::RCX, Register::RCX).unwrap());
+        let miss_tag = b.len() + 0x1000_0000;
+        b.br(Code::Je_rel32_64, miss_tag);
+        b.push(
+            Instruction::with2(
+                Code::Lea_r64_m,
+                Register::R11,
+                MemoryOperand::with_base_displ_size(Register::RBX, 4, 8),
+            )
+            .unwrap(),
+        );
+        let scan_top = b.len();
+        b.push(
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base(Register::R11),
+            )
+            .unwrap(),
+        );
+        movi(b, Register::R9, branch_target_key);
+        b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R9).unwrap());
+        b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::RAX, Register::R10).unwrap());
+        let found_tag = miss_tag + 1;
+        b.br(Code::Je_rel32_64, found_tag);
+        b.push(Instruction::with2(Code::Add_rm64_imm32, Register::R11, 16).unwrap());
+        b.push(Instruction::with1(Code::Dec_rm64, Register::RCX).unwrap());
+        b.push(Instruction::with2(Code::Test_rm64_r64, Register::RCX, Register::RCX).unwrap());
+        b.jne(scan_top);
+
+        let miss = b.len();
+        b.push(Instruction::with(Code::Ud2));
+        let found = b.len();
+        b.push(
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RBX,
+                MemoryOperand::with_base_displ_size(Register::R11, 8, 8),
+            )
+            .unwrap(),
+        );
+        movi(b, Register::R9, branch_offset_key);
+        b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RBX, Register::R9).unwrap());
+        b.call(sub_resync);
+        b.jmp(dispatch);
+        for (_, target) in &mut b.branches {
+            if *target == miss_tag {
+                *target = miss;
+            } else if *target == found_tag {
+                *target = found;
+            }
+        }
+        handler
+    };
+    // The lifter represents CALL as VirtualPush(ret_ip) followed by the typed
+    // transfer, so both handlers perform lookup/transfer only. VirtualRet pops
+    // the already-pushed continuation.
+    let h_indirect_call = emit_indirect_transfer(&mut b);
+    let h_indirect_jump = emit_indirect_transfer(&mut b);
 
     let h_halt = b.len();
     {
@@ -5749,6 +5849,8 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             },
             h_branch,
         );
+        h.insert(RiscOp::VirtualIndirectCall, h_indirect_call);
+        h.insert(RiscOp::VirtualIndirectJump, h_indirect_jump);
         h.insert(RiscOp::VirtualRet, h_ret);
         for (si, signed) in [false, true].iter().enumerate() {
             for (wi, w) in [1u8, 2, 4, 8].iter().enumerate() {

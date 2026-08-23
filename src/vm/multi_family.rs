@@ -1,6 +1,8 @@
 use crate::vm::poly::{FamilyOpPartition, ProductionFamilyPlan, VmArchitectureFamily};
 use crate::vm::risc::{BranchCondition, MicroOperand, RiscOp, RiscProgram};
-use std::collections::HashMap;
+use crate::vm::route_table::{GatewayKind, MaterializedRouteTable, OriginalTargetRva};
+use crate::vm::threaded::{poly_direct::NativeCrossFamilyRoute, VmRuntimeLayout};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct EncodedFamilyPartition {
@@ -32,6 +34,133 @@ pub struct CrossFamilyRouteRecord {
 pub struct MaterializedMultiFamilyProgram {
     pub modules: Vec<EncodedFamilyPartition>,
     pub route_table: Vec<CrossFamilyRouteRecord>,
+}
+
+/// Final generated addresses for one independently emitted family module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeneratedFamilyGateway {
+    pub family: VmArchitectureFamily,
+    pub entry_va: u64,
+    pub state_va: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalRouteMaterializationError {
+    DuplicateModuleFamily(VmArchitectureFamily),
+    DuplicateGatewayFamily(VmArchitectureFamily),
+    DuplicateOriginalTarget(OriginalTargetRva),
+    MissingModule(VmArchitectureFamily),
+    MissingGateway(VmArchitectureFamily),
+    NullGateway(VmArchitectureFamily),
+    InvalidGatewayKind {
+        rva: OriginalTargetRva,
+        kind: GatewayKind,
+    },
+    SameFamilyRoute {
+        rva: OriginalTargetRva,
+        family: VmArchitectureFamily,
+    },
+    EntryVipOutOfRange {
+        rva: OriginalTargetRva,
+        family: VmArchitectureFamily,
+        entry_vip: u64,
+    },
+}
+
+impl std::fmt::Display for CanonicalRouteMaterializationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "canonical cross-family route rejected: {self:?}")
+    }
+}
+
+impl std::error::Error for CanonicalRouteMaterializationError {}
+
+impl MaterializedMultiFamilyProgram {
+    /// Converts the authoritative RVA routes into native generated-code
+    /// descriptors. No address or family is inferred when its generated
+    /// destination is absent.
+    pub fn materialize_canonical_native_routes(
+        &self,
+        source_family: VmArchitectureFamily,
+        routes: &MaterializedRouteTable,
+        gateways: &[GeneratedFamilyGateway],
+        tail_jump_resume_offset: Option<u64>,
+    ) -> Result<Vec<NativeCrossFamilyRoute>, CanonicalRouteMaterializationError> {
+        let mut modules = HashMap::new();
+        for module in &self.modules {
+            if modules.insert(module.family, module).is_some() {
+                return Err(CanonicalRouteMaterializationError::DuplicateModuleFamily(
+                    module.family,
+                ));
+            }
+        }
+        if !modules.contains_key(&source_family) {
+            return Err(CanonicalRouteMaterializationError::MissingModule(
+                source_family,
+            ));
+        }
+        let mut destinations = HashMap::new();
+        for gateway in gateways {
+            if destinations.insert(gateway.family, *gateway).is_some() {
+                return Err(CanonicalRouteMaterializationError::DuplicateGatewayFamily(
+                    gateway.family,
+                ));
+            }
+            if gateway.entry_va == 0 || gateway.state_va == 0 {
+                return Err(CanonicalRouteMaterializationError::NullGateway(
+                    gateway.family,
+                ));
+            }
+        }
+
+        let mut seen_targets = HashSet::new();
+        let mut native = Vec::new();
+        for &(rva, route) in routes.entries() {
+            if !seen_targets.insert(rva) {
+                // MaterializedRouteTable normally guarantees this; retain the
+                // check at the generated-code trust boundary.
+                return Err(CanonicalRouteMaterializationError::DuplicateOriginalTarget(
+                    rva,
+                ));
+            }
+            if route.gateway != GatewayKind::CrossFamily {
+                return Err(CanonicalRouteMaterializationError::InvalidGatewayKind {
+                    rva,
+                    kind: route.gateway,
+                });
+            }
+            if route.family == source_family {
+                return Err(CanonicalRouteMaterializationError::SameFamilyRoute {
+                    rva,
+                    family: route.family,
+                });
+            }
+            let module = modules.get(&route.family).copied().ok_or(
+                CanonicalRouteMaterializationError::MissingModule(route.family),
+            )?;
+            let destination = destinations.get(&route.family).copied().ok_or(
+                CanonicalRouteMaterializationError::MissingGateway(route.family),
+            )?;
+            let local_op = usize::try_from(route.entry_vip.0).ok();
+            let byte_offset = local_op
+                .and_then(|index| module.instruction_offsets.get(index))
+                .copied()
+                .ok_or(CanonicalRouteMaterializationError::EntryVipOutOfRange {
+                    rva,
+                    family: route.family,
+                    entry_vip: route.entry_vip.0,
+                })?;
+            native.push(NativeCrossFamilyRoute {
+                target_va: u64::from(rva.0),
+                target_entry_va: destination.entry_va,
+                target_state_va: destination.state_va,
+                target_byte_offset: byte_offset as u64,
+                target_layout: VmRuntimeLayout::from_seed(module.module_domain),
+                tail_jump_resume_offset,
+            });
+        }
+        Ok(native)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,8 +379,10 @@ fn family_domain(family: VmArchitectureFamily) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::program_model::FunctionId;
     use crate::vm::poly::FunctionOpRange;
     use crate::vm::risc::{MicroInstr, MicroOperand};
+    use crate::vm::route_table::{EntryVip, FunctionRoute};
 
     #[test]
     fn splits_program_and_classifies_cross_family_call() {
@@ -301,5 +432,124 @@ mod tests {
             materialized.modules[0].module_domain,
             materialized.modules[1].module_domain
         );
+    }
+
+    fn encoded_module(family: VmArchitectureFamily, domain: u64) -> EncodedFamilyPartition {
+        EncodedFamilyPartition {
+            family,
+            bytecode: vec![0; 16],
+            instruction_offsets: vec![0, 7, 12],
+            ip_map: HashMap::new(),
+            module_domain: domain,
+            exit_byte_offset: 12,
+        }
+    }
+
+    fn canonical_routes(entries: Vec<(u32, VmArchitectureFamily, u64)>) -> MaterializedRouteTable {
+        MaterializedRouteTable::from_sorted_entries(
+            entries
+                .into_iter()
+                .enumerate()
+                .map(|(index, (rva, family, vip))| {
+                    (
+                        OriginalTargetRva(rva),
+                        FunctionRoute {
+                            function_id: FunctionId(index as u32 + 1),
+                            family,
+                            entry_vip: EntryVip(vip),
+                            gateway: GatewayKind::CrossFamily,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn canonical_routes_resolve_to_generated_family_gateway_and_local_offset() {
+        let program = MaterializedMultiFamilyProgram {
+            modules: vec![
+                encoded_module(VmArchitectureFamily::Stack, 11),
+                encoded_module(VmArchitectureFamily::Register, 22),
+            ],
+            route_table: Vec::new(),
+        };
+        let routes = canonical_routes(vec![(0x2000, VmArchitectureFamily::Register, 1)]);
+        let native = program
+            .materialize_canonical_native_routes(
+                VmArchitectureFamily::Stack,
+                &routes,
+                &[GeneratedFamilyGateway {
+                    family: VmArchitectureFamily::Register,
+                    entry_va: 0x5000,
+                    state_va: 0x9000,
+                }],
+                Some(12),
+            )
+            .unwrap();
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].target_va, 0x2000);
+        assert_eq!(native[0].target_entry_va, 0x5000);
+        assert_eq!(native[0].target_state_va, 0x9000);
+        assert_eq!(native[0].target_byte_offset, 7);
+        assert_eq!(native[0].tail_jump_resume_offset, Some(12));
+        assert_eq!(native[0].target_layout, VmRuntimeLayout::from_seed(22));
+    }
+
+    #[test]
+    fn canonical_route_materialization_fails_closed_on_missing_or_duplicate_data() {
+        let program = MaterializedMultiFamilyProgram {
+            modules: vec![
+                encoded_module(VmArchitectureFamily::Stack, 11),
+                encoded_module(VmArchitectureFamily::Register, 22),
+            ],
+            route_table: Vec::new(),
+        };
+        let routes = canonical_routes(vec![(0x2000, VmArchitectureFamily::Register, 3)]);
+        assert!(matches!(
+            program.materialize_canonical_native_routes(
+                VmArchitectureFamily::Stack,
+                &routes,
+                &[],
+                None,
+            ),
+            Err(CanonicalRouteMaterializationError::MissingGateway(
+                VmArchitectureFamily::Register
+            ))
+        ));
+        let gateways = [
+            GeneratedFamilyGateway {
+                family: VmArchitectureFamily::Register,
+                entry_va: 1,
+                state_va: 2,
+            },
+            GeneratedFamilyGateway {
+                family: VmArchitectureFamily::Register,
+                entry_va: 3,
+                state_va: 4,
+            },
+        ];
+        assert!(matches!(
+            program.materialize_canonical_native_routes(
+                VmArchitectureFamily::Stack,
+                &routes,
+                &gateways,
+                None,
+            ),
+            Err(CanonicalRouteMaterializationError::DuplicateGatewayFamily(
+                VmArchitectureFamily::Register
+            ))
+        ));
+
+        let valid_gateway = [gateways[0]];
+        assert!(matches!(
+            program.materialize_canonical_native_routes(
+                VmArchitectureFamily::Stack,
+                &routes,
+                &valid_gateway,
+                None,
+            ),
+            Err(CanonicalRouteMaterializationError::EntryVipOutOfRange { .. })
+        ));
     }
 }

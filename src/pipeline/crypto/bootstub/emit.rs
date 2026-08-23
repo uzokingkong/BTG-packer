@@ -32,79 +32,10 @@ pub(crate) fn emit_base_bind_loop(seq: &mut Vec<(Instruction, Option<Label>)>, s
         Instruction::with2(Code::Mov_r32_rm32, Register::R9D, Register::EDX).unwrap(),
         None,
     ));
-    // rax = PEB (gs:[0x60])
+    // Bind to the canonical preferred-base identity, not the randomized load
+    // address. Loader relocation must not change cryptographic key material.
     seq.push((
-        Instruction::with2(
-            Code::Mov_r64_rm64,
-            Register::RAX,
-            MemoryOperand::with_base_displ_bcst_seg(Register::None, 0x60, false, Register::GS),
-        )
-        .unwrap(),
-        None,
-    ));
-    // rax = PEB.ImageBaseAddress (offset 0x10)
-    seq.push((
-        Instruction::with2(
-            Code::Mov_r64_rm64,
-            Register::RAX,
-            M::with_base_displ(Register::RAX, 0x10),
-        )
-        .unwrap(),
-        None,
-    ));
-    // r8d = (base>>16) & 0xFF
-    seq.push((
-        Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 16).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(Code::Mov_r32_rm32, Register::R8D, Register::EDX).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(Code::And_rm32_imm32, Register::R8D, 0xFF).unwrap(),
-        None,
-    ));
-    // ecx = (base>>24) & 0xFF ; r8d ^= ecx
-    seq.push((
-        Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 24).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EDX).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(Code::Xor_rm32_r32, Register::R8D, Register::ECX).unwrap(),
-        None,
-    ));
-    // ecx = (base>>32) & 0xFF ; r8d ^= ecx  → r8b = bind byte
-    seq.push((
-        Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::RAX).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 32).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(Code::Mov_r32_rm32, Register::ECX, Register::EDX).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(Code::Xor_rm32_r32, Register::R8D, Register::ECX).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(Code::And_rm32_imm32, Register::R8D, 0xFF).unwrap(),
+        Instruction::with2(Code::Mov_r32_imm32, Register::R8D, 0).unwrap(),
         None,
     ));
     // compensated junk fold: bind ^= acc ^ acc == bind (net 0, but R8D now depends on the

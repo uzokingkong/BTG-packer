@@ -2134,6 +2134,54 @@ fn test_poly_direct_call_ret_roundtrip_matches_reference() {
     }
 }
 
+#[test]
+fn test_native_poly_direct_typed_indirect_call_and_jump_resolve_ip_map() {
+    let seed = 0x1D1E_C7CA_11A0_2026;
+    let call_target = 0x1400_0020_00u64;
+    let jump_target = 0x1400_0030_00u64;
+    let continuation = 0x1400_0010_00u64;
+    let instrs = vec![
+        // CALL lowering owns the continuation push. The typed handler must not
+        // push a second entry.
+        MicroInstr::new(RiscOp::VirtualPush).with_src1(MicroOperand::Imm64(continuation)),
+        MicroInstr::new(RiscOp::VirtualIndirectCall).with_src1(MicroOperand::Imm64(call_target)),
+        MicroInstr::new(RiscOp::Mov)
+            .with_dst(MicroOperand::VReg(1))
+            .with_src1(MicroOperand::Imm64(0x22)),
+        MicroInstr::new(RiscOp::VirtualIndirectJump).with_src1(MicroOperand::Imm64(jump_target)),
+        MicroInstr::new(RiscOp::Mov)
+            .with_dst(MicroOperand::VReg(2))
+            .with_src1(MicroOperand::Imm64(0xBAD)),
+        MicroInstr::new(RiscOp::Mov)
+            .with_dst(MicroOperand::VReg(0))
+            .with_src1(MicroOperand::Imm64(0x11)),
+        MicroInstr::new(RiscOp::VirtualRet),
+        MicroInstr::new(RiscOp::Mov)
+            .with_dst(MicroOperand::VReg(3))
+            .with_src1(MicroOperand::Imm64(0x33)),
+        MicroInstr::new(RiscOp::Halt),
+    ];
+    let ip_map = HashMap::from([
+        (continuation, 2usize),
+        (call_target, 5usize),
+        (jump_target, 7usize),
+    ]);
+    let bytecode = PolymorphicEncoder::new(seed)
+        .encode(&RiscProgram::with_ip_map(instrs, ip_map.clone()))
+        .unwrap();
+    let native = run_native_poly_direct_with(&bytecode, seed, &[0u64; 16], Some(&ip_map)).unwrap();
+
+    assert_eq!(native.regs[0], 0x11, "indirect callee executed");
+    assert_eq!(native.regs[1], 0x22, "call returned to its continuation");
+    assert_eq!(native.regs[2], 0, "indirect jump skipped fallthrough");
+    assert_eq!(native.regs[3], 0x33, "indirect jump reached mapped target");
+    assert_eq!(
+        native.vsp, 0,
+        "typed indirect call balanced its continuation"
+    );
+    assert!(native.stack.is_empty());
+}
+
 /// F1: 네이티브 브릿지(nf_real)가 Win64 FP ABI 를 실제로 구현하는지 검증한다.
 ///  - positional XMM0-3 미러링: FP 인자(regs[1]..=regs[4] = RCX/RDX/R8/R9)를
 ///    `movq xmmN, gpr` 로 전달한다 (Win64: i 번째 인자가 FP 이면 XMM[i-1]).
@@ -2450,17 +2498,6 @@ fn test_poly_direct_divide_matches_reference() {
             .with_src1(MicroOperand::VReg(5)),
         );
 
-        // div-by-zero: divisor 0 -> 0 (dst stays 0, regs[2]=0).
-
-        d.instrs.push(
-            MicroInstr::new(RiscOp::Divide {
-                signed: false,
-                width: 8,
-            })
-            .with_dst(MicroOperand::VReg(6))
-            .with_src1(MicroOperand::VReg(6)),
-        );
-
         d.instrs.push(MicroInstr::new(RiscOp::Halt));
 
         let prog = RiscProgram::new(d.instrs);
@@ -2510,22 +2547,7 @@ fn test_poly_direct_divide_matches_reference() {
             "seed {seed:#x}: IDIV w4 quotient wrong"
         );
 
-        // div-by-zero runs last and clears regs[2] (RDX) to 0.
-
-        assert_eq!(
-            native.regs[2], 0,
-            "seed {seed:#x}: IDIV w4 remainder lost / div-by-zero clears regs[2]"
-        );
-
-        assert_eq!(
-            native.regs[6], 0,
-            "seed {seed:#x}: div-by-zero must yield 0"
-        );
-
-        assert_eq!(
-            native.regs[2], 0,
-            "seed {seed:#x}: div-by-zero clears regs[2]"
-        );
+        assert_eq!(native.regs[2], 1, "seed {seed:#x}: IDIV w4 remainder lost");
     }
 }
 

@@ -287,6 +287,11 @@ impl NativeVmHarness {
         };
 
         match ins.op {
+            RiscOp::VirtualIndirectCall | RiscOp::VirtualIndirectJump => {
+                return Err(anyhow!(
+                    "typed virtual indirect control flow requires route-aware native lowering"
+                ));
+            }
             RiscOp::Nor => {
                 load(instrs, ins.src1, Register::R10)?;
                 load(instrs, ins.src2, Register::R11)?;

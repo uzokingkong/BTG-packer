@@ -895,11 +895,11 @@ fn test_integrity_stored_values_not_plain() {
         crc4_stored, crc,
         "crc4_stored must be whitened (rol(W32,13))"
     );
-    // derive_integrity_key adds a real base factor beyond the seed-only whiten.
-    assert_ne!(
+    // Load address must not alter integrity identity; ASLR rebases before boot.
+    assert_eq!(
         w32,
         super::integrity::derive_whiten_key(&seed),
-        "derive_integrity_key must fold the PEB base byte (multi-factor)"
+        "derive_integrity_key must remain stable across loader relocation"
     );
 }
 
@@ -916,10 +916,10 @@ fn test_crc4_stored_value_matches_native_r11d_rotate_width() {
     assert_ne!(expected, wrong_wide_result);
 }
 
-/// Runtime-derived whiten: deterministic per (seed, base), and base-sensitive --
-/// the expected value is a function of the load base the attacker must also match.
+/// Runtime-derived whiten is deterministic and independent of the randomized
+/// load address. Stable image/region identity supplies domain separation.
 #[test]
-fn test_integrity_derivation_deterministic_and_base_dependent() {
+fn test_integrity_derivation_deterministic_and_aslr_stable() {
     let seed: Vec<u8> = (0..256u32)
         .map(|i| (i.wrapping_mul(3) ^ 0xA7) as u8)
         .collect();
@@ -927,7 +927,7 @@ fn test_integrity_derivation_deterministic_and_base_dependent() {
         super::integrity::derive_integrity_key(&seed, 0x140000000),
         super::integrity::derive_integrity_key(&seed, 0x140000000)
     );
-    assert_ne!(
+    assert_eq!(
         super::integrity::derive_integrity_key(&seed, 0x140000000),
         super::integrity::derive_integrity_key(&seed, 0x150000000)
     );
