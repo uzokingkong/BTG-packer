@@ -483,18 +483,22 @@ impl RiscLifter {
             }
             Code::Mov_rm64_r64 | Code::Mov_rm32_r32 | Code::Mov_rm16_r16 | Code::Mov_rm8_r8 => {
                 let src_reg = inst.op1_register();
-                let src = if matches!(src_reg, Register::AH | Register::BH | Register::CH | Register::DH) {
-                    let base = match src_reg { Register::AH => 0, Register::CH => 1, Register::DH => 2, _ => 3 };
-                    let tmp = MicroOperand::Temp(6);
-                    self.desynth.instrs.push(MicroInstr::new(RiscOp::ShiftRight)
-                        .with_dst(tmp).with_src1(MicroOperand::VReg(base)).with_src2(MicroOperand::Imm64(8)));
-                    tmp
-                } else {
-                    Self::reg_to_vreg(src_reg).ok_or_else(|| anyhow!("invalid src"))?
-                };
+                let high_byte = matches!(src_reg, Register::AH | Register::BH | Register::CH | Register::DH);
                 if inst.op0_kind() == OpKind::Register {
                     let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
                     let mov_width = self.begin_mov_register_write(inst, dst);
+                    // Extracting AH/BH/CH/DH uses a RISC shift, which updates the
+                    // virtual flags.  Save the x86 flags before that internal
+                    // implementation detail so MOV remains flag-transparent.
+                    let src = if high_byte {
+                        let base = match src_reg { Register::AH => 0, Register::CH => 1, Register::DH => 2, _ => 3 };
+                        let tmp = MicroOperand::Temp(6);
+                        self.desynth.instrs.push(MicroInstr::new(RiscOp::ShiftRight)
+                            .with_dst(tmp).with_src1(MicroOperand::VReg(base)).with_src2(MicroOperand::Imm64(8)));
+                        tmp
+                    } else {
+                        Self::reg_to_vreg(src_reg).ok_or_else(|| anyhow!("invalid src"))?
+                    };
                     self.desynth.instrs.push(
                         MicroInstr::new(RiscOp::Mov).with_dst(dst).with_src1(src),
                     );
@@ -503,6 +507,15 @@ impl RiscLifter {
                     self.desynth.instrs.push(
                         MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::Temp(7)).with_src1(MicroOperand::Vflags),
                     );
+                    let src = if high_byte {
+                        let base = match src_reg { Register::AH => 0, Register::CH => 1, Register::DH => 2, _ => 3 };
+                        let tmp = MicroOperand::Temp(6);
+                        self.desynth.instrs.push(MicroInstr::new(RiscOp::ShiftRight)
+                            .with_dst(tmp).with_src1(MicroOperand::VReg(base)).with_src2(MicroOperand::Imm64(8)));
+                        tmp
+                    } else {
+                        Self::reg_to_vreg(src_reg).ok_or_else(|| anyhow!("invalid src"))?
+                    };
                     let t_addr = MicroOperand::Temp(4);
                     self.lower_effective_address(inst, t_addr)?;
                     self.desynth.instrs.push(

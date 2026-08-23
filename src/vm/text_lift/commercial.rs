@@ -92,6 +92,19 @@ fn emit_lifetime_sync(lifter: &mut RiscLifter, index: usize, acquire: bool) {
 fn block_poly_liftable(real: &[Instruction]) -> bool {
     let mut lifter = RiscLifter::new();
     for i in real {
+        // Legacy high-byte registers alias bits 8..15 of RAX..RBX.  The RISC
+        // reference lifter preserves their value and flags, but that aliasing
+        // contract is not yet certified across every commercial native handler
+        // family.  Keep the containing function native instead of silently
+        // changing crypto/checksum results (notably `mov [mem], bh`).
+        if (0..i.op_count()).any(|op| {
+            matches!(
+                i.op_register(op),
+                Register::AH | Register::BH | Register::CH | Register::DH
+            )
+        }) {
+            return false;
+        }
         let before = lifter.desynth.instrs.len();
         if lifter.lift_instruction(i).is_err() {
             return false;
@@ -419,6 +432,68 @@ pub fn lift_program_cfg_commercial(
         .map(|(start, end, _)| (start, end))
         .collect();
     let mut native_function_ranges = excl.func_ranges.clone();
+
+    // A function that uses a legacy high-byte register is kept native together
+    // with its direct-call dependency closure.  Mixing its native frame with
+    // commercial-VM crypto callees was observed to preserve process control
+    // flow while silently changing the computed digest.  Treat that connected
+    // calculation as one semantic ownership unit until every aliasing/call
+    // combination has a native-handler differential proof.
+    let has_high_byte = |i: &Instruction| {
+        (0..i.op_count()).any(|op| {
+            matches!(
+                i.op_register(op),
+                Register::AH | Register::BH | Register::CH | Register::DH
+            )
+        })
+    };
+    let mut semantic_quarantine: HashSet<(u64, u64)> = all_function_ranges
+        .iter()
+        .copied()
+        .filter(|(s, e)| {
+            blocks.iter().any(|bb| {
+                *s <= bb.start_va
+                    && bb.start_va < *e
+                    && bb.instructions.iter().any(has_high_byte)
+            })
+        })
+        .collect();
+    loop {
+        let mut discovered = Vec::new();
+        for &(s, e) in &semantic_quarantine {
+            for inst in blocks
+                .iter()
+                .filter(|bb| s <= bb.start_va && bb.start_va < e)
+                .flat_map(|bb| bb.instructions.iter())
+                .filter(|inst| inst.flow_control() == FlowControl::Call)
+            {
+                let target = inst.near_branch_target();
+                if let Some(range) = all_function_ranges
+                    .iter()
+                    .copied()
+                    .find(|(cs, ce)| *cs <= target && target < *ce)
+                {
+                    if !semantic_quarantine.contains(&range) {
+                        discovered.push(range);
+                    }
+                }
+            }
+        }
+        if discovered.is_empty() {
+            break;
+        }
+        semantic_quarantine.extend(discovered);
+    }
+    for range in &semantic_quarantine {
+        if !native_function_ranges.contains(range) {
+            native_function_ranges.push(*range);
+        }
+        for bb in &blocks {
+            if range.0 <= bb.start_va && bb.start_va < range.1 {
+                excluded_blocks.insert(bb.start_va);
+            }
+        }
+    }
 
     // SHLD and BT/BTR/BTS have passed family-isolated and combined whole-program
     // differential execution, so they are VM-owned by default.  Keep an opt-in

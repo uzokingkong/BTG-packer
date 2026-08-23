@@ -868,6 +868,19 @@ fn run_mem(raw: &[u8], ip: u64, init: [u64; 16], mem: HashMap<u64, u8>) -> RiscE
     lift(raw, ip).eval_state_with_mem(&init, mem)
 }
 
+#[test]
+fn test_lift_mov_mem_bh_preserves_flags() {
+    // cmp rax,rax; mov byte ptr [rsp+2Ah],bh; ret.  CMP establishes ZF,
+    // and the following MOV must not disturb it.
+    let raw = [0x48, 0x39, 0xc0, 0x88, 0x7c, 0x24, 0x2a, 0xc3];
+    let mut init = [0u64; 16];
+    init[3] = 0x1122_3344_5566_a5ff;
+    init[4] = 0x2000;
+    let st = lift(&raw, 0x140001000).eval_state_with_mem(&init, HashMap::new());
+    assert_eq!(st.mem.get(&0x202a), Some(&0xa5), "BH byte stored");
+    assert_ne!(st.flags & crate::vm::risc::flags::VFLAG_ZF, 0, "MOV must preserve ZF");
+}
+
 /// BlockEncoder 嚥?x86 筌뤿굝議??됰뗀以??獄쏅뗄??紐껋쨮 ?紐꾪맜??
 fn enc_block(insts: Vec<Instruction>) -> Vec<u8> {
     let blk = InstructionBlock::new(&insts, 0x140001000);
