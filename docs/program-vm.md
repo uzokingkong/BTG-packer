@@ -4,15 +4,15 @@
 
 BTG's Program-VM path virtualizes supported program semantics rather than mapping every original x86 instruction directly to one permanent VM opcode.
 
-```text
-x86-64
-  -> decode
-  -> RISC semantic IR
-  -> validation / transformation
-  -> VM-family representation
-  -> polymorphic ISA
-  -> rolling-key bytecode
-  -> native threaded execution
+```mermaid
+flowchart LR
+    A["x86-64"] --> B["Decode"]
+    B --> C["RISC Semantic IR"]
+    C --> D["Capability + Ownership Validation"]
+    D --> E["VM Family Planning"]
+    E --> F["Polymorphic ISA"]
+    F --> G["Rolling-Key Bytecode"]
+    G --> H["Generated Native Runtime"]
 ```
 
 The commercial path is enabled by the effective combination of `--vm`, `--vm-oep` and `--vm-commercial` with the crypto layer available.
@@ -91,6 +91,29 @@ The normal commercial contract is intentionally fail-closed. A generated VM modu
 
 The Program-VM contains architecture-family support rather than relying only on a single VM with shuffled opcode numbers. Family planning assigns stable function ownership to backend families, creates family-specific operation partitions and materializes cross-family routes.
 
+```mermaid
+flowchart TD
+    A["RISC Program"] --> B["Production Family Plan"]
+
+    B --> S["Stack family"]
+    B --> R["Register family"]
+    B --> M["MixedRisc family"]
+    B --> F["FusedCisc family"]
+
+    S --> C["Canonical Cross-Family State"]
+    R --> C
+    M --> C
+    F --> C
+
+    C --> RT["Generated Route Metadata"]
+    RT --> S
+    RT --> R
+    RT --> M
+    RT --> F
+
+    RT --> N["VM ↔ Native Bridge"]
+```
+
 The source-level architecture includes family planning/partition artifacts in `PipelineContext`:
 
 ```text
@@ -105,16 +128,10 @@ The purpose is to make family selection part of the VM ABI and execution plan, n
 
 Different VM families may use different private state layouts. Cross-family transfer therefore needs an interchange representation rather than allowing one family to assume another family's private register layout.
 
-Conceptually:
-
-```text
-Family A private state
-        |
-        v
-canonical register/flag state
-        |
-        v
-Family B private state
+```mermaid
+flowchart LR
+    A["Family A private state"] --> B["Canonical register + flag state"]
+    B --> C["Family B private state"]
 ```
 
 Generated route metadata records destinations needed for these transitions and is emitted separately from mutable VM state.
@@ -145,16 +162,17 @@ The table layout is itself seed-derived. The runtime and table builder share the
 
 ## Rolling-key runtime
 
-The commercial native runtime uses a self-decoding execution path. Conceptually each dispatch step:
+The commercial native runtime uses a self-decoding execution path.
 
-```text
-read encoded byte at VIP
-  -> derive current rolling-key byte
-  -> recover opcode/operand data
-  -> advance decode state
-  -> resolve generated handler metadata
-  -> execute semantic handler
-  -> continue dispatch
+```mermaid
+flowchart LR
+    A["Encoded byte @ VIP"] --> B["Rolling-key decode"]
+    B --> C["Recover opcode / operands"]
+    C --> D["Advance decode state"]
+    D --> E["Resolve handler metadata"]
+    E --> F["Execute semantic handler"]
+    F --> G["Next VIP / route"]
+    G --> A
 ```
 
 The embedded runtime initializes dedicated native registers for bytecode base, VIP, virtual stack, rolling-key state, handler-table base and VM state. Callee-saved registers used by the runtime are preserved around VM entry/exit.
@@ -178,6 +196,14 @@ Commercial Program-VM mode can use instruction-aligned bytecode chunks for M7 ru
 ## M8 concealment
 
 M8 is enabled only when VM support is effective. It is intended to conceal VM handler-table addressing using MBA-derived representation rather than leaving straightforward table addresses as the only lookup representation.
+
+## Planned BTG execution identity
+
+The existing code already has multi-family planning, canonical state exchange and generated routing. A planned experimental extension uses those pieces as the base for a graph-driven execution model where state-dependent trigger nodes participate in route/family selection.
+
+This is intentionally documented separately because it is a **design target, not a statement that the current production backend already executes this way**.
+
+See [Bidirectional Trigger Graph VM design](design/btg-trigger-graph.md).
 
 ## Diagnostics
 
