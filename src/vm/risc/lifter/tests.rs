@@ -4,8 +4,6 @@ use iced_x86::{BlockEncoder, BlockEncoderOptions, Instruction, InstructionBlock}
 use iced_x86::{Decoder, DecoderOptions};
 use std::collections::HashMap;
 
-/// 獄쏅뗄???甕곌쑵?곭몴??귐뗫늄??뉖릭?????뮞-IP ???紐껊쑔??筌띾벊??筌ｂ뫀????袁⑥쨮域밸챶???筌띾슢諭??
-/// (?브쑨由???繹먭퍔??eval_state??VIP ?紐껊쑔??살쨮 癰궰??묐릭疫??袁る맙.)
 fn lift(raw: &[u8], ip: u64) -> RiscProgram {
     let mut decoder = Decoder::with_ip(64, raw, ip, DecoderOptions::NONE);
     let mut lifter = RiscLifter::new();
@@ -175,13 +173,9 @@ fn test_lift_x86_to_risc_stream() {
     assert_eq!(out[3], 50); // rbx = 50
 }
 
-/// A: CALL ??RET ?類ｋ궗. call??癰귣벀? 雅뚯눘??next_ip)???紐꾨뻻??랁?callee嚥??브쑨由?
-/// callee ??쎈뻬 ??ret(Halt)揶쎛 癰귣벀? 雅뚯눘?쇘몴???쎄문????ｋ┸??
 #[test]
 fn test_lift_call_ret_roundtrip() {
     // 0x140001000: call 0x140001014  (E8 rel32)
-    // 0x140001005: mov rcx, 1        (fallthrough, 沃섎챷???
-    // 0x14000100C: mov rdx, 2        (沃섎챷???
     // 0x140001013: ret
     // 0x140001014: mov rbx, 7        (callee)
     // 0x14000101B: ret
@@ -194,7 +188,6 @@ fn test_lift_call_ret_roundtrip() {
         0xC3, // ret
     ];
     let st = run(&raw, 0x140001000, [0u64; 16]);
-    // callee ??쎈뻬
     assert_eq!(regs(&st)[3], 7, "rbx set in callee");
     // P0-1: callee 의 ret 가 호출자 next_ip(ip_map)로 **복귀**해 fallthrough 실행.
     assert_eq!(
@@ -211,12 +204,9 @@ fn test_lift_call_ret_roundtrip() {
     assert_eq!(st.stack.len(), 0, "return address popped by callee ret");
 }
 
-/// A(揶쏄쑴??: Call_rm64 ??push 癰귣벀? 雅뚯눘??+ 揶쏄쑴???브쑨由??????쎄숲 揶?.
 #[test]
 fn test_lift_call_indirect_register() {
-    // rax = callee 雅뚯눘?쇗에??λ뜃由??
     // 0x140001000: call rax   (FF D0)
-    // 0x140001002: mov rcx, 9  (沃섎챷???
     // 0x140001009: ret
     // 0x14000100A: mov rbx, 0x2A  (callee)
     // 0x140001011: ret
@@ -324,7 +314,6 @@ fn test_lift_cmp_then_jg() {
     assert_eq!(regs(&st2)[2], 0, "JG not-taken: rdx not reached");
 }
 
-/// D: 筌롫뗀?덄뵳???깅염?怨쀬쁽 ?怨쀫떊 (read-modify-write + reg?由멷m).
 #[test]
 fn test_lift_memory_operand_arith() {
     // 0x140001000: mov dword [rbx], 10
@@ -352,7 +341,6 @@ fn test_lift_memory_operand_arith() {
     assert_eq!(memval, 15, "memory updated by add qword [rbx],5");
 }
 
-/// E: SHL/SHR ??쀫늄??
 #[test]
 fn test_lift_shifts() {
     // 0x140001000: shl rax, cl   (rax = 16 << 2 = 64)
@@ -370,7 +358,6 @@ fn test_lift_shifts() {
     assert_eq!(regs(&st)[0], 16, "16 << 2 then >> 2 = 16");
 }
 
-/// F: MOVZX 0-?類ㅼ삢.
 #[test]
 fn test_lift_movzx() {
     // 0x140001000: movzx rax, al   (rax = 0xFF)
@@ -388,7 +375,6 @@ fn test_lift_movzx() {
     assert_eq!(regs(&st)[0], 0xFFFF, "movzx rax, bx zero-extends");
 }
 
-/// SAR (?怨쀫떊 ?怨쀫? ??쀫늄??: ???땾 揶쏅?? ?봔????쑵?껃첎? ?醫???뺣뼄.
 #[test]
 fn test_lift_sar_arithmetic_shift() {
     // 0x140001000: sar rax, 2   (rax = -16 >> 2 = -4)
@@ -406,7 +392,6 @@ fn test_lift_sar_arithmetic_shift() {
     assert_eq!(regs(&st)[0] as i64, -2, "SAR preserves sign bit");
 }
 
-/// MOVSX (?봔???類ㅼ삢): 8/16-bit ???뮞???봔???類ㅼ삢.
 #[test]
 fn test_lift_movsx_sign_extension() {
     // 0x140001000: movsx rax, al   (al = 0xFF ??-1)
@@ -424,17 +409,14 @@ fn test_lift_movsx_sign_extension() {
     assert_eq!(regs(&st)[0] as i64, -32768, "movsx sign-extends 16-bit");
 }
 
-/// JP/JNP: ??ㅲ봺?????삋域밸챷肉??怨뺚뀲 ?브쑨由?
 #[test]
 fn test_lift_jp_jnp_parity() {
-    // cmp al, 3 (0b11 ??1??揶쏆뮇??2 ??筌욎빘????PF=1) ; jp 0x14000100B ; ret
     // 0x14000100B: mov rbx, 7
-    // 0x140001000: cmp rax,3 (4B: 48 83 F8 03)  0x140001004: jp +1 ??0x140001007 (mov rbx,7 ??뽰삂)
     // 3 - 3 = 0 ??low byte 0b0 (0 ones, even) ??PF=1 ??JP taken.
     let raw_jp = [
         0x48, 0x83, 0xF8, 0x03, // cmp rax, 3
         0x7A, 0x01, // jp +1 ??0x140001007
-        0xC3, // ret (0x140001006) ??沃섎챷???
+        0xC3,
         0x48, 0xC7, 0xC3, 0x07, 0x00, 0x00, 0x00, // mov rbx, 7 (0x140001007)
         0xC3,
     ];
@@ -444,11 +426,8 @@ fn test_lift_jp_jnp_parity() {
     assert_eq!(regs(&st)[3], 7, "JP taken when parity even (PF set)");
 }
 
-/// JECXZ: ECX==0 ?????브쑨由?
 #[test]
 fn test_lift_jrcxz_counter_jump() {
-    // 0x140001000: jrcxz +8 ??0x14000100A (mov rbx,7 ??뽰삂); 0x140001002 mov rbx,1; 0x140001009 ret
-    // 64??쑵??筌뤴뫀諭?癒?퐣 E3??JRCXZ (RCX==0). 燁삳똻????브쑨由?嚥≪뮇彛?野꺜筌앹빘??
     let raw = [
         0xE3, 0x08, // jrcxz +8 ??0x14000100A
         0x48, 0xC7, 0xC3, 0x01, 0x00, 0x00, 0x00, // mov rbx, 1
@@ -465,7 +444,6 @@ fn test_lift_jrcxz_counter_jump() {
     assert_eq!(regs(&st2)[3], 1, "JRCXZ not taken when RCX!=0");
 }
 
-/// ?類? unsigned ?브쑨由? JA(CF=0?弛쯊=0) vs JAE(CF=0) ??揶쏆늿????筌△뫁??野꺜筌?
 #[test]
 fn test_lift_ja_jae_unsigned_boundary() {
     // cmp rax, rbx (rax==rbx ??ZF=1, CF=0)
@@ -482,12 +460,10 @@ fn test_lift_ja_jae_unsigned_boundary() {
     init[0] = 5;
     init[3] = 5;
     let st = run(&raw, 0x140001000, init);
-    // JA(Above): ZF=1 ???嚥?not taken ??rcx=1 ??쎈뻬
     assert_eq!(regs(&st)[1], 1, "JA not taken when operands equal (ZF=1)");
     assert_eq!(regs(&st)[2], 0, "JA target not reached");
 }
 
-/// JBE(CF=1 ??ZF=1): 揶쏆늿????CF=0, ZF=1) taken.
 #[test]
 fn test_lift_jbe_unsigned_boundary() {
     // cmp rax, rbx (rax==rbx ??ZF=1, CF=0)
@@ -507,7 +483,6 @@ fn test_lift_jbe_unsigned_boundary() {
     assert_eq!(regs(&st)[1], 0, "JBE target reached, fallthrough skipped");
 }
 
-/// ?袁⑥쨮嚥≪뮄?/?癒곕툡嚥≪뮄?? push rbp; mov rbp,rsp ... leave; ret.
 #[test]
 fn test_lift_prologue_epilogue_leave() {
     // 0x140001000: push rbp
@@ -532,12 +507,9 @@ fn test_lift_prologue_epilogue_leave() {
     assert_eq!(st.stack.len(), 0, "push/pop balanced");
 }
 
-/// 32??쑵???????쎄숲 ?怨뚮┛ zero-extension: mov eax + add eax ???怨몄맄 32??쑵?껆몴?0??곗쨮.
-/// `add eax, ebx`(ebx=1)??64??쑵?껅에?뺣뮉 0x100000000(??쑵??32 ?紐낅샒)?????筌?x86?? 0??곗쨮 揶쏅Ŋ???
 #[test]
 fn test_lift_32bit_write_zero_extends_upper_bits() {
     // 0x140001000: mov eax, 0xFFFFFFFF   (B8 FF FF FF FF)
-    // 0x140001005: add eax, ebx          (01 D8)  ??ebx = 1 (?????쎄숲 ???뮞)
     // 0x140001007: ret
     let raw = [
         0xB8, 0xFF, 0xFF, 0xFF, 0xFF, // mov eax, 0xFFFFFFFF
@@ -559,8 +531,6 @@ fn test_lift_32bit_write_zero_extends_upper_bits() {
     );
 }
 
-/// 32??쑵???????쎄숲 ??猷??zero-extension: mov eax, ebx ??RBX????륁맄 32??쑵?껓쭕??띯뫂釉??
-/// ?怨몄맄 32??쑵?껆몴?0??곗쨮 ?類ｂ봺??뺣뼄.
 #[test]
 fn test_lift_32bit_mov_reg_source_zero_extends() {
     // 0x140001000: mov rbx, 0xFFFFFFFF00000001  (48 BB 01 00 00 00 FF FF FF FF)
@@ -615,8 +585,6 @@ fn test_lift_mov_partial_register_write_preserves_upper_bits_and_flags() {
     assert_ne!(eax.flags & 0x40, 0, "mov eax,ebx preserves ZF");
 }
 
-/// 32??쑵????쀫늄????쏅땾??mod 32(31 筌띾뜆???: shl eax,32 == shl eax,0, sar eax,32 == sar eax,0.
-/// ?????쎄숲(CL) 燁삳똻???32??0??곗쨮 筌띾뜆???留??
 #[test]
 fn test_lift_32bit_shift_count_masked_mod32() {
     let mut init = [0u64; 16];
@@ -637,16 +605,14 @@ fn test_lift_32bit_shift_count_masked_mod32() {
     let st2 = run(&raw_sar, 0x140001000, init);
     assert_eq!(regs(&st2)[0], 0x8000_0000, "sar eax,32 == sar eax,0");
 
-    // ?????쎄숲 燁삳똻??? shl eax, cl with cl=32 ??masked to 0
     let raw_shl_cl = [0xD3, 0xE0, 0xC3]; // shl eax, cl ; ret
     let mut init2 = [0u64; 16];
     init2[0] = 0x8000_0000;
-    init2[1] = 32; // cl = 32 (??륁맄 8??쑵??
+    init2[1] = 32;
     let st3 = run(&raw_shl_cl, 0x140001000, init2);
     assert_eq!(regs(&st3)[0], 0x8000_0000, "shl eax,cl(32) == shl eax,0");
 }
 
-// ???? P2: ??덉쨮 ?곕떽????귐뗫늄??野껋럥以?筌△뫀踰?野꺜筌?(?醫륁굨 ?됰뗀以???μ맄 ??덊뒄) ????????????????????????????
 
 /// MUL r64 ??RDX:RAX = RAX * rm (unsigned). low ??dst(RAX), high ??RDX.
 #[test]
@@ -889,7 +855,6 @@ fn test_lift_cmpxchg_mem() {
     );
 }
 
-/// XCHG mem?遊켩g ??lift path emits memory RMW (read + write).
 #[test]
 fn test_lift_xchg_mem() {
     // xchg [rax], rbx (48 87 18) ; ret
@@ -966,16 +931,13 @@ fn test_lift_andn() {
     assert_eq!(regs(&st)[0], 0xF0, "ANDN = ~rbx & rcx = ~0x0F & 0xFF");
 }
 
-// ???? P2: ?얜챷???ops 筌△뫀踰?野꺜筌?(?醫륁굨 ?됰뗀以???μ맄 ??덊뒄) ????????????????????????????????????????????????????
 
-/// ???뮞??筌롫뗀?덄뵳????? ?귐??遺얜탵??`width`獄쏅뗄???疫꿸퀡以?
 fn seed_mem(mem: &mut HashMap<u64, u8>, addr: u64, width: u8, val: u64) {
     for i in 0..width {
         mem.insert(addr.wrapping_add(i as u64), (val >> (i as u64 * 8)) as u8);
     }
 }
 
-/// ???뮞??筌롫뗀?덄뵳????? ?귐??遺얜탵??`width`獄쏅뗄?????꾨┛.
 fn read_mem(mem: &HashMap<u64, u8>, addr: u64, width: u8) -> u64 {
     let mut v = 0u64;
     for i in 0..width {
@@ -984,7 +946,6 @@ fn read_mem(mem: &HashMap<u64, u8>, addr: u64, width: u8) -> u64 {
     v
 }
 
-/// lift + `eval_state_with_mem` ??쎈뻬 ????
 fn run_mem(raw: &[u8], ip: u64, init: [u64; 16], mem: HashMap<u64, u8>) -> RiscEvalState {
     lift(raw, ip).eval_state_with_mem(&init, mem)
 }
@@ -1006,7 +967,6 @@ fn test_lift_mov_mem_bh_preserves_flags() {
     );
 }
 
-/// BlockEncoder 嚥?x86 筌뤿굝議??됰뗀以??獄쏅뗄??紐껋쨮 ?紐꾪맜??
 fn enc_block(insts: Vec<Instruction>) -> Vec<u8> {
     let blk = InstructionBlock::new(&insts, 0x140001000);
     BlockEncoder::encode(64, blk, BlockEncoderOptions::NONE)
@@ -1014,7 +974,6 @@ fn enc_block(insts: Vec<Instruction>) -> Vec<u8> {
         .code_buffer
 }
 
-/// XMM(i) ????揶쎛??雅뚯눘??(?귐뗫늄?怨? ??덉뵬 ?④쑴鍮?.
 fn xmm_slot(idx: u8) -> u64 {
     super::XMM_SLOT_BASE + (idx as u64) * 16
 }
@@ -1046,7 +1005,6 @@ fn test_lift_stosd_single() {
     assert_eq!(read_mem(&st.mem, 0x2000, 4), 0xDEAD_BEEF, "dword stored");
 }
 
-/// LODSW (??μ뵬) ??AX = [rsi] (0-?類ㅼ삢); rsi+=2.
 #[test]
 fn test_lift_lodsw_single() {
     let raw = [0x66, 0xAD, 0xC3];
@@ -1102,7 +1060,6 @@ fn test_lift_cmpsq_single() {
     );
 }
 
-/// REP MOVSB ??燁삳똻?????쇱뒲 ?룐뫂遊? rcx ???돩, rsi/rdi += n*count, 筌롫뗀?덄뵳?癰귣벊沅?
 #[test]
 fn test_lift_rep_movsb() {
     let raw = [0xF3, 0xA4, 0xC3];
@@ -1154,7 +1111,6 @@ fn test_lift_std_rep_movsb_backward() {
     );
 }
 
-/// REP STOSB ???룐뫂遊썸에?筌롫뗀?덄뵳?筌?쑴??묾?
 #[test]
 fn test_lift_rep_stosb() {
     let raw = [0xF3, 0xAA, 0xC3];
@@ -1170,7 +1126,6 @@ fn test_lift_rep_stosb() {
     }
 }
 
-/// REP LODSQ ???룐뫂遊썸에?RAX 揶쏄퉮??(筌띾뜆?筌?嚥≪뮆諭?, rsi += 8*count.
 #[test]
 fn test_lift_rep_lodsq() {
     let raw = [0xF3, 0x48, 0xAD, 0xC3];
@@ -1187,7 +1142,6 @@ fn test_lift_rep_lodsq() {
     assert_eq!(st.regs[0], 333, "last loaded qword");
 }
 
-/// REPE SCASB ???븍뜆?ょ㎉?뤿퓠??餓λ쵎?? rdi/rcx ??餓λ쵎??獄쏆꼶?ф틦?? 筌욊쑵六? 筌ㅼ뮇伊????삋域?= 筌띾뜆?筌???쑨??
 #[test]
 fn test_lift_repe_scasb_stops_on_mismatch() {
     let raw = [0xF3, 0xAE, 0xC3];
@@ -1208,7 +1162,6 @@ fn test_lift_repe_scasb_stops_on_mismatch() {
     );
 }
 
-/// REPNE CMPSW ????깊뒄?癒?퐣 餓λ쵎??(REPNE ??ZF=1 ?癒?퐣 ?類?).
 #[test]
 fn test_lift_repne_cmpsw_stops_on_match() {
     let raw = [0xF2, 0x66, 0xA7, 0xC3];
@@ -1232,7 +1185,6 @@ fn test_lift_repne_cmpsw_stops_on_match() {
     );
 }
 
-// ???? P2: SSE/FPU ??쇰???筌△뫀踰?野꺜筌?????????????????????????????????????????????????????????????????????????????????????
 
 /// ADDSD xmm0, xmm1 ??1.5 + 2.25 = 3.75.
 #[test]
@@ -1289,7 +1241,6 @@ fn test_lift_subss() {
     );
 }
 
-/// CVTSI2SD xmm0, rax ???類ㅻ땾 -> double.
 #[test]
 fn test_lift_cvtsi2sd() {
     let raw = enc_block(vec![
@@ -1325,7 +1276,6 @@ fn test_lift_cvtss2sd_cvtsd2ss() {
     );
 }
 
-/// CVTTSS2SI(trunc) vs CVTSS2SI(nearest-even) ??half-way 獄쏆꼷?긺뵳?筌△뫁??
 #[test]
 fn test_lift_cvttss2si_trunc_vs_cvtss2si_round() {
     let raw = enc_block(vec![
@@ -1345,7 +1295,6 @@ fn test_lift_cvttss2si_trunc_vs_cvtss2si_round() {
     assert_eq!(st.regs[2] as i64, 4, "rne(3.5)=4 even (rdx)");
 }
 
-/// MOVSD xmm0, xmm1 (?????쎄숲 嚥≪뮆諭??? ????륁맄 8獄쏅뗄???癰귣벊沅?
 #[test]
 fn test_lift_movsd_reg() {
     let raw = enc_block(vec![
@@ -1358,7 +1307,6 @@ fn test_lift_movsd_reg() {
     assert_eq!(f64::from_bits(read_mem(&st.mem, xmm_slot(0), 8)), 9.75);
 }
 
-/// MOVSD [rax], xmm0 (筌롫뗀?덄뵳???쎈꽅?? + MOVSD xmm1, [rax] (筌롫뗀?덄뵳?嚥≪뮆諭?.
 #[test]
 fn test_lift_movsd_mem_load_store() {
     let raw = enc_block(vec![
@@ -1393,7 +1341,6 @@ fn test_lift_movsd_mem_load_store() {
     );
 }
 
-// ???? P2: BMI (BLSR/BLSMSK/BLSI/BZHI) 筌△뫀踰?野꺜筌?????????????????????????????????????????????????????????
 
 /// BLSR r64 ??x & (x-1) (lowest set bit clear).
 #[test]

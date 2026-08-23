@@ -4,8 +4,6 @@
 use super::*;
 use crate::vm::risc::{MicroInstr, MicroOperand, RiscDesynthesizer, RiscOp};
 
-/// ?�양??op(NOR/ADD/SHR/SHL/PUSH/POP/SET_FLAG)�??��? ?�로그램??
-/// ?�이?�브 ?�행�?참조 ?��??�이?�에 각각 ?�려 결과 ?�태가 ?�치?�는지 검�?
 #[test]
 fn test_native_harness_matches_reference_state() {
     let mut d = RiscDesynthesizer::new();
@@ -40,7 +38,6 @@ fn test_native_harness_matches_reference_state() {
         MicroOperand::VReg(0),
         MicroOperand::VReg(1),
     );
-    // push R3, push R0, pop R4  ???��? push 1�?(R3)
     d.emit_push(MicroOperand::VReg(3));
     d.emit_push(MicroOperand::VReg(0));
     d.emit_pop(MicroOperand::VReg(4));
@@ -51,7 +48,6 @@ fn test_native_harness_matches_reference_state() {
             .with_src1(MicroOperand::VReg(2))
             .with_src2(MicroOperand::VReg(1)),
     );
-    // SET_FLAG: ?�래�?= 0x8C1
     d.instrs
         .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Imm64(0x8C1)));
     // Halt
@@ -62,7 +58,6 @@ fn test_native_harness_matches_reference_state() {
 
     // 참조
     let ref_st = prog.eval_state(&init);
-    // ?�이?�브
     let nat = run_native_risc(&prog, &init).unwrap();
 
     assert_eq!(nat.regs, ref_st.regs, "regs mismatch");
@@ -76,7 +71,6 @@ fn test_native_harness_matches_reference_state() {
     assert_eq!(nat.stack, ref_st.stack, "stack mismatch");
 }
 
-/// ?�순 ADD ?�로그램??최종 ?��??�터 �?직접 ?�인.
 #[test]
 fn test_native_harness_add_value() {
     let mut d = RiscDesynthesizer::new();
@@ -108,17 +102,11 @@ fn test_native_harness_add_value() {
     assert_eq!(nat.regs[1], 450);
 }
 
-/// T1-4 차등 검�? **?�호?�된** ?�리모픽 바이?�코???�트림을
-/// (1) ?�이?�브 ?�네??`run_native_poly`), (2) ?�리모픽 ?�터?�리??
-/// (3) 참조 ?��??�이??`eval_state`)??각각 ?�행?????�태가 ?�전???�치?�는지 검�?
 ///
-/// ?�는 "?�베?�된 .btgvm ?�텁??rolling-key ?�트림을 ?�이?�브�??�석·?�행?�는
-/// ?�계"??검�?기�??�다 ???�이?�브 ?�행???�터?�리?�·참조�? ?�치?�야 ?�다.
 #[test]
 fn test_native_poly_matches_interpreter_and_reference() {
     use crate::vm::poly::{PolymorphicEncoder, PolymorphicInterpreter};
 
-    // ?�터?�리???�스?��? 같�? ?�로그램 (shift/push/pop/nor/flags ?�합).
     let mut d = RiscDesynthesizer::new();
     d.emit_add(
         MicroOperand::VReg(0),
@@ -163,14 +151,11 @@ fn test_native_poly_matches_interpreter_and_reference() {
     d.instrs.push(MicroInstr::new(RiscOp::Halt));
     let prog = RiscProgram::new(d.instrs);
 
-    // ?�러 ?�드???�??각각 ?�리모픽 ?�코??????경로 비교.
     for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
         let mut enc = PolymorphicEncoder::new(seed);
         let bytecode = enc.encode(&prog).unwrap();
 
-        // (1) ?�이?�브
         let nat = run_native_poly(&bytecode, seed, &[0u64; 16]).unwrap();
-        // (2) ?�터?�리??
         let mut interp = PolymorphicInterpreter::new(seed);
         interp.run(&bytecode).unwrap();
         // (3) 참조
@@ -210,10 +195,7 @@ fn test_native_poly_matches_interpreter_and_reference() {
     }
 }
 
-// ?�?�?P2: ?�규 ?�수/비트/?�어 op ?�이?�브 차등 (native == eval_state) ?�?�?�?�?�?�?�?�?�?�?
 
-/// ?�규 ?�산 ??계열 (Mov/ArithmeticShiftRight/Multiply/Divide/BSwap/BitScan/
-/// Count/PopCount/Setcc/ConditionalMove) ???�이?�브 ?�행??참조?�??�전 ?�치 검�?
 /// TEMP isolated static branch.
 #[test]
 fn temp_static_branch_only() {
@@ -413,12 +395,10 @@ fn test_native_new_ops_matches_reference() {
     assert_eq!(nat.stack, ref_st.stack, "stack mismatch");
 }
 
-/// ?�적/?�적 VirtualBranch ?�이?�브 ??branch-free ?�이�??�프 + ip_map ?�캔 ?�퍼.
 #[test]
 fn test_native_branch_static_and_dynamic_matches_reference() {
     use std::collections::HashMap;
 
-    // ?�적 분기: imm=?��??�덱??(ip_map ?�음 ??resolve_target ??imm ???�덱?�로).
     let mut d = RiscDesynthesizer::new();
     d.emit_add(
         MicroOperand::VReg(0),
@@ -435,7 +415,7 @@ fn test_native_branch_static_and_dynamic_matches_reference() {
         MicroOperand::VReg(7),
         MicroOperand::Imm64(111),
         MicroOperand::Imm64(0),
-    ); // index2: 건너?�?
+    );
     d.emit_add(
         MicroOperand::VReg(6),
         MicroOperand::Imm64(222),
@@ -449,7 +429,6 @@ fn test_native_branch_static_and_dynamic_matches_reference() {
     assert_eq!(nat.regs[6], 222, "static branch taken target");
     assert_eq!(nat.regs[7], 0, "static branch skipped block");
 
-    // ?�적 분기: src1=VReg(?��?IP) ??ip_map ?�캔 ?�퍼�??�덱???�석.
     let mut ip_map = HashMap::new();
     for i in 0..5u64 {
         ip_map.insert(0x1000 + i, i as usize);
@@ -465,7 +444,7 @@ fn test_native_branch_static_and_dynamic_matches_reference() {
             cond: BranchCondition::Always,
         })
         .with_src1(MicroOperand::VReg(5)),
-    ); // index1: ?�적 분기 ??0x1003 ??index3
+    );
     d.emit_add(
         MicroOperand::VReg(7),
         MicroOperand::Imm64(111),
@@ -487,7 +466,6 @@ fn test_native_branch_static_and_dynamic_matches_reference() {
     );
 }
 
-/// MemoryRead/Write + CompareExchange ?�이?�브 ??arena 창을 게스??메모리로 ?�용.
 #[test]
 fn test_native_memory_and_cmpxchg_matches_reference() {
     use std::collections::HashMap;
@@ -536,7 +514,6 @@ fn test_native_memory_and_cmpxchg_matches_reference() {
 
     let mut init = [0u64; 16];
     init[1] = addr;
-    // 참조??arena 창이 0 ?�로 ?�작?�다�?가????0xCAFE_F00D 기록 경로�?검�?
     let seed_mem: HashMap<u64, u8> = HashMap::new();
     let ref_st = prog.eval_state_with_mem(&init, seed_mem);
 
@@ -566,10 +543,6 @@ fn test_native_memory_and_cmpxchg_matches_reference() {
     assert_eq!(stored, 0x1234, "cmpxchg wrote new value");
 }
 
-/// P1 (??: ADD MBA ??desynth.emit_add ??`AddWithCarry` �?만들므�????�스?�는
-/// AddWithCarry ?�들??== 참조 eval_state �?검증한?? 진짜 `RiscOp::Add{width:8}`
-/// MBA 경로(?�래�??�확???�함)??`test_mba_add_handler_diversified_per_key`
-/// �?검증한??
 #[test]
 fn test_native_mba_add_matches_reference_state() {
     let mut d = RiscDesynthesizer::new();
@@ -585,13 +558,11 @@ fn test_native_mba_add_matches_reference_state() {
         MicroOperand::Imm64(1),
         MicroOperand::Imm64(0),
     );
-    // R2 = R0 + R1  ??0, CF=1 (?�버?�로 캐리)
     d.emit_add(
         MicroOperand::VReg(2),
         MicroOperand::VReg(0),
         MicroOperand::VReg(1),
     );
-    // R3 = 0x7FFF_FFFF_FFFF_FFFF, R4 = 1 ??OF=1 (부???�버?�로)
     d.emit_add(
         MicroOperand::VReg(3),
         MicroOperand::Imm64(0x7FFF_FFFF_FFFF_FFFF),
@@ -626,7 +597,6 @@ fn test_native_mba_add_matches_reference_state() {
     d.instrs.push(MicroInstr::new(RiscOp::Halt));
     let prog = RiscProgram::new(d.instrs);
 
-    // 모든 64-bit Add가 MBA 경로�??�?�록 강제.
     let mut vm = NativeVmHarness::compile_with_mba(&prog, 0x5A, 100).unwrap();
     let nat = vm.run(&[0u64; 16]).unwrap();
     let ref_st = prog.eval_state(&[0u64; 16]);
@@ -640,16 +610,11 @@ fn test_native_mba_add_matches_reference_state() {
     );
     assert_eq!(nat.vsp, ref_st.vsp, "MBA add vsp mismatch");
     assert_eq!(nat.stack, ref_st.stack, "MBA add stack mismatch");
-    // ?�술 ?��? 직접 ?�인
     assert_eq!(nat.regs[2], 0, "0xFFFF.. + 1 must wrap to 0");
     assert_eq!(nat.regs[5], 0x8000_0000_0000_0000, "sign-overflow sum");
     assert_eq!(nat.regs[8], 0x9999_9999_0000_0000, "partial add");
 }
 
-/// P1 (??: mba_prob=100/0 강제 ??결과 ?�치 ??**AddWithCarry 경로**(desynth.emit_add
-/// 가 만드??op) 검증이?? ?�제 `RiscOp::Add{width:8}` ?�들??MBA 경로??
-/// `test_mba_add_handler_diversified_per_key` 가 커버?�다 (?�기???�치/?�래�?
-/// ?�치 + 결정???�시 ?�택???�실???�정???�인).
 #[test]
 fn test_native_mba_add_prob_0_vs_100_equivalent() {
     let mut d = RiscDesynthesizer::new();
@@ -670,7 +635,6 @@ fn test_native_mba_add_prob_0_vs_100_equivalent() {
             MicroOperand::Imm64(0),
         );
     }
-    // R0+R1, R2+R3, R4+R5, R6+R7 (?�버?�로 ?�함 4??
     d.emit_add(
         MicroOperand::VReg(0),
         MicroOperand::VReg(0),
@@ -706,17 +670,10 @@ fn test_native_mba_add_prob_0_vs_100_equivalent() {
     );
 }
 
-/// P1 (handler diversification): ?�제 `RiscOp::Add { width: 8 }` (x86 ADD??
-/// P0-1 ?�래�??�확 op ??desynth.emit_add ??AddWithCarry �??��?�??�전 MBA
-/// ?�스?�들?� MBA 경로�??�제�??�지 ?�았??�??�함???�로그램?�로,
 ///
-///  (a) mba_prob=100 강제 ???�이?�브 ?�행??참조 `eval_state`?� ?�확???�치?�고,
-///  (b) **빌드 ?��? ?�르�?* ADD ?�들??코드(variant 0 `xor r9,r11` vs
-///      variant 1 `or r9,r11`)가 ?�르�?emit ?�다 (빌드 �?handler ?�형??.
 #[test]
 fn test_mba_add_handler_diversified_per_key() {
     use crate::vm::threaded::harness::OFF_CODE;
-    // 8개의 64-bit ADD: R(i) += R((i+1)%8) ???�버?�로/캐리/부???�래�??�함.
     let mut instrs = Vec::new();
     let vals: [u64; 8] = [
         0xFFFF_FFFF_FFFF_FFFF,
@@ -739,7 +696,6 @@ fn test_mba_add_handler_diversified_per_key() {
     instrs.push(MicroInstr::new(RiscOp::Halt));
     let prog = RiscProgram::new(instrs);
 
-    // (a) ??2�?모두 mba_prob=100 ???�이?�브 == 참조.
     let mut vm_a = NativeVmHarness::compile_with_mba(&prog, 0x11, 100).unwrap();
     let mut vm_b = NativeVmHarness::compile_with_mba(&prog, 0x22, 100).unwrap();
     let ref_st = prog.eval_state(&[0u64; 16]);
@@ -750,11 +706,8 @@ fn test_mba_add_handler_diversified_per_key() {
     assert_eq!(nb.regs, ref_st.regs, "key=0x22 MBA add regs mismatch");
     assert_eq!(nb.flags, ref_st.flags, "key=0x22 MBA add flags mismatch");
 
-    // (b) 코드 ?�역?�서 ADD ?�들??variant ?�턴 개수 비교.
     //     variant 0: `xor r9, r11` = 4D 33 CB (Xor_r64_rm64, opcode 33 /r),
     //     variant 1: `or  r9, r11` = 4D 0B CB (Or_r64_rm64,  opcode 0B /r).
-    //     ??빌드가 **블록�?variant 배정 ?�서**(?�명)가 ?�라???�다 (개수??
-    //     ?�연??같을 ???�어 ?�서�?비교).
     let signature = |vm: &mut NativeVmHarness| -> String {
         let bytes = vm.arena.bytes().to_vec();
         let mut s = String::new();
@@ -782,19 +735,12 @@ fn test_mba_add_handler_diversified_per_key() {
         sb.len() >= 8,
         "key=0x22: all 8 ADD blocks must use an MBA variant ({sb})"
     );
-    // ??빌드가 블록�?variant 배정???�라???�다 (같�? ?�로그램, ?�른 ?????�른 ?�들??코드).
     assert!(
         sa != sb,
         "different build keys must diversify ADD handler code (a={sa} b={sb})"
     );
 }
 
-// ?�?� P0-2: 3-path randomized differential ??eval_state vs poly vs native ?�?�
-// 보고??P0 "VM/native differential execution 강화": 같�? ?�덤 RISC ?�로그램??
-// (1) 참조 eval_state, (2) ?�리 ?�터?�리??롤링??, (3) ?�이?�브 threaded
-// ?�네????경로�??�행?�고 **?�체 ?�태**(regs/temps/flags/vsp/stack)가 ?�치?�는지
-// 무작?�로 검증한?? mem op ???�이?�브 ?�네?��? 가??arena 주소�??��?�?
-// (eval_state ??HashMap �?계약???�름) 비교 범위?�서 ?�외?�다.
 #[test]
 fn p0_randomized_three_path_differential() {
     use crate::vm::poly::{PolymorphicEncoder, PolymorphicInterpreter};
@@ -805,7 +751,6 @@ fn p0_randomized_three_path_differential() {
     for trial in 0..64 {
         let mut d = RiscDesynthesizer::new();
         let n = 6 + (rng.gen::<u32>() % 18) as usize;
-        // �??�택 pop(?�더?�로)?� 참조/?�이?�브 계약???�르므�?균형 push/pop �?
         let mut depth = 0i32;
         for _ in 0..n {
             let ra = (rng.gen::<u8>() % 16) as u8;
@@ -813,7 +758,7 @@ fn p0_randomized_three_path_differential() {
             let rc = (rng.gen::<u8>() % 16) as u8;
             let mut choice = rng.gen_range(0..16u32);
             if choice == 11 && depth <= 0 {
-                choice = 10; // �??�택?�면 pop ?�??push
+                choice = 10;
             }
             match choice {
                 0 => d.emit_add(
@@ -910,7 +855,6 @@ fn p0_randomized_three_path_differential() {
 
         // (1) 참조
         let ref_st = prog.eval_state(&init);
-        // (2) ?�리
         let mut enc = PolymorphicEncoder::new(seed);
         let bc = enc
             .encode(&prog)
@@ -918,11 +862,9 @@ fn p0_randomized_three_path_differential() {
         let mut interp = PolymorphicInterpreter::new(seed);
         interp.regs = init;
         interp.run(&bc).unwrap();
-        // (3) ?�이?�브
         let mut vm = NativeVmHarness::compile_with_mba(&prog, 0x5A, 100).unwrap();
         let nat = vm.run(&init).unwrap();
 
-        // ?�체 ?�태 비교 (mem ?�외 ???�이?�브??가??arena 주소 계약).
         assert_eq!(
             interp.regs, ref_st.regs,
             "trial={trial} poly regs != ref\nprog:\n{:?}",

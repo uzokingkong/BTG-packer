@@ -205,7 +205,6 @@ pub fn build_program_vm(
             handlers::EntryMode::Program,
         )?
     };
-    // The Ksa entry stub snapshots RBX?뭦tr_sbox/RDX?뭦tr_seed from the caller; for a
     // program VM the boot stub will instead pre-load the original entry GPRs into the
     // state vregs before calling. Keep the entry convention Ksa (state in RCX).
     let _ = state_va;
@@ -275,13 +274,11 @@ pub fn build_vm_module_obf(
     })
 }
 
-// ?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧??
 // Submodules (extracted from the old monolith to keep mod.rs a re-export layer):
 //   arena.rs    - RWX native-execution arena (unix/windows)
 //   encode.rs   - native x86 reference encoders (self-test / bench)
 //   self_test/   - --vm-test cross-validation suite (directory module)
 //   bench.rs    - --vm-bench interpreter vs native throughput
-// ?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧??
 pub(crate) mod arena;
 mod bench;
 mod encode;

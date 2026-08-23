@@ -6,10 +6,8 @@ fn test_reencrypt_dispatcher_builds_and_validates() {
     let code = build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false).unwrap();
     assert!(!code.is_empty());
     assert!(validate_dispatcher(&code).is_ok());
-    // ??뽰삂?? pushfq(0x9C), 筌띾뜆?筌띾맩? ret(0xC3)
     assert_eq!(code[0], 0x9C);
     assert_eq!(*code.last().unwrap(), 0xC3);
-    // ??釉?紐낆넅 ?遺용뮞??μ퓗????롪컶 獄쏅뗄??????醫딅뼣?????뵠???怨몃열 ??됰퓠 ??쇰선揶쎛????뺣뼄
     assert!(
         code.len() < 0x600 - 0x20,
         "dispatcher too large: {}",
@@ -32,9 +30,6 @@ fn test_reencrypt_dispatcher_size_va_independent() {
 
 #[test]
 fn test_reencrypt_dispatcher_rip_references_in_section() {
-    // RIP-relative 筌〓챷?쒎첎? 筌뤴뫀紐?.btg ?諭????? (?諭?↑린醫롮뵠???癒곕늄???뵠??疫뀀챷????뵠????
-    // 揶쎛?귐뗪텕?遺?. iced??RIP 筌롫뗀?덄뵳???깅염?怨쀬쁽??memory_displacement64()??**???
-    // ip-relative 雅뚯눘??*(ip+len+rawdisp)嚥?獄쏆꼹????嚥?域?揶??癒?퍥????쑨???뺣뼄.
     let va = 0x140001000u64;
     let table_off = 0x600usize;
     let nb = 16usize;
@@ -45,7 +40,7 @@ fn test_reencrypt_dispatcher_rip_references_in_section() {
     while dec.can_decode() {
         let inst = dec.decode();
         if matches!(inst.memory_base(), Register::RIP) {
-            let target = inst.memory_displacement64(); // ??? ??繹?(iced 域뱀뮇鍮?
+            let target = inst.memory_displacement64();
             assert!(
                 target == va || target == table_va || target == len_table_va,
                 "RIP target 0x{:X} not in .btg tables (va=0x{:X} table=0x{:X} len=0x{:X})",
@@ -58,9 +53,6 @@ fn test_reencrypt_dispatcher_rip_references_in_section() {
     }
 }
 
-/// ?遺용뮞??μ퓗揶쎛 筌욊쑴????쎄문?癒?퐣 ???돩??롫뮉 ??????? ??堉??덊닜嚥??④쑴沅??뺣뼄.
-/// (??쎈??N揶쏆뮆? push ???遺용뮞??μ퓗揶쎛 ?類μ넇??N揶쏆뮆? ???돩??곷튊 ??繹??됰뗀以??RSP揶쎛
-/// ?癒?궚????깊뒄??뺣뼄. ???돩揶쎛 ?怨몄몵筌??遺용뮞??ν뒄筌띾뜄????쎄문 ?袁⑸땾 ??8B ??욱닎??)
 fn net_stack_slots_consumed(code: &[u8], base_va: u64) -> i32 {
     let mut dec = Decoder::with_ip(64, code, base_va, DecoderOptions::NONE);
     let mut pushes = 0i32;
@@ -83,15 +75,11 @@ fn net_stack_slots_consumed(code: &[u8], base_va: u64) -> i32 {
         }
     }
     assert!(ret, "dispatcher must end with ret");
-    -pushes + pops + lea_rsp_slots + 1 // +1 = ret揶쎛 1????pop
+    -pushes + pops + lea_rsp_slots + 1
 }
 
 #[test]
 fn test_plain_dispatcher_stack_balance_two_slots() {
-    // v10 FIX ??? (??곗뺘 筌뤴뫀諭?8B ??쎄문 ?袁⑸땾):
-    // ??곗뺘 ?遺용뮞??μ퓗??2-?紐꾨뻻 域뱀뮇鍮?[seed][target]??筌띿쉸???類μ넇??2???숋쭕?
-    // ???돩??곷튊 ??뺣뼄. (v8~v9?癒?뮉 ?됰뗀以???쎈??3?紐꾨뻻?????筌??遺용뮞??μ퓗揶쎛
-    // 2???숋쭕????돩???遺용뮞??ν뒄筌띾뜄??8獄쏅뗄??硫? ??λ릭??
     let code = build_dispatcher(0x140001000, 0x80, 16, false, 0xCAFEBABE, false, 0, 2);
     let consumed = net_stack_slots_consumed(&code, 0x140001020);
     assert_eq!(
@@ -99,30 +87,24 @@ fn test_plain_dispatcher_stack_balance_two_slots() {
         "plain dispatcher must consume exactly 2 stack slots (got {})",
         consumed
     );
-    // trace 筌뤴뫀諭?INT3 1B)??揶쏆늿? 域뱀쥚??
     let code_t = build_dispatcher(0x140001000, 0x80, 16, true, 0xCAFEBABE, false, 0, 2);
     assert_eq!(net_stack_slots_consumed(&code_t, 0x140001020), 2);
 }
 
 #[test]
 fn test_dispatcher_ring_buffer_injects_and_validates() {
-    // v13.4d diag: block_ring=true ????ring write ??쀂???? ??쇰선揶쎛??
-    // ?遺용뮞??μ퓗???????validate/stack-balance ??筌띾슣???곷튊 ??뺣뼄.
     let va: u64 = 0x140001000;
     let to: usize = 0x600;
-    // ring ?怨몃열 VA = dispatcher_va + table_offset - RING_REGION
     let ring_va = va + to as u64 - RING_REGION as u64;
     let code = build_dispatcher(va, to, 16, false, 0xCAFEBABE, true, ring_va, 2);
     assert!(!code.is_empty());
     assert!(validate_dispatcher(&code).is_ok());
-    // ?遺용뮞??μ퓗揶쎛 ring ?怨몃열??燁삘뫀苡??롢늺 ????(disp_base + len <= ring_va)
     assert!(
         (va + 0x20) + code.len() as u64 <= ring_va,
         "dispatcher {} bytes overflows into ring region @0x{:X}",
         code.len(),
         ring_va
     );
-    // disasm ?? ring base(r11 ???雅뚯눘?? ???④쑴沅??롫뮉 mov r64,imm64 ??鈺곕똻???곷튊 ??뺣뼄.
     let mut dec = Decoder::with_ip(64, &code, va + 0x20, DecoderOptions::NONE);
     let mut found_base = false;
     let mut found_store = false;
@@ -137,7 +119,6 @@ fn test_dispatcher_ring_buffer_injects_and_validates() {
         {
             found_base = true;
         }
-        // [r11 + rax*4] ?紐껊쑔????쎈꽅??(ring[index] = block_id)
         if inst.code() == Code::Mov_rm32_r32
             && inst.memory_base() == Register::R11
             && inst.memory_index() == Register::RAX
@@ -147,7 +128,6 @@ fn test_dispatcher_ring_buffer_injects_and_validates() {
     }
     assert!(found_base, "ring base (mov r11, imm64=ring_va) not found");
     assert!(found_store, "ring indexed store not found");
-    // ring off ?????뮉 base store 揶쎛 ??곷선????뺣뼄.
     let code_off = build_dispatcher(va, to, 16, false, 0xCAFEBABE, false, 0, 2);
     let mut dec2 = Decoder::with_ip(64, &code_off, va + 0x20, DecoderOptions::NONE);
     let mut base_off = false;
@@ -208,8 +188,6 @@ fn test_reencrypt_expand_loop_preserves_len_edx() {
 
 #[test]
 fn test_reencrypt_dispatcher_stack_balance_three_slots() {
-    // ??釉?紐낆넅 ?遺용뮞??μ퓗??3-?紐꾨뻻 域뱀뮇鍮?[seed][target][current]??筌띿쉸??
-    // ?類μ넇??3????????돩??곷튊 ??뺣뼄.
     let code = build_dispatcher_reencrypt(0x140001000, 0x600, 16, 0xCAFEBABE, false).unwrap();
     let consumed = net_stack_slots_consumed(&code, 0x140001020);
     assert_eq!(

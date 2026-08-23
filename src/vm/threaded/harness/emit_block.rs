@@ -10,10 +10,6 @@ use anyhow::{anyhow, Result};
 use iced_x86::{Code, Instruction, Register};
 
 impl NativeVmHarness {
-    /// ?占쎌씪 留덉씠?占쎈줈 ?占쎌궛???占쎈Ц???占쎌씠?占쎈툕 釉붾줉???占쎌꽦?占쎈떎.
-    /// `block_index` = ??釉붾줉??紐낅졊 ?占쎈뜳??(遺꾧린 fallthrough ?占쏙옙?= index+1).
-    /// `static_target` = ?占쎌쟻 VirtualBranch ??紐⑺몴 釉붾줉 ?占쎈뜳??(?占쎌쟻?占쎈㈃ None).
-    /// `helper_va` = ?占쎌쟻 遺꾧린 ?占쎌틪 ?占쏀띁 二쇱냼 (?占쎌쟻 遺꾧린媛 ?占쎌쑝占?None).
     pub(super) fn emit_block(
         ins: &MicroInstr,
         instrs: &mut Vec<Instruction>,
@@ -25,7 +21,6 @@ impl NativeVmHarness {
         mba_prob: u32,
         diversity_seed: u64,
     ) -> Result<()> {
-        // ?占쏀깭 踰꾪띁 ?占쎄렐??硫붾え占??占쏀띁?占쎈뱶 ?占쏀띁.
         let mem = |disp: i64| -> iced_x86::MemoryOperand {
             iced_x86::MemoryOperand::with_base_index_scale_displ_size(
                 Register::RDX,
@@ -116,7 +111,6 @@ impl NativeVmHarness {
             Ok(())
         };
 
-        // ?占쎈옒占??占쎈’???占쎌옱 x86 ?占쎈옒洹몄쓽 CF|ZF|SF|OF 占?蹂묓빀 (PF/AF??蹂댁〈).
         let store_flags = |instrs: &mut Vec<Instruction>| -> Result<()> {
             instrs.push(Instruction::with(Code::Pushfq));
             instrs.push(
@@ -145,7 +139,6 @@ impl NativeVmHarness {
             Ok(())
         };
 
-        // CF|OF 占??占쎈’??蹂묓빀 (MUL/IMUL ??ZF/SF/PF 蹂댁〈).
         let store_cf_of = |instrs: &mut Vec<Instruction>| -> Result<()> {
             instrs.push(Instruction::with(Code::Pushfq));
             instrs.push(
@@ -174,7 +167,6 @@ impl NativeVmHarness {
             Ok(())
         };
 
-        // ZF 占??占쎈’??蹂묓빀 (BSF/BSR).
         let store_zf = |instrs: &mut Vec<Instruction>| -> Result<()> {
             instrs.push(Instruction::with(Code::Pushfq));
             instrs.push(
@@ -203,7 +195,6 @@ impl NativeVmHarness {
             Ok(())
         };
 
-        // CF|ZF 蹂묓빀 (TZCNT/LZCNT).
         let store_cf_zf = |instrs: &mut Vec<Instruction>| -> Result<()> {
             instrs.push(Instruction::with(Code::Pushfq));
             instrs.push(
@@ -232,7 +223,6 @@ impl NativeVmHarness {
             Ok(())
         };
 
-        // ?占쏀깭 ?占쎈’???占쎈옒洹몌옙? ?占쎌젣 x86 ?占쎈옒洹몃줈 蹂듭썝 (setcc/cmovcc/遺꾧린 ?占쎌슜).
         let load_flags_to_hw = |instrs: &mut Vec<Instruction>| -> Result<()> {
             instrs.push(
                 Instruction::with1(Code::Push_rm64, mem(FLAGS_OFF as i64))
@@ -242,7 +232,6 @@ impl NativeVmHarness {
             Ok(())
         };
 
-        // 議곌굔 ?占쏙옙? ??R8L = 0/1. (CounterZero ??regs[1] 寃?? 占????占쎈뱶?占쎌뼱 setcc.)
         let eval_cond = |instrs: &mut Vec<Instruction>, cond: BranchCondition| -> Result<()> {
             if cond == BranchCondition::Always {
                 instrs.push(
@@ -354,7 +343,6 @@ impl NativeVmHarness {
                 instrs.push(Instruction::with2(Code::Mov_rm64_r64, mem(FLAGS_OFF as i64), Register::RAX).map_err(|e| anyhow!("{e}"))?);
                 store(instrs, ins.dst)?;
             }
-            // P0-1: x86 ?뺥솗 ?뚮옒洹??꾩슜 op ????x86 紐낅졊(??퀎)?쇰줈 emit??李몄“? ?숈튂.
             RiscOp::Add { width } => {
                 load(instrs, ins.src1, Register::R10)?;
                 load(instrs, ins.src2, Register::R11)?;
@@ -520,7 +508,6 @@ impl NativeVmHarness {
                         instrs.push(Instruction::with1(Code::Not_rm64, Register::R10).map_err(|e| anyhow!("{e}"))?);
                     }
                 }
-                // x86 NOT? RFLAGS瑜?蹂寃쏀븯吏 ?딅뒗?????뚮옒洹????????
                 store(instrs, ins.dst)?;
             }
             RiscOp::ShiftRight => {
@@ -740,7 +727,6 @@ impl NativeVmHarness {
                 if width == 1 {
                     instrs.push(Instruction::with2(Code::Movzx_r32_rm16, Register::R10, Register::AX).map_err(|e| anyhow!("{e}"))?);
                 } else {
-                    // high ??R9 (??占쏙옙 留덉뒪??, low ??R10, RDX(state base) 蹂듭썝.
                     match width {
                         2 => instrs.push(Instruction::with2(Code::Movzx_r64_rm16, Register::R9, Register::DX).map_err(|e| anyhow!("{e}"))?),
                         4 => instrs.push(Instruction::with2(Code::Mov_r32_rm32, Register::R9D, Register::EDX).map_err(|e| anyhow!("{e}"))?),
@@ -770,7 +756,6 @@ impl NativeVmHarness {
             }
             RiscOp::Divide { signed, width } => {
                 load(instrs, ins.src1, Register::R11)?; // divisor
-                // RDX(state base) 占??占쎈닓?占쎌슜?占쎈줈 ?占쏙옙?占?R8 ??蹂댁〈.
                 instrs.push(Instruction::with2(Code::Mov_r64_rm64, Register::R8, Register::RDX).map_err(|e| anyhow!("{e}"))?);
                 let r8mem = |disp: i64, sz: u32| -> iced_x86::MemoryOperand {
                     iced_x86::MemoryOperand::with_base_index_scale_displ_size(Register::R8, Register::None, 1, disp, sz)
@@ -886,9 +871,6 @@ impl NativeVmHarness {
             }
             RiscOp::VirtualBranch { cond } => {
                 let next_idx = block_index.wrapping_add(1);
-                // 遺꾧린 ???源?釉붾줉???ㅽ뻾?섎뒗 ?숈븞 r12(VIP) = ?源??몃뜳??+ 1 ?댁뼱??
-                // 洹?釉붾줉??tail dispatch 媛 ?ㅼ쓬 ?몃뜳?ㅻ? ?뺥솗???쎈뒗??(?쒖감? ?숈씪 遺덈???.
-                // index 怨꾩궛: rcx = 理쒖쥌 ?몃뜳?? rax = rcx + 1 ??r12; ?먰봽 table[rcx].
                 let emit_branch_jump = |instrs: &mut Vec<Instruction>| -> Result<()> {
                     instrs.push(Instruction::with2(Code::Mov_r64_rm64, Register::RCX, Register::RAX).map_err(|e| anyhow!("{e}"))?);
                     instrs.push(Instruction::with2(Code::Add_rm64_imm8, Register::RAX, 1).map_err(|e| anyhow!("{e}"))?);
@@ -922,7 +904,6 @@ impl NativeVmHarness {
                 }
             }
 RiscOp::NativeCallBridge => {
-                // ?占쏙옙???no-op ???占쏀깭 遺덌옙?, tail dispatch 占??占占쎌쓬 紐낅졊 吏꾪뻾.
             }
             // P1 (③): VmCallBridge — VM→VM 콜 브릿지. 네이티브 하네스에서는 인지된
             // no-op (서브 VM 레지스트리 기반 nested-VM 실행은 런타임 계층). 상용
@@ -930,7 +911,6 @@ RiscOp::NativeCallBridge => {
             // 네이티브로 유지한다.
             RiscOp::VmCallBridge => {}
 RiscOp::Halt => {
-                // ret (caller?占占쎌꽌 泥섎━)
             }
             RiscOp::Trap => {
                 instrs.push(Instruction::with(Code::Ud2));

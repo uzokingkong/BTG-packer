@@ -7,20 +7,13 @@ use anyhow::{anyhow, Result};
 use iced_x86::{Code, Instruction, InstructionBlock, Register};
 
 impl NativeVmHarness {
-    /// ?�적 분기 ?��??�스-IP)??블록 ?�덱?�로 ?�석?�는 ?�캔 ?�퍼.
-    /// ?�력: R10 = ?��?x86 IP. 출력: RAX = 블록 ?�덱??(찾으�?, �?찾으�?
-    /// ?�스?�치 ?�이�?255] (=fallback, ret) �??�프.
-    /// ?��? 브랜�?루프)가 ?�으므�????�스 브랜�??�치�?별도 ?�셈블된??
     pub(super) fn emit_branch_lookup_helper(
         branch_map_va: u64,
         table_base: u64,
     ) -> Result<Vec<u8>> {
-        // 맵�? (ip, index) u64 ??배열, ip == 0 종결??
-        //   r11 = �??�작
         //   loop:
         //     mov rax, [r11]        ; ip
         //     test rax, rax
-        //     jz  not_found         ; 종결??
         //     cmp r10, rax
         //     je  found
         //     add r11, 16
@@ -95,8 +88,6 @@ impl NativeVmHarness {
         );
         instrs.push(Instruction::with1(Code::Jmp_rm64, Register::RAX).map_err(|e| anyhow!("{e}"))?);
 
-        // ???�스 브랜�??�치 (BlockEncoder ??rel8/rel32 �??�동 축소 ???��?IP �?
-        // 추정 ?�프?�으�?반복 ?�정???�렴?�킨??.
         let base = 0x140000000u64;
         let mut ips: Vec<u64> = (0..instrs.len()).map(|_| base).collect();
         let mut code = Vec::new();

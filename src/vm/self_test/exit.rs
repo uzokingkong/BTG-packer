@@ -291,7 +291,6 @@ pub fn run_exit_teardown_test() -> anyhow::Result<()> {
 
             let (vi, mi, vn, mn) = run(&prog, &data, seed)?;
 
-            // mem → al の値, al → mem の値 に交換
             if mi[0] != al_val {
                 return Err(anyhow!(
                     "[32-S2] xchg mem: expected 0x{:02X}, got 0x{:02X} (mem_init=0x{:02X})",

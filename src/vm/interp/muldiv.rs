@@ -136,7 +136,6 @@ pub(crate) fn exec(
             set_vreg64(state, 2, r as u64)?;
             Ok(ip)
         }
-        // ???? v33: 1-op multiply/divide 8/16-bit width (accumulator AX/DX) ??
         OP_MUL_R_R8 => {
             let src = code[ip] as usize;
             let ip = ip + 1;

@@ -544,7 +544,6 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
     //     anti_debug → `pushfq; push rax; mov rax, gs:[0x60]` (9C 50 65 ...),
     //     --vm-oep native → `pushfq; push rax; push rcx` (9C 50 51 ...),
     //     --vm-oep VM → `mov rax, imm64` (48 B8 ...),
-    //     그 외 → `sub rsp, imm32` (48 81 EC ?? ?? ?? ??).
     if ctx.crypto_enabled {
         let ep_local = (entry_rva - ep_sec.rva) as usize;
         let file_off = ep_sec.raw_ptr as usize + ep_local;

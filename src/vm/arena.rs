@@ -2,13 +2,7 @@
 // VM native-execution arena (RWX memory for running generated machine code).
 // ==============================================================================
 //
-// BOUNDARY (由щ럭 吏??#20): ??Arena ??**build/test-time 寃利??뚮뱶諛뺤뒪**?대ŉ
-// ?쒗뭹 PE ?뚯씠?꾨씪??src/pipeline/*)?먮뒗 ?덈? 李몄“?섏? ?딅뒗?? 寃利앸맂 VM 肄붾뱶??// PE 濡?鍮뚮뱶?섏뼱 諛고룷?섍퀬, 諛고룷 ?고??꾩쓽 肄붾뱶 ?섏씠吏??mem_harden ??RW ??RX 濡?// ?꾪솚??W^X) ?ㅽ뻾?쒕떎. ?ш린??Arena 媛 RWX 瑜??곕뒗 ?댁쑀?? VM ??媛숈? 留ㅽ븨??// state(0x6000)/data(0x9000) ?곸뿭??*?ㅽ뻾 以? 吏곸젒 ?쎄퀬 ?곌린 ?뚮Ц??肄붾뱶?
-// ?곗씠?곕? ???섏씠吏 洹몃９?쇰줈 遺꾨━(seal)?????녾린 ?뚮Ц?대떎.
 //
-// P1-2 (W^X): `seal()`/`unseal()`濡?RW ??RX ?꾪솚???쒓났?쒕떎. ?먯껜 ?꾧껐
-// (arena ?곗씠?곕? ?쎌? ?딅뒗) 肄붾뱶??seal(RX) ???ㅽ뻾??W^X 怨꾩빟??吏?????덈떎.
-// 肄붾뱶? ?곗씠?곕? ?꾩쟾??遺꾨━ 留ㅽ븨?쇰줈 ?섎늻???묒뾽???꾩슂?섎㈃ ???뚯씪?먯꽌 ?쒖옉?쒕떎.
 
 use anyhow::{anyhow, Result};
 
@@ -50,7 +44,6 @@ impl Arena {
         unsafe { std::slice::from_raw_parts_mut(self.base as *mut u8, self.size) }
     }
 
-    /// P1-2 (W^X): RW ??RX (seal). ?먯껜 ?꾧껐 肄붾뱶 ?ㅽ뻾 ?꾩뿉 ?몄텧.
     pub fn seal(&self) -> Result<()> {
         // SAFETY: mprotect on our own mapping.
         let r = unsafe {
@@ -158,7 +151,6 @@ mod arena_win {
     const PAGE_READWRITE: u32 = 0x04;
 
     impl Arena {
-        /// P1-2 (W^X): 肄붾뱶瑜?RX濡?怨좎젙(seal)?쒕떎. 洹???`bytes()`濡??곕㈃ AV ??        /// ?곗씠?곕뒗 `unseal` ?꾩뿉留??대떎. (?먯껜 ?꾧껐 肄붾뱶 ?ㅽ뻾 ?쒖뿉留?seal ?ъ슜.)
         pub fn seal(&self) -> Result<()> {
             let mut old = 0u32;
             // SAFETY: VirtualProtect on our own allocation.
@@ -176,7 +168,6 @@ mod arena_win {
             Ok(())
         }
 
-        /// P1-2 (W^X): RX ??RW 濡??섎룎???곗씠??肄붾뱶瑜??ㅼ떆 ?????덇쾶 ?쒕떎.
         pub fn unseal(&self) -> Result<()> {
             let mut old = 0u32;
             // SAFETY: VirtualProtect on our own allocation.
@@ -263,8 +254,6 @@ mod arena_win {
 mod tests {
     use super::*;
 
-    /// P1-2 (W^X): RW濡?肄붾뱶瑜??곌퀬 -> RX(seal)濡??ㅽ뻾?섍퀬 -> RW(unseal)濡??ш린濡?
-    /// sealed ?곹깭?먯꽌 bytes()濡??곕㈃ AV媛 ?섏빞 ?섎?濡?unseal ?꾩뿉留??대떎.
     #[test]
     fn seal_rx_executes_and_unseal_rewrites() {
         let mut a = Arena::new(0x1000).unwrap();

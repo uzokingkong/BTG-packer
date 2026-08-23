@@ -1,18 +1,15 @@
-// ?占?占?arena ?占쎌씠?占쎌썐 ?占쏀봽???占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?
-pub(crate) const OFF_CODE: usize = 0x1000; // ?占쏀뻾 肄붾뱶 (?占쏀듃占?+ 釉붾줉??
-pub(crate) const OFF_TABLE: usize = 0x8000; // ?占쎌뒪?占쎌튂 ?占쎌씠占?(256 x u64)
-pub(crate) const OFF_BYTECODE: usize = 0x9000; // opcode ?占쏀듃占?(怨좎젙??XOR)
-pub(crate) const OFF_STATE: usize = 0xA000; // VM ?占쏀깭 踰꾪띁
-pub(crate) const OFF_STACK_BASE: usize = 0xE000; // 媛???占쏀깮 理쒖긽??(?占쎈옒占??占쎌옣, 8KiB)
-pub(crate) const OFF_BRANCH_MAP: usize = 0xB000; // 遺꾧린 ?占쎌꽍 占?((ip, index) u64 ?? ???占쎌쟻 遺꾧린??
+pub(crate) const OFF_CODE: usize = 0x1000;
+pub(crate) const OFF_TABLE: usize = 0x8000;
+pub(crate) const OFF_BYTECODE: usize = 0x9000;
+pub(crate) const OFF_STATE: usize = 0xA000;
+pub(crate) const OFF_STACK_BASE: usize = 0xE000;
+pub(crate) const OFF_BRANCH_MAP: usize = 0xB000;
 pub(crate) const ARENA_SIZE: usize = 0x40000;
 
-// ?占?占??占쏀깭 踰꾪띁 ?占쎌씠?占쎌썐 (OFF_STATE 湲곤옙?) ?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?占?
 pub(crate) const REGS_OFF: usize = 0x000; // [u64;16]
 pub(crate) const TEMPS_OFF: usize = 0x080; // [u64;8]
 pub(crate) const FLAGS_OFF: usize = 0x0C0; // u64
 pub(crate) const VSP_OFF: usize = 0x0C8; // u64
 pub(crate) const STATE_END: usize = 0x100;
 
-// 李몄“媛 媛깆떊?占쎈뒗 ?占쎈옒占?鍮꾪듃 (CF|ZF|SF|OF) ??PF/AF??蹂댁〈.
 pub(crate) const FLAG_MASK: u64 = 0x8D5; // CF|PF|AF|ZF|SF|OF // CF|PF|ZF|SF|OF  (PF bit 2 added)

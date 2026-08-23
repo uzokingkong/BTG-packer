@@ -124,7 +124,6 @@ pub(crate) fn exec(
             set_vreg64(state, dst, rip.wrapping_add(rel))?;
             Ok(ip)
         }
-        // ???? v43: gs:/fs: ?硫몃젃?믪눛??PEB/TEB) ??vreg[dst] = STATE_SEG_GS + sext(disp32)
         OP_LEA_GS => {
             let dst = code[ip] as usize;
             let disp = i32::from_le_bytes(code[ip + 1..ip + 5].try_into().unwrap()) as i64 as u64;

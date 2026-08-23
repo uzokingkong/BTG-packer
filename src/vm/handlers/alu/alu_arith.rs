@@ -96,7 +96,6 @@ pub(crate) fn emit_rol_r_imm8(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     );
 }
 
-// ?? 0x14 ROR r,imm8  (op, r, imm8) ??v10 (媛뺥솕??key_mix??ror) ????????????
 pub(crate) fn emit_ror_r_imm8(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     hdr(
         seq,
@@ -260,7 +259,6 @@ pub(crate) fn emit_test(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     }
 }
 
-// ?? A-2 蹂닿컯 (v25) ??OR / NEG / NOT / 64-bit shift ????????????????????????
 // 0x42-0x45 OR r,r / r,r64 / r,imm32 / r,imm64 (logical flags)
 pub(crate) fn emit_or_rr(seq: &mut Vec<(Instruction, Option<Cl>)>) {
     for (op, code, is64) in [
