@@ -1,265 +1,574 @@
-# Ouroboros
+# BTG Packer
 
-**Windows x86-64 PE Transformation, Program Virtualization & Runtime Hardening Framework — written in Rust**
+### Windows x86-64 PE Transformation & Program Virtualization Framework
 
-Ouroboros는 Windows PE32+ 실행 파일을 대상으로 **제어 흐름 재구성, 프로그램 가상화, 코드 암호화, import 은닉, 무결성 검사, 메모리 권한 강화, PE 재구성 및 실행 차등 검증**을 수행하는 연구용 바이너리 보호 프레임워크입니다.
+[🇰🇷 한국어 문서 보기](README.ko.md)
 
-단순히 원본 코드를 암호화한 뒤 시작 시 복호화하는 형태의 packer가 아니라, 입력 프로그램을 분석해 CFG와 함수 ownership을 구성하고 선택한 protection profile에 따라 **native transformation pipeline** 또는 **x86-64 → RISC IR → polymorphic Program-VM pipeline**으로 변환합니다.
+![Language](https://img.shields.io/badge/language-Rust-orange)
+![Platform](https://img.shields.io/badge/platform-Windows%20x86--64-blue)
+![Binary Format](https://img.shields.io/badge/format-PE32%2B-informational)
+![Architecture](https://img.shields.io/badge/architecture-x86--64-lightgrey)
+![Status](https://img.shields.io/badge/status-research%20prototype-yellow)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-> **Research prototype.**
-> Windows x86-64 user-mode PE를 대상으로 하며, 자신이 소유하거나 분석 권한이 있는 바이너리에만 사용하세요.
+**BTG Packer** is a research-oriented Windows x86-64 binary protection framework written in Rust.
 
----
+Instead of treating a PE file as a single opaque payload, BTG analyzes the executable, reconstructs a program model, transforms native control flow, optionally lifts supported x86-64 code into an internal RISC representation, builds a polymorphic Program-VM, applies runtime protection layers, reconstructs the PE image, and validates the resulting executable.
 
-## Highlights
+The project combines several areas that are usually implemented independently:
 
-### PE Transformation Engine
+* PE32+ parsing and reconstruction
+* x86-64 decoding and control-flow analysis
+* basic-block transformation
+* RIP-relative and branch fixups
+* x86-64 → RISC lifting
+* function-level virtualization ownership
+* polymorphic virtual instruction sets
+* multi-family VM profiles
+* rolling-key bytecode encoding
+* native threaded VM execution
+* runtime code/data protection
+* import hiding
+* integrity verification
+* deterministic builds
+* post-build structural validation
+* execution differential testing
 
-* PE32+ header / section / directory 분석
-* x86-64 instruction decoding with `iced-x86`
-* basic-block CFG extraction
-* control-flow target validation
-* block slicing and layout shuffling
-* RIP-relative reference reconstruction
-* direct branch fixup
-* relocation reconstruction
-* import/resource/exception metadata 처리
-* `.pdata` / unwind metadata 보존 및 재구성
-* TLS / load-config / code-pointer 분석 지원
-* 출력 PE 재파싱 및 구조 검증
-
-### Whole-Program Virtualization
-
-* x86-64 → internal RISC micro-IR lifter
-* function-level VM ownership analysis
-* unsupported instruction evidence tracking
-* SEH / panic / setjmp / longjmp boundary policy
-* native / VM function separation
-* function-scoped VM family assignment
-* cross-family canonical routing
-* native-call and VM-call bridge
-* polymorphic build-local virtual ISA
-* native self-decoding threaded runtime
-
-### Runtime Protection
-
-* BTG-C1 custom stream-cipher path
-* ChaCha20 / Poly1305 authenticated bulk protection path
-* rolling-key VM bytecode encoding
-* build-local opcode permutation
-* virtual-register permutation
-* branch-condition encoding
-* operand encoding / masking
-* VM handler synthesis
-* super-operator fusion
-* distributed integrity descriptors
-* M7 runtime bytecode/block lifecycle protection
-* M8 handler-table concealment
-* runtime IAT reconstruction
-* W^X-oriented memory hardening
-* payload relocation into non-executable storage
-* `RT_RCDATA` payload registration
-* anti-debug policies
-
-### Verification & Reproducibility
-
-* deterministic `--seed` builds
-* post-build PE structural validation
-* requested-vs-effective protection validation
-* whole-program VM coverage gate
-* original/protected execution differential testing
-* multi-seed build + execution gate
-* SHA-256 build manifest
-* VM ownership reports
-* bytecode/source mapping
-* symbolic function/block mapping
+> [!WARNING]
+> BTG Packer is a **security research prototype**, not a production commercial protector.
+>
+> It is intended for binaries you own or are explicitly authorized to analyze or transform.
 
 ---
 
-# Architecture
+## Repository Description
+
+> **Windows x86-64 binary protection framework implementing x86→RISC lifting, polymorphic Program-VMs, rolling-key bytecode, PE reconstruction, runtime hardening, and differential execution verification.**
+
+Suggested GitHub topics:
 
 ```text
-                         Input PE32+
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │   PE Analyzer   │
-                    │ sections / dirs │
-                    │ imports / TLS   │
-                    │ pdata / reloc   │
-                    └────────┬────────┘
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │ Program Model   │
-                    │ CFG + functions │
-                    │ code pointers   │
-                    │ switch targets  │
-                    └────────┬────────┘
-                             │
-                 ┌───────────┴────────────┐
-                 │                        │
-                 ▼                        ▼
-        Native CFG Pipeline        Program-VM Pipeline
-                 │                        │
-          block slicing             x86-64 decode
-                 │                        │
-          layout shuffle                  ▼
-                 │                   RISC Lifter
-          RIP/branch fixup                │
-                 │                        ▼
-            MBA transform          Ownership Analysis
-                 │                        │
-                 │                VM / Native decision
-                 │                        │
-                 │                        ▼
-                 │                Multi-Family Plan
-                 │                        │
-                 │                        ▼
-                 │                Polymorphic ISA
-                 │                        │
-                 │                        ▼
-                 │                Rolling-Key Encode
-                 │                        │
-                 │                        ▼
-                 │              Native Threaded Runtime
-                 │                        │
-                 └────────────┬───────────┘
-                              │
-                              ▼
-                    Runtime Protection
-                              │
-                ┌─────────────┼─────────────┐
-                │             │             │
-             Crypto       Integrity     IAT / Memory
-                │             │             │
-                └─────────────┼─────────────┘
-                              │
-                              ▼
-                       PE Reconstruction
-                              │
-                              ▼
-                      Structural Validation
-                              │
-                              ▼
-                     Effective-Profile Gate
-                              │
-                              ▼
-                    Execution Differential
-                              │
-                              ▼
-                        Protected PE
+rust
+windows
+x86-64
+pe
+pe32-plus
+binary-protection
+program-virtualization
+virtual-machine
+reverse-engineering
+binary-analysis
+obfuscation
+risc
+cryptography
+security-research
 ```
 
 ---
 
-# Program-VM
+# Overview
 
-`--vm --vm-oep --vm-commercial`은 BTG의 whole-program virtualization 경로를 활성화합니다.
+BTG contains two major transformation paths.
 
-```text
-x86-64 machine code
-        │
-        ▼
-   CFG / function model
-        │
-        ▼
-   Commercial RISC Lifter
-        │
-        ▼
-      RISC IR
-        │
-        ▼
- Function Ownership Gate
-        │
-        ├── unsupported / unsafe ──► Native
-        │
-        ▼
- Multi-Family Partition
-        │
-        ▼
- Polymorphic Virtual ISA
-        │
-        ▼
- Rolling-Key Bytecode
-        │
-        ▼
- Self-Decoding Native Runtime
-        │
-        ▼
- VM / Native Bridge
-```
+### Native CFG Protection
 
-## RISC Intermediate Representation
+The original x86-64 program remains native code, but BTG reconstructs its control-flow graph, transforms basic blocks, rewrites branches and RIP-relative references, and applies runtime protection around the transformed program.
 
-Program-VM은 원본 x86 instruction을 그대로 `VM_MOV`, `VM_ADD` 같은 1:1 opcode로 복사하는 구조가 아닙니다.
+### Program Virtualization
 
-먼저 x86-64 instruction semantics를 내부 RISC micro-operation으로 변환합니다.
+Supported x86-64 program regions are lifted into an internal RISC representation and compiled into a generated virtual instruction set executed by a native VM runtime.
 
-지원 IR에는 산술/논리뿐 아니라 다음 계열이 포함됩니다.
+The Program-VM pipeline is approximately:
 
 ```text
-Arithmetic / Carry / Borrow
-Shift / Rotate
-Memory Read / Write
-Virtual Stack
-Virtual Branch / Return
-Conditional Move / Setcc
-Multiply / Divide
-Atomic Operations
-Bit Operations
-Packed SIMD Operations
-Native / VM Bridge Operations
+Original PE32+
+      │
+      ▼
+PE / Program Analysis
+      │
+      ▼
+Function + CFG Reconstruction
+      │
+      ▼
+x86-64 Decoder
+      │
+      ▼
+RISC Lifter
+      │
+      ▼
+Ownership / Safety Analysis
+      │
+      ├──────────────► Native fallback
+      │
+      ▼
+Multi-Family VM Planning
+      │
+      ▼
+Polymorphic ISA Generation
+      │
+      ▼
+RISC → Virtual Instruction Encoding
+      │
+      ▼
+Rolling-Key Bytecode
+      │
+      ▼
+Native Threaded VM Runtime
+      │
+      ▼
+VM / Native Bridge
+      │
+      ▼
+Runtime Protection Layer
+      │
+      ▼
+PE Reconstruction
+      │
+      ▼
+Structural + Capability Validation
+      │
+      ▼
+Optional Execution Differential Test
 ```
-
-이 중 현재 polymorphic backend가 안전하게 실행할 수 있는 operation만 Program-VM ownership을 받을 수 있습니다.
 
 ---
 
-# Function Ownership & Coverage
+# Design Goals
 
-Program-VM은 lift 실패를 무시하고 잘못된 bytecode를 생성하지 않습니다.
+BTG is primarily an experimental platform for studying how binary transformation, virtualization and PE reconstruction interact.
 
-함수에 안전성을 증명하기 어려운 instruction이나 runtime boundary가 존재하면 해당 함수는 native ownership으로 분류할 수 있습니다.
+The implementation is designed around several principles.
 
-대표적인 exclusion reason은 다음과 같습니다.
+### Preserve observable program behavior
+
+Transformations should not intentionally change:
 
 ```text
-seh-or-panic-policy
-setjmp-longjmp-policy
-legacy-high-byte-register
-semantic-dependency-closure
-integration-quarantine
-ambiguous-function-boundary
-unsupported-instruction
-unsupported-vm-opcode
-analysis-failure
+exit status
+stdout
+stderr
+program control flow
+required imports
+runtime state
 ```
 
-`--vm-commercial` production build는 기본적으로 **전체 VM coverage를 검증**합니다.
+The `--verify-output` mode can execute both binaries and compare their externally observable results.
 
-VM bytecode가 존재하더라도:
+### Fail instead of silently producing incomplete virtualization
 
-* 원본 executable `.text`가 여전히 실행 가능하거나
-* 함수/block/instruction VM coverage가 완전하지 않으면
+Commercial Program-VM builds normally require measured virtualization coverage to satisfy the production coverage gate.
 
-기본 production gate에서 실패합니다.
-
-개발 목적으로만 부분 virtualization을 허용하려면:
+Partial VM coverage can only be explicitly enabled for development with:
 
 ```powershell
 --allow-partial-vm
 ```
 
-을 명시해야 합니다.
+### Separate analysis from transformation
 
-`--allow-partial-vm`과 `--strict-profile`은 동시에 사용할 수 없습니다.
+BTG constructs program information before rewriting the image.
+
+This includes information about:
+
+* executable regions
+* functions
+* basic blocks
+* direct branches
+* indirect targets
+* pointer tables
+* code pointers
+* CRT-related structures
+* exception metadata
+* relocation information
+* imports
+* resources
+
+### Keep builds reproducible when requested
+
+A user-supplied seed controls the deterministic random sources used by transformation passes.
+
+```powershell
+--seed 31010
+```
+
+The same input, configuration and seed are intended to produce reproducible transformation decisions.
 
 ---
 
-# Multi-Family VM
+# High-Level Architecture
 
-Program-VM에는 다음 architecture family domain이 구현되어 있습니다.
+```text
+┌──────────────────────────────────────────────────────────────┐
+│                         Input PE32+                          │
+└──────────────────────────────┬───────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────┐
+│                         PE Analysis                          │
+│                                                              │
+│  Sections      Imports       Relocations      Resources      │
+│  Exception     TLS           Load Config      Code Pointers  │
+└──────────────────────────────┬───────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────┐
+│                     Program Reconstruction                   │
+│                                                              │
+│      CFG → Functions → Basic Blocks → Indirect Targets      │
+└──────────────────────────────┬───────────────────────────────┘
+                               │
+                 ┌─────────────┴──────────────┐
+                 │                            │
+                 ▼                            ▼
+┌────────────────────────┐       ┌────────────────────────────┐
+│ Native CFG Pipeline    │       │ Program-VM Pipeline        │
+│                        │       │                            │
+│ Block slicing          │       │ x86 → RISC                │
+│ Layout shuffle         │       │ Ownership analysis         │
+│ Branch rewriting       │       │ Family partitioning        │
+│ RIP fixups             │       │ Polymorphic ISA            │
+│ MBA transforms         │       │ Bytecode generation        │
+└───────────┬────────────┘       │ Native VM runtime          │
+            │                    └──────────────┬─────────────┘
+            │                                   │
+            └───────────────────┬───────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    Runtime Protection Layer                  │
+│                                                              │
+│   Crypto      Integrity      IAT Hiding      Memory Policy   │
+│   M7/M8       Anti-Debug     Payload Storage Resource Data   │
+└──────────────────────────────┬───────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────┐
+│                       PE Reconstruction                      │
+│                                                              │
+│ Sections → Directories → Relocations → pdata → Entry Point  │
+└──────────────────────────────┬───────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────┐
+│                           Validation                         │
+│                                                              │
+│ Structural PE Validation                                    │
+│ Protection Capability Validation                            │
+│ VM Coverage Validation                                      │
+│ Optional Runtime Differential Verification                  │
+└──────────────────────────────┬───────────────────────────────┘
+                               │
+                               ▼
+                         Protected PE
+```
+
+---
+
+# PE Analysis and Reconstruction
+
+BTG does not simply append a loader to an existing executable.
+
+The PE subsystem analyzes and later reconstructs information required by the transformed image.
+
+Relevant code is primarily located under:
+
+```text
+src/pe/
+src/analysis/
+src/pipeline/validate/
+```
+
+The implementation handles or analyzes structures including:
+
+```text
+DOS / NT headers
+PE32+ optional header
+section table
+imports
+base relocations
+resource directory
+exception directory
+.pdata / RUNTIME_FUNCTION
+TLS metadata
+load configuration
+code pointers
+image layout
+entry point
+```
+
+BTG also contains dedicated analysis for less direct control-flow information.
+
+Examples include:
+
+```text
+analysis/code_pointers.rs
+analysis/indirect_targets.rs
+analysis/indirect_resolver.rs
+analysis/pointer_tables.rs
+analysis/switch_targets.rs
+analysis/switch_producer.rs
+analysis/crt.rs
+```
+
+This information is important because rewriting executable code without tracking non-obvious references to that code can produce a structurally valid PE that crashes at runtime.
+
+---
+
+# Native CFG Transformation
+
+The native protection pipeline operates on decoded x86-64 basic blocks.
+
+Its responsibilities include:
+
+```text
+instruction decoding
+basic-block discovery
+CFG construction
+block slicing
+block layout randomization
+branch reconstruction
+RIP-relative fixups
+encoded output generation
+dispatcher integration
+```
+
+A simplified native transformation is:
+
+```text
+Original .text
+     │
+     ▼
+x86-64 Decode
+     │
+     ▼
+Basic Blocks
+     │
+     ▼
+CFG
+     │
+     ▼
+Block Slicing
+     │
+     ▼
+Block Shuffle
+     │
+     ▼
+Branch / RIP Reconstruction
+     │
+     ▼
+Dispatcher / Runtime Integration
+     │
+     ▼
+Transformed Native Code
+```
+
+Block relocation requires BTG to recalculate references whose original displacement depended on instruction location.
+
+Examples include:
+
+```asm
+call rel32
+jmp rel32
+jcc rel32
+
+mov rax, [rip + displacement]
+lea rcx, [rip + displacement]
+```
+
+The transformation pipeline therefore maintains layout and fixup information instead of blindly copying instruction bytes.
+
+---
+
+# Program-VM
+
+The Program-VM backend is enabled with:
+
+```powershell
+--vm --vm-oep --vm-commercial
+```
+
+The commercial Program-VM path is built around an intermediate RISC representation rather than directly assigning one virtual opcode to every original x86 instruction.
+
+```text
+x86-64
+   │
+   ▼
+RISC semantic operations
+   │
+   ▼
+optimization / transformation
+   │
+   ▼
+polymorphic virtual ISA
+   │
+   ▼
+encoded VM bytecode
+   │
+   ▼
+native threaded runtime
+```
+
+This separation allows the original x86 encoding and the final VM bytecode encoding to be different abstraction layers.
+
+---
+
+# x86-64 → RISC Lifting
+
+The lifter translates supported native instructions into internal semantic operations.
+
+Relevant implementation areas include:
+
+```text
+src/vm/lifter/
+src/vm/risc/
+src/vm/canonical_semantics.rs
+src/vm/semantics.rs
+```
+
+The RISC layer contains semantics for substantially more than basic `MOV`, `ADD` and `XOR` operations.
+
+Implemented areas include operations related to:
+
+```text
+integer arithmetic
+carry / borrow
+logical operations
+shifts
+rotates
+comparisons
+condition evaluation
+memory loads
+memory stores
+virtual stack operations
+branches
+returns
+multiplication
+division
+bit scanning
+bit manipulation
+atomic operations
+conditional moves
+selected SIMD semantics
+register state
+flag state
+VM/native transitions
+```
+
+The important architectural distinction is:
+
+```text
+x86 instruction != final VM opcode
+```
+
+For example, the pipeline is conceptually allowed to transform:
+
+```text
+x86 ADD
+   │
+   ▼
+RISC semantic representation
+   │
+   ▼
+transformed RISC sequence
+   │
+   ▼
+build-local virtual instruction encoding
+```
+
+instead of requiring:
+
+```text
+x86 ADD → VM_ADD
+```
+
+---
+
+# Function Ownership
+
+Not every decoded function is automatically considered safe to virtualize.
+
+BTG tracks function ownership and determines whether a function can be placed in the Program-VM or must remain native.
+
+Conceptually:
+
+```text
+                 Function
+                    │
+                    ▼
+             Decode + Analyze
+                    │
+          ┌─────────┴─────────┐
+          │                   │
+        Safe               Unsafe /
+          │               Unsupported
+          ▼                   │
+       VM-owned               ▼
+                           Native-owned
+```
+
+Ownership decisions can be affected by conditions such as:
+
+```text
+unsupported instructions
+unsupported VM semantics
+ambiguous function boundaries
+SEH / unwind constraints
+panic-related boundaries
+setjmp / longjmp behavior
+semantic dependency closure
+analysis failures
+explicit integration quarantine
+```
+
+The ownership system prevents the virtualizer from claiming coverage over code it cannot safely represent.
+
+---
+
+# Production VM Coverage Gate
+
+A Program-VM image existing in the output file does not automatically mean that the original executable has actually been virtualized completely.
+
+BTG therefore measures coverage.
+
+The validation pipeline checks coverage at multiple levels, including:
+
+```text
+functions
+basic blocks
+instructions
+```
+
+For normal commercial Program-VM builds, incomplete measured coverage causes the build to fail.
+
+Development builds may explicitly bypass this requirement:
+
+```powershell
+--allow-partial-vm
+```
+
+This option is intentionally incompatible with:
+
+```powershell
+--strict-profile
+```
+
+This distinction is useful because it separates:
+
+```text
+"the VM backend successfully generated something"
+```
+
+from:
+
+```text
+"the requested program virtualization actually covers the program"
+```
+
+---
+
+# Multi-Family VM Model
+
+BTG defines four Program-VM architecture families:
 
 ```text
 Stack
@@ -268,213 +577,421 @@ MixedRisc
 FusedCisc
 ```
 
-함수는 build seed와 안정적인 function identifier를 기반으로 family에 결정적으로 할당됩니다.
+The architecture-family layer is separate from simple opcode permutation.
 
-각 family는 별도의 ISA domain을 사용하며 build 과정에서 family-scoped opcode/operand encoding이 생성됩니다.
+A family profile contains parameters such as:
 
 ```text
-Function A ──► Stack family
-Function B ──► MixedRisc family
-Function C ──► Register family
-Function D ──► FusedCisc family
+virtual register count
+native operand width
+variable-width operand behavior
+flag model
+dispatch topology
+VM calling convention
+ISA domain separator
 ```
 
-family가 다른 함수 사이의 제어 이동은 canonical VM state를 사용하는 cross-family bridge를 통해 연결됩니다.
+The currently defined profiles are:
+
+| Family    | Registers | Native Width | Flag Model     | Dispatch Profile  | Call Convention |
+| --------- | --------: | -----------: | -------------- | ----------------- | --------------- |
+| Stack     |         8 |       64-bit | Lazy stack     | Call/return       | Stack frame     |
+| Register  |        16 |       64-bit | Packed         | Direct threaded   | Register window |
+| MixedRisc |        24 |       32-bit | Split          | Indirect threaded | Descriptor      |
+| FusedCisc |        12 |       64-bit | Producer token | Distributed       | Continuation    |
+
+These family descriptions act as part of the VM ABI/profile contract.
+
+Function-family selection is deterministic from the build seed and a stable function identifier.
+
+Conceptually:
 
 ```text
-VM Family A
-    │
-    │ canonical registers / flags
-    ▼
-Cross-VM Bridge
-    │
-    ▼
-VM Family B
+Program
+ │
+ ├── Function A ──► Stack
+ │
+ ├── Function B ──► Register
+ │
+ ├── Function C ──► MixedRisc
+ │
+ └── Function D ──► FusedCisc
 ```
 
 ---
 
-# Per-Build Polymorphic ISA
+# Cross-Family VM Bridge
 
-Program-VM의 bytecode format은 하나의 고정 opcode table만 사용하는 구조가 아닙니다.
+When control moves between functions assigned to different VM families, BTG defines a canonical state representation for the transition.
 
-build seed에서 다음 값들이 파생됩니다.
+The cross-family bridge uses a canonical register image and packed flags as an interchange ABI.
+
+```text
+Family A private state
+        │
+        ▼
+Canonical VM State
+        │
+        ├── registers
+        └── flags
+        │
+        ▼
+Family B private state
+```
+
+This prevents a VM family from directly assuming that another family's private register layout or calling convention is identical.
+
+---
+
+# Polymorphic Virtual ISA
+
+The Program-VM does not rely only on one permanently fixed opcode mapping.
+
+The polymorphic layer generates build-dependent encoding information.
+
+This includes mechanisms around:
 
 ```text
 opcode mapping
-register permutation
-branch-condition mapping
-operand mask
-family ISA domain
+virtual register mapping
+condition encoding
+operand encoding
+family-specific domains
+handler generation choices
 rolling-key state
-handler synthesis decisions
 ```
 
-따라서 서로 다른 seed를 사용한 build는 동일한 원본 프로그램에서도 다른 virtual encoding을 생성할 수 있습니다.
+A different build seed can therefore alter the virtual representation even when the original native code is unchanged.
 
-```powershell
-btg-packer.exe ... --seed 31010
-```
-
-동일한 input + 동일한 configuration + 동일한 seed는 재현 가능한 build를 목표로 합니다.
-
----
-
-# Rolling-Key Self-Decoding VM
-
-Program-VM bytecode는 build-local rolling key를 사용합니다.
-
-각 byte의 decode state가 stream position과 이전 state에 종속되므로 VM runtime은 현재 virtual instruction 위치와 key state를 함께 유지합니다.
-
-native runtime은 bytecode를 decode한 뒤 virtual opcode에 대응하는 handler로 제어를 전달합니다.
-
-branch가 발생하면 branch map을 통해 대상 bytecode offset을 계산하고 rolling-key state를 해당 위치에 맞게 재동기화합니다.
-
----
-
-# Super-Operator Fusion
-
-반복되는 RISC sequence 중 production allow-list에 포함된 패턴은 build-local super-operation으로 fusion될 수 있습니다.
-
-예:
+Conceptually:
 
 ```text
-primitive A
-primitive B
-primitive C
-
-        ↓
-
-build-local fused handler
+same input program
+       │
+       ├──── seed A ───► VM encoding A
+       │
+       ├──── seed B ───► VM encoding B
+       │
+       └──── seed C ───► VM encoding C
 ```
 
-이를 통해 일부 연산 sequence에서 VM dispatch boundary 자체를 줄일 수 있습니다.
-
-control-flow target이나 bridge boundary를 가로지르는 fusion은 허용하지 않습니다.
+while the same deterministic seed can reproduce the same transformation decisions.
 
 ---
 
-# Protection Layers
+# Family-Scoped ISA Encoding
 
-| Feature                  | Implementation                                                                |
-| ------------------------ | ----------------------------------------------------------------------------- |
-| `--integrity`            | boot/runtime integrity checks 및 Program-VM protected-region descriptors       |
-| `--iat-hide`             | loader-visible import를 최소 resolver set으로 줄이고 나머지 API를 runtime에 복원             |
-| `--mem-harden`           | immutable code/table과 mutable VM state의 권한 분리 및 runtime protection transition |
-| `--payload-relocate`     | protected payload를 non-executable `.vdata` storage로 이동                        |
-| `--rsrc-register`        | relocated payload를 `RT_RCDATA` resource로 등록                                   |
-| `--m7`                   | native 또는 commercial Program-VM의 runtime re-encryption/chunk lifecycle 보호     |
-| `--m8`                   | VM handler table address concealment                                          |
-| `--anti-debug`           | runtime debugger checks + selectable failure policy                           |
-| `--dispatcher-reencrypt` | native CFG block 단위 runtime decrypt/re-encrypt                                |
-| `--crypto-coverage`      | bulk encryption 적용 범위 제어                                                      |
+Each architecture family receives a separate ISA domain.
+
+This allows family-local transformations to use different encoding behavior without accidentally mixing VM ABIs.
+
+The family-specific ISA layer includes differing policies for areas such as:
+
+```text
+operand ordering
+condition token representation
+branch target representation
+register encoding
+domain separation
+```
+
+This is more than a single global:
+
+```text
+opcode → shuffled opcode
+```
+
+mapping.
+
+The family identity participates in how VM data is represented.
 
 ---
 
-# Cryptography
+# Native Threaded Runtime
 
-BTG에는 두 production crypto path가 존재합니다.
+The generated bytecode is consumed by native x86-64 VM runtime code.
 
-## ChaCha20 / Poly1305
+Relevant implementation is primarily located under:
 
-bulk at-rest encryption 경로에서는 RFC 8439 기반 ChaCha20과 Poly1305 verification logic이 구현되어 있습니다.
+```text
+src/vm/threaded/
+src/vm/threaded/poly_direct/
+```
+
+The threaded VM layer contains infrastructure for:
+
+```text
+handler generation
+handler layout
+dispatch
+VM context access
+operand decoding
+branch handling
+native bridges
+fault isolation tests
+runtime integrity interaction
+super-operation handling
+```
+
+The production Program-VM path therefore ultimately executes:
+
+```text
+VM bytecode
+    │
+    ▼
+native decoder / dispatcher
+    │
+    ▼
+generated native handlers
+    │
+    ▼
+VM state mutation
+    │
+    ▼
+next virtual instruction
+```
+
+rather than using a Rust interpreter inside the protected executable.
+
+---
+
+# Rolling-Key Bytecode
+
+BTG contains rolling-key encoding for VM bytecode.
+
+The decoding state evolves while bytecode is consumed rather than treating the entire bytecode stream as an independently XORed static array.
+
+Conceptually:
+
+```text
+bytecode[n]
+    +
+state[n]
+    │
+    ▼
+decode
+    │
+    ▼
+instruction[n]
+    │
+    ▼
+state[n + 1]
+```
+
+Control-flow changes require the VM to preserve or reconstruct the state associated with the target bytecode location.
+
+This is integrated with VM branch metadata rather than assuming all virtual code executes linearly.
+
+---
+
+# Handler Polymorphism
+
+Handler generation also contains code-generation strategy selection.
+
+Defined strategies include:
+
+```text
+DirectRegister
+InlineDecode
+FusedDispatch
+JunkPadded
+```
+
+The strategy can be selected from build-specific information rather than forcing every handler to use exactly one native implementation shape.
+
+This provides an additional transformation layer beyond opcode permutation alone.
+
+---
+
+# Super-Operator / Fusion Infrastructure
+
+The VM contains infrastructure for combining eligible operation sequences.
+
+Instead of always executing:
+
+```text
+OP_A
+dispatch
+
+OP_B
+dispatch
+
+OP_C
+dispatch
+```
+
+an eligible sequence can conceptually become:
+
+```text
+OP_ABC
+dispatch
+```
+
+Fusion must respect semantic and control-flow boundaries.
+
+The goal is to allow some RISC sequences to be represented by generated compound behavior rather than requiring a dispatcher transition for every primitive semantic operation.
+
+---
+
+# M7 — Runtime Re-Encryption
+
+`--m7` enables the M7 protection path.
+
+M7 has separate applicability rules depending on the selected execution mode.
+
+The profile resolver supports M7 for:
+
+```text
+native mode
+```
+
+or:
+
+```text
+--vm --vm-oep --vm-commercial
+```
+
+It is not treated as a generic flag that can be meaningfully attached to every VM configuration.
+
+In the runtime re-encryption path, protected units are stored encrypted and decrypted around their execution lifecycle.
+
+The design goal is to reduce the amount of protected executable content simultaneously available as plaintext in memory.
+
+For Program-VM configurations, M7 is integrated with the bytecode/runtime lifecycle rather than simply applying the native dispatcher implementation unchanged.
+
+---
+
+# M8 — Handler Table Concealment
+
+`--m8` applies when VM functionality is active.
+
+M8 protects VM handler table entries so that the table does not directly contain plainly readable native handler addresses.
+
+The implementation combines keyed transformation with MBA-style reconstruction logic.
+
+Conceptually:
+
+```text
+plain handler VA
+       │
+       ▼
+keyed table representation
+       │
+       ▼
+runtime key reconstruction
+       │
+       ▼
+handler target
+```
+
+M8 is therefore focused specifically on VM runtime metadata rather than general PE encryption.
+
+---
+
+# Runtime Cryptography
+
+BTG currently contains two main cryptographic paths:
+
+```text
+BTG-C1
+ChaCha20
+```
+
+with Poly1305 support also present in the cryptographic subsystem.
+
+## ChaCha20
+
+The profile resolver currently selects:
+
+```text
+ChaCha20
+```
+
+when no explicit `--crypto-mode` is supplied.
+
+For compatible bulk at-rest encryption configurations, the native boot path uses ChaCha20-compatible code and seed-derived key/nonce material.
 
 ```powershell
 --crypto-mode chacha20
 ```
 
-현재 protection-profile resolver의 기본 crypto mode는 `chacha20`입니다.
-
-단, VM / VM-OEP / runtime re-encryption 계열은 현재 별도의 C1 runtime path를 사용합니다.
-
 ## BTG-C1
+
+BTG-C1 is the project's custom stream-cipher-oriented protection primitive.
 
 ```powershell
 --crypto-mode c1
 ```
 
-BTG-C1은 프로젝트 내부에서 설계한 custom 512-bit-state stream cipher입니다.
-
-reference implementation, native runtime implementation 및 protection pipeline 연결이 존재하지만 **독립적인 암호학적 감사를 받은 표준 암호가 아닙니다.**
-
-따라서 BTG-C1은 cryptographic standard가 아니라 binary-protection research primitive로 취급해야 합니다.
-
-RC4 production mode는 제거되었습니다.
+The C1 implementation includes:
 
 ```text
---rc4             → explicit error
---crypto-mode rc4 → invalid CLI value
+state representation
+key scheduling
+round/permutation components
+native implementation support
+region encryption support
+runtime integration
 ```
 
----
+BTG-C1 is used by VM and runtime protection configurations that require the C1 native runtime ABI.
 
-# IAT Hiding
+### Requested Mode vs Effective Mode
 
-`--iat-hide`는 원본 import metadata를 그대로 노출하는 대신 runtime API resolution을 사용합니다.
+This distinction is important.
 
-출력 PE의 loader-visible import는 최소 resolver API로 축소되고, boot runtime이 원본 import table 정보를 이용해 필요한 API 주소를 다시 채웁니다.
+The resolver may request:
 
 ```text
-PE Loader
-   │
-   ▼
-LoadLibraryA / GetProcAddress
-   │
-   ▼
-BTG Runtime Resolver
-   │
-   ▼
-Original IAT Slots
+ChaCha20
 ```
 
-DLL/function name metadata는 runtime resolve table에 별도로 저장됩니다.
+but some protection modes are not compatible with the current ChaCha20 boot/runtime implementation.
 
----
+Current VM and runtime re-encryption paths therefore select the C1 runtime path when necessary.
 
-# Memory Hardening
-
-`--mem-harden`은 bootstrap 이후 immutable executable region과 mutable runtime state의 권한을 분리합니다.
-
-목표 runtime contract는 다음과 같습니다.
+Conceptually:
 
 ```text
-bootstrap/decrypt
-      │
-      ▼
-integrity verification
-      │
-      ▼
-immutable executable data ──► RX
-mutable VM state          ──► RW
+Requested Crypto Mode
+        │
+        ▼
+Protection Profile
+        │
+        ▼
+Compatibility Resolution
+        │
+        ▼
+Effective Runtime Crypto Mode
 ```
 
-runtime protection transition 실패는 fail-closed 처리됩니다.
+The build manifest records the effective protection state.
 
-`--dispatcher-reencrypt`는 native code page에 계속 쓰기 권한이 필요하므로 `--mem-harden`보다 우선합니다.
+## RC4
 
----
-
-# Payload Relocation & Resource Registration
+RC4 is retired as a selectable production crypto mode.
 
 ```powershell
---payload-relocate --rsrc-register
+--crypto-mode rc4
 ```
 
-를 사용하면 protected payload를 executable section에서 분리해 non-executable `.vdata` 영역으로 이동하고 resource directory에 `RT_RCDATA`로 등록할 수 있습니다.
+is rejected by the CLI.
 
-기존 icon/version/manifest 등의 resource tree를 보존하면서 BTG payload resource를 추가하는 경로가 구현되어 있습니다.
+The legacy:
 
-`--rsrc-register`는 반드시 `--payload-relocate`와 함께 사용해야 합니다.
+```powershell
+--rc4
+```
+
+flag remains parseable only so old build scripts fail explicitly instead of silently selecting a different primitive.
 
 ---
 
-# Integrity
+# Integrity Protection
 
-`--integrity`는 단일 checksum 하나만 사용하는 구조가 아닙니다.
+`--integrity` enables runtime integrity-related protection.
 
-boot pipeline에는 여러 integrity verification site가 존재하며 Program-VM 경로에서는 별도의 protected-region descriptor를 생성할 수 있습니다.
-
-보호 대상 종류에는 다음과 같은 domain이 정의되어 있습니다.
+The VM integrity system defines protected-region classes including:
 
 ```text
 FileImage
@@ -486,61 +1003,423 @@ NativeBridge
 ResolvedApiPointers
 ```
 
+This allows integrity metadata to describe different runtime objects instead of treating the complete binary as one undifferentiated checksum region.
+
+Program-VM placement code can create integrity descriptors for VM components such as:
+
+```text
+handler code
+handler tables
+bytecode
+```
+
+The boot/runtime pipeline also performs integrity checks before transferring execution into protected program state.
+
 ---
 
-# Anti-Debug Policies
+# Import Hiding
+
+```powershell
+--iat-hide
+```
+
+enables runtime import resolution.
+
+Instead of exposing the complete original API set through a conventional loader-visible import table, BTG can preserve only the bootstrap resolver requirements and reconstruct additional imports at runtime.
+
+Conceptually:
+
+```text
+Windows Loader
+      │
+      ▼
+minimal bootstrap imports
+      │
+      ▼
+BTG import resolver
+      │
+      ▼
+LoadLibraryA / GetProcAddress
+      │
+      ▼
+original API addresses
+      │
+      ▼
+reconstructed runtime IAT slots
+```
+
+This feature is designed to remain compatible with Program-VM ownership because the native/VM bridge and import resolver can reference the same reconstructed original IAT slots.
+
+---
+
+# Memory Hardening
+
+```powershell
+--mem-harden
+```
+
+separates memory that should remain immutable after initialization from memory that must stay writable.
+
+The intended runtime transition is approximately:
+
+```text
+bootstrapping
+     │
+     ▼
+decrypt / initialize
+     │
+     ▼
+integrity verification
+     │
+     ├──────── executable immutable regions ─────► RX
+     │
+     └──────── mutable VM/runtime state ─────────► RW
+```
+
+This is especially important for Program-VM mode because VM bytecode and handler-related data have different mutability requirements from VM context and call-stack state.
+
+Runtime memory-protection failures are designed to fail closed.
+
+---
+
+# `--mem-harden` vs `--dispatcher-reencrypt`
+
+Native dispatcher re-encryption requires transformed native code pages to remain writable because blocks are repeatedly decrypted and re-encrypted.
+
+That conflicts with sealing those pages RX.
+
+The resolver therefore gives:
+
+```text
+--dispatcher-reencrypt
+```
+
+precedence over:
+
+```text
+--mem-harden
+```
+
+for that native configuration.
+
+A warning is generated when the requested profile must be adjusted.
+
+With:
+
+```powershell
+--strict-profile
+```
+
+such a downgrade becomes an error instead of being silently accepted.
+
+---
+
+# Payload Relocation
+
+```powershell
+--payload-relocate
+```
+
+moves protected payload storage away from the normal executable-code layout into non-executable data storage.
+
+The boot/runtime layer is responsible for obtaining the payload from its storage location and preparing its runtime form.
+
+This reduces the need to store the protected payload directly as ordinary executable section content.
+
+---
+
+# Resource Registration
+
+```powershell
+--rsrc-register
+```
+
+registers the relocated payload as an `RT_RCDATA` resource.
+
+This requires:
+
+```powershell
+--payload-relocate
+```
+
+The profile resolver treats:
+
+```text
+--rsrc-register without --payload-relocate
+```
+
+as an invalid configuration.
+
+BTG reconstructs the resource tree rather than simply replacing every existing resource with the payload.
+
+---
+
+# Anti-Debugging
 
 ```powershell
 --anti-debug
+```
+
+enables generated anti-debug checks.
+
+The current native anti-debug implementation includes checks based on:
+
+```text
+PEB.BeingDebugged
+PEB.NtGlobalFlag
+ProcessHeap.Flags
+```
+
+Detection behavior is controlled with:
+
+```powershell
 --anti-debug-policy <MODE>
 ```
 
-지원 policy:
+Supported modes are:
 
-| Mode     | Behavior                |
-| -------- | ----------------------- |
-| `trap`   | 탐지 시 trap               |
-| `hang`   | 탐지 시 execution stall    |
-| `warn`   | 탐지 후 정상 경로 진행           |
-| `poison` | runtime state를 오염시키는 경로 |
+| Policy   | Behavior                                |
+| -------- | --------------------------------------- |
+| `trap`   | Execute an invalid-instruction trap     |
+| `hang`   | Enter an intentional loop               |
+| `warn`   | Continue normally                       |
+| `poison` | Continue through a state-poisoning path |
 
-기본 policy는 `trap`입니다.
-
----
-
-# Build Validation
-
-BTG는 PE를 생성하고 끝내지 않습니다.
-
-생성된 PE를 다시 파싱하여 section range, directory, relocation, VM metadata 및 요청한 protection capability가 실제 결과물에 materialize됐는지 검사합니다.
+Default:
 
 ```text
-Build
-  │
-  ▼
-Output PE
-  │
-  ▼
-Re-parse
-  │
-  ├─ structural validation
-  ├─ PE directory validation
-  ├─ relocation validation
-  ├─ VM metadata validation
-  └─ effective protection validation
+trap
 ```
-
-`--strict-profile`을 사용하면 요청한 protection이 충돌 때문에 비활성화되거나 build 결과에서 유효하지 않은 경우 오류로 처리합니다.
 
 ---
 
-# Execution Differential Verification
+# Protection Profile Resolver
+
+BTG does not apply every CLI flag independently.
+
+The requested options are first converted into an **effective protection profile**.
+
+This layer resolves:
+
+```text
+dependencies
+incompatible combinations
+implicit options
+runtime requirements
+feature precedence
+effective crypto mode
+VM applicability
+```
+
+For example:
+
+```text
+--vm-oep
+```
+
+implies the VM infrastructure.
+
+Meanwhile:
+
+```text
+--dispatcher-reencrypt + --mem-harden
+```
+
+requires a policy decision because writable native code conflicts with final RX sealing.
+
+And:
+
+```text
+--rsrc-register
+```
+
+requires:
+
+```text
+--payload-relocate
+```
+
+---
+
+# Strict Profile Validation
+
+Use:
+
+```powershell
+--strict-profile
+```
+
+when the command should fail instead of accepting a profile downgrade.
+
+Without strict mode:
+
+```text
+requested configuration
+        │
+        ▼
+resolver
+        │
+        ├── valid ─────► use feature
+        │
+        └── conflict ──► warning / adjustment
+```
+
+With strict mode:
+
+```text
+requested configuration
+        │
+        ▼
+resolver
+        │
+        ├── exact ─────► continue
+        │
+        └── warning ───► fail
+```
+
+This is especially useful for automated experiments where silently disabling one protection would make the resulting sample invalid for comparison.
+
+---
+
+# `--full`
+
+`--full` is the high-protection **native CFG bundle**.
+
+It does **not** automatically select whole-program virtualization.
+
+The bundle requests the equivalent of:
+
+```text
+obfuscation level 3
+anti-debug
+dispatcher re-encryption
+integrity
+payload relocation
+resource registration
+IAT hiding
+memory hardening
+```
+
+However, the effective profile still follows compatibility rules.
+
+For example:
+
+```text
+dispatcher re-encryption
+```
+
+takes precedence over native:
+
+```text
+memory hardening
+```
+
+because the former requires writable transformed code.
+
+To request Program-VM virtualization, use:
+
+```powershell
+--vm --vm-oep --vm-commercial
+```
+
+explicitly.
+
+---
+
+# Dispatcher Re-Encryption
+
+The native:
+
+```powershell
+--dispatcher-reencrypt
+```
+
+path encrypts transformed basic-block storage individually.
+
+The dispatcher participates in the block lifecycle so that blocks can be decrypted around execution and re-encrypted afterward.
+
+The option requires the cryptographic layer.
+
+Therefore:
+
+```powershell
+--dispatcher-reencrypt --no-crypto
+```
+
+is rejected.
+
+Dispatcher re-encryption also forces effective code encryption coverage to 100%.
+
+---
+
+# Obfuscation Levels
+
+```powershell
+--obf-level <N>
+```
+
+controls native transformation intensity.
+
+Current CLI levels are:
+
+| Level | Description                                       |
+| ----: | ------------------------------------------------- |
+|   `1` | Basic transformation                              |
+|   `2` | MBA-oriented transformation                       |
+|   `3` | Overlapping/MBA-oriented maximum configured level |
+
+Default:
+
+```text
+3
+```
+
+`--full` also forces level 3.
+
+---
+
+# Deterministic Builds
+
+BTG uses deterministic random generation when a build seed is supplied.
+
+```powershell
+--seed 31010
+```
+
+The seed is used across transformation components such as:
+
+```text
+layout randomization
+block shuffling
+MBA constants
+VM polymorphism
+crypto-derived values
+padding/layout choices
+```
+
+This is valuable for:
+
+```text
+debugging
+regression testing
+VM comparison
+multi-seed experiments
+reproducible crash analysis
+```
+
+---
+
+# Output Verification
+
+BTG can execute the original and protected binaries after packing.
+
+Enable it with:
 
 ```powershell
 --verify-output
 ```
 
-은 원본과 보호된 실행 파일을 실제로 실행하고 다음 결과를 비교합니다.
+The differential verifier captures:
 
 ```text
 exit code
@@ -548,11 +1427,30 @@ stdout bytes
 stderr bytes
 ```
 
-세 항목 중 하나라도 다르면 verification이 실패합니다.
+from both processes.
 
-실패한 결과물은 정상 output 이름으로 남기지 않고 별도의 failed artifact로 격리합니다.
+The protected program passes only if all three are equivalent.
 
-timeout은 다음 옵션으로 조절할 수 있습니다.
+Conceptually:
+
+```text
+             ┌──► Original PE ───► Result A
+Input ───────┤
+             └──► Protected PE ──► Result B
+
+Result A
+   │
+   ▼
+exit / stdout / stderr
+   │
+   ▼
+byte-for-byte comparison
+   │
+   ├── identical ──► PASS
+   └── different ──► FAIL
+```
+
+Process timeout is configurable:
 
 ```powershell
 --verify-timeout-secs 30
@@ -560,76 +1458,189 @@ timeout은 다음 옵션으로 조절할 수 있습니다.
 
 ---
 
-# Multi-Seed Gate
+# Multi-Seed Verification
 
 ```powershell
 --verify-seeds N
 ```
 
-은 서로 다른 build seed로 N개의 independent packing job을 실행합니다.
+runs multiple independent seeded pack-and-verification jobs.
 
-각 build는 자동으로 execution differential verification을 수행하며 하나라도 실패하면 전체 gate가 실패합니다.
+Each generated build receives its own deterministic seed and performs output verification.
 
-각 결과물의 SHA-256과 seed는 별도 report에 기록됩니다.
+This is useful for detecting transformation bugs that only occur under certain randomized layouts or virtual-ISA configurations.
+
+Conceptually:
+
+```text
+Input
+ │
+ ├── Seed 1 ──► Pack ──► Execute ──► Verify
+ │
+ ├── Seed 2 ──► Pack ──► Execute ──► Verify
+ │
+ ├── Seed 3 ──► Pack ──► Execute ──► Verify
+ │
+ └── Seed N ──► Pack ──► Execute ──► Verify
+```
+
+A single failed child build causes the multi-seed gate to fail.
 
 ---
 
-# Diagnostic Artifacts
+# Post-Build Validation
 
-build configuration에 따라 다음 artifact를 생성합니다.
+BTG reparses and validates the image it creates.
+
+Validation is not limited to checking whether the output file exists.
+
+The validation layer checks areas including:
 
 ```text
-<output>.btgmanifest
-<output>.ownership.csv
-<output>.map
-<output>.sym
-<output>.riscmap.csv
-unsupported-instruction evidence
-multi-seed verification report
+PE layout
+section ranges
+directories
+relocations
+resource layout
+Program-VM metadata
+ownership information
+requested protection capabilities
+measured virtualization coverage
 ```
 
-### `.btgmanifest`
+This allows BTG to catch cases where a transformation pass completed but the final PE does not actually contain the protection state that was requested.
 
-다음과 같은 build evidence를 기록합니다.
+---
+
+# Build Manifest
+
+BTG can generate a:
 
 ```text
-input/output SHA-256
+.btgmanifest
+```
+
+artifact containing information about the build.
+
+Manifest-related data includes areas such as:
+
+```text
+input hash
+output hash
 build seed
-feature flags
-effective crypto primitive
-VM ownership metrics
-VM bytecode information
-runtime cipher hash
+build identity
+enabled protection features
+effective crypto information
+Program-VM information
+runtime cipher information
 integrity state
-ASLR state
-W^X contract
 execution verification result
 ```
 
-### `.map`
+SHA-256 is used for build artifact hashing.
 
-VM bytecode offset과 원본 instruction VA를 연결합니다.
+---
 
-### `.sym`
+# Diagnostic Mapping
 
-VM block 범위와 원본 block/function ownership을 연결합니다.
+BTG contains several optional mapping/report outputs for debugging transformed binaries.
 
-### `.ownership.csv`
+## Instruction Map
 
-원본 함수가 VM/native 중 어느 쪽에 귀속되었는지와 exclusion reason을 기록합니다.
+```powershell
+--map
+```
+
+produces:
+
+```text
+<output>.map
+```
+
+containing VM bytecode/source mapping information.
+
+It is intended to help translate a VM-side fault location back to an original native instruction.
+
+---
+
+## Symbolic Map
+
+```powershell
+--sym-map
+```
+
+produces:
+
+```text
+<output>.sym
+```
+
+and enables instruction mapping as well.
+
+It tracks higher-level relationships such as:
+
+```text
+VM block range
+original basic block
+function ownership
+original instruction range
+```
+
+---
+
+## Ownership Report
+
+Commercial Program-VM builds can generate:
+
+```text
+<output>.ownership.csv
+```
+
+describing VM/native ownership decisions.
+
+This is useful when investigating why a particular function was not virtualized.
+
+---
+
+## RISC Map
+
+The Program-VM pipeline can also emit:
+
+```text
+<output>.riscmap.csv
+```
+
+for analysis of native-to-RISC transformation relationships.
 
 ---
 
 # Build
 
-Windows x86-64와 Rust/Cargo toolchain이 필요합니다.
+BTG targets Windows x86-64.
+
+Required development environment:
+
+```text
+Windows x86-64
+Rust
+Cargo
+rustup
+MSVC-compatible Windows toolchain
+```
+
+Build:
 
 ```powershell
 cargo build --release
+```
+
+Run the full test targets:
+
+```powershell
 cargo test --all-targets
 ```
 
-결과:
+Release binary:
 
 ```text
 target\release\btg-packer.exe
@@ -645,9 +1656,19 @@ target\release\btg-packer.exe `
     --output .\app.protected.exe
 ```
 
+Short form:
+
+```powershell
+target\release\btg-packer.exe `
+    -i .\app.exe `
+    -o .\app.protected.exe
+```
+
 ---
 
-# Recommended Program-VM Profile
+# Recommended Program-VM Example
+
+A high-feature Program-VM configuration:
 
 ```powershell
 target\release\btg-packer.exe `
@@ -672,87 +1693,164 @@ target\release\btg-packer.exe `
   --seed 31010
 ```
 
-이 profile은 다음 protection들을 동시에 요청합니다.
+This configuration requests:
 
 ```text
-whole-program Program-VM
-RISC lifting
-multi-family VM partitioning
-polymorphic ISA generation
+Program-VM OEP transfer
+commercial RISC/poly/threaded backend
+full Program-VM coverage validation
+multi-family VM planning
+polymorphic virtual ISA
 rolling-key bytecode
 M7 runtime protection
 M8 handler-table concealment
-IAT hiding
+memory hardening
+runtime import reconstruction
 integrity verification
-W^X memory hardening
 payload relocation
-resource registration
-BTG-C1 runtime crypto
-anti-debugging
-strict capability validation
-execution differential verification
-deterministic build
+RT_RCDATA registration
+BTG-C1 runtime protection
+anti-debug checks
+strict protection-profile resolution
+post-build execution verification
+deterministic transformation seed
 ```
 
 ---
 
-# `--full`
+# Important Option Relationships
 
-`--full`은 **native CFG protection bundle**입니다.
+Some options have explicit dependencies or precedence rules.
 
-Program-VM을 자동으로 활성화하지 않습니다.
+### Resource registration
 
 ```text
---full
-    ├─ obf-level 3
-    ├─ anti-debug
-    ├─ dispatcher-reencrypt
-    ├─ integrity
-    ├─ payload-relocate
-    ├─ rsrc-register
-    ├─ iat-hide
-    └─ mem-harden request
+--rsrc-register
+        │
+        └── requires ──► --payload-relocate
 ```
 
-단, native `dispatcher-reencrypt`는 runtime code write가 필요하기 때문에 `mem-harden`의 RX transition과 충돌합니다.
+### Program VM
 
-resolver는 dispatcher re-encryption을 우선하며 이와 같은 profile adjustment를 허용하지 않으려면 `--strict-profile`을 사용하세요.
-
-전체 프로그램 virtualization을 원한다면 명시적으로:
-
-```powershell
---vm --vm-oep --vm-commercial
+```text
+--vm-oep
+   │
+   └── implies VM infrastructure
 ```
 
-을 사용해야 합니다.
+Commercial backend:
+
+```text
+--vm
+--vm-oep
+--vm-commercial
+```
+
+### M7
+
+Supported effective configurations include:
+
+```text
+native + crypto + M7
+```
+
+or:
+
+```text
+VM + VM-OEP + VM-commercial + crypto + M7
+```
+
+### M8
+
+```text
+M8 requires VM to be active.
+```
+
+### Native dispatcher re-encryption
+
+```text
+--dispatcher-reencrypt
+        │
+        ├── requires crypto
+        │
+        ├── overrides partial crypto coverage
+        │
+        └── conflicts with final native RX sealing
+```
+
+### Strict mode
+
+```text
+--strict-profile
+```
+
+turns profile adjustment warnings into build failures.
+
+### Partial VM
+
+```text
+--allow-partial-vm
+```
+
+is development-only and conflicts with:
+
+```text
+--strict-profile
+```
 
 ---
 
-# Important CLI
+# CLI Reference
 
-| Option                   | Description                                      |
-| ------------------------ | ------------------------------------------------ |
-| `--strict-profile`       | protection downgrade/비활성화를 오류 처리                 |
-| `--allow-partial-vm`     | 개발용 partial commercial VM coverage 허용            |
-| `--verify-output`        | 원본/보호본 실행 결과 byte-for-byte 비교                    |
-| `--verify-seeds N`       | 여러 seed의 pack + execution gate                   |
-| `--seed U64`             | deterministic build                              |
-| `--vm`                   | VM/crypto infrastructure 활성화                     |
-| `--vm-oep`               | OEP를 Program-VM entry로 전환                        |
-| `--vm-commercial`        | RISC/poly/threaded Program-VM backend            |
-| `--m7`                   | runtime re-encryption/chunk lifecycle protection |
-| `--m8`                   | VM handler table concealment                     |
-| `--integrity`            | runtime integrity protection                     |
-| `--iat-hide`             | runtime import resolution                        |
-| `--mem-harden`           | executable/state memory permission 분리            |
-| `--payload-relocate`     | payload를 non-executable storage로 이동              |
-| `--rsrc-register`        | payload를 `RT_RCDATA`로 등록                         |
-| `--dispatcher-reencrypt` | native block runtime re-encryption               |
-| `--crypto-mode`          | `c1` 또는 `chacha20`                               |
-| `--map`                  | VM instruction mapping 생성                        |
-| `--sym-map`              | block/function symbolic mapping 생성               |
+| Option                       |             Default | Description                                               |
+| ---------------------------- | ------------------: | --------------------------------------------------------- |
+| `-i, --input <PATH>`         |  `dummy_target.exe` | Input PE32+ executable                                    |
+| `-o, --output <PATH>`        | `protected_btg.exe` | Output protected executable                               |
+| `--strict-profile`           |                 off | Reject requested protection downgrades                    |
+| `--allow-partial-vm`         |                 off | Allow incomplete commercial VM coverage for development   |
+| `--verify-output`            |                 off | Execute and compare original/protected binaries           |
+| `--verify-timeout-secs <N>`  |                `30` | Verification process timeout                              |
+| `--verify-seeds <N>`         |                 `0` | Run N seeded build/verification jobs                      |
+| `--seed <U64>`               |              random | Deterministic transformation seed                         |
+| `-l, --obf-level <N>`        |                 `3` | Native obfuscation level                                  |
+| `-a, --anti-debug`           |                 off | Enable anti-debug runtime checks                          |
+| `--anti-debug-policy <MODE>` |              `trap` | `trap`, `hang`, `warn`, or `poison`                       |
+| `-t, --test-qa`              |                 off | Run automated QA suite                                    |
+| `--qa-commercial`            |                 off | Run QA through commercial Program-VM                      |
+| `--qa-gen-corpus`            |                 off | Generate compiler-profile QA corpus                       |
+| `-d, --debug`                |                 off | Enable detailed logging                                   |
+| `-g, --log-file <PATH>`      |                none | Write log output to a file                                |
+| `--trace-blocks`             |                 off | Inject runtime block tracing                              |
+| `--no-crypto`                |                 off | Disable normal crypto layer                               |
+| `--vm`                       |                 off | Enable VM/crypto infrastructure                           |
+| `--vm-test`                  |                 off | Run VM self-tests                                         |
+| `--text-vm`                  |                 off | Report block-level lift capability                        |
+| `--text-vm-oep`              |                 off | Analyze OEP-reachable VM lift coverage                    |
+| `--payload-relocate`         |                 off | Relocate protected payload into non-executable data       |
+| `--rsrc-register`            |                 off | Register relocated payload as `RT_RCDATA`                 |
+| `--crypto-coverage <N>`      |               `100` | Requested protected code percentage                       |
+| `--chained-crypto`           |                 off | Enable chained legacy crypto lifecycle path               |
+| `--integrity`                |                 off | Enable integrity protection                               |
+| `--iat-hide`                 |                 off | Reconstruct original API imports at runtime               |
+| `--mem-harden`               |                 off | Apply post-bootstrap memory permission separation         |
+| `--dispatcher-reencrypt`     |                 off | Native block decrypt/re-encrypt lifecycle                 |
+| `--full`                     |                 off | Enable native maximum-protection bundle                   |
+| `--vm-oep`                   |                 off | Transfer original entry execution into Program-VM         |
+| `--vm-commercial`            |                 off | Select RISC → poly → threaded Program-VM backend          |
+| `--m7`                       |                 off | Runtime encrypted lifecycle protection                    |
+| `--m8`                       |                 off | VM handler-table concealment                              |
+| `--vm-bench`                 |                 off | Run VM interpreter/native benchmark                       |
+| `--map`                      |                 off | Generate VM instruction map                               |
+| `--sym-map`                  |                 off | Generate symbolic block/function map                      |
+| `--keep-pdata`               |                 off | Preserve original `.pdata` without dispatcher unwind leaf |
+| `--block-ring`               |                 off | Add recent-dispatch diagnostic ring buffer                |
+| `--custom-cipher`            |                 off | Explicitly request BTG custom cipher compatibility path   |
+| `--rc4`                      |               error | Retired compatibility flag                                |
+| `--crypto-mode <MODE>`       |         `chacha20`* | Request `c1` or `chacha20`                                |
 
-전체 목록:
+`*` The profile resolver currently defaults to ChaCha20 when no mode is supplied. Some VM/runtime protection configurations use the C1 native runtime as their effective cryptographic path.
+
+Full CLI help:
 
 ```powershell
 target\release\btg-packer.exe --help
@@ -760,105 +1858,371 @@ target\release\btg-packer.exe --help
 
 ---
 
-# QA & Self-Test
+# QA Infrastructure
+
+BTG contains a substantial internal testing and QA layer.
+
+The supplied source snapshot contains approximately:
+
+```text
+294 Rust source files
+123,000+ lines of Rust
+700+ #[test] annotations
+```
+
+These numbers describe the current source snapshot and are not intended as a measure of security quality.
+
+Testing covers areas such as:
+
+```text
+PE transformation
+RISC semantics
+virtual registers
+flags
+branches
+memory operations
+atomic operations
+VM encoding
+native handlers
+fault isolation
+crypto primitives
+integrity descriptors
+protection-profile resolution
+PE validation
+deterministic behavior
+execution differential testing
+```
+
+Useful commands include:
 
 ```powershell
 cargo test --lib
-cargo test --all-targets
-
-target\release\btg-packer.exe --vm-test
-target\release\btg-packer.exe --vm-bench
-target\release\btg-packer.exe --qa-gen-corpus
-target\release\btg-packer.exe --test-qa
-target\release\btg-packer.exe --test-qa --qa-commercial
 ```
 
-QA infrastructure에는 VM interpreter/native execution 비교, RISC semantics, branch/flags, memory, atomics, SSE 계열, bridge ABI, malformed bytecode 및 deterministic-build 관련 테스트가 포함되어 있습니다.
+```powershell
+cargo test --all-targets
+```
+
+```powershell
+target\release\btg-packer.exe --vm-test
+```
+
+```powershell
+target\release\btg-packer.exe --vm-bench
+```
+
+```powershell
+target\release\btg-packer.exe --qa-gen-corpus
+```
+
+```powershell
+target\release\btg-packer.exe --test-qa
+```
+
+Commercial Program-VM QA:
+
+```powershell
+target\release\btg-packer.exe `
+    --test-qa `
+    --qa-commercial
+```
+
+---
+
+# Project Layout
+
+```text
+src/
+│
+├── analysis/
+│   ├── program model construction
+│   ├── indirect target analysis
+│   ├── code-pointer analysis
+│   ├── switch analysis
+│   ├── CRT analysis
+│   └── pointer-table analysis
+│
+├── pe/
+│   ├── PE parsing
+│   ├── PE building
+│   ├── relocation handling
+│   ├── TLS handling
+│   ├── load configuration
+│   ├── exports
+│   └── unwind / exception metadata
+│
+├── graph/
+│   └── CFG-related analysis and transformation
+│
+├── assembler/
+│   └── native code generation / encoding support
+│
+├── dispatcher/
+│   ├── dispatcher generation
+│   ├── validation
+│   ├── anti-debug integration
+│   ├── re-encryption
+│   └── M7 runtime support
+│
+├── pipeline/
+│   ├── pass1_slice
+│   ├── pass2_shuffle
+│   ├── pass3_encode
+│   ├── pass4_section
+│   ├── ownership
+│   ├── IAT hiding
+│   ├── resource registration
+│   ├── validation
+│   └── crypto/
+│       ├── boot stub
+│       ├── payload placement
+│       ├── encryption
+│       ├── integrity
+│       ├── IAT reconstruction
+│       ├── memory hardening
+│       └── Program-VM embedding
+│
+├── vm/
+│   ├── lifter/
+│   │   └── x86-64 → RISC
+│   │
+│   ├── risc/
+│   │   ├── semantic IR
+│   │   ├── optimizer
+│   │   └── evaluation
+│   │
+│   ├── poly/
+│   │   ├── architecture families
+│   │   ├── ISA generation
+│   │   ├── operand encoding
+│   │   └── polymorphic mapping
+│   │
+│   ├── threaded/
+│   │   ├── native runtime
+│   │   ├── handler generation
+│   │   ├── poly-direct backend
+│   │   └── native fault testing
+│   │
+│   ├── multi_family.rs
+│   ├── distributed_integrity.rs
+│   ├── handler_poly.rs
+│   ├── data_lifetime.rs
+│   ├── ownership_verifier.rs
+│   └── route metadata / VM bridges
+│
+├── crypto/
+│   ├── BTG-C1 components
+│   ├── ChaCha20
+│   ├── Poly1305
+│   ├── key scheduling
+│   ├── native crypto support
+│   └── region encryption
+│
+├── differential.rs
+│   └── original/protected execution comparison
+│
+├── multi_seed.rs
+│   └── seeded verification jobs
+│
+├── manifest.rs
+│   └── build manifest / SHA-256 metadata
+│
+├── protection_profile.rs
+│   └── requested → effective protection resolution
+│
+└── main.rs
+    └── CLI orchestration
+```
 
 ---
 
 # Current Limitations
 
-BTG Packer는 연구용 prototype이며 모든 Windows PE를 지원하는 범용 commercial protector를 목표로 완성된 제품은 아닙니다.
+BTG Packer is still a research prototype.
 
-* Windows x86-64 PE32+ 중심
-* kernel-mode binary 미지원
-* unsupported x86 semantics는 VM ownership을 받을 수 없음
-* SEH/panic/setjmp/longjmp와 같은 runtime boundary는 보수적으로 처리
-* 일부 특수 PE/TLS/layout 조합은 추가 호환성 작업이 필요할 수 있음
-* Program-VM coverage는 입력 compiler와 생성 코드에 영향을 받음
-* BTG-C1은 독립적인 cryptographic audit를 받은 표준 암호가 아님
-* diagnostic map/manifest는 내부 보호 구조를 노출하므로 release artifact에서 제외 권장
+It should not be described as having universal PE compatibility.
+
+Current limitations include:
+
+* Windows x86-64 PE32+ is the primary target.
+* Kernel-mode binaries are outside the current target model.
+* Unsupported x86 semantics cannot safely receive VM ownership.
+* Complex SEH, panic and non-local-control-flow boundaries require conservative handling.
+* VM coverage depends on the instruction patterns generated by the source compiler.
+* Some unusual PE layouts can still expose parser/reconstruction edge cases.
+* TLS structures whose runtime storage resides in zero-filled virtual section tails require careful RVA handling.
+* PE metadata generated by unusual toolchains may require additional compatibility work.
+* Program-VM support should be evaluated with execution verification for each target compiler/profile.
+* BTG-C1 is a custom research primitive and has not received independent cryptographic review.
+* A successful transformation does not imply resistance against a skilled reverse engineer.
+* Diagnostic artifacts such as maps and ownership reports expose internal transformation information and should not normally accompany distributed protected binaries.
 
 ---
 
-# Project Structure
+# Security Model
+
+BTG attempts to increase the amount of work required to reconstruct transformed program logic.
+
+It does **not** claim that protected code becomes impossible to reverse engineer.
+
+A local attacker that can execute the program can ultimately observe some form of runtime state.
+
+The project therefore treats protection as layered transformation rather than absolute secrecy:
 
 ```text
-analysis/
-    canonical program model
-    indirect target analysis
-    code-pointer / CRT / switch analysis
+program analysis
+      +
+control-flow transformation
+      +
+program virtualization
+      +
+build polymorphism
+      +
+runtime encryption
+      +
+metadata concealment
+      +
+integrity checking
+      +
+memory policy
+```
 
-pe/
-    PE parsing and reconstruction
-    reloc / TLS / unwind / load-config
+The purpose of these layers is to increase analysis cost while preserving executable behavior.
 
-graph/
-    CFG extraction
-    slicing / shuffle / fixup
+---
 
-pipeline/
-    transformation passes
-    PE reconstruction
-    capability validation
+# What BTG Is Not
 
-pipeline/crypto/
-    boot runtime
-    encryption
-    integrity
-    IAT / memory hardening
-    Program-VM placement
+BTG is not intended to claim:
 
-vm/lifter/
-    x86-64 → RISC
+* mathematically unbreakable software protection
+* guaranteed malware-analysis resistance
+* universal x86-64 virtualization
+* compatibility with every Windows PE
+* equivalence to mature commercial protectors
+* audited cryptographic security for BTG-C1
 
-vm/risc/
-    RISC semantics
-    optimizer
-    evaluator
+The repository should be treated as an experimental binary-transformation and virtualization framework.
 
-vm/poly/
-    polymorphic ISA
-    family-specific encoding
-    rolling key
+---
 
-vm/threaded/
-    native self-decoding runtime
-    handler generation
-    super-operators
+# Research Areas
 
-vm/text_lift/
-    whole-program virtualization analysis
+BTG can be useful for experimentation involving:
 
-crypto/
-    BTG-C1
-    ChaCha20
-    Poly1305
-    keyed MAC
-
-qa.rs
-differential.rs
-multi_seed.rs
-manifest.rs
+```text
+binary rewriting
+PE internals
+control-flow reconstruction
+program virtualization
+virtual instruction-set design
+compiler-generated x86 analysis
+RISC intermediate representations
+runtime code generation
+VM dispatch strategies
+software-protection research
+binary hardening
+differential testing
+deterministic randomized builds
 ```
 
 ---
 
-## Security Research Only
+# Development Workflow
 
-BTG Packer is intended for binary-protection research, compiler/virtual-machine experimentation, PE transformation research and authorized reverse-engineering studies.
+A useful development cycle is:
 
-Do not use it to protect or distribute software you do not own or have permission to modify.
+```text
+1. Build
+2. Run unit tests
+3. Analyze target lift coverage
+4. Pack with a deterministic seed
+5. Enable output verification
+6. Inspect ownership and mapping artifacts
+7. Repeat with multiple seeds
+```
 
-MIT License는 `LICENSE`, 보안 관련 제보 방법은 `SECURITY.md`를 참고하세요.
+Example:
+
+```powershell
+cargo test --all-targets
+```
+
+```powershell
+btg-packer.exe `
+    -i .\target.exe `
+    -o .\target.protected.exe `
+    --text-vm-oep
+```
+
+Then:
+
+```powershell
+btg-packer.exe `
+    -i .\target.exe `
+    -o .\target.protected.exe `
+    --vm `
+    --vm-oep `
+    --vm-commercial `
+    --integrity `
+    --iat-hide `
+    --mem-harden `
+    --seed 31010 `
+    --verify-output
+```
+
+Finally, after one deterministic build is stable:
+
+```powershell
+btg-packer.exe `
+    -i .\target.exe `
+    -o .\target.protected.exe `
+    --vm `
+    --vm-oep `
+    --vm-commercial `
+    --verify-seeds 10
+```
+
+This workflow is generally more useful for development than immediately enabling every protection option at once.
+
+---
+
+# Responsible Use
+
+BTG Packer is intended for:
+
+* software-protection research
+* compiler and VM experimentation
+* PE transformation research
+* authorized reverse-engineering research
+* CTF and educational environments
+* testing software that you own or are permitted to modify
+
+Do not use the project to modify, conceal, distribute or protect software without authorization.
+
+---
+
+# License
+
+BTG Packer is distributed under the **MIT License**.
+
+See:
+
+```text
+LICENSE
+```
+
+for the complete license text.
+
+Security-related reports should follow the process documented in:
+
+```text
+SECURITY.md
+```
+
+---
+
+<p align="center">
+  <b>BTG Packer</b><br>
+  x86-64 → RISC → Polymorphic Program-VM → Native Threaded Runtime
+</p>
