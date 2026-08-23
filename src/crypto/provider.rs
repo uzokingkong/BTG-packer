@@ -248,6 +248,29 @@ pub fn chain_encrypt_with<P: CryptoProvider>(buf: &mut [u8], anchor: &[u8; 256])
     prev
 }
 
+/// BTG-C1 runtime chain ABI: each chunk is re-keyed from the first 32 bytes of
+/// the predecessor window with nonce zero. The native boot stub stores exactly
+/// those 32 bytes in its fixed C1 state, so using `BtgCipher::from_key` here
+/// would be incorrect: that general provider API hashes all 256 input bytes.
+pub fn chain_encrypt_c1(buf: &mut [u8], anchor: &[u8; 256]) -> [u8; 256] {
+    let plain = buf.to_vec();
+    let mut prev = *anchor;
+    let mut off = 0usize;
+    while off < buf.len() {
+        let n = (buf.len() - off).min(256);
+        let mut cipher = BtgCipher::new(&prev[..32], 0);
+        cipher.crypt(&mut buf[off..off + n]);
+        if off + n >= 256 {
+            prev.copy_from_slice(&plain[off + n - 256..off + n]);
+        } else {
+            prev = [0u8; 256];
+            prev[..off + n].copy_from_slice(&plain[..off + n]);
+        }
+        off += n;
+    }
+    prev
+}
+
 /// v7 청크 체이닝 (기본 Rc4 provider 호환):
 /// 부트 스텁의 체인 복호화 셸코드와 정확히 동일한 동작을 유지한다.
 pub fn chain_encrypt(buf: &mut [u8], anchor: &[u8; 256]) -> [u8; 256] {

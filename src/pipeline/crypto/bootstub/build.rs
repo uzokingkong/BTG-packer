@@ -2,7 +2,7 @@
 // BTG - boot-stub build orchestrators - split from bootstub.rs
 // ==============================================================================
 // Public entry points: build_anti_debug_raw_block (static byte blob) and
-// build_rc4_block (orchestrates the full RC4 boot stub).
+// build_boot_block (orchestrates the full native boot stub).
 // ==============================================================================
 
 use super::super::{cipher, encode, iat, integrity, memharden, payload, vm_embed};
@@ -223,7 +223,7 @@ fn emit_poly1305_verify(
     ));
 }
 
-pub(crate) fn build_rc4_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn build_boot_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     // ── 1. 명령어 목록 구성 ────────────────────────────────────────────────────────────────
     // (inst, Option<분기 레이블>)
     let mut seq: Vec<(Instruction, Option<super::ctx::Label>)> = Vec::new();
@@ -277,8 +277,8 @@ pub(crate) fn build_rc4_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     }
 
     // v60 (--custom-cipher): BTG-C1 경로는 RC4 KSA 대신 C1 상태 초기화를 수행한다.
-    // (chained/vm-oep는 RC4 전용 — c1_mode는 place.rs가 비활성화해 이 분기에
-    //  도달하지 않는다.) v61: --vm과 함께면 C1 상태 초기화를 VM으로 virtualize
+    // Chained mode rekeys the same C1 state per predecessor chunk; VM-OEP also
+    // uses this native C1 consumer. v61: --vm과 함께면 C1 상태 초기화를 VM으로 virtualize
     //  (emit_ksa_init의 c1_mode && vm 분기), 아니면 네이티브 emit_c1_init.
     // v63 (--crypto-mode chacha20): ChaCha20 상태 초기화는 emit_ksa_init의
     //  chacha_mode 분기에서 처리한다 (네이티브 emit_chacha_init).

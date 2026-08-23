@@ -70,7 +70,7 @@ pub(crate) struct BootStubCtx {
     pub(crate) vm_oep_text_runs_count: u32,
 
     // ── v7 chained-crypto ──────────────────────────────────────────────────
-    /// true = RC4를 256B 청크 단위로 재키잉해 순차 복호화
+    /// true = C1을 256B 청크 단위로 재키잉해 순차 복호화
     /// (Key_i = 이전 청크 평문, chunk0 = seed anchor → skip-ahead 불가)
     pub(crate) chained: bool,
     // ── v8 Phase 0.3: 디스패처 재암호화 ─────────────────────────────────────────

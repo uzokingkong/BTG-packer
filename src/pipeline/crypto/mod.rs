@@ -24,7 +24,7 @@
 // ==============================================================================
 
 use crate::crypto::chacha20::{chacha_apply, chacha_init_state, CHA_STATE_SIZE};
-use crate::crypto::{chain_encrypt, BlockCryptoMeta, CryptoMode, CryptoProvider};
+use crate::crypto::{chain_encrypt_c1, BlockCryptoMeta, CryptoMode, CryptoProvider};
 use crate::pipeline::pass4_section::BOOT_AREA_RESERVE;
 use crate::pipeline::PipelineContext;
 use anyhow::Result;
@@ -127,8 +127,9 @@ pub fn run(
     let integrity_effective = integrity && enabled;
 
     // ── v60 (--custom-cipher): BTG-C1 활성 판정 ───────────────────────────────
-    // chained/--vm-oep(프로그램 VM) 경로는 RC4 전용 부트 스텁 서브루틴/가상화를
-    // 쓰므로 이 조합에서는 --custom-cipher를 무시하고 RC4로 폴백한다.
+    // Program-VM/OEP changes the execution payload, not the boot stream ABI,
+    // so it now stays on the C1 native state/blob path. Chained crypto still
+    // has a distinct legacy consumer and is rejected instead of falling back.
     // v61: 평문(벌크)·reencrypt·--m7·--vm(비-oep) 경로는 모두 BTG-C1로 교체된다
     //     (--vm은 C1 상태 초기화를 VM으로 virtualize, 키스트림은 C1 blob).
     // v63 (--crypto-mode chacha20): chained/reencrypt/--vm/--vm-oep 경로는
@@ -140,17 +141,12 @@ pub fn run(
         && !vm_oep_effective
         && !vm_effective;
     if ctx.crypto_mode == CryptoMode::ChaCha20 && !chacha_mode {
-        println!(
-            "[!] --crypto-mode chacha20 ignored for this mode: chained/reencrypt/--vm/--vm-oep use the RC4/BTG-C1 boot-stub subroutines (falls back to {})",
-            if ctx.custom_cipher { "BTG-C1" } else { "RC4" }
-        );
+        println!("[!] --crypto-mode chacha20 is unsupported for this mode; using the C1 native boot/runtime");
     }
-    let c1_mode = ctx.custom_cipher && !chained_effective && !vm_oep_effective && !chacha_mode;
-    if ctx.custom_cipher && !c1_mode && !chacha_mode {
-        println!(
-            "[!] --custom-cipher (BTG-C1) ignored for this mode: chained/--vm-oep use the RC4 boot-stub/VM subroutines (falls back to RC4)"
-        );
-    }
+    // `custom_cipher` is always true after production profile resolution. Keep
+    // the false value only for legacy unit fixtures which exercise the retired
+    // implementation directly; unlike the old gate, VM-OEP no longer disables C1.
+    let c1_mode = ctx.custom_cipher && !chacha_mode;
     if c1_mode {
         println!("[+] v60 Custom Cipher: BTG-C1 512-bit stream cipher ENABLED (string runs via seed stream; reencrypt/m7 per-block via per-block C1 keys; --vm routes C1 state init through the VM)");
     }
@@ -160,12 +156,13 @@ pub fn run(
 
     // v63 (T3-1 Phase B): 유효 crypto primitive — 패커 암호화 == 부트 스텁 복호화.
     // (요청 `ctx.crypto_mode`가 아니라 게이트(chained/reencrypt/vm/vm-oep)를 통과한
-    //  최종 모드. chacha가 게이트에서 걸리면 custom_cipher 기준 C1/RC4 폴백.)
+    //  최종 모드. 지원되지 않는 chacha 조합도 retired RC4가 아니라 C1을 쓴다.)
     let effective_mode = if chacha_mode {
         CryptoMode::ChaCha20
     } else if c1_mode {
         CryptoMode::C1
     } else {
+        // Test-only compatibility seam. Production resolution cannot select it.
         CryptoMode::Rc4
     };
 
@@ -328,10 +325,10 @@ pub fn run(
         // (crypto 계층 chain_encrypt — boot 스텁 셸코드와 동일 알고리즘 유지)
         let mut anchor = [0u8; 256];
         anchor.copy_from_slice(&seed_masked);
-        let chain_key = chain_encrypt(&mut btg.bytes[code_start..code_end], &anchor);
-        rc4 = Rc4::new(&chain_key);
+        let chain_key = chain_encrypt_c1(&mut btg.bytes[code_start..code_end], &anchor);
+        c1 = Some(crate::crypto::BtgCipher::new(&chain_key[..32], 0));
         println!(
-            "[+] v7 Chained-Crypto: {} bytes code region chained in 256B chunks (skip-ahead blocked)",
+            "[+] v7 Chained-Crypto: {} bytes code region C1-chained in 256B chunks (skip-ahead blocked)",
             code_len
         );
     } else if !no_crypto {

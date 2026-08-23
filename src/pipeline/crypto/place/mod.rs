@@ -2,8 +2,7 @@
 // Boot-stub placement: stub building (3 passes), VM module embed, boot-data writes
 // ==============================================================================
 
-use super::bootstub::{build_anti_debug_raw_block, build_rc4_block, BootStubCtx};
-use super::cipher::Rc4;
+use super::bootstub::{build_anti_debug_raw_block, build_boot_block, BootStubCtx};
 use super::integrity::crc32;
 use super::scan::StringRun;
 use super::{BootStreamCipher, IMPORT_MBA_C};
@@ -59,8 +58,8 @@ pub(crate) fn place_boot_stub(
     rng: &mut impl RngCore,
 ) -> Result<()> {
     let boot_va = dispatcher_va + boot_off as u64;
-    let c1_mode = crypto_mode == crate::crypto::CryptoMode::C1;
-    let chacha_mode = crypto_mode == crate::crypto::CryptoMode::ChaCha20;
+    let c1_mode = !no_crypto && crypto_mode == crate::crypto::CryptoMode::C1;
+    let chacha_mode = !no_crypto && crypto_mode == crate::crypto::CryptoMode::ChaCha20;
 
     // M8: VM module builders live in `vm_build` (MBA-variant vs plain routing).
     // P3 (G1): 상용 프로그램 리프트의 ip_map (source-IP -> micro-op index) — the
@@ -193,12 +192,9 @@ pub(crate) fn place_boot_stub(
         // 겹치던 (스택 오염) 문제가 제거되었다. [VM-OEP-DIAG] STATE_SP/PTR_STACK 미사용 (vreg[4]=RSP).
     }
 
-    // M12: 순수 RC4 비-chained/비-reencrypt/비-vm 경로만 디크립트 디스크립터 사용.
-    // (그 외 모드 — chained/C1/ChaCha/vm — 는 기존 imm 기반 decrypt 유지 → 무회귀)
-    let desc_used = crypto_mode == crate::crypto::CryptoMode::Rc4
-        && !chained_effective
-        && !reencrypt
-        && !vm_effective;
+    // The retired descriptor cipher is disabled; C1/ChaCha use their native
+    // state and the existing immediate-backed target metadata.
+    let desc_used = false;
     let stub = BootStubCtx {
         desc_va: 0,
         desc_size: 0,
@@ -304,7 +300,7 @@ pub(crate) fn place_boot_stub(
     };
 
     // 1st pass: stub 길이 측정 (runs_va/seed_va/vm_* = 0)
-    let stub_code_len = build_rc4_block(&stub)?.len();
+    let stub_code_len = build_boot_block(&stub)?.len();
 
     // FIX(v3): 안티디버그 블록은 RC4 코드 **앞**에 붙는다. 과거 코드는
     // cursor = boot_off + stub_code_len (RC4 코드 길이만) 로 잡아서, --anti-debug 사용 시
@@ -929,7 +925,7 @@ pub(crate) fn place_boot_stub(
         poly_tag_va,
         ..stub
     };
-    let stub_code = build_rc4_block(&stub2)?;
+    let stub_code = build_boot_block(&stub2)?;
     if stub_code.len() != stub_code_len {
         anyhow::bail!(
             "boot stub size changed after VA fixup: {} vs {}",
@@ -1115,7 +1111,7 @@ pub(crate) fn place_boot_stub(
         },
         ..stub2
     };
-    let stub_code_final = build_rc4_block(&stub3)?;
+    let stub_code_final = build_boot_block(&stub3)?;
     if stub_code_final.len() != stub_code_len {
         anyhow::bail!(
             "boot stub size changed after payload/crc VA fixup: {} vs {}",
@@ -1559,7 +1555,7 @@ pub(crate) fn place_boot_stub(
         }
     }
 
-    // fresh RC4(seed_stored) 하나로 .text → bytecode 순 연속 암호화. 부트 스텁의
+    // fresh BTG-C1(seed) 하나로 .text → bytecode 순 연속 암호화. 부트 스텁의
     // emit_rest_decrypt가 같은 순서로 복호화한다. (.textb는 RWX, .text는 WRITE
     // 비트 추가로 in-place 복호화를 허용한다.)
     if vm_oep_effective && (!text_enc_runs.is_empty() || vm_prog_bc_len > 0) {
@@ -1568,13 +1564,14 @@ pub(crate) fn place_boot_stub(
                 sec.characteristics |= 0x8000_0000; // IMAGE_SCN_MEM_WRITE (boot in-place decrypt)
             }
         }
-        let mut r = Rc4::new(seed_masked);
+        let (rest_key, rest_nonce) = super::cipher::derive_c1_key_nonce(seed_masked);
+        let mut rest_cipher = crate::crypto::BtgCipher::new(&rest_key, rest_nonce);
         if !text_enc_runs.is_empty() {
             if let Some(sec) = ctx.patched_sections.iter_mut().find(|s| s.name == ".text") {
                 let sec_start = image_base + sec.virtual_address as u64;
                 for &(va, len) in &text_enc_runs {
                     let off = (va - sec_start) as usize;
-                    r.crypt(&mut sec.bytes[off..off + len as usize]);
+                    rest_cipher.crypt(&mut sec.bytes[off..off + len as usize]);
                 }
             }
         }
@@ -1597,10 +1594,10 @@ pub(crate) fn place_boot_stub(
                     new_section_len
                 ));
             }
-            r.crypt(&mut btg.bytes[vm_prog_bc_off..bc_end]);
+            rest_cipher.crypt(&mut btg.bytes[vm_prog_bc_off..bc_end]);
         }
         println!(
-            "[+] --vm-oep at-rest: fresh-RC4(seed) encryption applied (preserved .text {} run(s)/{}B + Program VM bytecode {}B)",
+            "[+] --vm-oep at-rest: fresh-C1(seed) encryption applied (preserved .text {} run(s)/{}B + Program VM bytecode {}B)",
             text_enc_runs.len(), text_enc_total, vm_prog_bc_len
         );
         // P0-⑦: .text 보존 런(원본 절대 VA 포함)이 at-rest 암호화됨 → 로더 .reloc
@@ -1650,7 +1647,7 @@ pub(crate) fn place_boot_stub(
     // 남기되 부트 스텁이 디스크립터를 읽지 않으므로 소비자는 imm64를 그대로 쓴다.
     // [A/B] descriptor written plaintext (no encryption) for testing
     // if !no_crypto {
-    //     let mut rc = Rc4::new(seed_masked);
+    //     legacy descriptor encryption was performed here.
     //     rc.crypt(&mut btg.bytes[desc_off..desc_off + DESC_SIZE]);
     // }
 

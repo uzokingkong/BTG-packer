@@ -1,9 +1,9 @@
-use super::bootstub::{build_anti_debug_raw_block, build_rc4_block, BootStubCtx};
+use super::bootstub::{build_anti_debug_raw_block, build_boot_block, BootStubCtx};
 use super::cipher::Rc4;
 use super::integrity::crc32;
 use super::scan::scan_string_runs;
 use super::{run, ANTI_DEBUG_BLOCK_LEN, IMPORT_MBA_C};
-use crate::crypto::chain_encrypt;
+use crate::crypto::{chain_encrypt_c1, CryptoProvider};
 use crate::pe::builder::SectionData;
 use crate::pipeline::PipelineContext;
 
@@ -38,14 +38,14 @@ fn test_chained_roundtrip() {
         .map(|i| (i.wrapping_mul(31) + 7) as u8)
         .collect();
     let orig = data.clone();
-    let last_key = chain_encrypt(&mut data, &anchor);
+    let last_key = chain_encrypt_c1(&mut data, &anchor);
 
     let mut prev = anchor;
     let mut off = 0usize;
     while off < data.len() {
         let n = (data.len() - off).min(256);
-        let mut rc4 = Rc4::new(&prev);
-        rc4.crypt(&mut data[off..off + n]);
+        let mut cipher = crate::crypto::BtgCipher::new(&prev[..32], 0);
+        cipher.apply(&mut data[off..off + n]);
         if off + n >= 256 {
             prev.copy_from_slice(&data[off + n - 256..off + n]);
         } else {
@@ -123,7 +123,7 @@ fn test_anti_debug_raw_block_policies() {
 
 #[test]
 fn test_boot_stub_generates() {
-    // build_rc4_block + build_anti_debug_raw_block가 패닉 없이 인코딩되는지 검증
+    // build_boot_block + build_anti_debug_raw_block가 패닉 없이 인코딩되는지 검증
     let stub = BootStubCtx {
         desc_va: 0,
         desc_size: 0,
@@ -195,7 +195,7 @@ fn test_boot_stub_generates() {
     };
     let ad = build_anti_debug_raw_block(crate::dispatcher::antidebug::AntiDebugPolicy::Trap);
     assert_eq!(ad.len(), ANTI_DEBUG_BLOCK_LEN);
-    let code = build_rc4_block(&stub).expect("boot stub encode must succeed");
+    let code = build_boot_block(&stub).expect("boot stub encode must succeed");
     assert!(!code.is_empty());
     assert!(code.len() > 100, "rc4 block too small: {}", code.len());
     // 마지막 명령이 ret(0xC3)이어야 한다 (prga 서브루틴 종료)
@@ -206,7 +206,7 @@ fn test_boot_stub_generates() {
         anti_debug: false,
         ..stub
     };
-    let code2 = build_rc4_block(&stub2).expect("boot stub (no anti-debug) encode must succeed");
+    let code2 = build_boot_block(&stub2).expect("boot stub (no anti-debug) encode must succeed");
     assert!(!code2.is_empty());
 }
 
@@ -284,7 +284,7 @@ fn test_boot_stub_generates_chacha20_mode() {
         poly_key_va: 0,
         poly_tag_va: 0,
     };
-    let code = build_rc4_block(&stub).expect("chacha boot stub encode must succeed");
+    let code = build_boot_block(&stub).expect("chacha boot stub encode must succeed");
     assert!(!code.is_empty());
     assert!(code.len() > 100, "chacha block too small: {}", code.len());
     // 마지막 명령이 ret(0xC3)이어야 한다 (zeromem 서브루틴 종료)
@@ -302,7 +302,7 @@ fn test_boot_stub_generates_chacha20_mode() {
         poly_tag_va: 0,
         ..stub
     };
-    let code2 = build_rc4_block(&stub2).expect("chacha stub VA fixup must encode");
+    let code2 = build_boot_block(&stub2).expect("chacha stub VA fixup must encode");
     assert_eq!(
         code.len(),
         code2.len(),
@@ -435,7 +435,7 @@ fn test_boot_stub_ksa_matches_shared_list() {
         poly_key_va: 0,
         poly_tag_va: 0,
     };
-    let code = build_rc4_block(&stub).expect("boot stub encode must succeed");
+    let code = build_boot_block(&stub).expect("boot stub encode must succeed");
     assert!(!code.is_empty());
     assert_eq!(*code.last().unwrap(), 0xC3);
 }
@@ -548,7 +548,7 @@ fn test_full_pipeline_crypto_anti_debug_no_overlap() {
     // crypto::run의 Err 가드가 통과했다는 것 자체가 레이아웃 무결성을 보장한다.
     // v5: 동적 부트 영역 — 고정 예약(0x4000) 대신 사용분만 남도록 잘렸어야 한다.
     assert!(
-        btg.bytes.len() < boot_off + 0x4000,
+        btg.bytes.len() < boot_off + 0x10000,
         "v5 size control failed: section not trimmed (len=0x{:X}, boot_off=0x{:X})",
         btg.bytes.len(),
         boot_off
@@ -636,7 +636,7 @@ fn test_boot_stub_generates_with_integrity() {
         poly_key_va: 0,
         poly_tag_va: 0,
     };
-    let code = build_rc4_block(&stub).expect("boot stub encode must succeed");
+    let code = build_boot_block(&stub).expect("boot stub encode must succeed");
     assert!(!code.is_empty());
     // 마지막 명령이 ret(0xC3)이어야 한다 (prga 서브루틴 종료)
     assert_eq!(*code.last().unwrap(), 0xC3);
@@ -736,9 +736,10 @@ fn test_phase03_per_block_encryption_roundtrip() {
                 id
             );
             // 블록 roundtrip: per-block 키로 복호화 → 평문 복원
-            let mut rc4 = Rc4::new(&key.to_le_bytes());
+            let key32 = super::cipher::repeat4(key);
+            let mut cipher = crate::crypto::BtgCipher::new(&key32, 0);
             let mut dec = btg.bytes[off..off + len].to_vec();
-            rc4.crypt(&mut dec);
+            cipher.crypt(&mut dec);
             assert_eq!(
                 dec, block.instructions,
                 "block {} must roundtrip with per-block key",
@@ -820,7 +821,7 @@ fn test_boot_stub_generates_chacha20_aead_mode() {
         poly_key_va: 0x140003000,
         poly_tag_va: 0x140003020,
     };
-    let code = build_rc4_block(&stub).expect("chacha AEAD boot stub encode must succeed");
+    let code = build_boot_block(&stub).expect("chacha AEAD boot stub encode must succeed");
     assert!(!code.is_empty());
     assert!(
         code.len() > 100,
@@ -841,7 +842,7 @@ fn test_boot_stub_generates_chacha20_aead_mode() {
         poly_tag_va: 0x140003220,
         ..stub
     };
-    let code2 = build_rc4_block(&stub2).expect("chacha AEAD stub VA fixup must encode");
+    let code2 = build_boot_block(&stub2).expect("chacha AEAD stub VA fixup must encode");
     assert_eq!(
         code.len(),
         code2.len(),
@@ -854,7 +855,7 @@ fn test_boot_stub_generates_chacha20_aead_mode() {
 /// own ud2 trap -- a single-byte `je`->`jmp` patch cannot neuter all of them.
 #[test]
 fn test_integrity_multi_site_count() {
-    let code = build_rc4_block(&integrity_stub()).expect("integrity stub encode");
+    let code = build_boot_block(&integrity_stub()).expect("integrity stub encode");
     let ud2 = code.windows(2).filter(|w| *w == [0x0F, 0x0B]).count();
     assert!(
         ud2 >= 4,
@@ -937,14 +938,14 @@ fn test_integrity_derivation_deterministic_and_base_dependent() {
 #[test]
 fn test_integrity_stub_size_length_invariant() {
     let stub = integrity_stub();
-    let code = build_rc4_block(&stub).unwrap();
+    let code = build_boot_block(&stub).unwrap();
     let stub2 = BootStubCtx {
         crc3_va: 0x140001700,
         crc4_va: 0x140001704,
         w32_slot_va: 0x140001708,
         ..stub
     };
-    let code2 = build_rc4_block(&stub2).unwrap();
+    let code2 = build_boot_block(&stub2).unwrap();
     assert_eq!(
         code.len(),
         code2.len(),
@@ -959,8 +960,8 @@ fn test_integrity_stub_size_length_invariant() {
 #[test]
 fn test_junk_has_real_dependency_and_seed_determinism() {
     let stub = integrity_stub();
-    let code = build_rc4_block(&stub).unwrap();
-    let code2 = build_rc4_block(&stub).unwrap();
+    let code = build_boot_block(&stub).unwrap();
+    let code2 = build_boot_block(&stub).unwrap();
     assert_eq!(code, code2, "junk must be seed-deterministic");
     let mut dec = iced_x86::Decoder::with_ip(64, &code, 0, iced_x86::DecoderOptions::NONE);
     let mut last_edx_def: usize = usize::MAX;

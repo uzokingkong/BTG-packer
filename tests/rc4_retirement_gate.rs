@@ -21,8 +21,6 @@ const LEGACY_RC4_ALLOWLIST: &[&str] = &[
     // Legacy pack-time and boot-stub consumers awaiting migration.
     "src/pipeline/crypto/bootstub/emit.rs",
     "src/pipeline/crypto/mod.rs",
-    "src/pipeline/crypto/perblock.rs",
-    "src/pipeline/crypto/place/mod.rs",
 ];
 
 const HIGH_SIGNAL_RC4_USES: &[&str] = &[

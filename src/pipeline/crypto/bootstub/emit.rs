@@ -300,8 +300,93 @@ pub(crate) fn trashformer_mixing_loop(seed: u32) -> Vec<(Instruction, Option<Lab
 }
 
 pub(crate) fn emit_c1_call(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
+    // The native blob follows Win64 and may clobber volatile R11. Boot loops use
+    // R11 as their descriptor/run counter across the call, so preserve it at
+    // this shared boundary. Do not use push/pop here: the boot frame deliberately
+    // leaves RSP 16-byte aligned at every call site. The 0x108 slot is outside
+    // the legacy 0x100-byte S-box scratch area and exists in both frame variants.
+    seq.push((
+        Instruction::with2(
+            Code::Mov_rm64_r64,
+            MemoryOperand::with_base_displ(Register::RSP, 0x108),
+            Register::R11,
+        )
+        .unwrap(),
+        None,
+    ));
     seq.push((
         Instruction::with_branch(Code::Call_rel32_64, stub.c1_blob_va).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Mov_r64_rm64,
+            Register::R11,
+            MemoryOperand::with_base_displ(Register::RSP, 0x108),
+        )
+        .unwrap(),
+        None,
+    ));
+}
+
+/// Re-key the C1 state from the first 32 bytes at RCX. Chained mode invokes
+/// this for every 256-byte plaintext predecessor window. BtgCipher::from_key
+/// uses the same first-32-byte/nonce-zero contract.
+fn emit_c1_rekey_from_rcx(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
+    use iced_x86::MemoryOperand as M;
+    seq.push((
+        Instruction::with2(Code::Mov_r64_imm64, Register::RDI, stub.c1_state_va).unwrap(),
+        None,
+    ));
+    for off in [0i64, 8, 16, 24] {
+        seq.push((
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RAX,
+                M::with_base_displ(Register::RCX, off),
+            )
+            .unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(
+                Code::Mov_rm64_r64,
+                M::with_base_displ(Register::RDI, off),
+                Register::RAX,
+            )
+            .unwrap(),
+            None,
+        ));
+    }
+    seq.push((
+        Instruction::with2(Code::Xor_r32_rm32, Register::EAX, Register::EAX).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Mov_rm64_r64,
+            M::with_base_displ(Register::RDI, 0x20),
+            Register::RAX,
+        )
+        .unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Mov_rm32_r32,
+            M::with_base_displ(Register::RDI, 0x28),
+            Register::EAX,
+        )
+        .unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Mov_rm32_imm32,
+            M::with_base_displ(Register::RDI, 0x70),
+            0x40u32,
+        )
+        .unwrap(),
         None,
     ));
 }
@@ -848,15 +933,19 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
                 Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.seed_va).unwrap(),
                 None,
             ));
-            // ChainKeyOk: KSA(key=[rcx], 256B) → S-box@rbx
+            // ChainKeyOk: re-key the selected primitive from the predecessor.
             seq.push((
                 Instruction::with2(Code::Mov_r64_imm64, Register::RDX, 0x100).unwrap(),
                 Some(Label::ChainKeyOk),
             ));
-            seq.push((
-                Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(),
-                Some(Label::Ksa),
-            ));
+            if stub.c1_mode() {
+                emit_c1_rekey_from_rcx(seq, stub);
+            } else {
+                seq.push((
+                    Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(),
+                    Some(Label::Ksa),
+                ));
+            }
             // 청크 길이 = min(0x100, r13) → r14
             seq.push((
                 Instruction::with2(Code::Mov_r64_imm64, Register::R14, 0x100).unwrap(),
@@ -901,10 +990,14 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
                 Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::R14).unwrap(),
                 None,
             ));
-            seq.push((
-                Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(),
-                Some(Label::Prga),
-            ));
+            if stub.c1_mode() {
+                emit_c1_call(seq, stub);
+            } else {
+                seq.push((
+                    Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(),
+                    Some(Label::Prga),
+                ));
+            }
             seq.push((
                 Instruction::with2(Code::Add_rm64_r64, Register::R12, Register::R14).unwrap(),
                 None,
@@ -972,18 +1065,22 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
                 Instruction::with2(Code::Mov_r64_imm64, Register::RDX, 0x100).unwrap(),
                 Some(Label::StrKeyHave),
             ));
-            seq.push((
-                Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(),
-                Some(Label::Ksa),
-            ));
-            seq.push((
-                Instruction::with2(Code::Xor_r32_rm32, Register::ESI, Register::ESI).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with2(Code::Xor_r32_rm32, Register::EDI, Register::EDI).unwrap(),
-                None,
-            ));
+            if stub.c1_mode() {
+                emit_c1_rekey_from_rcx(seq, stub);
+            } else {
+                seq.push((
+                    Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(),
+                    Some(Label::Ksa),
+                ));
+                seq.push((
+                    Instruction::with2(Code::Xor_r32_rm32, Register::ESI, Register::ESI).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with2(Code::Xor_r32_rm32, Register::EDI, Register::EDI).unwrap(),
+                    None,
+                ));
+            }
         } else {
             // v15: 비-chained(재암호화/평문/VM) 경로에도 fail-deceptive 인증 게이트를
             // 적용한다. chained 경로와 동일한 PEB 3검 + RDTSC 타이밍으로 디버거/에뮬레이터를
@@ -1385,13 +1482,12 @@ pub(crate) fn emit_run_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stub
 
 /// M6 Phase-2.3 (--vm-oep at-rest encryption): Program VM 바이트코드와 (TLS
 /// 콜백 없는 경우) 보존된 원본 .text를 부트 스텁이 디스패치 직전에 복호화한다.
-/// 두 영역은 패커에서 fresh RC4(seed_stored) 하나로 `.text` → bytecode 순으로
+/// 두 영역은 패커에서 fresh BTG-C1(seed) 하나로 `.text` → bytecode 순으로
 /// 연속 암호화되어 파일에는 평문이 없고, 이 블록이 실행되기 전까지 실행 불가능한
 /// 암호문 상태로 남는다.
 ///
-/// 키스트림 동치: 패커 `Rc4::new(seed_stored)`(canonical PRGA i=j=0 시작)와
-/// 동일하게 `Ksa(key=seed@seed_va)` 후 ESI/EDI=0 재설정 → `Prga(.text)` →
-/// `Prga(bytecode)` 연속 호출로 복호화한다. (S-box base는 RSP — RBX를 재확정.)
+/// 키스트림 동치: 패커와 런타임 모두 seed에서 C1 key/nonce를 다시 유도한 뒤
+/// `.text` → bytecode 순으로 같은 상태를 연속 소비한다.
 ///
 /// 길이 불변성: 이 블록은 `stub.vm_oep`일 때 항상 전체를 emit한다 (len/va는
 /// imm이므로 값이 달라도 인코딩 길이가 동일). 이렇게 해야 부트 스텁 3-pass
@@ -1401,32 +1497,10 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
     if !stub.vm_oep {
         return;
     }
-    // fresh KSA: S-box base(RBX) = RSP, key = seed_va(256B)
-    seq.push((
-        Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::RSP).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.seed_va).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(Code::Mov_r64_imm64, Register::RDX, 0x100).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(),
-        Some(Label::Ksa),
-    ));
-    // canonical RC4 PRGA: i=0, j=0에서 시작
-    seq.push((
-        Instruction::with2(Code::Xor_r32_rm32, Register::ESI, Register::ESI).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(Code::Xor_r32_rm32, Register::EDI, Register::EDI).unwrap(),
-        None,
-    ));
+    // Main code/string decrypt has already consumed its stream. VM-OEP uses an
+    // independent fresh C1 stream for the preserved .text runs and bytecode.
+    debug_assert!(stub.c1_mode(), "VM-OEP must use the C1 native runtime");
+    emit_c1_init(seq, stub);
     // P5: loop over .text at-rest decrypt run-table (va,len u64 pairs). Fresh
     // keystream is continuous across runs -> same order/lengths as the packer
     // encrypted them. count==0 -> immediate no-op (bytecode-only).
@@ -1495,10 +1569,7 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
         .unwrap(),
         None,
     ));
-    seq.push((
-        Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(),
-        Some(Label::Prga),
-    ));
+    emit_c1_call(seq, stub);
     seq.push((
         Instruction::with2(Code::Add_rm64_imm32, Register::RBP, 16).unwrap(),
         None,
@@ -1551,10 +1622,7 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
             None,
         ));
     }
-    seq.push((
-        Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(),
-        Some(Label::Prga),
-    ));
+    emit_c1_call(seq, stub);
 }
 
 pub(crate) fn emit_self_wipe(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {

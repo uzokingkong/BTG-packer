@@ -1,164 +1,158 @@
 # BTG Packer
 
-Windows x86-64 PE를 대상으로 하는 연구용 패커입니다. native CFG slicing/shuffle,
-PE 재배치, boot crypto, integrity, import/memory hardening, selective SDK VM, legacy VM,
-whole-program multi-family Program-VM, QA·재현·진단 산출물을 하나의 파이프라인에서
-제공합니다. Commercial Program-VM은 주력 고보호 경로이지만 프로젝트 전체는 아닙니다.
+BTG Packer는 Windows x86-64 PE 실행 파일을 변환하는 Rust 기반 연구용 바이너리 보호 도구입니다. 입력 PE의 제어 흐름을 재구성하고, 선택한 프로파일에 따라 코드 가상화, 암호화, 무결성 검사, import 은닉, 메모리 권한 강화와 실행 결과 검증을 적용한 새 PE를 생성합니다.
 
-> 이 저장소는 연구용 프로토타입입니다. 검증된 범위 밖의 PE, 드라이버, 다른
-> 아키텍처 또는 적대적인 입력에 대한 범용 호환성을 보장하지 않습니다.
+> 보안 연구용 프로토타입입니다. Windows x86-64 사용자 모드 PE만 대상으로 하며, 자신이 소유하거나 분석 권한이 있는 바이너리에만 사용하세요.
 
-## 현재 상태
+## 실제 동작
 
-기준: `main` · 2026-08-23
+일반 경로는 PE header와 section, import, resource, relocation, exception directory를 읽고 `.text` 명령을 디코딩합니다. basic block과 CFG를 만들고 블록을 분할·섞은 뒤 RIP-relative 참조와 분기를 다시 계산합니다. 보호 계층, boot stub, dispatcher와 payload를 새 section에 배치하고 PE directory/relocation을 재구성한 다음 구조를 검증합니다. 요청하면 원본과 결과물을 실제 실행해 exit code, stdout, stderr도 바이트 단위로 비교합니다.
 
-| 영역 | 상태 | 실제 구현 |
-|---|---|---|
-| Native CFG packer | 구현됨 | CFG slicing, shuffle, RIP fixup, dispatcher와 PE section 재합성 |
-| PE/platform | 구현됨 | parse/build, import/resource/reloc/`.pdata`, structural validator |
-| Crypto/runtime | 이전 진행 중 | RC1 region-context ABI/provider와 M7 lifetime simulation 구현. 신규 RC4 선택은 차단됐지만 boot/native KSA·PRGA 및 vm-oep/chained production 소비자는 아직 이전 중 |
-| Selective SDK VM | 구현됨 | marker scan, poly VM embed, entry trampoline patch |
-| Program VM | 구현됨 | x86 → RISC → family ISA → native threaded runtime |
-| Multi-family | 구현됨 | Stack/Register/MixedRisc/FusedCisc 4개 독립 module/state/table/bytecode |
-| Cross-family control | 구현됨 | CALL, tail-JUMP, return/resume canonical routing |
-| Bytecode 보호 | 구현됨 | rolling-key stream, family별 ISA, M7 instruction-aligned chunk 암호화 |
-| Handler table | 구현됨 | per-opcode key, MBA key derivation, family별 integrity traversal |
-| Distributed integrity | 구현됨 | family별 code/table/bytecode 12개 BTGI descriptor와 boot verifier |
-| Data lifetime | 부분 구현 | exact-width/direct-call scope, owner-aware sync, native bridge UHANDLER cleanup 연결 |
-| P2-13 grammar | 완료 | family operand/compact immediate/control token 및 독립 super-op grammar production 연결 |
-| P2-14 state/lazy flags | 핵심 완료 | split domains와 RSI/RDI hot lazy state, branch/native/HALT materialization 연결 |
-| Release gate | 부분 완료 | library 578/578 및 P2-13 20-seed grammar gate 통과; 전체 pack gate 재실행 필요 |
-| QA/diagnostics | 구현됨 | compiler corpus, differential/multi-seed, manifest, ownership와 VM maps |
-
-완료/부분/계획의 상세 근거는 [현재 구현 상태](docs/current-status.md)를 기준으로
-합니다. 오래된 journal·audit 문서의 상태 문구는 당시 시점의 기록이며 현재 상태를
-대체하지 않습니다.
-
-## 아키텍처 한눈에 보기
-
-```text
-input PE
-  │
-  ├─ PE parse / CFG extraction / trigger-block slicing
-  ├─ layout shuffle / RIP fixup / dispatcher generation
-  ├─ optional selective SDK marker VM
-  ├─ optional legacy boot/program VM
-  ├─ optional commercial Program-VM
-  │    └─ RISC lift → 4-family partition → independent runtimes/routes
-  ├─ crypto / integrity / IAT hide / memory hardening / payload relocation
-  ├─ PE sections + resources + .pdata/.reloc reconstruction
-  └─ structural validation + optional execution differential
-output PE
-  └─ manifest / ownership / maps / diagnostics
-```
-
-구성요소와 소유권, 데이터 배치, 부트 순서는
-[시스템 아키텍처](docs/architecture/system-overview.md)에 정리되어 있습니다.
-모든 269개 Rust 파일의 책임 지도는 [전체 소스 지도](docs/architecture/source-map.md)를
-참고하세요.
-
-## 핵심 소스 지도
+Program-VM 경로는 x86-64를 내부 RISC IR로 lift하고 Stack, Register, Mixed-RISC, Fused-CISC 계열로 분할합니다. 계열별 ISA, rolling key, handler table과 native threaded runtime을 만들며 CALL/JUMP/RET는 canonical route로 연결합니다. lift 또는 unwind 안전성을 증명하기 어려운 함수는 native로 유지합니다.
 
 | 경로 | 역할 |
 |---|---|
-| `src/pipeline/` | 패킹 pass, 설정 정규화, crypto placement, PE 검증 |
-| `src/pipeline/crypto/place/` | Program-VM module/state/table/bytecode 실제 배치 |
-| `src/pipeline/crypto/bootstub/` | 부트 복호화, integrity, runtime 진입 코드 |
-| `src/vm/text_lift/` | PE 함수/CFG lift와 native 제외 판정 |
-| `src/vm/risc/` | canonical micro-op IR, lifter, 의미 참조 모델 |
-| `src/vm/poly/` | family ISA, rolling key, encoder/decoder/interpreter |
-| `src/vm/threaded/poly_direct/` | production native self-decoding runtime과 handlers |
-| `src/vm/multi_family.rs` | family partition materialization과 route records |
-| `src/vm/distributed_integrity.rs` | BTGI descriptor sealing/serialization ABI |
-| `src/vm/data_lifetime.rs` | lifetime object proof와 toggle metadata |
-| `src/vm/bytecode/`, `handlers/`, `interp/` | 레거시 1:1 VM 경로 |
+| `src/pe` | PE 파싱·생성, section/directory/relocation 처리 |
+| `src/graph`, `src/core`, `src/assembler` | CFG, block slicing/shuffle, fixup과 코드 생성 |
+| `src/pipeline` | protection profile을 적용하는 전체 패킹 pass와 결과 검증 |
+| `src/pipeline/crypto` | boot stub, 암호 영역, 무결성, payload와 Program-VM 배치 |
+| `src/vm/lifter`, `src/vm/risc` | x86-64 → RISC IR 변환과 의미 모델 |
+| `src/vm/poly`, `src/vm/threaded` | 다중 ISA 인코딩과 native self-decoding dispatcher |
+| `src/vm/text_lift` | 전체 프로그램 가상화 범위 분석과 예외 경계 보존 |
+| `src/crypto` | BTG-C1, ChaCha20, Poly1305, SHA-256과 provider ABI |
+| `src/qa`, `src/differential`, `src/multi_seed` | corpus, 실행 차등검증, seed 반복 검증 |
+| `test`, `tests` | QA 대상 프로그램과 통합 테스트 |
 
-## 빌드와 검증
+## 적용 기술
+
+- Rust 2021, Cargo, rustup 고정 toolchain, GitHub Actions
+- `clap` derive CLI와 protection-profile resolver
+- `goblin` PE/COFF 파싱
+- `iced-x86` decoder, encoder, block encoder, NASM formatter
+- x86-64 CFG 분석, basic-block slicing, layout shuffle, branch/RIP fixup
+- x86-64 → RISC IR → polymorphic multi-family ISA
+- direct-threaded/self-decoding VM, handler permutation, MBA 변환
+- BTG-C1 region-context cipher, RFC 8439 ChaCha20/Poly1305, SHA-256
+- rolling-key bytecode, on-demand encryption, distributed integrity
+- Windows import/resource/relocation/`.pdata` 재구성과 W^X 메모리 모델
+- deterministic `StdRng`, multi-seed gate, execution differential testing
+- `log`/`env_logger`, `anyhow`/`thiserror`
+
+## 빌드
+
+Windows x86-64와 rustup/Cargo가 필요합니다. QA corpus 생성에는 MSVC Windows target과 C/C++ 빌드 도구도 필요합니다.
 
 ```powershell
 cargo build --release
-cargo test --lib
+cargo test --all-targets
 ```
 
-대표 production 검증:
+결과는 `target\release\btg-packer.exe`입니다.
+
+## 사용법
+
+```powershell
+target\release\btg-packer.exe --input .\app.exe --output .\app.protected.exe
+```
+
+결정적 Program-VM 패킹과 실제 동작 검증 예시:
 
 ```powershell
 target\release\btg-packer.exe `
-  -i corpus\o1.exe `
-  -o protected.exe `
+  --input .\app.exe `
+  --output .\app.protected.exe `
   --vm --vm-oep --vm-commercial `
-  --m7 --m8 --integrity `
-  --verify-output --seed 31010
+  --m7 --m8 --integrity --iat-hide --mem-harden `
+  --strict-profile --verify-output --seed 31010
 ```
 
-`--verify-output`은 원본과 보호본의 exit code/stdout/stderr를 byte 단위로
-비교합니다. 현재 기록된 기준은 library 578/578, 대표 최대 조합 exit 0,
-stdout 1,460B, stderr 0B입니다. 검증 범위와 재현 명령은
-[검증 기준](docs/verification.md)을 참고하세요.
+`--full`은 native CFG 보호 묶음이며 Program-VM을 자동 선택하지 않습니다. 전체 프로그램 가상화에는 `--vm --vm-oep --vm-commercial`을 명시하세요.
 
-## 주요 CLI
+## 전체 CLI
 
-전체 42개 option과 resolver 충돌 규칙은 [CLI 전체 레퍼런스](docs/cli-reference.md)에
-정리되어 있습니다. 실제 이름은 `btg-packer.exe --help`, effective 적용은
-`src/protection_profile.rs`가 최종 기준입니다.
+다음은 `src/cli.rs`에 정의된 모든 사용자 옵션입니다.
 
-| 옵션 | 의미 |
-|---|---|
-| `--strict-profile` | 요청 기능의 silent downgrade를 오류로 처리 |
-| `--verify-output` | 원본/보호본 실행 차등검증 |
-| `--verify-seeds N` | N개 seed pack+execution gate |
-| `--seed N` | 결정적 빌드 seed |
-| `--vm --vm-oep --vm-commercial` | multi-family commercial Program-VM 경로 |
-| `--m7` | instruction-aligned bytecode chunk 보호 및 lifetime 보호 |
-| `--m8` | handler table MBA/per-opcode concealment |
-| `--integrity` | boot multisite + distributed VM integrity |
-| `--iat-hide` | runtime import resolution |
-| `--mem-harden` | runtime memory-protection 전환 |
-| `--anti-debug` | 부트 안티디버그 검사 |
-| `--map --sym-map` | VM/source 진단 매핑 생성 |
-| `--crypto-mode` | `c1`, `chacha20` 선택. `rc4` 값은 파싱 거부 |
+| 옵션 | 기본값 | 설명 |
+|---|---:|---|
+| `-i, --input <PATH>` | `dummy_target.exe` | 입력 Windows PE |
+| `-o, --output <PATH>` | `protected_btg.exe` | 출력 PE |
+| `--strict-profile` | off | 충돌에 따른 downgrade/비활성화를 오류 처리 |
+| `--verify-output` | off | 원본/결과의 exit code, stdout, stderr 비교 |
+| `--verify-timeout-secs <N>` | `30` | 실행 검증 제한 시간(초) |
+| `--verify-seeds <N>` | `0` | N개 seed로 패킹 및 실행 검증 |
+| `--seed <U64>` | random | 모든 RNG를 고정하는 결정적 build seed |
+| `-l, --obf-level <N>` | `3` | 1 basic, 2 MBA, 3 overlapping+MBA |
+| `-a, --anti-debug` | off | anti-debug 활성화 |
+| `--anti-debug-policy <MODE>` | `trap` | `trap`, `hang`, `warn`, `poison` |
+| `-t, --test-qa` | off | multi-compiler QA 실행 |
+| `--qa-commercial` | off | commercial Program-VM으로 QA 및 차등검증 |
+| `--qa-gen-corpus` | off | 여러 최적화 profile의 QA corpus 생성 후 종료 |
+| `-d, --debug` | off | 상세 logging |
+| `-g, --log-file <PATH>` | 없음 | log 파일 경로 |
+| `--trace-blocks` | off | block 실행 tracer 삽입 |
+| `--no-crypto` | off | 기본 암호 계층 비활성화 |
+| `--vm` | off | boot crypto/선택 VM 경로 활성화 |
+| `--vm-test` | off | VM self-test 후 종료 |
+| `--text-vm` | off | 패킹 없이 block별 lift 가능 여부 보고 |
+| `--text-vm-oep` | off | 패킹 없이 OEP 도달 CFG lift 범위 보고 |
+| `--payload-relocate` | off | payload를 비실행 `.vdata`로 이동 |
+| `--rsrc-register` | off | payload를 `RT_RCDATA`로 등록 |
+| `--crypto-coverage <0..100>` | `100` | 코드 영역 암호화 비율 |
+| `--chained-crypto` | off | chunk chaining과 복호화 후 key material 소거 |
+| `--integrity` | off | boot CRC와 VM distributed integrity |
+| `--iat-hide` | off | 최소 loader import 외 API를 runtime 해석 |
+| `--mem-harden` | off | immutable RX와 mutable RW 영역 분리 |
+| `--dispatcher-reencrypt` | off | 현재 block만 복호화하고 직전 block 재암호화 |
+| `--full` | off | native CFG 최대 보호 bundle |
+| `--vm-oep` | off | OEP를 Program-VM entry로 전환; `--vm` 함의 |
+| `--vm-commercial` | off | RISC→poly→threaded backend 선택 |
+| `--m7` | off | on-demand 암호화와 data lifetime 보호 |
+| `--m8` | off | VM handler table key/MBA concealment |
+| `--vm-bench` | off | interpreter/native VM benchmark 후 종료 |
+| `--map` | off | `<output>.map` 명령 mapping 생성 |
+| `--sym-map` | off | `<output>.sym` block/function mapping 생성 |
+| `--keep-pdata` | off | dispatcher unwind leaf 없이 원본 `.pdata` 유지 |
+| `--block-ring` | off | 최근 32개 logical block 진단 ring 삽입 |
+| `--custom-cipher` | off | 기본 BTG-C1 경로를 명시 |
+| `--rc4` | 오류 | 구형 script 감지용이며 지정하면 실패 |
+| `--crypto-mode <MODE>` | `c1` | `c1` 또는 지원되는 bulk 경로의 `chacha20` |
+| `-h, --help` | - | 도움말 |
+| `-V, --version` | - | 버전 |
 
-`--full`은 native CFG 보호 bundle이며 commercial Program-VM을 자동으로 켜지 않습니다.
-Commercial 경로는 `--vm --vm-oep --vm-commercial`을 명시하세요.
+```powershell
+target\release\btg-packer.exe --help
+```
 
-옵션은 조합에 따라 effective profile이 달라질 수 있으므로 배포 검증에서는
-`--strict-profile` 사용을 권장합니다.
+## 옵션 조합
 
-## 알려진 한계
+- `--rsrc-register`는 `--payload-relocate`가 필요합니다.
+- `--dispatcher-reencrypt`와 `--no-crypto`는 함께 쓸 수 없습니다.
+- native `--dispatcher-reencrypt`는 쓰기 가능한 code page가 필요하므로 `--mem-harden`보다 우선합니다.
+- `--vm-oep`는 `--vm`을 함의하며 native dispatcher 재암호화보다 우선합니다.
+- selective `--vm --m7`은 지원하지 않습니다. Program-VM에서는 `--vm --vm-oep --vm-commercial --m7`을 사용합니다.
+- `--m8`은 VM이 활성화된 경우에만 적용됩니다.
+- `--crypto-mode chacha20`은 bulk 경로용입니다. chained/reencryption/일부 VM 조합은 resolver가 지원 경로로 조정할 수 있습니다.
+- `--rc4`와 `--crypto-mode rc4`는 지원하지 않습니다.
+- 조정을 허용하지 않으려면 `--strict-profile`을 사용합니다.
 
-- P2-13 control grammar는 family별 compact direct/keyed/table-selector/continuation token과 super-op tag/descriptor-mask ABI까지 production 연결됐습니다.
-- P2-14 split state, temp spill window, register-resident lazy flag와 경계 물질화가
-  연결됐습니다. 공유 lifetime 객체도 전역 owner/depth/atomic lock으로 동기화되며,
-  native call scope는 bridge `UNW_FLAG_UHANDLER`가 unwind 시 현재 thread 소유 객체를
-  재암호화하고 depth/owner/lock을 정리합니다. 증명되지 않은 복합 참조는 계속 제외합니다.
-- P2-15 native bridge는 복귀 직후 private canonical frame을 zeroize합니다. 실제
-  live-in/live-out subset marshaling과 instance별 frame layout은 아직 미완료입니다.
-- 일부 TLS, unwind, panic, setjmp/longjmp, loader-critical 함수는 안전을 위해
-  native로 유지됩니다.
-- at-rest 암호화와 relocation/ASLR 정책은 선택한 profile에 따라 제한됩니다.
-- RC1은 region/family/function/predecessor/integrity epoch를 분리하는 ABI와 provider,
-  M7 data-lifetime simulation까지 구현됐습니다. 아직 boot/native 내부의 legacy RC4
-  KSA/PRGA와 `vm-oep`/chained production 소비자는 RC1으로 완전히 이전되지 않았으므로
-  저장소 전체에서 RC4가 제거됐거나 production 경로가 모두 RC1이라고 간주하면 안 됩니다.
-- 신규 설정에서 `--crypto-mode rc4`는 허용되지 않으며, 호환용 `--rc4` 플래그도
-  조용히 다른 암호로 대체하지 않고 profile 해석 단계에서 오류로 종료합니다.
-- BTG-C1은 자체 연구용 cipher이며 독립적인 암호학 감사를 받지 않았습니다.
-- 최신 변경 전체에 대한 hostile corpus/20-seed release gate는 다시 수행해야 합니다.
+## 생성 파일과 테스트
 
-## 문서 읽는 순서
+기본 결과는 `--output` PE입니다. 옵션에 따라 `.btgmanifest`, `.ownership.csv`, `.btg_layout.log`, `.map`, `.sym`, `.riscmap.csv`가 생성될 수 있으며 Git에는 포함하지 않습니다.
 
-1. [현재 구현 상태](docs/current-status.md)
-2. [시스템 아키텍처](docs/architecture/system-overview.md)
-3. [전체 소스 지도](docs/architecture/source-map.md)
-4. [CLI 전체 레퍼런스](docs/cli-reference.md)
-5. [실제 production 파이프라인](docs/architecture/actual-pipeline.md)
-6. [검증 기준](docs/verification.md)
-7. [문서 인덱스](docs/README.md)
-8. [현재 구현 계획](plan_vmrestore_upgraded.md)
+```powershell
+cargo test --lib
+cargo test --all-targets
+target\release\btg-packer.exe --vm-test
+target\release\btg-packer.exe --vm-bench
+target\release\btg-packer.exe --qa-gen-corpus
+target\release\btg-packer.exe --test-qa --qa-commercial
+```
 
-`docs/journal/`, 날짜가 붙은 분석·audit·engine 보고서는 변경 당시의 증거와
-디버깅 기록을 보존하는 역사 문서입니다.
+## 제한 사항
 
-## 보안
+- lift 불가 명령이나 SEH/TLS/panic/unwind/setjmp 경계는 native로 남을 수 있습니다.
+- 자체 설계 BTG-C1은 독립적인 암호학 감사를 받은 표준 암호가 아닙니다.
+- 진단 map/manifest는 보호 구조를 노출할 수 있으므로 배포물에서 제외하세요.
+- 호환성과 보호 강도는 입력, compiler와 option 조합에 따라 달라집니다.
 
-취약점 제보와 안전한 사용 범위는 [SECURITY.md](SECURITY.md)를 참고하세요.
+MIT License는 `LICENSE`, 취약점 제보 방법은 `SECURITY.md`를 참고하세요.
