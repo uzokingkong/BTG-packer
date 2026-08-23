@@ -1,8 +1,8 @@
-# BTG Program Virtualizer
+# Ouroboros
 
 **Windows x86-64 PE Transformation, Program Virtualization & Runtime Hardening Framework — written in Rust**
 
-BTG Packer는 Windows PE32+ 실행 파일을 대상으로 **제어 흐름 재구성, 프로그램 가상화, 코드 암호화, import 은닉, 무결성 검사, 메모리 권한 강화, PE 재구성 및 실행 차등 검증**을 수행하는 연구용 바이너리 보호 프레임워크입니다.
+Ouroboros는 Windows PE32+ 실행 파일을 대상으로 **제어 흐름 재구성, 프로그램 가상화, 코드 암호화, import 은닉, 무결성 검사, 메모리 권한 강화, PE 재구성 및 실행 차등 검증**을 수행하는 연구용 바이너리 보호 프레임워크입니다.
 
 단순히 원본 코드를 암호화한 뒤 시작 시 복호화하는 형태의 packer가 아니라, 입력 프로그램을 분석해 CFG와 함수 ownership을 구성하고 선택한 protection profile에 따라 **native transformation pipeline** 또는 **x86-64 → RISC IR → polymorphic Program-VM pipeline**으로 변환합니다.
 
