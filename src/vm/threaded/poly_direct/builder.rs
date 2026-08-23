@@ -1862,6 +1862,18 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::R10, Register::RAX).unwrap());
             let next_route = 0xE000_0000usize + route_index;
             b.br(Code::Jne_rel32_64, next_route);
+            // A target VA is not a unique runtime route key: one family can both
+            // CALL and tail-JUMP to the same function from different bytecode
+            // sites.  R12 is the bytecode VIP *after* the current VirtualBranch
+            // has been fully decoded, so matching that post-instruction VIP
+            // disambiguates the source callsite without adding mutable VM state.
+            if let Some(source_next_byte_offset) = route.source_next_byte_offset {
+                movi(&mut b, Register::RAX, source_next_byte_offset);
+                b.push(
+                    Instruction::with2(Code::Cmp_rm64_r64, Register::R12, Register::RAX).unwrap(),
+                );
+                b.br(Code::Jne_rel32_64, next_route);
+            }
             movi(&mut b, Register::RCX, route.target_state_va);
             for index in 0..16 {
                 b.push(

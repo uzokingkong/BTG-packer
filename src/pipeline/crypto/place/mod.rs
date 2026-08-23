@@ -113,7 +113,16 @@ pub(crate) fn place_boot_stub(
     ctx.vm_family_partitions = vm_family_partitions;
     ctx.vm_multi_family = vm_multi_family;
     ctx.unsupported_instructions = unsupported_instructions;
+
+    // Route metadata is rebuilt from the current commercial-VM analysis below.
+    // Keep all authoritative placement/inventory state in the same lifecycle:
+    // a previous/sizing pass must never leave route facts behind after the
+    // serialized `.vmroute` payload has been cleared.
     ctx.route_metadata_section_data = None;
+    ctx.route_required_original_targets.clear();
+    ctx.route_generated_destinations.clear();
+    ctx.route_generated_executable_ranges.clear();
+
     if vm_commercial {
         if let (Some(program), Some(plan), Some(multi)) = (
             ctx.program_model.as_ref(),
@@ -678,16 +687,28 @@ pub(crate) fn place_boot_stub(
         0
     };
     ctx.vm_prog_total = vm_prog_total as u32;
-    ctx.route_generated_executable_ranges = if ctx.vm_prog_rva != 0 && ctx.vm_prog_total != 0 {
-        vec![crate::vm::route_metadata::RvaSpan {
-            start: ctx.vm_prog_rva,
-            end: ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total),
-        }]
-    } else {
-        Vec::new()
-    };
+
+    // Executable-route inventory only exists when a `.vmroute` image was
+    // actually staged. A commercial VM can legitimately have no proven
+    // indirect targets, in which case `build_commercial_routes()` returns
+    // `None` and no route metadata section should exist at all.
+    let route_metadata_active = ctx.route_metadata_section_data.is_some();
+    if route_metadata_active != !ctx.route_required_original_targets.is_empty() {
+        anyhow::bail!(
+            "canonical route metadata staging/inventory lifecycle mismatch"
+        );
+    }
+    ctx.route_generated_executable_ranges =
+        if route_metadata_active && ctx.vm_prog_rva != 0 && ctx.vm_prog_total != 0 {
+            vec![crate::vm::route_metadata::RvaSpan {
+                start: ctx.vm_prog_rva,
+                end: ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total),
+            }]
+        } else {
+            Vec::new()
+        };
     ctx.route_generated_destinations.clear();
-    if !ctx.route_required_original_targets.is_empty() {
+    if route_metadata_active {
         let sizing = vm_multi_family_sizing.as_ref().ok_or_else(|| {
             anyhow::anyhow!("canonical route metadata has no placed multi-family VM module")
         })?;

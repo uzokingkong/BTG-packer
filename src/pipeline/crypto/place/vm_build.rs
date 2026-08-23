@@ -35,8 +35,43 @@ pub(crate) fn build_multi_family_prog_mod(
     lifetime_key: u64,
     lifetime_objects: &[crate::vm::data_lifetime::LiteralObject],
 ) -> anyhow::Result<MultiFamilyVmModule> {
+    // `place/mod.rs` intentionally calls this function once with both bases set
+    // to zero to measure the complete multi-family module before its final PE
+    // location is known.  The generated commercial runtime, however, validates
+    // every cross-family destination as a non-null native address.  Using the
+    // literal zero bases for the second (final-shape) build inside this function
+    // therefore makes any route whose target module has offset zero look like a
+    // null route even though this is only a sizing pass.
+    //
+    // Preserve the production validator and give the outer sizing invocation
+    // deterministic synthetic bases instead.  Keep the synthetic code/table/
+    // bytecode/state bundle inside one +/-2 GiB window: the commercial runtime
+    // deliberately materializes its local anchors with RIP-relative LEA, whose
+    // disp32 cannot address farther than +/-2 GiB.  The real placement call
+    // later rebuilds the module with the actual image VAs.
+    if (code_va == 0) != (state_va == 0) {
+        return Err(anyhow::anyhow!(
+            "multi-family Program-VM received an asymmetric null placement base: code={code_va:#x} state={state_va:#x}"
+        ));
+    }
+    // Sizing-only addresses.  Keep state close to code so every generated
+    // RIP-relative anchor remains encodable as disp32.  0x2000_0000 = 512 MiB.
+    const OUTER_SIZING_CODE_BASE: u64 = 0x0000_0001_4000_0000;
+    const OUTER_SIZING_STATE_BASE: u64 = OUTER_SIZING_CODE_BASE + 0x2000_0000;
+    let sizing_only = code_va == 0;
+    let effective_code_va = if sizing_only {
+        OUTER_SIZING_CODE_BASE
+    } else {
+        code_va
+    };
+    let effective_state_va = if sizing_only {
+        OUTER_SIZING_STATE_BASE
+    } else {
+        state_va
+    };
+
     let lifetime_sync = crate::vm::data_lifetime::LifetimeSyncTable::build(
-        state_va,
+        effective_state_va,
         image_base,
         lifetime_key,
         lifetime_objects,
@@ -80,13 +115,15 @@ pub(crate) fn build_multi_family_prog_mod(
     // are not known until all module sizes have been measured.
     //
     // Use deterministic, non-zero synthetic addresses here instead of null
-    // placeholders. `movi()` always emits an imm64, so the concrete values do
-    // not affect generated code size.  The final build later replaces these
-    // values with the real code/state addresses.
-    const SIZING_ENTRY_BASE: u64 = 0x0000_0001_0000_0000;
-    const SIZING_STATE_BASE: u64 = 0x0000_0002_0000_0000;
+    // placeholders.  Cross-family entry/state addresses are currently loaded
+    // with imm64, but keeping all sizing addresses in the same local window also
+    // preserves the runtime's general near-placement invariant.
+    const SIZING_ENTRY_BASE: u64 = OUTER_SIZING_CODE_BASE + 0x0400_0000;
+    const SIZING_STATE_BASE: u64 = OUTER_SIZING_CODE_BASE + 0x0800_0000;
 
-    let dummy_routes = |source_family| {
+    let dummy_routes = |source_family| -> anyhow::Result<Vec<vm::threaded::poly_direct::NativeCrossFamilyRoute>> {
+        let source_index = index_by_family[&source_family];
+        let source = modules[source_index];
         materialized
             .route_table
             .iter()
@@ -94,8 +131,20 @@ pub(crate) fn build_multi_family_prog_mod(
             .map(|route| {
                 let target_index = index_by_family[&route.target_family];
                 let target = modules[target_index];
-                vm::threaded::poly_direct::NativeCrossFamilyRoute {
+                let source_next_byte_offset = source
+                    .instruction_offsets
+                    .get(route.source_local_op + 1)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "cross-family source op {} in {:?} has no following bytecode offset",
+                            route.source_local_op,
+                            source_family
+                        )
+                    })? as u64;
+                Ok(vm::threaded::poly_direct::NativeCrossFamilyRoute {
                     target_va: route.target_va,
+                    source_next_byte_offset: Some(source_next_byte_offset),
                     target_entry_va: SIZING_ENTRY_BASE
                         + (target_index as u64) * MULTI_FAMILY_STATE_STRIDE as u64,
                     target_state_va: SIZING_STATE_BASE
@@ -104,23 +153,22 @@ pub(crate) fn build_multi_family_prog_mod(
                     target_layout: vm::threaded::VmRuntimeLayout::from_seed(target.module_domain),
                     tail_jump_resume_offset: (route.kind
                         == vm::multi_family::CrossFamilyRouteKind::Jump)
-                        .then_some(
-                            modules[index_by_family[&source_family]].exit_byte_offset as u64,
-                        ),
-                }
+                        .then_some(source.exit_byte_offset as u64),
+                })
             })
-            .collect::<Vec<_>>()
+            .collect()
     };
 
     let mut sized = Vec::with_capacity(modules.len());
     for (module_index, module) in modules.iter().enumerate() {
-        let mut routes = dummy_routes(module.family);
+        let mut routes = dummy_routes(module.family)?;
         if routes.is_empty() {
             // Keep one unreachable route so the sizing pass and final pass use
             // the same generated route-scan shape.  It must still satisfy the
             // production validator's non-null address contract.
             routes.push(vm::threaded::poly_direct::NativeCrossFamilyRoute {
                 target_va: u64::MAX,
+                source_next_byte_offset: None,
                 target_entry_va: SIZING_ENTRY_BASE
                     + (module_index as u64) * MULTI_FAMILY_STATE_STRIDE as u64,
                 target_state_va: SIZING_STATE_BASE
@@ -172,10 +220,22 @@ pub(crate) fn build_multi_family_prog_mod(
             .map(|route| {
                 let target_index = index_by_family[&route.target_family];
                 let target = modules[target_index];
+                let source_next_byte_offset = module
+                    .instruction_offsets
+                    .get(route.source_local_op + 1)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "cross-family source op {} in {:?} has no following bytecode offset",
+                            route.source_local_op,
+                            module.family
+                        )
+                    })? as u64;
                 Ok(vm::threaded::poly_direct::NativeCrossFamilyRoute {
                     target_va: route.target_va,
-                    target_entry_va: code_va + code_offsets[target_index] as u64,
-                    target_state_va: state_va + (target_index * MULTI_FAMILY_STATE_STRIDE) as u64,
+                    source_next_byte_offset: Some(source_next_byte_offset),
+                    target_entry_va: effective_code_va + code_offsets[target_index] as u64,
+                    target_state_va: effective_state_va + (target_index * MULTI_FAMILY_STATE_STRIDE) as u64,
                     target_byte_offset: target.instruction_offsets[route.target_local_op] as u64,
                     target_layout: vm::threaded::VmRuntimeLayout::from_seed(target.module_domain),
                     tail_jump_resume_offset: (route.kind
@@ -187,8 +247,9 @@ pub(crate) fn build_multi_family_prog_mod(
         if routes.is_empty() {
             routes.push(vm::threaded::poly_direct::NativeCrossFamilyRoute {
                 target_va: u64::MAX,
-                target_entry_va: code_va + code_offsets[index] as u64,
-                target_state_va: state_va + (index * MULTI_FAMILY_STATE_STRIDE) as u64,
+                source_next_byte_offset: None,
+                target_entry_va: effective_code_va + code_offsets[index] as u64,
+                target_state_va: effective_state_va + (index * MULTI_FAMILY_STATE_STRIDE) as u64,
                 target_byte_offset: 0,
                 target_layout: vm::threaded::VmRuntimeLayout::from_seed(module.module_domain),
                 tail_jump_resume_offset: None,
@@ -196,11 +257,11 @@ pub(crate) fn build_multi_family_prog_mod(
         }
         let built_module =
             vm::commercial_build::build_program_vm_commercial_with_routes_for_family(
-                code_va + code_offsets[index] as u64,
-                code_va + code_total as u64 + table_offsets[index] as u64,
-                code_va + code_total as u64 + table_total as u64 + bytecode_offsets[index] as u64,
+                effective_code_va + code_offsets[index] as u64,
+                effective_code_va + code_total as u64 + table_offsets[index] as u64,
+                effective_code_va + code_total as u64 + table_total as u64 + bytecode_offsets[index] as u64,
                 module.bytecode.clone(),
-                state_va + (index * MULTI_FAMILY_STATE_STRIDE) as u64,
+                effective_state_va + (index * MULTI_FAMILY_STATE_STRIDE) as u64,
                 module.module_domain,
                 module.family,
                 Some(&module.ip_map),

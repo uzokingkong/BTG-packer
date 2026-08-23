@@ -11,6 +11,12 @@ pub const MAX_NATIVE_CROSS_FAMILY_ROUTES: usize = 4096;
 #[derive(Debug, Clone)]
 pub struct NativeCrossFamilyRoute {
     pub target_va: u64,
+    /// Bytecode VIP immediately after the source VirtualBranch. Production
+    /// multi-family routes set this so identical target VAs reached from
+    /// different callsites (including CALL vs tail-JUMP) remain distinguishable
+    /// by the native route scanner. Legacy/canonical target-only routes may leave
+    /// it unset.
+    pub source_next_byte_offset: Option<u64>,
     pub target_entry_va: u64,
     pub target_state_va: u64,
     pub target_byte_offset: u64,
@@ -26,17 +32,19 @@ pub(crate) fn validate_native_cross_family_routes(routes: &[NativeCrossFamilyRou
             MAX_NATIVE_CROSS_FAMILY_ROUTES
         ));
     }
-    let mut targets = BTreeSet::new();
+    let mut runtime_keys = BTreeSet::new();
     for (index, route) in routes.iter().enumerate() {
         if route.target_va == 0 || route.target_entry_va == 0 || route.target_state_va == 0 {
             return Err(anyhow!(
                 "commercial VM cross-family route {index} has a null address"
             ));
         }
-        if !targets.insert(route.target_va) {
+        let runtime_key = (route.target_va, route.source_next_byte_offset);
+        if !runtime_keys.insert(runtime_key) {
             return Err(anyhow!(
-                "commercial VM duplicate cross-family target {:#x}",
-                route.target_va
+                "commercial VM duplicate cross-family runtime key target={:#x} source_next={:?}",
+                route.target_va,
+                route.source_next_byte_offset
             ));
         }
         route.target_layout.validate().map_err(|error| {
@@ -223,6 +231,7 @@ mod route_validation_tests {
     fn route(target_va: u64) -> NativeCrossFamilyRoute {
         NativeCrossFamilyRoute {
             target_va,
+            source_next_byte_offset: Some(0x40),
             target_entry_va: 0x2000,
             target_state_va: 0x3000,
             target_byte_offset: 0,
@@ -232,12 +241,20 @@ mod route_validation_tests {
     }
 
     #[test]
-    fn duplicate_runtime_target_is_rejected_before_codegen() {
+    fn duplicate_runtime_key_is_rejected_before_codegen() {
         let routes = [route(0x1000), route(0x1000)];
         assert!(validate_native_cross_family_routes(&routes)
             .unwrap_err()
             .to_string()
-            .contains("duplicate cross-family target"));
+            .contains("duplicate cross-family runtime key"));
+    }
+
+    #[test]
+    fn same_target_from_different_source_vips_is_allowed() {
+        let first = route(0x1000);
+        let mut second = route(0x1000);
+        second.source_next_byte_offset = Some(0x80);
+        validate_native_cross_family_routes(&[first, second]).unwrap();
     }
 
     #[test]

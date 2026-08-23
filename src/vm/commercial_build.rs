@@ -580,6 +580,7 @@ mod tests {
         .unwrap();
         let routes = [NativeCrossFamilyRoute {
             target_va: 0x2000,
+            source_next_byte_offset: None,
             target_entry_va: child_code,
             target_state_va: child_state,
             target_byte_offset: 0,
