@@ -1,0 +1,754 @@
+// ==============================================================================
+// BTG Packer - Build manifest (commercial-readiness-plan 3-2).
+//
+// A BuildManifest records everything needed to reproduce / triage a build:
+//   * the packer version, a deterministic build_id, and the optional --seed,
+//   * the VM ISA version and the crypto engine version actually used,
+//   * the effective feature flags,
+//   * SHA-256 of the input PE and of the output PE.
+//
+// It is written next to the output PE as `<output>.btgmanifest` and echoed to the
+// pack log. Hashes are computed with the dependency-free SHA-256 in this module
+// so no hashing crate is added to Cargo.toml.
+//
+// build_id is derived deterministically from (seed, input_hash) so two builds of
+// the same input + seed + config produce the *same* build_id — that is what lets
+// a customer support ticket (a build_id) pin down the exact build that crashed.
+// ==============================================================================
+
+use std::io;
+use std::path::Path;
+
+/// VM ISA version this packer emits (roadmap v31 — full ISA milestone line).
+pub const VM_VERSION: u32 = 31;
+/// Crypto capability manifest ABI. RC4 is no longer a valid emitted mode.
+pub const CRYPTO_VERSION: u32 = 63;
+
+/// M0-2 measurements over the original application's code domain.
+///
+/// These values are deliberately optional: older manifest call sites can keep
+/// using [`BuildManifest::new`] until the ownership analysis has produced an
+/// authoritative measurement. `Some(0)` means "measured and zero", while
+/// `None` means "not measured"; the distinction is required for strict-profile
+/// validation to avoid treating missing evidence as a successful zero count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VmOriginalMetrics {
+    /// Number of canonical original application functions in the VM denominator.
+    pub vm_original_functions: Option<u64>,
+    /// Number of canonical original application basic blocks in the VM denominator.
+    pub vm_original_blocks: Option<u64>,
+    /// Number of canonical original application instructions in the VM denominator.
+    pub vm_original_instructions: Option<u64>,
+    /// Original application functions that remain natively owned in the output.
+    pub native_original_functions: Option<u64>,
+    /// Original application `.text` bytes that remain executable in the output.
+    pub original_text_exec_bytes: Option<u64>,
+    /// Internal control-flow edges whose targets remain unresolved.
+    pub unresolved_edges: Option<u64>,
+}
+
+impl VmOriginalMetrics {
+    /// Construct a complete M0-2 measurement set.
+    pub const fn measured(
+        vm_original_functions: u64,
+        vm_original_blocks: u64,
+        vm_original_instructions: u64,
+        native_original_functions: u64,
+        original_text_exec_bytes: u64,
+        unresolved_edges: u64,
+    ) -> Self {
+        Self {
+            vm_original_functions: Some(vm_original_functions),
+            vm_original_blocks: Some(vm_original_blocks),
+            vm_original_instructions: Some(vm_original_instructions),
+            native_original_functions: Some(native_original_functions),
+            original_text_exec_bytes: Some(original_text_exec_bytes),
+            unresolved_edges: Some(unresolved_edges),
+        }
+    }
+}
+
+/// A fully-qualified description of one pack run.
+#[derive(Debug, Clone)]
+pub struct BuildManifest {
+    /// Packer binary version (`CARGO_PKG_VERSION` = "1.0.0").
+    pub version: String,
+    /// Deterministic build identifier: `BTG-<seed:016X>-<input_hash[..8]>`.
+    pub build_id: String,
+    /// The `--seed` used (None = entropy-seeded RNG).
+    pub seed_id: Option<u64>,
+    /// VM ISA version (see [`VM_VERSION`]).
+    pub vm_version: u32,
+    /// Crypto engine version (see [`CRYPTO_VERSION`]).
+    pub crypto_version: u32,
+    /// Effective feature flags (ordered, CSV in `render`).
+    pub feature_flags: Vec<String>,
+    /// P0-1: resolved flags with observable output evidence.
+    pub effective_features: Vec<String>,
+    /// P0-1: resolved flags which failed their materialization invariant.
+    pub ineffective_features: Vec<String>,
+    /// Effective crypto primitive (`c1`/`chacha20`) used by the
+    /// boot stub at-rest decryption (readccc.md §6.1 capability manifest).
+    pub crypto_mode: String,
+    pub crypto_construction: String,
+    pub payload_initial_counter: u32,
+    pub poly_key_embedded: bool,
+    /// v63/P3-2: at-rest encryption was applied to the code region and/or data runs.
+    pub at_rest_encryption: bool,
+    /// v63/P3-2: ASLR (relocation-aware output) preserved. at-rest encryption
+    /// disables it (loader relocation would corrupt ciphertext) — record the
+    /// trade-off so the artifact states its guarantees.
+    pub aslr_preserved: bool,
+    /// v63/P3-2: integrity (CRC32 + keyed-MAC) active.
+    pub integrity: bool,
+    /// v63/P3-2: effective crypto coverage (%).
+    pub crypto_coverage: u32,
+    /// readccc §4.5: anti-debug 탐지 실패 정책 (`trap`/`hang`/`warn`).
+    pub anti_debug_policy: String,
+    /// readccc §4.4: W^X 메모리 계약 — 실행 코드가 어떤 권한 라이프사이클을
+    /// 갖는지 기록한다. 값 (쉼표 구분):
+    ///   `rwx-at-rest`   : mem-harden 미사용 레거시 in-place 경로
+    ///   `transient-rw-to-rx`: bootstrap 뒤 영구 RWX가 없는 전환 계약
+    ///   `rx-after-verify`: 복호화+무결성 검증 후 immutable 영역 RX
+    ///   `code-data-split`: `--payload-relocate` — 암호화 페이로드는 비실행
+    ///                      `.vdata`(데이터)에, 실행 스텁은 `.textb`에 분리
+    pub wx_contract: String,
+    /// SHA-256 (hex) of the input PE bytes.
+    pub input_hash: String,
+    /// SHA-256 (hex) of the output PE bytes.
+    pub output_hash: String,
+    /// Whether post-pack execution comparison was requested.
+    pub execution_verification_attempted: bool,
+    /// Whether exit code/stdout/stderr matched the original byte-for-byte.
+    pub execution_verified: bool,
+    /// Captured execution facts for an accepted verified artifact.
+    pub verified_exit_code: Option<i32>,
+    pub verified_stdout_len: Option<usize>,
+    pub verified_stderr_len: Option<usize>,
+    pub vm_coverage: Option<crate::pipeline::VmCoverageMetrics>,
+    /// M0-2: exact measurements over the original application's code domain.
+    pub vm_original_metrics: VmOriginalMetrics,
+    /// Generated VM→native machine-code bridge ranges as RVA half-open ranges.
+    pub native_bridge_ranges: Vec<(u32, u32)>,
+    pub vm_bytecode_chunks: usize,
+    pub vm_bytecode_chunk_max: u32,
+    pub vm_bytecode_rva: u32,
+    pub vm_bytecode_len: u32,
+    pub vm_runtime_cipher_hash: Option<String>,
+}
+
+impl BuildManifest {
+    /// Construct a manifest from raw inputs, deriving `build_id` and `version`.
+    pub fn new(
+        seed: Option<u64>,
+        feature_flags: Vec<String>,
+        input_hash: String,
+        output_hash: String,
+    ) -> Self {
+        let build_id = format!(
+            "BTG-{:016X}-{}",
+            seed.unwrap_or(0),
+            &input_hash[..input_hash.len().min(8)]
+        );
+        Self {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            build_id,
+            seed_id: seed,
+            vm_version: VM_VERSION,
+            crypto_version: CRYPTO_VERSION,
+            feature_flags,
+            effective_features: Vec::new(),
+            ineffective_features: Vec::new(),
+            crypto_mode: "c1".to_string(),
+            crypto_construction: "btg-c1".to_string(),
+            payload_initial_counter: 0,
+            poly_key_embedded: false,
+            at_rest_encryption: false,
+            aslr_preserved: true,
+            integrity: false,
+            crypto_coverage: 0,
+            anti_debug_policy: "trap".to_string(),
+            wx_contract: "unsealed".to_string(),
+            input_hash,
+            output_hash,
+            execution_verification_attempted: false,
+            execution_verified: false,
+            verified_exit_code: None,
+            verified_stdout_len: None,
+            verified_stderr_len: None,
+            vm_coverage: None,
+            vm_original_metrics: VmOriginalMetrics::default(),
+            native_bridge_ranges: Vec::new(),
+            vm_bytecode_chunks: 0,
+            vm_bytecode_chunk_max: 0,
+            vm_bytecode_rva: 0,
+            vm_bytecode_len: 0,
+            vm_runtime_cipher_hash: None,
+        }
+    }
+
+    pub fn with_effective_profile(
+        mut self,
+        report: &crate::pipeline::validate::EffectiveProfileReport,
+    ) -> Self {
+        self.effective_features = report.effective_features.clone();
+        self.ineffective_features = report.ineffective_features.clone();
+        self
+    }
+
+    pub fn with_vm_ownership(
+        mut self,
+        coverage: Option<&crate::pipeline::VmCoverageMetrics>,
+        vm_program_rva: u32,
+        bridge: Option<(u32, u32)>,
+        chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
+        bytecode_rva: u32,
+        bytecode_len: u32,
+        runtime_cipher_hash: Option<&str>,
+    ) -> Self {
+        self.vm_coverage = coverage.cloned();
+        if let Some((start, end)) = bridge.filter(|(start, end)| start < end) {
+            self.native_bridge_ranges.push((
+                vm_program_rva.saturating_add(start),
+                vm_program_rva.saturating_add(end),
+            ));
+        }
+        self.vm_bytecode_chunks = chunks.len();
+        self.vm_bytecode_chunk_max = chunks.iter().map(|chunk| chunk.len).max().unwrap_or(0);
+        self.vm_bytecode_rva = bytecode_rva;
+        self.vm_bytecode_len = bytecode_len;
+        self.vm_runtime_cipher_hash = runtime_cipher_hash.map(str::to_string);
+        self
+    }
+
+    /// Attach exact M0-2 measurements produced by ownership/CFG analysis.
+    ///
+    /// Keeping this separate from [`Self::with_vm_ownership`] lets existing
+    /// callers compile unchanged while the analysis pipeline is migrated.
+    pub fn with_vm_original_metrics(mut self, metrics: VmOriginalMetrics) -> Self {
+        self.vm_original_metrics = metrics;
+        self
+    }
+
+    pub fn with_execution_verification(
+        mut self,
+        attempted: bool,
+        report: Option<&crate::differential::DifferentialReport>,
+    ) -> Self {
+        self.execution_verification_attempted = attempted;
+        self.execution_verified = report.is_some();
+        if let Some(report) = report {
+            self.verified_exit_code = Some(report.original.exit_code);
+            self.verified_stdout_len = Some(report.original.stdout.len());
+            self.verified_stderr_len = Some(report.original.stderr.len());
+        }
+        self
+    }
+
+    /// P3-2/readccc §6.1: record effective protection capabilities so the
+    /// artifact self-describes its guarantees (crypto primitive, at-rest,
+    /// ASLR trade-off, integrity, coverage).
+    pub fn with_capabilities(
+        mut self,
+        crypto_mode: &str,
+        at_rest_encryption: bool,
+        aslr_preserved: bool,
+        integrity: bool,
+        crypto_coverage: u32,
+        anti_debug_policy: &str,
+        wx_contract: &str,
+    ) -> Self {
+        assert!(
+            matches!(crypto_mode, "c1" | "chacha20" | "region-context-v1"),
+            "retired or unknown crypto mode must not be written to a build manifest: {crypto_mode}"
+        );
+        self.crypto_mode = crypto_mode.to_string();
+        if crypto_mode == "chacha20" {
+            self.crypto_construction = "rfc8439-chacha20-poly1305".to_string();
+            self.payload_initial_counter = 1;
+        } else {
+            self.crypto_construction = crypto_mode.to_string();
+            self.payload_initial_counter = 0;
+        }
+        self.poly_key_embedded = false;
+        self.at_rest_encryption = at_rest_encryption;
+        self.aslr_preserved = aslr_preserved;
+        self.integrity = integrity;
+        self.crypto_coverage = crypto_coverage;
+        self.anti_debug_policy = anti_debug_policy.to_string();
+        self.wx_contract = wx_contract.to_string();
+        self
+    }
+
+    /// Render as `key = value` lines (one per field), CSV for feature_flags.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("version = {}\n", self.version));
+        out.push_str(&format!("build_id = {}\n", self.build_id));
+        out.push_str(&format!(
+            "seed_id = {}\n",
+            self.seed_id
+                .map(|s| format!("0x{:016X}", s))
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        out.push_str(&format!("vm_version = {}\n", self.vm_version));
+        out.push_str(&format!("crypto_version = {}\n", self.crypto_version));
+        out.push_str(&format!("input_hash = {}\n", self.input_hash));
+        out.push_str(&format!("output_hash = {}\n", self.output_hash));
+        out.push_str(&format!(
+            "feature_flags = {}\n",
+            self.feature_flags.join(",")
+        ));
+        out.push_str(&format!(
+            "effective_features = {}\n",
+            if self.effective_features.is_empty() {
+                "none".to_string()
+            } else {
+                self.effective_features.join(",")
+            }
+        ));
+        out.push_str(&format!(
+            "ineffective_features = {}\n",
+            if self.ineffective_features.is_empty() {
+                "none".to_string()
+            } else {
+                self.ineffective_features.join(";")
+            }
+        ));
+        out.push_str(&format!("crypto_mode = {}\n", self.crypto_mode));
+        out.push_str(&format!(
+            "crypto_construction = {}\n",
+            self.crypto_construction
+        ));
+        out.push_str(&format!(
+            "payload_initial_counter = {}\n",
+            self.payload_initial_counter
+        ));
+        out.push_str(&format!("poly_key_embedded = {}\n", self.poly_key_embedded));
+        out.push_str(&format!(
+            "at_rest_encryption = {}\n",
+            self.at_rest_encryption
+        ));
+        out.push_str(&format!("aslr_preserved = {}\n", self.aslr_preserved));
+        out.push_str(&format!("integrity = {}\n", self.integrity));
+        out.push_str(&format!("crypto_coverage = {}\n", self.crypto_coverage));
+        out.push_str(&format!("anti_debug_policy = {}\n", self.anti_debug_policy));
+        out.push_str(&format!("wx_contract = {}\n", self.wx_contract));
+        out.push_str(&format!(
+            "execution_verification_attempted = {}\n",
+            self.execution_verification_attempted
+        ));
+        out.push_str(&format!(
+            "execution_verified = {}\n",
+            self.execution_verified
+        ));
+        out.push_str(&format!(
+            "verified_exit_code = {}\n",
+            self.verified_exit_code
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        out.push_str(&format!(
+            "verified_stdout_len = {}\n",
+            self.verified_stdout_len
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        out.push_str(&format!(
+            "verified_stderr_len = {}\n",
+            self.verified_stderr_len
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        if let Some(c) = &self.vm_coverage {
+            out.push_str(&format!("vm_blocks = {}/{}\n", c.vm_blocks, c.total_blocks));
+            out.push_str(&format!(
+                "vm_instructions = {}/{}\n",
+                c.vm_instructions, c.total_instructions
+            ));
+            out.push_str(&format!(
+                "vm_functions = {}/{}\n",
+                c.vm_functions, c.total_functions
+            ));
+            out.push_str(&format!(
+                "vm_hot_path = {}\n",
+                if c.hot_path_profiled {
+                    format!("{}/{}", c.hot_vm_weight, c.hot_total_weight)
+                } else {
+                    "unprofiled".to_string()
+                }
+            ));
+            out.push_str(&format!("vm_sensitive_regions = {}\n", c.sensitive_regions));
+            out.push_str(&format!(
+                "unresolved_internal_edges = {}\n",
+                render_optional_metric(c.unresolved_internal_edges)
+            ));
+            out.push_str(&format!(
+                "unsupported_instructions = {}\n",
+                render_optional_metric(c.unsupported_instructions)
+            ));
+            out.push_str(&format!(
+                "capability_mismatches = {}\n",
+                render_optional_metric(c.capability_mismatches)
+            ));
+        } else {
+            out.push_str("vm_blocks = none\nvm_instructions = none\nvm_functions = none\nvm_hot_path = unprofiled\nvm_sensitive_regions = 0\nunresolved_internal_edges = none\nunsupported_instructions = none\ncapability_mismatches = none\n");
+        }
+        let original = &self.vm_original_metrics;
+        out.push_str(&format!(
+            "vm_original_functions = {}\n",
+            render_optional_metric(original.vm_original_functions)
+        ));
+        out.push_str(&format!(
+            "vm_original_blocks = {}\n",
+            render_optional_metric(original.vm_original_blocks)
+        ));
+        out.push_str(&format!(
+            "vm_original_instructions = {}\n",
+            render_optional_metric(original.vm_original_instructions)
+        ));
+        out.push_str(&format!(
+            "native_original_functions = {}\n",
+            render_optional_metric(original.native_original_functions)
+        ));
+        out.push_str(&format!(
+            "original_text_exec_bytes = {}\n",
+            render_optional_metric(original.original_text_exec_bytes)
+        ));
+        out.push_str(&format!(
+            "unresolved_edges = {}\n",
+            render_optional_metric(original.unresolved_edges)
+        ));
+        out.push_str(&format!(
+            "native_bridge_ranges = {}\n",
+            if self.native_bridge_ranges.is_empty() {
+                "none".to_string()
+            } else {
+                self.native_bridge_ranges
+                    .iter()
+                    .map(|(start, end)| format!("0x{start:X}..0x{end:X}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        ));
+        out.push_str(&format!(
+            "vm_bytecode_chunks = {}\n",
+            self.vm_bytecode_chunks
+        ));
+        out.push_str(&format!(
+            "vm_bytecode_chunk_max = {}\n",
+            self.vm_bytecode_chunk_max
+        ));
+        out.push_str(&format!("vm_bytecode_rva = 0x{:X}\n", self.vm_bytecode_rva));
+        out.push_str(&format!("vm_bytecode_len = {}\n", self.vm_bytecode_len));
+        out.push_str(&format!(
+            "vm_runtime_cipher_hash = {}\n",
+            self.vm_runtime_cipher_hash.as_deref().unwrap_or("none")
+        ));
+        out.push_str(&format!(
+            "vm_bytecode_chunk_encryption = {}\n",
+            if self.vm_bytecode_chunks == 0 {
+                "disabled"
+            } else {
+                "active-register-only"
+            }
+        ));
+        out
+    }
+
+    /// Write the rendered manifest to `path`.
+    pub fn write_manifest(&self, path: &Path) -> io::Result<()> {
+        std::fs::write(path, self.render().as_bytes())
+    }
+}
+
+fn render_optional_metric(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+/// Collect the feature flags that were actually active into an ordered list.
+/// Deliberately a plain function (not coupled to `CliArgs`) so the lib API can
+/// build a manifest without constructing a CLI arg struct.
+#[allow(clippy::too_many_arguments)]
+pub fn feature_flags(
+    anti_debug: bool,
+    vm: bool,
+    vm_oep: bool,
+    vm_commercial: bool,
+    m7: bool,
+    m8: bool,
+    integrity: bool,
+    dispatcher_reencrypt: bool,
+    payload_relocate: bool,
+    rsrc_register: bool,
+    iat_hide: bool,
+    mem_harden: bool,
+    custom_cipher: bool,
+    chacha20: bool,
+    map: bool,
+    sym_map: bool,
+    seed: bool,
+) -> Vec<String> {
+    let mut v = Vec::new();
+    if anti_debug {
+        v.push("anti_debug".to_string());
+    }
+    if vm {
+        v.push("vm".to_string());
+    }
+    if vm_oep {
+        v.push("vm_oep".to_string());
+    }
+    if vm_commercial {
+        v.push("vm_commercial".to_string());
+    }
+    if m7 {
+        v.push("m7".to_string());
+    }
+    if m8 {
+        v.push("m8".to_string());
+    }
+    if integrity {
+        v.push("integrity".to_string());
+    }
+    if dispatcher_reencrypt {
+        v.push("dispatcher_reencrypt".to_string());
+    }
+    if payload_relocate {
+        v.push("payload_relocate".to_string());
+    }
+    if rsrc_register {
+        v.push("rsrc_register".to_string());
+    }
+    if iat_hide {
+        v.push("iat_hide".to_string());
+    }
+    if mem_harden {
+        v.push("mem_harden".to_string());
+    }
+    if custom_cipher {
+        v.push("custom_cipher".to_string());
+    }
+    if chacha20 {
+        v.push("chacha20".to_string());
+    }
+    if map {
+        v.push("map".to_string());
+    }
+    if sym_map {
+        v.push("sym_map".to_string());
+    }
+    if seed {
+        v.push("seed".to_string());
+    }
+    v
+}
+
+// ── Dependency-free SHA-256 (FIPS 180-4) ─────────────────────────────────────
+// Compact (~70 line) pure-Rust implementation so the packer does not need a
+// hashing crate. Correctness is pinned by the known-vector test below.
+
+const K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+/// SHA-256 of `data`, lower-case hex.
+pub fn sha256_hex(data: &[u8]) -> String {
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+
+    let mut msg = Vec::with_capacity(data.len() + 72);
+    msg.extend_from_slice(data);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    let mut w = [0u32; 64];
+    for chunk in msg.chunks_exact(64) {
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    h.iter().map(|x| format!("{:08x}", x)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "retired or unknown crypto mode")]
+    fn manifest_rejects_retired_rc4_capability() {
+        let _ = BuildManifest::new(None, vec![], "ab".repeat(16), "cd".repeat(16))
+            .with_capabilities("rc4", true, false, true, 100, "trap", "rx-after-verify");
+    }
+
+    #[test]
+    fn sha256_known_vectors() {
+        // FIPS 180-4 test vectors.
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn render_contains_all_fields() {
+        let m = BuildManifest::new(
+            Some(0x1234),
+            vec!["vm".to_string(), "m8".to_string()],
+            "ab".repeat(16),
+            "cd".repeat(16),
+        );
+        let body = m.render();
+        assert!(body.contains("version = 1.0.0"));
+        assert!(body.contains("build_id = BTG-"));
+        assert!(body.contains("seed_id = 0x0000000000001234"));
+        assert!(body.contains("vm_version = 31"));
+        assert!(body.contains("crypto_version = 63"));
+        assert!(body.contains("input_hash = "));
+        assert!(body.contains("output_hash = "));
+        assert!(body.contains("feature_flags = vm,m8"));
+        assert!(body.contains("vm_original_functions = none"));
+        assert!(body.contains("vm_original_blocks = none"));
+        assert!(body.contains("vm_original_instructions = none"));
+        assert!(body.contains("native_original_functions = none"));
+        assert!(body.contains("original_text_exec_bytes = none"));
+        assert!(body.contains("unresolved_edges = none"));
+        assert!(body.contains("unresolved_internal_edges = none"));
+        assert!(body.contains("unsupported_instructions = none"));
+        assert!(body.contains("capability_mismatches = none"));
+    }
+
+    #[test]
+    fn render_distinguishes_measured_zero_capability_metrics() {
+        let coverage = crate::pipeline::VmCoverageMetrics {
+            unsupported_instructions: Some(0),
+            capability_mismatches: Some(0),
+            ..Default::default()
+        };
+        let mut m = BuildManifest::new(None, vec![], "ab".repeat(16), "cd".repeat(16));
+        m.vm_coverage = Some(coverage);
+        let body = m.render();
+        assert!(body.contains("unsupported_instructions = 0"));
+        assert!(body.contains("capability_mismatches = 0"));
+    }
+
+    #[test]
+    fn render_contains_measured_original_vm_metrics() {
+        let m = BuildManifest::new(None, vec![], "ab".repeat(16), "cd".repeat(16))
+            .with_vm_original_metrics(VmOriginalMetrics::measured(
+                748, 12_283, 51_171, 228, 186_872, 7,
+            ));
+
+        let body = m.render();
+        assert!(body.contains("vm_original_functions = 748\n"));
+        assert!(body.contains("vm_original_blocks = 12283\n"));
+        assert!(body.contains("vm_original_instructions = 51171\n"));
+        assert!(body.contains("native_original_functions = 228\n"));
+        assert!(body.contains("original_text_exec_bytes = 186872\n"));
+        assert!(body.contains("unresolved_edges = 7\n"));
+    }
+
+    #[test]
+    fn original_vm_metrics_distinguish_unmeasured_from_measured_zero() {
+        let unmeasured = BuildManifest::new(None, vec![], "ab".repeat(16), "cd".repeat(16));
+        let measured = BuildManifest::new(None, vec![], "ab".repeat(16), "cd".repeat(16))
+            .with_vm_original_metrics(VmOriginalMetrics::measured(0, 0, 0, 0, 0, 0));
+
+        assert!(unmeasured.render().contains("unresolved_edges = none\n"));
+        assert!(measured.render().contains("unresolved_edges = 0\n"));
+        assert!(measured
+            .render()
+            .contains("native_original_functions = 0\n"));
+    }
+
+    #[test]
+    fn build_id_is_deterministic_per_seed_input() {
+        let a = BuildManifest::new(Some(7), vec![], "ab".repeat(16), "cd".repeat(16));
+        let b = BuildManifest::new(Some(7), vec![], "ab".repeat(16), "ef".repeat(16));
+        let c = BuildManifest::new(Some(8), vec![], "ab".repeat(16), "cd".repeat(16));
+        // Same seed + input hash -> same build_id (output_hash difference irrelevant).
+        assert_eq!(a.build_id, b.build_id);
+        // Different seed -> different build_id.
+        assert_ne!(a.build_id, c.build_id);
+        assert!(a.build_id.starts_with("BTG-0000000000000007-"));
+    }
+
+    #[test]
+    fn write_manifest_roundtrip() {
+        let m = BuildManifest::new(
+            None,
+            vec!["iat_hide".to_string()],
+            "ab".repeat(16),
+            "cd".repeat(16),
+        );
+        let p = std::env::temp_dir().join("btg_manifest_test.txt");
+        m.write_manifest(&p).expect("write manifest");
+        let text = std::fs::read_to_string(&p).expect("read manifest");
+        assert!(text.contains("seed_id = none"));
+        assert!(text.contains("feature_flags = iat_hide"));
+        let _ = std::fs::remove_file(&p);
+    }
+}

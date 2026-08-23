@@ -1,0 +1,370 @@
+// ==============================================================================
+// BTG (Bidirectional Trigger Graph) - Pipeline Context & Module Declarations
+// ==============================================================================
+
+pub mod artifacts;
+pub mod build;
+pub mod config;
+pub mod crypto;
+pub mod iat_hide;
+pub mod ondemand;
+pub mod ownership;
+pub mod pack;
+pub mod pass1_slice;
+pub mod pass2_shuffle;
+pub mod pass3_encode;
+pub mod pass4_section;
+pub mod patch_data;
+pub mod poly_embed;
+pub mod rdata_strip;
+pub mod reports;
+pub mod rsrc_register;
+pub mod selective_vm;
+pub mod validate;
+
+pub use artifacts::{CryptoArtifact, PeArtifact, VmArtifact};
+pub use config::{RequestedConfig, ResolvedConfig};
+pub use rdata_strip::RdataMetadataStripper;
+
+use crate::core::trigger_block::TriggerBlock;
+use crate::graph::{BasicBlock, ShuffledLayout};
+use crate::pe::{builder::SectionData, parser::TargetPeInfo};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Default)]
+pub struct VmCoverageMetrics {
+    pub vm_blocks: usize,
+    pub total_blocks: usize,
+    pub vm_instructions: usize,
+    pub total_instructions: usize,
+    pub vm_functions: usize,
+    pub total_functions: usize,
+    /// Canonical internal indirect edges which analysis could not resolve.
+    /// `None` means the ProgramModel edge analysis was not available; `Some(0)`
+    /// is the measured-zero evidence required by full commercial VM policy.
+    pub unresolved_internal_edges: Option<u64>,
+    /// Instructions rejected by the production VM lifting pipeline.
+    /// `None` is deliberately distinct from a measured zero.
+    pub unsupported_instructions: Option<u64>,
+    /// Registry/encoder capability disagreements found during production validation.
+    /// Commercial full-coverage builds require explicit `Some(0)` evidence.
+    pub capability_mismatches: Option<u64>,
+    pub hot_path_profiled: bool,
+    pub hot_vm_weight: u64,
+    pub hot_total_weight: u64,
+    pub sensitive_regions: usize,
+}
+
+/// 각 Pass 사이에 공유되는 파이프라인 상태.
+///
+/// `main`에서 `PipelineContext`를 생성하고 각 Pass 함수에 `&mut self`로 전달한다.
+/// 각 Pass는 이전 Pass의 결과를 소비하거나 참조하여 다음 단계 출력을 채운다.
+pub struct PipelineContext {
+    /// P3-1 (결정적 빌드): 패킹의 모든 랜덤성(셔플/mba_constant/crypto 시드/폴리
+    /// 시드/레이아웃 패드)을 파생하는 단일 시드 RNG. `--seed <u64>`로 고정하면
+    /// 같은 input+seed+config → 같은 output (재현·디버깅·상용 배포용).
+    pub rng: StdRng,
+    // ── 입력 (파이프라인 시작 전 설정) ──────────────────────────────────────────
+    pub target_info: TargetPeInfo,
+    pub dispatcher_va: u64,
+    pub dispatcher_rva: u32,
+    pub obf_complexity: usize,
+
+    // ── Pass 1 출력 ─────────────────────────────────────────────────────────────
+    /// CfgExtractor가 추출한 원본 기본 블록 목록
+    pub basic_blocks: Vec<BasicBlock>,
+    /// M1 canonical authority for discovered functions, blocks, metadata seeds,
+    /// and executable-byte ownership. Native TriggerBlocks remain a derived view.
+    pub program_model: Option<crate::analysis::program_model::ProgramModel>,
+    /// Deterministic evidence accumulated by decode/registry/lift/encode stages.
+    pub unsupported_instructions: reports::UnsupportedInstructionReport,
+    /// MicroSlicer가 생성한 Trigger Block 목록
+    pub trigger_blocks: Vec<TriggerBlock>,
+    /// 원본 `.text` VA → Trigger Block ID 매핑 (정렬 BTreeMap)
+    pub va_to_trigger_id: BTreeMap<u64, u32>,
+
+    // ── Pass 2 출력 ─────────────────────────────────────────────────────────────
+    /// 물리 레이아웃 셔플 결과
+    pub shuffled_layout: Option<ShuffledLayout>,
+    /// 점프 테이블 시작 오프셋 (dispatcher_va 기준 섹션 내 byte offset)
+    pub table_offset: usize,
+    /// 첫 번째 코드 블록의 시작 오프셋
+    pub first_block_offset: usize,
+
+    // ── Pass 4 출력 ─────────────────────────────────────────────────────────────
+    /// 완성된 .btg 섹션 데이터
+    pub btg_section_data: Option<SectionData>,
+
+    // ── Patch 출력 ──────────────────────────────────────────────────────────────
+    /// 재배치·패치된 섹션 목록 (.text, .rdata, .data, .pdata 등)
+    pub patched_sections: Vec<SectionData>,
+
+    // ── v3 Crypto 출력 ─────────────────────────────────────────────────────────
+    /// 암호화 부트 스텁의 섹션 내 오프셋 (0이면 섹션 시작점 = OEP)
+    pub boot_entry_offset: u32,
+    /// 암호화 적용 여부
+    pub crypto_enabled: bool,
+    /// P0-⑦: at-rest 암호화가 실제로 적용됐는지 (코드 블록/데이터 런 암호화).
+    pub at_rest_encrypted: bool,
+    /// Exact ciphertext RVA ranges which the Windows loader must never mutate.
+    /// Plain boot/runtime address operands outside these ranges remain eligible
+    /// for DIR64 relocation, including protected images.
+    pub at_rest_cipher_ranges: Vec<(u32, u32)>,
+    /// v4: --payload-relocate 시 암호화된 코드 페이로드를 담는 데이터 섹션
+    pub payload_section_data: Option<SectionData>,
+    /// Loader-populated bootstrap imports. Windows writes these slots before
+    /// OEP, so they must not share the executable `.textb` mapping.
+    pub bootstrap_iat_section_data: Option<SectionData>,
+    /// Page-aligned mutable VM state/call-stack tail split from `.textb` for
+    /// static W^X: RW and non-executable from the loader's first mapping.
+    pub mutable_state_section_data: Option<SectionData>,
+    /// Canonical VM route image. This is immutable runtime metadata and is
+    /// emitted in its own read-only, non-executable PE section.
+    pub route_metadata_section_data: Option<SectionData>,
+    /// Authoritative original RVA inventory serialized into `.vmroute`.
+    pub route_required_original_targets: Vec<crate::vm::route_table::OriginalTargetRva>,
+    /// Authoritative generated target RVAs produced by VM code placement.
+    pub route_generated_destinations: Vec<crate::vm::route_metadata::GeneratedRouteDestination>,
+    /// Final generated-code spans that are expected to be executable.
+    pub route_generated_executable_ranges: Vec<crate::vm::route_metadata::RvaSpan>,
+    /// 페이로드 섹션 RVA (rsrc_register가 리소스 데이터 엔트리로 사용)
+    pub payload_rva: u32,
+    /// 페이로드 길이
+    pub payload_len: u32,
+    /// --rsrc-register: 재구성된 리소스 디렉터리 RVA/크기 (0 = 미사용)
+    pub rsrc_dir_rva: u32,
+    pub rsrc_dir_size: u32,
+    /// entry 블록 ID / 시드 (boot stub이 dispatcher 진입 시 push; 디스패처가
+    /// MBA 항등식으로 키를 재도출한다)
+    pub entry_block_id: usize,
+    pub entry_seed: u32,
+    /// v5: 안티디버그 부트 스텁 사용 여부 (validate EP 프롤로그 검사용)
+    pub anti_debug: bool,
+    /// v6: MBA 키 스케줄 상수 (패킹당 1회 랜덤 — 슬라이서/패스3/패스4/디스패처 공유)
+    pub mba_constant: u32,
+    // ── v6: IAT 은닉 + 메모리 하드닝 ──────────────────────────────────────────
+    /// --iat-hide 사용 여부 (원본 import 제거 + 더미 import)
+    pub iat_hide: bool,
+    /// --mem-harden 사용 여부 (복호화 후 .textb RWX->RX)
+    pub mem_harden: bool,
+    /// v8: --dispatcher-reencrypt (Phase 0.3) — 블록별 개별 암호화 + 디스패처
+    /// '실행 후 재암호화'. 블록 스텁 3-푸시 규약 / 길이 테이블 / 부트 스텁 생략을 결정.
+    pub reencrypt: bool,
+    /// M6 Phase-2: --vm-oep — 부트 스텁이 원본 .text를 평문 복호화하지 않고
+    /// lift된 프로그램 VM 모듈로 디스패치. (기본 false → 기존 경로 유지)
+    pub vm_oep: bool,
+    /// P3 (G1): --vm-oep의 백엔드를 상용 엔진(risc→poly→threaded)으로 전환.
+    /// `--vm --vm-oep --vm-commercial` 모두 켜야 상용 경로를 쓰고, 레거시 경로는
+    /// 바이트 동일 유지. (기본 false → 레거시 1:1 프로그램 VM 유지)
+    pub vm_commercial: bool,
+    /// M7: --m7 — on-demand 재암호화(anti-dump) 활성화 (기본 false → 기존 경로 유지)
+    pub m7: bool,
+    /// M8: --m8 — VM handler 테이블 MBA 난독화 (기본 false → 기존 경로 유지)
+    pub m8: bool,
+    /// v11: 직접 `call` 대상 블록 ID 집합 (재암호화 모드에서 평문 유지).
+    /// call은 디스패처를 거치지 않고 블록을 직접 실행하므로, 암호문 상태로
+    /// 남으면 0xC0000096 (privileged instruction) 크래시가 발생한다.
+    pub call_target_block_ids: std::collections::HashSet<u32>,
+    /// 원본 import 목록 (main에서 collect_from_pe로 채움)
+    pub original_imports: Vec<crate::pipeline::iat_hide::OriginalImport>,
+    /// 더미 import 디렉터리 RVA/크기 (build.rs가 DataDirectory[1]에 기록)
+    pub iat_dir_rva: u32,
+    pub iat_dir_size: u32,
+    /// 더미 import IAT 슬롯 RVA (LoadLibraryA / GetProcAddress)
+    pub iat_ll_slot_rva: u32,
+    pub iat_gpa_slot_rva: u32,
+    /// 리졸브 테이블 RVA/크기 (부트 스텁이 처리)
+    pub iat_table_rva: u32,
+    pub iat_table_len: u32,
+    /// mem-harden 문자열 VA
+    pub mem_ntdll_name_va: u64,
+    pub mem_ntprot_name_va: u64,
+    /// --keep-pdata — 원본 .pdata를 바이트 단위로 유지한다. 기본 모드도 모든 원본
+    /// 항목을 보존하지만 디스패처 부트 leaf를 하나 추가한다.
+    pub keep_pdata: bool,
+    /// P4 (전체 SEH 가상화): whole-program VM(--vm-oep) 모듈 코드 시작 RVA
+    /// (.textb 내). build.rs가 이 영역을 브리지 UNWIND_INFO로 커버해 OS
+    /// unwinder가 VM 내부 프레임을 걸 수 있게 한다. 0 = 프로그램 VM 미사용.
+    pub vm_prog_rva: u32,
+    /// P4: whole-program VM 모듈 총 길이 (code+table+bytecode+state).
+    pub vm_prog_total: u32,
+    /// Code-relative VM→native bridge range requiring its private-frame unwind.
+    pub vm_prog_native_bridge: Option<(u32, u32)>,
+    pub vm_prog_native_bridges: Vec<(u32, u32)>,
+    /// RVA of the generated UNW_FLAG_UHANDLER cleanup routine used by every
+    /// commercial VM native-call bridge.
+    pub vm_prog_lifetime_cleanup_handler_rva: u32,
+    /// P1-3: commercial Program-VM ownership metrics persisted to the manifest.
+    pub vm_coverage: Option<VmCoverageMetrics>,
+    /// Authoritative ownership decisions emitted by the commercial lifter.
+    /// Validation and artifact writers must consume this instead of deriving
+    /// ownership from the rewritten PE layout.
+    pub ownership_report: Vec<ownership::FunctionOwnershipDiagnostic>,
+    /// P1-4: instruction-aligned Program-VM bytecode chunks for M7 runtime.
+    pub vm_prog_chunks: Vec<crate::vm::chunk_crypto::BytecodeChunk>,
+    /// P2-10 function-stable production family ownership plan.
+    pub vm_family_plan: Option<crate::vm::poly::ProductionFamilyPlan>,
+    /// P2-10 validated function micro-op partitions grouped by backend family.
+    pub vm_family_partitions: Option<Vec<crate::vm::poly::FamilyOpPartition>>,
+    /// P2-10 independently encoded family streams and canonical cross-family routes.
+    pub vm_multi_family: Option<crate::vm::multi_family::MaterializedMultiFamilyProgram>,
+    pub vm_prog_bytecode_rva: u32,
+    pub vm_prog_bytecode_len: u32,
+    pub vm_prog_runtime_cipher_hash: Option<String>,
+    /// Family-scoped integrity descriptors sealed over the exact immutable
+    /// runtime representation (including the persistent M7 bytecode layer).
+    pub vm_integrity_descriptors: Vec<crate::vm::distributed_integrity::IntegrityDescriptor>,
+    pub vm_integrity_table_rva: u32,
+    pub vm_integrity_table_len: u32,
+    /// P2-5 conservative read-only literal/reference graph. Only objects with
+    /// statically proven RIP-relative x64 use sites are recorded here.
+    pub vm_data_lifetime_objects: Vec<crate::vm::data_lifetime::LiteralObject>,
+    /// v13.4d diag: --block-ring — 표준 디스패처에 마지막 32개 logical block id
+    /// ring-buffer 를 주입한다 (재암호화 디스패처는 미지원).
+    pub block_ring: bool,
+    /// v59: --custom-cipher — BTG-C1 커스텀 512-bit 스트림 사이퍼 사용 (기본 RC4).
+    pub custom_cipher: bool,
+    /// v63 (T3-1 Phase B): --crypto-mode — 선택된 crypto primitive (RC4/C1/ChaCha20).
+    /// 커스텀 암호 경로(재암호화/VM)는 이 값 대신 custom_cipher를 계속 쓴다.
+    pub crypto_mode: crate::crypto::CryptoMode,
+    /// T1-1: 폴리모픽 VM 시드 (빌드마다 OsRng로 생성).
+    pub poly_vm_seed: u64,
+    /// T1-1: 폴리모픽 VM 시드 마스킹 분할 저장 값.
+    pub poly_vm_seed_masked: u64,
+    /// T1-3: SDK 마커 리전 lift 결과(폴리모픽 바이트코드+시드+오프셋). embed 단계가 소비.
+    pub poly_vm_regions: Vec<crate::pipeline::selective_vm::PolyVmRegion>,
+    /// T1-2: 리프트 불가로 거부된 리전 수.
+    pub poly_vm_regions_rejected: usize,
+    /// T1-3: 임베드된 `.btgvm` 섹션 (VM 진입 스텁 + 핸들러 테이블 + 폴리 바이트코드 + 시드).
+    pub poly_vm_section: Option<crate::pe::builder::SectionData>,
+    /// T1-3: 임베드된 VM 진입 스텁의 절대 VA (마커 트램펄린이 점프할 대상).
+    pub poly_vm_entry_va: u64,
+}
+
+impl PipelineContext {
+    /// O1: 실제로 적용할 MBA 키 스케줄 레벨. reencrypt(dispatcher-reencrypt /
+    /// M7) 경로는 전용 디스패처의 키 유도가 레벨 2 하드코딩이라 2 로 고정하고
+    /// (패커/런타임 정합), 그 외 경로는 --obf-level 1..3 을 그대로 사용한다.
+    pub fn effective_obf_level(&self) -> usize {
+        if self.reencrypt {
+            2
+        } else {
+            self.obf_complexity.clamp(1, 3)
+        }
+    }
+
+    pub fn new(
+        target_info: TargetPeInfo,
+        dispatcher_va: u64,
+        dispatcher_rva: u32,
+        obf_complexity: usize,
+    ) -> Self {
+        Self {
+            target_info,
+            dispatcher_va,
+            dispatcher_rva,
+            obf_complexity,
+            rng: StdRng::from_entropy(),
+            basic_blocks: Vec::new(),
+            program_model: None,
+            unsupported_instructions: reports::UnsupportedInstructionReport::new(),
+            trigger_blocks: Vec::new(),
+            va_to_trigger_id: BTreeMap::new(),
+            shuffled_layout: None,
+            table_offset: 0,
+            first_block_offset: 0,
+            btg_section_data: None,
+            patched_sections: Vec::new(),
+            boot_entry_offset: 0,
+            crypto_enabled: false,
+            at_rest_encrypted: false,
+            at_rest_cipher_ranges: Vec::new(),
+            payload_section_data: None,
+            bootstrap_iat_section_data: None,
+            mutable_state_section_data: None,
+            route_metadata_section_data: None,
+            route_required_original_targets: Vec::new(),
+            route_generated_destinations: Vec::new(),
+            route_generated_executable_ranges: Vec::new(),
+            payload_rva: 0,
+            payload_len: 0,
+            rsrc_dir_rva: 0,
+            rsrc_dir_size: 0,
+            entry_block_id: 0,
+            entry_seed: 0,
+            anti_debug: false,
+            mba_constant: 0,
+            iat_hide: false,
+            mem_harden: false,
+            reencrypt: false,
+            vm_oep: false,
+            vm_commercial: false,
+            m7: false,
+            m8: false,
+            call_target_block_ids: std::collections::HashSet::new(),
+            original_imports: Vec::new(),
+            iat_dir_rva: 0,
+            iat_dir_size: 0,
+            iat_ll_slot_rva: 0,
+            iat_gpa_slot_rva: 0,
+            iat_table_rva: 0,
+            iat_table_len: 0,
+            mem_ntdll_name_va: 0,
+            mem_ntprot_name_va: 0,
+            keep_pdata: false,
+            vm_prog_rva: 0,
+            vm_prog_total: 0,
+            vm_prog_native_bridge: None,
+            vm_prog_native_bridges: Vec::new(),
+            vm_prog_lifetime_cleanup_handler_rva: 0,
+            vm_coverage: None,
+            ownership_report: Vec::new(),
+            vm_prog_chunks: Vec::new(),
+            vm_family_plan: None,
+            vm_family_partitions: None,
+            vm_multi_family: None,
+            vm_prog_bytecode_rva: 0,
+            vm_prog_bytecode_len: 0,
+            vm_prog_runtime_cipher_hash: None,
+            vm_integrity_descriptors: Vec::new(),
+            vm_integrity_table_rva: 0,
+            vm_integrity_table_len: 0,
+            vm_data_lifetime_objects: Vec::new(),
+            block_ring: false,
+            // RC4 is retired. Programmatic callers which construct a context
+            // directly must start on the same C1 baseline as the CLI resolver;
+            // legacy modes may never be selected merely by skipping clap.
+            custom_cipher: true,
+            crypto_mode: crate::crypto::CryptoMode::C1,
+            poly_vm_seed: 0,
+            poly_vm_seed_masked: 0,
+            poly_vm_regions: Vec::new(),
+            poly_vm_regions_rejected: 0,
+            poly_vm_section: None,
+            poly_vm_entry_va: 0,
+        }
+    }
+
+    /// Pass 2 이후 확정된 `ShuffledLayout` 참조 반환.
+    pub fn layout(&self) -> anyhow::Result<&ShuffledLayout> {
+        self.shuffled_layout
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("ShuffledLayout not yet built (Pass 2 not run)"))
+    }
+
+    /// Pass 2 이후 확정된 `ShuffledLayout` 가변 참조 반환.
+    pub fn layout_mut(&mut self) -> anyhow::Result<&mut ShuffledLayout> {
+        self.shuffled_layout
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("ShuffledLayout not yet built (Pass 2 not run)"))
+    }
+
+    /// `.text` 섹션의 VA 범위 (start, end).
+    pub fn text_va_range(&self) -> (u64, u64) {
+        let start = self.target_info.image_base + self.target_info.text_rva as u64;
+        let end = start + self.target_info.text_vsize as u64;
+        (start, end)
+    }
+}

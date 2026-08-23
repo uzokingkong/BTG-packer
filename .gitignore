@@ -1,0 +1,62 @@
+# Build artifacts
+/target
+**/target
+
+# Packer runtime outputs (debug / packed binaries)
+packed*.exe
+packed*.btg_layout.log
+pack_*.log
+*.btg_layout.log
+native_ksa.bin
+bt_cdb.txt
+_*.txt
+_*.ps1
+_*.log
+_*.py
+_*.diff
+packed_*.map
+packed_*.sym
+packed_*.riscmap.csv
+
+# Archives / scratch
+*.zip
+*.rar
+*.7z
+temp_iced_src/
+scratch/
+src/bin/
+src/vm/count.ps1
+pack_log.txt
+pack_keep_log.txt
+pack_novm_log.txt
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Dev-only scratch / debug artifacts (not source)
+*.exe
+*.log
+*.ps1
+*.cdb.txt
+.cdb_nat.txt
+_head_*.rs
+_bld_head.rs
+_baseline_pack.exe
+nowaction.txt
+plan.txt
+w_fix.txt
+dbg_err.txt
+dbg_out.txt
+ntt*.txt
+read.txt
+읽어.txt
+test_analysis.exe
+
+# Local test scratch dir
+/test/target
+/_qa/
+/_head_wt/

@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: cargo build + test (locked)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Lockfile drift / missing dependency detection: fail if Cargo.lock is stale.
+      - name: Check lockfile is up to date
+        run: cargo check --locked
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      # QA tests invoke target/release/btg-packer.exe, so the binary build above
+      # is an explicit prerequisite. This prevents a stale local-style packer
+      # artifact from being used by the end-to-end gates.
+      # Unit / differential tests (T3-1 chacha + VM + pipeline + QA lib tests).
+      - name: Test (release)
+        run: cargo test --release --locked --lib
+
+  # Warning-debt gate (T3-3): non-blocking today; promote to `-- -D warnings` in
+  # the same job when `cargo build` reaches zero warnings.
+  clippy-debt:
+    name: clippy warning debt (non-blocking)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy
+        run: cargo clippy --release --locked --message-format short 2>&1 | Tee-Object -FilePath clippy.txt
+      - name: Report warning count
+        run: |
+          $n = (Select-String -Path clippy.txt -Pattern '^warning:' | Measure-Object).Count
+          Write-Output "warning_count=$n"
+          Write-Output "GATE: promote to -D warnings when warning_count==0 (T3-3)"
