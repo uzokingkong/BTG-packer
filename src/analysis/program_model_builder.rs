@@ -909,13 +909,21 @@ fn merge_basic_blocks(
                 push(EdgeKind::Fallthrough, next);
             }
             FlowControl::UnconditionalBranch => {
-                let tail = direct.and_then(|r| {
-                    model
-                        .functions
-                        .iter()
-                        .find(|(_, f)| f.entries.contains(&r))
-                        .map(|(id, _)| *id)
-                }) != Some(model.blocks[&source].function_id);
+                let target_owner = direct.and_then(|rva| {
+                    starts
+                        .get(&rva)
+                        .and_then(|block| model.blocks.get(block))
+                        .map(|block| block.function_id)
+                        .or_else(|| {
+                            model
+                                .functions
+                                .iter()
+                                .find(|(_, function)| function.entries.contains(&rva))
+                                .map(|(id, _)| *id)
+                        })
+                });
+                let tail = target_owner.is_some()
+                    && target_owner != Some(model.blocks[&source].function_id);
                 push(
                     if tail {
                         EdgeKind::TailCall
@@ -965,10 +973,16 @@ fn merge_basic_blocks(
                 }
             }
             _ => {
-                if block
-                    .successor_vas
-                    .iter()
-                    .any(|&va| Some(va) == next.map(|r| image_base + r as u64))
+                // A decoded `Next` instruction necessarily reaches the next
+                // contiguous block. Some extractors omit successor metadata
+                // for split NOP/prologue fragments; dropping that edge breaks
+                // canonical reaching-definition and dominance proofs.
+                if (last.flow_control() == FlowControl::Next
+                    && next.is_some_and(|rva| starts.contains_key(&rva)))
+                    || block
+                        .successor_vas
+                        .iter()
+                        .any(|&va| Some(va) == next.map(|r| image_base + r as u64))
                 {
                     push(EdgeKind::Fallthrough, next);
                 }
@@ -1254,5 +1268,72 @@ mod tests {
             .build_with_basic_blocks(&[foreign])
             .unwrap();
         assert!(model.blocks.is_empty());
+    }
+
+    #[test]
+    fn decoded_next_block_has_canonical_fallthrough_without_extractor_hint() {
+        let target = target(vec![RuntimeFunction {
+            begin_address: 0x1010,
+            end_address: 0x1020,
+            unwind_info_address: 0x2000,
+        }]);
+        let base = target.image_base;
+        let model = ProgramModelBuilder::new(&target)
+            .build_with_basic_blocks(&[
+                block(base, 0x1010, &[0x90], &[]),
+                block(base, 0x1011, &[0xc3], &[]),
+            ])
+            .unwrap();
+        let source = model
+            .blocks
+            .values()
+            .find(|block| block.range.start == 0x1010)
+            .unwrap()
+            .id;
+        let target = model
+            .blocks
+            .values()
+            .find(|block| block.range.start == 0x1011)
+            .unwrap()
+            .id;
+        assert!(model.edges.iter().any(|edge| {
+            edge.source == source
+                && edge.kind == EdgeKind::Fallthrough
+                && edge.target == EdgeTarget::Block(target)
+        }));
+    }
+
+    #[test]
+    fn intra_function_jump_to_secondary_entry_is_not_a_tail_call() {
+        let target = target(vec![RuntimeFunction {
+            begin_address: 0x1010,
+            end_address: 0x1030,
+            unwind_info_address: 0x2000,
+        }]);
+        let base = target.image_base;
+        let model = ProgramModelBuilder::new(&target)
+            .build_with_basic_blocks(&[
+                // Makes 0x1024 a declared secondary function entry.
+                block(base, 0x1010, &[0xe8, 0x0f, 0, 0, 0], &[0x1015]),
+                block(base, 0x1015, &[0xc3], &[]),
+                block(base, 0x1020, &[0xeb, 0x02], &[0x1024]),
+                block(base, 0x1024, &[0xc3], &[]),
+            ])
+            .unwrap();
+        let source = model
+            .blocks
+            .values()
+            .find(|block| block.range.start == 0x1020)
+            .unwrap()
+            .id;
+        assert!(model.edges.iter().any(|edge| {
+            edge.source == source
+                && edge.kind == EdgeKind::DirectBranch
+                && matches!(edge.target, EdgeTarget::Block(_))
+        }));
+        assert!(!model
+            .edges
+            .iter()
+            .any(|edge| edge.source == source && edge.kind == EdgeKind::TailCall));
     }
 }
