@@ -217,6 +217,24 @@ fn transfer(ins: &Instruction, state: &mut State, image_base: u64) {
     state.bounds.remove(&dst);
     if let Some(bound) = copied_bound {
         state.bounds.insert(dst, bound);
+    } else if ins.mnemonic() == Mnemonic::Movzx {
+        let source_bytes = match ins.op1_kind() {
+            OpKind::Register => ins.op1_register().size(),
+            OpKind::Memory => ins.memory_size().size(),
+            _ => 0,
+        };
+        if matches!(source_bytes, 1 | 2) {
+            state.bounds.insert(
+                dst,
+                Bound {
+                    compare: CompareKind::BelowOrEqual,
+                    upper: (1_u64 << (source_bytes * 8)) - 1,
+                    inclusive: true,
+                    compare_ip: ins.ip(),
+                    branch_ip: None,
+                },
+            );
+        }
     }
 }
 
@@ -410,6 +428,21 @@ mod tests {
         ));
         let b = result.bound_before(4, Register::RCX).unwrap();
         assert_eq!((b.upper, b.inclusive), (7, true));
+    }
+
+    #[test]
+    fn zero_extension_proves_finite_selector_domain() {
+        let instructions = decode(&[0x44, 0x0f, 0xb6, 0x41, 0x08]); // movzx r8d,byte ptr [rcx+8]
+        let result = analyze(&instructions, ValueFlowConfig::default());
+        let state_after = analyze(
+            &decode(&[0x44, 0x0f, 0xb6, 0x41, 0x08, 0x90]),
+            ValueFlowConfig::default(),
+        );
+        assert!(result.bound_before(0, Register::R8).is_none());
+        let bound = state_after.bound_before(1, Register::R8).unwrap();
+        assert_eq!(bound.compare, CompareKind::BelowOrEqual);
+        assert_eq!(bound.upper, 0xff);
+        assert!(bound.branch_ip.is_none());
     }
 
     #[test]
