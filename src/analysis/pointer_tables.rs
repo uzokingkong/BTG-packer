@@ -270,7 +270,7 @@ pub fn produce_dynamic_import_resolutions(
             continue;
         }
         let mut visiting = BTreeSet::new();
-        if prove_dynamic_external_register(
+        let proven = prove_dynamic_external_register(
             program,
             site.source_block,
             index,
@@ -279,7 +279,8 @@ pub fn produce_dynamic_import_resolutions(
             get_proc_address_slots,
             &dynamic_slots,
             &mut visiting,
-        ) {
+        );
+        if proven {
             out.push((site.id, identity));
         }
     }
@@ -346,6 +347,7 @@ fn discover_dynamic_import_slots(
                     true
                 } else {
                     proven_stores.contains(&instruction.ip())
+                        || unsigned_immediate(instruction, 1) == Some(0)
                 }
             })
     });
@@ -380,10 +382,7 @@ fn prove_dynamic_external_register(
             visiting.remove(&key);
             return true;
         }
-        if instruction.op0_kind() == OpKind::Register
-            && instruction.op0_register().full_register() == register
-            && !matches!(instruction.mnemonic(), Mnemonic::Cmp | Mnemonic::Test)
-        {
+        if writes_op0_register(instruction, register) {
             let result = if instruction.mnemonic() == Mnemonic::Mov
                 && instruction.op1_kind() == OpKind::Register
             {
@@ -1494,10 +1493,18 @@ fn read_u64(sections: &[SectionData], rva: u32) -> Option<u64> {
         let Some(end) = offset.checked_add(8) else {
             continue;
         };
-        let Some(bytes) = section.bytes.get(offset..end) else {
+        if end > section.virtual_size as usize {
             continue;
-        };
-        return Some(u64::from_le_bytes(bytes.try_into().ok()?));
+        }
+        // PE maps VirtualSize, zero-filling the portion beyond SizeOfRawData.
+        // Dynamic import caches commonly live in that BSS tail and therefore
+        // have a typed initial value of null even though no file bytes exist.
+        let mut value = [0u8; 8];
+        if offset < section.bytes.len() {
+            let available = (section.bytes.len() - offset).min(8);
+            value[..available].copy_from_slice(&section.bytes[offset..offset + available]);
+        }
+        return Some(u64::from_le_bytes(value));
     }
     None
 }
@@ -1542,6 +1549,20 @@ mod tests {
         assert!(!writes_op0_register(&decode(&[0x48, 0x85, 0xFF]), Register::RDI));
         assert!(!writes_op0_register(&decode(&[0x48, 0x39, 0xF7]), Register::RDI));
         assert!(!writes_op0_register(&decode(&[0x57]), Register::RDI));
+    }
+
+    #[test]
+    fn section_reads_use_loader_zero_fill_for_bss_tail() {
+        let section = SectionData {
+            name: ".data".into(),
+            virtual_address: 0x3000,
+            virtual_size: 0x20,
+            characteristics: 0,
+            bytes: vec![0xAA; 8],
+        };
+        assert_eq!(read_u64(&[section.clone()], 0x3008), Some(0));
+        assert_eq!(read_u64(&[section.clone()], 0x3018), Some(0));
+        assert_eq!(read_u64(&[section], 0x3019), None);
     }
     const BASE: u64 = 0x0040_0000;
 
