@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use iced_x86::{Mnemonic, OpKind, Register};
+use iced_x86::{Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register};
 
 use super::indirect_resolver::IndirectResolution;
 use super::indirect_targets::{ResolutionStatus, TargetProvenance};
@@ -216,6 +216,25 @@ pub fn produce_iat_slots(
     }
     out.sort_by_key(|(site, _)| *site);
     out
+}
+
+/// Returns whether operand zero actually modifies `register`.
+///
+/// Merely naming a register as operand zero is insufficient: indirect calls,
+/// tests, comparisons, and pushes read that operand. Treating those uses as
+/// definitions cuts reaching-definition walks off before an earlier typed IAT
+/// or table load can be observed.
+fn writes_op0_register(instruction: &Instruction, register: Register) -> bool {
+    if instruction.op0_kind() != OpKind::Register
+        || instruction.op0_register().full_register() != register
+    {
+        return false;
+    }
+    let mut factory = InstructionInfoFactory::new();
+    matches!(
+        factory.info(instruction).op0_access(),
+        OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+    )
 }
 
 /// Resolves function pointers obtained from GetProcAddress and cached in
@@ -446,9 +465,7 @@ fn find_reaching_register_definitions<'a>(
             {
                 return None;
             }
-            if instruction.op0_kind() == OpKind::Register
-                && instruction.op0_register().full_register() == register
-            {
+            if writes_op0_register(instruction, register) {
                 found = Some(instruction);
                 break;
             }
@@ -531,9 +548,7 @@ fn find_contiguous_register_definition<'a>(
         ) {
             return None;
         }
-        if instruction.op0_kind() == OpKind::Register
-            && instruction.op0_register().full_register() == register
-        {
+        if writes_op0_register(instruction, register) {
             return Some(instruction);
         }
         expected_ip = instruction.ip();
@@ -931,10 +946,7 @@ fn trace_register_copy_origin(
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, instruction)| {
-                instruction.op0_kind() == OpKind::Register
-                    && instruction.op0_register().full_register() == register
-            })
+            .find(|(_, instruction)| writes_op0_register(instruction, register))
         {
             if definition.mnemonic() == Mnemonic::Mov && definition.op1_kind() == OpKind::Register {
                 register = definition.op1_register().full_register();
@@ -994,10 +1006,7 @@ fn find_unique_register_definition(
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, instruction)| {
-                instruction.op0_kind() == OpKind::Register
-                    && instruction.op0_register().full_register() == target
-            })
+            .find(|(_, instruction)| writes_op0_register(instruction, target))
         {
             return Some((block_id, index));
         }
@@ -1390,14 +1399,28 @@ fn provenance_for(encoding: CodePointerEncoding) -> TargetProvenance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced_x86::{Decoder, DecoderOptions};
     use crate::analysis::indirect_targets::IndirectSiteId;
     use crate::analysis::indirect_targets::{IndirectSite, ResolutionStatus, TargetSet};
     use crate::analysis::program_model::{
         BlockId, BlockModel, ByteClass, CodePointerId, CodePointerModel, FunctionId, FunctionModel,
         FunctionProvenance,
     };
-    use iced_x86::{Decoder, DecoderOptions};
 
+    #[test]
+    fn register_uses_do_not_hide_the_reaching_definition() {
+        let decode = |bytes: &[u8]| {
+            Decoder::with_ip(64, bytes, 0x140001000, DecoderOptions::NONE).decode()
+        };
+        assert!(writes_op0_register(
+            &decode(&[0x48, 0x8B, 0x3D, 0, 0, 0, 0]),
+            Register::RDI
+        ));
+        assert!(!writes_op0_register(&decode(&[0xFF, 0xD7]), Register::RDI));
+        assert!(!writes_op0_register(&decode(&[0x48, 0x85, 0xFF]), Register::RDI));
+        assert!(!writes_op0_register(&decode(&[0x48, 0x39, 0xF7]), Register::RDI));
+        assert!(!writes_op0_register(&decode(&[0x57]), Register::RDI));
+    }
     const BASE: u64 = 0x0040_0000;
 
     fn model(code: &[u8], pointer_locations: &[u32]) -> ProgramModel {

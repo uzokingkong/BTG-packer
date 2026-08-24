@@ -23,7 +23,7 @@ anyhow = "1.0"
 clap = { version = "4.4", features = ["derive"] }
 env_logger = "0.11"
 goblin = "0.8"
-iced-x86 = { version = "1.21", features = ["decoder", "encoder", "block_encoder", "nasm", "fast_fmt"] }
+iced-x86 = { version = "1.21", features = ["decoder", "encoder", "block_encoder", "nasm", "fast_fmt", "instr_info"] }
 log = "0.4"
 rand = "0.8"
 thiserror = "1.0"
