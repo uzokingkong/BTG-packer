@@ -1313,8 +1313,7 @@ fn find_linear_vtable_method_load(
         .collect::<Vec<_>>();
     instructions.sort_by_key(|instruction| instruction.ip());
     instructions.into_iter().rev().take(16).find_map(|instruction| {
-        (instruction.op0_kind() == OpKind::Register
-            && instruction.op0_register().full_register() == target)
+        writes_op0_register(instruction, target)
             .then(|| {
                 (instruction.mnemonic() == Mnemonic::Mov
                     && instruction.op1_kind() == OpKind::Memory
@@ -1448,9 +1447,7 @@ fn find_vtable_method_load(
         }
         let block = program.blocks.get(&block_id)?;
         for instruction in block.instructions[..before_index].iter().rev() {
-            if instruction.op0_kind() == OpKind::Register
-                && instruction.op0_register().full_register() == target
-            {
+            if writes_op0_register(instruction, target) {
                 return (instruction.mnemonic() == Mnemonic::Mov
                     && instruction.op1_kind() == OpKind::Memory
                     && instruction.memory_index() == Register::None
