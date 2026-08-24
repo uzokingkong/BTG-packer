@@ -27,7 +27,7 @@ pub fn run_with_indirect_resolutions(
     let target_base_va = ctx.target_info.image_base + ctx.target_info.text_rva as u64;
     let target_ep_va = ctx.target_info.image_base + ctx.target_info.entry_point_rva as u64;
 
-    let (basic_blocks, mut bi_graph) = CfgExtractor::extract(
+    let (mut basic_blocks, mut bi_graph) = CfgExtractor::extract(
         &ctx.target_info.text_bytes,
         target_base_va,
         target_ep_va,
@@ -35,13 +35,45 @@ pub fn run_with_indirect_resolutions(
         ctx.target_info.image_base,
     )?;
 
-    let program_model =
+    let mut program_model =
         crate::analysis::program_model_builder::ProgramModelBuilder::new(&ctx.target_info)
             .build_with_basic_blocks_and_auto_indirect_resolutions(
                 &basic_blocks,
                 indirect_resolutions,
             )
             .map_err(|error| anyhow::anyhow!(error))?;
+    let existing_starts = basic_blocks
+        .iter()
+        .map(|block| block.start_va)
+        .collect::<std::collections::BTreeSet<_>>();
+    let discovered_starts = program_model
+        .discovered_indirect_code_targets
+        .iter()
+        .map(|rva| ctx.target_info.image_base + u64::from(*rva))
+        .filter(|target| !existing_starts.contains(target))
+        .collect::<std::collections::BTreeSet<_>>();
+    if !discovered_starts.is_empty() {
+        let starts = discovered_starts.iter().copied().collect::<Vec<_>>();
+        (basic_blocks, bi_graph) = CfgExtractor::extract_with_additional_starts(
+            &ctx.target_info.text_bytes,
+            target_base_va,
+            target_ep_va,
+            &ctx.target_info.relayed_sections,
+            ctx.target_info.image_base,
+            &starts,
+        )?;
+        program_model =
+            crate::analysis::program_model_builder::ProgramModelBuilder::new(&ctx.target_info)
+                .build_with_basic_blocks_and_auto_indirect_resolutions(
+                    &basic_blocks,
+                    indirect_resolutions,
+                )
+                .map_err(|error| anyhow::anyhow!(error))?;
+        println!(
+            "[+] Canonical CFG refinement: {} indirect target boundary(s) materialized.",
+            discovered_starts.len()
+        );
+    }
     println!(
         "[+] Canonical ProgramModel: {} executable range(s), {} function(s), {} block(s), {} edge(s), {} unknown range(s).",
         program_model.executable_ranges.len(),
@@ -51,6 +83,68 @@ pub fn run_with_indirect_resolutions(
         program_model.unknown_ranges.len()
     );
     ctx.program_model = Some(program_model);
+    if let Some(model) = ctx.program_model.as_ref() {
+        use crate::analysis::indirect_targets::ResolutionStatus;
+        use iced_x86::{OpKind, Register};
+        let mut shapes = std::collections::BTreeMap::<&'static str, usize>::new();
+        let mut patterns = std::collections::BTreeMap::<String, usize>::new();
+        for site in model
+            .indirect_targets
+            .sites
+            .values()
+            .filter(|site| site.status != ResolutionStatus::Complete)
+        {
+            let instruction = model.blocks.get(&site.source_block).and_then(|block| {
+                block.instructions.iter().find(|instruction| {
+                    instruction
+                        .ip()
+                        .checked_sub(ctx.target_info.image_base)
+                        .and_then(|rva| u32::try_from(rva).ok())
+                        == Some(site.instruction_rva)
+                })
+            });
+            let transfer = match site.kind {
+                crate::analysis::indirect_targets::IndirectKind::Call => "call",
+                crate::analysis::indirect_targets::IndirectKind::Jump => "jump",
+            };
+            let shape = match instruction.map(|i| i.op0_kind()) {
+                Some(OpKind::Register) if transfer == "call" => "call-register",
+                Some(OpKind::Register) => "jump-register",
+                Some(OpKind::Memory)
+                    if instruction.is_some_and(|i| i.memory_index() != Register::None) =>
+                {
+                    if transfer == "call" { "call-indexed-memory" } else { "jump-indexed-memory" }
+                }
+                Some(OpKind::Memory) if transfer == "call" => "call-direct-memory",
+                Some(OpKind::Memory) => "jump-direct-memory",
+                _ => "other",
+            };
+            *shapes.entry(shape).or_default() += 1;
+            if let Some(instruction) = instruction {
+                let pattern = match instruction.op0_kind() {
+                    OpKind::Register => format!("{transfer} {:?}", instruction.op0_register()),
+                    OpKind::Memory => format!(
+                        "{transfer} [{:?}+{:?}*{}+{:#x}]",
+                        instruction.memory_base(),
+                        instruction.memory_index(),
+                        instruction.memory_index_scale(),
+                        instruction.memory_displacement64()
+                    ),
+                    kind => format!("{:?}:{kind:?}", instruction.code()),
+                };
+                *patterns.entry(pattern).or_default() += 1;
+            }
+        }
+        if !shapes.is_empty() {
+            println!("[+] Canonical unresolved indirect shapes: {shapes:?}");
+            let mut top = patterns.into_iter().collect::<Vec<_>>();
+            top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            println!(
+                "[+] Canonical unresolved top patterns: {:?}",
+                top.into_iter().take(16).collect::<Vec<_>>()
+            );
+        }
+    }
 
     println!(
         "[+] Extracted {} Basic Blocks from target CFG.",
@@ -207,17 +301,26 @@ pub fn run_with_indirect_resolutions(
     // can bypass the dispatcher. Do not independently re-decode `.text` here:
     // that used to create a second, subtly different call-target policy.
     if ctx.reencrypt {
-        let model = ctx.program_model.as_ref().expect("ProgramModel installed above");
+        let model = ctx
+            .program_model
+            .as_ref()
+            .expect("ProgramModel installed above");
         let mut added = 0usize;
         for rva in model.direct_entry_rvas() {
             let va = ctx.target_info.image_base + rva as u64;
             if let Some(id) = crate::pipeline::patch_data::resolve_block_id(
-                &va_to_trigger_id, va, text_start_va, text_end_va,
+                &va_to_trigger_id,
+                va,
+                text_start_va,
+                text_end_va,
             ) {
                 added += usize::from(call_target_block_ids.insert(id));
             }
         }
-        println!("[+] Canonical direct-entry inventory: {added} additional plaintext block(s), {} total", call_target_block_ids.len());
+        println!(
+            "[+] Canonical direct-entry inventory: {added} additional plaintext block(s), {} total",
+            call_target_block_ids.len()
+        );
     }
 
     println!(

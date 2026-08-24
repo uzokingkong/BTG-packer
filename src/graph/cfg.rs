@@ -24,6 +24,24 @@ impl CfgExtractor {
         relayed_sections: &[crate::pe::builder::SectionData],
         image_base: u64,
     ) -> Result<(Vec<BasicBlock>, BidirectionalGraph)> {
+        Self::extract_with_additional_starts(
+            text_bytes,
+            base_va,
+            entry_point_va,
+            relayed_sections,
+            image_base,
+            &[],
+        )
+    }
+
+    pub fn extract_with_additional_starts(
+        text_bytes: &[u8],
+        base_va: u64,
+        entry_point_va: u64,
+        relayed_sections: &[crate::pe::builder::SectionData],
+        image_base: u64,
+        additional_starts: &[u64],
+    ) -> Result<(Vec<BasicBlock>, BidirectionalGraph)> {
         // RawSize commonly includes file-alignment zero padding after .text's
         // VirtualSize. Decoding that padding creates fake `add [rax],al` blocks
         // and used to be masked later by a synthetic RET. Restrict CFG input to
@@ -39,6 +57,7 @@ impl CfgExtractor {
         // branch-targeted INT3 is executable program semantics, never padding.
         let mut explicit_code_targets = std::collections::BTreeSet::new();
         explicit_code_targets.insert(entry_point_va);
+        explicit_code_targets.extend(additional_starts.iter().copied());
         let mut target_decoder = Decoder::with_ip(64, text_bytes, base_va, DecoderOptions::NONE);
         while target_decoder.can_decode() {
             let inst = target_decoder.decode();
@@ -125,6 +144,12 @@ impl CfgExtractor {
         if entry_point_va >= base_va && entry_point_va < text_end_va {
             block_starts.insert(entry_point_va);
         }
+        block_starts.extend(
+            additional_starts
+                .iter()
+                .copied()
+                .filter(|target| *target >= base_va && *target < text_end_va),
+        );
 
         // CRITICAL FIX: Scan .rdata, .data, .pdata for function pointers and RVA/VA table targets
         // that are referenced only from data sections (e.g. CRT init tables, vtables, SEH scope tables).

@@ -134,6 +134,9 @@ pub struct ProgramModel {
     pub blocks: BTreeMap<BlockId, BlockModel>,
     pub edges: Vec<EdgeModel>,
     pub indirect_targets: crate::analysis::indirect_targets::IndirectTargetModel,
+    /// Typed switch/callback destinations discovered before the decoded block
+    /// partition was refined. Pass-1 feeds these RVAs back into CFG extraction.
+    pub discovered_indirect_code_targets: BTreeSet<u32>,
     pub code_pointers: BTreeMap<CodePointerId, CodePointerModel>,
     pub tls_callbacks: BTreeSet<FunctionId>,
     pub crt_entries: BTreeSet<FunctionId>,

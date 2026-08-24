@@ -100,6 +100,21 @@ impl ValueFlowResult {
             .get(instruction_index)
             .and_then(|s| s.bounds.get(&full_register(register)).copied())
     }
+
+    /// Computes the effective address of a memory operand from the bounded
+    /// state immediately before that instruction. This does not dereference
+    /// memory; consumers must validate the resulting slot against typed data.
+    pub fn memory_address_before(
+        &self,
+        instruction_index: usize,
+        instruction: &Instruction,
+        image_base: u64,
+    ) -> AbstractValue {
+        self.before
+            .get(instruction_index)
+            .map(|state| memory_value(instruction, state, image_base))
+            .unwrap_or(AbstractValue::Unknown)
+    }
 }
 
 pub fn analyze(instructions: &[Instruction], config: ValueFlowConfig) -> ValueFlowResult {
@@ -153,6 +168,13 @@ fn transfer(ins: &Instruction, state: &mut State, image_base: u64) {
     let Some(dst) = register_operand(ins, 0).map(full_register) else {
         return;
     };
+    // A selector is commonly range-checked in one register and copied to a
+    // different register for addressing the jump table. Preserve that proof
+    // only for an exact register copy; every other write invalidates it.
+    let copied_bound = (ins.mnemonic() == Mnemonic::Mov)
+        .then(|| register_operand(ins, 1).map(full_register))
+        .flatten()
+        .and_then(|src| state.bounds.get(&src).copied());
     let value = match ins.mnemonic() {
         Mnemonic::Mov => operand_value(ins, 1, state, image_base),
         Mnemonic::Lea if ins.op1_kind() == OpKind::Memory => memory_value(ins, state, image_base),
@@ -193,6 +215,9 @@ fn transfer(ins: &Instruction, state: &mut State, image_base: u64) {
     };
     state.values.insert(dst, value);
     state.bounds.remove(&dst);
+    if let Some(bound) = copied_bound {
+        state.bounds.insert(dst, bound);
+    }
 }
 
 fn operand_value(ins: &Instruction, operand: u32, state: &State, image_base: u64) -> AbstractValue {

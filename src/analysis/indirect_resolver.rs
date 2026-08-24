@@ -48,6 +48,58 @@ pub fn apply_indirect_resolution(
     Ok(())
 }
 
+/// Marks a canonical indirect call as an exhaustive external slot dispatch
+/// (for example, a PE IAT entry). The slot VA is used as the stable external
+/// identity; the loader-populated function VA is intentionally not guessed.
+pub fn apply_external_indirect_resolution(
+    program: &mut ProgramModel,
+    site_id: IndirectSiteId,
+    slot_va: u64,
+    provenance: TargetProvenance,
+) -> Result<(), IndirectResolveError> {
+    let mut next = program.clone();
+    let site = next
+        .indirect_targets
+        .sites
+        .get(&site_id)
+        .ok_or(IndirectResolveError::MissingSite(site_id))?
+        .clone();
+    let edge_kind = match site.kind {
+        IndirectKind::Call => EdgeKind::IndirectCall,
+        IndirectKind::Jump => EdgeKind::IndirectJump,
+    };
+    let matching = next
+        .edges
+        .iter()
+        .enumerate()
+        .filter(|(_, edge)| {
+            edge.source == site.source_block
+                && edge.kind == edge_kind
+                && edge.target == EdgeTarget::Unresolved
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [index] => {
+            next.edges.remove(*index);
+        }
+        [] => return Err(IndirectResolveError::MissingUnresolvedEdge(site_id)),
+        _ => return Err(IndirectResolveError::MultipleUnresolvedEdges(site_id)),
+    }
+    let target = IndirectTarget::External(slot_va);
+    let target_site = next.indirect_targets.sites.get_mut(&site_id).unwrap();
+    target_site.targets.insert(target, provenance);
+    target_site.status = ResolutionStatus::Complete;
+    next.edges.push(EdgeModel {
+        source: site.source_block,
+        kind: edge_kind,
+        target: EdgeTarget::External(slot_va),
+    });
+    next.edges.sort_by_key(edge_key);
+    *program = next;
+    Ok(())
+}
+
 /// Atomically applies a producer's complete batch of indirect-target evidence.
 ///
 /// A later request may depend on an earlier request in the same batch (for
@@ -285,6 +337,31 @@ mod tests {
             ResolutionStatus::Complete
         );
         assert_eq!(p.edges[0].target, EdgeTarget::Function(FunctionId(2)));
+    }
+
+    #[test]
+    fn resolves_loader_slot_as_complete_external_edge() {
+        let mut p = model(IndirectKind::Call);
+        apply_external_indirect_resolution(
+            &mut p,
+            IndirectSiteId(7),
+            0x140003000,
+            TargetProvenance::ImportAddressTable,
+        )
+        .unwrap();
+        let site = &p.indirect_targets.sites[&IndirectSiteId(7)];
+        assert_eq!(site.status, ResolutionStatus::Complete);
+        assert!(site
+            .targets
+            .targets
+            .contains_key(&IndirectTarget::External(0x140003000)));
+        assert!(p.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::IndirectCall && edge.target == EdgeTarget::External(0x140003000)
+        }));
+        assert!(!p
+            .edges
+            .iter()
+            .any(|edge| edge.target == EdgeTarget::Unresolved));
     }
 
     #[test]

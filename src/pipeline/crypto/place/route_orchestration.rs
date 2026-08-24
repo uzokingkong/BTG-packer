@@ -43,9 +43,11 @@ pub(super) fn build_commercial_routes(
         let source_va = image_base
             .checked_add(u64::from(source_rva))
             .ok_or_else(|| anyhow!("source function VA overflow at RVA {source_rva:#x}"))?;
-        let source_family = plan.assignment_for(source_va).ok_or_else(|| {
-            anyhow!("complete indirect site {:?} source RVA {source_rva:#x} has no family assignment", site.id)
-        })?.family;
+        // Native-owned source functions execute their original indirect call
+        // and therefore require no VM gateway metadata.
+        let Some(source_family) = plan.assignment_for(source_va).map(|a| a.family) else {
+            continue;
+        };
 
         for target in site.targets.targets.keys() {
             let (function_id, target_rva) = match *target {
@@ -72,21 +74,17 @@ pub(super) fn build_commercial_routes(
                     let function = program.functions.get(&block.function_id).ok_or_else(|| {
                         anyhow!("complete indirect target block {id:?} has no function")
                     })?;
-                    if !function.entries.contains(&block.range.start) {
-                        bail!("complete indirect target block {id:?} at RVA {:#x} is not a canonical function entry", block.range.start);
-                    }
                     (block.function_id, block.range.start)
                 }
             };
             let target_va = image_base
                 .checked_add(u64::from(target_rva))
                 .ok_or_else(|| anyhow!("target function VA overflow at RVA {target_rva:#x}"))?;
-            let target_family = plan
-                .assignment_for(target_va)
-                .ok_or_else(|| {
-                    anyhow!("complete indirect target RVA {target_rva:#x} has no family assignment")
-                })?
-                .family;
+            // Native-owned destinations remain valid passthrough targets in a
+            // partial build; only VM-owned destinations need route entries.
+            let Some(target_family) = plan.assignment_for(target_va).map(|a| a.family) else {
+                continue;
+            };
             let module = materialized.modules.iter().find(|module| module.family == target_family)
                 .ok_or_else(|| anyhow!("complete indirect target RVA {target_rva:#x} has no materialized {:?} module", target_family))?;
             let entry_vip = *module.ip_map.get(&target_va).ok_or_else(|| {
@@ -100,10 +98,15 @@ pub(super) fn build_commercial_routes(
                 GatewayKind::CrossFamily
             };
             let candidate = (function_id, entry_vip as u64, gateway);
-            if let Some(existing) = required.insert(OriginalTargetRva(target_rva), candidate) {
-                if existing != candidate {
-                    bail!("complete indirect target RVA {target_rva:#x} requires conflicting family gateways");
+            if let Some(existing) = required.get_mut(&OriginalTargetRva(target_rva)) {
+                if existing.0 != candidate.0 || existing.1 != candidate.1 {
+                    bail!("complete indirect target RVA {target_rva:#x} requires conflicting route identities");
                 }
+                if existing.2 != candidate.2 {
+                    existing.2 = GatewayKind::CrossFamily;
+                }
+            } else {
+                required.insert(OriginalTargetRva(target_rva), candidate);
             }
         }
     }

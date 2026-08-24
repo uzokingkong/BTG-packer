@@ -32,7 +32,9 @@ pub mod switch;
 mod tests;
 pub mod tls_guard;
 
-pub use commercial::{lift_program_cfg_commercial, ProgramLiftCommercial};
+pub use commercial::{
+    lift_program_cfg_commercial, lift_program_cfg_commercial_with_model, ProgramLiftCommercial,
+};
 pub use exclusions::{
     detect_panic_unwind_ranges, detect_seh_native_functions, detect_setjmp_longjmp_functions,
 };

@@ -47,7 +47,7 @@ pub(crate) fn lift_program(
         let base_va = image_base + ctx.target_info.text_rva as u64;
         let ep_va = image_base + ctx.target_info.entry_point_rva as u64;
         let (prog_bytecode, entry_native): (Vec<u8>, bool) = if vm_commercial {
-            let lift = vm::text_lift::lift_program_cfg_commercial(
+            let lift = vm::text_lift::lift_program_cfg_commercial_with_model(
                 &ctx.target_info.text_bytes,
                 base_va,
                 ep_va,
@@ -55,6 +55,7 @@ pub(crate) fn lift_program(
                 image_base,
                 &ctx.vm_data_lifetime_objects,
                 ctx.poly_vm_seed,
+                ctx.program_model.as_ref(),
             )?;
             data_lifetime_objects = lift.data_lifetime_objects.clone();
             unsupported_report = lift.unsupported_report.clone();

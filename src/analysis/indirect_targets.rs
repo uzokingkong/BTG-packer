@@ -24,7 +24,9 @@ pub enum TargetProvenance {
     JumpTable,
     PointerTable,
     Vtable,
+    ImportAddressTable,
     LoadConfig,
+    AbiArgument,
     UserSupplied,
 }
 

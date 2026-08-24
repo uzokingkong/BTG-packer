@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use iced_x86::{Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{FlowControl, Instruction, Mnemonic, OpKind, Register};
 
 use super::indirect_resolver::IndirectResolution;
 use super::indirect_targets::{
@@ -34,14 +34,22 @@ pub fn produce_switch_resolutions(
     sections: &[SwitchSection<'_>],
 ) -> Vec<ProducedSwitchResolution> {
     let mut out = Vec::new();
+    let mut canonical_instructions = program
+        .blocks
+        .values()
+        .flat_map(|block| block.instructions.iter().cloned())
+        .collect::<Vec<_>>();
+    canonical_instructions.sort_by_key(|instruction| instruction.ip());
+    canonical_instructions.dedup_by_key(|instruction| instruction.ip());
     for site in program.indirect_targets.sites.values() {
         if site.kind != IndirectKind::Jump {
             continue;
         }
-        let Some(block) = program.blocks.get(&site.source_block) else {
-            continue;
-        };
-        let Some(jump_index) = block.instructions.iter().position(|i| {
+        // The CFG importer may split at every branch target, including the
+        // three-instruction table dispatch itself. Reconstruct an ordered,
+        // function-local instruction view; pattern recovery still requires
+        // adjacent load/add/jump instructions and an explicit bound proof.
+        let Some(global_jump_index) = canonical_instructions.iter().position(|i| {
             i.ip()
                 .checked_sub(image_base)
                 .and_then(|x| u32::try_from(x).ok())
@@ -49,8 +57,11 @@ pub fn produce_switch_resolutions(
         }) else {
             continue;
         };
+        let window_start = global_jump_index.saturating_sub(128);
+        let instructions = &canonical_instructions[window_start..=global_jump_index];
+        let jump_index = instructions.len() - 1;
         let flow = value_flow::analyze(
-            &block.instructions,
+            &instructions,
             ValueFlowConfig {
                 image_base,
                 ..Default::default()
@@ -59,18 +70,21 @@ pub fn produce_switch_resolutions(
         if flow.truncated {
             continue;
         }
-        let Some(pattern) = recover_pattern(&block.instructions, jump_index, &flow, image_base)
-        else {
+        let Some(pattern) = recover_pattern(&instructions, jump_index, &flow, image_base) else {
             continue;
         };
-        let Some(bound) = flow.bound_before(jump_index, pattern.index) else {
-            continue;
-        };
-        let entry_count = match bound.compare {
-            CompareKind::BelowOrEqual => bound.upper.checked_add(1),
-            CompareKind::Below => Some(bound.upper),
-            _ => None,
-        };
+        let entry_count = flow
+            // In the rel32 idiom the table load overwrites the index register
+            // (`movsxd rax,[base+rax*4]`). Query before that load, while the
+            // compare-derived bound is still live.
+            .bound_before(pattern.load_index, pattern.index)
+            .and_then(|bound| match bound.compare {
+                CompareKind::BelowOrEqual => bound.upper.checked_add(1),
+                CompareKind::Below => Some(bound.upper),
+                _ => None,
+            })
+            .or_else(|| masked_entry_count(&instructions, jump_index, pattern.index))
+            .or_else(|| compared_entry_count(&instructions, jump_index, pattern.index));
         let Some(entry_count) = entry_count.and_then(|n| u32::try_from(n).ok()) else {
             continue;
         };
@@ -135,6 +149,64 @@ pub fn produce_switch_resolutions(
     out
 }
 
+fn compared_entry_count(ins: &[Instruction], jump_index: usize, index: Register) -> Option<u64> {
+    let window_start = jump_index.saturating_sub(24);
+    for (offset, instruction) in ins[window_start..jump_index].iter().enumerate().rev() {
+        if instruction.mnemonic() != Mnemonic::Cmp
+            || instruction.op0_kind() != OpKind::Register
+            || instruction.op0_register().full_register() != index
+        {
+            continue;
+        }
+        let upper = match instruction.op1_kind() {
+            OpKind::Immediate8 => u64::from(instruction.immediate8()),
+            OpKind::Immediate32 => u64::from(instruction.immediate32()),
+            OpKind::Immediate32to64 => instruction.immediate32to64() as u64,
+            _ => return None,
+        };
+        let absolute = window_start + offset;
+        let guard = ins.get(absolute + 1)?;
+        let count = match guard.mnemonic() {
+            Mnemonic::Ja => upper.checked_add(1),
+            Mnemonic::Jae => Some(upper),
+            _ => None,
+        }?;
+        // No later write may change the selector before the table load.
+        let load_index = jump_index.saturating_sub(2);
+        if ins[absolute + 2..load_index].iter().any(|candidate| {
+            candidate.op0_kind() == OpKind::Register
+                && candidate.op0_register().full_register() == index
+        }) {
+            return None;
+        }
+        return Some(count);
+    }
+    None
+}
+
+fn masked_entry_count(ins: &[Instruction], jump_index: usize, index: Register) -> Option<u64> {
+    for instruction in ins[jump_index.saturating_sub(12)..jump_index].iter().rev() {
+        if instruction.op0_kind() != OpKind::Register
+            || instruction.op0_register().full_register() != index
+        {
+            continue;
+        }
+        if instruction.mnemonic() != Mnemonic::And {
+            return None;
+        }
+        let mask = match instruction.op1_kind() {
+            OpKind::Immediate8 => u64::from(instruction.immediate8()),
+            OpKind::Immediate32 => u64::from(instruction.immediate32()),
+            OpKind::Immediate32to64 => instruction.immediate32to64() as u64,
+            _ => return None,
+        };
+        // A low-bit mask produces the exhaustive domain 0..=mask only when it
+        // is of the form 2^n-1. Arbitrary bit masks have holes.
+        return mask.checked_add(1).filter(|count| count.is_power_of_two());
+    }
+    None
+}
+
 #[derive(Clone, Copy)]
 struct Pattern {
     index: Register,
@@ -142,6 +214,7 @@ struct Pattern {
     base_rva: u32,
     width: u8,
     encoding: SwitchEntryEncoding,
+    load_index: usize,
 }
 
 fn recover_pattern(
@@ -166,13 +239,30 @@ fn recover_pattern(
             base_rva: 0,
             width: 8,
             encoding: SwitchEntryEncoding::Va64,
+            load_index: j,
         });
     }
     // lea base,[rip+table]; movsxd tmp,dword ptr [base+index*4]; add tmp,base; jmp tmp
     let target =
         (jump.op0_kind() == OpKind::Register).then(|| jump.op0_register().full_register())?;
-    let add = ins.get(j.checked_sub(1)?)?;
-    let load = ins.get(j.checked_sub(2)?)?;
+    let add_index = (j.saturating_sub(8)..j).rev().find(|&candidate| {
+        let instruction = &ins[candidate];
+        instruction.mnemonic() == Mnemonic::Add
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op0_register().full_register() == target
+            && instruction.op1_kind() == OpKind::Register
+            && ins[candidate + 1..j].iter().all(|between| {
+                between.flow_control() == FlowControl::Next
+                    && !(between.op0_kind() == OpKind::Register
+                        && between.op0_register().full_register() == target)
+            })
+    })?;
+    let load_index = add_index.checked_sub(1)?;
+    let add = &ins[add_index];
+    let load = &ins[load_index];
+    if load.ip().checked_add(load.len() as u64) != Some(add.ip()) {
+        return None;
+    }
     if add.mnemonic() != Mnemonic::Add
         || add.op0_register().full_register() != target
         || add.op1_kind() != OpKind::Register
@@ -188,14 +278,15 @@ fn recover_pattern(
         return None;
     }
     let index = load.memory_index().full_register();
-    let table_rva = memory_base_rva(load, j - 2, flow, image_base)?;
-    let base_rva = abstract_rva(flow.value_before(j - 1, base), image_base)?;
+    let table_rva = memory_base_rva(load, load_index, flow, image_base)?;
+    let base_rva = abstract_rva(flow.value_before(add_index, base), image_base)?;
     Some(Pattern {
         index,
         table_rva,
         base_rva,
         width: 4,
         encoding: SwitchEntryEncoding::Rel32 { base_rva },
+        load_index,
     })
 }
 

@@ -431,10 +431,65 @@ impl<'a> ProgramModelBuilder<'a> {
                 bytes: &s.bytes,
             })
             .collect::<Vec<_>>();
+        let relayed_sections = self.target.relayed_sections.clone();
+        let iat = self.target.data_directories.get(12).and_then(|directory| {
+            (directory.virtual_address != 0 && directory.size != 0).then_some(
+                crate::analysis::program_model::RvaRange {
+                    start: directory.virtual_address,
+                    end: directory.virtual_address.saturating_add(directory.size),
+                },
+            )
+        });
+        let load_config_slots = self
+            .target
+            .load_config
+            .as_ref()
+            .map(|load| {
+                let code = &load.code;
+                [
+                    code.guard_cf_check,
+                    code.guard_cf_dispatch,
+                    code.guard_rf_failure_routine,
+                    code.guard_rf_failure_routine_function,
+                    code.guard_rf_verify_stack_pointer,
+                    code.guard_xfg_check,
+                    code.guard_xfg_dispatch,
+                    code.guard_xfg_table_dispatch,
+                    code.cast_guard_failure_mode,
+                    code.guard_memcpy,
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
         let mut model = self.build_with_basic_blocks(blocks)?;
-        let produced = crate::analysis::switch_producer::produce_switch_resolutions(
+        let mut produced = crate::analysis::switch_producer::produce_switch_resolutions(
             &model, image_base, &sections,
         );
+        let switch_targets = produced
+            .iter()
+            .flat_map(|item| item.resolution.target_rvas.iter().copied())
+            .collect::<BTreeSet<_>>();
+        model
+            .discovered_indirect_code_targets
+            .extend(switch_targets.iter().copied());
+        split_blocks_at_targets(&mut model, image_base, &switch_targets);
+        let mapped_starts = model
+            .blocks
+            .values()
+            .map(|block| block.range.start)
+            .collect::<BTreeSet<_>>();
+        for item in &mut produced {
+            let before = item.resolution.target_rvas.len();
+            item.resolution
+                .target_rvas
+                .retain(|target| mapped_starts.contains(target));
+            if item.resolution.target_rvas.len() != before {
+                item.resolution.complete = false;
+            }
+        }
+        produced.retain(|item| !item.resolution.target_rvas.is_empty());
         let explicit_sites = resolutions.iter().map(|r| r.site).collect::<BTreeSet<_>>();
         let automatic = produced
             .iter()
@@ -452,10 +507,166 @@ impl<'a> ProgramModelBuilder<'a> {
                 }
             }
         }
+        // Resolve direct memory function-pointer slots after switch sites have
+        // been applied. This producer is site-scoped and only consumes
+        // canonical code-pointer inventory; unrelated global candidates are
+        // never assigned to an indirect call.
+        let pointer_resolutions = crate::analysis::pointer_tables::produce(&model, image_base, &[])
+            .into_iter()
+            .filter(|p| !explicit_sites.contains(&p.site))
+            .collect::<Vec<_>>();
+        crate::analysis::indirect_resolver::apply_indirect_resolutions(
+            &mut model,
+            &pointer_resolutions,
+        )?;
+        let local_resolutions =
+            crate::analysis::pointer_tables::produce_local_value_flow(&model, image_base)
+                .into_iter()
+                .filter(|p| !explicit_sites.contains(&p.site))
+                .collect::<Vec<_>>();
+        crate::analysis::indirect_resolver::apply_indirect_resolutions(
+            &mut model,
+            &local_resolutions,
+        )?;
+        let stack_resolutions =
+            crate::analysis::pointer_tables::produce_stack_spill_resolutions(&model, image_base)
+                .into_iter()
+                .filter(|p| !explicit_sites.contains(&p.site))
+                .collect::<Vec<_>>();
+        crate::analysis::indirect_resolver::apply_indirect_resolutions(
+            &mut model,
+            &stack_resolutions,
+        )?;
+        let abi_resolutions =
+            crate::analysis::pointer_tables::produce_abi_argument_resolutions(&model, image_base)
+                .into_iter()
+                .filter(|p| !explicit_sites.contains(&p.site))
+                .collect::<Vec<_>>();
+        crate::analysis::indirect_resolver::apply_indirect_resolutions(
+            &mut model,
+            &abi_resolutions,
+        )?;
+        let vtable_bases =
+            crate::analysis::pointer_tables::discover_rust_vtable_bases(&model, &relayed_sections);
+        let vtable_resolutions = crate::analysis::pointer_tables::produce_rust_vtable_resolutions(
+            &model,
+            image_base,
+            &vtable_bases,
+        )
+        .into_iter()
+        .filter(|p| !explicit_sites.contains(&p.site))
+        .collect::<Vec<_>>();
+        crate::analysis::indirect_resolver::apply_indirect_resolutions(
+            &mut model,
+            &vtable_resolutions,
+        )?;
+        if let Some(iat) = iat {
+            for (site, slot_va) in
+                crate::analysis::pointer_tables::produce_iat_slots(&model, image_base, iat)
+            {
+                if !explicit_sites.contains(&site) {
+                    crate::analysis::indirect_resolver::apply_external_indirect_resolution(
+                        &mut model,
+                        site,
+                        slot_va,
+                        crate::analysis::indirect_targets::TargetProvenance::ImportAddressTable,
+                    )?;
+                }
+            }
+        }
+        for slot_rva in load_config_slots {
+            let range = crate::analysis::program_model::RvaRange {
+                start: slot_rva,
+                end: slot_rva.saturating_add(8),
+            };
+            for (site, slot_va) in
+                crate::analysis::pointer_tables::produce_iat_slots(&model, image_base, range)
+            {
+                if !explicit_sites.contains(&site) {
+                    crate::analysis::indirect_resolver::apply_external_indirect_resolution(
+                        &mut model,
+                        site,
+                        slot_va,
+                        crate::analysis::indirect_targets::TargetProvenance::LoadConfig,
+                    )?;
+                }
+            }
+        }
         crate::analysis::indirect_resolver::apply_indirect_resolutions(&mut model, resolutions)?;
         model.indirect_targets.validate(&model)?;
         model.validate()?;
         Ok(model)
+    }
+}
+
+/// Refines the canonical partition at proven indirect-jump destinations that
+/// already correspond to decoded instructions. Incoming edges continue to
+/// enter the old prefix; terminal outgoing edges move to the new suffix.
+fn split_blocks_at_targets(model: &mut ProgramModel, image_base: u64, targets: &BTreeSet<u32>) {
+    for &target in targets {
+        if model
+            .blocks
+            .values()
+            .any(|block| block.range.start == target)
+        {
+            continue;
+        }
+        let Some((block_id, split_index)) = model.blocks.iter().find_map(|(&id, block)| {
+            block
+                .instructions
+                .iter()
+                .position(|instruction| {
+                    instruction
+                        .ip()
+                        .checked_sub(image_base)
+                        .and_then(|rva| u32::try_from(rva).ok())
+                        == Some(target)
+                })
+                .filter(|&index| index > 0)
+                .map(|index| (id, index))
+        }) else {
+            continue;
+        };
+        let Some(mut prefix) = model.blocks.remove(&block_id) else {
+            continue;
+        };
+        let suffix_instructions = prefix.instructions.split_off(split_index);
+        let old_end = prefix.range.end;
+        prefix.range.end = target;
+        let function_id = prefix.function_id;
+        let new_id = crate::analysis::program_model::BlockId(
+            model.blocks.keys().next_back().map_or(0, |id| id.0 + 1),
+        );
+        let suffix = crate::analysis::program_model::BlockModel {
+            id: new_id,
+            function_id,
+            range: crate::analysis::program_model::RvaRange {
+                start: target,
+                end: old_end,
+            },
+            instructions: suffix_instructions,
+            byte_class: prefix.byte_class,
+        };
+        model.blocks.insert(block_id, prefix);
+        model.blocks.insert(new_id, suffix);
+        if let Some(function) = model.functions.get_mut(&function_id) {
+            function.blocks.insert(new_id);
+        }
+        for edge in &mut model.edges {
+            if edge.source == block_id {
+                edge.source = new_id;
+            }
+        }
+        for site in model.indirect_targets.sites.values_mut() {
+            if site.source_block == block_id && site.instruction_rva >= target {
+                site.source_block = new_id;
+            }
+        }
+        model.edges.push(crate::analysis::program_model::EdgeModel {
+            source: block_id,
+            kind: crate::analysis::program_model::EdgeKind::Fallthrough,
+            target: crate::analysis::program_model::EdgeTarget::Block(new_id),
+        });
     }
 }
 

@@ -357,6 +357,8 @@ fn build_semantic_dependency_report(
     all_function_ranges: &[(u64, u64)],
     blocks: &[BasicBlock],
     roots: &HashSet<(u64, u64)>,
+    canonical_model: Option<&crate::analysis::program_model::ProgramModel>,
+    image_base: u64,
 ) -> CommercialSemanticDependencyReport {
     let owner_of = |va: u64| {
         all_function_ranges
@@ -405,12 +407,56 @@ fn build_semantic_dependency_report(
                     }
                 }
                 FlowControl::IndirectCall => {
-                    raw_unresolved.insert(CommercialUnresolvedCall {
-                        caller_start,
-                        call_site: instruction.ip(),
-                        code: instruction.code(),
-                        detail: "indirect call target/state dependency is not statically resolved",
+                    use crate::analysis::indirect_targets::{IndirectTarget, ResolutionStatus};
+                    let instruction_rva = instruction
+                        .ip()
+                        .checked_sub(image_base)
+                        .and_then(|rva| u32::try_from(rva).ok());
+                    let canonical_site = canonical_model.and_then(|model| {
+                        model
+                            .indirect_targets
+                            .sites
+                            .values()
+                            .find(|site| Some(site.instruction_rva) == instruction_rva)
                     });
+                    if let Some(site) =
+                        canonical_site.filter(|site| site.status == ResolutionStatus::Complete)
+                    {
+                        if let Some(model) = canonical_model {
+                            for target in site.targets.targets.keys() {
+                                let target_rva = match target {
+                                    IndirectTarget::Function(id) => model
+                                        .functions
+                                        .get(id)
+                                        .and_then(|function| function.entries.iter().next())
+                                        .copied(),
+                                    IndirectTarget::Block(id) => {
+                                        model.blocks.get(id).map(|block| block.range.start)
+                                    }
+                                    IndirectTarget::External(_) => None,
+                                };
+                                if let Some(target_rva) = target_rva {
+                                    let target = image_base + u64::from(target_rva);
+                                    if let Some((callee_start, _)) = owner_of(target) {
+                                        raw_edges.insert((
+                                            caller_start,
+                                            callee_start,
+                                            instruction.ip(),
+                                            target,
+                                            target == callee_start,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        raw_unresolved.insert(CommercialUnresolvedCall {
+                            caller_start,
+                            call_site: instruction.ip(),
+                            code: instruction.code(),
+                            detail: "canonical ProgramModel target set is incomplete",
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -894,6 +940,30 @@ pub fn lift_program_cfg_commercial(
     lifetime_objects: &[crate::vm::data_lifetime::LiteralObject],
     lifetime_key: u64,
 ) -> Result<ProgramLiftCommercial> {
+    lift_program_cfg_commercial_with_model(
+        text_bytes,
+        base_va,
+        entry_point_va,
+        relayed_sections,
+        image_base,
+        lifetime_objects,
+        lifetime_key,
+        None,
+    )
+}
+
+/// Pipeline entry point. Unlike the compatibility wrapper above, all indirect
+/// dependency decisions consume the canonical ProgramModel target inventory.
+pub fn lift_program_cfg_commercial_with_model(
+    text_bytes: &[u8],
+    base_va: u64,
+    entry_point_va: u64,
+    relayed_sections: &[crate::pe::builder::SectionData],
+    image_base: u64,
+    lifetime_objects: &[crate::vm::data_lifetime::LiteralObject],
+    lifetime_key: u64,
+    canonical_model: Option<&crate::analysis::program_model::ProgramModel>,
+) -> Result<ProgramLiftCommercial> {
     let marker_regions = crate::sdk::MarkerScanner::scan_markers(text_bytes);
     let mut marker_normalized;
     let cfg_text = if marker_regions.is_empty() {
@@ -1061,35 +1131,27 @@ pub fn lift_program_cfg_commercial(
             })
         })
         .collect();
-    let mut semantic_quarantine = semantic_quarantine_roots.clone();
-    loop {
-        let mut discovered = Vec::new();
-        for &(s, e) in &semantic_quarantine {
-            for inst in blocks
+    let semantic_dependency_report = build_semantic_dependency_report(
+        &all_function_ranges,
+        &blocks,
+        &semantic_quarantine_roots,
+        canonical_model,
+        image_base,
+    );
+    // Publish exactly the canonical dependency closure used by the report.
+    // This replaces the older independent direct-call rescan as an ownership
+    // input and keeps the report and exclusion policy in lockstep.
+    let semantic_quarantine: HashSet<(u64, u64)> = semantic_dependency_report
+        .sccs
+        .iter()
+        .flat_map(|scc| scc.functions.iter().copied())
+        .filter_map(|start| {
+            all_function_ranges
                 .iter()
-                .filter(|bb| s <= bb.start_va && bb.start_va < e)
-                .flat_map(|bb| bb.instructions.iter())
-                .filter(|inst| inst.flow_control() == FlowControl::Call)
-            {
-                let target = inst.near_branch_target();
-                if let Some(range) = all_function_ranges
-                    .iter()
-                    .copied()
-                    .find(|(cs, ce)| *cs <= target && target < *ce)
-                {
-                    if !semantic_quarantine.contains(&range) {
-                        discovered.push(range);
-                    }
-                }
-            }
-        }
-        if discovered.is_empty() {
-            break;
-        }
-        semantic_quarantine.extend(discovered);
-    }
-    let semantic_dependency_report =
-        build_semantic_dependency_report(&all_function_ranges, &blocks, &semantic_quarantine_roots);
+                .copied()
+                .find(|(range_start, _)| *range_start == start)
+        })
+        .collect();
     debug_assert_eq!(
         semantic_dependency_report.reachable_functions,
         semantic_quarantine.len(),
@@ -2263,8 +2325,7 @@ mod tests {
         // keeps the entire containing function native; partial sibling lifting
         // would violate the canonical ownership model.
         assert_eq!(
-            lift_com.virtualized_blocks,
-            0,
+            lift_com.virtualized_blocks, 0,
             "unsupported function must not be partially virtualized"
         );
         assert_eq!(lift_com.native_blocks, lift_com.blocks);
