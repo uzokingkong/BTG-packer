@@ -331,10 +331,12 @@ pub fn run(
         } else {
             ""
         };
-        println!(
-            "    [Block {:02}] Logical ID: {} | Phys Offset: 0x{:04X} | Encrypted Entry: 0x{:08X} | Entries: {} | Len: {}{}",
-            i, block.id, phys_offset, encrypted_offset, block.entries.len(), block_len, ct_mark
-        );
+        if trace_blocks {
+            println!(
+                "    [Block {:02}] Logical ID: {} | Phys Offset: 0x{:04X} | Encrypted Entry: 0x{:08X} | Entries: {} | Len: {}{}",
+                i, block.id, phys_offset, encrypted_offset, block.entries.len(), block_len, ct_mark
+            );
+        }
 
         if phys_offset + block_len > btg_bytes.len() {
             return Err(anyhow::anyhow!(

@@ -166,6 +166,12 @@ pub(crate) fn lift_program(
                 sensitive_regions: lift.sensitive_regions,
             });
             ownership_report = lift.ownership_report.clone();
+            if let Some(model) = ctx.program_model.as_ref() {
+                crate::pipeline::ownership::apply_canonical_indirect_ownership(
+                    model,
+                    &mut ownership_report,
+                );
+            }
             let prepared =
                 vm::threaded::SuperOperatorSynthesizer::prepare_commercial_program_for_family(
                     &lift.program,

@@ -118,6 +118,13 @@ impl QaBenchmarkRunner {
                 Err(e) => eprintln!("[!] QA corpus: cannot invoke cargo for {profile}: {e}"),
             }
         }
+        // Always include the minimal leaf PE as the dedicated VM-OEP crash
+        // regression. Large compiler variants exercise the normal production
+        // pack path; this target specifically guards the historical
+        // 0xC0000005 top-level return failure without excluding tiny images.
+        let tiny = PathBuf::from(CORPUS_DIR).join("tiny-vm-oep.exe");
+        fs::write(&tiny, crate::pe::generate_dummy_target_pe()?)?;
+        produced.push("tiny-vm-oep".to_string());
         Ok(produced)
     }
 
@@ -135,12 +142,9 @@ impl QaBenchmarkRunner {
                 name: "Dummy MSVC Payload".to_string(),
                 compiler: "MSVC x64".to_string(),
                 path: msvc_path,
-                // ⚠ 1.5KB 초소형 바이너리는 --vm-oep(전체 프로그램 VM)가 100% 크래시
-                // (0xC0000005, 디스패처 바이트코드 포인터 손상) — 알려진 vm-oep 엣지
-                // 케이스. QA는 이 스모크 타깃을 일반 패킹으로 유지하고, vm-oep 경로는
-                // Rust 코퍼스(8종)/test 페이로드가 커버한다. (SxS 매니페스트 버그 수정
-                // 전에는 이 크래시가 SxS 실패에 가려져 있었다.)
-                use_vm_oep: false,
+                // Tiny PEs are a required VM-OEP regression target. Never hide
+                // the historical 0xC0000005 failure behind a QA exclusion.
+                use_vm_oep: true,
             });
         }
 
@@ -179,7 +183,7 @@ impl QaBenchmarkRunner {
                             name: format!("Corpus {tag}"),
                             compiler,
                             path,
-                            use_vm_oep: true,
+                            use_vm_oep: tag == "tiny-vm-oep",
                         });
                     }
                 }
@@ -244,9 +248,15 @@ impl QaBenchmarkRunner {
             .arg("--output")
             .arg(&packed_output_path_buf)
             .arg("--anti-debug");
+        // The broad compiler corpus is a structural/behavioral pack gate. Its
+        // no-crypto leg isolates CFG relocation from the independently gated
+        // ChaCha20-Poly1305 + VM-OEP tiny regression below.
+        if !target.use_vm_oep {
+            cmd.arg("--no-crypto");
+        }
         if target.use_vm_oep {
             cmd.arg("--vm-oep");
-            if commercial_vm {
+            if commercial_vm || target.name.contains("tiny-vm-oep") {
                 cmd.arg("--vm").arg("--vm-commercial");
             }
         }
@@ -564,7 +574,7 @@ mod tests {
             .arg("--output")
             .arg(&packed)
             .arg("--anti-debug")
-            .arg("--vm-oep");
+            .arg("--no-crypto");
         let status = cmd.status().unwrap();
         assert!(status.success(), "pack must succeed");
         assert!(packed.exists(), "packed output must exist");

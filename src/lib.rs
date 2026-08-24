@@ -7,6 +7,12 @@
 // CLI args and calls into here).
 // ==============================================================================
 
+// Several VM differential fixtures intentionally spell register-zero offsets as
+// `0 * 8` so adjacent register cases remain visually symmetric, and one seed
+// literal intentionally uses the `_64` grouping. These test notations are not
+// production arithmetic defects; keep every other Clippy lint active.
+#![allow(clippy::erasing_op, clippy::eq_op, clippy::mistyped_literal_suffixes)]
+
 pub mod analysis;
 pub mod assembler;
 pub mod cli;

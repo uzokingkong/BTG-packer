@@ -88,7 +88,7 @@ pub fn export_debug_layout_log(
 pub fn verify_overlapped_disassembly(
     _pe_bytes: &[u8],
     _btg_rva: u64,
-    _image_base: u64,
+    image_base: u64,
     layout: &ShuffledLayout,
 ) -> Result<()> {
     println!("\n==================================================================");
@@ -97,7 +97,7 @@ pub fn verify_overlapped_disassembly(
 
     for block in &layout.shuffled_blocks {
         let phys_offset = layout.table_offsets[block.id as usize] as usize;
-        let base_va = 0x140000000 + _btg_rva + phys_offset as u64;
+        let base_va = image_base + _btg_rva + phys_offset as u64;
         let slice = &block.instructions;
 
         println!(

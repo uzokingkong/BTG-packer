@@ -29,10 +29,16 @@ pub mod region_cipher;
 pub enum CryptoMode {
     /// RC4-256 (레거시 — chained/--vm-oep 폴백).
     Rc4,
-    /// BTG-C1 커스텀 512-bit 스트림 사이퍼 (v60+, 기본).
+    /// BTG-C1 custom research primitive. Experimental and opt-in only.
     C1,
-    /// ChaCha20 (RFC 8439) — T3-1.
+    /// ChaCha20-Poly1305 (RFC 8439), the sole production default.
     ChaCha20,
+}
+
+impl Default for CryptoMode {
+    fn default() -> Self {
+        Self::ChaCha20
+    }
 }
 
 pub use mac::BtgKeyedMac;

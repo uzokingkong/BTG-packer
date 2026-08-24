@@ -1,5 +1,5 @@
 // ==============================================================================
-// BTG - Commercial-Grade VM: Phase 4 SDK & LLVM Module
+// BTG - SDK and experimental textual IR module
 // ==============================================================================
 
 pub mod llvm_interface;
@@ -7,7 +7,7 @@ pub mod markers;
 pub mod selective;
 
 pub use llvm_interface::{
-    LlvmIngestionInterface, LlvmSynthesizer, LlvmVirtualFunction, PolyConsumptionRuntime,
+    ExperimentalIrFunction, ExperimentalIrParser, ExperimentalIrSynthesizer, PolyConsumptionRuntime,
 };
 pub use markers::{MarkerScanner, VmMarkerRegion, SIG_VM_END, SIG_VM_START};
 pub use selective::SelectiveVirtualizer;

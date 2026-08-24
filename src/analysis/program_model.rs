@@ -158,6 +158,60 @@ impl std::fmt::Display for ProgramModelError {
 impl std::error::Error for ProgramModelError {}
 
 impl ProgramModel {
+    /// Canonical fail-closed inventory used by ownership and dependency policy.
+    /// Consumers must not rediscover indirect instructions or infer resolution
+    /// from the derived `edges` vector.
+    pub fn incomplete_indirect_functions(&self) -> BTreeMap<FunctionId, u32> {
+        use crate::analysis::indirect_targets::ResolutionStatus;
+        let mut result: BTreeMap<FunctionId, u32> = BTreeMap::new();
+        for site in self.indirect_targets.sites.values() {
+            if site.status != ResolutionStatus::Complete {
+                result
+                    .entry(site.source_function)
+                    .and_modify(|rva| *rva = (*rva).min(site.instruction_rva))
+                    .or_insert(site.instruction_rva);
+            }
+        }
+        result
+    }
+
+    pub fn unresolved_internal_edge_count(&self) -> u64 {
+        self.indirect_targets
+            .edge_metrics()
+            .unresolved_internal_edges
+    }
+
+    /// Canonical entry RVAs that may be entered without the shuffled
+    /// dispatcher. Re-encryption policy consumes this inventory instead of
+    /// linearly decoding `.text` a second time with local heuristics.
+    pub fn direct_entry_rvas(&self) -> BTreeSet<u32> {
+        let mut entries = BTreeSet::new();
+        for edge in &self.edges {
+            if !matches!(edge.kind, EdgeKind::DirectCall | EdgeKind::TailCall) {
+                continue;
+            }
+            match edge.target {
+                EdgeTarget::Block(id) => {
+                    if let Some(block) = self.blocks.get(&id) {
+                        entries.insert(block.range.start);
+                    }
+                }
+                EdgeTarget::Function(id) => {
+                    if let Some(function) = self.functions.get(&id) {
+                        entries.extend(function.entries.iter().copied());
+                    }
+                }
+                EdgeTarget::External(_) | EdgeTarget::Unresolved => {}
+            }
+        }
+        for pointer in self.code_pointers.values() {
+            if let Some(function) = self.functions.get(&pointer.target) {
+                entries.extend(function.entries.iter().copied());
+            }
+        }
+        entries
+    }
+
     pub fn validate(&self) -> Result<(), ProgramModelError> {
         let mut ranges = self.executable_ranges.clone();
         ranges.sort();

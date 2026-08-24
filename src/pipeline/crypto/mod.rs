@@ -137,15 +137,8 @@ pub fn run(
     //     폴백한다 (chacha는 평문 bulk at-rest 경로 전용).
     let chacha_mode = ctx.crypto_mode == CryptoMode::ChaCha20
         && !chained_effective
-        && !reencrypt
-        && !vm_oep_effective
-        && !vm_effective;
-    if ctx.crypto_mode == CryptoMode::ChaCha20 && !chacha_mode {
-        println!("[!] --crypto-mode chacha20 is unsupported for this mode; using the C1 native boot/runtime");
-    }
-    // `custom_cipher` is always true after production profile resolution. Keep
-    // the false value only for legacy unit fixtures which exercise the retired
-    // implementation directly; unlike the old gate, VM-OEP no longer disables C1.
+        && !reencrypt;
+    // C1 is reachable only through the explicit experimental selection.
     let c1_mode = ctx.custom_cipher && !chacha_mode;
     if c1_mode {
         println!("[+] v60 Custom Cipher: BTG-C1 512-bit stream cipher ENABLED (string runs via seed stream; reencrypt/m7 per-block via per-block C1 keys; --vm routes C1 state init through the VM)");
@@ -162,8 +155,9 @@ pub fn run(
     } else if c1_mode {
         CryptoMode::C1
     } else {
-        // Test-only compatibility seam. Production resolution cannot select it.
-        CryptoMode::Rc4
+        return Err(anyhow::anyhow!(
+            "the requested chained/re-encrypt crypto path requires the experimental-custom-crypto feature and explicit C1 selection; production ChaCha20-Poly1305 never falls back to legacy RC4"
+        ));
     };
 
     // ── M7: on-demand 재암호화(anti-dump) — refcount-safe 디스패처가 블록을
@@ -462,6 +456,28 @@ pub fn run(
         chacha_aead_tag,
         &mut rng,
     )?;
+    if vm_commercial_effective
+        && ctx.vm_coverage.as_ref().is_some_and(|coverage| {
+            coverage.total_functions > 0
+                && coverage.vm_functions == coverage.total_functions
+                && coverage.vm_blocks == coverage.total_blocks
+                && coverage.vm_instructions == coverage.total_instructions
+                && coverage.unresolved_internal_edges == Some(0)
+                && coverage.unsupported_instructions == Some(0)
+                && coverage.capability_mismatches == Some(0)
+        })
+    {
+        let text_start = ctx.target_info.text_rva;
+        let text_end = text_start.saturating_add(ctx.target_info.text_vsize as u32);
+        for section in &mut ctx.patched_sections {
+            let section_end = section
+                .virtual_address
+                .saturating_add(section.virtual_size.max(section.bytes.len() as u32));
+            if section.virtual_address < text_end && text_start < section_end {
+                section.characteristics &= !(0x2000_0000 | 0x0000_0020);
+            }
+        }
+    }
     // P3-1: 시드 RNG를 ctx에 다시 기록 (단일 소스 유지).
     ctx.rng = rng;
     Ok(())

@@ -2742,6 +2742,17 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
     let h_halt = b.len();
     {
         emit_materialize_lazy_flags(&mut b);
+        // A top-level VirtualRet terminates the VM and returns directly to the
+        // original native caller.  The interpreter's scratch RAX is not an ABI
+        // result: publish virtual RAX exactly as the lifted RET would have.
+        b.push(
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RAX,
+                m(REGS_OFF),
+            )
+            .unwrap(),
+        );
         // restore ALL callee-saved registers pushed at entry (reverse order).
         b.push(Instruction::with1(Code::Pop_r64, Register::RBP).unwrap());
         b.push(Instruction::with1(Code::Pop_r64, Register::RBX).unwrap());

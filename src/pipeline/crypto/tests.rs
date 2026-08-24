@@ -671,6 +671,11 @@ fn test_phase03_per_block_encryption_roundtrip() {
         .unwrap_or(0x2000);
     let dispatcher_va = info.image_base + dispatcher_rva as u64;
     let mut ctx = PipelineContext::new(info, dispatcher_va, dispatcher_rva, 3);
+    // This is the legacy per-block cipher compatibility test, not a production
+    // default-policy test. Select C1 explicitly so the asserted BtgCipher
+    // roundtrip cannot silently inherit the ChaCha20 production default.
+    ctx.crypto_mode = crate::crypto::CryptoMode::C1;
+    ctx.custom_cipher = true;
     ctx.reencrypt = true; // Phase 0.3 활성 — pass4가 재암호화 디스패처/길이 테이블 배치
     crate::pipeline::pass1_slice::run(&mut ctx).unwrap();
     crate::pipeline::pass2_shuffle::run(&mut ctx).unwrap();

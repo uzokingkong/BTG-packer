@@ -10,9 +10,7 @@
 
 use crate::pe::TargetPeInfo;
 use crate::pipeline::PipelineContext;
-use crate::pipeline::{
-    build, crypto, pass1_slice, pass2_shuffle, pass3_encode, pass4_section, patch_data,
-};
+use crate::pipeline::artifacts::StagedPipeline;
 use anyhow::Result;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
@@ -57,10 +55,7 @@ pub fn run_full(
 
     let obf = obf_level.clamp(1, 3) as usize;
     let mut ctx = PipelineContext::new(info, dispatcher_va, dispatcher_rva, obf);
-    debug_assert!(
-        ctx.custom_cipher && ctx.crypto_mode == crate::crypto::CryptoMode::C1,
-        "programmatic pack entrypoint must inherit the non-RC4 crypto baseline"
-    );
+    debug_assert_eq!(ctx.crypto_mode, crate::crypto::CryptoMode::ChaCha20);
     // P3-1 (결정적 빌드): --seed가 주어지면 ctx.rng를 단일 시드 RNG로 고정.
     // 셔플/mba_constant/crypto 시드/폴리 시드/레이아웃 패드가 모두 이 RNG에서
     // 파생되므로, 같은 input+seed+config → 같은 output.
@@ -70,51 +65,57 @@ pub fn run_full(
     // v6: MBA key schedule constant (once per pack) — P3-1: from the ctx RNG.
     ctx.mba_constant = ctx.rng.next_u32();
 
-    pass1_slice::run(&mut ctx)?;
-    pass2_shuffle::run(&mut ctx)?;
-    pass3_encode::run(&mut ctx)?;
-    pass4_section::run(
-        &mut ctx,
-        false,
-        crate::dispatcher::antidebug::AntiDebugPolicy::Trap,
-        true,
-        false,
-    )?;
-
-    let relayed = ctx.target_info.relayed_sections.clone();
-    patch_data::run(&mut ctx, relayed)?;
-
-    crypto::run(
-        &mut ctx,
-        true,
-        false,
-        crate::dispatcher::antidebug::AntiDebugPolicy::Trap,
-        false,
+    let requested = crate::protection_profile::RequestedConfig {
+        full: false,
+        obf_level,
+        anti_debug: false,
+        anti_debug_policy: crate::dispatcher::antidebug::AntiDebugPolicy::Trap,
+        no_crypto: false,
+        vm: false,
+        vm_oep: false,
+        vm_commercial: false,
+        m7: false,
+        m8: false,
+        payload_relocate: true,
+        rsrc_register: false,
         crypto_coverage,
-        true,
-        false,
-        false,
-        false,
-    )?;
-
-    // build::run writes to the given path; pass the caller's optional path.
-    // None → build in-memory only (no side-effect file in the caller's cwd).
-    let bytes = build::run(&ctx, output_path)?;
-    Ok(bytes)
+        chained_crypto: false,
+        integrity: false,
+        iat_hide: false,
+        mem_harden: false,
+        dispatcher_reencrypt: false,
+        custom_cipher: false,
+        rc4: false,
+        crypto_mode: Some(crate::cli::CryptoModeCli::ChaCha20),
+    };
+    let resolved = crate::protection_profile::resolve(&requested);
+    if !resolved.errors.is_empty() {
+        anyhow::bail!("library protection profile resolution failed: {:?}", resolved.errors);
+    }
+    // Typestate is the library API boundary: only a `ValidatedStage` can emit
+    // bytes, so `run_full` cannot accidentally acquire weaker guarantees than
+    // the CLI by skipping or reordering a pass.
+    StagedPipeline::new(ctx)
+        .analyze()?
+        .layout()?
+        .protect(crypto_coverage)?
+        .validate(&resolved.config)?
+        .emit(output_path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::manifest::sha256_hex;
+    use crate::pipeline::{build, crypto, pass1_slice, pass2_shuffle, pass3_encode, pass4_section, patch_data};
 
     #[test]
     fn programmatic_context_defaults_to_non_rc4_cipher() {
         let input = crate::pe::generate_dummy_target_pe().expect("generate dummy PE");
         let info = TargetPeInfo::parse(&input).expect("parse");
         let ctx = PipelineContext::new(info, 0x1400_2000, 0x2000, 2);
-        assert!(ctx.custom_cipher);
-        assert_eq!(ctx.crypto_mode, crate::crypto::CryptoMode::C1);
+        assert!(!ctx.custom_cipher);
+        assert_eq!(ctx.crypto_mode, crate::crypto::CryptoMode::ChaCha20);
     }
 
     /// P3-1 (상용 3-1): 동일 seed → 바이트 동일 output. 같은 input + seed +

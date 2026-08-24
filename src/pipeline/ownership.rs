@@ -231,6 +231,31 @@ impl FunctionOwnershipDiagnostic {
     }
 }
 
+/// Apply canonical ProgramModel indirect-target evidence to commercial
+/// ownership. This is intentionally the only unresolved-indirect policy hook:
+/// callers must not rescan instructions or inspect derived unresolved edges.
+pub fn apply_canonical_indirect_ownership(
+    model: &crate::analysis::program_model::ProgramModel,
+    diagnostics: &mut [FunctionOwnershipDiagnostic],
+) {
+    for (&function_id, &site_rva) in &model.incomplete_indirect_functions() {
+        let Some(function) = model.functions.get(&function_id) else {
+            continue;
+        };
+        for diagnostic in diagnostics.iter_mut().filter(|diagnostic| {
+            function.ranges.iter().any(|range| {
+                diagnostic.function.start_rva < range.end
+                    && range.start < diagnostic.function.end_rva
+            })
+        }) {
+            diagnostic.function.owned_by_vm = false;
+            diagnostic.function.reason = OwnershipReason::UnresolvedIndirectTarget.as_str();
+            diagnostic.reason = OwnershipReason::UnresolvedIndirectTarget;
+            diagnostic.first_blocker = Some(OwnershipBlocker::new(site_rva, None));
+        }
+    }
+}
+
 /// A non-overlapping original-code interval used as the coverage denominator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanonicalOwnershipInterval {

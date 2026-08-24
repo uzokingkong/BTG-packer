@@ -89,6 +89,15 @@ pub(crate) fn encode_rc4_block(
         }
     }
 
+    for (index, (inst, label)) in seq.iter().enumerate() {
+        if inst.code() == iced_x86::Code::Call_rel32_64
+            && label.is_none()
+            && inst.near_branch_target() == 0
+        {
+            anyhow::bail!("boot stub direct call #{index} has an unresolved null target");
+        }
+    }
+
     let insts: Vec<Instruction> = seq.iter().map(|(i, _)| *i).collect();
     let block = InstructionBlock::new(&insts, rc4_start_va);
     let enc = BlockEncoder::encode(64, block, enc_opts)

@@ -1,13 +1,13 @@
 // ==============================================================================
-// BTG - Commercial-Grade VM: LLVM IR & Compiler Ingestion Interface
+// BTG - Experimental textual IR ingestion
 // ==============================================================================
-// LLVM 컴파일러 패스(Clang/Rustc)로부터 방출된 구조화된 가상화 메타데이터/IR
-// 파싱 및 RiscProgram 직접 합성 인터페이스.
+// A deliberately small LLVM-like textual grammar parsed into RiscProgram.
+// This is not an LLVM pass, bitcode reader, or LLVM SDK.
 //
 // S5 (implementation-gap-plan 축4): 이전엔 24줄 스텁(`build_risc_program`이
 // `vf.body.clone()`만 수행) + SDK 마커가 "데이터 임베드만" 되어 소비 런타임이
 // 검증되지 않았다. 이 파일은
-//   1) 실제 LLVM-IR 텍스트를 파싱해 RISC 마이크로-op 로 합성하는 `LlvmIrParser`,
+//   1) 제한된 텍스트 IR을 RISC micro-op으로 합성하는 `ExperimentalIrParser`,
 //   2) 폴리모픽(rolling-key) 바이트코드를 **소비**(복호화)해 원래 `RiscProgram` 을
 //      복원하고 원본과 실행 정합(regs/flags/stack)을 검증하는 `PolyConsumptionRuntime`
 // 을 제공한다. `selective_vm.rs` 가 마커 리전을 encode 한 뒤 이 소비 런타임으로
@@ -20,20 +20,20 @@ use crate::vm::risc::{
 };
 use anyhow::{anyhow, Context, Result};
 
-/// LLVM 패스로부터 합성된 가상화 함수 — `body` 는 RISC 마이크로-op 시퀀스.
+/// Function produced by the experimental textual parser.
 #[derive(Debug, Clone)]
-pub struct LlvmVirtualFunction {
+pub struct ExperimentalIrFunction {
     pub name: String,
     pub body: Vec<MicroInstr>,
 }
 
 /// RISC 마이크로-op 를 생성하는 데 필요한 합성기의 가변 파생 타입.
 /// (`RiscDesynthesizer` 를 직접 노출하지 않고, 파서가 사용할 수 있는 얇은 래퍼.)
-pub struct LlvmSynthesizer {
+pub struct ExperimentalIrSynthesizer {
     pub d: RiscDesynthesizer,
 }
 
-impl LlvmSynthesizer {
+impl ExperimentalIrSynthesizer {
     pub fn new() -> Self {
         Self {
             d: RiscDesynthesizer::new(),
@@ -154,19 +154,19 @@ impl LlvmSynthesizer {
     }
 }
 
-impl Default for LlvmSynthesizer {
+impl Default for ExperimentalIrSynthesizer {
     fn default() -> Self {
         Self::new()
     }
 }
 
-pub struct LlvmIngestionInterface;
+pub struct ExperimentalIrParser;
 
-impl LlvmIngestionInterface {
+impl ExperimentalIrParser {
     /// LLVM-IR 텍스트 한 함수 본문을 `RiscProgram` 으로 직접 합성한다.
     /// `fn_name` 은 진단용. 파싱에 실패하면 `Err` 를 반환한다 (조용한 스킵 금지).
     pub fn synthesize_ir(fn_name: &str, ir: &str) -> Result<RiscProgram> {
-        let mut synth = LlvmSynthesizer::new();
+        let mut synth = ExperimentalIrSynthesizer::new();
         for (i, line) in ir.lines().enumerate() {
             synth
                 .emit_line(line)
@@ -179,19 +179,24 @@ impl LlvmIngestionInterface {
     }
 
     /// 합성된 가상 함수의 RISC 본문을 `RiscProgram` 으로 검증·빌드한다.
-    pub fn build_risc_program(vf: &LlvmVirtualFunction) -> RiscProgram {
+    pub fn build_risc_program(vf: &ExperimentalIrFunction) -> RiscProgram {
         RiscProgram::new(vf.body.clone())
     }
 
-    /// IR 을 파싱해 `LlvmVirtualFunction` 으로 빌드한다.
-    pub fn parse_ir(fn_name: &str, ir: &str) -> Result<LlvmVirtualFunction> {
+    /// Parse the restricted textual grammar into an experimental IR function.
+    pub fn parse_ir(fn_name: &str, ir: &str) -> Result<ExperimentalIrFunction> {
         let prog = Self::synthesize_ir(fn_name, ir)?;
-        Ok(LlvmVirtualFunction {
+        Ok(ExperimentalIrFunction {
             name: fn_name.to_string(),
             body: prog.instrs,
         })
     }
 }
+
+#[deprecated(note = "this is an experimental textual IR parser, not an LLVM pass/SDK")]
+pub type LlvmSynthesizer = ExperimentalIrSynthesizer;
+#[deprecated(note = "use ExperimentalIrParser; no LLVM pass or bitcode ingestion is provided")]
+pub type LlvmIngestionInterface = ExperimentalIrParser;
 
 /// S5: 폴리모픽(rolling-key) 바이트코드 **소비 런타임**.
 ///
@@ -313,7 +318,7 @@ mod tests {
     use super::*;
 
     fn sample_prog() -> RiscProgram {
-        LlvmIngestionInterface::synthesize_ir(
+        ExperimentalIrParser::synthesize_ir(
             "sample",
             "%0 = add i64 %0, 0x1337
              %1 = mul i64 %0, 5
@@ -358,7 +363,7 @@ mod tests {
     /// IR 파서가 단항 연산(not/neg)을 처리한다.
     #[test]
     fn test_ir_parser_unary_ops() {
-        let prog = LlvmIngestionInterface::synthesize_ir(
+        let prog = ExperimentalIrParser::synthesize_ir(
             "u",
             "%0 = not i64 %1\n%2 = neg i64 %3\nret i64 %0",
         )
@@ -370,15 +375,15 @@ mod tests {
     /// IR 파서가 지원하지 않는 연산을 조용히 넘기지 않고 Err 를 낸다.
     #[test]
     fn test_ir_parser_rejects_unknown_op() {
-        let r = LlvmIngestionInterface::synthesize_ir("bad", "%0 = frobnicate i64 %1, %2");
+        let r = ExperimentalIrParser::synthesize_ir("bad", "%0 = frobnicate i64 %1, %2");
         assert!(r.is_err());
     }
 
     /// `LlvmIngestionInterface::parse_ir` → `build_risc_program` 파이프라인.
     #[test]
     fn test_ingest_parse_then_build() {
-        let vf = LlvmIngestionInterface::parse_ir("f", "%0 = add i64 %0, 2\nret i64 %0").unwrap();
-        let prog = LlvmIngestionInterface::build_risc_program(&vf);
+        let vf = ExperimentalIrParser::parse_ir("f", "%0 = add i64 %0, 2\nret i64 %0").unwrap();
+        let prog = ExperimentalIrParser::build_risc_program(&vf);
         assert_eq!(prog.instrs.len(), vf.body.len());
     }
 }

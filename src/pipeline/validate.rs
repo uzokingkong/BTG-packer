@@ -1027,6 +1027,12 @@ fn derive_ownership_model(
 /// WS2.1: run the function-ownership ↔ .pdata consistency check. Bails on the
 /// first inconsistency (validate becomes a hard gate on program-VM paths).
 pub(crate) fn validate_function_ownership(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
+    if ctx.target_info.original_pdata_entries.is_empty() {
+        println!(
+            "[VALIDATE] OK  no-SEH image: canonical ownership has no .pdata coverage obligation"
+        );
+        return Ok(());
+    }
     let (derived_model, runtime_functions) = derive_ownership_model(ctx, out)?;
     let authoritative = !ctx.ownership_report.is_empty();
     let mut model = if !authoritative {
@@ -1059,7 +1065,9 @@ pub(crate) fn validate_function_ownership(ctx: &PipelineContext, out: &[u8]) -> 
         ctx.vm_prog_rva,
         ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total)
     );
-    if !ctx.vm_prog_native_bridges.is_empty() {
+    if !ctx.vm_prog_native_bridges.is_empty()
+        && !ctx.target_info.original_pdata_entries.is_empty()
+    {
         let handler = ctx.vm_prog_lifetime_cleanup_handler_rva;
         let vm_end = ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total);
         if handler < ctx.vm_prog_rva || handler >= vm_end {
@@ -1115,6 +1123,11 @@ pub(crate) fn validate_function_ownership(ctx: &PipelineContext, out: &[u8]) -> 
             "[VALIDATE] OK  {} native bridge UHANDLER record(s) → lifetime cleanup RVA 0x{:X}",
             ctx.vm_prog_native_bridges.len(),
             handler
+        );
+    } else if !ctx.vm_prog_native_bridges.is_empty() {
+        println!(
+            "[VALIDATE] OK  tiny/no-SEH image: {} native bridge(s) use leaf unwind semantics",
+            ctx.vm_prog_native_bridges.len()
         );
     }
     Ok(())

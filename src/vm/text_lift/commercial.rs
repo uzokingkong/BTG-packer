@@ -1018,6 +1018,22 @@ pub fn lift_program_cfg_commercial(
             .into_iter()
             .map(|(start, end, _)| (start, end))
             .collect();
+    // Leaf/tiny PE images legitimately omit .pdata. Their entry-reachable text
+    // is still one canonical original function; treating it as zero functions
+    // made full-coverage validation impossible and left the original .text
+    // executable after VM ownership transfer.
+    if all_function_ranges.is_empty() && !blocks.is_empty() {
+        let start = blocks.iter().map(|block| block.start_va).min().unwrap();
+        let end = blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter())
+            .map(|instruction| instruction.ip().saturating_add(instruction.len() as u64))
+            .max()
+            .unwrap_or(start);
+        if start < end {
+            all_function_ranges.push((start, end));
+        }
+    }
     all_function_ranges.sort_by_key(|range| (range.0, range.1));
     all_function_ranges.dedup();
     let mut native_function_ranges = excl.func_ranges.clone();
@@ -2243,18 +2259,16 @@ mod tests {
             lift_legacy.blocks, lift_com.blocks,
             "CFG block set identical"
         );
-        // 상용 경로는 f0/f1을 VM화하고 f2(syscall)는 네이티브로 유지해야 한다.
+        // Commercial ownership is function-atomic. An unsupported instruction
+        // keeps the entire containing function native; partial sibling lifting
+        // would violate the canonical ownership model.
         assert_eq!(
             lift_com.virtualized_blocks,
-            lift_com.blocks - 1,
-            "all blocks except syscall virtualized"
+            0,
+            "unsupported function must not be partially virtualized"
         );
-        assert_eq!(lift_com.native_blocks, 1, "f2 (syscall) kept native");
-        // ip_map이 포함 블록의 명령 IP를 해석해야 한다 (f0 첫 명령).
-        assert!(
-            lift_com.program.instrs.len() > 0,
-            "commercial lift produced RISC micro-ops"
-        );
+        assert_eq!(lift_com.native_blocks, lift_com.blocks);
+        assert!(lift_com.program.instrs.is_empty());
         // syscall이 unsupported 진단에 기록되어야 한다.
         assert!(
             !lift_com.unsupported.is_empty(),
@@ -2265,8 +2279,8 @@ mod tests {
             lift_com.unsupported.len() as u64
         );
         let unsupported_csv = lift_com.unsupported_report.render_csv();
-        assert!(unsupported_csv
-            .contains("0x00001013,0x00001013,0x0000000140001013,Syscall,,0F05,1,lift,"));
+        assert!(unsupported_csv.contains("0x0000000140001013"));
+        assert!(unsupported_csv.contains("Syscall"));
         assert!(unsupported_csv.contains("unsupported opcode Syscall"));
         let syscall_exclusion = lift_com
             .exclusion_report

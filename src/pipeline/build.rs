@@ -60,6 +60,35 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
 
     //
     let mut relayed_sections = ctx.patched_sections.clone();
+    let commercial_owns_all_original_text = ctx.vm_commercial
+        && ctx.vm_coverage.as_ref().is_some_and(|coverage| {
+            coverage.total_functions != 0
+                && coverage.vm_functions == coverage.total_functions
+                && coverage.vm_blocks == coverage.total_blocks
+                && coverage.vm_instructions == coverage.total_instructions
+                && coverage.unresolved_internal_edges == Some(0)
+                && coverage.unsupported_instructions == Some(0)
+                && coverage.capability_mismatches == Some(0)
+        });
+    if commercial_owns_all_original_text {
+        let text_start = ctx.target_info.text_rva;
+        let text_end = text_start.saturating_add(ctx.target_info.text_vsize as u32);
+        for section in &mut relayed_sections {
+            let end = section
+                .virtual_address
+                .saturating_add(section.virtual_size.max(section.bytes.len() as u32));
+            if section.virtual_address < text_end && text_start < end {
+                section.characteristics &= !(0x2000_0000 | 0x0000_0020);
+            }
+        }
+        debug_assert!(relayed_sections.iter().all(|section| {
+            let end = section
+                .virtual_address
+                .saturating_add(section.virtual_size.max(section.bytes.len() as u32));
+            !(section.virtual_address < text_end && text_start < end)
+                || section.characteristics & 0x2000_0000 == 0
+        }));
+    }
     // Pillar 1: Sanitize sensitive metadata, source paths, and PDB signatures from data sections
     let stripped = crate::pipeline::rdata_strip::RdataMetadataStripper::sanitize_sections(
         &mut relayed_sections,

@@ -130,6 +130,8 @@ pub enum ResolveError {
     DispatcherReencryptRequiresCrypto,
     /// RC4는 제거됐으며 다른 primitive로 묵시 변환하지 않는다.
     Rc4Retired,
+    /// C1 is compiled/selectable only in explicit research builds.
+    ExperimentalC1Disabled,
 }
 
 impl ResolveError {
@@ -142,7 +144,10 @@ impl ResolveError {
                 "--dispatcher-reencrypt requires the crypto layer (remove --no-crypto)"
             }
             ResolveError::Rc4Retired => {
-                "RC4 has been retired; remove --rc4 and select --crypto-mode c1 or --crypto-mode chacha20"
+                "RC4 has been retired; remove --rc4 and select --crypto-mode chacha20"
+            }
+            ResolveError::ExperimentalC1Disabled => {
+                "C1 is experimental; rebuild with --features experimental-custom-crypto to select it"
             }
         }
     }
@@ -211,12 +216,16 @@ pub fn resolve(req: &RequestedConfig) -> ResolveOutcome {
     if req.rc4 {
         errors.push(ResolveError::Rc4Retired);
     }
-    let custom_cipher = match req.crypto_mode {
-        Some(CryptoModeCli::C1) | Some(CryptoModeCli::ChaCha20) => true,
-        None => true,
-    };
+    // Custom crypto is an explicit experimental selection. Production and all
+    // implicit defaults use the standard ChaCha20-Poly1305 path.
+    let c1_requested = req.custom_cipher || matches!(req.crypto_mode, Some(CryptoModeCli::C1));
+    if c1_requested && !cfg!(feature = "experimental-custom-crypto") {
+        errors.push(ResolveError::ExperimentalC1Disabled);
+    }
+    let custom_cipher = c1_requested && cfg!(feature = "experimental-custom-crypto");
     let crypto_mode = match req.crypto_mode {
-        Some(CryptoModeCli::C1) => CryptoMode::C1,
+        Some(CryptoModeCli::C1) if cfg!(feature = "experimental-custom-crypto") => CryptoMode::C1,
+        Some(CryptoModeCli::C1) => CryptoMode::ChaCha20,
         Some(CryptoModeCli::ChaCha20) => CryptoMode::ChaCha20,
         None => CryptoMode::ChaCha20,
     };
@@ -338,7 +347,7 @@ mod tests {
             "crypto on by default -> boot stub needed"
         );
         assert_eq!(c.obf_level, 2);
-        assert_eq!(c.custom_cipher, true, "default cipher is BTG-C1");
+        assert!(!c.custom_cipher, "default cipher must not enable experimental C1");
     }
 
     /// --full → 최대 보호 스택 (+ obf 3, boot stub 필요).
@@ -569,10 +578,7 @@ mod tests {
         r.crypto_mode = Some(CryptoModeCli::ChaCha20);
         let o = resolve(&r);
         assert_eq!(o.config.crypto_mode, CryptoMode::ChaCha20);
-        assert!(
-            o.config.custom_cipher,
-            "custom_cipher stays true (chacha는 custom path 아님 — 평문 bulk 전용)"
-        );
+        assert!(!o.config.custom_cipher, "ChaCha20 must not enable experimental C1");
     }
 
     /// 기본 (플래그 없음) → RFC 8439 ChaCha20-Poly1305 경로.

@@ -203,85 +203,21 @@ pub fn run_with_indirect_resolutions(
         let _ = added;
     }
 
-    // ── v13.2-검증: .text 전체를 선형 디코드해 모든 직접 참조 형태가 평문 집합에 있는지 전수 확인 ──
-    // v13.1까지는 (a) CFG 기본블록의 call, (b) rip-relative, (c) mov imm64 만 수집했다.
-    // CFG가 놓친 코드 영역의 direct call / tail-call jmp, index 레지스터를 쓴
-    // rip-relative(점프 테이블 산술) 등이 빠지면 해당 타깃 블록이 암호문으로 남아
-    // 0xC000001D 크래시가 난다. 여기서 .text 전체를 독립 디코드해 검증하고,
-    // 누락이 발견되면 평문 집합에 추가한다.
+    // Canonical ProgramModel is the only additional authority for entries that
+    // can bypass the dispatcher. Do not independently re-decode `.text` here:
+    // that used to create a second, subtly different call-target policy.
     if ctx.reencrypt {
-        let mut dec = iced_x86::Decoder::with_ip(
-            64,
-            &ctx.target_info.text_bytes,
-            ctx.target_info.image_base + ctx.target_info.text_rva as u64,
-            iced_x86::DecoderOptions::NONE,
-        );
-        let mut added_v132: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        while dec.can_decode() {
-            let inst = dec.decode();
-            if inst.is_invalid() {
-                continue;
-            }
-            // 1) 직접 분기: call / jmp / jcc — 타깃이 블록이면 평문이어야 함
-            let is_near = matches!(
-                inst.op0_kind(),
-                iced_x86::OpKind::NearBranch16
-                    | iced_x86::OpKind::NearBranch32
-                    | iced_x86::OpKind::NearBranch64
-            );
-            if is_near {
-                let tgt = inst.near_branch_target();
-                if let Some(id) = crate::pipeline::patch_data::resolve_block_id(
-                    &va_to_trigger_id,
-                    tgt,
-                    text_start_va,
-                    text_end_va,
-                ) {
-                    if !call_target_block_ids.contains(&id) {
-                        added_v132.insert(id);
-                    }
-                }
-            }
-            // 2) rip-relative 메모리 피연산자 (index 레지스터 포함 전부)
-            if inst.memory_base() == iced_x86::Register::RIP {
-                let tgt = inst.ip_rel_memory_address();
-                if let Some(id) = crate::pipeline::patch_data::resolve_block_id(
-                    &va_to_trigger_id,
-                    tgt,
-                    text_start_va,
-                    text_end_va,
-                ) {
-                    if !call_target_block_ids.contains(&id) {
-                        added_v132.insert(id);
-                    }
-                }
-            }
-            // 3) mov r64, imm64 (정확 블록 시작점)
-            if inst.code() == iced_x86::Code::Mov_r64_imm64 {
-                let tgt = inst.immediate64();
-                if tgt >= text_start_va && tgt < text_end_va {
-                    if let Some(&id) = va_to_trigger_id.get(&tgt) {
-                        if crate::util::is_block_entry(&va_to_trigger_id, tgt, id)
-                            && !call_target_block_ids.contains(&id)
-                        {
-                            added_v132.insert(id);
-                        }
-                    }
-                }
+        let model = ctx.program_model.as_ref().expect("ProgramModel installed above");
+        let mut added = 0usize;
+        for rva in model.direct_entry_rvas() {
+            let va = ctx.target_info.image_base + rva as u64;
+            if let Some(id) = crate::pipeline::patch_data::resolve_block_id(
+                &va_to_trigger_id, va, text_start_va, text_end_va,
+            ) {
+                added += usize::from(call_target_block_ids.insert(id));
             }
         }
-        if !added_v132.is_empty() {
-            call_target_block_ids.extend(added_v132.iter().copied());
-            println!(
-                "[+] v13.2-GAP: {} additional directly-referenced block(s) added to plaintext set (CFG-missed call/jmp/rip-indexed) — total {}",
-                added_v132.len(),
-                call_target_block_ids.len()
-            );
-        } else {
-            println!(
-                "[+] v13.2-VERIFY: all direct references in .text resolve to plaintext blocks. ✓"
-            );
-        }
+        println!("[+] Canonical direct-entry inventory: {added} additional plaintext block(s), {} total", call_target_block_ids.len());
     }
 
     println!(

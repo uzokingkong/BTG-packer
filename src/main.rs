@@ -55,7 +55,7 @@ fn main() -> error::Result<()> {
     }
 
     // 하드 에러 (정책 위반 → 조기 종료) — resolve 가 수집한 내용을 Err 로 승격.
-    for e in &profile.errors {
+    if let Some(e) = profile.errors.first() {
         return Err(error::BtgError::Anyhow(anyhow::anyhow!("{}", e.message())));
     }
     if args.strict_profile && !profile.warnings.is_empty() {
@@ -98,7 +98,7 @@ fn main() -> error::Result<()> {
     let log_level = if args.debug {
         log::LevelFilter::Trace
     } else {
-        log::LevelFilter::Debug
+        log::LevelFilter::Info
     };
     let mut builder = env_logger::Builder::from_default_env();
     builder.filter_level(log_level);
@@ -383,7 +383,12 @@ fn main() -> error::Result<()> {
     let vm_enabled = cfg.vm_enabled;
     if vm_enabled {
         println!(
-            "[+] Composite VM: ENABLED (boot-stub RC4 KSA executed via generated VM handlers)"
+            "[+] Composite VM: ENABLED ({})",
+            if cfg.crypto_mode == btg_packer::crypto::CryptoMode::ChaCha20 {
+                "ChaCha20-Poly1305 boot crypto; generated VM executes the protected program"
+            } else {
+                "experimental C1 initialization via generated VM handlers"
+            }
         );
     }
 
@@ -890,20 +895,22 @@ fn main() -> error::Result<()> {
     }
 
     // ── 디버그 출력 ───────────────────────────────────────────────────────────────
-    debug::export_debug_layout_log(
-        &output_path,
-        ctx.target_info.image_base,
-        dispatcher_rva,
-        dispatcher_rva,
-        ctx.layout()?,
-    )?;
+    if args.debug || args.trace_blocks {
+        debug::export_debug_layout_log(
+            &output_path,
+            ctx.target_info.image_base,
+            dispatcher_rva,
+            dispatcher_rva,
+            ctx.layout()?,
+        )?;
 
-    debug::verify_overlapped_disassembly(
-        &output_pe_bytes,
-        dispatcher_rva as u64,
-        ctx.target_info.image_base,
-        ctx.layout()?,
-    )?;
+        debug::verify_overlapped_disassembly(
+            &output_pe_bytes,
+            dispatcher_rva as u64,
+            ctx.target_info.image_base,
+            ctx.layout()?,
+        )?;
+    }
 
     Ok(())
 }

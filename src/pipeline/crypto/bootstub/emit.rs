@@ -1429,9 +1429,31 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
         return;
     }
     // Main code/string decrypt has already consumed its stream. VM-OEP uses an
-    // independent fresh C1 stream for the preserved .text runs and bytecode.
-    debug_assert!(stub.c1_mode(), "VM-OEP must use the C1 native runtime");
-    emit_c1_init(seq, stub);
+    // independent fresh stream of the selected production primitive for the
+    // preserved .text runs and bytecode.
+    if stub.chacha_mode() {
+        emit_chacha_init(seq, stub);
+        // This independent VM-OEP stream has no preceding Poly1305-key
+        // derivation call. Reserve block 0 explicitly and begin payload
+        // transport at RFC 8439 counter 1, matching the pack-time stream.
+        seq.push((
+            Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.chacha_state_va)
+                .unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(
+                Code::Mov_rm64_imm32,
+                iced_x86::MemoryOperand::with_base_displ(Register::RAX, 0x20),
+                1,
+            )
+            .unwrap(),
+            None,
+        ));
+    } else {
+        debug_assert!(stub.c1_mode(), "VM-OEP rest cipher must be ChaCha20 or experimental C1");
+        emit_c1_init(seq, stub);
+    }
     // P5: loop over .text at-rest decrypt run-table (va,len u64 pairs). Fresh
     // keystream is continuous across runs -> same order/lengths as the packer
     // encrypted them. count==0 -> immediate no-op (bytecode-only).
@@ -1500,7 +1522,11 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
         .unwrap(),
         None,
     ));
-    emit_c1_call(seq, stub);
+    if stub.chacha_mode() {
+        emit_chacha_call(seq, stub);
+    } else {
+        emit_c1_call(seq, stub);
+    }
     seq.push((
         Instruction::with2(Code::Add_rm64_imm32, Register::RBP, 16).unwrap(),
         None,
@@ -1553,7 +1579,11 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
             None,
         ));
     }
-    emit_c1_call(seq, stub);
+    if stub.chacha_mode() {
+        emit_chacha_call(seq, stub);
+    } else {
+        emit_c1_call(seq, stub);
+    }
 }
 
 pub(crate) fn emit_self_wipe(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {

@@ -377,7 +377,7 @@ pub(crate) fn place_boot_stub(
     // 바이트코드는 VA 독립적이므로 1차 sizing(VA=0)으로 크기를 확정한 뒤,
     // 최종 VA로 재생성한다. 모듈 레이아웃: [code][table][bytecode][state]
     // v61: --custom-cipher + --vm — RC4 KSA 대신 C1 상태 초기화 VM(C1Init 모드).
-    let vm_plain_bc: Option<Vec<u8>> = if vm_effective {
+    let vm_plain_bc: Option<Vec<u8>> = if vm_effective && !chacha_mode {
         if c1_mode {
             Some(vm::c1::build_c1_init_bytecode())
         } else {
@@ -401,7 +401,7 @@ pub(crate) fn place_boot_stub(
     // v19: PRGA VM (RC4 키스트림 생성/복호화 루프) — vm과 함께 배치.
     // 바이트코드는 VA 독립이므로 1차 sizing(VA=0)으로 크기 확정 후 최종 VA 재생성.
     // v61: --custom-cipher + --vm — 키스트림은 C1 blob이 생성하므로 PRGA VM 생략.
-    let vm_prga_plain_bc: Option<Vec<u8>> = if vm_effective && !c1_mode {
+    let vm_prga_plain_bc: Option<Vec<u8>> = if vm_effective && !c1_mode && !chacha_mode {
         Some(vm::prga::build_prga_bytecode())
     } else {
         None
@@ -1770,7 +1770,7 @@ pub(crate) fn place_boot_stub(
         }
     }
 
-    // fresh BTG-C1(seed) 하나로 .text → bytecode 순 연속 암호화. 부트 스텁의
+    // fresh production stream 하나로 .text → bytecode 순 연속 암호화. 부트 스텁의
     // emit_rest_decrypt가 같은 순서로 복호화한다. (.textb는 RWX, .text는 WRITE
     // 비트 추가로 in-place 복호화를 허용한다.)
     if vm_oep_effective && (!text_enc_runs.is_empty() || vm_prog_bc_len > 0) {
@@ -1779,14 +1779,35 @@ pub(crate) fn place_boot_stub(
                 sec.characteristics |= 0x8000_0000; // IMAGE_SCN_MEM_WRITE (boot in-place decrypt)
             }
         }
-        let (rest_key, rest_nonce) = super::cipher::derive_c1_key_nonce(seed_masked);
-        let mut rest_cipher = crate::crypto::BtgCipher::new(&rest_key, rest_nonce);
+        let mut rest_c1 = if chacha_mode {
+            None
+        } else {
+            let (key, nonce) = super::cipher::derive_c1_key_nonce(seed_masked);
+            Some(crate::crypto::BtgCipher::new(&key, nonce))
+        };
+        let mut rest_chacha = if chacha_mode {
+            let (key, nonce) = super::cipher::derive_chacha_key_nonce_raw(seed_masked);
+            let mut state = [0u8; crate::crypto::chacha20::CHA_STATE_SIZE];
+            crate::crypto::chacha20::chacha_init_state(&mut state, &key, &nonce);
+            state[crate::crypto::chacha20::CHA_OFF_CTR..crate::crypto::chacha20::CHA_OFF_CTR + 8]
+                .copy_from_slice(&1u64.to_le_bytes());
+            Some(state)
+        } else {
+            None
+        };
+        let mut crypt_rest = |bytes: &mut [u8]| {
+            if let Some(state) = rest_chacha.as_mut() {
+                crate::crypto::chacha20::chacha_apply(state, bytes);
+            } else if let Some(cipher) = rest_c1.as_mut() {
+                cipher.crypt(bytes);
+            }
+        };
         if !text_enc_runs.is_empty() {
             if let Some(sec) = ctx.patched_sections.iter_mut().find(|s| s.name == ".text") {
                 let sec_start = image_base + sec.virtual_address as u64;
                 for &(va, len) in &text_enc_runs {
                     let off = (va - sec_start) as usize;
-                    rest_cipher.crypt(&mut sec.bytes[off..off + len as usize]);
+                    crypt_rest(&mut sec.bytes[off..off + len as usize]);
                 }
             }
         }
@@ -1809,11 +1830,11 @@ pub(crate) fn place_boot_stub(
                     new_section_len
                 ));
             }
-            rest_cipher.crypt(&mut btg.bytes[vm_prog_bc_off..bc_end]);
+            crypt_rest(&mut btg.bytes[vm_prog_bc_off..bc_end]);
         }
         println!(
-            "[+] --vm-oep at-rest: fresh-C1(seed) encryption applied (preserved .text {} run(s)/{}B + Program VM bytecode {}B)",
-            text_enc_runs.len(), text_enc_total, vm_prog_bc_len
+            "[+] --vm-oep at-rest: fresh-{}(seed) encryption applied (preserved .text {} run(s)/{}B + Program VM bytecode {}B)",
+            if chacha_mode { "ChaCha20" } else { "C1" }, text_enc_runs.len(), text_enc_total, vm_prog_bc_len
         );
         // P0-⑦: .text 보존 런(원본 절대 VA 포함)이 at-rest 암호화됨 → 로더 .reloc
         // 적용 시 암호문 파괴 → relocation-aware(ASLR) 비활성화.

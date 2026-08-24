@@ -333,11 +333,10 @@ impl PipelineContext {
             vm_integrity_table_len: 0,
             vm_data_lifetime_objects: Vec::new(),
             block_ring: false,
-            // RC4 is retired. Programmatic callers which construct a context
-            // directly must start on the same C1 baseline as the CLI resolver;
-            // legacy modes may never be selected merely by skipping clap.
-            custom_cipher: true,
-            crypto_mode: crate::crypto::CryptoMode::C1,
+            // Keep the library/API baseline identical to protection_profile::resolve.
+            // Custom research primitives are opt-in only.
+            custom_cipher: false,
+            crypto_mode: crate::crypto::CryptoMode::ChaCha20,
             poly_vm_seed: 0,
             poly_vm_seed_masked: 0,
             poly_vm_regions: Vec::new(),
