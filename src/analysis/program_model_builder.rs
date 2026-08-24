@@ -544,6 +544,30 @@ impl<'a> ProgramModelBuilder<'a> {
                 .into_iter()
                 .filter(|p| !explicit_sites.contains(&p.site))
                 .collect::<Vec<_>>();
+        let stack_callback_entries = stack_resolutions
+            .iter()
+            .flat_map(|resolution| resolution.target_rvas.iter().copied())
+            .collect::<BTreeSet<_>>();
+        if !stack_callback_entries.is_empty() {
+            model
+                .discovered_indirect_code_targets
+                .extend(stack_callback_entries.iter().copied());
+            split_blocks_at_targets(&mut model, image_base, &stack_callback_entries);
+            for entry in &stack_callback_entries {
+                if let Some(function) = model
+                    .functions
+                    .values_mut()
+                    .find(|function| {
+                        function
+                            .ranges
+                            .iter()
+                            .any(|range| range.start <= *entry && *entry < range.end)
+                    })
+                {
+                    function.entries.insert(*entry);
+                }
+            }
+        }
         crate::analysis::indirect_resolver::apply_indirect_resolutions(
             &mut model,
             &stack_resolutions,

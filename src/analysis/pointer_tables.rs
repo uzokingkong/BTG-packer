@@ -682,8 +682,23 @@ pub fn produce_stack_spill_resolutions(
         }) else { continue };
         if call.op0_kind() != OpKind::Memory
             || call.memory_base().full_register() != Register::RBP
-            || call.memory_index() != Register::None
         {
+            continue;
+        }
+        if call.memory_index() != Register::None {
+            if let Some(target_rvas) = resolve_bounded_stack_callback_table(
+                program,
+                site.source_function,
+                call,
+                image_base,
+            ) {
+                out.push(IndirectResolution {
+                    site: site.id,
+                    target_rvas,
+                    provenance: TargetProvenance::ConstantPropagation,
+                    complete: true,
+                });
+            }
             continue;
         }
         let mut instructions = program.blocks.values()
@@ -737,6 +752,108 @@ pub fn produce_stack_spill_resolutions(
     out
 }
 
+/// Resolves compiler-generated callback arrays materialized in a stack frame.
+/// Completeness requires a zero-based, pointer-stride loop, an equality bound,
+/// and a typed internal target for every stack slot in the proven extent.
+fn resolve_bounded_stack_callback_table(
+    program: &ProgramModel,
+    function: super::program_model::FunctionId,
+    call: &Instruction,
+    image_base: u64,
+) -> Option<BTreeSet<u32>> {
+    let index = call.memory_index().full_register();
+    if call.memory_index_scale() != 1 || index == Register::None {
+        return None;
+    }
+    let mut instructions = program
+        .blocks
+        .values()
+        .filter(|block| block.function_id == function)
+        .flat_map(|block| block.instructions.iter())
+        .collect::<Vec<_>>();
+    instructions.sort_by_key(|instruction| instruction.ip());
+    instructions.dedup_by_key(|instruction| instruction.ip());
+    let call_index = instructions.iter().position(|candidate| candidate.ip() == call.ip())?;
+    let before = &instructions[call_index.saturating_sub(96)..call_index];
+    let bound = before.iter().rev().find_map(|instruction| {
+        (instruction.mnemonic() == Mnemonic::Cmp
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op0_register().full_register() == index)
+            .then(|| unsigned_immediate(instruction, 1))
+            .flatten()
+    })?;
+    if bound == 0 || bound > 0x100 || bound % 8 != 0 {
+        return None;
+    }
+    let zero_based = before.iter().any(|instruction| {
+        instruction.mnemonic() == Mnemonic::Xor
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op1_kind() == OpKind::Register
+            && instruction.op0_register().full_register() == index
+            && instruction.op1_register().full_register() == index
+    });
+    let pointer_stride = before.iter().any(|instruction| {
+        instruction.mnemonic() == Mnemonic::Lea
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op1_kind() == OpKind::Memory
+            && instruction.memory_base().full_register() == index
+            && instruction.memory_index() == Register::None
+            && instruction.memory_displacement64() == 8
+    });
+    if !zero_based || !pointer_stride {
+        return None;
+    }
+
+    let base = call.memory_displacement64() as i64;
+    let mut targets = BTreeSet::new();
+    for offset in (0..bound).step_by(8) {
+        let displacement = base.wrapping_add(offset as i64) as u64;
+        let store = before.iter().rev().find(|instruction| {
+            instruction.mnemonic() == Mnemonic::Mov
+                && instruction.op0_kind() == OpKind::Memory
+                && instruction.memory_base().full_register() == Register::RBP
+                && instruction.memory_index() == Register::None
+                && instruction.memory_displacement64() == displacement
+        })?;
+        let target = if store.op1_kind() == OpKind::Register {
+            let source = store.op1_register().full_register();
+            let store_index = instructions
+                .iter()
+                .position(|instruction| instruction.ip() == store.ip())?;
+            let mut expected_ip = store.ip();
+            let definition = instructions[..store_index]
+                .iter()
+                .rev()
+                .take(8)
+                .find(|instruction| {
+                    let contiguous = instruction.ip().checked_add(instruction.len() as u64)
+                        == Some(expected_ip);
+                    expected_ip = instruction.ip();
+                    contiguous && writes_op0_register(instruction, source)
+                })?;
+            direct_definition_target(program, definition, image_base)?
+        } else {
+            direct_definition_target(program, store, image_base)?
+        };
+        targets.insert(target);
+    }
+    (!targets.is_empty()).then_some(targets)
+}
+
+fn unsigned_immediate(instruction: &Instruction, operand: u32) -> Option<u64> {
+    Some(match instruction.op_kind(operand) {
+        OpKind::Immediate8 => instruction.immediate8() as u64,
+        OpKind::Immediate8to16 => instruction.immediate8to16() as u16 as u64,
+        OpKind::Immediate8to32 => instruction.immediate8to32() as u32 as u64,
+        OpKind::Immediate8to64 => instruction.immediate8to64() as u64,
+        OpKind::Immediate16 => instruction.immediate16() as u64,
+        OpKind::Immediate32 => instruction.immediate32() as u64,
+        OpKind::Immediate32to64 => instruction.immediate32to64() as u64,
+        OpKind::Immediate64 => instruction.immediate64(),
+        _ => return None,
+    })
+}
+
 fn direct_definition_target(
     program: &ProgramModel,
     definition: &iced_x86::Instruction,
@@ -758,7 +875,12 @@ fn direct_definition_target(
         _ => return None,
     };
     let rva = u32::try_from(target_va.checked_sub(image_base)?).ok()?;
-    program.functions.values().any(|function| function.entries.contains(&rva)).then_some(rva)
+    (program
+        .functions
+        .values()
+        .any(|function| function.entries.contains(&rva))
+        || program.blocks.values().any(|block| block.range.start == rva))
+    .then_some(rva)
 }
 
 /// Resolves callbacks passed through the four Windows x64 integer argument
