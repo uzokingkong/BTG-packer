@@ -1123,13 +1123,19 @@ pub fn produce_rust_vtable_resolutions(
             (*offset >= 0x18 && *offset <= 0x400 && *offset % 8 == 0)
                 || (*offset == 0
                     && call.op0_kind() == OpKind::Register
-                    && has_rust_drop_load_chain(
-                        program,
-                        site.source_function,
-                        site.instruction_rva,
-                        call.op0_register().full_register(),
-                        image_base,
-                    ))
+                    && (has_rust_drop_load_chain(
+                            program,
+                            site.source_function,
+                            site.instruction_rva,
+                            call.op0_register().full_register(),
+                            image_base,
+                        ) || has_rust_drop_layout_prefix(
+                            program,
+                            site.source_function,
+                            site.instruction_rva,
+                            call.op0_register().full_register(),
+                            image_base,
+                        )))
         })
         else {
             continue;
@@ -1235,6 +1241,67 @@ fn has_rust_drop_load_chain(
             && instruction.op1_register().full_register() == target
     });
     vtable_loaded && null_checked
+}
+
+/// Recognizes Rust's `(drop, size, align)` vtable prefix around a nullable
+/// drop invocation. Requiring both post-call metadata slots prevents a generic
+/// optional callback at offset zero from being mislabeled as trait dispatch.
+fn has_rust_drop_layout_prefix(
+    program: &ProgramModel,
+    function: super::program_model::FunctionId,
+    site_rva: u32,
+    target: Register,
+    image_base: u64,
+) -> bool {
+    let Some(site_va) = image_base.checked_add(u64::from(site_rva)) else {
+        return false;
+    };
+    let mut instructions = program
+        .blocks
+        .values()
+        .filter(|block| block.function_id == function)
+        .flat_map(|block| block.instructions.iter())
+        .collect::<Vec<_>>();
+    instructions.sort_by_key(|instruction| instruction.ip());
+    instructions.dedup_by_key(|instruction| instruction.ip());
+    let Some(site_index) = instructions.iter().position(|instruction| instruction.ip() == site_va)
+    else {
+        return false;
+    };
+    let before = &instructions[site_index.saturating_sub(10)..site_index];
+    let loaded_drop = before.iter().rev().any(|instruction| {
+        instruction.mnemonic() == Mnemonic::Mov
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op0_register().full_register() == target
+            && instruction.op1_kind() == OpKind::Memory
+            && instruction.memory_index() == Register::None
+            && instruction.memory_displacement64() == 0
+    });
+    let null_checked = before.iter().any(|instruction| {
+        instruction.mnemonic() == Mnemonic::Test
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op1_kind() == OpKind::Register
+            && instruction.op0_register().full_register() == target
+            && instruction.op1_register().full_register() == target
+    });
+    if !loaded_drop || !null_checked {
+        return false;
+    }
+    let after = &instructions[site_index + 1..instructions.len().min(site_index + 18)];
+    let metadata_bases = |displacement| {
+        after
+            .iter()
+            .filter(|instruction| {
+                instruction.mnemonic() == Mnemonic::Mov
+                    && instruction.op1_kind() == OpKind::Memory
+                    && instruction.memory_index() == Register::None
+                    && instruction.memory_base() != Register::None
+                    && instruction.memory_displacement64() == displacement
+            })
+            .map(|instruction| instruction.memory_base().full_register())
+            .collect::<BTreeSet<_>>()
+    };
+    !metadata_bases(8).is_disjoint(&metadata_bases(0x10))
 }
 
 fn find_vtable_method_load(
@@ -1436,6 +1503,48 @@ mod tests {
         assert_eq!(resolutions.len(), 1);
         assert_eq!(resolutions[0].target_rvas, BTreeSet::from([0x2100]));
         assert!(resolutions[0].complete);
+    }
+
+    #[test]
+    fn rust_drop_prefix_requires_size_and_alignment_slots() {
+        let bytes = [
+            0x48, 0x8b, 0x02, // mov rax,[rdx]
+            0x48, 0x85, 0xc0, // test rax,rax
+            0xff, 0xd0, // call rax
+            0x48, 0x8b, 0x51, 0x08, // mov rdx,[rcx+8]
+            0x4c, 0x8b, 0x41, 0x10, // mov r8,[rcx+10h]
+        ];
+        let mut decoder = Decoder::with_ip(64, &bytes, BASE + 0x1000, DecoderOptions::NONE);
+        let mut instructions = Vec::new();
+        while decoder.can_decode() {
+            instructions.push(decoder.decode());
+        }
+        let mut program = ProgramModel::default();
+        program.blocks.insert(
+            BlockId(1),
+            BlockModel {
+                id: BlockId(1),
+                function_id: FunctionId(1),
+                range: RvaRange::new(0x1000, 0x1000 + bytes.len() as u32).unwrap(),
+                instructions,
+                byte_class: ByteClass::Instruction,
+            },
+        );
+        assert!(has_rust_drop_layout_prefix(
+            &program,
+            FunctionId(1),
+            0x1006,
+            Register::RAX,
+            BASE,
+        ));
+        program.blocks.get_mut(&BlockId(1)).unwrap().instructions.pop();
+        assert!(!has_rust_drop_layout_prefix(
+            &program,
+            FunctionId(1),
+            0x1006,
+            Register::RAX,
+            BASE,
+        ));
     }
 
     #[test]
