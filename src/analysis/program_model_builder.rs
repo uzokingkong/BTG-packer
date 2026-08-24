@@ -440,6 +440,17 @@ impl<'a> ProgramModelBuilder<'a> {
                 },
             )
         });
+        let get_proc_address_slots = crate::pipeline::iat_hide::collect_from_pe(
+            &self.target.original_pe_bytes,
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|import| match import.func {
+            crate::pipeline::iat_hide::FuncRef::Name(name)
+                if name.eq_ignore_ascii_case("GetProcAddress") => Some(import.slot_rva),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
         let load_config_slots = self
             .target
             .load_config
@@ -572,6 +583,23 @@ impl<'a> ProgramModelBuilder<'a> {
                         crate::analysis::indirect_targets::TargetProvenance::ImportAddressTable,
                     )?;
                 }
+            }
+        }
+        for (site, resolver_slot_va) in
+            crate::analysis::pointer_tables::produce_dynamic_import_resolutions(
+                &model,
+                image_base,
+                &get_proc_address_slots,
+                &relayed_sections,
+            )
+        {
+            if !explicit_sites.contains(&site) {
+                crate::analysis::indirect_resolver::apply_external_indirect_resolution(
+                    &mut model,
+                    site,
+                    resolver_slot_va,
+                    crate::analysis::indirect_targets::TargetProvenance::DynamicImport,
+                )?;
             }
         }
         for slot_rva in load_config_slots {

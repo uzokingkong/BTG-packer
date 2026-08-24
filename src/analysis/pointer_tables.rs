@@ -218,6 +218,193 @@ pub fn produce_iat_slots(
     out
 }
 
+/// Resolves function pointers obtained from GetProcAddress and cached in
+/// zero-initialized image globals. A cache slot is trusted only when every
+/// decoded store to it is reached directly from the typed resolver return.
+pub fn produce_dynamic_import_resolutions(
+    program: &ProgramModel,
+    image_base: u64,
+    get_proc_address_slots: &BTreeSet<u32>,
+    sections: &[SectionData],
+) -> Vec<(crate::analysis::indirect_targets::IndirectSiteId, u64)> {
+    let dynamic_slots = discover_dynamic_import_slots(
+        program,
+        image_base,
+        get_proc_address_slots,
+        sections,
+    );
+    if dynamic_slots.is_empty() {
+        return Vec::new();
+    }
+    let identity = image_base + u64::from(*get_proc_address_slots.iter().next().unwrap());
+    let mut out = Vec::new();
+    for site in program.indirect_targets.sites.values().filter(|site| {
+        site.status == ResolutionStatus::Unresolved
+    }) {
+        let Some(block) = program.blocks.get(&site.source_block) else { continue };
+        let Some(index) = block.instructions.iter().position(|instruction| {
+            instruction.ip().checked_sub(image_base)
+                .and_then(|rva| u32::try_from(rva).ok()) == Some(site.instruction_rva)
+        }) else { continue };
+        let transfer = &block.instructions[index];
+        if transfer.op0_kind() != OpKind::Register {
+            continue;
+        }
+        let mut visiting = BTreeSet::new();
+        if prove_dynamic_external_register(
+            program,
+            site.source_block,
+            index,
+            transfer.op0_register().full_register(),
+            image_base,
+            get_proc_address_slots,
+            &dynamic_slots,
+            &mut visiting,
+        ) {
+            out.push((site.id, identity));
+        }
+    }
+    out.sort_by_key(|(site, _)| *site);
+    out
+}
+
+fn discover_dynamic_import_slots(
+    program: &ProgramModel,
+    image_base: u64,
+    resolver_slots: &BTreeSet<u32>,
+    sections: &[SectionData],
+) -> BTreeSet<u32> {
+    let mut candidates = BTreeMap::<u32, BTreeSet<u64>>::new();
+    for function in program.functions.keys() {
+        let mut instructions = program.blocks.values()
+            .filter(|block| block.function_id == *function)
+            .flat_map(|block| block.instructions.iter())
+            .collect::<Vec<_>>();
+        instructions.sort_by_key(|instruction| instruction.ip());
+        instructions.dedup_by_key(|instruction| instruction.ip());
+        for (index, call) in instructions.iter().enumerate() {
+            if call.flow_control() != iced_x86::FlowControl::IndirectCall
+                || call.op0_kind() != OpKind::Memory
+                || call.memory_index() != Register::None
+                || memory_operand_rva(call, image_base)
+                    .is_none_or(|slot| !resolver_slots.contains(&slot))
+            {
+                continue;
+            }
+            let mut aliases = BTreeSet::from([Register::RAX]);
+            for instruction in instructions.iter().skip(index + 1).take(12) {
+                if matches!(instruction.flow_control(), iced_x86::FlowControl::Call | iced_x86::FlowControl::IndirectCall) {
+                    break;
+                }
+                if instruction.mnemonic() != Mnemonic::Mov {
+                    continue;
+                }
+                if instruction.op0_kind() == OpKind::Register
+                    && instruction.op1_kind() == OpKind::Register
+                    && aliases.contains(&instruction.op1_register().full_register())
+                {
+                    aliases.insert(instruction.op0_register().full_register());
+                } else if instruction.op0_kind() == OpKind::Memory
+                    && instruction.memory_index() == Register::None
+                    && instruction.op1_kind() == OpKind::Register
+                    && aliases.contains(&instruction.op1_register().full_register())
+                {
+                    if let Some(slot) = memory_operand_rva(instruction, image_base) {
+                        candidates.entry(slot).or_default().insert(instruction.ip());
+                    }
+                }
+            }
+        }
+    }
+    candidates.retain(|slot, proven_stores| {
+        read_u64(sections, *slot) == Some(0)
+            && program.blocks.values().flat_map(|block| block.instructions.iter()).all(|instruction| {
+                if instruction.mnemonic() != Mnemonic::Mov
+                    || instruction.op0_kind() != OpKind::Memory
+                    || instruction.memory_index() != Register::None
+                    || memory_operand_rva(instruction, image_base) != Some(*slot)
+                {
+                    true
+                } else {
+                    proven_stores.contains(&instruction.ip())
+                }
+            })
+    });
+    candidates.into_keys().collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_dynamic_external_register(
+    program: &ProgramModel,
+    block_id: super::program_model::BlockId,
+    before: usize,
+    register: Register,
+    image_base: u64,
+    resolver_slots: &BTreeSet<u32>,
+    dynamic_slots: &BTreeSet<u32>,
+    visiting: &mut BTreeSet<(super::program_model::BlockId, usize, Register)>,
+) -> bool {
+    use super::program_model::EdgeTarget;
+    let key = (block_id, before, register);
+    if !visiting.insert(key) {
+        return false;
+    }
+    let Some(block) = program.blocks.get(&block_id) else { return false };
+    for (index, instruction) in block.instructions[..before].iter().enumerate().rev() {
+        if register == Register::RAX
+            && instruction.flow_control() == iced_x86::FlowControl::IndirectCall
+            && instruction.op0_kind() == OpKind::Memory
+            && instruction.memory_index() == Register::None
+            && memory_operand_rva(instruction, image_base)
+                .is_some_and(|slot| resolver_slots.contains(&slot))
+        {
+            visiting.remove(&key);
+            return true;
+        }
+        if instruction.op0_kind() == OpKind::Register
+            && instruction.op0_register().full_register() == register
+            && !matches!(instruction.mnemonic(), Mnemonic::Cmp | Mnemonic::Test)
+        {
+            let result = if instruction.mnemonic() == Mnemonic::Mov
+                && instruction.op1_kind() == OpKind::Register
+            {
+                prove_dynamic_external_register(
+                    program, block_id, index, instruction.op1_register().full_register(),
+                    image_base, resolver_slots, dynamic_slots, visiting,
+                )
+            } else if instruction.mnemonic() == Mnemonic::Mov
+                && instruction.op1_kind() == OpKind::Memory
+                && instruction.memory_index() == Register::None
+            {
+                memory_operand_rva(instruction, image_base)
+                    .is_some_and(|slot| dynamic_slots.contains(&slot))
+            } else {
+                false
+            };
+            visiting.remove(&key);
+            return result;
+        }
+        if matches!(instruction.flow_control(), iced_x86::FlowControl::Call | iced_x86::FlowControl::IndirectCall)
+            && matches!(register, Register::RAX | Register::RCX | Register::RDX | Register::R8 | Register::R9 | Register::R10 | Register::R11)
+        {
+            visiting.remove(&key);
+            return false;
+        }
+    }
+    let function = block.function_id;
+    let predecessors = program.edges.iter().filter_map(|edge| match edge.target {
+        EdgeTarget::Block(target) if target == block_id
+            && program.blocks.get(&edge.source).is_some_and(|source| source.function_id == function) => Some(edge.source),
+        _ => None,
+    }).collect::<BTreeSet<_>>();
+    let result = !predecessors.is_empty() && predecessors.into_iter().all(|predecessor| {
+        let len = program.blocks.get(&predecessor).map_or(0, |owner| owner.instructions.len());
+        prove_dynamic_external_register(program, predecessor, len, register, image_base, resolver_slots, dynamic_slots, visiting)
+    });
+    visiting.remove(&key);
+    result
+}
+
 /// Returns the nearest definition on every CFG path reaching a register use.
 /// A path that enters with no definition, or a volatile register crossing a
 /// call, makes the proof incomplete. Multiple definitions are accepted only

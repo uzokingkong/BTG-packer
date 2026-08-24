@@ -26,6 +26,7 @@ pub enum TargetProvenance {
     Vtable,
     ImportAddressTable,
     LoadConfig,
+    DynamicImport,
     AbiArgument,
     UserSupplied,
 }
