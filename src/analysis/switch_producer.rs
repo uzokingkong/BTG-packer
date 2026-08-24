@@ -83,8 +83,8 @@ pub fn produce_switch_resolutions(
                 CompareKind::Below => Some(bound.upper),
                 _ => None,
             })
-            .or_else(|| masked_entry_count(&instructions, jump_index, pattern.index))
-            .or_else(|| compared_entry_count(&instructions, jump_index, pattern.index));
+            .or_else(|| masked_entry_count(&instructions, pattern.load_index, pattern.index))
+            .or_else(|| compared_entry_count(&instructions, pattern.load_index, pattern.index));
         let Some(entry_count) = entry_count.and_then(|n| u32::try_from(n).ok()) else {
             continue;
         };
@@ -149,9 +149,9 @@ pub fn produce_switch_resolutions(
     out
 }
 
-fn compared_entry_count(ins: &[Instruction], jump_index: usize, index: Register) -> Option<u64> {
-    let window_start = jump_index.saturating_sub(24);
-    for (offset, instruction) in ins[window_start..jump_index].iter().enumerate().rev() {
+fn compared_entry_count(ins: &[Instruction], load_index: usize, index: Register) -> Option<u64> {
+    let window_start = load_index.saturating_sub(24);
+    for (offset, instruction) in ins[window_start..load_index].iter().enumerate().rev() {
         if instruction.mnemonic() != Mnemonic::Cmp
             || instruction.op0_kind() != OpKind::Register
             || instruction.op0_register().full_register() != index
@@ -160,6 +160,9 @@ fn compared_entry_count(ins: &[Instruction], jump_index: usize, index: Register)
         }
         let upper = match instruction.op1_kind() {
             OpKind::Immediate8 => u64::from(instruction.immediate8()),
+            OpKind::Immediate8to16 | OpKind::Immediate8to32 | OpKind::Immediate8to64 => {
+                instruction.immediate8to64() as u64
+            }
             OpKind::Immediate32 => u64::from(instruction.immediate32()),
             OpKind::Immediate32to64 => instruction.immediate32to64() as u64,
             _ => return None,
@@ -172,7 +175,6 @@ fn compared_entry_count(ins: &[Instruction], jump_index: usize, index: Register)
             _ => None,
         }?;
         // No later write may change the selector before the table load.
-        let load_index = jump_index.saturating_sub(2);
         if ins[absolute + 2..load_index].iter().any(|candidate| {
             candidate.op0_kind() == OpKind::Register
                 && candidate.op0_register().full_register() == index
@@ -184,8 +186,8 @@ fn compared_entry_count(ins: &[Instruction], jump_index: usize, index: Register)
     None
 }
 
-fn masked_entry_count(ins: &[Instruction], jump_index: usize, index: Register) -> Option<u64> {
-    for instruction in ins[jump_index.saturating_sub(12)..jump_index].iter().rev() {
+fn masked_entry_count(ins: &[Instruction], load_index: usize, index: Register) -> Option<u64> {
+    for instruction in ins[load_index.saturating_sub(12)..load_index].iter().rev() {
         if instruction.op0_kind() != OpKind::Register
             || instruction.op0_register().full_register() != index
         {
@@ -196,6 +198,9 @@ fn masked_entry_count(ins: &[Instruction], jump_index: usize, index: Register) -
         }
         let mask = match instruction.op1_kind() {
             OpKind::Immediate8 => u64::from(instruction.immediate8()),
+            OpKind::Immediate8to16 | OpKind::Immediate8to32 | OpKind::Immediate8to64 => {
+                instruction.immediate8to64() as u64
+            }
             OpKind::Immediate32 => u64::from(instruction.immediate32()),
             OpKind::Immediate32to64 => instruction.immediate32to64() as u64,
             _ => return None,
@@ -370,6 +375,14 @@ mod tests {
         let p = recover_pattern(&ins, 5, &flow, 0x140000000).unwrap();
         assert!(matches!(p.encoding, SwitchEntryEncoding::Rel32 { .. }));
         assert_eq!(p.width, 4);
+    }
+
+    #[test]
+    fn recognizes_sign_extended_imm8_selector_mask() {
+        // and eax,3; movsxd rax,dword ptr [rdx+rax*4]
+        let ins = decode(&[0x83, 0xe0, 0x03, 0x48, 0x63, 0x04, 0x82]);
+        assert_eq!(ins[0].op1_kind(), OpKind::Immediate8to32);
+        assert_eq!(masked_entry_count(&ins, 1, Register::RAX), Some(4));
     }
 
     #[test]
