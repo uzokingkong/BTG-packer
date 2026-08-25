@@ -689,12 +689,16 @@ fn first_poly_blocker(
         // contract is not yet certified across every commercial native handler
         // family.  Keep the containing function native instead of silently
         // changing crypto/checksum results (notably `mov [mem], bh`).
-        if (0..i.op_count()).any(|op| {
+        let has_high_byte = (0..i.op_count()).any(|op| {
             matches!(
                 i.op_register(op),
                 Register::AH | Register::BH | Register::CH | Register::DH
             )
-        }) {
+        });
+        let certified_high_byte_store = i.code() == Code::Mov_rm8_r8
+            && i.op0_kind() == iced_x86::OpKind::Memory
+            && crate::vm::lifter::is_high_byte_register(i.op1_register());
+        if has_high_byte && !certified_high_byte_store {
             return Some((
                 CommercialExclusionReason::LegacyHighByteRegister,
                 CommercialFirstBlocker {
@@ -1114,20 +1118,26 @@ pub fn lift_program_cfg_commercial_with_model(
     // flow while silently changing the computed digest.  Treat that connected
     // calculation as one semantic ownership unit until every aliasing/call
     // combination has a native-handler differential proof.
-    let has_high_byte = |i: &Instruction| {
-        (0..i.op_count()).any(|op| {
+    let has_unsupported_high_byte = |i: &Instruction| {
+        let has_high_byte = (0..i.op_count()).any(|op| {
             matches!(
                 i.op_register(op),
                 Register::AH | Register::BH | Register::CH | Register::DH
             )
-        })
+        });
+        let supported_memory_store = i.code() == iced_x86::Code::Mov_rm8_r8
+            && i.op0_kind() == iced_x86::OpKind::Memory
+            && crate::vm::lifter::is_high_byte_register(i.op1_register());
+        has_high_byte && !supported_memory_store
     };
     let semantic_quarantine_roots: HashSet<(u64, u64)> = all_function_ranges
         .iter()
         .copied()
         .filter(|(s, e)| {
             blocks.iter().any(|bb| {
-                *s <= bb.start_va && bb.start_va < *e && bb.instructions.iter().any(has_high_byte)
+                *s <= bb.start_va
+                    && bb.start_va < *e
+                    && bb.instructions.iter().any(has_unsupported_high_byte)
             })
         })
         .collect();
@@ -1352,7 +1362,7 @@ pub fn lift_program_cfg_commercial_with_model(
             let mut failures: Vec<_> = function_blocks
                     .iter()
                     .flat_map(|bb| bb.instructions.iter())
-                    .filter(|instruction| has_high_byte(instruction))
+                    .filter(|instruction| has_unsupported_high_byte(instruction))
                     .map(|instruction| CommercialFirstBlocker {
                         rva: instruction.ip(),
                         code: instruction.code(),
@@ -1363,7 +1373,7 @@ pub fn lift_program_cfg_commercial_with_model(
             failures.sort_by_key(|failure| failure.rva);
             let direct = function_blocks
                 .iter()
-                .filter(|bb| bb.instructions.iter().any(has_high_byte))
+                .filter(|bb| bb.instructions.iter().any(has_unsupported_high_byte))
                 .count();
             (
                 CommercialExclusionReason::LegacyHighByteRegister,

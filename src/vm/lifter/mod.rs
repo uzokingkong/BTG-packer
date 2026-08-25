@@ -321,8 +321,19 @@ pub fn lift_one(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
                 }
             } else if inst.op1_kind() == OpKind::Register {
                 let addr = mem_emit(b, inst, 0)?;
-                let s = vreg(inst.op1_register())?;
+                let source = inst.op1_register();
                 let sz = reg_bits(inst.op1_register());
+                let s = if sz == 8 && is_high_byte_register(source) {
+                    // AH/BH/CH/DH are bits 8..15 of their full GPR. Extract
+                    // that byte into a temporary without changing the source
+                    // register or flags, then use the ordinary byte store.
+                    let full = source.full_register().number() as u8;
+                    b.mov_r_r64(SCRATCH2, full);
+                    b.shift64_r_imm8(OP_SHR64_R_IMM8, SCRATCH2, 8);
+                    SCRATCH2
+                } else {
+                    vreg(source)?
+                };
                 match sz {
                     8 => b.mem_store_a(OP_MOV_MEM8_A, addr, s),
                     16 => b.mem_store_a(OP_MOV_MEM16_A, addr, s),
@@ -810,6 +821,10 @@ fn reg_bits(r: Register) -> usize {
     r.size() * 8
 }
 
+pub(crate) fn is_high_byte_register(r: Register) -> bool {
+    matches!(r, Register::AH | Register::BH | Register::CH | Register::DH)
+}
+
 /// Map any GPR (or sub-register) to its vreg index = full GPR number.
 ///
 /// The VM's register model stores each GPR as a single 64-bit vreg and
@@ -822,7 +837,7 @@ pub fn vreg(r: Register) -> Result<u8> {
     if !r.is_gpr() {
         return Err(anyhow!("lifter: non-GPR register {:?}", r));
     }
-    if matches!(r, Register::AH | Register::BH | Register::CH | Register::DH) {
+    if is_high_byte_register(r) {
         return Err(anyhow!(
             "lifter: high-byte register {:?} not representable in the 64-bit vreg model \
              (8/16-bit operands are stored zero-extended into the full GPR vreg; \
@@ -877,8 +892,8 @@ mod tests {
         );
     }
 
-    /// v65: AH/BH/CH/DH cannot be represented in the 64-bit vreg model — the
-    /// lifter must reject them explicitly instead of silently aliasing the low byte.
+    /// High-byte destinations still require merge semantics and remain
+    /// rejected until that operation is represented explicitly.
     #[test]
     fn test_lift_rejects_high_byte_register() {
         let inst = Instruction::with2(Code::Mov_r8_rm8, Register::AH, Register::AL).unwrap();
@@ -887,6 +902,23 @@ mod tests {
             lift_one(&mut b, &inst).is_err(),
             "AH must be rejected at lift time (not representable in the vreg model)"
         );
+    }
+
+    #[test]
+    fn test_lift_high_byte_memory_store_extracts_bits_8_through_15() {
+        use crate::vm::bytecode::disassemble;
+        use iced_x86::MemoryOperand;
+        let inst = Instruction::with2(
+            Code::Mov_rm8_r8,
+            MemoryOperand::with_base_displ(Register::RSI, 8),
+            Register::BH,
+        )
+        .unwrap();
+        let mut b = BytecodeBuilder::new();
+        lift_one(&mut b, &inst).unwrap();
+        let dis = disassemble(&b.finish());
+        assert!(dis.contains("shr64"), "high byte must be shifted down: {dis}");
+        assert!(dis.contains("(u8)"), "extracted byte must be stored: {dis}");
     }
 }
 
