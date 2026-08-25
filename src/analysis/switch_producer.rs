@@ -36,13 +36,6 @@ pub fn produce_switch_resolutions(
     sections: &[SwitchSection<'_>],
 ) -> Vec<ProducedSwitchResolution> {
     let mut out = Vec::new();
-    let mut canonical_instructions = program
-        .blocks
-        .values()
-        .flat_map(|block| block.instructions.iter().cloned())
-        .collect::<Vec<_>>();
-    canonical_instructions.sort_by_key(|instruction| instruction.ip());
-    canonical_instructions.dedup_by_key(|instruction| instruction.ip());
     for site in program.indirect_targets.sites.values() {
         if site.kind != IndirectKind::Jump {
             continue;
@@ -51,7 +44,18 @@ pub fn produce_switch_resolutions(
         // three-instruction table dispatch itself. Reconstruct an ordered,
         // function-local instruction view; pattern recovery still requires
         // adjacent load/add/jump instructions and an explicit bound proof.
-        let Some(global_jump_index) = canonical_instructions.iter().position(|i| {
+        let Some(function) = program.functions.get(&site.source_function) else {
+            continue;
+        };
+        let mut function_instructions = function
+            .blocks
+            .iter()
+            .filter_map(|block_id| program.blocks.get(block_id))
+            .flat_map(|block| block.instructions.iter().cloned())
+            .collect::<Vec<_>>();
+        function_instructions.sort_by_key(|instruction| instruction.ip());
+        function_instructions.dedup_by_key(|instruction| instruction.ip());
+        let Some(global_jump_index) = function_instructions.iter().position(|i| {
             i.ip()
                 .checked_sub(image_base)
                 .and_then(|x| u32::try_from(x).ok())
@@ -59,8 +63,8 @@ pub fn produce_switch_resolutions(
         }) else {
             continue;
         };
-        let window_start = global_jump_index.saturating_sub(128);
-        let instructions = &canonical_instructions[window_start..=global_jump_index];
+        let window_start = global_jump_index.saturating_sub(4095);
+        let instructions = &function_instructions[window_start..=global_jump_index];
         let jump_index = instructions.len() - 1;
         let flow = value_flow::analyze(
             &instructions,
