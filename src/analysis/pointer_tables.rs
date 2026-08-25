@@ -182,6 +182,16 @@ pub fn produce_iat_slots(
             .map(|definition| vec![definition])
             .or_else(|| {
                 find_reaching_register_definitions(program, site.source_block, site_index, register)
+            })
+            .or_else(|| {
+                find_unique_nonvolatile_definition(
+                    program,
+                    site.source_function,
+                    site.instruction_rva,
+                    register,
+                    image_base,
+                )
+                .map(|definition| vec![definition])
             });
             let Some(definitions) = definitions else {
                 continue;
@@ -216,6 +226,48 @@ pub fn produce_iat_slots(
     }
     out.sort_by_key(|(site, _)| *site);
     out
+}
+
+/// Conservative fallback for compiler-hoisted IAT loads kept in a
+/// callee-saved register across a loop. Some decoded CFGs contain synthetic
+/// roots at shared loop entries, which makes path-sensitive reaching analysis
+/// report `undefined`. A single canonical function entry and a unique write to
+/// a nonvolatile register still prove the value for every valid invocation.
+fn find_unique_nonvolatile_definition<'a>(
+    program: &'a ProgramModel,
+    function_id: super::program_model::FunctionId,
+    site_rva: u32,
+    register: Register,
+    image_base: u64,
+) -> Option<&'a Instruction> {
+    if !matches!(
+        register,
+        Register::RBX
+            | Register::RBP
+            | Register::RSI
+            | Register::RDI
+            | Register::R12
+            | Register::R13
+            | Register::R14
+            | Register::R15
+    ) {
+        return None;
+    }
+    let function = program.functions.get(&function_id)?;
+    if function.entries.len() != 1 || function.entries.first().copied()? >= site_rva {
+        return None;
+    }
+    let site_ip = image_base.checked_add(u64::from(site_rva))?;
+    let mut definitions = function
+        .blocks
+        .iter()
+        .filter_map(|block_id| program.blocks.get(block_id))
+        .flat_map(|block| block.instructions.iter())
+        .filter(|instruction| {
+            instruction.ip() < site_ip && writes_op0_register(instruction, register)
+        });
+    let definition = definitions.next()?;
+    definitions.next().is_none().then_some(definition)
 }
 
 /// Returns whether operand zero actually modifies `register`.
