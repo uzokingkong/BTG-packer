@@ -4,7 +4,7 @@
 //! excessive state, or arithmetic that cannot be represented by the small affine
 //! domain become `Unknown` instead of guessing a target.
 
-use iced_x86::{Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +168,15 @@ fn transfer(ins: &Instruction, state: &mut State, image_base: u64) {
     let Some(dst) = register_operand(ins, 0).map(full_register) else {
         return;
     };
+    // Operand zero is not necessarily a destination (`push rax`, `test rax`,
+    // `call rax`). Preserve reaching definitions across pure register uses.
+    let mut info_factory = InstructionInfoFactory::new();
+    if !matches!(
+        info_factory.info(ins).op0_access(),
+        OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+    ) {
+        return;
+    }
     // A selector is commonly range-checked in one register and copied to a
     // different register for addressing the jump table. Preserve that proof
     // only for an exact register copy; every other write invalidates it.
@@ -443,6 +452,27 @@ mod tests {
         assert_eq!(bound.compare, CompareKind::BelowOrEqual);
         assert_eq!(bound.upper, 0xff);
         assert!(bound.branch_ip.is_none());
+    }
+
+    #[test]
+    fn register_uses_preserve_reaching_values_and_bounds() {
+        // mov r14,imagebase; movzx r8d,byte ptr [rcx]; push r14; test r8d,r8d; nop
+        let instructions = decode(&[
+            0x49, 0xbe, 0x00, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00, 0x44, 0x0f, 0xb6, 0x01,
+            0x41, 0x56, 0x45, 0x85, 0xc0, 0x90,
+        ]);
+        let result = analyze(
+            &instructions,
+            ValueFlowConfig {
+                image_base: 0x140000000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            result.value_before(4, Register::R14),
+            AbstractValue::ImageBase { addend: 0 }
+        );
+        assert_eq!(result.bound_before(4, Register::R8).unwrap().upper, 0xff);
     }
 
     #[test]
