@@ -6,13 +6,15 @@
 
 use std::collections::BTreeSet;
 
-use iced_x86::{FlowControl, Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{
+    FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register,
+};
 
 use super::indirect_resolver::IndirectResolution;
 use super::indirect_targets::{
     IndirectKind, JumpTableDescriptor, TableDescriptor, TargetProvenance,
 };
-use super::program_model::{ProgramModel, RvaRange};
+use super::program_model::{EdgeKind, EdgeTarget, ProgramModel, RvaRange};
 use super::switch_targets::{
     resolve_switch_targets, SwitchEntryEncoding, SwitchSection, SwitchTableLayout,
 };
@@ -84,7 +86,15 @@ pub fn produce_switch_resolutions(
                 _ => None,
             })
             .or_else(|| masked_entry_count(&instructions, pattern.load_index, pattern.index))
-            .or_else(|| compared_entry_count(&instructions, pattern.load_index, pattern.index));
+            .or_else(|| compared_entry_count(&instructions, pattern.load_index, pattern.index))
+            .or_else(|| {
+                cfg_taken_entry_count(
+                    program,
+                    image_base,
+                    instructions[pattern.load_index].ip(),
+                    pattern.index,
+                )
+            });
         let Some(entry_count) = entry_count.and_then(|n| u32::try_from(n).ok()) else {
             continue;
         };
@@ -147,6 +157,107 @@ pub fn produce_switch_resolutions(
         });
     }
     out
+}
+
+/// Recovers the range proof carried by a conditional taken edge into the
+/// dispatch block. MSVC and rustc commonly emit `cmp index,N; jbe dispatch`
+/// with the default case on the fallthrough path, so a linear instruction
+/// window cannot soundly retain that proof.
+fn cfg_taken_entry_count(
+    program: &ProgramModel,
+    image_base: u64,
+    load_ip: u64,
+    index: Register,
+) -> Option<u64> {
+    let load_rva = u32::try_from(load_ip.checked_sub(image_base)?).ok()?;
+    let (load_block_id, load_block) = program
+        .blocks
+        .iter()
+        .find(|(_, block)| block.range.start <= load_rva && load_rva < block.range.end)?;
+    let load_position = load_block
+        .instructions
+        .iter()
+        .position(|instruction| instruction.ip() == load_ip)?;
+    let mut compared_register = index.full_register();
+    for instruction in load_block.instructions[..load_position].iter().rev() {
+        if !writes_register(instruction, compared_register) {
+            continue;
+        }
+        if instruction.mnemonic() == Mnemonic::Mov && instruction.op1_kind() == OpKind::Register {
+            compared_register = instruction.op1_register().full_register();
+        } else {
+            return None;
+        }
+    }
+
+    let mut counts = BTreeSet::new();
+    for edge in program.edges.iter().filter(|edge| {
+        edge.kind == EdgeKind::DirectBranch && edge.target == EdgeTarget::Block(*load_block_id)
+    }) {
+        let Some(source) = program.blocks.get(&edge.source) else {
+            continue;
+        };
+        if source.function_id != load_block.function_id || source.instructions.len() < 2 {
+            continue;
+        }
+        let Some(branch) = source.instructions.last() else {
+            continue;
+        };
+        let compare = &source.instructions[source.instructions.len() - 2];
+        let Some(branch_target_rva) = branch
+            .near_branch_target()
+            .checked_sub(image_base)
+            .and_then(|rva| u32::try_from(rva).ok())
+        else {
+            continue;
+        };
+        if branch_target_rva != load_block.range.start
+            || compare.mnemonic() != Mnemonic::Cmp
+            || compare.op0_kind() != OpKind::Register
+            || compare.op0_register().full_register() != compared_register
+        {
+            continue;
+        }
+        let Some(upper) = immediate_operand(compare, 1) else {
+            continue;
+        };
+        let count = match branch.mnemonic() {
+            Mnemonic::Jbe => upper.checked_add(1),
+            Mnemonic::Jb => Some(upper),
+            _ => None,
+        };
+        if let Some(count) = count {
+            counts.insert(count);
+        }
+    }
+    (counts.len() == 1).then(|| *counts.first().unwrap())
+}
+
+fn immediate_operand(instruction: &Instruction, operand: u32) -> Option<u64> {
+    match instruction.op_kind(operand) {
+        OpKind::Immediate8 => Some(u64::from(instruction.immediate8())),
+        OpKind::Immediate8to16 | OpKind::Immediate8to32 | OpKind::Immediate8to64 => {
+            Some(instruction.immediate8to64() as u64)
+        }
+        OpKind::Immediate16 => Some(u64::from(instruction.immediate16())),
+        OpKind::Immediate32 => Some(u64::from(instruction.immediate32())),
+        OpKind::Immediate32to64 => Some(instruction.immediate32to64() as u64),
+        OpKind::Immediate64 => Some(instruction.immediate64()),
+        _ => None,
+    }
+}
+
+fn writes_register(instruction: &Instruction, register: Register) -> bool {
+    if instruction.op0_kind() != OpKind::Register
+        || instruction.op0_register().full_register() != register.full_register()
+    {
+        return false;
+    }
+    let mut factory = InstructionInfoFactory::new();
+    matches!(
+        factory.info(instruction).op0_access(),
+        OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+    )
 }
 
 fn compared_entry_count(ins: &[Instruction], load_index: usize, index: Register) -> Option<u64> {
@@ -329,15 +440,66 @@ fn abstract_rva(value: AbstractValue, image_base: u64) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::program_model::{BlockId, BlockModel, ByteClass, EdgeModel, FunctionId};
     use iced_x86::{Decoder, DecoderOptions};
 
     fn decode(bytes: &[u8]) -> Vec<Instruction> {
-        let mut d = Decoder::with_ip(64, bytes, 0x140001000, DecoderOptions::NONE);
+        decode_at(bytes, 0x140001000)
+    }
+
+    fn decode_at(bytes: &[u8], ip: u64) -> Vec<Instruction> {
+        let mut d = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
         let mut result = Vec::new();
         while d.can_decode() {
             result.push(d.decode());
         }
         result
+    }
+
+    #[test]
+    fn carries_taken_edge_bound_through_exact_selector_copy() {
+        let image_base = 0x140000000;
+        // cmp r12d,27h; jbe 140001010
+        let source_instructions =
+            decode_at(&[0x41, 0x83, 0xfc, 0x27, 0x76, 0x0a], image_base + 0x1000);
+        // mov eax,r12d; movsxd rax,dword ptr [r14+rax*4]
+        let dispatch_instructions = decode_at(
+            &[0x41, 0x8b, 0xc4, 0x49, 0x63, 0x04, 0x86],
+            image_base + 0x1010,
+        );
+        let source_id = BlockId(1);
+        let dispatch_id = BlockId(2);
+        let function_id = FunctionId(1);
+        let mut program = ProgramModel::default();
+        program.blocks.insert(
+            source_id,
+            BlockModel {
+                id: source_id,
+                function_id,
+                range: RvaRange::new(0x1000, 0x1006).unwrap(),
+                instructions: source_instructions,
+                byte_class: ByteClass::Instruction,
+            },
+        );
+        program.blocks.insert(
+            dispatch_id,
+            BlockModel {
+                id: dispatch_id,
+                function_id,
+                range: RvaRange::new(0x1010, 0x1017).unwrap(),
+                instructions: dispatch_instructions,
+                byte_class: ByteClass::Instruction,
+            },
+        );
+        program.edges.push(EdgeModel {
+            source: source_id,
+            kind: EdgeKind::DirectBranch,
+            target: EdgeTarget::Block(dispatch_id),
+        });
+        assert_eq!(
+            cfg_taken_entry_count(&program, image_base, image_base + 0x1013, Register::RAX),
+            Some(40)
+        );
     }
 
     #[test]
