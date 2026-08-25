@@ -92,6 +92,13 @@ pub fn produce_switch_resolutions(
             .or_else(|| masked_entry_count(&instructions, pattern.load_index, pattern.index))
             .or_else(|| compared_entry_count(&instructions, pattern.load_index, pattern.index))
             .or_else(|| {
+                matches!(
+                    flow.value_before(pattern.load_index, pattern.index),
+                    AbstractValue::Constant(0)
+                )
+                .then_some(1)
+            })
+            .or_else(|| {
                 cfg_taken_entry_count(
                     program,
                     image_base,
@@ -266,10 +273,11 @@ fn writes_register(instruction: &Instruction, register: Register) -> bool {
 
 fn compared_entry_count(ins: &[Instruction], load_index: usize, index: Register) -> Option<u64> {
     let window_start = load_index.saturating_sub(24);
+    let compared_register = selector_copy_origin(ins, load_index, index);
     for (offset, instruction) in ins[window_start..load_index].iter().enumerate().rev() {
         if instruction.mnemonic() != Mnemonic::Cmp
             || instruction.op0_kind() != OpKind::Register
-            || instruction.op0_register().full_register() != index
+            || instruction.op0_register().full_register() != compared_register
         {
             continue;
         }
@@ -291,14 +299,30 @@ fn compared_entry_count(ins: &[Instruction], load_index: usize, index: Register)
         }?;
         // No later write may change the selector before the table load.
         if ins[absolute + 2..load_index].iter().any(|candidate| {
-            candidate.op0_kind() == OpKind::Register
-                && candidate.op0_register().full_register() == index
+            writes_register(candidate, index)
+                || (compared_register != index && writes_register(candidate, compared_register))
         }) {
             return None;
         }
         return Some(count);
     }
     None
+}
+
+fn selector_copy_origin(ins: &[Instruction], load_index: usize, index: Register) -> Register {
+    let mut current = index.full_register();
+    for instruction in ins[load_index.saturating_sub(32)..load_index].iter().rev() {
+        if !writes_register(instruction, current) {
+            continue;
+        }
+        if instruction.mnemonic() == Mnemonic::Mov
+            && instruction.op1_kind() == OpKind::Register
+        {
+            current = instruction.op1_register().full_register();
+        }
+        break;
+    }
+    current
 }
 
 fn masked_entry_count(ins: &[Instruction], load_index: usize, index: Register) -> Option<u64> {

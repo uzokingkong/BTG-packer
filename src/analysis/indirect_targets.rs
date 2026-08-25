@@ -28,6 +28,7 @@ pub enum TargetProvenance {
     LoadConfig,
     DynamicImport,
     AbiArgument,
+    RuntimeCallback,
     UserSupplied,
 }
 

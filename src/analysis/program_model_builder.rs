@@ -595,6 +595,26 @@ impl<'a> ProgramModelBuilder<'a> {
             &mut model,
             &vtable_resolutions,
         )?;
+        for (internal, runtime_identity) in
+            crate::analysis::pointer_tables::produce_optional_runtime_callbacks(
+                &model,
+                image_base,
+                &relayed_sections,
+            )
+        {
+            if !explicit_sites.contains(&internal.site) {
+                crate::analysis::indirect_resolver::apply_indirect_resolution(
+                    &mut model,
+                    &internal,
+                )?;
+                crate::analysis::indirect_resolver::apply_external_indirect_resolution(
+                    &mut model,
+                    internal.site,
+                    runtime_identity,
+                    crate::analysis::indirect_targets::TargetProvenance::RuntimeCallback,
+                )?;
+            }
+        }
         if let Some(iat) = iat {
             for (site, slot_va) in
                 crate::analysis::pointer_tables::produce_iat_slots(&model, image_base, iat)
@@ -642,6 +662,51 @@ impl<'a> ProgramModelBuilder<'a> {
                         crate::analysis::indirect_targets::TargetProvenance::LoadConfig,
                     )?;
                 }
+            }
+        }
+        // Opaque runtime dispatch is deliberately last: precise internal,
+        // vtable, IAT, dynamic-import and load-config evidence always wins.
+        for (site, runtime_identity) in
+            crate::analysis::pointer_tables::produce_runtime_abi_dispatches(&model, image_base)
+        {
+            if !explicit_sites.contains(&site) {
+                crate::analysis::indirect_resolver::apply_external_indirect_resolution(
+                    &mut model,
+                    site,
+                    runtime_identity,
+                    crate::analysis::indirect_targets::TargetProvenance::RuntimeCallback,
+                )?;
+            }
+        }
+        for (site, runtime_identity) in
+            crate::analysis::pointer_tables::produce_runtime_global_callbacks(
+                &model,
+                image_base,
+                &relayed_sections,
+            )
+        {
+            if !explicit_sites.contains(&site) {
+                crate::analysis::indirect_resolver::apply_external_indirect_resolution(
+                    &mut model,
+                    site,
+                    runtime_identity,
+                    crate::analysis::indirect_targets::TargetProvenance::RuntimeCallback,
+                )?;
+            }
+        }
+        for (site, runtime_identity) in
+            crate::analysis::pointer_tables::produce_runtime_stack_callback_dispatches(
+                &model,
+                image_base,
+            )
+        {
+            if !explicit_sites.contains(&site) {
+                crate::analysis::indirect_resolver::apply_external_indirect_resolution(
+                    &mut model,
+                    site,
+                    runtime_identity,
+                    crate::analysis::indirect_targets::TargetProvenance::RuntimeCallback,
+                )?;
             }
         }
         crate::analysis::indirect_resolver::apply_indirect_resolutions(&mut model, resolutions)?;
@@ -881,6 +946,38 @@ fn merge_basic_blocks(
         let Some(last) = block.instructions.last() else {
             continue;
         };
+        // Calls do not terminate a basic block, so CFG extractors normally
+        // leave one or more indirect calls in the middle of a decoded block.
+        // They are nevertheless first-class canonical sites: commercial
+        // dependency analysis must not rediscover them from raw instructions.
+        for instruction in block.instructions.iter().take(block.instructions.len() - 1) {
+            if instruction.flow_control() != FlowControl::IndirectCall {
+                continue;
+            }
+            let site_id = crate::analysis::indirect_targets::IndirectSiteId(
+                model.indirect_targets.sites.len() as u32,
+            );
+            let instruction_rva = va_to_rva(instruction.ip()).unwrap_or(*start);
+            let source_function = model.blocks[&source].function_id;
+            model
+                .indirect_targets
+                .merge_site(crate::analysis::indirect_targets::IndirectSite {
+                    id: site_id,
+                    instruction_rva,
+                    source_block: source,
+                    source_function,
+                    kind: crate::analysis::indirect_targets::IndirectKind::Call,
+                    status: crate::analysis::indirect_targets::ResolutionStatus::Unresolved,
+                    targets: Default::default(),
+                    table: None,
+                })
+                .expect("new canonical indirect-site id must be unique");
+            model.edges.push(EdgeModel {
+                source,
+                kind: EdgeKind::IndirectCall,
+                target: EdgeTarget::Unresolved,
+            });
+        }
         let next = va_to_rva(last.ip().saturating_add(last.len() as u64));
         let direct = va_to_rva(last.near_branch_target());
         let mut push = |kind, target: Option<u32>| {
@@ -1268,6 +1365,31 @@ mod tests {
             .build_with_basic_blocks(&[foreign])
             .unwrap();
         assert!(model.blocks.is_empty());
+    }
+
+    #[test]
+    fn indirect_call_inside_block_is_a_canonical_site() {
+        let target = target(vec![RuntimeFunction {
+            begin_address: 0x1010,
+            end_address: 0x1020,
+            unwind_info_address: 0x2000,
+        }]);
+        let base = target.image_base;
+        // call rax; nop; ret -- the indirect call is intentionally nonterminal.
+        let model = ProgramModelBuilder::new(&target)
+            .build_with_basic_blocks(&[block(base, 0x1010, &[0xff, 0xd0, 0x90, 0xc3], &[])])
+            .unwrap();
+        let site = model.indirect_targets.sites.values().next().unwrap();
+        assert_eq!(site.instruction_rva, 0x1010);
+        assert_eq!(
+            site.kind,
+            crate::analysis::indirect_targets::IndirectKind::Call
+        );
+        assert!(model.edges.iter().any(|edge| {
+            edge.source == site.source_block
+                && edge.kind == EdgeKind::IndirectCall
+                && edge.target == EdgeTarget::Unresolved
+        }));
     }
 
     #[test]

@@ -1048,6 +1048,274 @@ pub fn produce_abi_argument_resolutions(
     out
 }
 
+pub type MixedRuntimeDispatch = (IndirectResolution, u64);
+
+/// Resolves `fallback = &internal; candidate = [zero-filled callback slot];
+/// cmov fallback,candidate; call fallback`. The internal fallback is retained
+/// as dependency evidence while the externally populated slot closes the
+/// runtime target inventory.
+pub fn produce_optional_runtime_callbacks(
+    program: &ProgramModel,
+    image_base: u64,
+    sections: &[SectionData],
+) -> Vec<MixedRuntimeDispatch> {
+    let mut out = Vec::new();
+    for site in program.indirect_targets.sites.values().filter(|site| {
+        site.status == ResolutionStatus::Unresolved
+    }) {
+        let Some(block) = program.blocks.get(&site.source_block) else { continue };
+        let Some(call_index) = block.instructions.iter().position(|instruction| {
+            instruction.ip().checked_sub(image_base)
+                .and_then(|rva| u32::try_from(rva).ok()) == Some(site.instruction_rva)
+        }) else { continue };
+        let call = &block.instructions[call_index];
+        if call.op0_kind() != OpKind::Register {
+            continue;
+        }
+        let target = call.op0_register().full_register();
+        let Some((cmov_index, cmov)) = block.instructions[..call_index]
+            .iter().enumerate().rev()
+            .find(|(_, instruction)| writes_op0_register(instruction, target))
+        else { continue };
+        if !matches!(cmov.mnemonic(), Mnemonic::Cmove | Mnemonic::Cmovne)
+            || cmov.op1_kind() != OpKind::Register
+        {
+            continue;
+        }
+        let candidate = cmov.op1_register().full_register();
+        let Some(fallback) = block.instructions[..cmov_index].iter().rev().find(|instruction| {
+            writes_op0_register(instruction, target)
+                && instruction.mnemonic() == Mnemonic::Lea
+                && instruction.op1_kind() == OpKind::Memory
+                && instruction.is_ip_rel_memory_operand()
+        }) else { continue };
+        let fallback_rva = u32::try_from(fallback.ip_rel_memory_address().checked_sub(image_base).unwrap_or(u64::MAX)).ok();
+        let Some(fallback_rva) = fallback_rva.filter(|rva| {
+            program.functions.values().any(|function| function.entries.contains(rva))
+        }) else { continue };
+        let Some(load) = block.instructions[..cmov_index].iter().rev().find(|instruction| {
+            writes_op0_register(instruction, candidate)
+                && instruction.mnemonic() == Mnemonic::Mov
+                && instruction.op1_kind() == OpKind::Memory
+                && instruction.memory_index() == Register::None
+        }) else { continue };
+        let Some(slot_rva) = memory_operand_rva(load, image_base) else { continue };
+        if read_u64(sections, slot_rva) != Some(0) {
+            continue;
+        }
+        let writes_are_external_or_zero = program.blocks.values()
+            .flat_map(|owner| owner.instructions.iter())
+            .all(|instruction| {
+                memory_operand_rva(instruction, image_base) != Some(slot_rva)
+                    || instruction.op0_kind() != OpKind::Memory
+                    || unsigned_immediate(instruction, 1) == Some(0)
+            });
+        if !writes_are_external_or_zero {
+            continue;
+        }
+        out.push((
+            IndirectResolution {
+                site: site.id,
+                target_rvas: BTreeSet::from([fallback_rva]),
+                provenance: TargetProvenance::ConstantPropagation,
+                complete: false,
+            },
+            image_base + u64::from(slot_rva),
+        ));
+    }
+    out.sort_by_key(|(resolution, _)| resolution.site);
+    out
+}
+
+/// Classifies callbacks loaded directly from a loader-zero-filled image slot
+/// that has no decoded non-zero direct store. Such slots are populated through
+/// an external registration/runtime mechanism rather than by an internal code
+/// pointer assignment visible in the image.
+pub fn produce_runtime_global_callbacks(
+    program: &ProgramModel,
+    image_base: u64,
+    sections: &[SectionData],
+) -> Vec<(crate::analysis::indirect_targets::IndirectSiteId, u64)> {
+    let mut out = Vec::new();
+    for site in program.indirect_targets.sites.values().filter(|site| {
+        site.status == ResolutionStatus::Unresolved
+    }) {
+        let Some(block) = program.blocks.get(&site.source_block) else { continue };
+        let Some(site_index) = block.instructions.iter().position(|instruction| {
+            instruction.ip().checked_sub(image_base)
+                .and_then(|rva| u32::try_from(rva).ok()) == Some(site.instruction_rva)
+        }) else { continue };
+        let transfer = &block.instructions[site_index];
+        if transfer.op0_kind() != OpKind::Register {
+            continue;
+        }
+        let target = transfer.op0_register().full_register();
+        let Some((definition_block, definition_index)) = find_unique_register_definition(
+            program,
+            site.source_block,
+            site_index,
+            target,
+        ) else { continue };
+        let Some(owner) = program.blocks.get(&definition_block) else { continue };
+        let definition = &owner.instructions[definition_index];
+        if definition.mnemonic() != Mnemonic::Mov
+            || definition.op1_kind() != OpKind::Memory
+            || definition.memory_index() != Register::None
+        {
+            continue;
+        }
+        let Some(slot_rva) = memory_operand_rva(definition, image_base) else { continue };
+        if read_u64(sections, slot_rva) != Some(0) {
+            continue;
+        }
+        let no_internal_store = program.blocks.values()
+            .flat_map(|candidate| candidate.instructions.iter())
+            .all(|instruction| {
+                instruction.op0_kind() != OpKind::Memory
+                    || memory_operand_rva(instruction, image_base) != Some(slot_rva)
+                    || unsigned_immediate(instruction, 1) == Some(0)
+            });
+        if no_internal_store {
+            out.push((site.id, image_base + u64::from(slot_rva)));
+        }
+    }
+    out.sort_by_key(|(site, _)| *site);
+    out
+}
+
+/// Resolves a callback spilled from an ABI argument into a fixed RBP slot.
+/// The slot is accepted only when its nearest canonical store is an exact
+/// register copy whose origin traces back to one of the four x64 ABI arguments.
+pub fn produce_runtime_stack_callback_dispatches(
+    program: &ProgramModel,
+    image_base: u64,
+) -> Vec<(crate::analysis::indirect_targets::IndirectSiteId, u64)> {
+    let mut out = Vec::new();
+    for site in program.indirect_targets.sites.values().filter(|site| {
+        site.status == ResolutionStatus::Unresolved
+    }) {
+        let Some(block) = program.blocks.get(&site.source_block) else { continue };
+        let Some(call) = block.instructions.iter().find(|instruction| {
+            instruction.ip().checked_sub(image_base)
+                .and_then(|rva| u32::try_from(rva).ok()) == Some(site.instruction_rva)
+        }) else { continue };
+        if call.op0_kind() != OpKind::Memory
+            || call.memory_base().full_register() != Register::RBP
+            || call.memory_index() != Register::None
+        {
+            continue;
+        }
+        let mut candidates = program.blocks.values()
+            .filter(|candidate| candidate.function_id == site.source_function)
+            .flat_map(|candidate| candidate.instructions.iter().map(move |instruction| (candidate.id, instruction)))
+            .filter(|(_, instruction)| instruction.ip() < call.ip())
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(_, instruction)| instruction.ip());
+        let displacement = call.memory_displacement64();
+        let Some((store_block, store)) = candidates.into_iter().rev().find(|(_, instruction)| {
+            instruction.mnemonic() == Mnemonic::Mov
+                && instruction.op0_kind() == OpKind::Memory
+                && instruction.memory_base().full_register() == Register::RBP
+                && instruction.memory_index() == Register::None
+                && instruction.memory_displacement64() == displacement
+                && instruction.op1_kind() == OpKind::Register
+        }) else { continue };
+        let Some(owner) = program.blocks.get(&store_block) else { continue };
+        let Some(store_index) = owner.instructions.iter().position(|instruction| instruction.ip() == store.ip()) else { continue };
+        if trace_register_copy_origin(
+            program,
+            store_block,
+            store_index,
+            store.op1_register().full_register(),
+        ).is_none() {
+            continue;
+        }
+        out.push((site.id, image_base + u64::from(site.instruction_rva)));
+    }
+    out.sort_by_key(|(site, _)| *site);
+    out
+}
+
+/// Classifies indirect transfers whose target remains an ABI-supplied runtime
+/// value after canonical copy tracing. These are exhaustive runtime dispatches,
+/// not unresolved internal CFG edges: the machine target is supplied by the
+/// caller and is invoked directly by the VM/native-call bridge.
+pub fn produce_runtime_abi_dispatches(
+    program: &ProgramModel,
+    image_base: u64,
+) -> Vec<(crate::analysis::indirect_targets::IndirectSiteId, u64)> {
+    let mut out = Vec::new();
+    for site in program
+        .indirect_targets
+        .sites
+        .values()
+        .filter(|site| site.status == ResolutionStatus::Unresolved)
+    {
+        let Some(block) = program.blocks.get(&site.source_block) else { continue };
+        let Some(site_index) = block.instructions.iter().position(|instruction| {
+            instruction.ip().checked_sub(image_base)
+                .and_then(|rva| u32::try_from(rva).ok()) == Some(site.instruction_rva)
+        }) else { continue };
+        let transfer = &block.instructions[site_index];
+        let origin = match transfer.op0_kind() {
+            OpKind::Register => {
+                let target = transfer.op0_register().full_register();
+                trace_register_copy_origin(
+                    program,
+                    site.source_block,
+                    site_index,
+                    target,
+                )
+                .or_else(|| {
+                    let (definition_block, definition_index) =
+                        find_unique_register_definition(
+                            program,
+                            site.source_block,
+                            site_index,
+                            target,
+                        )?;
+                    let owner = program.blocks.get(&definition_block)?;
+                    let definition = &owner.instructions[definition_index];
+                    (definition.mnemonic() == Mnemonic::Mov
+                        && definition.op1_kind() == OpKind::Memory
+                        && definition.memory_base() != Register::RIP
+                        && definition.memory_base() != Register::RSP)
+                        .then(|| {
+                            trace_register_copy_origin(
+                                program,
+                                definition_block,
+                                definition_index,
+                                definition.memory_base().full_register(),
+                            )
+                        })
+                        .flatten()
+                })
+            }
+            OpKind::Memory
+                if transfer.memory_base() != Register::RIP
+                    && transfer.memory_base() != Register::RBP
+                    && transfer.memory_base() != Register::RSP =>
+            {
+                trace_register_copy_origin(
+                    program,
+                    site.source_block,
+                    site_index,
+                    transfer.memory_base().full_register(),
+                )
+            }
+            _ => None,
+        };
+        if origin.is_none() {
+            continue;
+        }
+        // The instruction VA is a stable identity for this runtime dispatch
+        // class; it is not presented as the eventual loader/runtime target.
+        out.push((site.id, image_base + u64::from(site.instruction_rva)));
+    }
+    out.sort_by_key(|(site, _)| *site);
+    out
+}
+
 fn direct_call_argument_target(
     program: &ProgramModel,
     block_id: super::program_model::BlockId,
