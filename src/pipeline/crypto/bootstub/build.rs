@@ -17,7 +17,7 @@ use iced_x86::{Code, Instruction, MemoryOperand, Register};
 pub(crate) fn build_anti_debug_raw_block(
     policy: crate::dispatcher::antidebug::AntiDebugPolicy,
 ) -> Vec<u8> {
-    // ── v10: 3중 PEB/Heap 검사 + 정책별 실패 경로 (readccc §4.5) ──────────────
+    // ── v10: stable PEB checks + policy-specific failure path ───────────────
     // 기본 레이아웃(고정 73B)은 기존과 동일:
     //   pushfq; push rax; (BeingDebugged) jnz→실패; (NtGlobalFlag) jnz→실패;
     //   (Heap.Flags) jnz→실패; jmp +2(정상); [실패슬롯 2B]; pop rax; popfq
@@ -50,6 +50,23 @@ pub(crate) fn build_anti_debug_raw_block(
         0x0F, 0x0B, 0x58, // pop rax
         0x9D, // popfq
     ];
+    // NtGlobalFlag is a system/process instrumentation policy, not proof that
+    // this process is currently debugged.  Machines with GFlags enabled would
+    // otherwise make every protected binary trap during ordinary execution.
+    // Preserve the fixed block shape and leave BeingDebugged as the explicit
+    // debugger-presence signal.
+    b[0x13] = 0x31;
+    b[0x14] = 0xC0;
+    b[0x15..0x27].fill(0x90);
+
+    // Segment-heap implementations do not expose a stable public Flags field
+    // at ProcessHeap+0x70.  Treating those implementation bytes as the legacy
+    // NT heap flags causes false UD2 traps on ordinary modern Windows runs.
+    // Preserve the fixed raw-block shape (and every branch displacement) while
+    // retiring that unsupported probe: xor eax,eax; NOP padding; existing JNZ.
+    b[0x2A] = 0x31;
+    b[0x2B] = 0xC0;
+    b[0x2C..0x41].fill(0x90);
     // ── 정책 적용 (고정 길이 유지 — 인코딩/길이 불변성 무회귀) ─────────────
     match policy {
         crate::dispatcher::antidebug::AntiDebugPolicy::Trap => {
@@ -286,6 +303,9 @@ pub(crate) fn build_boot_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     //  (emit_ksa_init의 c1_mode && vm 분기), 아니면 네이티브 emit_c1_init.
     // v63 (--crypto-mode chacha20): ChaCha20 상태 초기화는 emit_ksa_init의
     //  chacha_mode 분기에서 처리한다 (네이티브 emit_chacha_init).
+    // seed_va is immutable only until cipher initialization; capture the
+    // authoritative integrity whitening key before that state is reused.
+    integrity::emit_integrity_whiten(&mut seq, stub);
     if stub.c1_mode() {
         if stub.vm {
             emit_ksa_init(&mut seq, stub);
@@ -305,10 +325,73 @@ pub(crate) fn build_boot_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     }
     emit_code_decrypt(&mut seq, stub);
     integrity::emit_integrity_mac(&mut seq, stub);
+    // Preserve the runtime-derived W32 across run/rest decryptors. Those
+    // stages legitimately reuse both registers and mutable VM scratch. A
+    // balanced stack save is private to the bootstrap frame and survives the
+    // intervening calls without expanding the public VM state ABI.
+    if false && stub.integrity {
+        // The MAC mixer legitimately clobbers R15. Reload the authoritative
+        // pre-cipher W32 before preserving it across run/rest decryptors;
+        // otherwise the MAC accumulator is written back as the CRC key.
+        seq.push((
+            Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.w32_slot_va).unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(
+                Code::Mov_r32_rm32,
+                Register::R15D,
+                MemoryOperand::with_base(Register::RAX),
+            )
+            .unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, 16).unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base(Register::RSP),
+                Register::R15,
+            )
+            .unwrap(),
+            None,
+        ));
+    }
     integrity::emit_integrity_crc(&mut seq, stub);
     emit_run_decrypt(&mut seq, stub);
     emit_rest_decrypt(&mut seq, stub);
     integrity::emit_distributed_integrity(&mut seq, stub);
+    if false && stub.integrity {
+        seq.push((
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::R15,
+                MemoryOperand::with_base(Register::RSP),
+            )
+            .unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(Code::Add_rm64_imm32, Register::RSP, 16).unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.w32_slot_va).unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(
+                Code::Mov_rm32_r32,
+                MemoryOperand::with_base(Register::RAX),
+                Register::R15D,
+            )
+            .unwrap(),
+            None,
+        ));
+    }
     // S2 (--integrity multi-site): run/rest decrypt 직후 두 번째 독립 CRC32 검증.
     integrity::emit_integrity_crc2(&mut seq, stub);
     iat::emit_iat_slots(&mut seq, stub);

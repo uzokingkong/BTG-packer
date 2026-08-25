@@ -100,6 +100,60 @@ pub fn apply_external_indirect_resolution(
     Ok(())
 }
 
+/// Closes an indirect site with the canonical runtime-route partition. At
+/// execution time the computed address is first looked up in the complete
+/// ProgramModel route; addresses outside the image use the native bridge.
+/// This represents the dispatch algorithm itself, not a guessed target.
+pub fn apply_runtime_route_resolution(
+    program: &mut ProgramModel,
+    site_id: IndirectSiteId,
+) -> Result<(), IndirectResolveError> {
+    let mut next = program.clone();
+    let site = next
+        .indirect_targets
+        .sites
+        .get(&site_id)
+        .ok_or(IndirectResolveError::MissingSite(site_id))?
+        .clone();
+    let edge_kind = match site.kind {
+        IndirectKind::Call => EdgeKind::IndirectCall,
+        IndirectKind::Jump => EdgeKind::IndirectJump,
+    };
+    let matching = next
+        .edges
+        .iter()
+        .enumerate()
+        .filter(|(_, edge)| {
+            edge.source == site.source_block
+                && edge.kind == edge_kind
+                && edge.target == EdgeTarget::Unresolved
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let [index] = matching.as_slice() else {
+        return Err(if matching.is_empty() {
+            IndirectResolveError::MissingUnresolvedEdge(site_id)
+        } else {
+            IndirectResolveError::MultipleUnresolvedEdges(site_id)
+        });
+    };
+    next.edges.remove(*index);
+    let target_site = next.indirect_targets.sites.get_mut(&site_id).unwrap();
+    target_site.targets.insert(
+        IndirectTarget::RuntimeRoute,
+        TargetProvenance::RuntimeRoute,
+    );
+    target_site.status = ResolutionStatus::Complete;
+    next.edges.push(EdgeModel {
+        source: site.source_block,
+        kind: edge_kind,
+        target: EdgeTarget::RuntimeRoute,
+    });
+    next.edges.sort_by_key(edge_key);
+    *program = next;
+    Ok(())
+}
+
 /// Atomically applies a producer's complete batch of indirect-target evidence.
 ///
 /// A later request may depend on an earlier request in the same batch (for
@@ -198,6 +252,7 @@ fn apply(
                 IndirectTarget::Block(id) => EdgeTarget::Block(id),
                 IndirectTarget::Function(id) => EdgeTarget::Function(id),
                 IndirectTarget::External(va) => EdgeTarget::External(va),
+                IndirectTarget::RuntimeRoute => EdgeTarget::RuntimeRoute,
             },
         });
     }
@@ -256,7 +311,8 @@ fn edge_key(edge: &EdgeModel) -> (BlockId, u8, u8, u64) {
         EdgeTarget::Block(id) => (0, u64::from(id.0)),
         EdgeTarget::Function(id) => (1, u64::from(id.0)),
         EdgeTarget::External(va) => (2, va),
-        EdgeTarget::Unresolved => (3, 0),
+        EdgeTarget::RuntimeRoute => (3, 0),
+        EdgeTarget::Unresolved => (4, 0),
     };
     (edge.source, kind, target_kind, target)
 }

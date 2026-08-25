@@ -25,13 +25,14 @@ fn seh_ownership_mode(full_seh_virtualize: bool) -> SehOwnershipMode {
     {
         "full" | "strict" => SehOwnershipMode::Full,
         "guarded" => SehOwnershipMode::Guarded,
+        "preserve" | "native" => SehOwnershipMode::Preserve,
         _ if std::env::var("BTG_SEH_NONE").map_or(false, |v| v != "0") => {
             // The legacy switch's literal contract is now enforced: no input
             // SEH/panic function remains native.  Callers needing the former
             // safety-net behavior must request BTG_SEH_OWNERSHIP=guarded.
             SehOwnershipMode::Full
         }
-        _ => SehOwnershipMode::Preserve,
+        _ => SehOwnershipMode::Full,
     }
 }
 

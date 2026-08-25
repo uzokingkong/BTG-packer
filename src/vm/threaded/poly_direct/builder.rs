@@ -2651,6 +2651,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
     // on an entry proven by ip_map and consequently present in branch_map.
     // A miss executes UD2 instead of interpreting attacker-controlled input as
     // a native function pointer.
+    let indirect_halt_tag = usize::MAX - 0xC4;
     let mut emit_indirect_transfer = |b: &mut CodeBuilder| -> usize {
         let handler = b.len();
         b.call(sub_dec_ops);
@@ -2660,6 +2661,12 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         mov_m(b, Register::R11, DEC_IMM1);
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R10, Register::RAX).unwrap());
+
+        // C4 is the canonical top-level continuation sentinel installed by
+        // the dispatcher. It denotes VM completion, not an indirect target.
+        movi(b, Register::R9, C4);
+        b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::R10, Register::R9).unwrap());
+        b.br(Code::Je_rel32_64, indirect_halt_tag);
 
         // Resolve exclusively through the immutable branch map.
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::R15).unwrap());
@@ -2763,6 +2770,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         b.push(Instruction::with1(Code::Pop_r64, Register::R13).unwrap());
         b.push(Instruction::with1(Code::Pop_r64, Register::R12).unwrap());
         b.push(Instruction::with(Code::Retnq));
+    }
+    for (_, target) in &mut b.branches {
+        if *target == indirect_halt_tag {
+            *target = h_halt;
+        }
     }
     let h_trap = b.len();
     b.push(Instruction::with(Code::Ud2));
@@ -6291,7 +6303,10 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
     ] {
         b.push(Instruction::with1(Code::Pop_r64, reg).unwrap());
     }
-    b.push(Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::EAX).unwrap());
+    // EXCEPTION_DISPOSITION::ExceptionContinueSearch. Returning zero means
+    // ContinueExecution, which is invalid during phase-2 unwind and causes
+    // STATUS_INVALID_DISPOSITION (0xC0000026) for Rust/MSVC panics.
+    b.push(Instruction::with2(Code::Mov_r32_imm32, Register::EAX, 1).unwrap());
     b.push(Instruction::with(Code::Retnq));
     for (edge, target) in [
         (cleanup_done_edge, cleanup_done),

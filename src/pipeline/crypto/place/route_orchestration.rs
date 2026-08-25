@@ -52,6 +52,7 @@ pub(super) fn build_commercial_routes(
         for target in site.targets.targets.keys() {
             let (function_id, target_rva) = match *target {
                 IndirectTarget::External(_) => continue,
+                IndirectTarget::RuntimeRoute => continue,
                 IndirectTarget::Function(id) => {
                     let function = program.functions.get(&id).ok_or_else(|| {
                         anyhow!(

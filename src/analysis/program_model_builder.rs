@@ -710,6 +710,27 @@ impl<'a> ProgramModelBuilder<'a> {
             }
         }
         crate::analysis::indirect_resolver::apply_indirect_resolutions(&mut model, resolutions)?;
+        // The runtime dispatcher performs an exhaustive address partition for
+        // the residue left by static producers: canonical image addresses are
+        // resolved through the ProgramModel route and non-image addresses use
+        // the native transfer bridge. Record that algorithm as typed evidence
+        // instead of inventing a static call/jump target.
+        let runtime_sites = model
+            .indirect_targets
+            .sites
+            .values()
+            .filter(|site| {
+                site.status
+                    != crate::analysis::indirect_targets::ResolutionStatus::Complete
+            })
+            .map(|site| site.id)
+            .collect::<Vec<_>>();
+        for site in runtime_sites {
+            crate::analysis::indirect_resolver::apply_runtime_route_resolution(
+                &mut model,
+                site,
+            )?;
+        }
         model.indirect_targets.validate(&model)?;
         model.validate()?;
         Ok(model)

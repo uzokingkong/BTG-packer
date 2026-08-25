@@ -367,6 +367,7 @@ pub fn render_edges_csv(model: &ProgramModel) -> String {
             EdgeTarget::External(address) => {
                 ("external", String::new(), format!("0x{address:016X}"))
             }
+            EdgeTarget::RuntimeRoute => ("runtime_route", String::new(), String::new()),
             EdgeTarget::Unresolved => ("unresolved", String::new(), String::new()),
         };
         push_row(
@@ -438,7 +439,8 @@ fn edge_target_sort_key(target: &EdgeTarget) -> (u8, u64) {
         EdgeTarget::Block(id) => (0, id.0 as u64),
         EdgeTarget::Function(id) => (1, id.0 as u64),
         EdgeTarget::External(address) => (2, *address),
-        EdgeTarget::Unresolved => (3, 0),
+        EdgeTarget::RuntimeRoute => (3, 0),
+        EdgeTarget::Unresolved => (4, 0),
     }
 }
 

@@ -143,6 +143,39 @@ pub fn run_with_indirect_resolutions(
                 "[+] Canonical unresolved top patterns: {:?}",
                 top.into_iter().take(16).collect::<Vec<_>>()
             );
+            if std::env::var("BTG_DIAG_INDIRECT").is_ok_and(|value| value != "0") {
+                for site in model.indirect_targets.sites.values().filter(|site| {
+                    site.status
+                        != crate::analysis::indirect_targets::ResolutionStatus::Complete
+                }) {
+                    if let Some(block) = model.blocks.get(&site.source_block) {
+                        let mut context = model
+                            .edges
+                            .iter()
+                            .filter_map(|edge| match edge.target {
+                                crate::analysis::program_model::EdgeTarget::Block(target)
+                                    if target == site.source_block => model.blocks.get(&edge.source),
+                                _ => None,
+                            })
+                            .flat_map(|predecessor| predecessor.instructions.iter().rev().take(8))
+                            .map(|instruction| format!("{:#x}:{}", instruction.ip(), instruction))
+                            .collect::<Vec<_>>();
+                        context.reverse();
+                        context.extend(block
+                            .instructions
+                            .iter()
+                            .map(|instruction| format!("{:#x}:{}", instruction.ip(), instruction))
+                        );
+                        eprintln!(
+                            "[INDIRECT-DIAG] rva={:#x} kind={:?} status={:?} block={}",
+                            site.instruction_rva, site.kind, site.status, site.source_block.0
+                        );
+                        for instruction in context {
+                            eprintln!("[INDIRECT-CONTEXT] rva={:#x} {instruction}", site.instruction_rva);
+                        }
+                    }
+                }
+            }
         }
     }
 

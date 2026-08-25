@@ -74,6 +74,7 @@ pub enum EdgeTarget {
     Block(BlockId),
     Function(FunctionId),
     External(u64),
+    RuntimeRoute,
     Unresolved,
 }
 
@@ -204,7 +205,7 @@ impl ProgramModel {
                         entries.extend(function.entries.iter().copied());
                     }
                 }
-                EdgeTarget::External(_) | EdgeTarget::Unresolved => {}
+                EdgeTarget::External(_) | EdgeTarget::RuntimeRoute | EdgeTarget::Unresolved => {}
             }
         }
         for pointer in self.code_pointers.values() {

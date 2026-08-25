@@ -663,77 +663,13 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
                 Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
                 Some(Label::AttestFail),
             ));
-            seq.push((
-                Instruction::with2(
-                    Code::Mov_r64_rm64,
-                    Register::RAX,
-                    MemoryOperand::with_base_displ_bcst_seg(
-                        Register::None,
-                        0x60,
-                        false,
-                        Register::GS,
-                    ),
-                )
-                .unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with2(
-                    Code::Mov_r32_rm32,
-                    Register::EAX,
-                    MemoryOperand::with_base_displ(Register::RAX, 0xBC),
-                )
-                .unwrap(),
-                None,
-            )); // NtGlobalFlag
-            seq.push((
-                Instruction::with2(Code::And_rm32_imm32, Register::EAX, 0x70).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
-                Some(Label::AttestFail),
-            ));
-            seq.push((
-                Instruction::with2(
-                    Code::Mov_r64_rm64,
-                    Register::RAX,
-                    MemoryOperand::with_base_displ_bcst_seg(
-                        Register::None,
-                        0x60,
-                        false,
-                        Register::GS,
-                    ),
-                )
-                .unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with2(
-                    Code::Mov_r64_rm64,
-                    Register::RAX,
-                    MemoryOperand::with_base_displ(Register::RAX, 0x30),
-                )
-                .unwrap(),
-                None,
-            )); // ProcessHeap
-            seq.push((
-                Instruction::with2(
-                    Code::Mov_r32_rm32,
-                    Register::EAX,
-                    MemoryOperand::with_base_displ(Register::RAX, 0x70),
-                )
-                .unwrap(),
-                None,
-            )); // Heap.Flags
-            seq.push((
-                Instruction::with2(Code::And_rm32_imm32, Register::EAX, 0x70).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
-                Some(Label::AttestFail),
-            ));
+            // NtGlobalFlag describes configured instrumentation and can remain
+            // set without an attached debugger. BeingDebugged above is the
+            // stable loader-owned presence signal.
+            // ProcessHeap internals are not a stable anti-debug ABI (segment
+            // heap in particular does not provide legacy Flags at +0x70).
+            // BeingDebugged and NtGlobalFlag above remain the loader-stable
+            // probes; omit the heap-layout-dependent false-positive source.
             // 타이밍: 10만회 루프가 너무 빠르면(에뮬/튜닝) 실패
             seq.push((Instruction::with(Code::Rdtsc), None));
             seq.push((
@@ -1058,77 +994,10 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
                 Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
                 Some(Label::AttestFail),
             ));
-            seq.push((
-                Instruction::with2(
-                    Code::Mov_r64_rm64,
-                    Register::RAX,
-                    MemoryOperand::with_base_displ_bcst_seg(
-                        Register::None,
-                        0x60,
-                        false,
-                        Register::GS,
-                    ),
-                )
-                .unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with2(
-                    Code::Mov_r32_rm32,
-                    Register::EAX,
-                    MemoryOperand::with_base_displ(Register::RAX, 0xBC),
-                )
-                .unwrap(),
-                None,
-            )); // NtGlobalFlag
-            seq.push((
-                Instruction::with2(Code::And_rm32_imm32, Register::EAX, 0x70).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
-                Some(Label::AttestFail),
-            ));
-            seq.push((
-                Instruction::with2(
-                    Code::Mov_r64_rm64,
-                    Register::RAX,
-                    MemoryOperand::with_base_displ_bcst_seg(
-                        Register::None,
-                        0x60,
-                        false,
-                        Register::GS,
-                    ),
-                )
-                .unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with2(
-                    Code::Mov_r64_rm64,
-                    Register::RAX,
-                    MemoryOperand::with_base_displ(Register::RAX, 0x30),
-                )
-                .unwrap(),
-                None,
-            )); // ProcessHeap
-            seq.push((
-                Instruction::with2(
-                    Code::Mov_r32_rm32,
-                    Register::EAX,
-                    MemoryOperand::with_base_displ(Register::RAX, 0x70),
-                )
-                .unwrap(),
-                None,
-            )); // Heap.Flags
-            seq.push((
-                Instruction::with2(Code::And_rm32_imm32, Register::EAX, 0x70).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
-                Some(Label::AttestFail),
-            ));
+            // Configured GFlags are not an attached-debugger signal.
+            // Do not infer debugger state from undocumented ProcessHeap
+            // offsets. Modern segment heaps make the legacy +0x70 probe an
+            // ordinary-execution false positive.
             // 타이밍: 10만회 루프가 너무 빠르면(에뮬/튜닝) 실패
             seq.push((Instruction::with(Code::Rdtsc), None));
             seq.push((

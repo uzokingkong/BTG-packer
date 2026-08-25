@@ -202,7 +202,10 @@ pub(crate) fn place_boot_stub(
     } else {
         Vec::new()
     };
-    let table_is_run = !no_crypto && !iat_table_blob.is_empty();
+    // The IAT blob is already canonically sealed record-by-record by
+    // iat_hide. Do not layer it onto the payload cipher's continuous stream:
+    // that coupled import resolution to unrelated code/run stream position.
+    let table_is_run = false;
     let total_num_runs = runs.len() + usize::from(table_is_run);
     let num_runs_u32 = total_num_runs as u32;
 
@@ -626,6 +629,37 @@ pub(crate) fn place_boot_stub(
     };
     cursor += vm_prga_total;
     cursor = (cursor + 7) & !7; // align 8
+
+    // Windows invokes TLS callbacks before the PE entry point.  Under complete
+    // commercial ownership the original `.text` is deliberately NX from the
+    // loader's first mapping, so leaving callback-array entries pointed at the
+    // original functions would fault before the boot stub can run.  Keep a
+    // generated pre-entry lifecycle gateway in the executable immutable area.
+    //
+    // Rust's TLS callback is attach-neutral (PROCESS_ATTACH/THREAD_ATTACH take
+    // the immediate return path); its detach path only drains process/thread
+    // destructor bookkeeping.  The OS is already tearing the corresponding
+    // lifetime down, so the pre-entry gateway is intentionally a leaf `ret`.
+    // This removes native `.text` execution without weakening the static W^X
+    // contract.  A future callable-VM TLS ABI can replace the leaf while
+    // retaining the same typed callback-slot relocation point.
+    let tls_gateway_slots: Vec<u32> = if vm_oep_effective && vm_commercial {
+        ctx.target_info
+            .tls
+            .as_ref()
+            .map(|tls| tls.callbacks.iter().map(|cb| cb.slot_rva).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let tls_gateway_off = if tls_gateway_slots.is_empty() {
+        None
+    } else {
+        let off = cursor;
+        cursor += 1; // RET
+        cursor = (cursor + 7) & !7;
+        Some(off)
+    };
 
     // ── M6 Phase-2: 프로그램 VM을 KSA/PRGA VM 뒤에 배치 (각각 독립 state) ──────
     let vm_prog_off = cursor;
@@ -1147,8 +1181,6 @@ pub(crate) fn place_boot_stub(
         .max(runs_off + 8 + total_num_runs * 16)
         .max(text_runs_off + text_runs_block)
         .max(boot_data_end);
-    println!("[DEBUG boot_end] stub_end={} vm_prog_off={} vm_prog_total={} prog_end={} boot_data_end={} boot_end={}",
-        stub_end, vm_prog_off, vm_prog_total, vm_prog_off + vm_prog_total + vm_prog_call_stack, boot_data_end, boot_end);
     let old_section_len = btg.bytes.len();
     let new_section_len = (boot_end + 0xFF) & !0xFF;
     if new_section_len < old_section_len {
@@ -1240,6 +1272,9 @@ pub(crate) fn place_boot_stub(
     let crc_va = dispatcher_va + (seed_off + 256) as u64;
     let mac_va = dispatcher_va + (seed_off + 260) as u64;
     let crc2_va = dispatcher_va + (seed_off + 268) as u64;
+    // Dedicated integrity scratch directly follows CRC2.  It remains live
+    // through CRC4 and is wiped only afterwards; unlike an arbitrary offset in
+    // Program-VM state it cannot alias ChaCha or family runtime state.
     let w32_slot_va = dispatcher_va + (seed_off + 272) as u64;
     let crc3_va = dispatcher_va + (seed_off + 276) as u64;
     let crc4_va = dispatcher_va + (seed_off + 280) as u64;
@@ -1920,18 +1955,24 @@ pub(crate) fn place_boot_stub(
         //   crc2_stored = crc ^ W32 (사이트 2). W32 = derive_integrity_key(seed_masked,
         //   image_base) — runtime-derived multi-factor whiten (seed_masked 256B +
         //   PEB ImageBaseAddress low/high bytes). 사이트 3/4는 W32 / rol(W32,13)로 결합.
-        let w32 = super::integrity::derive_integrity_key(seed_masked, image_base) as u64;
+        // base-bind uses the canonical preferred-base identity (zero XOR), so
+        // the immutable bytes captured by the boot preamble are seed_stored.
+        let mac_w32 = super::integrity::derive_whiten_key(seed_stored) as u64;
+        // One authoritative W32 feeds MAC and every CRC site.  Re-deriving a
+        // second value here previously drifted from the base-bound runtime
+        // preamble and made untouched commercial images fail CRC2.
+        let crc_w32 = mac_w32 as u32;
         let crc_stored = crc_val ^ (mac_val as u32);
-        let mac_stored = mac_val ^ w32;
-        let crc2_stored = crc_val ^ (w32 as u32);
+        let mac_stored = mac_val ^ mac_w32;
+        let crc2_stored = crc_val ^ crc_w32;
         // S3/S4 확장: 사이트별로 다른 runtime-derived whiten 결합 —
         //   crc3_stored = crc ^ W32 / crc4_stored = crc ^ rol(W32,13).
-        let crc3_stored = crc_val ^ (w32 as u32);
+        let crc3_stored = crc_val ^ crc_w32;
         // The native CRC4 verifier loads only the low dword into R11D and
         // executes `rol r11d, 13`.  Rotate that same 32-bit value here.  A
         // 64-bit rotate followed by truncation folds different high bits into
         // the result and made every untouched image fail CRC4 at runtime.
-        let crc4_stored = super::integrity::crc4_stored_value(crc_val, w32 as u32);
+        let crc4_stored = super::integrity::crc4_stored_value(crc_val, crc_w32);
         btg.bytes[seed_off + 256..seed_off + 260].copy_from_slice(&crc_stored.to_le_bytes());
         // S1: keyed-MAC(8B)를 crc 뒤 seed_off+260에 저장 — 부트 스텁이 런타임에
         // 재계산·비교 (불일치 시 ud2). 키 = seed_stored.
@@ -2065,6 +2106,32 @@ pub(crate) fn place_boot_stub(
         println!(
             "[+] v4 Payload Relocate: .vdata section @RVA 0x{:X} ({} bytes) registered",
             payload_rva, ctx.payload_len
+        );
+    }
+
+    if let Some(gateway_off) = tls_gateway_off {
+        if gateway_off >= btg.bytes.len() {
+            anyhow::bail!("TLS lifecycle gateway exceeds generated executable section");
+        }
+        btg.bytes[gateway_off] = 0xC3; // ret
+        let gateway_va = dispatcher_va + gateway_off as u64;
+        for slot_rva in &tls_gateway_slots {
+            let section = ctx
+                .patched_sections
+                .iter_mut()
+                .find(|section| {
+                    *slot_rva >= section.virtual_address
+                        && (*slot_rva as u64 + 8)
+                            <= section.virtual_address as u64 + section.bytes.len() as u64
+                })
+                .ok_or_else(|| anyhow::anyhow!("TLS callback slot RVA {slot_rva:#x} is not file-backed"))?;
+            let offset = (*slot_rva - section.virtual_address) as usize;
+            section.bytes[offset..offset + 8].copy_from_slice(&gateway_va.to_le_bytes());
+        }
+        println!(
+            "[+] TLS pre-entry ownership: redirected {} callback slot(s) to generated lifecycle gateway RVA {:#X}",
+            tls_gateway_slots.len(),
+            dispatcher_rva + gateway_off as u32
         );
     }
 

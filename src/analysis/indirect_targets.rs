@@ -29,6 +29,9 @@ pub enum TargetProvenance {
     DynamicImport,
     AbiArgument,
     RuntimeCallback,
+    /// Exhaustive runtime partition: canonical internal block/function lookup,
+    /// with the non-image remainder delegated to the native transfer bridge.
+    RuntimeRoute,
     UserSupplied,
 }
 
@@ -37,6 +40,7 @@ pub enum IndirectTarget {
     Block(BlockId),
     Function(FunctionId),
     External(u64),
+    RuntimeRoute,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

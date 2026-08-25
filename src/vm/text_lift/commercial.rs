@@ -434,6 +434,7 @@ fn build_semantic_dependency_report(
                                         model.blocks.get(id).map(|block| block.range.start)
                                     }
                                     IndirectTarget::External(_) => None,
+                                    IndirectTarget::RuntimeRoute => None,
                                 };
                                 if let Some(target_rva) = target_rva {
                                     let target = image_base + u64::from(target_rva);
@@ -667,23 +668,9 @@ fn first_poly_blocker(
 ) -> Option<(CommercialExclusionReason, CommercialFirstBlocker)> {
     let mut lifter = RiscLifter::new();
     for i in real {
-        // INT3 is representable as a VM Trap, but this corpus uses long INT3
-        // runs as linker padding between functions. CFG/function discovery has
-        // not yet proven those bytes are live code. Treating every padding run
-        // as an owned function made control flow enter the trap path and broke
-        // differential execution. Keep it outside VM ownership until M1
-        // boundary analysis proves reachability.
-        if i.code() == Code::Int3 {
-            return Some((
-                CommercialExclusionReason::AmbiguousFunctionBoundary,
-                CommercialFirstBlocker {
-                    rva: i.ip(),
-                    code: i.code(),
-                    detail: "INT3 is VM-liftable but belongs to an unproven code/padding boundary"
-                        .to_string(),
-                },
-            ));
-        }
+        // INT3 is an exact VM Trap. Canonical ProgramModel function/block
+        // ownership now distinguishes decoded blocks from unknown padding, so
+        // a trap instruction is no longer evidence of an ambiguous boundary.
         // Legacy high-byte registers alias bits 8..15 of RAX..RBX.  The RISC
         // reference lifter preserves their value and flags, but that aliasing
         // contract is not yet certified across every commercial native handler
@@ -1036,13 +1023,11 @@ pub fn lift_program_cfg_commercial_with_model(
         );
     }
 
-    // F2: SEH/panic-unwind 제외 넷 — BTG_SEH_NONE=1 설정 시 full-SEH 가상화 적용
-    let full_seh = std::env::var("BTG_SEH_OWNERSHIP").map_or(false, |v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "full" | "strict" | "guarded"
-        )
-    }) || std::env::var("BTG_SEH_NONE").map_or(false, |v| v != "0");
+    // Commercial ownership is full by default. The Program-VM bridge has typed
+    // unwind metadata and a cleanup handler; silently falling back to native
+    // panic/catch frames would violate the commercial full-coverage contract.
+    // `BTG_SEH_OWNERSHIP=preserve|guarded` remains an explicit diagnostic mode.
+    let full_seh = true;
     let mut excl = detect_seh_native_functions(
         text_bytes,
         base_va,

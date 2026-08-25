@@ -398,6 +398,33 @@ pub(crate) fn emit_distributed_integrity(
 /// **길이 불변성**: 모든 상수/주소는 imm64/imm32, 분기는 rel32 — 값과 무관 고정
 /// 길이. RBX(S-box base)와 RSP는 건드리지 않는다. (나머지 GPR은 이후 경로가 다시
 /// 초기화하므로 스크래치로 안전.)
+/// Capture the seed-derived whitening key before cipher setup reuses `seed_va`
+/// as mutable working state.  Every later integrity site consumes this slot.
+pub(crate) fn emit_integrity_whiten(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
+    use iced_x86::MemoryOperand as M;
+    if !stub.integrity {
+        return;
+    }
+    seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::R15D, Register::R15D).unwrap(), None));
+    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RSI, stub.seed_va).unwrap(), None));
+    seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::R8D, Register::R8D).unwrap(), None));
+    seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::ECX, Register::ECX).unwrap(), None));
+    seq.push((Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, M::with_base(Register::RSI)).unwrap(), Some(Label::WhitenLoop)));
+    seq.push((Instruction::with3(Code::Imul_r32_rm32_imm32, Register::EAX, Register::EAX, 0x9E37_79B9u32 as i32).unwrap(), None));
+    seq.push((Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::ECX).unwrap(), None));
+    seq.push((Instruction::with2(Code::Rol_rm32_imm8, Register::R15D, 3).unwrap(), None));
+    seq.push((Instruction::with2(Code::Xor_rm32_r32, Register::R15D, Register::EAX).unwrap(), None));
+    seq.push((Instruction::with1(Code::Inc_rm64, Register::RSI).unwrap(), None));
+    seq.push((Instruction::with1(Code::Inc_rm32, Register::R8D).unwrap(), None));
+    seq.push((Instruction::with2(Code::Add_rm32_imm32, Register::ECX, 0x9E37_79B9u32 as i32).unwrap(), None));
+    seq.push((Instruction::with2(Code::Cmp_rm32_imm32, Register::R8D, 256).unwrap(), None));
+    seq.push((Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(), Some(Label::WhitenLoop)));
+    seq.push((Instruction::with2(Code::Rol_rm32_imm8, Register::R15D, 13).unwrap(), None));
+    seq.push((Instruction::with2(Code::Xor_rm32_imm32, Register::R15D, 0xA5A5_5A5Au32).unwrap(), None));
+    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.w32_slot_va).unwrap(), None));
+    seq.push((Instruction::with2(Code::Mov_rm32_r32, M::with_base(Register::RAX), Register::R15D).unwrap(), None));
+}
+
 pub(crate) fn emit_integrity_mac(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
     use iced_x86::MemoryOperand as M;
     const PHI: u64 = 0x9E37_79B9_7F4A_7C15u64;
@@ -417,6 +444,9 @@ pub(crate) fn emit_integrity_mac(seq: &mut Vec<(Instruction, Option<Label>)>, st
             Instruction::with1(Code::Push_r64, Register::RDI).unwrap(),
             None,
         ));
+        // Legacy in-place derivation is intentionally disabled: cipher setup
+        // has already reused seed_va as mutable state at this point.
+        if false {
         // ── W32 whiten-key 유도 (R15D): seed_va(런타임 seed_masked)를 폴드해
         //    derive_whiten_key(seed_masked)와 동일 값을 만든다. 저장된 CRC/MAC
         //    값은 이 값으로 whiten되므로 파일에서 평문이 아니다. R15는 여기서부터
@@ -513,6 +543,20 @@ pub(crate) fn emit_integrity_mac(seq: &mut Vec<(Instruction, Option<Label>)>, st
                 Code::Mov_rm32_r32,
                 MemoryOperand::with_base(Register::RAX),
                 Register::R15D,
+            )
+            .unwrap(),
+            None,
+        ));
+        }
+        seq.push((
+            Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.w32_slot_va).unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(
+                Code::Mov_r32_rm32,
+                Register::R15D,
+                MemoryOperand::with_base(Register::RAX),
             )
             .unwrap(),
             None,
@@ -944,12 +988,13 @@ pub(crate) fn emit_integrity_mac(seq: &mut Vec<(Instruction, Option<Label>)>, st
 
 /// ── S2 (--integrity multi-site hardening): 두 번째 독립 CRC32 검증 사이트 ──────
 /// emit_integrity_crc(사이트 1)와 **다른 지점**(run/rest decrypt 직후)에서 코드
-/// 영역 CRC32를 다시 계산해, `crc2_stored = crc ^ W32`(R15에 남은 런타임 유도
+/// 영역 CRC32를 다시 계산해, `crc2_stored = crc ^ W32`(전용 scratch slot의 런타임 유도
 /// whiten key)와 비교한다. 사이트 1의 `je`→`jmp` 단일 바이트 패치로는 이 사이트를
 /// 무력화할 수 없어, 공격자가 사이트 1을 온전히 우회해도 여기서 트랩된다.
 ///
-/// 길이 불변: 전부 고정 길이 형태 (imm64/imm32/rel32). R15(W32)는 emit_integrity_mac
-/// 의 프리엠블에서 유도되어 run/rest decrypt를 지나 여기까지 생존한다. RSI/RDI
+/// W32 is reloaded from the dedicated slot written by emit_integrity_mac.  It
+/// must not rely on R15 surviving run/rest decryption: ChaCha and payload/IAT
+/// setup legitimately reuse that register. RSI/RDI
 /// (PRGA i/j — 이어지는 IAT 복호화가 사용)는 건드리지 않는다. RBX/RSP도 보존.
 pub(crate) fn emit_integrity_crc2(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
     if stub.integrity {
@@ -1058,9 +1103,23 @@ pub(crate) fn emit_integrity_crc2(seq: &mut Vec<(Instruction, Option<Label>)>, s
             Instruction::with1(Code::Not_rm32, Register::EAX).unwrap(),
             Some(Label::Crc2Done),
         ));
-        // whiten: crc ^ W32 (R15 — 사이트 1 MAC 프리엠블에서 유도). 저장값 = crc ^ W32.
+        // whiten: crc ^ W32. Reload the authoritative value instead of relying
+        // on a cross-stage live-register convention.
         seq.push((
-            Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::R15D).unwrap(),
+            Instruction::with2(Code::Mov_r64_imm64, Register::R11, stub.w32_slot_va).unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(
+                Code::Mov_r32_rm32,
+                Register::R11D,
+                MemoryOperand::with_base(Register::R11),
+            )
+            .unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::R11D).unwrap(),
             None,
         ));
         seq.push((

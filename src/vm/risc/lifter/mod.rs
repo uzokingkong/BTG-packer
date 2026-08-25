@@ -508,6 +508,31 @@ impl RiscLifter {
             }
             Code::Cpuid => self.desynth.instrs.push(MicroInstr::new(RiscOp::CpuId)),
             Code::Xgetbv => self.desynth.instrs.push(MicroInstr::new(RiscOp::XGetBv)),
+            Code::Cdqe => {
+                // RAX := sign_extend(EAX). CDQE does not modify flags, while
+                // the primitive shift ops do, so preserve the guest flags
+                // across the two-op sign-extension sequence.
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::Mov)
+                        .with_dst(MicroOperand::Temp(7))
+                        .with_src1(MicroOperand::Vflags),
+                );
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::ShiftLeft)
+                        .with_dst(MicroOperand::VReg(0))
+                        .with_src1(MicroOperand::VReg(0))
+                        .with_src2(MicroOperand::Imm64(32)),
+                );
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::ArithmeticShiftRight)
+                        .with_dst(MicroOperand::VReg(0))
+                        .with_src1(MicroOperand::VReg(0))
+                        .with_src2(MicroOperand::Imm64(32)),
+                );
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)),
+                );
+            }
             Code::Mov_r64_rm64 | Code::Mov_r32_rm32 | Code::Mov_r16_rm16 | Code::Mov_r8_rm8 => {
                 let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
                 let mov_width = self.begin_mov_register_write(inst, dst);
