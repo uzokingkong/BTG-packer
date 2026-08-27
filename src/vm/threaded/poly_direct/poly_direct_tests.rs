@@ -1113,7 +1113,7 @@ fn test_lifted_fnv_loop_backward_branch_matches_host_arithmetic() {
         0x49, 0xFF, 0xC0, // inc r8
         0x4C, 0x8B, 0xCE, // mov r9,rsi
         0x4C, 0x39, 0xC1, // cmp rcx,r8
-        0x75, 0xE6, 0xC3, // jne mov r9,rsi; ret
+        0x75, 0xE6, // jne mov r9,rsi; fall through to explicit VM Halt
     ];
     let mut decoder = Decoder::with_ip(64, &raw, 0x140002000, DecoderOptions::NONE);
     let mut lifter = RiscLifter::new();
@@ -1123,6 +1123,10 @@ fn test_lifted_fnv_loop_backward_branch_matches_host_arithmetic() {
         ip_map.insert(inst.ip(), lifter.desynth.instrs.len());
         lifter.lift_instruction(&inst).unwrap();
     }
+    // This test isolates backward-branch/IP-map/rolling-key resync semantics.
+    // Terminate explicitly in VM IR instead of relying on architectural x86 RET,
+    // which has its own guest-stack semantics and is covered by dedicated tests.
+    lifter.desynth.instrs.push(MicroInstr::new(RiscOp::Halt));
     let prog = RiscProgram::with_ip_map(lifter.desynth.instrs, ip_map.clone());
     let mut guest_stack = vec![0u8; 0x4000];
     let mut init = [0u64; 16];
