@@ -164,6 +164,20 @@ jobs:
             test/target/release/rust_packer_test.pdb
           if-no-files-found: warn
 
+      - name: Arm first-crash dumps for real payload verification
+        if: always()
+        shell: pwsh
+        run: |
+          $dumpDir = Join-Path $PWD "real-first-crashdumps"
+          New-Item -ItemType Directory -Force $dumpDir | Out-Null
+          foreach ($name in @("commercial-real-full.exe", "commercial-real-partial.exe")) {
+            $wer = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\$name"
+            New-Item -Path $wer -Force | Out-Null
+            Set-ItemProperty -Path $wer -Name DumpFolder -Value $dumpDir -Type ExpandString
+            Set-ItemProperty -Path $wer -Name DumpType -Value 2 -Type DWord
+            Set-ItemProperty -Path $wer -Name DumpCount -Value 4 -Type DWord
+          }
+
       - name: Commercial real payload full-coverage differential
         if: always()
         id: real_full
@@ -260,6 +274,7 @@ jobs:
             commercial-real-partial.exe.sym
             commercial-real-partial.log
             real-crashdumps/*.dmp
+            real-first-crashdumps/*.dmp
           if-no-files-found: ignore
 
       - name: Commercial Program-VM corpus E2E
