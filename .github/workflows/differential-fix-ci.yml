@@ -112,16 +112,31 @@ jobs:
         if: always()
         run: cargo clippy --all-targets --all-features --locked
 
+      - name: Reconstruct exact uploaded Rust QA payload
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force qa | Out-Null
+          $b64 = (Get-Content ".ci/rust_packer_test.exe.b64" -Raw) -replace "\\s+", ""
+          [IO.File]::WriteAllBytes("qa/rust_packer_test.exe", [Convert]::FromBase64String($b64))
+          $sha = (Get-FileHash "qa/rust_packer_test.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $size = (Get-Item "qa/rust_packer_test.exe").Length
+          Write-Host "[EXACT-UPLOAD] size=$size sha256=$sha"
+          if ($size -ne 261632) { throw "exact uploaded payload size mismatch: $size" }
+          if ($sha -ne "9e3e6949f51ac2e07072a4f170ca00f9ecb66150eb4787742e5adab3964c7c62") {
+            throw "exact uploaded payload SHA-256 mismatch: $sha"
+          }
+
       - name: Build uploaded-equivalent Windows QA payload
         if: always()
         run: cargo build --release --manifest-path test/Cargo.toml
 
-      - name: Fingerprint uploaded-equivalent payload
+      - name: Fingerprint exact uploaded payload
         if: always()
         id: uploaded_fingerprint
         shell: pwsh
         run: |
-          $input = "test/target/release/rust_packer_test.exe"
+          $input = "qa/rust_packer_test.exe"
           if (-not (Test-Path $input)) { throw "QA payload missing: $input" }
           $expectedSha = "9e3e6949f51ac2e07072a4f170ca00f9ecb66150eb4787742e5adab3964c7c62"
           $expectedSize = 261632
@@ -135,13 +150,15 @@ jobs:
           "sha256=$actualSha" >> $env:GITHUB_OUTPUT
           "size=$actualSize" >> $env:GITHUB_OUTPUT
           "exact=$($isExact.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          if (-not $isExact) { throw "exact uploaded payload fingerprint mismatch" }
 
-      - name: Upload reproduced real payload
+      - name: Upload exact and reproduced QA payloads
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rust-packer-test-reproduced
+          name: rust-packer-test-inputs
           path: |
+            qa/rust_packer_test.exe
             test/target/release/rust_packer_test.exe
             test/target/release/rust_packer_test.pdb
           if-no-files-found: warn
@@ -155,7 +172,7 @@ jobs:
           BTG_TRACE_OP_MAP_OFFSET: "619da"
           BTG_TRACE_OP_MAP_RANGE: "61900-61a30"
         run: |
-          $input = "test/target/release/rust_packer_test.exe"
+          $input = "qa/rust_packer_test.exe"
           $output = "commercial-real-full.exe"
           Remove-Item -Force $output, "$output.failed.exe" -ErrorAction SilentlyContinue
           $packArgs = @(
@@ -179,7 +196,7 @@ jobs:
           BTG_TRACE_OP_MAP_OFFSET: "619da"
           BTG_TRACE_OP_MAP_RANGE: "61900-61a30"
         run: |
-          $input = "test/target/release/rust_packer_test.exe"
+          $input = "qa/rust_packer_test.exe"
           $output = "commercial-real-partial.exe"
           Remove-Item -Force $output, "$output.failed.exe" -ErrorAction SilentlyContinue
           $packArgs = @(
