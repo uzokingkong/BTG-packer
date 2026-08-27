@@ -34,6 +34,32 @@ jobs:
           path: target/release/btg-packer.exe
           if-no-files-found: error
 
+      - name: Commercial Program-VM E2E differential
+        shell: pwsh
+        run: |
+          Remove-Item -Force dummy_target.exe, packed-e2e.exe -ErrorAction SilentlyContinue
+          & .\target\release\btg-packer.exe `
+            --input dummy_target.exe `
+            --output packed-e2e.exe `
+            --vm --vm-oep --vm-commercial `
+            --verify-output --verify-timeout-secs 15 `
+            --seed 31010
+          if (-not (Test-Path packed-e2e.exe)) {
+            throw "commercial E2E did not produce packed-e2e.exe"
+          }
+
+      - name: Upload commercial E2E PE
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btg-commercial-e2e
+          path: |
+            packed-e2e.exe
+            packed-e2e.failed.*.exe
+            packed-e2e.exe.btgmanifest
+            packed-e2e.exe.ownership.csv
+          if-no-files-found: ignore
+
       - name: Backward branch regression
         run: cargo test --release --locked --lib test_lifted_fnv_loop_backward_branch_matches_host_arithmetic -- --nocapture --test-threads=1
 
