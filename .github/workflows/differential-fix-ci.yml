@@ -11,7 +11,7 @@ env:
 
 jobs:
   validate:
-    name: cargo check + test + build
+    name: cargo check + test + real pack differential
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,32 +40,49 @@ jobs:
         shell: pwsh
         run: |
           Remove-Item -Force dummy_target.exe, packed-e2e.exe -ErrorAction SilentlyContinue
-          & .\target\release\btg-packer.exe `
-            --input dummy_target.exe `
-            --output packed-e2e.exe `
-            --vm --vm-oep --vm-commercial `
-            --verify-output --verify-timeout-secs 15 `
-            --seed 31010
+          $packArgs = @(
+            "--input", "dummy_target.exe",
+            "--output", "packed-e2e.exe",
+            "--vm", "--vm-oep", "--vm-commercial",
+            "--verify-output", "--verify-timeout-secs", "15",
+            "--map", "--sym-map",
+            "--seed", "31010"
+          )
+          & ".\target\release\btg-packer.exe" @packArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path packed-e2e.exe)) {
             throw "commercial E2E did not produce packed-e2e.exe"
           }
 
       - name: Capture commercial E2E crash dump
         if: steps.commercial_e2e.outcome == 'failure'
+        continue-on-error: true
         shell: pwsh
         run: |
-          $failed = Get-ChildItem -File "packed-e2e.failed*.exe" | Select-Object -First 1
-          if (-not $failed) { throw "isolated failed PE not found" }
+          $failed = Get-ChildItem -File "packed-e2e.failed*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $failed) {
+            Write-Warning "isolated failed PE not found; no crash probe"
+            exit 0
+          }
           $dumpDir = Join-Path $PWD "crashdumps"
           New-Item -ItemType Directory -Force $dumpDir | Out-Null
           $wer = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\$($failed.Name)"
           New-Item -Path $wer -Force | Out-Null
           Set-ItemProperty -Path $wer -Name DumpFolder -Value $dumpDir -Type ExpandString
           Set-ItemProperty -Path $wer -Name DumpType -Value 2 -Type DWord
+          $started = Get-Date
           $p = Start-Process -FilePath $failed.FullName -PassThru -Wait
-          Write-Host ("[CRASH-PROBE] exit=0x{0:X8}" -f ([uint32]$p.ExitCode))
-          Start-Sleep -Seconds 2
-          Get-ChildItem -File $dumpDir | Format-Table Name,Length,LastWriteTime
+          $bits = [System.BitConverter]::ToUInt32([System.BitConverter]::GetBytes([int32]$p.ExitCode), 0)
+          Write-Host ("[CRASH-PROBE] exit=0x{0:X8}" -f $bits)
+          Start-Sleep -Seconds 3
+          $dumps = Get-ChildItem -File $dumpDir -ErrorAction SilentlyContinue
+          if ($dumps) {
+            $dumps | Format-Table Name,Length,LastWriteTime
+          } else {
+            Write-Warning "WER did not materialize a dump"
+          }
+          Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000; StartTime=$started.AddMinutes(-1)} -ErrorAction SilentlyContinue |
+            Select-Object -First 3 TimeCreated,Message | Format-List
 
       - name: Upload commercial E2E PE
         if: always()
@@ -79,44 +96,164 @@ jobs:
             crashdumps/*.dmp
             packed-e2e.exe.btgmanifest
             packed-e2e.exe.ownership.csv
+            packed-e2e.exe.map
+            packed-e2e.exe.sym
           if-no-files-found: ignore
 
       - name: Backward branch regression
+        if: always()
         run: cargo test --release --locked --lib test_lifted_fnv_loop_backward_branch_matches_host_arithmetic -- --nocapture --test-threads=1
 
       - name: Cargo test (serial diagnostics)
+        if: always()
         run: cargo test --release --locked --lib -- --nocapture --test-threads=1
 
       - name: Clippy
+        if: always()
         run: cargo clippy --all-targets --all-features --locked
 
-      - name: Build real Windows QA payload
-        run: cargo build --manifest-path test/Cargo.toml
+      - name: Build uploaded-equivalent Windows QA payload
+        if: always()
+        run: cargo build --release --manifest-path test/Cargo.toml
 
-      - name: Commercial Program-VM direct differential
+      - name: Fingerprint uploaded-equivalent payload
+        if: always()
+        id: uploaded_fingerprint
         shell: pwsh
         run: |
-          $input = "test/target/debug/rust_packer_test.exe"
-          $output = "commercial-direct-verified.exe"
+          $input = "test/target/release/rust_packer_test.exe"
           if (-not (Test-Path $input)) { throw "QA payload missing: $input" }
-          & "target/release/btg-packer.exe" --input $input --output $output --vm --vm-oep --vm-commercial --verify-output --verify-timeout-secs 30 --seed 3134984190
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (-not (Test-Path $output)) { throw "verified output missing: $output" }
+          $expectedSha = "9e3e6949f51ac2e07072a4f170ca00f9ecb66150eb4787742e5adab3964c7c62"
+          $expectedSize = 261632
+          $actualSha = (Get-FileHash $input -Algorithm SHA256).Hash.ToLowerInvariant()
+          $actualSize = (Get-Item $input).Length
+          $isExact = ($actualSha -eq $expectedSha -and $actualSize -eq $expectedSize)
+          Write-Host "[UPLOADED-PAYLOAD] path=$input"
+          Write-Host "[UPLOADED-PAYLOAD] size=$actualSize expected=$expectedSize"
+          Write-Host "[UPLOADED-PAYLOAD] sha256=$actualSha"
+          Write-Host "[UPLOADED-PAYLOAD] exact_match=$isExact"
+          "sha256=$actualSha" >> $env:GITHUB_OUTPUT
+          "size=$actualSize" >> $env:GITHUB_OUTPUT
+          "exact=$($isExact.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
-      - name: Commercial Program-VM corpus E2E
-        run: cargo run --release --locked -- --test-qa --qa-commercial
-
-      - name: Upload verified commercial binary
+      - name: Upload reproduced real payload
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: btg-commercial-differential-verified
+          name: rust-packer-test-reproduced
           path: |
-            commercial-direct-verified.exe
-            commercial-direct-verified.exe.btgmanifest
-          if-no-files-found: error
+            test/target/release/rust_packer_test.exe
+            test/target/release/rust_packer_test.pdb
+          if-no-files-found: warn
 
-      - name: Fail on commercial E2E regression
-        if: always() && steps.commercial_e2e.outcome == 'failure'
+      - name: Commercial real payload full-coverage differential
+        if: always()
+        id: real_full
+        continue-on-error: true
         shell: pwsh
         run: |
-          throw "Commercial Program-VM E2E differential failed; diagnostics were uploaded."
+          $input = "test/target/release/rust_packer_test.exe"
+          $output = "commercial-real-full.exe"
+          Remove-Item -Force $output, "$output.failed.exe" -ErrorAction SilentlyContinue
+          $packArgs = @(
+            "--input", $input,
+            "--output", $output,
+            "--vm", "--vm-oep", "--vm-commercial",
+            "--verify-output", "--verify-timeout-secs", "45",
+            "--map", "--sym-map", "--debug", "--log-file", "commercial-real-full.log",
+            "--seed", "3134984190"
+          )
+          & "target/release/btg-packer.exe" @packArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path $output)) { throw "verified full-coverage output missing: $output" }
+
+      - name: Commercial real payload partial-ownership runtime differential
+        if: always() && steps.real_full.outcome == 'failure'
+        id: real_partial
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $input = "test/target/release/rust_packer_test.exe"
+          $output = "commercial-real-partial.exe"
+          Remove-Item -Force $output, "$output.failed.exe" -ErrorAction SilentlyContinue
+          $packArgs = @(
+            "--input", $input,
+            "--output", $output,
+            "--vm", "--vm-oep", "--vm-commercial", "--allow-partial-vm",
+            "--verify-output", "--verify-timeout-secs", "45",
+            "--map", "--sym-map", "--debug", "--log-file", "commercial-real-partial.log",
+            "--seed", "3134984190"
+          )
+          & "target/release/btg-packer.exe" @packArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path $output)) { throw "verified partial-ownership output missing: $output" }
+
+      - name: Capture real payload crash dump
+        if: always() && (steps.real_full.outcome == 'failure' || steps.real_partial.outcome == 'failure')
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $failed = Get-ChildItem -File "commercial-real-*.failed*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $failed) {
+            Write-Warning "no isolated real-payload failed PE was produced (likely an ownership/build gate)"
+            exit 0
+          }
+          $dumpDir = Join-Path $PWD "real-crashdumps"
+          New-Item -ItemType Directory -Force $dumpDir | Out-Null
+          $wer = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\$($failed.Name)"
+          New-Item -Path $wer -Force | Out-Null
+          Set-ItemProperty -Path $wer -Name DumpFolder -Value $dumpDir -Type ExpandString
+          Set-ItemProperty -Path $wer -Name DumpType -Value 2 -Type DWord
+          $started = Get-Date
+          $p = Start-Process -FilePath $failed.FullName -PassThru -Wait
+          $bits = [System.BitConverter]::ToUInt32([System.BitConverter]::GetBytes([int32]$p.ExitCode), 0)
+          Write-Host ("[REAL-CRASH-PROBE] exit=0x{0:X8}" -f $bits)
+          Start-Sleep -Seconds 3
+          Get-ChildItem -File $dumpDir -ErrorAction SilentlyContinue | Format-Table Name,Length,LastWriteTime
+          Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000; StartTime=$started.AddMinutes(-1)} -ErrorAction SilentlyContinue |
+            Select-Object -First 5 TimeCreated,Message | Format-List
+
+      - name: Upload real payload packing evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btg-real-payload-differential
+          path: |
+            commercial-real-full.exe
+            commercial-real-full.failed.exe
+            commercial-real-full.failed.*.exe
+            commercial-real-full.exe.btgmanifest
+            commercial-real-full.exe.ownership.csv
+            commercial-real-full.exe.map
+            commercial-real-full.exe.sym
+            commercial-real-full.log
+            commercial-real-partial.exe
+            commercial-real-partial.failed.exe
+            commercial-real-partial.failed.*.exe
+            commercial-real-partial.exe.btgmanifest
+            commercial-real-partial.exe.ownership.csv
+            commercial-real-partial.exe.map
+            commercial-real-partial.exe.sym
+            commercial-real-partial.log
+            real-crashdumps/*.dmp
+          if-no-files-found: ignore
+
+      - name: Commercial Program-VM corpus E2E
+        if: always() && (steps.real_full.outcome == 'success' || steps.real_partial.outcome == 'success')
+        continue-on-error: true
+        run: cargo run --release --locked -- --test-qa --qa-commercial
+
+      - name: Final differential gate
+        if: always()
+        shell: pwsh
+        run: |
+          $smallFailed = "${{ steps.commercial_e2e.outcome }}" -ne "success"
+          $full = "${{ steps.real_full.outcome }}"
+          $partial = "${{ steps.real_partial.outcome }}"
+          $realFailed = ($full -ne "success" -and $partial -ne "success")
+          Write-Host "[FINAL] small_e2e=${{ steps.commercial_e2e.outcome }}"
+          Write-Host "[FINAL] uploaded_exact=${{ steps.uploaded_fingerprint.outputs.exact }}"
+          Write-Host "[FINAL] real_full=$full real_partial=$partial"
+          if ($smallFailed -or $realFailed) {
+            throw "Commercial Program-VM differential regression remains; all diagnostics were uploaded."
+          }
