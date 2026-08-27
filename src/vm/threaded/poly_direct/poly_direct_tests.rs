@@ -171,14 +171,14 @@ fn runtime_anchors_are_rip_relative_and_bridge_frame_is_zeroized() {
         if ins.code() == Code::Mov_rm64_imm32
             && ins.memory_base() == Register::RSP
             && ins.immediate32() == 0
-            && (0x70..=0xA8).contains(&off)
+            && (0x70..=0xB8).contains(&off)
         {
             zero_offsets.insert(off);
         }
     }
     assert_eq!(
         zero_offsets,
-        [0x70, 0x78, 0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8]
+        [0x70, 0x78, 0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xB8]
             .into_iter()
             .collect(),
         "private bridge anchors were not all erased"
