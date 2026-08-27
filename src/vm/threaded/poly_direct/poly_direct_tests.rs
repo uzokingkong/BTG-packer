@@ -75,6 +75,104 @@ fn compact_immediates_preserve_rolling_key_in_every_family() {
 }
 
 #[test]
+fn explicit_setflag_barrier_restores_lazy_cmp_flags_across_mov32_lowering() {
+    use crate::vm::poly::VmArchitectureFamily;
+    use crate::vm::risc::flags::VFLAG_ZF;
+
+    // Mirrors the flag-sensitive core of the MSVC/UCRT startup sequence:
+    //   cmp byte ptr [...], 0
+    //   mov ebx, ecx        ; MOV must not change flags
+    //   jne ...
+    //
+    // MOV r32 zero-extension is lowered through flag-producing NOR/AND
+    // primitives bracketed by Vflags save + SetFlag restore. The native
+    // dispatcher must read the pending CMP flags and SetFlag must terminate
+    // any lazy flags produced by those implementation-detail primitives.
+    let mut d = RiscDesynthesizer::new();
+    d.instrs.push(
+        MicroInstr::new(RiscOp::SubWithBorrow { width: 1 })
+            .with_dst(MicroOperand::Temp(6))
+            .with_src1(MicroOperand::VReg(0))
+            .with_src2(MicroOperand::VReg(2)),
+    );
+    d.instrs.push(
+        MicroInstr::new(RiscOp::Mov)
+            .with_dst(MicroOperand::Temp(7))
+            .with_src1(MicroOperand::Vflags),
+    );
+    d.instrs.push(
+        MicroInstr::new(RiscOp::Mov)
+            .with_dst(MicroOperand::VReg(3))
+            .with_src1(MicroOperand::VReg(1)),
+    );
+    d.emit_and(
+        MicroOperand::VReg(3),
+        MicroOperand::VReg(3),
+        MicroOperand::Imm64(0xFFFF_FFFF),
+    );
+    d.instrs.push(
+        MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)),
+    );
+    d.instrs.push(
+        MicroInstr::new(RiscOp::VirtualBranch {
+            cond: BranchCondition::NotZero,
+        })
+        .with_imm(0x2000),
+    );
+    d.instrs.push(
+        MicroInstr::new(RiscOp::Mov)
+            .with_dst(MicroOperand::VReg(0))
+            .with_src1(MicroOperand::Imm64(0xAA)),
+    );
+    d.instrs.push(MicroInstr::new(RiscOp::Halt));
+    let taken_index = d.instrs.len();
+    d.instrs.push(
+        MicroInstr::new(RiscOp::Mov)
+            .with_dst(MicroOperand::VReg(0))
+            .with_src1(MicroOperand::Imm64(0xBB)),
+    );
+    d.instrs.push(MicroInstr::new(RiscOp::Halt));
+
+    let program = RiscProgram::with_ip_map(
+        d.instrs,
+        HashMap::from([(0x2000, taken_index)]),
+    );
+    let mut init_regs = [0u64; 16];
+    init_regs[1] = 1; // internal 32-bit mask path produces ZF=0 if it leaks.
+
+    for (ordinal, family) in [
+        VmArchitectureFamily::Stack,
+        VmArchitectureFamily::Register,
+        VmArchitectureFamily::MixedRisc,
+        VmArchitectureFamily::FusedCisc,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seed = 0xF1A6_BA22_2026_0828 ^ ordinal as u64;
+        let mut encoder = PolymorphicEncoder::new_for_family(seed, family);
+        let bytecode = encoder.encode(&program).unwrap();
+        let state = run_native_poly_direct_for_family(
+            &bytecode,
+            seed,
+            family,
+            &init_regs,
+            program.ip_map(),
+        )
+        .unwrap();
+        assert_eq!(
+            state.regs[0], 0xAA,
+            "{family:?}: MOV32 implementation flags leaked into JNE",
+        );
+        assert_ne!(
+            state.flags & VFLAG_ZF,
+            0,
+            "{family:?}: CMP ZF was not restored by SetFlag",
+        );
+    }
+}
+
+#[test]
 fn long_entry_resync_preserves_full_width_vip() {
     use crate::vm::poly::VmArchitectureFamily;
 

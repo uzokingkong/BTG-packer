@@ -1011,6 +1011,30 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             1,
         );
         b.push(Instruction::with2(Code::Movzx_r32_rm16, Register::ECX, om).unwrap());
+
+        // Vflags is a logical operand backed by FLAGS_OFF, but flag-producing
+        // handlers may keep a newer snapshot lazily in RSI while RDI != 0.
+        // Reading the physical slot here would therefore observe stale flags
+        // (notably CMP -> MOV flag-save sequences emitted by the lifter).
+        // Return the lazy snapshot directly for Vflags; ordinary state operands
+        // continue through the offset-indexed load below.
+        b.push(
+            Instruction::with2(
+                Code::Cmp_rm32_imm32,
+                Register::ECX,
+                state_disp(FLAGS_OFF) as u32,
+            )
+            .unwrap(),
+        );
+        let ordinary_state_operand = b.br(Code::Jne_rel32_64, usize::MAX);
+        b.push(Instruction::with2(Code::Test_rm64_r64, Register::RDI, Register::RDI).unwrap());
+        let canonical_flags_operand = b.br(Code::Je_rel32_64, usize::MAX);
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RSI).unwrap());
+        b.push(Instruction::with(Code::Retnq));
+        let canonical_flags = b.len();
+        b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(FLAGS_OFF)).unwrap());
+        b.push(Instruction::with(Code::Retnq));
+        let ordinary_state = b.len();
         b.push(
             Instruction::with2(
                 Code::Mov_r64_rm64,
@@ -1026,6 +1050,13 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             .unwrap(),
         );
         b.push(Instruction::with(Code::Retnq));
+        for (branch, target) in &mut b.branches {
+            if *branch == ordinary_state_operand {
+                *target = ordinary_state;
+            } else if *branch == canonical_flags_operand {
+                *target = canonical_flags;
+            }
+        }
         let l_done_imm = b.len();
         b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R11).unwrap());
         b.push(Instruction::with(Code::Retnq));
@@ -1786,6 +1817,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         b.call(sub_resolve);
         b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x8D5).unwrap());
         store_m(&mut b, FLAGS_OFF, Register::RAX);
+        // SetFlag is an explicit architectural flags write/barrier. Any lazy
+        // producer snapshot predating this restore must stop being authoritative;
+        // otherwise the next branch/native/HALT materialization overwrites the
+        // restored FLAGS_OFF value with unrelated internal lowering flags.
+        b.push(Instruction::with2(Code::Xor_rm32_r32, Register::EDI, Register::EDI).unwrap());
         b.jmp(dispatch);
     }
 
