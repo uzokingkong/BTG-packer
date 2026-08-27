@@ -153,6 +153,7 @@ jobs:
         shell: pwsh
         env:
           BTG_TRACE_OP_MAP_OFFSET: "619da"
+          BTG_TRACE_OP_MAP_RANGE: "61900-61a30"
         run: |
           $input = "test/target/release/rust_packer_test.exe"
           $output = "commercial-real-full.exe"
@@ -176,6 +177,7 @@ jobs:
         shell: pwsh
         env:
           BTG_TRACE_OP_MAP_OFFSET: "619da"
+          BTG_TRACE_OP_MAP_RANGE: "61900-61a30"
         run: |
           $input = "test/target/release/rust_packer_test.exe"
           $output = "commercial-real-partial.exe"
