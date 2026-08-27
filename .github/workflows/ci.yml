@@ -11,7 +11,7 @@ env:
 
 jobs:
   build:
-    name: cargo build + test (locked)
+    name: cargo + exact QA Program-VM differential
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,27 +30,103 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      # Lockfile drift / missing dependency detection: fail if Cargo.lock is stale.
       - name: Check lockfile is up to date
         run: cargo check --locked
 
       - name: Build (release)
         run: cargo build --release --locked
 
-      # QA tests invoke target/release/btg-packer.exe, so the binary build above
-      # is an explicit prerequisite. This prevents a stale local-style packer
-      # artifact from being used by the end-to-end gates.
-      # Unit / differential tests (T3-1 chacha + VM + pipeline + QA lib tests).
-      - name: Test (release)
-        run: cargo test --release --locked --lib
+      - name: Test (release, serial diagnostics)
+        run: cargo test --release --locked --lib -- --nocapture --test-threads=1
 
       - name: Clippy (mandatory)
         run: cargo clippy --all-targets --all-features --locked
 
+      - name: Reconstruct exact uploaded Rust QA payload
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force qa | Out-Null
+          $b64 = (Get-Content ".ci/rust_packer_test.exe.b64" -Raw) -replace "\s+", ""
+          [IO.File]::WriteAllBytes("qa/rust_packer_test.exe", [Convert]::FromBase64String($b64))
+          $sha = (Get-FileHash "qa/rust_packer_test.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $size = (Get-Item "qa/rust_packer_test.exe").Length
+          Write-Host "[EXACT-QA] size=$size sha256=$sha"
+          if ($size -ne 261632) { throw "exact QA payload size mismatch: $size" }
+          if ($sha -ne "9e3e6949f51ac2e07072a4f170ca00f9ecb66150eb4787742e5adab3964c7c62") {
+            throw "exact QA payload SHA-256 mismatch: $sha"
+          }
+
+      - name: Exact QA commercial Program-VM differential
+        id: exact_qa
+        shell: pwsh
+        env:
+          BTG_TRACE_OP_MAP_OFFSET: "619da"
+          BTG_TRACE_OP_MAP_RANGE: "61900-61a30"
+        run: |
+          $input = "qa/rust_packer_test.exe"
+          $output = "qa-packed.exe"
+          Remove-Item -Force $output, "$output.failed.exe" -ErrorAction SilentlyContinue
+          $packArgs = @(
+            "--input", $input,
+            "--output", $output,
+            "--vm", "--vm-oep", "--vm-commercial",
+            "--verify-output", "--verify-timeout-secs", "45",
+            "--map", "--sym-map", "--debug", "--log-file", "qa-packed.log",
+            "--seed", "3134984190"
+          )
+          & ".\target\release\btg-packer.exe" @packArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path $output)) { throw "verified exact-QA output missing: $output" }
+
+      - name: Capture exact QA failure diagnostics
+        if: failure() && steps.exact_qa.outcome == 'failure'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $failed = Get-ChildItem -File "qa-packed.failed*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $failed) {
+            Write-Warning "no isolated failed PE produced"
+            exit 0
+          }
+          $dumpDir = Join-Path $PWD "qa-crashdumps"
+          New-Item -ItemType Directory -Force $dumpDir | Out-Null
+          $wer = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\$($failed.Name)"
+          New-Item -Path $wer -Force | Out-Null
+          Set-ItemProperty -Path $wer -Name DumpFolder -Value $dumpDir -Type ExpandString
+          Set-ItemProperty -Path $wer -Name DumpType -Value 2 -Type DWord
+          $started = Get-Date
+          $p = Start-Process -FilePath $failed.FullName -PassThru -Wait
+          $bits = [System.BitConverter]::ToUInt32([System.BitConverter]::GetBytes([int32]$p.ExitCode), 0)
+          Write-Host ("[QA-CRASH] exit=0x{0:X8}" -f $bits)
+          Start-Sleep -Seconds 3
+          Get-ChildItem -File $dumpDir -ErrorAction SilentlyContinue | Format-Table Name,Length,LastWriteTime
+          Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000; StartTime=$started.AddMinutes(-1)} -ErrorAction SilentlyContinue |
+            Select-Object -First 5 TimeCreated,Message | Format-List
+
+      - name: Upload exact QA evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-qa-program-vm
+          path: |
+            qa/rust_packer_test.exe
+            qa-packed.exe
+            qa-packed.failed.exe
+            qa-packed.failed.*.exe
+            qa-packed.log
+            qa-packed.exe.btgmanifest
+            qa-packed.exe.ownership.csv
+            qa-packed.exe.map
+            qa-packed.exe.sym
+            qa-crashdumps/*.dmp
+          if-no-files-found: ignore
+
       - name: Windows corpus E2E (pack -> run -> differential)
+        if: always()
         run: |
           cargo build --release --manifest-path test/Cargo.toml
           cargo run --release --locked -- --test-qa
 
       - name: Fuzz regression corpus (mandatory)
+        if: always()
         run: cargo test --release --locked self_test::fuzz
