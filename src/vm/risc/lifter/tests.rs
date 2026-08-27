@@ -110,8 +110,10 @@ fn test_lift_trap_preserves_registers_and_flags() {
         ("int imm8", &[0xCD, 0x29]),
     ];
 
+    // RET is architectural now: it consumes the guest return slot and advances
+    // guest RSP. Use a trap as the state-neutral stop baseline instead.
     let mut baseline_raw = prefix.to_vec();
-    baseline_raw.push(0xC3); // RET lowers to Halt without changing state.
+    baseline_raw.push(0xCC);
     let baseline = run(&baseline_raw, 0x140001000, [0u64; 16]);
 
     for (name, trap_bytes) in cases {
@@ -877,8 +879,8 @@ fn test_lift_cmpxchg_mem() {
 
 #[test]
 fn test_lift_xchg_mem() {
-    // xchg [rax], rbx (48 87 18) ; ret
-    let raw = [0x48, 0x87, 0x18, 0xC3];
+    // Scope this IR-shape assertion to XCHG; architectural RET emits MemoryRead.
+    let raw = [0x48, 0x87, 0x18];
     let prog = lift(&raw, 0x140001000);
     // P0-4: 메모리 XCHG 는 암시적 LOCK — AtomicExchange 단일 원자로 lift.
     let has_atomic = prog
@@ -903,8 +905,8 @@ fn test_lift_xchg_mem() {
 /// XADD (mem form) ??lift path emits atomic LOCK XADD.
 #[test]
 fn test_lift_xadd_mem() {
-    // xadd [rax], rbx (48 0F C1 18) ; ret
-    let raw = [0x48, 0x0F, 0xC1, 0x18, 0xC3];
+    // Scope this IR-shape assertion to XADD; architectural RET emits MemoryRead.
+    let raw = [0x48, 0x0F, 0xC1, 0x18];
     let prog = lift(&raw, 0x140001000);
     // P0-4: LOCK XADD 는 원자 RMW — AtomicAdd 단일 원자로 lift.
     let has_atomic = prog
@@ -1822,7 +1824,6 @@ fn test_lift_packed_no_flag_write() {
     let raw = enc_block(vec![
         Instruction::with2(Code::Paddd_xmm_xmmm128, Register::XMM0, Register::XMM1).unwrap(),
         Instruction::with2(Code::Movdqu_xmm_xmmm128, Register::XMM2, Register::XMM3).unwrap(),
-        Instruction::with(Code::Retnq),
     ]);
     let prog = lift(&raw, 0x140001000);
     let packed = prog
