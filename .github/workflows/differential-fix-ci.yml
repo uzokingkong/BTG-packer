@@ -3,6 +3,7 @@ name: Differential Fix CI
 on:
   push:
     branches:
+      - main
       - fix/differential-lane-stack-ci
   workflow_dispatch:
 
