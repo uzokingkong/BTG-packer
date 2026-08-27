@@ -387,6 +387,46 @@ impl MultiFamilyProgramPlan {
                     }
                 }
             }
+            if let Some((range_start, range_end)) = std::env::var("BTG_TRACE_OP_MAP_RANGE")
+                .ok()
+                .and_then(|raw| {
+                    let (a, b) = raw.split_once('-')?;
+                    let parse = |s: &str| {
+                        let s = s.trim();
+                        u64::from_str_radix(s.trim_start_matches("0x"), 16)
+                            .ok()
+                            .or_else(|| s.parse::<u64>().ok())
+                    };
+                    Some((parse(a)?, parse(b)?))
+                })
+            {
+                for (index, &offset) in instruction_offsets
+                    .iter()
+                    .enumerate()
+                    .take(partition.program.instrs.len())
+                {
+                    let offset = offset as u64;
+                    if offset < range_start || offset > range_end {
+                        continue;
+                    }
+                    let instruction = &partition.program.instrs[index];
+                    eprintln!(
+                        "[BTG_OP_MAP_RANGE] family={:?} local={} offset={:#x} ip={} op={:?} dst={:?} src1={:?} src2={:?} imm={:#x}",
+                        partition.family,
+                        index,
+                        offset,
+                        local_to_ip
+                            .get(&index)
+                            .map(|ip| format!("{ip:#x}"))
+                            .unwrap_or_else(|| "-".to_string()),
+                        instruction.op,
+                        instruction.dst,
+                        instruction.src1,
+                        instruction.src2,
+                        instruction.imm
+                    );
+                }
+            }
             let exit_byte_offset = *instruction_offsets
                 .last()
                 .ok_or_else(|| "family partition emitted no exit offset".to_string())?;
