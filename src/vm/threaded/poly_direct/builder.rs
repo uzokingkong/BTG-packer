@@ -469,6 +469,27 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
     }
     entries.sort_unstable_by_key(|e| e.0);
     entries.dedup_by_key(|e| e.0);
+
+    if let Ok(raw) = std::env::var("BTG_TRACE_BRANCH_MAP_TARGET") {
+        let parse = |value: &str| {
+            let value = value.trim();
+            u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                .ok()
+                .or_else(|| value.parse::<u64>().ok())
+        };
+        if let Some(target) = parse(&raw) {
+            let ip_index = ip_map.and_then(|map| map.get(&target)).copied();
+            let resolved = resolve_off(target, &op_offsets, &ip_map);
+            let serialized = entries.iter().find(|(key, _)| *key == target).copied();
+            eprintln!(
+                "[BTG_BRANCH_MAP] family={family:?} seed={seed:#x} target={target:#x} ip_index={ip_index:?} resolved={resolved:?} serialized={serialized:?} entries={} prog_ops={} offsets={} bytecode_len={}",
+                entries.len(),
+                prog.instrs.len(),
+                op_offsets.len(),
+                bytecode.len(),
+            );
+        }
+    }
     // P6: branch metadata is encoded independently from the handler table.
     // The two domains use distinct seed-derived keys so target values and byte
     // offsets cannot be correlated directly in the embedded metadata blob.
