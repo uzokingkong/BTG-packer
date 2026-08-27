@@ -186,6 +186,65 @@ fn runtime_anchors_are_rip_relative_and_bridge_frame_is_zeroized() {
 }
 
 #[test]
+fn cross_family_child_call_stays_on_host_stack_while_native_keeps_guest_stack() {
+    let seed = 0xC0DE_2026_0828_0027;
+    let code_base = 0x0000_0001_4001_0000;
+    let table_base = 0x0000_0001_4012_3000;
+    let bytecode_base = 0x0000_0001_4014_5000;
+    let state_base = 0x0000_0001_4018_7000;
+    let stack_base = 0x0000_0001_401D_F000;
+    let mut encoder = PolymorphicEncoder::new(seed);
+    let bytecode = encoder
+        .encode(&RiscProgram::new(vec![MicroInstr::new(RiscOp::Halt)]))
+        .unwrap();
+    let parts = build_self_decoding_parts(
+        &bytecode,
+        seed,
+        code_base,
+        table_base,
+        bytecode_base,
+        state_base,
+        stack_base,
+    )
+    .unwrap();
+
+    let (bridge_start, bridge_end) = parts.native_bridge_range.unwrap();
+    let bridge = &parts.code[bridge_start..bridge_end];
+    let bridge_ip = code_base + bridge_start as u64;
+    let mut saw_child_state_load = false;
+    let mut saw_child_host_call = false;
+    let mut saw_native_guest_call = false;
+    let mut decoder = Decoder::with_ip(64, bridge, bridge_ip, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let ins = decoder.decode();
+        let off = ins.memory_displacement64() as i64;
+        if ins.code() == Code::Mov_r64_rm64
+            && ins.op0_register() == Register::RDX
+            && ins.memory_base() == Register::RSP
+            && off == 0xD0
+        {
+            saw_child_state_load = true;
+        }
+        if ins.code() == Code::Call_rm64
+            && ins.memory_base() == Register::RSP
+            && off == 0xC8
+        {
+            saw_child_host_call = true;
+        }
+        if ins.code() == Code::Call_rm64
+            && ins.memory_base() == Register::RSP
+            && off == -8
+        {
+            saw_native_guest_call = true;
+        }
+    }
+
+    assert!(saw_child_state_load, "cross-family child state is not loaded from the host frame");
+    assert!(saw_child_host_call, "generated child entry still leaves the isolated VM host stack");
+    assert!(saw_native_guest_call, "ordinary native calls no longer use the architectural guest stack");
+}
+
+#[test]
 fn n20_runtime_anchor_signature_reuse_stays_below_ten_percent() {
     let code_base = 0x0000_0001_4001_0000;
     let anchors = [

@@ -2369,6 +2369,51 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             );
             b.push(Instruction::with2(Code::Movq_xmm_rm64, Register::XMM15, Register::RSP).unwrap());
 
+            // Generated cross-family child entries are VM runtime entrypoints,
+            // not native Windows callees. Keep them on the isolated VM host
+            // stack: the child mutates its architectural guest RSP in state and
+            // can write to that real thread stack while executing lifted
+            // prologues. Calling the child with physical RSP on the guest stack
+            // makes those writes overlap the child's dynamic-entry frame.
+            b.push(
+                Instruction::with2(
+                    Code::Cmp_rm64_imm8,
+                    MemoryOperand::with_base_displ_size(Register::RSP, 0xA8, 8),
+                    0,
+                )
+                .unwrap(),
+            );
+            let native_stack_edge = b.br(Code::Je_rel32_64, usize::MAX - 0xBC04);
+
+            // Host-frame P is 8 mod 16 here. Reserve Win64 shadow space plus an
+            // alignment qword, then invoke the generated child directly from
+            // the host stack. P+0xA0 is the target and P+0xA8 is child state.
+            b.push(Instruction::with2(Code::Sub_rm64_imm8, Register::RSP, 0x28).unwrap());
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RDX,
+                    MemoryOperand::with_base_displ_size(Register::RSP, 0xD0, 8),
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with1(
+                    Code::Call_rm64,
+                    MemoryOperand::with_base_displ_size(Register::RSP, 0xC8, 8),
+                )
+                .unwrap(),
+            );
+            b.push(Instruction::with2(Code::Add_rm64_imm8, Register::RSP, 0x28).unwrap());
+            let child_host_return_edge = b.br(Code::Jmp_rel32_64, usize::MAX - 0xBC05);
+
+            let native_stack_path = b.len();
+            for &mut (branch, ref mut target) in b.branches.iter_mut() {
+                if branch == native_stack_edge || *target == usize::MAX - 0xBC04 {
+                    *target = native_stack_path;
+                }
+            }
+
             // 3. Recreate the original CALL stack exactly. guest RSP points at
             // the architectural return slot; overwrite that dead slot with the
             // bridge target, then set physical RSP to the original pre-call RSP.
@@ -2506,6 +2551,16 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             // value is restored from the host frame.
             b.push(Instruction::with2(Code::Movq_rm64_xmm, Register::RBX, Register::XMM15).unwrap());
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSP, Register::RBX).unwrap());
+
+            // The generated-child path never left the host stack, so skip the
+            // XMM15-based guest->host recovery above and converge here with RSP
+            // already equal to the private bridge-frame base.
+            let host_frame_ready = b.len();
+            for &mut (branch, ref mut target) in b.branches.iter_mut() {
+                if branch == child_host_return_edge || *target == usize::MAX - 0xBC05 {
+                    *target = host_frame_ready;
+                }
+            }
             b.push(
                 Instruction::with2(
                     Code::Movups_xmm_xmmm128,
