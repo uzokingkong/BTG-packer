@@ -77,6 +77,9 @@ pub enum FloatCvtMode {
 /// P3 (G1): assembled self-decoding dispatcher pieces (machine code + tables).
 pub struct SelfDecodingParts {
     pub code: Vec<u8>,
+    /// Entry stub which saves the Win64 nonvolatiles but keeps RDX supplied by
+    /// a native gateway instead of anchoring the canonical state VA.
+    pub dynamic_state_entry_offset: usize,
     /// Machine-code byte range of the VM→native call bridge. Exceptions whose
     /// return RIP lands here require the bridge's private stack allocation in
     /// addition to the module-entry nonvolatile saves.

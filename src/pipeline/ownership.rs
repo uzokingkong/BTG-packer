@@ -440,6 +440,14 @@ pub fn check_ownership(
         }
         vm_entries.push(f);
 
+        // Metadata-free x64 leaf functions legitimately have no `.pdata`
+        // record. Once their original `.text` is NX and their body is owned by
+        // the generated VM module, requiring a fictitious original unwind
+        // entry is both impossible and weaker than the actual routing proof.
+        if f.reason == "vm-owned-leaf" {
+            continue;
+        }
+
         // (1) fully covered by a RUNTIME_FUNCTION
         let Some((b, e)) = contiguous_coverage_end(runtime_functions, f.start_rva) else {
             report.inconsistencies += 1;

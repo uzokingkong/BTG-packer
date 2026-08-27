@@ -220,7 +220,13 @@ fn test_lift_call_indirect_register() {
     let mut init = [0u64; 16];
     init[0] = 0x14000100A; // rax = callee
     let lifted = lift(&raw, 0x140001000);
-    assert_eq!(lifted.instrs[1].op, RiscOp::VirtualIndirectCall);
+    assert!(
+        lifted
+            .instrs
+            .iter()
+            .any(|ins| ins.op == RiscOp::VirtualIndirectCall),
+        "indirect CALL must retain typed VM continuation routing",
+    );
     let st = run(&raw, 0x140001000, init);
     assert_eq!(regs(&st)[3], 0x2A, "indirect callee executed");
     // P0-1: 간접 call 도 복귀해 fallthrough 실행.
@@ -503,7 +509,7 @@ fn test_lift_prologue_epilogue_leave() {
     let st = run(&raw, 0x140001000, init);
     assert_eq!(regs(&st)[0], 5, "rax = 5");
     assert_eq!(regs(&st)[5], 0x200, "rbp restored by leave pop");
-    assert_eq!(regs(&st)[4], 0x1000, "rsp = rbp after leave");
+    assert_eq!(regs(&st)[4], 0x1008, "leave restores frame and RET pops return slot");
     assert_eq!(st.stack.len(), 0, "push/pop balanced");
 }
 
@@ -826,7 +832,7 @@ fn test_lift_ret_imm16() {
     // 0x140001000: ret 8 (C2 08 00)
     let raw = [0xC2, 0x08, 0x00];
     let st = run(&raw, 0x140001000, [0u64; 16]);
-    assert_eq!(regs(&st)[4], 8, "RET imm16 advances RSP by 8");
+    assert_eq!(regs(&st)[4], 16, "RET 8 pops the return slot and then 8 argument bytes");
 }
 
 /// PUSH r64 / POP r64 ??stack roundtrip.
@@ -839,6 +845,20 @@ fn test_lift_push_pop() {
     let st = run(&raw, 0x140001000, init);
     assert_eq!(regs(&st)[3], 0xCAFE, "push rax; pop rbx");
     assert_eq!(st.vsp, 0, "push/pop balanced");
+}
+
+#[test]
+fn test_arch_push_pop_tracks_rsp_and_memory() {
+    // push rax; mov rbx,rsp; pop rcx; ret
+    let raw = [0x50, 0x48, 0x89, 0xE3, 0x59, 0xC3];
+    let mut init = [0u64; 16];
+    init[0] = 0xCAFE_BABE_D00D_F00D;
+    init[4] = 0x1000;
+    let st = run(&raw, 0x140001000, init);
+    assert_eq!(regs(&st)[3], 0x0FF8, "PUSH must decrement architectural RSP before the next instruction");
+    assert_eq!(regs(&st)[1], init[0], "POP must reload the value through guest memory");
+    assert_eq!(regs(&st)[4], 0x1008, "POP balances PUSH and top-level RET consumes its return slot");
+    assert_eq!(st.vsp, 0, "ordinary x86 PUSH/POP must not consume the VM continuation stack");
 }
 
 /// CMPXCHG (mem form) ??lift path emits CompareExchange micro-op.
@@ -1817,4 +1837,16 @@ fn test_lift_packed_no_flag_write() {
         .count();
     assert_eq!(packed, 2, "PADDD + MOVDQU lifted to Packed ops");
     assert_eq!(flag_writes, 0, "packed integer ops never write RFLAGS");
+}
+
+#[test]
+fn indexed_effective_address_encodes_scale_as_shift_operand() {
+    // mov rax, qword ptr [rbx + rcx*8]
+    let prog = lift(&[0x48, 0x8B, 0x04, 0xCB], 0x140001000);
+    let scale = prog
+        .instrs
+        .iter()
+        .find(|ins| ins.op == RiscOp::ShiftLeft)
+        .expect("indexed address must lower its scale");
+    assert_eq!(scale.src2, Some(MicroOperand::Imm64(3)));
 }

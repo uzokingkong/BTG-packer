@@ -272,6 +272,127 @@ impl RiscLifter {
         }
     }
 
+    /// Push onto the architectural x86 stack. `VirtualPush` is reserved for
+    /// the VM's bytecode continuation stack and must not stand in for guest RSP.
+    /// PUSH itself is flag-transparent, so preserve the incoming snapshot around
+    /// the RISC arithmetic used to update RSP.
+    fn emit_arch_push(&mut self, value: MicroOperand, width: u8) {
+        let rsp = MicroOperand::VReg(4);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::Mov)
+                .with_dst(MicroOperand::Temp(7))
+                .with_src1(MicroOperand::Vflags),
+        );
+        // PUSH RSP stores the pre-decrement value. Snapshot every source before
+        // touching RSP so register and memory forms share the same ordering.
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::Mov)
+                .with_dst(MicroOperand::Temp(6))
+                .with_src1(value),
+        );
+        self.desynth.emit_sub(rsp, rsp, MicroOperand::Imm64(width as u64));
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryWrite { width })
+                .with_src1(rsp)
+                .with_src2(MicroOperand::Temp(6)),
+        );
+        self.desynth
+            .instrs
+            .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
+    }
+
+    fn emit_arch_pop_reg(
+        &mut self,
+        inst: &Instruction,
+        dst: MicroOperand,
+        width: u8,
+    ) -> Result<()> {
+        let rsp = MicroOperand::VReg(4);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::Mov)
+                .with_dst(MicroOperand::Temp(7))
+                .with_src1(MicroOperand::Vflags),
+        );
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryRead { width })
+                .with_dst(MicroOperand::Temp(6))
+                .with_src1(rsp),
+        );
+        self.desynth.emit_add(rsp, rsp, MicroOperand::Imm64(width as u64));
+        if width < 8 {
+            // For POP SP, upper bits are taken from the already-incremented RSP.
+            self.desynth.instrs.push(
+                MicroInstr::new(RiscOp::Mov)
+                    .with_dst(MicroOperand::Temp(5))
+                    .with_src1(dst),
+            );
+        }
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::Mov)
+                .with_dst(dst)
+                .with_src1(MicroOperand::Temp(6)),
+        );
+        if width < 8 {
+            self.mask_result(width, inst, dst)?;
+            self.preserve_upper_from(dst, width, MicroOperand::Temp(5));
+        }
+        self.desynth
+            .instrs
+            .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
+        Ok(())
+    }
+
+    fn emit_arch_pop_mem(&mut self, inst: &Instruction, width: u8) -> Result<()> {
+        let rsp = MicroOperand::VReg(4);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::Mov)
+                .with_dst(MicroOperand::Temp(7))
+                .with_src1(MicroOperand::Vflags),
+        );
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryRead { width })
+                .with_dst(MicroOperand::Temp(6))
+                .with_src1(rsp),
+        );
+        self.desynth.emit_add(rsp, rsp, MicroOperand::Imm64(width as u64));
+        // Intel POP computes an RSP-based destination EA after the increment.
+        let addr = MicroOperand::Temp(4);
+        self.lower_effective_address(inst, addr)?;
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryWrite { width })
+                .with_src1(addr)
+                .with_src2(MicroOperand::Temp(6)),
+        );
+        self.desynth
+            .instrs
+            .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
+        Ok(())
+    }
+
+    fn emit_arch_ret_pop(&mut self, width: u8, extra: u16) {
+        let rsp = MicroOperand::VReg(4);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::Mov)
+                .with_dst(MicroOperand::Temp(7))
+                .with_src1(MicroOperand::Vflags),
+        );
+        // RET must perform the architectural stack read even though the VM's
+        // continuation stack remains the authoritative dispatch key.
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::MemoryRead { width })
+                .with_dst(MicroOperand::Temp(6))
+                .with_src1(rsp),
+        );
+        self.desynth.emit_add(
+            rsp,
+            rsp,
+            MicroOperand::Imm64(width as u64 + extra as u64),
+        );
+        self.desynth
+            .instrs
+            .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
+    }
+
     /// Preserve x86 MOV's flag transparency while finalizing a register write.
     /// A 32-bit destination zero-extends its virtual GPR; 8/16-bit destinations
     /// replace only their low part.  The RISC expressions used for masking and
@@ -388,21 +509,21 @@ impl RiscLifter {
                     MicroInstr::new(RiscOp::ShiftLeft)
                         .with_dst(t1)
                         .with_src1(t1)
-                        .with_imm(1),
+                        .with_src2(MicroOperand::Imm64(1)),
                 );
             } else if scale == 4 {
                 self.desynth.instrs.push(
                     MicroInstr::new(RiscOp::ShiftLeft)
                         .with_dst(t1)
                         .with_src1(t1)
-                        .with_imm(2),
+                        .with_src2(MicroOperand::Imm64(2)),
                 );
             } else if scale == 8 {
                 self.desynth.instrs.push(
                     MicroInstr::new(RiscOp::ShiftLeft)
                         .with_dst(t1)
                         .with_src1(t1)
-                        .with_imm(3),
+                        .with_src2(MicroOperand::Imm64(3)),
                 );
             }
             self.desynth.emit_add(temp_dst, temp_dst, t1);
@@ -846,36 +967,55 @@ impl RiscLifter {
 
             Code::Push_r64 | Code::Push_r16 => {
                 let src = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid src"))?;
-                self.desynth.emit_push(src);
+                let width = if code == Code::Push_r16 { 2 } else { 8 };
+                self.emit_arch_push(src, width);
             }
             Code::Pushd_imm32 | Code::Pushq_imm32 | Code::Pushq_imm8 | Code::Pushw_imm8 => {
                 let imm = inst.immediate64();
-                self.desynth.emit_push(MicroOperand::Imm64(imm));
+                let width = match code {
+                    Code::Pushw_imm8 => 2,
+                    Code::Pushd_imm32 => 4,
+                    _ => 8,
+                };
+                self.emit_arch_push(MicroOperand::Imm64(imm), width);
             }
             Code::Pop_r64 | Code::Pop_r16 => {
                 let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
-                self.desynth.emit_pop(dst);
+                let width = if code == Code::Pop_r16 { 2 } else { 8 };
+                self.emit_arch_pop_reg(inst, dst, width)?;
             }
 
             Code::Leaveq | Code::Leaved | Code::Leavew => {
                 self.desynth.instrs.push(
                     MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::VReg(4)).with_src1(MicroOperand::VReg(5)),
                 );
-                self.desynth.emit_pop(MicroOperand::VReg(5));
+                let width = if code == Code::Leavew { 2 } else { 8 };
+                self.emit_arch_pop_reg(inst, MicroOperand::VReg(5), width)?;
             }
 
             Code::Call_rel32_64 => {
                 let target = inst.near_branch_target();
                 let ret_ip = inst.next_ip();
+                // Keep the VM continuation and the architectural x86 stack in
+                // sync. The former routes VM RET; the latter drives real RSP and
+                // stack-relative memory semantics inside the callee.
+                self.emit_arch_push(MicroOperand::Imm64(ret_ip), 8);
                 self.desynth.emit_push(MicroOperand::Imm64(ret_ip));
                 self.desynth.emit_jmp(target);
             }
             Code::Call_rm64 | Code::Call_rm32 => {
                 let ret_ip = inst.next_ip();
-                self.desynth.emit_push(MicroOperand::Imm64(ret_ip));
+                // The indirect target is evaluated before CALL changes RSP.
                 let target = self.operand_value(inst, 0)?;
                 self.desynth.instrs.push(
-                    MicroInstr::new(RiscOp::VirtualIndirectCall).with_src1(target),
+                    MicroInstr::new(RiscOp::Mov)
+                        .with_dst(MicroOperand::Temp(5))
+                        .with_src1(target),
+                );
+                self.emit_arch_push(MicroOperand::Imm64(ret_ip), 8);
+                self.desynth.emit_push(MicroOperand::Imm64(ret_ip));
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::VirtualIndirectCall).with_src1(MicroOperand::Temp(5)),
                 );
             }
 
@@ -971,20 +1111,14 @@ impl RiscLifter {
                 self.emit_jcxz(8, target);
             }
             Code::Retnq | Code::Retnw => {
-                // P0-1: RET → VirtualRet — 가상 스택에서 복귀 주소를 pop 해
-                // ip_map 안이면 VM 내부 복귀, 아니면 Halt(프로그램 종료)로.
+                let width = if code == Code::Retnw { 2 } else { 8 };
+                self.emit_arch_ret_pop(width, 0);
+                // VM continuation routing remains separate from architectural RSP.
                 self.desynth.instrs.push(MicroInstr::new(RiscOp::VirtualRet));
             }
-            // RET imm16: RSP += imm ??VirtualRet (복귀 주소는 그대로 스택에서 pop).
             Code::Retnq_imm16 | Code::Retnw_imm16 => {
-                let imm = inst.immediate16() as u64;
-                if imm != 0 {
-                    self.desynth.emit_add(
-                        MicroOperand::VReg(4),
-                        MicroOperand::VReg(4),
-                        MicroOperand::Imm64(imm),
-                    );
-                }
+                let width = if code == Code::Retnw_imm16 { 2 } else { 8 };
+                self.emit_arch_ret_pop(width, inst.immediate16());
                 self.desynth.instrs.push(MicroInstr::new(RiscOp::VirtualRet));
             }
 
@@ -1434,23 +1568,16 @@ impl RiscLifter {
             }
 
             Code::Push_rm64 => {
+                // Source memory is read before RSP is decremented.
                 let v = self.operand_value(inst, 0)?;
-                self.desynth.emit_push(v);
+                self.emit_arch_push(v, 8);
             }
             Code::Pop_rm64 => {
                 if inst.op0_kind() == OpKind::Register {
                     let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid pop dst"))?;
-                    self.desynth.emit_pop(dst);
+                    self.emit_arch_pop_reg(inst, dst, 8)?;
                 } else if inst.op0_kind() == OpKind::Memory {
-                    let addr = MicroOperand::Temp(4);
-                    self.lower_effective_address(inst, addr)?;
-                    let val = MicroOperand::Temp(5);
-                    self.desynth.emit_pop(val);
-                    self.desynth.instrs.push(
-                        MicroInstr::new(RiscOp::MemoryWrite { width: 8 })
-                            .with_src1(addr)
-                            .with_src2(val),
-                    );
+                    self.emit_arch_pop_mem(inst, 8)?;
                 } else {
                     return Err(anyhow!("risc lifter: invalid pop op0"));
                 }

@@ -13,15 +13,19 @@ pub struct LiteralObject {
     pub references: Vec<u32>,
 }
 
-/// Shared production ABI for lifetime synchronization.  The table lives in
-/// the entry-family state stride so every VM family and OS thread addresses
-/// the same atomic words instead of accidentally using family-local locks.
+/// Shared production ABI for lifetime synchronization.  Legacy callers may
+/// still place the table at `entry_state + 0x2000`, but production multi-family
+/// placement now stores it once in the global `.vstate` tail so no virtual
+/// stack or family-local state can overlap the atomic words.
 pub const LIFETIME_SYNC_TABLE_OFFSET: u64 = 0x2000;
 pub const LIFETIME_SYNC_ENTRY_SIZE: usize = 48;
 pub const LIFETIME_SYNC_CAPACITY: usize = 256;
 pub const LIFETIME_SYNC_TABLE_SIZE: usize = LIFETIME_SYNC_ENTRY_SIZE * LIFETIME_SYNC_CAPACITY;
-pub const LIFETIME_SYNC_PTR_STATE_OFFSET: usize = 0x5020;
-pub const LIFETIME_SYNC_COUNT_STATE_OFFSET: usize = 0x5028;
+// Keep the process-lifetime table metadata outside the transient cross-family
+// return ABI at 0x5000..0x50a0.  In particular, 0x5020/0x5028 are the RCX/RDX
+// return-slot pointers and are rewritten for every routed invocation.
+pub const LIFETIME_SYNC_PTR_STATE_OFFSET: usize = 0x50A0;
+pub const LIFETIME_SYNC_COUNT_STATE_OFFSET: usize = 0x50A8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifetimeSyncEntry {
@@ -41,8 +45,24 @@ pub struct LifetimeSyncTable {
 }
 
 impl LifetimeSyncTable {
+    /// Legacy in-stride constructor retained for compatibility with unit tests
+    /// and non-commercial callers.  Production multi-family placement uses
+    /// `build_at()` so the synchronization table lives in the global `.vstate`
+    /// tail, outside every family's virtual-stack range.
     pub fn build(
         entry_state_va: u64,
+        image_base: u64,
+        build_key: u64,
+        objects: &[LiteralObject],
+    ) -> anyhow::Result<Self> {
+        let base_va = entry_state_va
+            .checked_add(LIFETIME_SYNC_TABLE_OFFSET)
+            .ok_or_else(|| anyhow::anyhow!("data-lifetime sync table VA overflow"))?;
+        Self::build_at(base_va, image_base, build_key, objects)
+    }
+
+    pub fn build_at(
+        base_va: u64,
         image_base: u64,
         build_key: u64,
         objects: &[LiteralObject],
@@ -58,9 +78,6 @@ impl LifetimeSyncTable {
                 LIFETIME_SYNC_CAPACITY
             );
         }
-        let base_va = entry_state_va
-            .checked_add(LIFETIME_SYNC_TABLE_OFFSET)
-            .ok_or_else(|| anyhow::anyhow!("data-lifetime sync table VA overflow"))?;
         let entries = unique
             .into_iter()
             .enumerate()
@@ -77,17 +94,10 @@ impl LifetimeSyncTable {
         Ok(Self { base_va, entries })
     }
 
-    pub fn validate_stride(&self, stride: usize) -> anyhow::Result<()> {
-        let start = LIFETIME_SYNC_TABLE_OFFSET as usize;
-        let end = start
-            .checked_add(LIFETIME_SYNC_TABLE_SIZE)
+    pub fn validate_table(&self) -> anyhow::Result<()> {
+        self.base_va
+            .checked_add(LIFETIME_SYNC_TABLE_SIZE as u64)
             .ok_or_else(|| anyhow::anyhow!("data-lifetime sync table range overflow"))?;
-        let call_stack_start = stride
-            .checked_sub(crate::vm::interp::CALL_STACK_SIZE)
-            .ok_or_else(|| anyhow::anyhow!("VM family stride is smaller than call stack"))?;
-        if end > call_stack_start || end > 0x5000 {
-            anyhow::bail!("data-lifetime sync table overlaps cross-family/call-stack state");
-        }
         if self.entries.iter().enumerate().any(|(index, entry)| {
             entry.lock_va != self.base_va + (index * LIFETIME_SYNC_ENTRY_SIZE) as u64
                 || entry.refcount_va != entry.lock_va + 4
@@ -96,6 +106,27 @@ impl LifetimeSyncTable {
             anyhow::bail!("data-lifetime sync table entry layout drift");
         }
         Ok(())
+    }
+
+    pub fn validate_stride(&self, stride: usize) -> anyhow::Result<()> {
+        let start = LIFETIME_SYNC_TABLE_OFFSET as usize;
+        let end = start
+            .checked_add(LIFETIME_SYNC_TABLE_SIZE)
+            .ok_or_else(|| anyhow::anyhow!("data-lifetime sync table range overflow"))?;
+        let virtual_stack_start = crate::vm::commercial_build::COMMERCIAL_STATE_SIZE as usize;
+        let virtual_stack_end = virtual_stack_start
+            .checked_add(crate::vm::commercial_build::VIRTUAL_STACK_SIZE as usize)
+            .ok_or_else(|| anyhow::anyhow!("commercial virtual-stack range overflow"))?;
+        let overlaps_virtual_stack = start < virtual_stack_end && virtual_stack_start < end;
+        let call_stack_start = stride
+            .checked_sub(crate::vm::interp::CALL_STACK_SIZE)
+            .ok_or_else(|| anyhow::anyhow!("VM family stride is smaller than call stack"))?;
+        if overlaps_virtual_stack || end > call_stack_start || end > 0x5000 {
+            anyhow::bail!(
+                "data-lifetime sync table overlaps commercial virtual-stack/cross-family/call-stack state"
+            );
+        }
+        self.validate_table()
     }
 }
 
@@ -699,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_sync_table_is_deterministic_and_disjoint_from_call_stack() {
+    fn legacy_in_stride_sync_table_is_rejected_for_commercial_state() {
         let objects = [
             LiteralObject {
                 class: DataClass::Ascii,
@@ -715,13 +746,31 @@ mod tests {
             },
         ];
         let table = LifetimeSyncTable::build(0x1400_8000_0, 0x1400_0000_0, 7, &objects).unwrap();
-        table.validate_stride(0x8000).unwrap();
+        assert!(
+            table.validate_stride(0x8000).is_err(),
+            "legacy +0x2000 placement overlaps the commercial virtual stack",
+        );
         assert_eq!(table.entries[0].object_rva, 0x3000);
         assert_eq!(table.entries[0].lock_va, 0x1400_8200_0);
         assert_eq!(table.entries[0].refcount_va, 0x1400_8200_4);
         assert_eq!(table.entries[0].owner_va, 0x1400_8200_8);
         assert_eq!(table.entries[0].object_va, 0x1400_0300_0);
         assert_eq!(table.entries[1].lock_va, table.entries[0].lock_va + 48);
+    }
+
+    #[test]
+    fn global_sync_table_exact_base_validates_without_stride_aliasing() {
+        let objects = [LiteralObject {
+            class: DataClass::Ascii,
+            rva: 0x3000,
+            len: 8,
+            references: vec![0x1100],
+        }];
+        let base = 0x1401_0000_0;
+        let table = LifetimeSyncTable::build_at(base, 0x1400_0000_0, 7, &objects).unwrap();
+        table.validate_table().unwrap();
+        assert_eq!(table.base_va, base);
+        assert_eq!(table.entries[0].lock_va, base);
     }
 
     #[test]

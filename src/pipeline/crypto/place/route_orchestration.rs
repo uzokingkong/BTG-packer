@@ -112,6 +112,49 @@ pub(super) fn build_commercial_routes(
         }
     }
 
+    // Pointer-table targets can be consumed by code outside the image (most
+    // notably UCRT `_initterm[_e]`, TLS callbacks, and OS callback walkers), so
+    // there is no in-image indirect site from which to derive a route.  They
+    // are nevertheless canonical ProgramModel facts and must participate in
+    // the same route inventory; otherwise an external runtime calls the now-NX
+    // original `.text` address directly.
+    for &target_rva in &program.discovered_indirect_code_targets {
+        let Some(function) = program
+            .functions
+            .values()
+            .find(|function| function.entries.contains(&target_rva))
+        else {
+            continue;
+        };
+        let target_va = image_base
+            .checked_add(u64::from(target_rva))
+            .ok_or_else(|| anyhow!("pointer-table target VA overflow at RVA {target_rva:#x}"))?;
+        let Some(target_family) = plan.assignment_for(target_va).map(|a| a.family) else {
+            continue;
+        };
+        let module = materialized
+            .modules
+            .iter()
+            .find(|module| module.family == target_family)
+            .ok_or_else(|| {
+                anyhow!(
+                    "pointer-table target RVA {target_rva:#x} has no materialized {:?} module",
+                    target_family
+                )
+            })?;
+        let entry_vip = *module.ip_map.get(&target_va).ok_or_else(|| {
+            anyhow!("pointer-table target RVA {target_rva:#x} has no family-local entry VIP")
+        })?;
+        let candidate = (function.id, entry_vip as u64, GatewayKind::VmEntry);
+        if let Some(existing) = required.get(&OriginalTargetRva(target_rva)) {
+            if existing.0 != candidate.0 || existing.1 != candidate.1 {
+                bail!("pointer-table target RVA {target_rva:#x} conflicts with indirect-site route");
+            }
+        } else {
+            required.insert(OriginalTargetRva(target_rva), candidate);
+        }
+    }
+
     if required.is_empty() {
         return Ok(None);
     }
@@ -220,6 +263,7 @@ mod tests {
         };
         let modules = vec![EncodedFamilyPartition {
             family: VmArchitectureFamily::Register,
+            function_ids: vec![BASE + 0x2000],
             bytecode: vec![0],
             instruction_offsets: vec![0],
             ip_map: HashMap::from([(BASE + 0x2000, 0)]),

@@ -7,6 +7,10 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone)]
 pub struct EncodedFamilyPartition {
     pub family: VmArchitectureFamily,
+    /// Canonical original function-entry VAs owned by this family. Runtime
+    /// indirect calls use these entries to route away from non-executable
+    /// original `.text` even when no static VirtualBranch names the target.
+    pub function_ids: Vec<u64>,
     pub bytecode: Vec<u8>,
     pub instruction_offsets: Vec<usize>,
     pub ip_map: HashMap<u64, usize>,
@@ -312,11 +316,34 @@ impl MultiFamilyProgramPlan {
             let (bytecode, instruction_offsets) = encoder
                 .encode_with_offsets(&routed_program)
                 .map_err(|error| error.to_string())?;
+            if std::env::var_os("BTG_TRACE_OP_MAP").is_some() {
+                let local_to_ip: HashMap<usize, u64> = partition
+                    .program
+                    .ip_map()
+                    .into_iter()
+                    .flatten()
+                    .map(|(&ip, &local)| (local, ip))
+                    .collect();
+                for (local, instruction) in partition.program.instrs.iter().enumerate() {
+                    eprintln!(
+                        "BTG_OP_MAP family={:?} local={} offset={:#x} ip={} op={:?}",
+                        partition.family,
+                        local,
+                        instruction_offsets[local],
+                        local_to_ip
+                            .get(&local)
+                            .map(|ip| format!("{ip:#x}"))
+                            .unwrap_or_else(|| "-".to_string()),
+                        instruction.op
+                    );
+                }
+            }
             let exit_byte_offset = *instruction_offsets
                 .last()
                 .ok_or_else(|| "family partition emitted no exit offset".to_string())?;
             modules.push(EncodedFamilyPartition {
                 family: partition.family,
+                function_ids: partition.function_ids.clone(),
                 bytecode,
                 instruction_offsets,
                 ip_map: partition.program.ip_map().cloned().unwrap_or_default(),
@@ -463,6 +490,7 @@ mod tests {
     fn encoded_module(family: VmArchitectureFamily, domain: u64) -> EncodedFamilyPartition {
         EncodedFamilyPartition {
             family,
+            function_ids: Vec::new(),
             bytecode: vec![0; 16],
             instruction_offsets: vec![0, 7, 12],
             ip_map: HashMap::new(),

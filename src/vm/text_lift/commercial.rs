@@ -181,6 +181,7 @@ impl CommercialExclusionReport {
 
 fn build_ownership_report(
     function_ranges: &[(u64, u64)],
+    pdata_function_ranges: &[(u64, u64)],
     blocks: &[BasicBlock],
     exclusions: &CommercialExclusionReport,
     dependencies: &CommercialSemanticDependencyReport,
@@ -276,12 +277,19 @@ fn build_ownership_report(
             reason = OwnershipReason::FunctionAtomicityPropagation;
             legacy_reason = "function-atomicity-propagation";
         }
+        let has_native_unwind_entry = pdata_function_ranges
+            .iter()
+            .any(|range| range.0 == start && end <= range.1);
         let function = FunctionOwnership {
             start_rva,
             end_rva,
             owned_by_vm,
-            enforce_entry_begin: true,
-            reason: legacy_reason,
+            enforce_entry_begin: has_native_unwind_entry,
+            reason: if owned_by_vm && !has_native_unwind_entry {
+                "vm-owned-leaf"
+            } else {
+                legacy_reason
+            },
         };
         let mut diagnostic = FunctionOwnershipDiagnostic::new(function, reason)
             .with_counts(function_blocks.len() as u64, instruction_count as u64);
@@ -967,12 +975,22 @@ pub fn lift_program_cfg_commercial_with_model(
         }
         marker_normalized.as_slice()
     };
-    let (mut blocks, _g) = CfgExtractor::extract(
+    let canonical_starts = canonical_model
+        .map(|model| {
+            model
+                .direct_entry_rvas()
+                .into_iter()
+                .map(|rva| image_base + u64::from(rva))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let (mut blocks, _g) = CfgExtractor::extract_with_additional_starts(
         cfg_text,
         base_va,
         entry_point_va,
         relayed_sections,
         image_base,
+        &canonical_starts,
     )?;
     // Marker signatures are inline data skipped by their leading `jmp +8`.
     // A whole-text CFG sweep can still seed blocks inside those eight bytes;
@@ -1072,11 +1090,35 @@ pub fn lift_program_cfg_commercial_with_model(
     // native function body without its prologue/ABI state.  Track the complete
     // native-function set independently from the SEH policy so every later
     // bridge and return-value decision sees the same ownership boundary.
-    let mut all_function_ranges: Vec<(u64, u64)> =
+    let pdata_function_ranges: Vec<(u64, u64)> =
         parse_pdata_functions(relayed_sections, image_base)
             .into_iter()
             .map(|(start, end, _)| (start, end))
             .collect();
+    let mut all_function_ranges: Vec<(u64, u64)> = canonical_model
+        .map(|model| {
+            model
+                .functions
+                .values()
+                .filter_map(|function| {
+                    let entry = function.entries.iter().next().copied()?;
+                    function
+                        .ranges
+                        .iter()
+                        .filter(|range| range.start <= entry && entry < range.end)
+                        .max_by_key(|range| range.end.saturating_sub(range.start))
+                })
+                .map(|range| {
+                    (
+                        image_base + u64::from(range.start),
+                        image_base + u64::from(range.end),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            pdata_function_ranges.clone()
+        });
     // Leaf/tiny PE images legitimately omit .pdata. Their entry-reachable text
     // is still one canonical original function; treating it as zero functions
     // made full-coverage validation impossible and left the original .text
@@ -1470,6 +1512,7 @@ pub fn lift_program_cfg_commercial_with_model(
     let exclusion_report = CommercialExclusionReport::from_functions(exclusion_functions);
     let ownership_report = build_ownership_report(
         &all_function_ranges,
+        &pdata_function_ranges,
         &blocks,
         &exclusion_report,
         &semantic_dependency_report,
@@ -1693,15 +1736,17 @@ pub fn lift_program_cfg_commercial_with_model(
             }
             let block_ops = lifter.desynth.instrs.len();
             instrs.extend(lifter.desynth.instrs);
-            if let Some((function_id, _)) = all_function_ranges
+            if block_ops != 0 {
+                if let Some((function_id, _)) = all_function_ranges
                 .iter()
                 .find(|(start, end)| *start <= bb.start_va && bb.start_va < *end)
-            {
-                raw_function_op_ranges.push(crate::vm::poly::FunctionOpRange {
-                    function_id: *function_id,
-                    start_op: base,
-                    end_op: base + block_ops,
-                });
+                {
+                    raw_function_op_ranges.push(crate::vm::poly::FunctionOpRange {
+                        function_id: *function_id,
+                        start_op: base,
+                        end_op: base + block_ops,
+                    });
+                }
             }
             virtualized += 1;
             virtualized_inst += real.len();
@@ -2168,6 +2213,11 @@ mod tests {
             ..Default::default()
         };
         let report = build_ownership_report(
+            &[
+                (0x140001000, 0x140001040),
+                (0x140002000, 0x140002040),
+                (0x140003000, 0x140003040),
+            ],
             &[
                 (0x140001000, 0x140001040),
                 (0x140002000, 0x140002040),

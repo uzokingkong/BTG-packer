@@ -6,31 +6,20 @@ on:
       - fix/differential-lane-stack-ci
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   validate:
-    name: apply patch + build + test
+    name: cargo check + test + build
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Reconstruct differential patch
-        shell: bash
-        run: cat .ci/differential-fix.patch.* > differential-fix.patch
-
-      - name: Apply differential patch
-        shell: bash
-        run: |
-          git apply --whitespace=nowarn --ignore-space-change --ignore-whitespace differential-fix.patch
-          git diff --check
+        with:
+          components: clippy
 
       - name: Cargo check
         run: cargo check --locked --lib
@@ -41,21 +30,12 @@ jobs:
       - name: Cargo build release
         run: cargo build --release --locked
 
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked
+
       - name: Upload release binary
         uses: actions/upload-artifact@v4
         with:
           name: btg-packer-windows-x64
           path: target/release/btg-packer.exe
           if-no-files-found: error
-
-      - name: Materialize validated source on branch
-        if: success()
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src
-          if ! git diff --cached --quiet; then
-            git commit -m "Apply differential lane stack fix"
-            git push
-          fi

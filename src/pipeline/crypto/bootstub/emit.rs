@@ -1301,10 +1301,11 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
     // independent fresh stream of the selected production primitive for the
     // preserved .text runs and bytecode.
     if stub.chacha_mode() {
-        emit_chacha_init(seq, stub);
-        // This independent VM-OEP stream has no preceding Poly1305-key
-        // derivation call. Reserve block 0 explicitly and begin payload
-        // transport at RFC 8439 counter 1, matching the pack-time stream.
+        // The seed buffer is bootstrap scratch and integrity/cipher stages may
+        // legitimately reuse it after the first initialization.  Re-reading it
+        // here produced a different key for relocated Program-VM payloads.
+        // ChaCha's key and nonce fields are immutable across apply calls, so
+        // retain the authoritative initial state and reset only stream position.
         seq.push((
             Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.chacha_state_va)
                 .unwrap(),
@@ -1315,6 +1316,15 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
                 Code::Mov_rm64_imm32,
                 iced_x86::MemoryOperand::with_base_displ(Register::RAX, 0x20),
                 1,
+            )
+            .unwrap(),
+            None,
+        ));
+        seq.push((
+            Instruction::with2(
+                Code::Mov_rm32_imm32,
+                iced_x86::MemoryOperand::with_base_displ(Register::RAX, 0x78),
+                0x40u32,
             )
             .unwrap(),
             None,

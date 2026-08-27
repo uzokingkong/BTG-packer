@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use super::builder::{
     build_self_decoding_parts_with_layouts, build_self_decoding_parts_with_superops,
     build_self_decoding_parts_with_superops_and_chunks,
+    build_self_decoding_parts_with_superops_and_chunks_for_family,
 };
 use super::codegen_util::*;
 use crate::vm::table_layout::TableLayout;
@@ -54,6 +55,88 @@ pub fn run_native_poly_direct_with_layout(
         None,
         &[],
     )
+}
+
+#[cfg(test)]
+pub(crate) fn run_native_poly_direct_for_family(
+    bytecode: &[u8],
+    seed: u64,
+    family: crate::vm::poly::VmArchitectureFamily,
+    init_regs: &[u64; 16],
+    ip_map: Option<&HashMap<u64, usize>>,
+) -> Result<RiscEvalState> {
+    run_native_poly_direct_configured_for_family(
+        bytecode,
+        seed,
+        family,
+        init_regs,
+        ip_map,
+        VmRuntimeLayout::from_seed(seed),
+    )
+}
+
+#[cfg(test)]
+fn run_native_poly_direct_configured_for_family(
+    bytecode: &[u8],
+    seed: u64,
+    family: crate::vm::poly::VmArchitectureFamily,
+    init_regs: &[u64; 16],
+    ip_map: Option<&HashMap<u64, usize>>,
+    runtime_layout: VmRuntimeLayout,
+) -> Result<RiscEvalState> {
+    let bytecode_off = 0x20000usize;
+    let state_off = (bytecode_off + bytecode.len() + 0xFFF) & !0xFFF;
+    let stack_off = state_off + 0x10000;
+    let mut arena = Arena::new(stack_off + 0x10000)?;
+    let parts = build_self_decoding_parts_with_superops_and_chunks_for_family(
+        bytecode,
+        seed,
+        family,
+        (arena.base + OFF_CODE) as u64,
+        (arena.base + OFF_TABLE) as u64,
+        (arena.base + bytecode_off) as u64,
+        (arena.base + state_off) as u64,
+        (arena.base + stack_off) as u64,
+        ip_map,
+        TableLayout::legacy(),
+        runtime_layout.clone(),
+        &[],
+        None,
+        &[],
+    )?;
+    {
+        let buf = arena.bytes();
+        buf[OFF_CODE..OFF_CODE + parts.code.len()].copy_from_slice(&parts.code);
+        for (i, value) in parts.table.iter().enumerate() {
+            let p = OFF_TABLE + parts.layout.handler_table_off + i * 8;
+            buf[p..p + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let p = OFF_TABLE + parts.layout.operand_offs_off;
+        for (i, value) in parts.offs_tab.iter().enumerate() {
+            buf[p + i * 2..p + i * 2 + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        let p = OFF_TABLE + parts.layout.operand_flags_off;
+        buf[p..p + 256].copy_from_slice(&parts.flags_tab);
+        let p = OFF_TABLE + parts.layout.cond_codes_off;
+        buf[p..p + 256].copy_from_slice(&parts.cond_codes);
+        let p = OFF_TABLE + parts.layout.branch_map_off;
+        buf[p..p + parts.branch_map.len()].copy_from_slice(&parts.branch_map);
+        buf[bytecode_off..bytecode_off + bytecode.len()].copy_from_slice(bytecode);
+        buf[state_off..state_off + runtime_layout.total_size].fill(0);
+        buf[stack_off - 0x2000..stack_off].fill(0);
+        for (i, value) in init_regs.iter().enumerate() {
+            let p = state_off + runtime_layout.vregs[i] as usize;
+            buf[p..p + 8].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    arena.call(OFF_CODE);
+    let buf = arena.bytes();
+    let mut state = RiscEvalState::default();
+    for i in 0..16 {
+        let p = state_off + runtime_layout.vregs[i] as usize;
+        state.regs[i] = u64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
+    }
+    Ok(state)
 }
 
 /// Execute a build-local super-op stream using its original-index to rewritten

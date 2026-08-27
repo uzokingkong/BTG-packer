@@ -25,6 +25,95 @@ fn install_operand_offsets(buf: &mut [u8], base: usize, offsets: &[u16]) {
 }
 
 #[test]
+fn compact_immediates_preserve_rolling_key_in_every_family() {
+    use crate::vm::poly::VmArchitectureFamily;
+
+    let program = RiscProgram::with_ip_map(
+        vec![
+            MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Imm64(0)),
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::Zero,
+            })
+            .with_imm(0x2000),
+            MicroInstr::new(RiscOp::AddWithCarry)
+                .with_dst(MicroOperand::Temp(4))
+                .with_src1(MicroOperand::VReg(5))
+                .with_src2(MicroOperand::Imm64(0)),
+            MicroInstr::new(RiscOp::AddWithCarry)
+                .with_dst(MicroOperand::Temp(4))
+                .with_src1(MicroOperand::Temp(4))
+                .with_src2(MicroOperand::Imm64(u64::MAX - 15)),
+            MicroInstr::new(RiscOp::VirtualPush)
+                .with_src1(MicroOperand::Imm64(0x1400_1ff28)),
+            MicroInstr::new(RiscOp::VirtualPop).with_dst(MicroOperand::Temp(0)),
+            MicroInstr::new(RiscOp::Halt),
+        ],
+        HashMap::from([(0x1000, 0), (0x2000, 6)]),
+    );
+    for (ordinal, family) in [
+        VmArchitectureFamily::Stack,
+        VmArchitectureFamily::Register,
+        VmArchitectureFamily::MixedRisc,
+        VmArchitectureFamily::FusedCisc,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seed = 0xA531_7C29_D40B_1100 ^ ordinal as u64;
+        let mut encoder = PolymorphicEncoder::new_for_family(seed, family);
+        let bytecode = encoder.encode(&program).unwrap();
+        let state = run_native_poly_direct_for_family(
+            &bytecode,
+            seed,
+            family,
+            &[0; 16],
+            program.ip_map(),
+        )
+        .unwrap();
+        assert_eq!(state.stack.len(), 0, "{family:?} lost stream synchronization");
+    }
+}
+
+#[test]
+fn long_entry_resync_preserves_full_width_vip() {
+    use crate::vm::poly::VmArchitectureFamily;
+
+    let target = 70_001usize;
+    let mut instrs = Vec::with_capacity(target + 2);
+    instrs.push(
+        MicroInstr::new(RiscOp::VirtualBranch {
+            cond: BranchCondition::Always,
+        })
+        .with_imm(0x1400_2c080),
+    );
+    instrs.extend((1..target).map(|_| {
+        MicroInstr::new(RiscOp::Mov)
+            .with_dst(MicroOperand::Temp(0))
+            .with_src1(MicroOperand::Temp(0))
+    }));
+    instrs.push(
+        MicroInstr::new(RiscOp::Mov)
+            .with_dst(MicroOperand::VReg(0))
+            .with_src1(MicroOperand::Imm64(0x5A)),
+    );
+    instrs.push(MicroInstr::new(RiscOp::Halt));
+    let program = RiscProgram::with_ip_map(instrs, HashMap::from([(0x1400_2c080, target)]));
+    let seed = 0x7315_992A_4410_0E17;
+    let family = VmArchitectureFamily::Register;
+    let mut encoder = PolymorphicEncoder::new_for_family(seed, family);
+    let bytecode = encoder.encode(&program).unwrap();
+    let state = run_native_poly_direct_for_family(
+        &bytecode,
+        seed,
+        family,
+        &[0; 16],
+        program.ip_map(),
+    )
+    .unwrap();
+    assert_eq!(state.regs[0], 0x5A);
+}
+
+#[test]
 fn runtime_anchors_are_rip_relative_and_bridge_frame_is_zeroized() {
     let seed = 0xA11C_40C5_2026_0823;
     let code_base = 0x0000_0001_4001_0000;
@@ -2169,7 +2258,14 @@ fn test_native_poly_direct_typed_indirect_call_and_jump_resolve_ip_map() {
     let bytecode = PolymorphicEncoder::new(seed)
         .encode(&RiscProgram::with_ip_map(instrs, ip_map.clone()))
         .unwrap();
-    let native = run_native_poly_direct_with(&bytecode, seed, &[0u64; 16], Some(&ip_map)).unwrap();
+    let native = run_native_poly_direct_with_layout(
+        &bytecode,
+        seed,
+        &[0u64; 16],
+        Some(&ip_map),
+        VmRuntimeLayout::from_seed(seed),
+    )
+    .unwrap();
 
     assert_eq!(native.regs[0], 0x11, "indirect callee executed");
     assert_eq!(native.regs[1], 0x22, "call returned to its continuation");

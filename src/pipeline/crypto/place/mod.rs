@@ -19,6 +19,7 @@ mod vm_build;
 use lift::lift_program;
 use vm_build::{
     build_multi_family_prog_mod, build_prog_vm_mod, build_vm_mod, MULTI_FAMILY_STATE_STRIDE,
+    VM_HOST_STACK_SIZE, VM_HOST_STACK_SLOTS, VM_INVOCATION_LANES, VM_THREAD_BUCKETS,
 };
 
 /// BTG-C1 상태 버퍼 크기 (key[32] + ctr[8] + nonce[4] + pad + ks[64] + ks_off[4] = 0x80).
@@ -47,6 +48,43 @@ fn route_metadata_section(
         characteristics: 0x4000_0040, // INITIALIZED_DATA | READ
         bytes: metadata.bytes,
     })
+}
+
+fn rewrite_native_gateway_pointers(
+    sections: &mut [crate::pe::builder::SectionData],
+    image_base: u64,
+    program_vm_va: u64,
+    gateways: &std::collections::BTreeMap<u64, usize>,
+) -> usize {
+    let mut rewritten = 0usize;
+    for section in sections {
+        // Code immediates are VM-owned and must not be mechanically rewritten;
+        // callback/vtable/function-pointer storage lives in non-executable data.
+        if section.characteristics & 0x2000_0000 != 0 {
+            continue;
+        }
+        for (&original_va, &gateway_off) in gateways {
+            let gateway_va = program_vm_va + gateway_off as u64;
+            let original = original_va.to_le_bytes();
+            let replacement = gateway_va.to_le_bytes();
+            let mut cursor = 0usize;
+            while cursor + 8 <= section.bytes.len() {
+                if section.bytes[cursor..cursor + 8] == original {
+                    section.bytes[cursor..cursor + 8].copy_from_slice(&replacement);
+                    rewritten += 1;
+                    cursor += 8;
+                } else {
+                    cursor += 1;
+                }
+            }
+            // Do not byte-scan arbitrary 32-bit RVA values here. They are not
+            // self-describing pointers and collide with ordinary constants,
+            // relocation metadata and packed structures. Canonical RVA-table
+            // rewrites belong to the typed table provenance path; PE32+ native
+            // callback/vtable slots are full image VAs.
+        }
+    }
+    rewritten
 }
 
 pub(crate) fn place_boot_stub(
@@ -454,6 +492,10 @@ pub(crate) fn place_boot_stub(
             image_base,
             ctx.poly_vm_seed,
             &ctx.vm_data_lifetime_objects,
+            &ctx.route_required_original_targets
+                .iter()
+                .map(|target| image_base + u64::from(target.0))
+                .collect::<Vec<_>>(),
         )?)
     } else {
         None
@@ -671,12 +713,16 @@ pub(crate) fn place_boot_stub(
         let immutable_end = vm_prog_off + m.code.len() + m.table.len() + m.bytecode.len();
         let state_off = (immutable_end + 0xFFF) & !0xFFF;
         let sva = dispatcher_va + state_off as u64;
+        let entry_gateway_off = vm_multi_family_sizing
+            .as_ref()
+            .map(|multi| multi.canonical_entry_gateway_offset)
+            .unwrap_or(0);
         (
-            dispatcher_va + vm_prog_off as u64,
+            dispatcher_va + vm_prog_off as u64 + entry_gateway_off as u64,
             sva,
             state_off - vm_prog_off
                 + if let Some(multi) = &vm_multi_family_sizing {
-                    multi.families.len() * MULTI_FAMILY_STATE_STRIDE
+                    multi.invocation_layout.reserve_size
                 } else {
                     vm::VM_STATE_SIZE
                 },
@@ -1534,10 +1580,35 @@ pub(crate) fn place_boot_stub(
                 image_base,
                 ctx.poly_vm_seed,
                 &ctx.vm_data_lifetime_objects,
+                &ctx.route_required_original_targets
+                    .iter()
+                    .map(|target| image_base + u64::from(target.0))
+                    .collect::<Vec<_>>(),
             )?)
         } else {
             None
         };
+        if let Some(multi) = &multi_built {
+            let expected_entry_va = prva + multi.canonical_entry_gateway_offset as u64;
+            if expected_entry_va != vm_prog_entry_va {
+                anyhow::bail!(
+                    "canonical OEP gateway placement drift: sized=0x{:X} final=0x{:X}",
+                    vm_prog_entry_va,
+                    expected_entry_va
+                );
+            }
+            let rewritten = rewrite_native_gateway_pointers(
+                &mut ctx.patched_sections,
+                image_base,
+                prva,
+                &multi.native_entry_gateways,
+            );
+            println!(
+                "[+] Canonical native gateways: {} gateway(s), {} function-pointer slot(s) rewritten",
+                multi.native_entry_gateways.len(),
+                rewritten
+            );
+        }
         let prmod = if let Some(multi) = &multi_built {
             vm_multi_family_chunks = multi.chunks.clone();
             multi.module.clone()
@@ -1613,40 +1684,8 @@ pub(crate) fn place_boot_stub(
                 btg.bytes[sync_count_off..sync_count_off + 8]
                     .copy_from_slice(&(multi.lifetime_sync.entries.len() as u64).to_le_bytes());
                 if index == 0 {
-                    let sync_start =
-                        state_off + crate::vm::data_lifetime::LIFETIME_SYNC_TABLE_OFFSET as usize;
-                    let sync_end = sync_start + crate::vm::data_lifetime::LIFETIME_SYNC_TABLE_SIZE;
-                    btg.bytes[sync_start..sync_end].fill(0);
-                    for (entry_index, entry) in multi.lifetime_sync.entries.iter().enumerate() {
-                        let entry_off = sync_start
-                            + entry_index * crate::vm::data_lifetime::LIFETIME_SYNC_ENTRY_SIZE;
-                        btg.bytes[entry_off + 16..entry_off + 24]
-                            .copy_from_slice(&entry.object_va.to_le_bytes());
-                        btg.bytes[entry_off + 24..entry_off + 28]
-                            .copy_from_slice(&entry.object_len.to_le_bytes());
-                        btg.bytes[entry_off + 28..entry_off + 32]
-                            .copy_from_slice(&entry.object_rva.to_le_bytes());
-                        btg.bytes[entry_off + 32..entry_off + 40]
-                            .copy_from_slice(&entry.object_key.to_le_bytes());
-                    }
-                    let expected_sync_va =
-                        vm_prog_state_va + crate::vm::data_lifetime::LIFETIME_SYNC_TABLE_OFFSET;
-                    if multi.lifetime_sync.base_va != expected_sync_va {
-                        anyhow::bail!(
-                            "P2-14 lifetime sync table VA drift: built=0x{:X} placed=0x{:X}",
-                            multi.lifetime_sync.base_va,
-                            expected_sync_va
-                        );
-                    }
                     btg.bytes[state_off + 0x5000..state_off + 0x5008]
                         .copy_from_slice(&(multi.entry_byte_offset as u64).to_le_bytes());
-                    if !multi.lifetime_sync.entries.is_empty() {
-                        println!(
-                            "[+] P2-14 shared lifetime sync: {} global lock/depth/owner entry(s) @0x{:X}",
-                            multi.lifetime_sync.entries.len(),
-                            multi.lifetime_sync.base_va,
-                        );
-                    }
                 }
                 let ptr = state_off + crate::vm::interp::STATE_PTR_CALL_STACK;
                 btg.bytes[ptr..ptr + 8].copy_from_slice(&call_stack_va.to_le_bytes());
@@ -1657,14 +1696,96 @@ pub(crate) fn place_boot_stub(
                     call_stack_va,
                 );
             }
+
+            // Global `.vstate` tail: bucket counters, one process-shared
+            // lifetime table, then 128 lane-private native runtime stacks.
+            // Keeping this table outside every 0x8000 family stride removes the
+            // previous 0x2000..0x3060 overlap with the commercial virtual stack.
+            let lane_control_off = (multi.invocation_layout.lane_control_va - dispatcher_va) as usize;
+            let lane_control_end = lane_control_off + VM_THREAD_BUCKETS * 4;
+            if lane_control_end > btg.bytes.len() {
+                anyhow::bail!("multi-family lane-control tail exceeds .textb/.vstate backing");
+            }
+            btg.bytes[lane_control_off..lane_control_end].fill(0);
+
+            let sync_start = (multi.lifetime_sync.base_va - dispatcher_va) as usize;
+            let sync_end = sync_start + crate::vm::data_lifetime::LIFETIME_SYNC_TABLE_SIZE;
+            if sync_end > btg.bytes.len() {
+                anyhow::bail!("P2-14 global lifetime sync table exceeds .vstate backing");
+            }
+            btg.bytes[sync_start..sync_end].fill(0);
+            for (entry_index, entry) in multi.lifetime_sync.entries.iter().enumerate() {
+                let entry_off = sync_start
+                    + entry_index * crate::vm::data_lifetime::LIFETIME_SYNC_ENTRY_SIZE;
+                btg.bytes[entry_off + 16..entry_off + 24]
+                    .copy_from_slice(&entry.object_va.to_le_bytes());
+                btg.bytes[entry_off + 24..entry_off + 28]
+                    .copy_from_slice(&entry.object_len.to_le_bytes());
+                btg.bytes[entry_off + 28..entry_off + 32]
+                    .copy_from_slice(&entry.object_rva.to_le_bytes());
+                btg.bytes[entry_off + 32..entry_off + 40]
+                    .copy_from_slice(&entry.object_key.to_le_bytes());
+            }
+            if !multi.lifetime_sync.entries.is_empty() {
+                println!(
+                    "[+] P2-14 shared lifetime sync: {} global lock/depth/owner entry(s) @0x{:X}",
+                    multi.lifetime_sync.entries.len(),
+                    multi.lifetime_sync.base_va,
+                );
+            }
+
+            let host_pool_off = (multi.invocation_layout.host_stack_pool_va - dispatcher_va) as usize;
+            let host_pool_len = VM_HOST_STACK_SLOTS * VM_HOST_STACK_SIZE;
+            let host_pool_end = host_pool_off
+                .checked_add(host_pool_len)
+                .ok_or_else(|| anyhow::anyhow!("native host-stack pool range overflow"))?;
+            if host_pool_end > btg.bytes.len() {
+                anyhow::bail!("native host-stack pool exceeds .vstate backing");
+            }
+            btg.bytes[host_pool_off..host_pool_end].fill(0);
+            println!(
+                "[+] native gateway host stacks: {} slot(s) (canonical + {} lanes) x 0x{:X} bytes @0x{:X}",
+                VM_HOST_STACK_SLOTS,
+                VM_INVOCATION_LANES,
+                VM_HOST_STACK_SIZE,
+                multi.invocation_layout.host_stack_pool_va,
+            );
+
+            // Initialize every gateway invocation lane. Lifetime coordination
+            // remains process-shared, while architectural state and call stacks
+            // are lane-private.
+            let lane_group_stride = multi.invocation_layout.lane_group_stride;
+            for lane in 1..=VM_INVOCATION_LANES {
+                for state_delta in multi.state_offsets.iter().copied() {
+                    let lane_delta = lane * lane_group_stride + state_delta;
+                    let state_off = (vm_prog_state_va - dispatcher_va) as usize + lane_delta;
+                    btg.bytes[state_off..state_off + MULTI_FAMILY_STATE_STRIDE].fill(0);
+                    let sync_ptr_off = state_off
+                        + crate::vm::data_lifetime::LIFETIME_SYNC_PTR_STATE_OFFSET;
+                    btg.bytes[sync_ptr_off..sync_ptr_off + 8]
+                        .copy_from_slice(&multi.lifetime_sync.base_va.to_le_bytes());
+                    let sync_count_off = state_off
+                        + crate::vm::data_lifetime::LIFETIME_SYNC_COUNT_STATE_OFFSET;
+                    btg.bytes[sync_count_off..sync_count_off + 8]
+                        .copy_from_slice(&(multi.lifetime_sync.entries.len() as u64).to_le_bytes());
+                    let call_stack_va = vm_prog_state_va + lane_delta as u64
+                        + (MULTI_FAMILY_STATE_STRIDE - crate::vm::interp::CALL_STACK_SIZE) as u64;
+                    let ptr = state_off + crate::vm::interp::STATE_PTR_CALL_STACK;
+                    btg.bytes[ptr..ptr + 8].copy_from_slice(&call_stack_va.to_le_bytes());
+                }
+            }
         }
+        let placed_state_bytes = multi_built
+            .as_ref()
+            .map(|multi| multi.invocation_layout.reserve_size)
+            .unwrap_or(vm::VM_STATE_SIZE);
         println!(
             "[+] M6 Phase-2 Program VM: module @0x{:X} (code {}B table {}B bytecode {}B state {}B) entry_va=0x{:X} state_va=0x{:X}",
             vm_prog_off,
             prmod.code.len(),
             prmod.table.len(),
             prmod.bytecode.len(),
-            vm::VM_STATE_SIZE,
+            placed_state_bytes,
             vm_prog_entry_va,
             vm_prog_state_va
         );

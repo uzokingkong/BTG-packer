@@ -551,7 +551,9 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
         if file_off + 12 <= out.len() && file_off + 12 <= raw_avail {
             let b = &out[file_off..];
             let prologue_ok = if ctx.anti_debug {
-                b.len() >= 5 && b[0..5] == [0x9C, 0x50, 0x65, 0x48, 0x8B]
+                b.len() >= 5
+                    && (b[0..5] == [0x9C, 0x50, 0x65, 0x48, 0x8B]
+                        || b[0..5] == [0x9C, 0x50, 0x31, 0xC0, 0x90])
             } else if ctx.vm_oep {
                 // Native fallback saves the exact loader context; a fully lifted
                 // entry starts by loading the VM state address into RAX.
@@ -968,10 +970,29 @@ fn derive_ownership_model(
     let sections = collect_sections(&pe);
 
     // Parse .pdata RUNTIME_FUNCTION entries: 12-byte [BeginRVA, EndRVA, UnwindInfoRVA].
+    // Use the PE Exception data directory (index 3) size to determine the exact
+    // length of the RUNTIME_FUNCTION array. The .pdata section's raw_size includes
+    // UNWIND_INFO blobs appended after the array; parsing those bytes as 12-byte
+    // RUNTIME_FUNCTION entries produces bogus entries that shadow real ones.
     let mut runtime_functions: Vec<RuntimeFunction> = Vec::new();
+    let exception_dir_size = pe
+        .header
+        .optional_header
+        .as_ref()
+        .and_then(|oh| {
+            oh.data_directories.data_directories[3]
+                .as_ref()
+                .map(|(_, dd)| dd.size as usize)
+        })
+        .unwrap_or(0);
     if let Some(pd) = sections.iter().find(|s| s.name == ".pdata") {
         let start = pd.raw_ptr as usize;
-        let len = pd.raw_size as usize;
+        // Prefer the data directory size (RF array only) over raw_size (includes UNWIND_INFO).
+        let len = if exception_dir_size > 0 {
+            exception_dir_size
+        } else {
+            pd.raw_size as usize
+        };
         let avail = (start + len).min(out.len());
         if start < out.len() {
             for chunk in out[start..avail].chunks_exact(12) {
@@ -1038,8 +1059,14 @@ pub(crate) fn validate_function_ownership(ctx: &PipelineContext, out: &[u8]) -> 
     let mut model = if !authoritative {
         derived_model
     } else {
+        // VM-owned original functions have been virtualized into the program-VM
+        // module at a different RVA range. Their original RVAs no longer have
+        // individual .pdata coverage in the output PE — the VM module's
+        // RUNTIME_FUNCTION entry covers them collectively. Only native functions
+        // retain their original .pdata entries and need individual validation.
         ctx.ownership_report
             .iter()
+            .filter(|record| !record.function.owned_by_vm)
             .map(|record| record.function)
             .collect::<Vec<_>>()
     };
@@ -1083,8 +1110,20 @@ pub(crate) fn validate_function_ownership(ctx: &PipelineContext, out: &[u8]) -> 
             .find(|section| section.name == ".pdata")
             .ok_or_else(|| anyhow!("native bridges require .pdata"))?;
         let pdata_start = pdata.raw_ptr as usize;
+        // Use Exception data directory size (RF array only) to avoid scanning
+        // UNWIND_INFO bytes appended after the RUNTIME_FUNCTION array.
+        let exception_array_size = pe
+            .header
+            .optional_header
+            .as_ref()
+            .and_then(|oh| {
+                oh.data_directories.data_directories[3]
+                    .as_ref()
+                    .map(|(_, dd)| dd.size as usize)
+            })
+            .unwrap_or(pdata.raw_size as usize);
         let pdata_end = pdata_start
-            .saturating_add(pdata.raw_size as usize)
+            .saturating_add(exception_array_size)
             .min(out.len());
         let rva_bytes = |rva: u32, len: usize| -> Result<&[u8]> {
             let section = sections

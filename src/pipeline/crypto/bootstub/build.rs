@@ -50,6 +50,15 @@ pub(crate) fn build_anti_debug_raw_block(
         0x0F, 0x0B, 0x58, // pop rax
         0x9D, // popfq
     ];
+    // The raw pre-loader PEB probe has produced repeatable false positives on
+    // ordinary Windows launches (including differential verification) before
+    // the protected runtime has established its normal process context. Keep
+    // the fixed block/branch shape but make this early probe neutral; the
+    // structured post-entry anti-debug policy remains responsible for an
+    // actual debugger decision.
+    b[0x02] = 0x31;
+    b[0x03] = 0xC0;
+    b[0x04..0x11].fill(0x90);
     // NtGlobalFlag is a system/process instrumentation policy, not proof that
     // this process is currently debugged.  Machines with GFlags enabled would
     // otherwise make every protected binary trap during ordinary execution.

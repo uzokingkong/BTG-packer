@@ -1,7 +1,10 @@
 //! Conservative inventory of code pointers stored in loader-mapped data.
 //!
-//! Absolute VA candidates are accepted only at typed `IMAGE_REL_BASED_DIR64`
-//! slots. RVA candidates do not have relocation evidence, so callers can
+//! Absolute VA candidates prefer typed `IMAGE_REL_BASED_DIR64` slots, but
+//! fixed-base/relocation-stripped Rust and MSVC images also contain naturally
+//! aligned vtable leaf targets without DIR64 records. Those are inventoried as
+//! lower-provenance data VAs when they point exactly into executable ranges.
+//! RVA candidates do not have relocation evidence, so callers can
 //! exclude directory/table ranges whose layouts are already interpreted by a
 //! typed PE parser (imports, unwind, TLS, load-config, and similar metadata).
 
@@ -13,6 +16,7 @@ const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CodePointerProvenance {
     Dir64Relocation,
+    DataVa64,
     DataRva32,
 }
 
@@ -70,6 +74,49 @@ impl CodePointerScan<'_> {
                     target_rva: target,
                     provenance: CodePointerProvenance::Dir64Relocation,
                 });
+            }
+        }
+
+        // Rust trait/vtable leaves and MSVC callback tables can survive in a
+        // fixed-base image without a relocation for every absolute slot. Scan
+        // aligned loader-mapped data so these real internal entry points become
+        // canonical functions instead of falling through to NX original text.
+        for section in self
+            .sections
+            .iter()
+            .filter(|s| s.characteristics & IMAGE_SCN_MEM_EXECUTE == 0)
+        {
+            for offset in (0..section.bytes.len().saturating_sub(7)).step_by(8) {
+                let Some(location) = section.virtual_address.checked_add(offset as u32) else {
+                    break;
+                };
+                let Some(location_end) = location.checked_add(8) else {
+                    continue;
+                };
+                if self.is_protected(location, 8)
+                    || self.overlaps_dir64(location, location_end)
+                {
+                    continue;
+                }
+                let value =
+                    u64::from_le_bytes(section.bytes[offset..offset + 8].try_into().unwrap());
+                let Some(target) = value
+                    .checked_sub(self.image_base)
+                    .and_then(|value| u32::try_from(value).ok())
+                else {
+                    continue;
+                };
+                if self.is_executable(target) {
+                    seeds.push(CodePointerSeed {
+                        location: RvaRange {
+                            start: location,
+                            end: location_end,
+                        },
+                        encoding: CodePointerEncoding::Va64,
+                        target_rva: target,
+                        provenance: CodePointerProvenance::DataVa64,
+                    });
+                }
             }
         }
 
@@ -182,7 +229,7 @@ mod tests {
         assert!(seeds
             .iter()
             .any(|s| s.location.start == 0x3010 && s.encoding == CodePointerEncoding::Rva32));
-        assert!(!seeds
+        assert!(seeds
             .iter()
             .any(|s| s.location.start == 0x3008 && s.encoding == CodePointerEncoding::Va64));
     }

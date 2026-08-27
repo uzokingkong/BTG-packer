@@ -7,7 +7,7 @@ use super::program_model::{
 };
 use crate::graph::cfg::BasicBlock;
 use crate::pe::{load_config::LoadConfig64, parser::TargetPeInfo, tls::TlsDirectory64};
-use iced_x86::FlowControl;
+use iced_x86::{Decoder, DecoderOptions, FlowControl};
 use std::collections::{BTreeMap, BTreeSet};
 
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
@@ -112,6 +112,7 @@ impl<'a> ProgramModelBuilder<'a> {
                 crate::analysis::code_pointers::CodePointerProvenance::Dir64Relocation => {
                     "dir64-relocation"
                 }
+                crate::analysis::code_pointers::CodePointerProvenance::DataVa64 => "data-va64",
                 crate::analysis::code_pointers::CodePointerProvenance::DataRva32 => "data-rva32",
             };
             builder.points.push(PointSeed {
@@ -269,10 +270,19 @@ impl<'a> ProgramModelBuilder<'a> {
                 .iter()
                 .any(|(r, _)| r.start <= seed.rva && seed.rva < r.end)
             {
+                let next_declared = groups
+                    .iter()
+                    .filter_map(|(range, _)| (range.start > seed.rva).then_some(range.start))
+                    .min()
+                    .unwrap_or(u32::MAX);
+                let end = infer_point_function_end(self.target, seed.rva, &executable_ranges)
+                    .unwrap_or(seed.rva.saturating_add(1))
+                    .min(next_declared)
+                    .max(seed.rva.saturating_add(1));
                 groups.push((
                     RvaRange {
                         start: seed.rva,
-                        end: seed.rva + 1,
+                        end,
                     },
                     Vec::new(),
                 ));
@@ -329,6 +339,7 @@ impl<'a> ProgramModelBuilder<'a> {
             if let (Some(target), Some((location, encoding, provenance))) =
                 (rva_to_function.get(&seed.rva).copied(), seed.pointer)
             {
+                model.discovered_indirect_code_targets.insert(seed.rva);
                 if !seen_pointers.insert((location, encoding, target)) {
                     continue;
                 }
@@ -735,6 +746,50 @@ impl<'a> ProgramModelBuilder<'a> {
         model.validate()?;
         Ok(model)
     }
+}
+
+/// Give metadata-free code-pointer leaves a real, terminal-bounded body. A
+/// one-byte placeholder cannot represent even `mov al,1; ret`, which previously
+/// left Rust vtable leaves owned in the model but absent from VM bytecode.
+fn infer_point_function_end(
+    target: &TargetPeInfo,
+    start: u32,
+    executable_ranges: &[RvaRange],
+) -> Option<u32> {
+    let exec_end = executable_ranges
+        .iter()
+        .find(|range| range.start <= start && start < range.end)?
+        .end;
+    let section = target.relayed_sections.iter().find(|section| {
+        section.virtual_address <= start
+            && start < section.virtual_address.saturating_add(section.bytes.len() as u32)
+    })?;
+    let offset = start.checked_sub(section.virtual_address)? as usize;
+    let available = section.bytes.len().saturating_sub(offset).min(0x1000);
+    let mut decoder = Decoder::with_ip(
+        64,
+        &section.bytes[offset..offset + available],
+        target.image_base + u64::from(start),
+        DecoderOptions::NONE,
+    );
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        let end = instruction
+            .next_ip()
+            .checked_sub(target.image_base)
+            .and_then(|rva| u32::try_from(rva).ok())?
+            .min(exec_end);
+        if matches!(
+            instruction.flow_control(),
+            FlowControl::Return | FlowControl::UnconditionalBranch | FlowControl::Exception
+        ) {
+            return (end > start).then_some(end);
+        }
+    }
+    None
 }
 
 /// Refines the canonical partition at proven indirect-jump destinations that

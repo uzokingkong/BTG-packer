@@ -257,6 +257,7 @@ pub fn build_program_vm_commercial_with_routes_for_family(
         handler_offsets: Vec::new(),
         native_bridge_range: parts.native_bridge_range,
         lifetime_cleanup_handler_offset: parts.lifetime_cleanup_handler_offset,
+        dynamic_state_entry_offset: Some(parts.dynamic_state_entry_offset),
     })
 }
 
@@ -523,6 +524,9 @@ mod tests {
         let child_layout = VmRuntimeLayout::from_seed(child_seed);
         let parent = RiscProgram::with_ip_map(
             vec![
+                MicroInstr::new(RiscOp::Mov)
+                    .with_dst(MicroOperand::VReg(1))
+                    .with_src1(MicroOperand::Imm64(42)),
                 MicroInstr::new(RiscOp::VirtualPush).with_src1(MicroOperand::Imm64(0x1002)),
                 MicroInstr::new(RiscOp::VirtualBranch {
                     cond: crate::vm::risc::BranchCondition::Always,
@@ -533,15 +537,21 @@ mod tests {
                     .with_src1(MicroOperand::VReg(0)),
                 MicroInstr::new(RiscOp::Halt),
             ],
-            HashMap::from([(0x1000, 0), (0x1002, 2)]),
+            HashMap::from([(0x1000, 0), (0x1002, 3)]),
         );
         let child = RiscProgram::with_ip_map(
-            vec![
+            std::iter::once(
                 MicroInstr::new(RiscOp::Mov)
                     .with_dst(MicroOperand::VReg(0))
-                    .with_src1(MicroOperand::Imm64(42)),
-                MicroInstr::new(RiscOp::VirtualRet),
-            ],
+                    .with_src1(MicroOperand::VReg(1)),
+            )
+            .chain([2usize, 8, 9, 10, 11].into_iter().map(|reg| {
+                MicroInstr::new(RiscOp::Mov)
+                    .with_dst(MicroOperand::VReg(reg as u8))
+                    .with_src1(MicroOperand::Imm64(0xA000 + reg as u64))
+            }))
+            .chain(std::iter::once(MicroInstr::new(RiscOp::VirtualRet)))
+            .collect(),
             HashMap::from([(0x2000, 0)]),
         );
         let mut parent_encoder =
@@ -641,6 +651,16 @@ mod tests {
             42,
             "child module must execute at the routed local VIP"
         );
+        let child_vsp_off = child_layout.vsp as usize;
+        assert_eq!(
+            u64::from_le_bytes(
+                buf[child_state_off + child_vsp_off..child_state_off + child_vsp_off + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            0,
+            "cross-family invocation must leave the child operand stack empty"
+        );
         let parent_state = (parent_state - base) as usize;
         for reg in [0usize, 1] {
             let off = parent_layout.vregs[reg] as usize;
@@ -652,6 +672,18 @@ mod tests {
                 ),
                 42,
                 "parent vreg {reg} must observe child return and resume"
+            );
+        }
+        for reg in [2usize, 8, 9, 10, 11] {
+            let off = parent_layout.vregs[reg] as usize;
+            assert_eq!(
+                u64::from_le_bytes(
+                    buf[parent_state + off..parent_state + off + 8]
+                        .try_into()
+                        .unwrap()
+                ),
+                0xA000 + reg as u64,
+                "parent vreg {reg} must use child guest state, not dispatcher scratch"
             );
         }
     }
