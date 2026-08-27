@@ -151,6 +151,8 @@ jobs:
         id: real_full
         continue-on-error: true
         shell: pwsh
+        env:
+          BTG_TRACE_OP_MAP_OFFSET: "619da"
         run: |
           $input = "test/target/release/rust_packer_test.exe"
           $output = "commercial-real-full.exe"
@@ -172,6 +174,8 @@ jobs:
         id: real_partial
         continue-on-error: true
         shell: pwsh
+        env:
+          BTG_TRACE_OP_MAP_OFFSET: "619da"
         run: |
           $input = "test/target/release/rust_packer_test.exe"
           $output = "commercial-real-partial.exe"
