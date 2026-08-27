@@ -316,14 +316,14 @@ impl MultiFamilyProgramPlan {
             let (bytecode, instruction_offsets) = encoder
                 .encode_with_offsets(&routed_program)
                 .map_err(|error| error.to_string())?;
+            let local_to_ip: HashMap<usize, u64> = partition
+                .program
+                .ip_map()
+                .into_iter()
+                .flatten()
+                .map(|(&ip, &local)| (local, ip))
+                .collect();
             if std::env::var_os("BTG_TRACE_OP_MAP").is_some() {
-                let local_to_ip: HashMap<usize, u64> = partition
-                    .program
-                    .ip_map()
-                    .into_iter()
-                    .flatten()
-                    .map(|(&ip, &local)| (local, ip))
-                    .collect();
                 for (local, instruction) in partition.program.instrs.iter().enumerate() {
                     eprintln!(
                         "BTG_OP_MAP family={:?} local={} offset={:#x} ip={} op={:?}",
@@ -336,6 +336,55 @@ impl MultiFamilyProgramPlan {
                             .unwrap_or_else(|| "-".to_string()),
                         instruction.op
                     );
+                }
+            }
+            if let Some(target) = std::env::var("BTG_TRACE_OP_MAP_OFFSET")
+                .ok()
+                .and_then(|raw| {
+                    let raw = raw.trim();
+                    u64::from_str_radix(raw.trim_start_matches("0x"), 16)
+                        .ok()
+                        .or_else(|| raw.parse::<u64>().ok())
+                })
+            {
+                if !instruction_offsets.is_empty() {
+                    let mut local = 0usize;
+                    for (index, &offset) in instruction_offsets.iter().enumerate() {
+                        if offset as u64 > target {
+                            break;
+                        }
+                        local = index;
+                    }
+                    let start = local.saturating_sub(8);
+                    let end = (local + 9).min(partition.program.instrs.len());
+                    eprintln!(
+                        "[BTG_OP_MAP_NEAR] family={:?} target={target:#x} local={} start_off={:#x} next_off={}",
+                        partition.family,
+                        local,
+                        instruction_offsets[local],
+                        instruction_offsets
+                            .get(local + 1)
+                            .map(|v| format!("{v:#x}"))
+                            .unwrap_or_else(|| "-".to_string())
+                    );
+                    for index in start..end {
+                        let instruction = &partition.program.instrs[index];
+                        eprintln!(
+                            "[BTG_OP_MAP_NEAR] family={:?} local={} offset={:#x} ip={} op={:?} dst={:?} src1={:?} src2={:?} imm={:#x}",
+                            partition.family,
+                            index,
+                            instruction_offsets[index],
+                            local_to_ip
+                                .get(&index)
+                                .map(|ip| format!("{ip:#x}"))
+                                .unwrap_or_else(|| "-".to_string()),
+                            instruction.op,
+                            instruction.dst,
+                            instruction.src1,
+                            instruction.src2,
+                            instruction.imm
+                        );
+                    }
                 }
             }
             let exit_byte_offset = *instruction_offsets
