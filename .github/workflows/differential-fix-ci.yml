@@ -24,14 +24,8 @@ jobs:
       - name: Cargo check
         run: cargo check --locked --lib
 
-      - name: Cargo test
-        run: cargo test --release --locked --lib
-
       - name: Cargo build release
         run: cargo build --release --locked
-
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features --locked
 
       - name: Upload release binary
         uses: actions/upload-artifact@v4
@@ -39,3 +33,9 @@ jobs:
           name: btg-packer-windows-x64
           path: target/release/btg-packer.exe
           if-no-files-found: error
+
+      - name: Cargo test (serial diagnostics)
+        run: cargo test --release --locked --lib -- --nocapture --test-threads=1
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked
