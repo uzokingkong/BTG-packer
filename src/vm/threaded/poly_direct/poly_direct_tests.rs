@@ -1124,10 +1124,12 @@ fn test_lifted_fnv_loop_backward_branch_matches_host_arithmetic() {
         lifter.lift_instruction(&inst).unwrap();
     }
     let prog = RiscProgram::with_ip_map(lifter.desynth.instrs, ip_map.clone());
+    let mut guest_stack = vec![0u8; 0x4000];
     let mut init = [0u64; 16];
     init[0] = bytes.as_ptr() as u64;
     init[1] = bytes.len() as u64;
     init[2] = 0x0000_0100_0000_01B3;
+    init[4] = guest_stack.as_mut_ptr().wrapping_add(0x2000) as u64;
     init[6] = 0xCBF2_9CE4_8422_2325;
     let expected = bytes
         .iter()
@@ -1152,6 +1154,8 @@ fn test_lifted_fnv_loop_backward_branch_matches_host_arithmetic() {
     let native = run_native_poly_direct_with(&bytecode, seed, &init, Some(&ip_map)).unwrap();
     assert_eq!(native.regs[6], expected, "lifted backward-loop FNV result");
     assert_eq!(native.regs[8], bytes.len() as u64, "all bytes consumed");
+    // Keep the architectural stack allocation alive through every native VM run.
+    std::hint::black_box(&guest_stack);
 }
 
 /// Differential: native self-decoding == interpreter == reference.
