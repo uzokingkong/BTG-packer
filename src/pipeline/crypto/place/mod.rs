@@ -1061,7 +1061,13 @@ pub(crate) fn place_boot_stub(
     {
         anyhow::bail!("--mem-harden requires LoadLibraryA and GetProcAddress bootstrap imports when preserving the original IAT");
     }
-    let needs_dummy_bootstrap = ctx.iat_hide || ctx.original_imports.is_empty();
+    // An empty cached import inventory is not proof that the target has no
+    // imports. main populates original_imports only when IAT hiding or
+    // mem-harden actually needs it. Installing a dummy directory merely because
+    // this cache is empty replaces the target's loader-owned Import Directory;
+    // the original IAT then remains full of IMAGE_IMPORT_BY_NAME RVAs.
+    let needs_dummy_bootstrap =
+        ctx.iat_hide || (ctx.mem_harden && ctx.original_imports.is_empty());
     // The dummy directory belongs exclusively to IAT hiding.  Mem-harden by
     // itself must retain the loader-populated original IAT (notably for TLS
     // callbacks that run before OEP).
@@ -1080,10 +1086,14 @@ pub(crate) fn place_boot_stub(
     let (dummy_blob, dummy_dir_rva, dummy_dir_size, iat_ll_slot_rva, iat_gpa_slot_rva) =
         if needs_dummy_bootstrap {
             crate::pipeline::iat_hide::build_dummy_import_block(dummy_base_rva)
-        } else {
+        } else if ctx.mem_harden {
             let ll = original_ll.expect("bootstrap presence checked above");
             let gpa = original_gpa.expect("bootstrap presence checked above");
             (Vec::new(), 0, 0, ll, gpa)
+        } else {
+            // Ordinary Program-VM builds do not own import resolution. Leave
+            // the target's Import Directory/IAT entirely loader-owned.
+            (Vec::new(), 0, 0, 0, 0)
         };
     debug_assert_eq!(dummy_blob.len(), dummy_blob0.len());
     ctx.bootstrap_iat_section_data = if dummy_blob.is_empty() {
