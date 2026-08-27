@@ -2294,15 +2294,33 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R12, Register::RDX).unwrap()); // state_base
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::R8).unwrap()); // bytecode_base
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RDI, Register::R10).unwrap()); // target
-            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::RSP).unwrap()); // original S
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::RSP).unwrap()); // VM host RSP
+
+            // Native Windows code must execute on the real thread stack. The VM
+            // dispatcher uses an isolated .vstate host stack so guest architectural
+            // stack writes cannot corrupt dispatcher frames, but carrying that
+            // synthetic RSP into ucrt/ntdll violates the thread-stack contract.
+            // Guest RSP is the real Windows stack position after the lifted CALL's
+            // architectural return-address push; build the private bridge frame
+            // below it, then restore the VM host RSP after the native call returns.
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RAX,
+                    MemoryOperand::with_base_displ_size(
+                        Register::R12,
+                        state_disp(REGS_OFF + 4 * 8) as i64,
+                        8,
+                    ),
+                )
+                .unwrap(),
+            );
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSP, Register::RAX).unwrap());
 
             // Frame [rsp+0x00..0x6F] = Win64 shadow space + eight stack args;
-            // [rsp+0x70..0xA7] = state, bytecode, vstack, table, ret-ip, old-rsp,
-            // target.  0xB0 preserves the required pre-call 16-byte alignment.
-            // Entry RSP is 8 mod 16 and the eight entry pushes preserve that
-            // alignment. A fixed 0xB8 allocation produces the required 0-mod-16
-            // pre-call RSP while remaining exactly representable by x64 unwind
-            // metadata (unlike the former dynamic `and rsp,-16; sub rsp,0xB0`).
+            // [rsp+0x70..0xAF] = state, bytecode, vstack, table, ret-ip,
+            // VM-host-rsp, target, optional child-state. Guest RSP is 8 mod 16,
+            // so subtracting 0xB8 yields the required 0-mod-16 pre-call RSP.
             b.push(Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, 0xB8).unwrap());
             for (off, reg) in [
                 (0x70, Register::R12),
@@ -2783,7 +2801,9 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
                 );
             }
 
-            // 7. Restore the VM infra from the bridge frame before restoring RSP.
+            // 7. Restore VM infrastructure while physical RSP still points at
+            // the real-thread-stack bridge frame. Keep the saved VM host RSP in
+            // RBX until the frame has been scrubbed.
             b.push(
                 Instruction::with2(
                     Code::Mov_r64_rm64,
@@ -2827,16 +2847,16 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             b.push(
                 Instruction::with2(
                     Code::Mov_r64_rm64,
-                    Register::RSP,
+                    Register::RBX,
                     MemoryOperand::with_base_displ_size(Register::RSP, 0x98, 8),
                 )
                 .unwrap(),
             );
+
             // The source CALL's architectural return slot was pushed by the
-            // lifter.  Native/generated child execution returned through the
+            // lifter. Native/generated child execution returned through the
             // bridge rather than through the source VM's VirtualRet, so consume
-            // that slot here.  This also mirrors a cross-family tail target's
-            // final RET back into the parent state.
+            // that slot here.
             b.push(
                 Instruction::with2(
                     Code::Mov_r64_rm64,
@@ -2862,10 +2882,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
                 )
                 .unwrap(),
             );
-            // The dead private frame is now below the restored RSP. Immediate
-            // stores erase every anchor without borrowing a live guest/route
-            // register from the cross-family continuation ABI.
-            for off in [-0x48, -0x40, -0x38, -0x30, -0x28, -0x20, -0x18] {
+
+            // Scrub context while the real-stack frame is still addressable.
+            // RBX already holds the VM host RSP and is repurposed immediately
+            // after the stack switch for branch-map lookup.
+            for off in [0x70i64, 0x78, 0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8] {
                 b.push(
                     Instruction::with2(
                         Code::Mov_rm64_imm32,
@@ -2875,6 +2896,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
                     .unwrap(),
                 );
             }
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSP, Register::RBX).unwrap());
 
             // 9. resume at ret_ip (RBP): branch-map lookup -> byte offset.
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::R15).unwrap());
