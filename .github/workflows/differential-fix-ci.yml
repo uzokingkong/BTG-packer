@@ -68,3 +68,28 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked
+
+      - name: Build real Windows QA payload
+        run: cargo build --manifest-path test/Cargo.toml
+
+      - name: Commercial Program-VM direct differential
+        shell: pwsh
+        run: |
+          $input = "test/target/debug/rust_packer_test.exe"
+          $output = "commercial-direct-verified.exe"
+          if (-not (Test-Path $input)) { throw "QA payload missing: $input" }
+          & "target/release/btg-packer.exe" --input $input --output $output --vm --vm-oep --vm-commercial --verify-output --verify-timeout-secs 30 --seed 3134984190
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path $output)) { throw "verified output missing: $output" }
+
+      - name: Commercial Program-VM corpus E2E
+        run: cargo run --release --locked -- --test-qa --qa-commercial
+
+      - name: Upload verified commercial binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: btg-commercial-differential-verified
+          path: |
+            commercial-direct-verified.exe
+            commercial-direct-verified.exe.btgmanifest
+          if-no-files-found: error
