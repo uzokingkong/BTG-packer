@@ -50,39 +50,94 @@ fn route_metadata_section(
     })
 }
 
+fn collect_native_gateway_targets(
+    sections: &[crate::pe::builder::SectionData],
+    image_base: u64,
+    multi: &crate::vm::multi_family::MaterializedMultiFamilyProgram,
+    required_original_targets: &[crate::vm::route_table::OriginalTargetRva],
+) -> Vec<u64> {
+    // Native code can re-enter VM-owned code through address-taken callbacks
+    // that never appear in the static cross-family route table (CRT onexit/
+    // initializer tables are a common example). Discover every full PE32+
+    // function VA stored in non-executable data before module sizing so sizing
+    // and final placement build exactly the same gateway set.
+    let vm_entries: std::collections::HashSet<u64> = multi
+        .modules
+        .iter()
+        .flat_map(|module| module.function_ids.iter().copied())
+        .collect();
+    let mut targets: std::collections::BTreeSet<u64> = required_original_targets
+        .iter()
+        .map(|target| image_base + u64::from(target.0))
+        .collect();
+
+    for section in sections {
+        if section.characteristics & 0x2000_0000 != 0 || section.bytes.len() < 8 {
+            continue;
+        }
+        let mut cursor = 0usize;
+        while cursor + 8 <= section.bytes.len() {
+            let candidate = u64::from_le_bytes(
+                section.bytes[cursor..cursor + 8]
+                    .try_into()
+                    .expect("8-byte PE pointer window"),
+            );
+            if vm_entries.contains(&candidate) {
+                targets.insert(candidate);
+                cursor += 8;
+            } else {
+                cursor += 1;
+            }
+        }
+    }
+
+    targets.into_iter().collect()
+}
+
 fn rewrite_native_gateway_pointers(
     sections: &mut [crate::pe::builder::SectionData],
-    image_base: u64,
+    _image_base: u64,
     program_vm_va: u64,
     gateways: &std::collections::BTreeMap<u64, usize>,
 ) -> usize {
+    // Build a direct replacement map once. The old gateway-major scan was
+    // O(gateways * data bytes), which became prohibitively expensive once
+    // address-taken callbacks were included in the gateway inventory.
+    let replacements: std::collections::HashMap<u64, u64> = gateways
+        .iter()
+        .map(|(&original_va, &gateway_off)| {
+            (original_va, program_vm_va + gateway_off as u64)
+        })
+        .collect();
+
     let mut rewritten = 0usize;
     for section in sections {
         // Code immediates are VM-owned and must not be mechanically rewritten;
         // callback/vtable/function-pointer storage lives in non-executable data.
-        if section.characteristics & 0x2000_0000 != 0 {
+        if section.characteristics & 0x2000_0000 != 0 || section.bytes.len() < 8 {
             continue;
         }
-        for (&original_va, &gateway_off) in gateways {
-            let gateway_va = program_vm_va + gateway_off as u64;
-            let original = original_va.to_le_bytes();
-            let replacement = gateway_va.to_le_bytes();
-            let mut cursor = 0usize;
-            while cursor + 8 <= section.bytes.len() {
-                if section.bytes[cursor..cursor + 8] == original {
-                    section.bytes[cursor..cursor + 8].copy_from_slice(&replacement);
-                    rewritten += 1;
-                    cursor += 8;
-                } else {
-                    cursor += 1;
-                }
+        let mut cursor = 0usize;
+        while cursor + 8 <= section.bytes.len() {
+            let candidate = u64::from_le_bytes(
+                section.bytes[cursor..cursor + 8]
+                    .try_into()
+                    .expect("8-byte PE pointer window"),
+            );
+            if let Some(&replacement) = replacements.get(&candidate) {
+                section.bytes[cursor..cursor + 8]
+                    .copy_from_slice(&replacement.to_le_bytes());
+                rewritten += 1;
+                cursor += 8;
+            } else {
+                cursor += 1;
             }
-            // Do not byte-scan arbitrary 32-bit RVA values here. They are not
-            // self-describing pointers and collide with ordinary constants,
-            // relocation metadata and packed structures. Canonical RVA-table
-            // rewrites belong to the typed table provenance path; PE32+ native
-            // callback/vtable slots are full image VAs.
         }
+        // Do not byte-scan arbitrary 32-bit RVA values here. They are not
+        // self-describing pointers and collide with ordinary constants,
+        // relocation metadata and packed structures. Canonical RVA-table
+        // rewrites belong to the typed table provenance path; PE32+ native
+        // callback/vtable slots are full image VAs.
     }
     rewritten
 }
@@ -478,6 +533,21 @@ pub(crate) fn place_boot_stub(
         );
         ctx.vm_prog_chunks.clear();
     }
+    let native_gateway_targets = if vm_multi_family_active {
+        let targets = collect_native_gateway_targets(
+            &ctx.patched_sections,
+            image_base,
+            ctx.vm_multi_family.as_ref().unwrap(),
+            &ctx.route_required_original_targets,
+        );
+        println!(
+            "[+] Canonical native gateway inventory: {} route/address-taken target(s)",
+            targets.len()
+        );
+        targets
+    } else {
+        Vec::new()
+    };
     let vm_multi_family_sizing = if vm_multi_family_active {
         let plan = ctx.vm_family_plan.as_ref().ok_or_else(|| {
             anyhow::anyhow!("multi-family materialization is missing its family plan")
@@ -492,10 +562,7 @@ pub(crate) fn place_boot_stub(
             image_base,
             ctx.poly_vm_seed,
             &ctx.vm_data_lifetime_objects,
-            &ctx.route_required_original_targets
-                .iter()
-                .map(|target| image_base + u64::from(target.0))
-                .collect::<Vec<_>>(),
+            &native_gateway_targets,
         )?)
     } else {
         None
