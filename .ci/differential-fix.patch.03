@@ -1,0 +1,224 @@
+           };
++                self.emit_arch_push(MicroOperand::Imm64(imm), width);
+             }
+             Code::Pop_r64 | Code::Pop_r16 => {
+                 let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
+-                self.desynth.emit_pop(dst);
++                let width = if code == Code::Pop_r16 { 2 } else { 8 };
++                self.emit_arch_pop_reg(inst, dst, width)?;
+             }
+ 
+             Code::Leaveq | Code::Leaved | Code::Leavew => {
+                 self.desynth.instrs.push(
+                     MicroInstr::new(RiscOp::Mov).with_dst(MicroOperand::VReg(4)).with_src1(MicroOperand::VReg(5)),
+                 );
+-                self.desynth.emit_pop(MicroOperand::VReg(5));
++                let width = if code == Code::Leavew { 2 } else { 8 };
++                self.emit_arch_pop_reg(inst, MicroOperand::VReg(5), width)?;
+             }
+ 
+             Code::Call_rel32_64 => {
+                 let target = inst.near_branch_target();
+                 let ret_ip = inst.next_ip();
++                // Keep the VM continuation and the architectural x86 stack in
++                // sync. The former routes VM RET; the latter drives real RSP and
++                // stack-relative memory semantics inside the callee.
++                self.emit_arch_push(MicroOperand::Imm64(ret_ip), 8);
+                 self.desynth.emit_push(MicroOperand::Imm64(ret_ip));
+                 self.desynth.emit_jmp(target);
+             }
+             Code::Call_rm64 | Code::Call_rm32 => {
+                 let ret_ip = inst.next_ip();
+-                self.desynth.emit_push(MicroOperand::Imm64(ret_ip));
++                // The indirect target is evaluated before CALL changes RSP.
+                 let target = self.operand_value(inst, 0)?;
+                 self.desynth.instrs.push(
+-                    MicroInstr::new(RiscOp::VirtualIndirectCall).with_src1(target),
++                    MicroInstr::new(RiscOp::Mov)
++                        .with_dst(MicroOperand::Temp(5))
++                        .with_src1(target),
++                );
++                self.emit_arch_push(MicroOperand::Imm64(ret_ip), 8);
++                self.desynth.emit_push(MicroOperand::Imm64(ret_ip));
++                self.desynth.instrs.push(
++                    MicroInstr::new(RiscOp::VirtualIndirectCall).with_src1(MicroOperand::Temp(5)),
+                 );
+             }
+ 
+@@ -971,20 +1111,14 @@ impl RiscLifter {
+                 self.emit_jcxz(8, target);
+             }
+             Code::Retnq | Code::Retnw => {
+-                // P0-1: RET → VirtualRet — 가상 스택에서 복귀 주소를 pop 해
+-                // ip_map 안이면 VM 내부 복귀, 아니면 Halt(프로그램 종료)로.
++                let width = if code == Code::Retnw { 2 } else { 8 };
++                self.emit_arch_ret_pop(width, 0);
++                // VM continuation routing remains separate from architectural RSP.
+                 self.desynth.instrs.push(MicroInstr::new(RiscOp::VirtualRet));
+             }
+-            // RET imm16: RSP += imm ??VirtualRet (복귀 주소는 그대로 스택에서 pop).
+             Code::Retnq_imm16 | Code::Retnw_imm16 => {
+-                let imm = inst.immediate16() as u64;
+-                if imm != 0 {
+-                    self.desynth.emit_add(
+-                        MicroOperand::VReg(4),
+-                        MicroOperand::VReg(4),
+-                        MicroOperand::Imm64(imm),
+-                    );
+-                }
++                let width = if code == Code::Retnw_imm16 { 2 } else { 8 };
++                self.emit_arch_ret_pop(width, inst.immediate16());
+                 self.desynth.instrs.push(MicroInstr::new(RiscOp::VirtualRet));
+             }
+ 
+@@ -1434,23 +1568,16 @@ impl RiscLifter {
+             }
+ 
+             Code::Push_rm64 => {
++                // Source memory is read before RSP is decremented.
+                 let v = self.operand_value(inst, 0)?;
+-                self.desynth.emit_push(v);
++                self.emit_arch_push(v, 8);
+             }
+             Code::Pop_rm64 => {
+                 if inst.op0_kind() == OpKind::Register {
+                     let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid pop dst"))?;
+-                    self.desynth.emit_pop(dst);
++                    self.emit_arch_pop_reg(inst, dst, 8)?;
+                 } else if inst.op0_kind() == OpKind::Memory {
+-                    let addr = MicroOperand::Temp(4);
+-                    self.lower_effective_address(inst, addr)?;
+-                    let val = MicroOperand::Temp(5);
+-                    self.desynth.emit_pop(val);
+-                    self.desynth.instrs.push(
+-                        MicroInstr::new(RiscOp::MemoryWrite { width: 8 })
+-                            .with_src1(addr)
+-                            .with_src2(val),
+-                    );
++                    self.emit_arch_pop_mem(inst, 8)?;
+                 } else {
+                     return Err(anyhow!("risc lifter: invalid pop op0"));
+                 }
+diff --git a/src/vm/risc/lifter/tests.rs b/src/vm/risc/lifter/tests.rs
+index 978ac0c..908435a 100644
+--- a/src/vm/risc/lifter/tests.rs
++++ b/src/vm/risc/lifter/tests.rs
+@@ -220,7 +220,13 @@ fn test_lift_call_indirect_register() {
+     let mut init = [0u64; 16];
+     init[0] = 0x14000100A; // rax = callee
+     let lifted = lift(&raw, 0x140001000);
+-    assert_eq!(lifted.instrs[1].op, RiscOp::VirtualIndirectCall);
++    assert!(
++        lifted
++            .instrs
++            .iter()
++            .any(|ins| ins.op == RiscOp::VirtualIndirectCall),
++        "indirect CALL must retain typed VM continuation routing",
++    );
+     let st = run(&raw, 0x140001000, init);
+     assert_eq!(regs(&st)[3], 0x2A, "indirect callee executed");
+     // P0-1: 간접 call 도 복귀해 fallthrough 실행.
+@@ -503,7 +509,7 @@ fn test_lift_prologue_epilogue_leave() {
+     let st = run(&raw, 0x140001000, init);
+     assert_eq!(regs(&st)[0], 5, "rax = 5");
+     assert_eq!(regs(&st)[5], 0x200, "rbp restored by leave pop");
+-    assert_eq!(regs(&st)[4], 0x1000, "rsp = rbp after leave");
++    assert_eq!(regs(&st)[4], 0x1008, "leave restores frame and RET pops return slot");
+     assert_eq!(st.stack.len(), 0, "push/pop balanced");
+ }
+ 
+@@ -826,7 +832,7 @@ fn test_lift_ret_imm16() {
+     // 0x140001000: ret 8 (C2 08 00)
+     let raw = [0xC2, 0x08, 0x00];
+     let st = run(&raw, 0x140001000, [0u64; 16]);
+-    assert_eq!(regs(&st)[4], 8, "RET imm16 advances RSP by 8");
++    assert_eq!(regs(&st)[4], 16, "RET 8 pops the return slot and then 8 argument bytes");
+ }
+ 
+ /// PUSH r64 / POP r64 ??stack roundtrip.
+@@ -841,6 +847,20 @@ fn test_lift_push_pop() {
+     assert_eq!(st.vsp, 0, "push/pop balanced");
+ }
+ 
++#[test]
++fn test_arch_push_pop_tracks_rsp_and_memory() {
++    // push rax; mov rbx,rsp; pop rcx; ret
++    let raw = [0x50, 0x48, 0x89, 0xE3, 0x59, 0xC3];
++    let mut init = [0u64; 16];
++    init[0] = 0xCAFE_BABE_D00D_F00D;
++    init[4] = 0x1000;
++    let st = run(&raw, 0x140001000, init);
++    assert_eq!(regs(&st)[3], 0x0FF8, "PUSH must decrement architectural RSP before the next instruction");
++    assert_eq!(regs(&st)[1], init[0], "POP must reload the value through guest memory");
++    assert_eq!(regs(&st)[4], 0x1008, "POP balances PUSH and top-level RET consumes its return slot");
++    assert_eq!(st.vsp, 0, "ordinary x86 PUSH/POP must not consume the VM continuation stack");
++}
++
+ /// CMPXCHG (mem form) ??lift path emits CompareExchange micro-op.
+ #[test]
+ fn test_lift_cmpxchg_mem() {
+diff --git a/src/vm/threaded/poly_direct/builder.rs b/src/vm/threaded/poly_direct/builder.rs
+index 4c261a0..13f5cb4 100644
+--- a/src/vm/threaded/poly_direct/builder.rs
++++ b/src/vm/threaded/poly_direct/builder.rs
+@@ -2308,10 +2308,10 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
+             }
+ 
+             // 3. Forward the caller's real stack-argument area (args 5..12).
+-            // `VSP_OFF` is the VM's own Push/Pop stack, not the x64 ABI stack;
+-            // using it here both lost ordinary stack arguments and placed them
+-            // one slot too high.  The guest RSP points at the original caller
+-            // frame, where the first stack argument is [RSP+0x20] before CALL.
++            // `VSP_OFF` is the VM's bytecode continuation stack, not the x64 ABI
++            // stack. CALL now performs the architectural return-address push as
++            // well, so guest RSP points at that return slot and the first Win64
++            // stack argument is [RSP+0x28].
+             b.push(
+                 Instruction::with2(
+                     Code::Mov_r64_rm64,
+@@ -2331,7 +2331,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
+                         Register::R11,
+                         MemoryOperand::with_base_displ_size(
+                             Register::R10,
+-                            (0x20 + i * 8) as i64,
++                            (0x28 + i * 8) as i64,
+                             8,
+                         ),
+                     )
+@@ -2756,6 +2756,36 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
+                 )
+                 .unwrap(),
+             );
++            // The source CALL's architectural return slot was pushed by the
++            // lifter.  Native/generated child execution returned through the
++            // bridge rather than through the source VM's VirtualRet, so consume
++            // that slot here.  This also mirrors a cross-family tail target's
++            // final RET back into the parent state.
++            b.push(
++                Instruction::with2(
++                    Code::Mov_r64_rm64,
++                    Register::RAX,
++                    MemoryOperand::with_base_displ_size(
++                        Register::RDX,
++                        state_disp(REGS_OFF + 4 * 8) as i64,
++                        8,
++                    ),
++                )
++                .unwrap(),
++            );
++            b.push(Instruction::with2(Code::Add_rm64_imm8, Register::RAX, 8).unwrap());
++            b.push(
++                Instruction::with2(
++                    Code::Mov_r64_r64,
++                    MemoryOperand::with_base_displ_size(
++                        Register::RDX,
++                        state_disp(REGS_OFF + 4 * 8) as i64,
++                        8,
++                    ),
++                    Register::RAX,
++                )
++                .unwrap(),
++            );
+             // The dead private frame is now below the restored RSP. Immediate
+             // stores erase every anchor without borrowing a live guest/route
+             // register from the cross-family continuation ABI.

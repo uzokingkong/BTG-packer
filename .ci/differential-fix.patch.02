@@ -1,0 +1,327 @@
+                VM_HOST_STACK_SIZE,
++                multi.invocation_layout.host_stack_pool_va,
++            );
++
+             // Initialize every gateway invocation lane. Lifetime coordination
+             // remains process-shared, while architectural state and call stacks
+             // are lane-private.
+-            let lane_group_stride = multi.families.len() * MULTI_FAMILY_STATE_STRIDE;
++            let lane_group_stride = multi.invocation_layout.lane_group_stride;
+             for lane in 1..=VM_INVOCATION_LANES {
+                 for state_delta in multi.state_offsets.iter().copied() {
+                     let lane_delta = lane * lane_group_stride + state_delta;
+@@ -1743,13 +1775,17 @@ pub(crate) fn place_boot_stub(
+                 }
+             }
+         }
++        let placed_state_bytes = multi_built
++            .as_ref()
++            .map(|multi| multi.invocation_layout.reserve_size)
++            .unwrap_or(vm::VM_STATE_SIZE);
+         println!(
+             "[+] M6 Phase-2 Program VM: module @0x{:X} (code {}B table {}B bytecode {}B state {}B) entry_va=0x{:X} state_va=0x{:X}",
+             vm_prog_off,
+             prmod.code.len(),
+             prmod.table.len(),
+             prmod.bytecode.len(),
+-            vm::VM_STATE_SIZE,
++            placed_state_bytes,
+             vm_prog_entry_va,
+             vm_prog_state_va
+         );
+diff --git a/src/vm/data_lifetime.rs b/src/vm/data_lifetime.rs
+index ab453d0..38f8bc1 100644
+--- a/src/vm/data_lifetime.rs
++++ b/src/vm/data_lifetime.rs
+@@ -13,9 +13,10 @@ pub struct LiteralObject {
+     pub references: Vec<u32>,
+ }
+ 
+-/// Shared production ABI for lifetime synchronization.  The table lives in
+-/// the entry-family state stride so every VM family and OS thread addresses
+-/// the same atomic words instead of accidentally using family-local locks.
++/// Shared production ABI for lifetime synchronization.  Legacy callers may
++/// still place the table at `entry_state + 0x2000`, but production multi-family
++/// placement now stores it once in the global `.vstate` tail so no virtual
++/// stack or family-local state can overlap the atomic words.
+ pub const LIFETIME_SYNC_TABLE_OFFSET: u64 = 0x2000;
+ pub const LIFETIME_SYNC_ENTRY_SIZE: usize = 48;
+ pub const LIFETIME_SYNC_CAPACITY: usize = 256;
+@@ -44,11 +45,27 @@ pub struct LifetimeSyncTable {
+ }
+ 
+ impl LifetimeSyncTable {
++    /// Legacy in-stride constructor retained for compatibility with unit tests
++    /// and non-commercial callers.  Production multi-family placement uses
++    /// `build_at()` so the synchronization table lives in the global `.vstate`
++    /// tail, outside every family's virtual-stack range.
+     pub fn build(
+         entry_state_va: u64,
+         image_base: u64,
+         build_key: u64,
+         objects: &[LiteralObject],
++    ) -> anyhow::Result<Self> {
++        let base_va = entry_state_va
++            .checked_add(LIFETIME_SYNC_TABLE_OFFSET)
++            .ok_or_else(|| anyhow::anyhow!("data-lifetime sync table VA overflow"))?;
++        Self::build_at(base_va, image_base, build_key, objects)
++    }
++
++    pub fn build_at(
++        base_va: u64,
++        image_base: u64,
++        build_key: u64,
++        objects: &[LiteralObject],
+     ) -> anyhow::Result<Self> {
+         let mut unique = std::collections::BTreeMap::new();
+         for object in objects {
+@@ -61,9 +78,6 @@ impl LifetimeSyncTable {
+                 LIFETIME_SYNC_CAPACITY
+             );
+         }
+-        let base_va = entry_state_va
+-            .checked_add(LIFETIME_SYNC_TABLE_OFFSET)
+-            .ok_or_else(|| anyhow::anyhow!("data-lifetime sync table VA overflow"))?;
+         let entries = unique
+             .into_iter()
+             .enumerate()
+@@ -80,17 +94,10 @@ impl LifetimeSyncTable {
+         Ok(Self { base_va, entries })
+     }
+ 
+-    pub fn validate_stride(&self, stride: usize) -> anyhow::Result<()> {
+-        let start = LIFETIME_SYNC_TABLE_OFFSET as usize;
+-        let end = start
+-            .checked_add(LIFETIME_SYNC_TABLE_SIZE)
++    pub fn validate_table(&self) -> anyhow::Result<()> {
++        self.base_va
++            .checked_add(LIFETIME_SYNC_TABLE_SIZE as u64)
+             .ok_or_else(|| anyhow::anyhow!("data-lifetime sync table range overflow"))?;
+-        let call_stack_start = stride
+-            .checked_sub(crate::vm::interp::CALL_STACK_SIZE)
+-            .ok_or_else(|| anyhow::anyhow!("VM family stride is smaller than call stack"))?;
+-        if end > call_stack_start || end > 0x5000 {
+-            anyhow::bail!("data-lifetime sync table overlaps cross-family/call-stack state");
+-        }
+         if self.entries.iter().enumerate().any(|(index, entry)| {
+             entry.lock_va != self.base_va + (index * LIFETIME_SYNC_ENTRY_SIZE) as u64
+                 || entry.refcount_va != entry.lock_va + 4
+@@ -100,6 +107,27 @@ impl LifetimeSyncTable {
+         }
+         Ok(())
+     }
++
++    pub fn validate_stride(&self, stride: usize) -> anyhow::Result<()> {
++        let start = LIFETIME_SYNC_TABLE_OFFSET as usize;
++        let end = start
++            .checked_add(LIFETIME_SYNC_TABLE_SIZE)
++            .ok_or_else(|| anyhow::anyhow!("data-lifetime sync table range overflow"))?;
++        let virtual_stack_start = crate::vm::commercial_build::COMMERCIAL_STATE_SIZE as usize;
++        let virtual_stack_end = virtual_stack_start
++            .checked_add(crate::vm::commercial_build::VIRTUAL_STACK_SIZE as usize)
++            .ok_or_else(|| anyhow::anyhow!("commercial virtual-stack range overflow"))?;
++        let overlaps_virtual_stack = start < virtual_stack_end && virtual_stack_start < end;
++        let call_stack_start = stride
++            .checked_sub(crate::vm::interp::CALL_STACK_SIZE)
++            .ok_or_else(|| anyhow::anyhow!("VM family stride is smaller than call stack"))?;
++        if overlaps_virtual_stack || end > call_stack_start || end > 0x5000 {
++            anyhow::bail!(
++                "data-lifetime sync table overlaps commercial virtual-stack/cross-family/call-stack state"
++            );
++        }
++        self.validate_table()
++    }
+ }
+ 
+ /// Builds a conservative reference graph for NUL-terminated literals in one
+@@ -702,7 +730,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn shared_sync_table_is_deterministic_and_disjoint_from_call_stack() {
++    fn legacy_in_stride_sync_table_is_rejected_for_commercial_state() {
+         let objects = [
+             LiteralObject {
+                 class: DataClass::Ascii,
+@@ -718,7 +746,10 @@ mod tests {
+             },
+         ];
+         let table = LifetimeSyncTable::build(0x1400_8000_0, 0x1400_0000_0, 7, &objects).unwrap();
+-        table.validate_stride(0x8000).unwrap();
++        assert!(
++            table.validate_stride(0x8000).is_err(),
++            "legacy +0x2000 placement overlaps the commercial virtual stack",
++        );
+         assert_eq!(table.entries[0].object_rva, 0x3000);
+         assert_eq!(table.entries[0].lock_va, 0x1400_8200_0);
+         assert_eq!(table.entries[0].refcount_va, 0x1400_8200_4);
+@@ -727,6 +758,21 @@ mod tests {
+         assert_eq!(table.entries[1].lock_va, table.entries[0].lock_va + 48);
+     }
+ 
++    #[test]
++    fn global_sync_table_exact_base_validates_without_stride_aliasing() {
++        let objects = [LiteralObject {
++            class: DataClass::Ascii,
++            rva: 0x3000,
++            len: 8,
++            references: vec![0x1100],
++        }];
++        let base = 0x1401_0000_0;
++        let table = LifetimeSyncTable::build_at(base, 0x1400_0000_0, 7, &objects).unwrap();
++        table.validate_table().unwrap();
++        assert_eq!(table.base_va, base);
++        assert_eq!(table.entries[0].lock_va, base);
++    }
++
+     #[test]
+     fn shared_sync_table_rejects_capacity_overflow() {
+         let objects: Vec<_> = (0..=LIFETIME_SYNC_CAPACITY)
+diff --git a/src/vm/risc/lifter/mod.rs b/src/vm/risc/lifter/mod.rs
+index 62a3bbd..996f0fd 100644
+--- a/src/vm/risc/lifter/mod.rs
++++ b/src/vm/risc/lifter/mod.rs
+@@ -272,6 +272,127 @@ impl RiscLifter {
+         }
+     }
+ 
++    /// Push onto the architectural x86 stack. `VirtualPush` is reserved for
++    /// the VM's bytecode continuation stack and must not stand in for guest RSP.
++    /// PUSH itself is flag-transparent, so preserve the incoming snapshot around
++    /// the RISC arithmetic used to update RSP.
++    fn emit_arch_push(&mut self, value: MicroOperand, width: u8) {
++        let rsp = MicroOperand::VReg(4);
++        self.desynth.instrs.push(
++            MicroInstr::new(RiscOp::Mov)
++                .with_dst(MicroOperand::Temp(7))
++                .with_src1(MicroOperand::Vflags),
++        );
++        // PUSH RSP stores the pre-decrement value. Snapshot every source before
++        // touching RSP so register and memory forms share the same ordering.
++        self.desynth.instrs.push(
++            MicroInstr::new(RiscOp::Mov)
++                .with_dst(MicroOperand::Temp(6))
++                .with_src1(value),
++        );
++        self.desynth.emit_sub(rsp, rsp, MicroOperand::Imm64(width as u64));
++        self.desynth.instrs.push(
++            MicroInstr::new(RiscOp::MemoryWrite { width })
++                .with_src1(rsp)
++                .with_src2(MicroOperand::Temp(6)),
++        );
++        self.desynth
++            .instrs
++            .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
++    }
++
++    fn emit_arch_pop_reg(
++        &mut self,
++        inst: &Instruction,
++        dst: MicroOperand,
++        width: u8,
++    ) -> Result<()> {
++        let rsp = MicroOperand::VReg(4);
++        self.desynth.instrs.push(
++            MicroInstr::new(RiscOp::Mov)
++                .with_dst(MicroOperand::Temp(7))
++                .with_src1(MicroOperand::Vflags),
++        );
++        self.desynth.instrs.push(
++            MicroInstr::new(RiscOp::MemoryRead { width })
++                .with_dst(MicroOperand::Temp(6))
++                .with_src1(rsp),
++        );
++        self.desynth.emit_add(rsp, rsp, MicroOperand::Imm64(width as u64));
++        if width < 8 {
++            // For POP SP, upper bits are taken from the already-incremented RSP.
++            self.desynth.instrs.push(
++                MicroInstr::new(RiscOp::Mov)
++                    .with_dst(MicroOperand::Temp(5))
++                    .with_src1(dst),
++            );
++        }
++        self.desynth.instrs.push(
++            MicroInstr::new(RiscOp::Mov)
++                .with_dst(dst)
++                .with_src1(MicroOperand::Temp(6)),
++        );
++        if width < 8 {
++            self.mask_result(width, inst, dst)?;
++            self.preserve_upper_from(dst, width, MicroOperand::Temp(5));
++        }
++        self.desynth
++            .instrs
++            .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
++        Ok(())
++    }
++
++    fn emit_arch_pop_mem(&mut self, inst: &Instruction, width: u8) -> Result<()> {
++        let rsp = MicroOperand::VReg(4);
++        self.desynth.instrs.push(
++            MicroInstr::new(RiscOp::Mov)
++                .with_dst(MicroOperand::Temp(7))
++                .with_src1(MicroOperand::Vflags),
++        );
++        self.desynth.instrs.push(
++            MicroInstr::new(RiscOp::MemoryRead { width })
++                .with_dst(MicroOperand::Temp(6))
++                .with_src1(rsp),
++        );
++        self.desynth.emit_add(rsp, rsp, MicroOperand::Imm64(width as u64));
++        // Intel POP computes an RSP-based destination EA after the increment.
++        let addr = MicroOperand::Temp(4);
++        self.lower_effective_address(inst, addr)?;
++        self.desynth.instrs.push(
++            MicroInstr::new(RiscOp::MemoryWrite { width })
++                .with_src1(addr)
++                .with_src2(MicroOperand::Temp(6)),
++        );
++        self.desynth
++            .instrs
++            .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
++        Ok(())
++    }
++
++    fn emit_arch_ret_pop(&mut self, width: u8, extra: u16) {
++        let rsp = MicroOperand::VReg(4);
++        self.desynth.instrs.push(
++            MicroInstr::new(RiscOp::Mov)
++                .with_dst(MicroOperand::Temp(7))
++                .with_src1(MicroOperand::Vflags),
++        );
++        // RET must perform the architectural stack read even though the VM's
++        // continuation stack remains the authoritative dispatch key.
++        self.desynth.instrs.push(
++            MicroInstr::new(RiscOp::MemoryRead { width })
++                .with_dst(MicroOperand::Temp(6))
++                .with_src1(rsp),
++        );
++        self.desynth.emit_add(
++            rsp,
++            rsp,
++            MicroOperand::Imm64(width as u64 + extra as u64),
++        );
++        self.desynth
++            .instrs
++            .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
++    }
++
+     /// Preserve x86 MOV's flag transparency while finalizing a register write.
+     /// A 32-bit destination zero-extends its virtual GPR; 8/16-bit destinations
+     /// replace only their low part.  The RISC expressions used for masking and
+@@ -846,36 +967,55 @@ impl RiscLifter {
+ 
+             Code::Push_r64 | Code::Push_r16 => {
+                 let src = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid src"))?;
+-                self.desynth.emit_push(src);
++                let width = if code == Code::Push_r16 { 2 } else { 8 };
++                self.emit_arch_push(src, width);
+             }
+             Code::Pushd_imm32 | Code::Pushq_imm32 | Code::Pushq_imm8 | Code::Pushw_imm8 => {
+                 let imm = inst.immediate64();
+-                self.desynth.emit_push(MicroOperand::Imm64(imm));
++                let width = match code {
++                    Code::Pushw_imm8 => 2,
++                    Code::Pushd_imm32 => 4,
++                    _ => 8,
++     
