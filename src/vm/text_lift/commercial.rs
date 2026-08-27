@@ -2175,6 +2175,19 @@ pub fn lift_program_cfg_commercial_with_model(
 
 #[cfg(test)]
 mod tests {
+
+    /// Provide a real writable backing range for architectural x86 RSP during
+    /// native-harness differential tests. The reference evaluator treats
+    /// memory sparsely, while the native harness dereferences guest addresses
+    /// directly, so RSP=0 is not a valid native test setup once PUSH/POP/RET
+    /// are modeled architecturally.
+    fn native_stack_init() -> (Vec<u8>, [u64; 16]) {
+        let mut backing = vec![0u8; 0x4000];
+        let mut init = [0u64; 16];
+        init[4] = backing.as_mut_ptr().wrapping_add(0x2000) as u64;
+        (backing, init)
+    }
+
     use super::*;
 
     #[test]
@@ -2455,7 +2468,7 @@ mod tests {
         let prog = RiscProgram::new(lifter.desynth.instrs);
         assert!(!prog.instrs.is_empty(), "lifted program must be non-empty");
 
-        let init = [0u64; 16];
+        let (guest_stack, init) = native_stack_init();
         let ref_st = prog.eval_state(&init);
 
         // 폴리모픽 인코딩 → 네이티브 실행 — 여러 시드에서 참조와 일치해야 한다.
@@ -2482,6 +2495,7 @@ mod tests {
         assert_eq!(ref_st.regs[2], ref_st.regs[0], "mov rdx, rax");
         assert_eq!(ref_st.stack.len(), 0, "push+pop balanced");
         assert_eq!(ref_st.vsp, 0, "vsp balanced");
+        std::hint::black_box(&guest_stack);
     }
 
     /// P3 (G1) 통합 차등 검증 — **프로그램(OEP) 경로** 실행 동치.
@@ -2535,7 +2549,7 @@ mod tests {
             "lifted program must begin with the OEP entry-jump"
         );
 
-        let init = [0u64; 16];
+        let (guest_stack, init) = native_stack_init();
         let ref_st = lift.program.eval_state(&init);
 
         // 리프트된 RiscProgram (ip_map 보존)을 네이티브 하네스로 실행 == 참조.
@@ -2559,6 +2573,7 @@ mod tests {
         assert_eq!(ref_st.regs[2], ref_st.regs[0], "mov rdx, rax");
         assert_eq!(ref_st.stack.len(), 0, "push+pop balanced");
         assert_eq!(ref_st.vsp, 0, "vsp balanced");
+        std::hint::black_box(&guest_stack);
     }
 
     /// P3 (G1) 확장 선형 블록 차등 검증 — 플래그 갱신(ADD/NOR/SHR/SHL)을 포함한
@@ -2604,7 +2619,7 @@ mod tests {
         let prog = RiscProgram::new(lifter.desynth.instrs);
         assert!(!prog.instrs.is_empty(), "lifted program must be non-empty");
 
-        let init = [0u64; 16];
+        let (guest_stack, init) = native_stack_init();
         let ref_st = prog.eval_state(&init);
 
         for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
@@ -2633,6 +2648,7 @@ mod tests {
         assert_eq!(ref_st.regs[6], exp_rax, "rsi = rax"); // reg[6] = rsi
         assert_eq!(ref_st.stack.len(), 0, "push+pop balanced");
         assert_eq!(ref_st.vsp, 0, "vsp balanced");
+        std::hint::black_box(&guest_stack);
     }
 
     /// P2 (G3): 8-bit ALU/CMP/TEST/NOP lift 정확성 — **값 단언**(x86 실제 의미론).
@@ -2681,7 +2697,7 @@ mod tests {
         let prog = RiscProgram::new(lifter.desynth.instrs);
         assert!(!prog.instrs.is_empty(), "lifted program must be non-empty");
 
-        let init = [0u64; 16];
+        let (guest_stack, init) = native_stack_init();
         let ref_st = prog.eval_state(&init);
 
         // P2 (G3): 하네스 8/16비트 Add/Sub 어셈블 버그(Register 63 + 상위 비트 0-확장)
@@ -2713,6 +2729,7 @@ mod tests {
             "ZF set by final test"
         );
         assert_eq!(ref_st.vsp, 0, "vsp balanced");
+        std::hint::black_box(&guest_stack);
     }
 
     /// P0-①: VM↔native 경계 함수 원자성 — 제외 함수 범위로 나가는 직접 `VirtualBranch`
