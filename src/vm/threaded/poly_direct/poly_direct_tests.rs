@@ -2099,6 +2099,7 @@ fn test_narrow_shift_flags_preserved_matches_reference() {
         let bytecode = enc.encode(&prog).unwrap();
         let native = run_native_poly_direct(&bytecode, seed, &init).unwrap();
         let mut interp = PolymorphicInterpreter::new(seed);
+        interp.regs = init;
         interp.run(&bytecode).unwrap();
 
         assert_eq!(
