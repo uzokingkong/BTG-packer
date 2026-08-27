@@ -2089,7 +2089,9 @@ fn test_narrow_shift_flags_preserved_matches_reference() {
             .expect("all RISC-liftable");
     }
     let prog = RiscProgram::new(lifter.desynth.instrs);
-    let init = [0u64; 16];
+    let mut guest_stack = vec![0u8; 0x4000];
+    let mut init = [0u64; 16];
+    init[4] = guest_stack.as_mut_ptr().wrapping_add(0x2000) as u64;
     let ref_st = prog.eval_state(&init);
 
     for seed in [0x1122334455667788u64, 0xDEADBEEFCAFE0001, 0x123456789] {
@@ -2143,6 +2145,7 @@ fn test_narrow_shift_flags_preserved_matches_reference() {
             "seed {seed:#x}: SF after shr"
         );
     }
+    std::hint::black_box(&guest_stack);
 }
 
 /// P0-1: 네이티브 self-decoding CALL/RET 라운드트립 — callee 의 `VirtualRet` 가
