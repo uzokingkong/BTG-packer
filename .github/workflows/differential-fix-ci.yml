@@ -35,6 +35,8 @@ jobs:
           if-no-files-found: error
 
       - name: Commercial Program-VM E2E differential
+        id: commercial_e2e
+        continue-on-error: true
         shell: pwsh
         run: |
           Remove-Item -Force dummy_target.exe, packed-e2e.exe -ErrorAction SilentlyContinue
@@ -48,6 +50,23 @@ jobs:
             throw "commercial E2E did not produce packed-e2e.exe"
           }
 
+      - name: Capture commercial E2E crash dump
+        if: steps.commercial_e2e.outcome == 'failure'
+        shell: pwsh
+        run: |
+          $failed = Get-ChildItem -File "packed-e2e.failed*.exe" | Select-Object -First 1
+          if (-not $failed) { throw "isolated failed PE not found" }
+          $dumpDir = Join-Path $PWD "crashdumps"
+          New-Item -ItemType Directory -Force $dumpDir | Out-Null
+          $wer = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\$($failed.Name)"
+          New-Item -Path $wer -Force | Out-Null
+          Set-ItemProperty -Path $wer -Name DumpFolder -Value $dumpDir -Type ExpandString
+          Set-ItemProperty -Path $wer -Name DumpType -Value 2 -Type DWord
+          $p = Start-Process -FilePath $failed.FullName -PassThru -Wait
+          Write-Host ("[CRASH-PROBE] exit=0x{0:X8}" -f ([uint32]$p.ExitCode))
+          Start-Sleep -Seconds 2
+          Get-ChildItem -File $dumpDir | Format-Table Name,Length,LastWriteTime
+
       - name: Upload commercial E2E PE
         if: always()
         uses: actions/upload-artifact@v4
@@ -55,7 +74,9 @@ jobs:
           name: btg-commercial-e2e
           path: |
             packed-e2e.exe
+            packed-e2e.failed.exe
             packed-e2e.failed.*.exe
+            crashdumps/*.dmp
             packed-e2e.exe.btgmanifest
             packed-e2e.exe.ownership.csv
           if-no-files-found: ignore
@@ -93,3 +114,9 @@ jobs:
             commercial-direct-verified.exe
             commercial-direct-verified.exe.btgmanifest
           if-no-files-found: error
+
+      - name: Fail on commercial E2E regression
+        if: always() && steps.commercial_e2e.outcome == 'failure'
+        shell: pwsh
+        run: |
+          throw "Commercial Program-VM E2E differential failed; diagnostics were uploaded."
