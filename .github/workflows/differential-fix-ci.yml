@@ -34,6 +34,9 @@ jobs:
           path: target/release/btg-packer.exe
           if-no-files-found: error
 
+      - name: Backward branch regression
+        run: cargo test --release --locked --lib test_lifted_fnv_loop_backward_branch_matches_host_arithmetic -- --nocapture --test-threads=1
+
       - name: Cargo test (serial diagnostics)
         run: cargo test --release --locked --lib -- --nocapture --test-threads=1
 
