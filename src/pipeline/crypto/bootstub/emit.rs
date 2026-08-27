@@ -1544,6 +1544,12 @@ pub(crate) fn emit_self_wipe(seq: &mut Vec<(Instruction, Option<Label>)>, stub: 
     }
 }
 
+fn program_vm_rsp_state_offset(layout_seed: Option<u64>) -> i64 {
+    layout_seed
+        .map(|seed| crate::vm::threaded::VmRuntimeLayout::from_seed(seed).vregs[4] as i64)
+        .unwrap_or((crate::vm::interp::STATE_VREGS as i64) + 4 * 8)
+}
+
 pub(crate) fn emit_dispatcher_entry(
     seq: &mut Vec<(Instruction, Option<Label>)>,
     stub: &BootStubCtx,
@@ -1569,7 +1575,7 @@ pub(crate) fn emit_dispatcher_entry(
                 Code::Mov_rm64_r64,
                 M::with_base_displ(
                     Register::RAX,
-                    (crate::vm::interp::STATE_VREGS as i64) + 4 * 8,
+                    program_vm_rsp_state_offset(stub.vm_prog_runtime_layout_seed),
                 ),
                 Register::RSP,
             )
@@ -1669,5 +1675,24 @@ pub(crate) fn emit_dispatcher_entry(
             Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap(),
             None,
         ));
+    }
+}
+
+
+#[cfg(test)]
+mod program_vm_rsp_layout_tests {
+    use super::program_vm_rsp_state_offset;
+
+    #[test]
+    fn commercial_program_vm_rsp_uses_seeded_state_abi() {
+        let seed = 31_010u64;
+        let expected = crate::vm::threaded::VmRuntimeLayout::from_seed(seed).vregs[4] as i64;
+        let legacy = (crate::vm::interp::STATE_VREGS as i64) + 4 * 8;
+        assert_eq!(program_vm_rsp_state_offset(Some(seed)), expected);
+        assert_ne!(
+            expected, legacy,
+            "regression seed must exercise a non-legacy RSP slot"
+        );
+        assert_eq!(program_vm_rsp_state_offset(None), legacy);
     }
 }
