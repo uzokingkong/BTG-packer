@@ -45,6 +45,7 @@ const STATE_CROSS_FAMILY_TRANSIENT_END: i64 = 0x50A0;
 /// Dispatch clears it before every opcode; an extension entry arms it only
 /// after validating its encrypted grammar tag.
 const STATE_SUPEROP_DESCRIPTOR_MASK: i64 = 0x5010;
+const STATE_CROSS_FAMILY_CALLEE_STATE: i64 = 0x5018;
 
 const _: () = assert!(
     crate::vm::data_lifetime::LIFETIME_SYNC_PTR_STATE_OFFSET
@@ -2161,6 +2162,21 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
                 b.push(Instruction::with2(Code::Sub_rm64_imm8, Register::RAX, 8).unwrap());
                 store_m(&mut b, VSP_OFF, Register::RAX);
             }
+            // Generated VM dynamic entries use RDX as their state-base ABI.
+            // Preserve the selected child state before the shared native bridge
+            // materializes the source guest's architectural RDX.
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RDX,
+                        STATE_CROSS_FAMILY_CALLEE_STATE,
+                        8,
+                    ),
+                    Register::RCX,
+                )
+                .unwrap(),
+            );
             movi(&mut b, Register::R10, route.target_entry_va);
             b.br(Code::Jmp_rel32_64, 0xEFFF_FFFE);
             let next = b.len();
@@ -2307,6 +2323,42 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
                 );
             }
 
+            // frame[0xA8] is outside Win64 shadow/forwarded arguments.
+            // Snapshot the child state there and clear the transient parent slot
+            // so a later ordinary native call cannot reuse a stale route.
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RAX,
+                    MemoryOperand::with_base_displ_size(
+                        Register::R12,
+                        STATE_CROSS_FAMILY_CALLEE_STATE,
+                        8,
+                    ),
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ_size(Register::RSP, 0xA8, 8),
+                    Register::RAX,
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_imm32,
+                    MemoryOperand::with_base_displ_size(
+                        Register::R12,
+                        STATE_CROSS_FAMILY_CALLEE_STATE,
+                        8,
+                    ),
+                    0,
+                )
+                .unwrap(),
+            );
+
             // 3. Forward the caller's real stack-argument area (args 5..12).
             // `VSP_OFF` is the VM's bytecode continuation stack, not the x64 ABI
             // stack. CALL now performs the architectural return-address push as
@@ -2406,8 +2458,32 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
                 b.push(Instruction::with2(Code::Movq_xmm_rm64, xmm, gpr).unwrap());
             }
 
-            // 5. Indirect call through the bridge frame: RDI now contains the
-            // program's virtual value, not a dispatcher scratch value.
+            // 5. Indirect call through the bridge frame. Ordinary native
+            // targets keep guest RDX; generated child modules require
+            // dynamic_state_entry's RDX=child-state contract.
+            b.push(
+                Instruction::with2(
+                    Code::Cmp_rm64_imm8,
+                    MemoryOperand::with_base_displ_size(Register::RSP, 0xA8, 8),
+                    0,
+                )
+                .unwrap(),
+            );
+            let native_rdx_ready_edge = b.br(Code::Je_rel32_64, usize::MAX - 0xBC04);
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RDX,
+                    MemoryOperand::with_base_displ_size(Register::RSP, 0xA8, 8),
+                )
+                .unwrap(),
+            );
+            let native_rdx_ready = b.len();
+            for &mut (branch, ref mut target) in b.branches.iter_mut() {
+                if branch == native_rdx_ready_edge || *target == usize::MAX - 0xBC04 {
+                    *target = native_rdx_ready;
+                }
+            }
             b.push(
                 Instruction::with1(
                     Code::Call_rm64,
