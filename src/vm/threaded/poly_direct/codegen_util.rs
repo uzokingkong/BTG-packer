@@ -8,9 +8,7 @@
 use crate::vm::risc::BranchCondition;
 use crate::vm::threaded::VmRuntimeLayout;
 use anyhow::{anyhow, Result};
-use iced_x86::{
-    BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, MemoryOperand, Register,
-};
+use iced_x86::{Code, Encoder, Instruction, MemoryOperand, Register};
 use std::cell::RefCell;
 // ── arena layout ─────────────────────────────────────────────────────────────
 pub(crate) const OFF_CODE: usize = 0x1000; // entry + dispatch + handlers + helpers
@@ -324,60 +322,73 @@ impl CodeBuilder {
     }
 
     pub(crate) fn assemble(&mut self, base_va: u64) -> Result<(Vec<u8>, Vec<u64>)> {
-        // CodeBuilder emits explicit rel32 branches/calls and a commercial module
-        // is far smaller than +/-2 GiB. Keep those widths fixed. Letting the block
-        // encoder shrink rel32 to rel8 creates a cascading layout problem on large
-        // programs: the old 16-round relaxation could stop before convergence and
-        // silently return bytes whose branch targets belonged to the previous pass.
-        // That produced direct jumps into the middle of instructions in the next
-        // family module on the exact QA image.
+        // Every control-transfer emitted by CodeBuilder has an explicit rel32
+        // opcode. Its width is therefore independent of the final target.
         //
-        // With DONT_FIX_BRANCHES instruction widths are stable: one pass discovers
-        // the instruction IP map, the next installs exact targets. A third pass is
-        // only a fail-closed invariant check.
-        let options = BlockEncoderOptions::DONT_FIX_BRANCHES
-            | BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS;
-        let mut ips: Vec<u64> = (0..self.instrs.len()).map(|_| base_va).collect();
-
-        for round in 0..3 {
-            for &(bi, ti) in &self.branches {
-                let target = *ips
-                    .get(ti)
-                    .ok_or_else(|| anyhow!("branch target instruction index {ti} is out of range"))?;
-                self.instrs[bi].set_near_branch64(target);
+        // Do not use BlockEncoder's rewritten-instruction offset map as the
+        // instruction-index -> VA authority here. On very large commercial
+        // modules that map can describe rewritten block-encoder instructions,
+        // while the branch graph is indexed by the original instruction vector.
+        // Mixing those coordinate systems produced direct JMPs into the middle
+        // of instructions on the exact QA image.
+        //
+        // Measure original instructions once, derive their exact IPs, install
+        // targets from that map, then encode again and require width stability.
+        for &(bi, ti) in &self.branches {
+            if bi >= self.instrs.len() {
+                return Err(anyhow!("branch instruction index {bi} is out of range"));
             }
-            let blk = InstructionBlock::new(&self.instrs, base_va);
-            let enc = BlockEncoder::encode(64, blk, options)
-                .map_err(|e| anyhow!("block: {e:?}"))?;
-            let new_ips: Vec<u64> = enc
-                .new_instruction_offsets
-                .iter()
-                .map(|o| base_va + *o as u64)
-                .collect();
-
-            if new_ips.len() != self.instrs.len()
-                || new_ips
-                    .iter()
-                    .any(|&ip| ip < base_va || ip >= base_va + enc.code_buffer.len() as u64)
-            {
-                return Err(anyhow!("block encoder returned an invalid instruction-offset map"));
+            if ti >= self.instrs.len() {
+                return Err(anyhow!("branch target instruction index {ti} is out of range"));
             }
+            self.instrs[bi].set_near_branch64(base_va);
+        }
 
-            if new_ips == ips {
-                return Ok((enc.code_buffer, new_ips));
-            }
-            ips = new_ips;
+        let mut ips = Vec::with_capacity(self.instrs.len());
+        let mut lengths = Vec::with_capacity(self.instrs.len());
+        let mut measure = Encoder::new(64);
+        let mut ip = base_va;
+        for (index, instr) in self.instrs.iter().enumerate() {
+            ips.push(ip);
+            let len = measure
+                .encode(instr, ip)
+                .map_err(|e| anyhow!("measure instruction {index} at 0x{ip:X}: {e}"))?;
+            lengths.push(len);
+            ip = ip
+                .checked_add(len as u64)
+                .ok_or_else(|| anyhow!("CodeBuilder instruction IP overflow"))?;
+        }
 
-            if round == 2 {
+        for &(bi, ti) in &self.branches {
+            self.instrs[bi].set_near_branch64(ips[ti]);
+        }
+
+        let mut encoder = Encoder::new(64);
+        for (index, instr) in self.instrs.iter().enumerate() {
+            let len = encoder
+                .encode(instr, ips[index])
+                .map_err(|e| anyhow!("encode instruction {index} at 0x{:X}: {e}", ips[index]))?;
+            if len != lengths[index] {
                 return Err(anyhow!(
-                    "fixed-width CodeBuilder layout failed to converge after 3 passes"
+                    "fixed-width CodeBuilder invariant failed at instruction {index}: measured {} byte(s), final encode {} byte(s)",
+                    lengths[index],
+                    len
                 ));
             }
         }
+        let code = encoder.take_buffer();
+        let expected_len = ip
+            .checked_sub(base_va)
+            .ok_or_else(|| anyhow!("CodeBuilder final size underflow"))? as usize;
+        if code.len() != expected_len {
+            return Err(anyhow!(
+                "fixed-width CodeBuilder size drift: measured {expected_len} byte(s), encoded {} byte(s)",
+                code.len()
+            ));
+        }
 
-        unreachable!("fixed-width CodeBuilder convergence loop always returns")
-    }
-}
+        Ok((code, ips))
+    }}
 
 pub(crate) fn m(disp: i32) -> MemoryOperand {
     MemoryOperand::with_base_index_scale_displ_size(
@@ -559,6 +570,46 @@ mod code_builder_tests {
         assert!(b.branches.contains(&(clone + 1, clone + 2)));
         assert!(b.branches.contains(&(clone + 2, next_handler)));
         b.assemble(0x1400_0000_0).unwrap();
+    }
+
+    #[test]
+    fn fixed_width_assemble_keeps_direct_targets_on_instruction_boundaries() {
+        use iced_x86::{Decoder, DecoderOptions, FlowControl};
+
+        let base = 0x0000_0001_4010_0000;
+        let mut b = CodeBuilder::new();
+        let entry = b.len();
+        for i in 0..4096usize {
+            b.push(if i % 3 == 0 {
+                Instruction::with2(Code::Mov_r64_imm64, Register::RAX, i as u64).unwrap()
+            } else if i % 3 == 1 {
+                Instruction::with2(Code::Add_rm64_imm32, Register::RAX, i as i32).unwrap()
+            } else {
+                Instruction::with(Code::Nopd)
+            });
+        }
+        let target = b.len();
+        b.push(Instruction::with(Code::Retnq));
+        b.br(Code::Jmp_rel32_64, entry);
+        b.br(Code::Je_rel32_64, target);
+
+        let (code, ips) = b.assemble(base).unwrap();
+        let boundaries: std::collections::HashSet<u64> = ips.iter().copied().collect();
+        let mut decoder = Decoder::with_ip(64, &code, base, DecoderOptions::NONE);
+        while decoder.can_decode() {
+            let ins = decoder.decode();
+            match ins.flow_control() {
+                FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch => {
+                    assert!(
+                        boundaries.contains(&ins.near_branch_target()),
+                        "direct branch at 0x{:X} targets non-boundary 0x{:X}",
+                        ins.ip(),
+                        ins.near_branch_target()
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 
     #[test]
