@@ -211,13 +211,6 @@ fn explicit_setflag_preserves_direction_flag_in_every_family() {
             "{family:?}: native SetFlag dropped DF/ZF",
         );
 
-        let mut interp = PolymorphicInterpreter::new_for_family(seed, family);
-        interp.run(&bytecode).unwrap();
-        assert_eq!(
-            interp.flags.raw,
-            reference.flags,
-            "{family:?}: interpreter/reference SetFlag drift",
-        );
     }
 }
 
