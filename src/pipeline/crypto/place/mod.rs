@@ -233,6 +233,41 @@ pub(crate) fn place_boot_stub(
             }
         }
     }
+    // P2-5 runtime lifetime toggles decrypt/re-encrypt selected literal objects
+    // in place.  The scanner deliberately selects objects from read-only
+    // .rdata/.rodata, so the final PE must grant those backing pages WRITE or
+    // the first MemoryWrite8 in emit_lifetime_toggle faults with 0xC0000005.
+    // Keep them non-executable: this is mutable data, never runtime code.
+    for object in &data_lifetime_objects {
+        let object_end = object
+            .rva
+            .checked_add(object.len)
+            .ok_or_else(|| anyhow::anyhow!("P2-5 lifetime object RVA range overflow"))?;
+        let section = ctx
+            .patched_sections
+            .iter_mut()
+            .find(|section| {
+                let section_end = section
+                    .virtual_address
+                    .saturating_add(section.bytes.len() as u32);
+                object.rva >= section.virtual_address && object_end <= section_end
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "P2-5 lifetime object RVA 0x{:X} is outside relayed sections",
+                    object.rva
+                )
+            })?;
+        if section.characteristics & 0x2000_0000 != 0 {
+            anyhow::bail!(
+                "P2-5 lifetime object RVA 0x{:X} unexpectedly resides in executable section '{}'",
+                object.rva,
+                section.name
+            );
+        }
+        section.characteristics |= 0x8000_0000; // IMAGE_SCN_MEM_WRITE
+    }
+
     for object in &data_lifetime_objects {
         let plaintext =
             crate::vm::data_lifetime::section_object_bytes(&ctx.patched_sections, object)
