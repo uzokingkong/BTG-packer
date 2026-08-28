@@ -1768,10 +1768,7 @@ pub(crate) fn place_boot_stub(
                 image_base,
                 ctx.poly_vm_seed,
                 &ctx.vm_data_lifetime_objects,
-                &ctx.route_required_original_targets
-                    .iter()
-                    .map(|target| image_base + u64::from(target.0))
-                    .collect::<Vec<_>>(),
+                &native_gateway_targets,
             )?)
         } else {
             None
