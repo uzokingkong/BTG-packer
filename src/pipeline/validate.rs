@@ -610,6 +610,48 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
         );
     }
 
+    // P2-5 data-lifetime objects are decrypted/re-encrypted in place by the
+    // Program-VM runtime. Their backing section therefore has a strict RW/NX
+    // contract. Missing WRITE used to pass structural validation and then fault
+    // at the first MemoryWrite8 into .rdata/.rodata.
+    if !ctx.vm_data_lifetime_objects.is_empty() {
+        for object in &ctx.vm_data_lifetime_objects {
+            let object_end = object
+                .rva
+                .checked_add(object.len)
+                .ok_or_else(|| anyhow!("P2-5 lifetime object RVA range overflow"))?;
+            let sec = section_for_rva(&sections, object.rva).ok_or_else(|| {
+                anyhow!(
+                    "P2-5 lifetime object RVA 0x{:X} is outside all output sections",
+                    object.rva
+                )
+            })?;
+            let sec_end = sec.rva.saturating_add(sec.virtual_size.max(sec.raw_size));
+            if object_end > sec_end {
+                bail!(
+                    "P2-5 lifetime object RVA 0x{:X}..0x{:X} crosses section '{}' boundary",
+                    object.rva,
+                    object_end,
+                    sec.name
+                );
+            }
+            if sec.characteristics & 0x4000_0000 == 0
+                || sec.characteristics & 0x8000_0000 == 0
+                || sec.characteristics & 0x2000_0000 != 0
+            {
+                bail!(
+                    "P2-5 lifetime section '{}' must be RW/NX, got characteristics 0x{:08X}",
+                    sec.name,
+                    sec.characteristics
+                );
+            }
+        }
+        println!(
+            "[VALIDATE] OK  P2-5 lifetime backing: {} object(s) in RW/NX section(s)",
+            ctx.vm_data_lifetime_objects.len()
+        );
+    }
+
     if ctx.mem_harden && ctx.vm_oep {
         let textb = sections
             .iter()
