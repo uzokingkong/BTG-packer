@@ -51,6 +51,10 @@ const _: () = assert!(
     crate::vm::data_lifetime::LIFETIME_SYNC_PTR_STATE_OFFSET
         >= STATE_CROSS_FAMILY_TRANSIENT_END as usize
 );
+const _: () = assert!(
+    STATE_CROSS_FAMILY_DEPTH as usize
+        >= crate::vm::data_lifetime::LIFETIME_SYNC_COUNT_STATE_OFFSET + 8
+);
 
 fn emit_table_integrity_mix(b: &mut CodeBuilder) {
     b.push(
@@ -1337,6 +1341,22 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         rip_anchor(&mut b, Register::RCX, state_base);
         b.push(Instruction::with2(Code::Sub_rm64_r64, Register::RAX, Register::RCX).unwrap());
         b.push(Instruction::with2(Code::Add_rm64_r64, Register::R13, Register::RAX).unwrap());
+        // A reused lane may contain transient pointers from an earlier child
+        // invocation. They are bridge-private, never architectural state, so
+        // clear them before this invocation can perform an ordinary native call.
+        b.push(Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RAX).unwrap());
+        for off in std::iter::once(STATE_CROSS_FAMILY_RETURN_PTR)
+            .chain(std::iter::once(STATE_CROSS_FAMILY_CALLEE_STATE))
+            .chain(STATE_CROSS_FAMILY_VOLATILE_PTRS.into_iter().map(|(_, off)| off))
+            .chain(std::iter::once(STATE_CROSS_FAMILY_FLAGS_PTR))
+            .chain((0..6i64).map(|slot| STATE_CROSS_FAMILY_XMM_PTR_BASE + slot * 8))
+        {
+            b.push(Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_displ_size(Register::RDX, off, 8),
+                Register::RAX,
+            ).unwrap());
+        }
 
         let entry_common = b.len();
         for &mut (branch, ref mut target) in b.branches.iter_mut() {
@@ -2020,6 +2040,59 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
                 )
                 .unwrap(),
             );
+            if route.child_lane_stride != 0 {
+                // Advance the child into the next invocation lane. Reusing the
+                // same target-family state is unsafe for cyclic routes such as
+                // Stack -> Fused -> Mixed -> Fused: the second Fused entry would
+                // overwrite the suspended ancestor's GPRs and return metadata.
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_r64_rm64,
+                        Register::RAX,
+                        MemoryOperand::with_base_displ_size(
+                            Register::RDX,
+                            STATE_CROSS_FAMILY_DEPTH,
+                            8,
+                        ),
+                    )
+                    .unwrap(),
+                );
+                b.push(
+                    Instruction::with2(
+                        Code::Cmp_rm64_imm8,
+                        Register::RAX,
+                        MAX_CROSS_FAMILY_DEPTH as i32,
+                    )
+                    .unwrap(),
+                );
+                let depth_ok_edge = b.br(Code::Jb_rel32_64, 0);
+                b.push(Instruction::with(Code::Ud2));
+                let depth_ok = b.len();
+                if let Some((_, target)) = b
+                    .branches
+                    .iter_mut()
+                    .find(|(branch, _)| *branch == depth_ok_edge)
+                {
+                    *target = depth_ok;
+                }
+                b.push(Instruction::with1(Code::Inc_rm64, Register::RAX).unwrap());
+                movi(&mut b, Register::R9, route.child_lane_stride);
+                b.push(
+                    Instruction::with2(Code::Add_rm64_r64, Register::RCX, Register::R9).unwrap(),
+                );
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_rm64_r64,
+                        MemoryOperand::with_base_displ_size(
+                            Register::RCX,
+                            STATE_CROSS_FAMILY_DEPTH,
+                            8,
+                        ),
+                        Register::RAX,
+                    )
+                    .unwrap(),
+                );
+            }
             for index in 0..16 {
                 b.push(
                     Instruction::with2(
@@ -2824,7 +2897,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
             let native_flags = b.len();
             b.push(Instruction::with(Code::Pushfq));
             b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
-            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x8D5).unwrap());
+            b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xCD5).unwrap());
             let flags_ready = b.len();
             for &mut (_, ref mut target) in b.branches.iter_mut() {
                 if *target == usize::MAX - 0xBF00 {
@@ -3295,10 +3368,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
     }
 
     // Only arithmetic status flags belong to the virtual ISA. Feeding raw
-    // state into POPFQ can enable TF/DF/AC and turn ordinary condition checks
-    // into single-step or alignment exceptions. Bit 1 is architecturally set.
+    // state into POPFQ can enable TF/AC and turn ordinary condition checks into
+    // single-step or alignment exceptions. DF is architectural and must cross
+    // VM/native boundaries for CLD/STD + string-operation parity. Bit 1 is set.
     fn emit_safe_popfq(b: &mut CodeBuilder, reg: Register) {
-        b.push(Instruction::with2(Code::And_rm64_imm32, reg, 0x8D5).unwrap());
+        b.push(Instruction::with2(Code::And_rm64_imm32, reg, 0xCD5).unwrap());
         b.push(Instruction::with2(Code::Or_rm64_imm8, reg, 2).unwrap());
         b.push(Instruction::with1(Code::Push_r64, reg).unwrap());
         b.push(Instruction::with(Code::Popfq));

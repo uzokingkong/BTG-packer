@@ -221,6 +221,45 @@ fn explicit_setflag_preserves_direction_flag_in_every_family() {
     }
 }
 
+
+#[test]
+fn explicit_setflag_preserves_direction_flag_in_native_runtime() {
+    use crate::vm::poly::VmArchitectureFamily;
+    use crate::vm::risc::flags::VFLAG_DF;
+
+    let program = RiscProgram::new(vec![
+        MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Imm64(VFLAG_DF)),
+        MicroInstr::new(RiscOp::Mov)
+            .with_dst(MicroOperand::VReg(0))
+            .with_src1(MicroOperand::Vflags),
+        MicroInstr::new(RiscOp::Halt),
+    ]);
+
+    for (ordinal, family) in [
+        VmArchitectureFamily::Stack,
+        VmArchitectureFamily::Register,
+        VmArchitectureFamily::MixedRisc,
+        VmArchitectureFamily::FusedCisc,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seed = 0xDF00_2026_0828_0000 ^ ordinal as u64;
+        let mut encoder = PolymorphicEncoder::new_for_family(seed, family);
+        let bytecode = encoder.encode(&program).unwrap();
+        let state = run_native_poly_direct_for_family(
+            &bytecode,
+            seed,
+            family,
+            &[0; 16],
+            program.ip_map(),
+        )
+        .unwrap();
+        assert_eq!(state.flags & VFLAG_DF, VFLAG_DF, "{family:?}: SetFlag dropped DF");
+        assert_eq!(state.regs[0] & VFLAG_DF, VFLAG_DF, "{family:?}: Vflags read lost DF");
+    }
+}
+
 #[test]
 fn long_entry_resync_preserves_full_width_vip() {
     use crate::vm::poly::VmArchitectureFamily;

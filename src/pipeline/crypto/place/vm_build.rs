@@ -221,6 +221,18 @@ fn build_native_entry_gateway(
     ins.push(Instruction::with2(Code::Add_rm64_r64, Register::R11, Register::R9)?);
     ins.push(Instruction::with3(Code::Imul_r64_rm64_imm32, Register::RAX, Register::RAX, lane_group_stride as i32)?);
     ins.push(Instruction::with2(Code::Add_rm64_r64, Register::R10, Register::RAX)?);
+    // Preserve the gateway-selected re-entry depth in the lane state. Internal
+    // cross-family calls advance to the next lane and increment this value,
+    // preventing cyclic family routes from reusing an ancestor state.
+    ins.push(Instruction::with2(
+        Code::Mov_rm64_r64,
+        MemoryOperand::with_base_displ_size(
+            Register::R10,
+            vm::threaded::poly_direct::STATE_CROSS_FAMILY_DEPTH,
+            8,
+        ),
+        Register::RCX,
+    )?);
     // Saved stack from low to high: r15..rax, rflags; original RSP is +0x80.
     let saved = [112i64, 104, 96, 88, 128, 80, 72, 64, 56, 48, 40, 32, 24, 16, 8, 0];
     for (index, stack_off) in saved.into_iter().enumerate() {
@@ -237,7 +249,7 @@ fn build_native_entry_gateway(
     }
     ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX,
         MemoryOperand::with_base_displ_size(Register::RSP, 120, 8))?);
-    ins.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x8D5)?);
+    ins.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xCD5)?);
     ins.push(Instruction::with2(Code::Or_rm64_imm8, Register::RAX, 2)?);
     ins.push(Instruction::with2(Code::Mov_rm64_r64,
         MemoryOperand::with_base_displ_size(Register::R10, layout.flags as i64, 8), Register::RAX)?);
@@ -495,6 +507,8 @@ pub(crate) fn build_multi_family_prog_mod(
                         + (target_index as u64) * MULTI_FAMILY_STATE_STRIDE as u64,
                     target_state_va: SIZING_STATE_BASE
                         + (target_index as u64) * MULTI_FAMILY_STATE_STRIDE as u64,
+                    child_lane_stride: invocation_layout.lane_group_stride as u64,
+
                     target_byte_offset: target.instruction_offsets[route.target_local_op] as u64,
                     target_layout: vm::threaded::VmRuntimeLayout::from_seed(target.module_domain),
                     tail_jump_resume_offset: (route.kind
@@ -523,6 +537,7 @@ pub(crate) fn build_multi_family_prog_mod(
                         + (target_index as u64) * MULTI_FAMILY_STATE_STRIDE as u64,
                     target_state_va: SIZING_STATE_BASE
                         + (target_index as u64) * MULTI_FAMILY_STATE_STRIDE as u64,
+                    child_lane_stride: invocation_layout.lane_group_stride as u64,
                     target_byte_offset: target.instruction_offsets[target_local_op] as u64,
                     target_layout: vm::threaded::VmRuntimeLayout::from_seed(target.module_domain),
                     tail_jump_resume_offset: None,
@@ -546,6 +561,8 @@ pub(crate) fn build_multi_family_prog_mod(
                     + (module_index as u64) * MULTI_FAMILY_STATE_STRIDE as u64,
                 target_state_va: SIZING_STATE_BASE
                     + (module_index as u64) * MULTI_FAMILY_STATE_STRIDE as u64,
+                child_lane_stride: invocation_layout.lane_group_stride as u64,
+
                 target_byte_offset: 0,
                 target_layout: vm::threaded::VmRuntimeLayout::from_seed(module.module_domain),
                 tail_jump_resume_offset: None,
@@ -651,6 +668,8 @@ pub(crate) fn build_multi_family_prog_mod(
                     target_entry_va: effective_code_va + code_offsets[target_index] as u64
                         + sized[target_index].dynamic_state_entry_offset.unwrap_or(0) as u64,
                     target_state_va: effective_state_va + (target_index * MULTI_FAMILY_STATE_STRIDE) as u64,
+                    child_lane_stride: invocation_layout.lane_group_stride as u64,
+
                     target_byte_offset: target.instruction_offsets[route.target_local_op] as u64,
                     target_layout: vm::threaded::VmRuntimeLayout::from_seed(target.module_domain),
                     tail_jump_resume_offset: (route.kind
@@ -679,6 +698,7 @@ pub(crate) fn build_multi_family_prog_mod(
                         + sized[target_index].dynamic_state_entry_offset.unwrap_or(0) as u64,
                     target_state_va: effective_state_va
                         + (target_index * MULTI_FAMILY_STATE_STRIDE) as u64,
+                    child_lane_stride: invocation_layout.lane_group_stride as u64,
                     target_byte_offset: target.instruction_offsets[target_local_op] as u64,
                     target_layout: vm::threaded::VmRuntimeLayout::from_seed(target.module_domain),
                     tail_jump_resume_offset: None,
@@ -692,6 +712,8 @@ pub(crate) fn build_multi_family_prog_mod(
                 target_entry_va: effective_code_va + code_offsets[index] as u64
                     + sized[index].dynamic_state_entry_offset.unwrap_or(0) as u64,
                 target_state_va: effective_state_va + (index * MULTI_FAMILY_STATE_STRIDE) as u64,
+                child_lane_stride: invocation_layout.lane_group_stride as u64,
+
                 target_byte_offset: 0,
                 target_layout: vm::threaded::VmRuntimeLayout::from_seed(module.module_domain),
                 tail_jump_resume_offset: None,
