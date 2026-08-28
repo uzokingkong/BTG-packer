@@ -324,32 +324,58 @@ impl CodeBuilder {
     }
 
     pub(crate) fn assemble(&mut self, base_va: u64) -> Result<(Vec<u8>, Vec<u64>)> {
-        // Branch sizes may be shrunk by BlockEncoder (rel32 -> rel8), so the layout
-        // is not known a priori. Iterate: guess branch targets, encode, read back the
-        // true per-instruction offsets, and re-target until it converges.
+        // CodeBuilder emits explicit rel32 branches/calls and a commercial module
+        // is far smaller than +/-2 GiB. Keep those widths fixed. Letting the block
+        // encoder shrink rel32 to rel8 creates a cascading layout problem on large
+        // programs: the old 16-round relaxation could stop before convergence and
+        // silently return bytes whose branch targets belonged to the previous pass.
+        // That produced direct jumps into the middle of instructions in the next
+        // family module on the exact QA image.
+        //
+        // With DONT_FIX_BRANCHES instruction widths are stable: one pass discovers
+        // the instruction IP map, the next installs exact targets. A third pass is
+        // only a fail-closed invariant check.
+        let options = BlockEncoderOptions::DONT_FIX_BRANCHES
+            | BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS;
         let mut ips: Vec<u64> = (0..self.instrs.len()).map(|_| base_va).collect();
-        let mut code = Vec::new();
-        for _ in 0..16 {
+
+        for round in 0..3 {
             for &(bi, ti) in &self.branches {
-                self.instrs[bi].set_near_branch64(ips[ti]);
+                let target = *ips
+                    .get(ti)
+                    .ok_or_else(|| anyhow!("branch target instruction index {ti} is out of range"))?;
+                self.instrs[bi].set_near_branch64(target);
             }
             let blk = InstructionBlock::new(&self.instrs, base_va);
-            let enc =
-                BlockEncoder::encode(64, blk, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS)
-                    .map_err(|e| anyhow!("block: {e:?}"))?;
+            let enc = BlockEncoder::encode(64, blk, options)
+                .map_err(|e| anyhow!("block: {e:?}"))?;
             let new_ips: Vec<u64> = enc
                 .new_instruction_offsets
                 .iter()
                 .map(|o| base_va + *o as u64)
                 .collect();
-            code = enc.code_buffer;
+
+            if new_ips.len() != self.instrs.len()
+                || new_ips
+                    .iter()
+                    .any(|&ip| ip < base_va || ip >= base_va + enc.code_buffer.len() as u64)
+            {
+                return Err(anyhow!("block encoder returned an invalid instruction-offset map"));
+            }
+
             if new_ips == ips {
-                ips = new_ips;
-                break;
+                return Ok((enc.code_buffer, new_ips));
             }
             ips = new_ips;
+
+            if round == 2 {
+                return Err(anyhow!(
+                    "fixed-width CodeBuilder layout failed to converge after 3 passes"
+                ));
+            }
         }
-        Ok((code, ips))
+
+        unreachable!("fixed-width CodeBuilder convergence loop always returns")
     }
 }
 
