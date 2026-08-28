@@ -539,6 +539,34 @@ mod tests {
     use crate::vm::route_table::{EntryVip, FunctionRoute};
 
     #[test]
+    fn rejects_ip_mapped_vm_op_missing_from_family_partition() {
+        let program = RiscProgram::with_ip_map(
+            vec![
+                MicroInstr::new(RiscOp::Mov),
+                MicroInstr::new(RiscOp::Mov),
+                MicroInstr::new(RiscOp::Mov),
+            ],
+            HashMap::from([(0x1000, 0), (0x1039, 2)]),
+        );
+        let plan = ProductionFamilyPlan::new(0x7922, 0x1000, &[0x1000]);
+        let partitions = vec![FamilyOpPartition {
+            family: plan.entry_family,
+            regions: vec![FunctionOpRange {
+                function_id: 0x1000,
+                start_op: 0,
+                end_op: 2,
+            }],
+        }];
+
+        let error = MultiFamilyProgramPlan::build(&program, &plan, &partitions)
+            .expect_err("an IP-mapped VM op must never disappear from materialization");
+        assert!(
+            error.contains("0x1039") && error.contains("unowned RISC op 2"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn splits_program_and_classifies_cross_family_call() {
         let seed = 7;
         let functions = [0x1000, 0x2000];
