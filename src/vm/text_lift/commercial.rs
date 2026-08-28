@@ -1737,12 +1737,38 @@ pub fn lift_program_cfg_commercial_with_model(
             let block_ops = lifter.desynth.instrs.len();
             instrs.extend(lifter.desynth.instrs);
             if block_ops != 0 {
-                if let Some((function_id, _)) = all_function_ranges
-                .iter()
-                .find(|(start, end)| *start <= bb.start_va && bb.start_va < *end)
-                {
+                // Canonical ProgramModel functions may own multiple discontiguous
+                // RVA ranges.  Do not re-infer ownership from only the primary
+                // entry-containing range: that silently dropped branch-only
+                // blocks (the tiny QA JG target at 0x140001039 was the minimal
+                // reproducer) from multi-family materialization even though the
+                // block itself lifted and was counted as VM-owned.
+                let canonical_function_id = canonical_model.and_then(|model| {
+                    let block_rva = bb
+                        .start_va
+                        .checked_sub(image_base)
+                        .and_then(|rva| u32::try_from(rva).ok())?;
+                    let block = model.blocks.values().find(|block| {
+                        block.range.start <= block_rva && block_rva < block.range.end
+                    })?;
+                    let function = model.functions.get(&block.function_id)?;
+                    let entry = function.entries.iter().next().copied()?;
+                    let primary = function
+                        .ranges
+                        .iter()
+                        .filter(|range| range.start <= entry && entry < range.end)
+                        .max_by_key(|range| range.end.saturating_sub(range.start))?;
+                    Some(image_base + u64::from(primary.start))
+                });
+                let function_id = canonical_function_id.or_else(|| {
+                    all_function_ranges
+                        .iter()
+                        .find(|(start, end)| *start <= bb.start_va && bb.start_va < *end)
+                        .map(|(start, _)| *start)
+                });
+                if let Some(function_id) = function_id {
                     raw_function_op_ranges.push(crate::vm::poly::FunctionOpRange {
-                        function_id: *function_id,
+                        function_id,
                         start_op: base,
                         end_op: base + block_ops,
                     });
