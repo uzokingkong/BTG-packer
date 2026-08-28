@@ -2698,6 +2698,22 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
                 }
             }
 
+            // RAX was used as rewrite scratch above. Native-entry bridging
+            // promises to materialize the complete guest register file, so put
+            // the authoritative guest RAX back before releasing the state-base
+            // scratch held in R11.
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RAX,
+                    MemoryOperand::with_base_displ_size(
+                        Register::R11,
+                        state_disp(REGS_OFF) as i64,
+                        8,
+                    ),
+                )
+                .unwrap(),
+            );
             b.push(
                 Instruction::with2(
                     Code::Mov_r64_rm64,
