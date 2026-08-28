@@ -388,7 +388,8 @@ impl CodeBuilder {
         }
 
         Ok((code, ips))
-    }}
+    }
+}
 
 pub(crate) fn m(disp: i32) -> MemoryOperand {
     MemoryOperand::with_base_index_scale_displ_size(
