@@ -219,6 +219,18 @@ impl MultiFamilyProgramPlan {
             }
         }
 
+        // Every source IP that the runtime branch map can resolve must remain
+        // owned by a materialized family. Synthetic bootstrap ops are intentionally
+        // absent from the IP map, but dropping an IP-mapped op would turn an
+        // internal VM branch into a native fallback after original .text is NX.
+        for (&ip, &op) in global_ip_map {
+            if op >= program.instrs.len() || !op_owner.contains_key(&op) {
+                return Err(format!(
+                    "canonical source IP {ip:#x} maps to unowned RISC op {op}; multi-family partition dropped a VM-owned block"
+                ));
+            }
+        }
+
         let mut output = Vec::new();
         for partition in partitions {
             let mut instrs = Vec::new();
