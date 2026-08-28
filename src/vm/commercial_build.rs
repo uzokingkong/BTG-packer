@@ -174,6 +174,36 @@ pub fn build_program_vm_commercial_with_routes_for_family(
     chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
     routes: &[crate::vm::threaded::poly_direct::NativeCrossFamilyRoute],
 ) -> Result<VmModule> {
+    build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
+        code_va,
+        table_va,
+        bytecode_va,
+        bytecode,
+        state_va,
+        seed,
+        family,
+        ip_map,
+        prepared,
+        chunks,
+        routes,
+        &[],
+    )
+}
+
+pub fn build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
+    code_va: u64,
+    table_va: u64,
+    bytecode_va: u64,
+    bytecode: Vec<u8>,
+    state_va: u64,
+    seed: u64,
+    family: crate::vm::poly::VmArchitectureFamily,
+    ip_map: Option<&HashMap<u64, usize>>,
+    prepared: Option<&PreparedSuperOpProgram>,
+    chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
+    routes: &[crate::vm::threaded::poly_direct::NativeCrossFamilyRoute],
+    native_pointer_rewrites: &[(u64, u64)],
+) -> Result<VmModule> {
     // Virtual stack top: right after the state buffer (COMMERCIAL_STATE_SIZE),
     // growing down into the reserved VIRTUAL_STACK_SIZE region. Keeps the
     // dispatcher's R13-based push/pop isolated from both state and bytecode.
@@ -191,7 +221,7 @@ pub fn build_program_vm_commercial_with_routes_for_family(
         }
     }
     let parts = if let Some(prepared) = prepared {
-        crate::vm::threaded::poly_direct::build_self_decoding_parts_with_superops_chunks_family_and_routes(
+        crate::vm::threaded::poly_direct::build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_rewrites(
             &bytecode,
             seed,
             family,
@@ -207,9 +237,10 @@ pub fn build_program_vm_commercial_with_routes_for_family(
             Some(&prepared.metadata),
             chunks,
             routes,
+            native_pointer_rewrites,
         )?
     } else {
-        crate::vm::threaded::poly_direct::build_self_decoding_parts_with_superops_chunks_family_and_routes(
+        crate::vm::threaded::poly_direct::build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_rewrites(
             &bytecode,
             seed,
             family,
@@ -225,6 +256,7 @@ pub fn build_program_vm_commercial_with_routes_for_family(
             None,
             chunks,
             routes,
+            native_pointer_rewrites,
         )?
     };
 

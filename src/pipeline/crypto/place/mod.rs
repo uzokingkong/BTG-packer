@@ -57,10 +57,12 @@ fn collect_native_gateway_targets(
     required_original_targets: &[crate::vm::route_table::OriginalTargetRva],
 ) -> Vec<u64> {
     // Native code can re-enter VM-owned code through address-taken callbacks
-    // that never appear in the static cross-family route table (CRT onexit/
-    // initializer tables are a common example). Discover every full PE32+
-    // function VA stored in non-executable data before module sizing so sizing
-    // and final placement build exactly the same gateway set.
+    // that never appear in the static cross-family route table. Inventory both
+    // full pointers stored in non-executable data and code materialization such
+    // as `lea rdx,[rip+callback]` before module sizing.
+    //
+    // Only exact VM-owned function entries qualify, so ordinary RIP-relative
+    // constants/data references cannot inflate the gateway set.
     let vm_entries: std::collections::HashSet<u64> = multi
         .modules
         .iter()
@@ -72,7 +74,33 @@ fn collect_native_gateway_targets(
         .collect();
 
     for section in sections {
-        if section.characteristics & 0x2000_0000 != 0 || section.bytes.len() < 8 {
+        if section.characteristics & 0x2000_0000 != 0 {
+            let section_va = image_base + u64::from(section.virtual_address);
+            let mut decoder = iced_x86::Decoder::with_ip(
+                64,
+                &section.bytes,
+                section_va,
+                iced_x86::DecoderOptions::NONE,
+            );
+            while decoder.can_decode() {
+                let instruction = decoder.decode();
+                let candidate = match instruction.code() {
+                    iced_x86::Code::Lea_r64_m if instruction.is_ip_rel_memory_operand() => {
+                        Some(instruction.ip_rel_memory_address())
+                    }
+                    iced_x86::Code::Mov_r64_imm64 => Some(instruction.immediate64()),
+                    _ => None,
+                };
+                if let Some(candidate) = candidate {
+                    if vm_entries.contains(&candidate) {
+                        targets.insert(candidate);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if section.bytes.len() < 8 {
             continue;
         }
         let mut cursor = 0usize;
@@ -92,6 +120,54 @@ fn collect_native_gateway_targets(
     }
 
     targets.into_iter().collect()
+}
+
+#[cfg(test)]
+mod native_gateway_target_tests {
+    use super::collect_native_gateway_targets;
+    use crate::pe::builder::SectionData;
+    use crate::vm::multi_family::{EncodedFamilyPartition, MaterializedMultiFamilyProgram};
+    use crate::vm::poly::VmArchitectureFamily;
+    use std::collections::HashMap;
+
+    #[test]
+    fn rip_relative_lea_of_vm_function_is_gateway_target() {
+        let image_base = 0x0000_0001_4000_0000u64;
+        let section_rva = 0x1000u32;
+        let target = image_base + 0x3000;
+        let next_ip = image_base + u64::from(section_rva) + 7;
+        let disp = i32::try_from(target as i64 - next_ip as i64).unwrap();
+
+        // lea rdx,[rip+disp32] ; ret
+        let mut bytes = vec![0x48, 0x8D, 0x15];
+        bytes.extend_from_slice(&disp.to_le_bytes());
+        bytes.push(0xC3);
+
+        let sections = vec![SectionData {
+            name: ".text".to_string(),
+            virtual_address: section_rva,
+            virtual_size: bytes.len() as u32,
+            characteristics: 0x6000_0020,
+            bytes,
+        }];
+        let multi = MaterializedMultiFamilyProgram {
+            modules: vec![EncodedFamilyPartition {
+                family: VmArchitectureFamily::Stack,
+                function_ids: vec![target],
+                bytecode: Vec::new(),
+                instruction_offsets: Vec::new(),
+                ip_map: HashMap::new(),
+                module_domain: 1,
+                exit_byte_offset: 0,
+            }],
+            route_table: Vec::new(),
+        };
+
+        assert_eq!(
+            collect_native_gateway_targets(&sections, image_base, &multi, &[]),
+            vec![target],
+        );
+    }
 }
 
 fn rewrite_native_gateway_pointers(

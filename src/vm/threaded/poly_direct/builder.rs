@@ -352,6 +352,59 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
     chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
     cross_family_routes: &[NativeCrossFamilyRoute],
 ) -> Result<SelfDecodingParts> {
+    build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_rewrites(
+        bytecode,
+        seed,
+        family,
+        code_base,
+        table_base,
+        bytecode_base,
+        state_base,
+        stack_base,
+        ip_map,
+        layout,
+        runtime_layout,
+        superops,
+        superop_metadata,
+        chunks,
+        cross_family_routes,
+        &[],
+    )
+}
+
+pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_rewrites(
+    bytecode: &[u8],
+    seed: u64,
+    family: crate::vm::poly::VmArchitectureFamily,
+    code_base: u64,
+    table_base: u64,
+    bytecode_base: u64,
+    state_base: u64,
+    stack_base: u64,
+    ip_map: Option<&HashMap<u64, usize>>,
+    layout: TableLayout,
+    runtime_layout: VmRuntimeLayout,
+    superops: &[AssignedSuperOp],
+    superop_metadata: Option<&SuperOpBuildMetadata>,
+    chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
+    cross_family_routes: &[NativeCrossFamilyRoute],
+    native_pointer_rewrites: &[(u64, u64)],
+) -> Result<SelfDecodingParts> {
+    let mut rewrite_sources =
+        std::collections::HashSet::with_capacity(native_pointer_rewrites.len());
+    for (index, &(original_va, gateway_va)) in native_pointer_rewrites.iter().enumerate() {
+        if original_va == 0 || gateway_va == 0 {
+            return Err(anyhow!(
+                "commercial VM native pointer rewrite {index} has a null address"
+            ));
+        }
+        if !rewrite_sources.insert(original_va) {
+            return Err(anyhow!(
+                "commercial VM duplicate native pointer rewrite source {original_va:#x}"
+            ));
+        }
+    }
+
     // P1 migration: every state access now passes through the runtime-layout
     // translator. Keep the legacy contract until the embed/bridge initializers
     // consume the same layout value, then production can switch to `from_seed`.
@@ -2623,6 +2676,28 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
                 )
                 .unwrap(),
             );
+            // VM-owned function addresses can escape through native API
+            // register arguments (the exact QA path is a VEH callback in RDX).
+            // Original .text remains NX; translate only the physical outbound
+            // ABI value to the generated native-entry gateway. Guest state stays
+            // canonical/original, and generated child calls bypass this path.
+            for &(original_va, gateway_va) in native_pointer_rewrites {
+                for reg in [Register::RCX, Register::RDX, Register::R8, Register::R9] {
+                    movi(&mut b, Register::RAX, original_va);
+                    b.push(
+                        Instruction::with2(Code::Cmp_rm64_r64, reg, Register::RAX).unwrap(),
+                    );
+                    let skip = b.br(Code::Jne_rel32_64, usize::MAX);
+                    movi(&mut b, reg, gateway_va);
+                    let after = b.len();
+                    for (branch, target) in &mut b.branches {
+                        if *branch == skip {
+                            *target = after;
+                        }
+                    }
+                }
+            }
+
             b.push(
                 Instruction::with2(
                     Code::Mov_r64_rm64,

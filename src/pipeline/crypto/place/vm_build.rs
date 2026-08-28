@@ -547,6 +547,20 @@ pub(crate) fn build_multi_family_prog_mod(
         Ok(routes)
     };
 
+    let mut gateway_targets = native_gateway_targets.to_vec();
+    gateway_targets.sort_unstable();
+    gateway_targets.dedup();
+    let dummy_native_pointer_rewrites: Vec<(u64, u64)> = gateway_targets
+        .iter()
+        .enumerate()
+        .map(|(index, &target_va)| {
+            (
+                target_va,
+                SIZING_ENTRY_BASE + 0x0100_0000 + (index as u64) * 0x10,
+            )
+        })
+        .collect();
+
     let mut sized = Vec::with_capacity(modules.len());
     for (module_index, module) in modules.iter().enumerate() {
         let mut routes = dummy_routes(module.family)?;
@@ -569,7 +583,7 @@ pub(crate) fn build_multi_family_prog_mod(
             });
         }
         sized.push(
-            vm::commercial_build::build_program_vm_commercial_with_routes_for_family(
+            vm::commercial_build::build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
                 0,
                 0,
                 0,
@@ -582,6 +596,7 @@ pub(crate) fn build_multi_family_prog_mod(
                 None,
                 &chunk_plans[module_index],
                 &routes,
+                &dummy_native_pointer_rewrites,
             )?,
         );
     }
@@ -611,10 +626,8 @@ pub(crate) fn build_multi_family_prog_mod(
     )?;
     let canonical_gateway_size = sized_canonical_gateway.len();
 
-    let mut gateway_targets = native_gateway_targets.to_vec();
-    gateway_targets.sort_unstable();
-    gateway_targets.dedup();
     let mut sized_gateway_total = 0usize;
+    let mut gateway_offsets = std::collections::BTreeMap::new();
     for &target_va in &gateway_targets {
         let (target_index, target) = modules
             .iter()
@@ -623,11 +636,10 @@ pub(crate) fn build_multi_family_prog_mod(
             .ok_or_else(|| anyhow::anyhow!("native gateway target {target_va:#x} has no materialized family entry"))?;
         let local_op = target.ip_map[&target_va];
         let entry_offset = target.instruction_offsets[local_op] as u64;
+        let gateway_off = code_total + canonical_gateway_size + sized_gateway_total;
+        gateway_offsets.insert(target_va, gateway_off);
         let bytes = build_native_entry_gateway(
-            effective_code_va
-                + code_total as u64
-                + canonical_gateway_size as u64
-                + sized_gateway_total as u64,
+            effective_code_va + gateway_off as u64,
             effective_code_va + code_offsets[target_index] as u64,
             effective_state_va + (target_index * MULTI_FAMILY_STATE_STRIDE) as u64,
             entry_offset,
@@ -639,6 +651,15 @@ pub(crate) fn build_multi_family_prog_mod(
         sized_gateway_total += bytes.len();
     }
     let full_code_total = code_total + canonical_gateway_size + sized_gateway_total;
+    let native_pointer_rewrites: Vec<(u64, u64)> = gateway_targets
+        .iter()
+        .map(|&target_va| {
+            (
+                target_va,
+                effective_code_va + gateway_offsets[&target_va] as u64,
+            )
+        })
+        .collect();
 
     let mut built = Vec::with_capacity(modules.len());
     let mut native_bridge_ranges = Vec::new();
@@ -720,7 +741,7 @@ pub(crate) fn build_multi_family_prog_mod(
             });
         }
         let built_module =
-            vm::commercial_build::build_program_vm_commercial_with_routes_for_family(
+            vm::commercial_build::build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
                 effective_code_va + code_offsets[index] as u64,
                 effective_code_va + full_code_total as u64 + table_offsets[index] as u64,
                 effective_code_va + full_code_total as u64 + table_total as u64 + bytecode_offsets[index] as u64,
@@ -732,6 +753,7 @@ pub(crate) fn build_multi_family_prog_mod(
                 None,
                 &chunk_plans[index],
                 &routes,
+                &native_pointer_rewrites,
             )?;
         if built_module.code.len() != sized[index].code.len()
             || built_module.table.len() != sized[index].table.len()
@@ -790,6 +812,12 @@ pub(crate) fn build_multi_family_prog_mod(
             .ok_or_else(|| anyhow::anyhow!("native gateway target {target_va:#x} disappeared"))?;
         let local_op = target.ip_map[&target_va];
         let gateway_off = code.len();
+        let expected_gateway_off = gateway_offsets[&target_va];
+        if gateway_off != expected_gateway_off {
+            return Err(anyhow::anyhow!(
+                "native entry gateway placement drift for {target_va:#x}: sized={expected_gateway_off:#x} final={gateway_off:#x}"
+            ));
+        }
         let bytes = build_native_entry_gateway(
             effective_code_va + gateway_off as u64,
             effective_code_va + code_offsets[target_index] as u64
