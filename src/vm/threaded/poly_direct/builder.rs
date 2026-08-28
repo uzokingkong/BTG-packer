@@ -1815,8 +1815,10 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_and_routes(
         movzx8_m(&mut b, Register::EAX, DEC_SRC1);
         mov_m(&mut b, Register::R11, DEC_IMM1);
         b.call(sub_resolve);
-        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0x8D5).unwrap());
+        b.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xCD5).unwrap());
         store_m(&mut b, FLAGS_OFF, Register::RAX);
+        // SetFlag owns CF/PF/AF/ZF/SF/DF/OF. Keep DF (bit 10) alongside
+        // the arithmetic status flags so CLD/STD survives the native backend.
         // SetFlag is an explicit architectural flags write/barrier. Any lazy
         // producer snapshot predating this restore must stop being authoritative;
         // otherwise the next branch/native/HALT materialization overwrites the
