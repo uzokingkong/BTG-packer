@@ -562,7 +562,7 @@ impl RiscLifter {
             | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate32to64
-            | OpKind::Immediate64 => Ok(MicroOperand::Imm64(inst.immediate64())),
+            | OpKind::Immediate64 => Ok(MicroOperand::Imm64(inst.immediate(which as u32))),
             OpKind::Memory => {
                 let addr = MicroOperand::Temp(4);
                 self.lower_effective_address(inst, addr)?;
@@ -729,7 +729,10 @@ impl RiscLifter {
             | Code::Mov_rm32_imm32
             | Code::Mov_rm16_imm16
             | Code::Mov_rm8_imm8 => {
-                let imm = inst.immediate64();
+                // Use the operand-aware getter: Immediate8to64/Immediate32to64
+                // must be sign-extended, and immediate64() would alias the
+                // instruction's mem_displ field for memory-destination forms.
+                let imm = inst.immediate(1);
                 if inst.op0_kind() == OpKind::Register {
                     let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
                     let mov_width = self.begin_mov_register_write(inst, dst);
@@ -971,7 +974,7 @@ impl RiscLifter {
                 self.emit_arch_push(src, width);
             }
             Code::Pushd_imm32 | Code::Pushq_imm32 | Code::Pushq_imm8 | Code::Pushw_imm8 => {
-                let imm = inst.immediate64();
+                let imm = inst.immediate(0);
                 let width = match code {
                     Code::Pushw_imm8 => 2,
                     Code::Pushd_imm32 => 4,
@@ -1178,7 +1181,7 @@ impl RiscLifter {
                 };
                 let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid imul dst"))?;
                 let (a, b) = if inst.op_count() == 3 {
-                    (self.operand_value(inst, 1)?, MicroOperand::Imm64(inst.immediate64()))
+                    (self.operand_value(inst, 1)?, self.operand_value(inst, 2)?)
                 } else {
                     (dst, self.operand_value(inst, 1)?)
                 };
