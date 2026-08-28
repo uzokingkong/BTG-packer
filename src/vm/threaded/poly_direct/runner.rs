@@ -136,6 +136,25 @@ fn run_native_poly_direct_configured_for_family(
         let p = state_off + runtime_layout.vregs[i] as usize;
         state.regs[i] = u64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
     }
+    for i in 0..8 {
+        let p = state_off + runtime_layout.temps[i] as usize;
+        state.temps[i] = u64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
+    }
+    let p = state_off + runtime_layout.flags as usize;
+    state.flags = u64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
+    let p = state_off + runtime_layout.vsp as usize;
+    state.vsp = u64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
+    let pending = if (state.vsp as i64) < 0 {
+        (-(state.vsp as i64) as u64) / 8
+    } else {
+        0
+    };
+    for k in 0..pending as usize {
+        let p = stack_off - ((k + 1) * 8);
+        state
+            .stack
+            .push(u64::from_le_bytes(buf[p..p + 8].try_into().unwrap()));
+    }
     Ok(state)
 }
 
