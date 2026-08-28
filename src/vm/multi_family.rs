@@ -159,6 +159,7 @@ impl MaterializedMultiFamilyProgram {
                 source_next_byte_offset: None,
                 target_entry_va: destination.entry_va,
                 target_state_va: destination.state_va,
+            child_lane_stride: 0,
                 target_byte_offset: byte_offset as u64,
                 target_layout: VmRuntimeLayout::from_seed(module.module_domain),
                 tail_jump_resume_offset,

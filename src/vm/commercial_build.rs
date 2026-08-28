@@ -593,6 +593,7 @@ mod tests {
             source_next_byte_offset: None,
             target_entry_va: child_code,
             target_state_va: child_state,
+            child_lane_stride: 0,
             target_byte_offset: 0,
             target_layout: child_layout.clone(),
             tail_jump_resume_offset: None,

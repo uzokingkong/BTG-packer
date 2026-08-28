@@ -5,6 +5,10 @@ use std::collections::BTreeSet;
 /// Hard ceiling keeps generated route scans and code size bounded even when
 /// upstream analysis is malformed or attacker-controlled.
 pub const MAX_NATIVE_CROSS_FAMILY_ROUTES: usize = 4096;
+/// Per-state nested cross-family depth. Lifetime sync owns 0x50A0/0x50A8.
+pub const STATE_CROSS_FAMILY_DEPTH: i64 = 0x50B0;
+/// Eight re-entry depths are reserved per thread bucket; depth 7 cannot spawn another child.
+pub const MAX_CROSS_FAMILY_DEPTH: u64 = 7;
 
 /// Build-time description of an unresolved branch that must enter another
 /// independently built commercial VM module instead of native code.
@@ -19,6 +23,9 @@ pub struct NativeCrossFamilyRoute {
     pub source_next_byte_offset: Option<u64>,
     pub target_entry_va: u64,
     pub target_state_va: u64,
+    /// Production multi-family routes advance child state by this lane-group stride.
+    /// Zero retains the standalone/single-module route contract.
+    pub child_lane_stride: u64,
     pub target_byte_offset: u64,
     pub target_layout: crate::vm::threaded::VmRuntimeLayout,
     pub tail_jump_resume_offset: Option<u64>,
@@ -237,6 +244,7 @@ mod route_validation_tests {
             source_next_byte_offset: Some(0x40),
             target_entry_va: 0x2000,
             target_state_va: 0x3000,
+            child_lane_stride: 0,
             target_byte_offset: 0,
             target_layout: crate::vm::threaded::VmRuntimeLayout::legacy(),
             tail_jump_resume_offset: None,
