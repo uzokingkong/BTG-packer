@@ -173,6 +173,55 @@ fn explicit_setflag_barrier_restores_lazy_cmp_flags_across_mov32_lowering() {
 }
 
 #[test]
+fn explicit_setflag_preserves_direction_flag_in_every_family() {
+    use crate::vm::poly::VmArchitectureFamily;
+    use crate::vm::risc::flags::{VFLAG_DF, VFLAG_ZF};
+
+    let expected = VFLAG_DF | VFLAG_ZF;
+    let program = RiscProgram::new(vec![
+        MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Imm64(expected)),
+        MicroInstr::new(RiscOp::Halt),
+    ]);
+    let reference = program.eval_state(&[0u64; 16]);
+    assert_eq!(reference.flags & expected, expected);
+
+    for (ordinal, family) in [
+        VmArchitectureFamily::Stack,
+        VmArchitectureFamily::Register,
+        VmArchitectureFamily::MixedRisc,
+        VmArchitectureFamily::FusedCisc,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seed = 0x5E7F_1A60_DF00_0000u64 ^ ordinal as u64;
+        let mut encoder = PolymorphicEncoder::new_for_family(seed, family);
+        let bytecode = encoder.encode(&program).unwrap();
+        let native = run_native_poly_direct_for_family(
+            &bytecode,
+            seed,
+            family,
+            &[0u64; 16],
+            program.ip_map(),
+        )
+        .unwrap();
+        assert_eq!(
+            native.flags & expected,
+            expected,
+            "{family:?}: native SetFlag dropped DF/ZF",
+        );
+
+        let mut interp = PolymorphicInterpreter::new_for_family(seed, family);
+        interp.run(&bytecode).unwrap();
+        assert_eq!(
+            interp.flags.raw,
+            reference.flags,
+            "{family:?}: interpreter/reference SetFlag drift",
+        );
+    }
+}
+
+#[test]
 fn long_entry_resync_preserves_full_width_vip() {
     use crate::vm::poly::VmArchitectureFamily;
 
