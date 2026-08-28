@@ -12,6 +12,7 @@
 //   * NativeCallBridge — 인지된 no-op 스텁 (실제 호스트 콜은 런타임 계층, Phase P3)
 // ==============================================================================
 
+use super::architecture_family::VmArchitectureFamily;
 use super::isa_spec::VirtualIsaSpec;
 use super::rolling_key::RollingKeyEngine;
 use crate::vm::risc::flags::VFLAG_DF;
@@ -38,8 +39,15 @@ pub struct PolymorphicInterpreter {
 
 impl PolymorphicInterpreter {
     pub fn new(seed: u64) -> Self {
+        Self::new_for_family(seed, VmArchitectureFamily::for_build(seed))
+    }
+
+    /// Construct an interpreter with the same family-local ISA identity used by
+    /// `PolymorphicEncoder::new_for_family`. The rolling stream key remains
+    /// seed-local; family separation lives in `VirtualIsaSpec`.
+    pub fn new_for_family(seed: u64, family: VmArchitectureFamily) -> Self {
         Self {
-            spec: VirtualIsaSpec::from_seed(seed),
+            spec: VirtualIsaSpec::from_seed_and_family(seed, family),
             rolling: RollingKeyEngine::new(seed),
             regs: [0u64; 16],
             temps: [0u64; 8],
