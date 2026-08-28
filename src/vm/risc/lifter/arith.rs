@@ -291,7 +291,7 @@ impl RiscLifter {
             | OpKind::Immediate32
             | OpKind::Immediate32to64
             | OpKind::Immediate64 => {
-                let v = inst.immediate64();
+                let v = inst.immediate(1);
                 if width == 8 {
                     MicroOperand::Imm64(v)
                 } else {
