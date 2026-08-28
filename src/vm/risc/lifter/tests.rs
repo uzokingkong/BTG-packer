@@ -26,6 +26,45 @@ fn regs(st: &RiscEvalState) -> [u64; 16] {
 }
 
 #[test]
+fn sign_extended_rip_relative_immediates_do_not_alias_memory_displacement() {
+    // Exact MSVC CRT shapes from the real QA payload.
+    //
+    // cmp qword ptr [rip+0x12fca], -1
+    // The old code called immediate64() for Immediate8to64, which combined
+    // iced-x86's RIP-relative mem_displ with the 0xFF immediate and produced
+    // 0x4003F2B8000000FF instead of -1.
+    let cmp = lift(
+        &[0x48, 0x83, 0x3D, 0xCA, 0x2F, 0x01, 0x00, 0xFF],
+        0x14002_C2E6,
+    );
+    let cmp_op = cmp
+        .instrs
+        .iter()
+        .find(|ins| matches!(ins.op, RiscOp::SubWithBorrow { width: 8 }))
+        .expect("CMP must lower to 64-bit SubWithBorrow");
+    assert_eq!(cmp_op.src2, Some(MicroOperand::Imm64(u64::MAX)));
+
+    // mov qword ptr [rip+0x13122], -1
+    // Immediate32to64 must also sign-extend instead of inheriting mem_displ.
+    let mov = lift(
+        &[
+            0x48, 0xC7, 0x05, 0x22, 0x31, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+        ],
+        0x14002_C19B,
+    );
+    let imm_write = mov
+        .instrs
+        .iter()
+        .find(|ins| {
+            ins.op == RiscOp::Mov
+                && ins.dst == Some(MicroOperand::Temp(5))
+                && matches!(ins.src1, Some(MicroOperand::Imm64(_)))
+        })
+        .expect("MOV [rip], imm32 must materialize its sign-extended immediate");
+    assert_eq!(imm_write.src1, Some(MicroOperand::Imm64(u64::MAX)));
+}
+
+#[test]
 fn unsupported_opcode_error_preserves_guest_diagnostic() {
     let raw = [0xF4]; // HLT is intentionally kept native.
     let ip = 0x1400_0123_4;
