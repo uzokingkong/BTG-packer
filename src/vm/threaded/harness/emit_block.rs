@@ -590,7 +590,8 @@ impl NativeVmHarness {
             }
             RiscOp::SetFlag => {
                 load(instrs, ins.src1, Register::R10)?;
-                instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::R10, 0x8D5).map_err(|e| anyhow!("{e}"))?);
+                // SetFlag carries DF (bit 10) in addition to CF/PF/AF/ZF/SF/OF.
+                instrs.push(Instruction::with2(Code::And_rm64_imm32, Register::R10, 0xCD5).map_err(|e| anyhow!("{e}"))?);
                 instrs.push(Instruction::with2(Code::Mov_rm64_r64, mem(FLAGS_OFF as i64), Register::R10).map_err(|e| anyhow!("{e}"))?);
             }
             RiscOp::MemoryRead { width } => {
