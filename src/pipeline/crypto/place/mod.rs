@@ -66,11 +66,18 @@ fn collect_native_gateway_targets(
     let vm_entries: std::collections::HashSet<u64> = multi
         .modules
         .iter()
-        .flat_map(|module| module.function_ids.iter().copied())
+        .flat_map(|module| {
+            module
+                .function_ids
+                .iter()
+                .copied()
+                .filter(|entry| module.ip_map.contains_key(entry))
+        })
         .collect();
     let mut targets: std::collections::BTreeSet<u64> = required_original_targets
         .iter()
         .map(|target| image_base + u64::from(target.0))
+        .filter(|target| vm_entries.contains(target))
         .collect();
 
     for section in sections {
@@ -131,6 +138,31 @@ mod native_gateway_target_tests {
     use std::collections::HashMap;
 
     #[test]
+    fn required_native_target_without_vm_entry_is_not_rewritten() {
+        let image_base = 0x0000_0001_4000_0000u64;
+        let native_target = image_base + 0x3000;
+        let multi = MaterializedMultiFamilyProgram {
+            modules: vec![EncodedFamilyPartition {
+                family: VmArchitectureFamily::Stack,
+                function_ids: Vec::new(),
+                bytecode: Vec::new(),
+                instruction_offsets: Vec::new(),
+                ip_map: HashMap::new(),
+                module_domain: 1,
+                exit_byte_offset: 0,
+            }],
+            route_table: Vec::new(),
+        };
+        let targets = collect_native_gateway_targets(
+            &[],
+            image_base,
+            &multi,
+            &[crate::vm::route_table::OriginalTargetRva(0x3000)],
+        );
+        assert!(!targets.contains(&native_target));
+    }
+
+    #[test]
     fn rip_relative_lea_of_vm_function_is_gateway_target() {
         let image_base = 0x0000_0001_4000_0000u64;
         let section_rva = 0x1000u32;
@@ -155,8 +187,8 @@ mod native_gateway_target_tests {
                 family: VmArchitectureFamily::Stack,
                 function_ids: vec![target],
                 bytecode: Vec::new(),
-                instruction_offsets: Vec::new(),
-                ip_map: HashMap::new(),
+                instruction_offsets: vec![0],
+                ip_map: HashMap::from([(target, 0)]),
                 module_domain: 1,
                 exit_byte_offset: 0,
             }],
@@ -1069,6 +1101,39 @@ pub(crate) fn place_boot_stub(
     } else {
         0
     };
+
+    // T3-3 layout invariant: the relocated Program-VM bytecode destination is
+    // inside the generated .textb image and must not overlap the bootstrap data
+    // that is appended after the VM module.  The old code relied on truncate()
+    // sizing alone, which could hide a bad cursor calculation until runtime.
+    if vm_prog_bc_len > 0 {
+        let bc_end = vm_prog_bc_off
+            .checked_add(vm_prog_bc_len as usize)
+            .ok_or_else(|| anyhow::anyhow!("Program-VM bytecode destination overflow"))?;
+        let btg_capacity_end = btg.bytes.len();
+        if vm_prog_bc_off < vm_prog_off || bc_end > btg_capacity_end {
+            anyhow::bail!(
+                "Program-VM bytecode layout invalid: bc=[0x{:X},0x{:X}) vm=[0x{:X},0x{:X}) section=0x{:X}",
+                vm_prog_bc_off, bc_end, vm_prog_off, vm_prog_off + vm_prog_total, btg_capacity_end
+            );
+        }
+        // The bytecode itself is allowed to sit inside the VM module, but it
+        // must not run beyond the module's immutable payload portion.
+        let immutable_end = vm_prog_off
+            .checked_add(
+                vm_prog_mod
+                    .as_ref()
+                    .map(|m| m.code.len() + m.table.len() + m.bytecode.len())
+                    .unwrap_or(0),
+            )
+            .ok_or_else(|| anyhow::anyhow!("Program-VM immutable layout overflow"))?;
+        if bc_end > immutable_end {
+            anyhow::bail!(
+                "Program-VM bytecode exceeds module immutable payload: bc_end=0x{:X} immutable_end=0x{:X}",
+                bc_end, immutable_end
+            );
+        }
+    }
     ctx.vm_prog_bytecode_rva = vm_prog_bc_va.saturating_sub(image_base) as u32;
     ctx.vm_prog_bytecode_len = vm_prog_bc_len;
     // 보존 원본 .text at-rest 암호화는 실제 실행되는 TLS 콜백이 없는 타깃에서 활성화.
@@ -1105,7 +1170,14 @@ pub(crate) fn place_boot_stub(
     // program-VM bytecode. No TLS callbacks -> a single run over the whole
     // `.text` (identical to the previous whole-region behaviour).
     let mut text_enc_runs: Vec<(u64, u32)> = Vec::new(); // (VA, len)
-    if vm_oep_effective && !ctx.mem_harden {
+    // A PE with TLS callbacks must not have its original .text encrypted at rest: the
+    // Windows loader invokes TLS callbacks before our boot stub has a chance to decrypt
+    // anything.  Keep the whole .text plaintext for this case; VM-OEP still protects
+    // the actual OEP path through the Program VM, while native TLS/CRT startup remains
+    // loader-safe.  The previous code computed `has_tls_cb` but did not use it to gate
+    // the encryption pass, so `--crypto-coverage 100` could encrypt loader-reachable
+    // code and trigger an immediate c0000005 before OEP.
+    if vm_oep_effective && !ctx.mem_harden && !has_tls_cb {
         let base_va = image_base + ctx.target_info.text_rva as u64;
         let excl = crate::vm::text_lift::detect_tls_callback_ranges(
             &ctx.target_info.text_bytes,
@@ -1155,7 +1227,7 @@ pub(crate) fn place_boot_stub(
         } else if ctx.mem_harden {
             println!("[+] --mem-harden: preserved .text remains RX; at-rest encryption is confined to relocated Program-VM payload");
         } else if has_tls_cb {
-            println!("[!] --vm-oep at-rest: preserved .text fully TLS-reachable; no .text runs encrypted");
+            println!("[!] --vm-oep at-rest: TLS callbacks present; preserving the entire .text plaintext for loader safety");
         }
     }
     // v16: 패킹당 레이아웃 난독화 — 부트 스텁/시드/문자열/리졸브 테이블의 절대
@@ -2394,6 +2466,19 @@ pub(crate) fn place_boot_stub(
         );
     }
     if payload_relocate && !payload_bytes.is_empty() {
+        // Source and destination must describe two disjoint, valid ranges.
+        // In particular, never let a malformed cursor cause the boot stub to
+        // copy the payload into .vdata or bootstrap metadata.
+        let dst_off = payload_target_off;
+        let dst_end = dst_off
+            .checked_add(payload_bytes.len())
+            .ok_or_else(|| anyhow::anyhow!("relocated payload destination overflow"))?;
+        if dst_off < vm_prog_off || dst_end > btg.bytes.len() {
+            anyhow::bail!(
+                "relocated payload destination outside .textb: dst=[0x{:X},0x{:X}) section=0x{:X}",
+                dst_off, dst_end, btg.bytes.len()
+            );
+        }
         let payload_rva = (payload_va - image_base) as u32;
         ctx.payload_rva = payload_rva;
         ctx.payload_len = payload_bytes.len() as u32;

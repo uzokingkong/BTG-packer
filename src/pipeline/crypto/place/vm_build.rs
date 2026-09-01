@@ -12,8 +12,18 @@ use std::collections::BTreeMap;
 
 pub(crate) const MULTI_FAMILY_STATE_STRIDE: usize = 0x8000;
 pub(crate) const VM_THREAD_BUCKETS: usize = 16;
-pub(crate) const VM_REENTRY_DEPTHS: usize = 8;
-pub(crate) const VM_INVOCATION_LANES: usize = VM_THREAD_BUCKETS * VM_REENTRY_DEPTHS;
+// Commercial programs routinely cross family boundaries more than eight
+// frames deep (the Rust std/MPMC path reaches at least depth 8 before doing any
+// application work).  Each depth needs an independent family-state group and
+// host stack; wrapping or trapping at eight either aliases a suspended parent
+// or executes the router's depth-guard UD2.
+pub(crate) const VM_REENTRY_DEPTHS: usize = 64;
+/// Lane zero plus the following depth window belong exclusively to the
+/// canonical OEP chain. Native-entry roots begin after that window; otherwise
+/// bucket-0 workers alias OEP children at identical cross-family depths.
+pub(crate) const VM_CANONICAL_LANES: usize = VM_REENTRY_DEPTHS + 1;
+pub(crate) const VM_INVOCATION_LANES: usize =
+    VM_CANONICAL_LANES + VM_THREAD_BUCKETS * VM_REENTRY_DEPTHS;
 
 /// Per-lane native runtime stack used by native-entry gateways.  The guest's
 /// architectural RSP remains in the selected VM state, while dispatcher/helper
@@ -126,6 +136,13 @@ fn build_canonical_oep_gateway(
     // The boot stub arrives with physical RSP equal to the architectural OEP
     // stack. Never let dispatcher/helper frames share that address space.
     // Slot zero is reserved for the canonical OEP invocation.
+    ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RSP)?);
+    ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::R11, state_va)?);
+    ins.push(Instruction::with2(
+        Code::Mov_rm64_r64,
+        MemoryOperand::with_base_displ_size(Register::R11, layout.vregs[4] as i64, 8),
+        Register::RAX,
+    )?);
     ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::R11, host_stack_top)?);
     ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSP, Register::R11)?);
     // Win64 caller shadow space. H is page/16-byte aligned, so pre-call RSP is
@@ -200,10 +217,22 @@ fn build_native_entry_gateway(
     xadd.set_has_lock_prefix(true);
     ins.push(xadd);
     ins.push(Instruction::with2(Code::And_rm32_imm32, Register::ECX, (VM_REENTRY_DEPTHS - 1) as i32)?);
-    ins.push(Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3)?);
+    // One thread bucket owns VM_REENTRY_DEPTHS consecutive lanes. Keep this
+    // scale derived from the configured power-of-two depth count; the old
+    // hard-coded x8 overlapped buckets after depths grew to 32.
+    ins.push(Instruction::with2(
+        Code::Shl_rm32_imm8,
+        Register::EAX,
+        VM_REENTRY_DEPTHS.trailing_zeros() as i32,
+    )?);
     ins.push(Instruction::with2(Code::Add_rm32_r32, Register::EAX, Register::ECX)?);
-    ins.push(Instruction::with1(Code::Inc_rm32, Register::EAX)?);
-    // EAX is now the 1-based invocation lane.  Build the lane-private native
+    ins.push(Instruction::with2(
+        Code::Add_rm32_imm32,
+        Register::EAX,
+        VM_CANONICAL_LANES as i32,
+    )?);
+    // EAX now names a lane beyond the canonical OEP depth window. Build its
+    // lane-private native
     // stack top in R11 before scaling RAX into the family-state group.
     ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX)?);
     // Slot zero belongs to canonical OEP. Invocation lane N uses host-stack
@@ -278,6 +307,7 @@ fn build_native_entry_gateway(
         0x5040,
         0x5048,
         0x5050,
+        0x5058,
         0x5060,
         0x5068,
         0x5070,
@@ -314,12 +344,14 @@ fn build_native_entry_gateway(
     // R11 points at a 16-byte-aligned lane-private stack top in `.vstate`.
     ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RSP)?);
     ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSP, Register::R11)?);
-    // Reserve 0x20 bytes of Win64 shadow space plus a private 0x20-byte
-    // persistence frame.  The callee owns the shadow area, so gateway values
-    // must live above it rather than inside it.
-    ins.push(Instruction::with2(Code::Sub_rm64_imm8, Register::RSP, 0x40)?);
+    // Reserve Win64 shadow space, bridge metadata, and 10 x 16 bytes for the
+    // nonvolatile XMM6..XMM15 register set.  A native entry gateway is itself a
+    // Win64 callee; the Program VM is free to use every physical XMM register,
+    // so failing to preserve XMM15 corrupted an enclosing native-call bridge's
+    // host-frame carrier during recursive callback entry.
+    ins.push(Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, 0xE0)?);
     // Persistent host frame: +0x20 guest RSP, +0x28 original RBX,
-    // +0x30 depth-counter VA.
+    // +0x30 depth-counter VA, +0x38 selected architectural state.
     ins.push(Instruction::with2(
         Code::Mov_rm64_r64,
         MemoryOperand::with_base_displ_size(Register::RSP, 0x20, 8),
@@ -330,6 +362,32 @@ fn build_native_entry_gateway(
         MemoryOperand::with_base_displ_size(Register::RSP, 0x28, 8),
         Register::RBX,
     )?);
+    ins.push(Instruction::with2(
+        Code::Mov_rm64_r64,
+        MemoryOperand::with_base_displ_size(Register::RSP, 0x38, 8),
+        Register::R10,
+    )?);
+    for (index, xmm) in [
+        Register::XMM6,
+        Register::XMM7,
+        Register::XMM8,
+        Register::XMM9,
+        Register::XMM10,
+        Register::XMM11,
+        Register::XMM12,
+        Register::XMM13,
+        Register::XMM14,
+        Register::XMM15,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        ins.push(Instruction::with2(
+            Code::Movups_xmmm128_xmm,
+            MemoryOperand::with_base_displ_size(Register::RSP, 0x40 + index as i64 * 16, 16),
+            xmm,
+        )?);
+    }
 
     let mut read_tid_release = Instruction::with2(
         Code::Mov_r32_rm32,
@@ -360,6 +418,51 @@ fn build_native_entry_gateway(
     let mut dec = Instruction::with1(Code::Dec_rm32, MemoryOperand::with_base(Register::RBX))?;
     dec.set_has_lock_prefix(true);
     ins.push(dec);
+    // HALT guarantees virtual RAX in physical RAX, but Win64 aggregate returns
+    // also use RDX and FP/vector returns use XMM0. The dynamic entry's physical
+    // RDX is its state-base ABI argument, so publish all return channels from
+    // the authoritative architectural state before returning to native code.
+    ins.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::R10,
+        MemoryOperand::with_base_displ_size(Register::RSP, 0x38, 8),
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::RAX,
+        MemoryOperand::with_base_displ_size(Register::R10, layout.vregs[0] as i64, 8),
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::RDX,
+        MemoryOperand::with_base_displ_size(Register::R10, layout.vregs[2] as i64, 8),
+    )?);
+    ins.push(Instruction::with2(
+        Code::Movups_xmm_xmmm128,
+        Register::XMM0,
+        MemoryOperand::with_base_displ_size(Register::R10, layout.xmm as i64, 16),
+    )?);
+    for (index, xmm) in [
+        Register::XMM6,
+        Register::XMM7,
+        Register::XMM8,
+        Register::XMM9,
+        Register::XMM10,
+        Register::XMM11,
+        Register::XMM12,
+        Register::XMM13,
+        Register::XMM14,
+        Register::XMM15,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        ins.push(Instruction::with2(
+            Code::Movups_xmm_xmmm128,
+            xmm,
+            MemoryOperand::with_base_displ_size(Register::RSP, 0x40 + index as i64 * 16, 16),
+        )?);
+    }
     ins.push(Instruction::with2(
         Code::Mov_r64_rm64,
         Register::R11,
@@ -962,6 +1065,37 @@ pub(crate) fn build_prog_vm_mod(
 #[cfg(test)]
 mod invocation_layout_tests {
     use super::*;
+
+    #[test]
+    fn native_gateway_starts_after_canonical_cross_family_window() {
+        let layout = vm::threaded::VmRuntimeLayout::from_seed(7);
+        let bytes = build_native_entry_gateway(
+            0x0000_0001_4100_0000,
+            0x0000_0001_4101_0000,
+            0x0000_0001_5000_0000,
+            0,
+            &layout,
+            0x0000_0001_6000_0000,
+            0x20_000,
+            0x0000_0001_7000_0000,
+        )
+        .unwrap();
+        let mut decoder = iced_x86::Decoder::with_ip(
+            64,
+            &bytes,
+            0x0000_0001_4100_0000,
+            iced_x86::DecoderOptions::NONE,
+        );
+        let instructions: Vec<_> = std::iter::from_fn(|| decoder.can_decode().then(|| decoder.decode())).collect();
+        assert!(instructions.iter().any(|instruction| {
+            instruction.code() == Code::Add_rm32_imm32
+                && instruction.op0_register() == Register::EAX
+                && instruction.immediate32() == VM_CANONICAL_LANES as u32
+        }));
+        assert!(!instructions.iter().any(|instruction| {
+            instruction.code() == Code::Inc_rm32 && instruction.op0_register() == Register::EAX
+        }));
+    }
 
     #[test]
     fn global_tail_does_not_overlap_family_states_or_host_stacks() {

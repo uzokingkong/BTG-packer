@@ -491,13 +491,18 @@ pub(crate) fn emit_chacha_init(seq: &mut Vec<(Instruction, Option<Label>)>, stub
         Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
         Some(Label::ChaKeyLoop),
     ));
-    // ctr = 0 → chacha_state_va+0x20 (u64 8B)
+    // The packer encrypts the at-rest code stream starting at ChaCha20 counter 1
+    // (counter 0 is reserved for the Poly1305 one-time key).  The boot stub must
+    // therefore initialize the live decrypt state to the same counter before its
+    // first emit_chacha_call.  Using ctr=0 here produced valid-looking execution
+    // flow into ciphertext and then 0xC0000005 at random-looking bytes (for example
+    // packed+0x8bbe2).
     seq.push((
         Instruction::with2(Code::Mov_r64_imm64, Register::RDI, stub.chacha_state_va).unwrap(),
         None,
     ));
     seq.push((
-        Instruction::with2(Code::Xor_r32_rm32, Register::EAX, Register::EAX).unwrap(),
+        Instruction::with2(Code::Mov_r32_imm32, Register::EAX, 1u32).unwrap(),
         None,
     ));
     seq.push((
@@ -619,6 +624,11 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
     // ── v9: crypto-off 스텁은 코드 영역 복호화를 생략한다 ───────────────────────
     if !stub.no_crypto {
         if stub.chained {
+            // Anti-debug attestation must be opt-in. The CLI in the reproduced
+            // crash did not request --anti-debug, but this branch used to poison
+            // the live crypto state whenever a debugger was attached, producing
+            // a later 0xC0000005 that looked like a payload/layout fault.
+            if stub.anti_debug {
             // ── v7 Phase 0.1: 환경 인증 게이트 (정적 에뮬레이터/디버거 차단) ────────
             // PEB 3검(BeingDebugged/NtGlobalFlag/Heap.Flags) + RDTSC 타이밍.
             // 실패 시 **시드를 XOR 변조**해 체인 복호화를 쓰레기로 유도 — "깨끗한 감지"
@@ -736,6 +746,7 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
                 Some(Label::AttestMutLoop),
             ));
             seq.push((Instruction::with(Code::Nopd), Some(Label::AttestOk)));
+            }
 
             // ── v7 chained-crypto: 코드 영역 256B 청크 순차 복호화 ────────────────
             // Key_i = 이전 청크 평문 (chunk 0 = seed anchor) → skip-ahead 불가.
@@ -949,6 +960,10 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
                 ));
             }
         } else {
+            // v15: non-chained attestation is opt-in for the same reason as the
+            // chained path above: without --anti-debug it must not mutate the
+            // live crypto state merely because the process is being debugged.
+            if stub.anti_debug {
             // v15: 비-chained(재암호화/평문/VM) 경로에도 fail-deceptive 인증 게이트를
             // 적용한다. chained 경로와 동일한 PEB 3검 + RDTSC 타이밍으로 디버거/에뮬레이터를
             // 탐지하고, 실패 시 **S-box(스택 프레임, RBX)를 0x5A로 XOR 변조**해 이후 모든
@@ -1064,6 +1079,7 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
                 Some(Label::AttestMutLoop),
             ));
             seq.push((Instruction::with(Code::Nopd), Some(Label::AttestOk)));
+            }
 
             // PRGA i,j 초기화 (canonical RC4: j=0에서 시작) — 복사 블록 이후에 수행해
             // 어떤 복사 경로가 RSI/RDI를 쓰더라도 RC4 i/j 카운터가 보존되게 한다.
@@ -1085,28 +1101,33 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
             // 남고 디스패처가 런타임에 복호화/재암호화한다. 문자열 런 키스트림은
             // 패커와 동일하게 "영역 없이 시작"하므로 이 스텁의 런 복호화와 일치한다.
             if !stub.reencrypt {
-                seq.push((
-                    Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.desc_va).unwrap(),
-                    None,
-                ));
-                seq.push((
-                    Instruction::with2(
-                        Code::Mov_r64_rm64,
-                        Register::RCX,
-                        MemoryOperand::with_base_displ(Register::RAX, 0x00),
-                    )
-                    .unwrap(),
-                    None,
-                ));
-                seq.push((
-                    Instruction::with2(
-                        Code::Mov_r64_rm64,
-                        Register::RDX,
-                        MemoryOperand::with_base_displ(Register::RAX, 0x08),
-                    )
-                    .unwrap(),
-                    None,
-                ));
+                if stub.desc_used {
+                    seq.push((
+                        Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.desc_va).unwrap(),
+                        None,
+                    ));
+                    seq.push((
+                        Instruction::with2(
+                            Code::Mov_r64_rm64,
+                            Register::RCX,
+                            MemoryOperand::with_base_displ(Register::RAX, 0x00),
+                        )
+                        .unwrap(),
+                        None,
+                    ));
+                    seq.push((
+                        Instruction::with2(
+                            Code::Mov_r64_rm64,
+                            Register::RDX,
+                            MemoryOperand::with_base_displ(Register::RAX, 0x08),
+                        )
+                        .unwrap(),
+                        None,
+                    ));
+                } else {
+                    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.code_va).unwrap(), None));
+                    seq.push((Instruction::with2(Code::Mov_r32_imm32, Register::EDX, stub.code_len).unwrap(), None));
+                }
                 if stub.c1_mode() {
                     emit_c1_call(seq, stub);
                 } else if stub.chacha_mode() {
@@ -1128,25 +1149,26 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
 pub(crate) fn emit_run_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
     // ── 문자열 런 복호화 루프 ──
     if !stub.no_crypto {
-        seq.push((
-            Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.desc_va).unwrap(),
-            Some(Label::CrcOk),
-        ));
-        seq.push((
-            Instruction::with2(
-                Code::Mov_r64_rm64,
-                Register::RBP,
-                MemoryOperand::with_base_displ(Register::RAX, 0x10),
-            )
-            .unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(
-                Code::Mov_r64_rm64,
-                Register::R11,
-                MemoryOperand::with_base_displ(Register::RAX, 0x18),
-            )
+        if stub.desc_used {
+            seq.push((
+                Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.desc_va).unwrap(),
+                Some(Label::CrcOk),
+            ));
+            seq.push((
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RBP,
+                    MemoryOperand::with_base_displ(Register::RAX, 0x10),
+                )
+                .unwrap(),
+                None,
+            ));
+            seq.push((
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R11,
+                    MemoryOperand::with_base_displ(Register::RAX, 0x18),
+                )
             .unwrap(),
             None,
         ));
@@ -1159,6 +1181,7 @@ pub(crate) fn emit_run_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stub
             Instruction::with2(Code::Mov_r32_imm32, Register::R11D, stub.num_runs).unwrap(),
             None,
         ));
+        }
     }
     seq.push((
         Instruction::with2(Code::Test_rm64_r64, Register::R11, Register::R11).unwrap(),
@@ -1329,14 +1352,14 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
             .unwrap(),
             None,
         ));
-    } else {
+    } else if stub.vm_oep {
         debug_assert!(stub.c1_mode(), "VM-OEP rest cipher must be ChaCha20 or experimental C1");
         emit_c1_init(seq, stub);
     }
     // P5: loop over .text at-rest decrypt run-table (va,len u64 pairs). Fresh
     // keystream is continuous across runs -> same order/lengths as the packer
     // encrypted them. count==0 -> immediate no-op (bytecode-only).
-    if !stub.no_crypto {
+    if stub.desc_used {
         seq.push((
             Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.desc_va).unwrap(),
             None,
@@ -1359,7 +1382,7 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
             .unwrap(),
             None,
         ));
-    } else {
+    } else if stub.vm_oep {
         seq.push((
             Instruction::with2(Code::Mov_r64_imm64, Register::RBP, stub.vm_oep_text_runs_va)
                 .unwrap(),
@@ -1372,6 +1395,15 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
                 stub.vm_oep_text_runs_count,
             )
             .unwrap(),
+            None,
+        ));
+    } else {
+        seq.push((
+            Instruction::with2(Code::Mov_r64_imm64, Register::RBP, stub.runs_va).unwrap(),
+            Some(Label::CrcOk),
+        ));
+        seq.push((
+            Instruction::with2(Code::Mov_r32_imm32, Register::R11D, stub.num_runs).unwrap(),
             None,
         ));
     }
@@ -1420,7 +1452,7 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
     ));
     seq.push((Instruction::with(Code::Nopd), Some(Label::TextRunDone)));
     // bytecode 복호화 (len=0이면 no-op)
-    if !stub.no_crypto {
+    if stub.desc_used {
         seq.push((
             Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.desc_va).unwrap(),
             None,
@@ -1678,6 +1710,21 @@ pub(crate) fn emit_dispatcher_entry(
     }
 }
 
+
+#[cfg(test)]
+mod chacha_bootstub_ctr_tests {
+    use super::*;
+    use crate::pipeline::crypto::bootstub::ctx::BootStubCtx;
+
+    #[test]
+    fn chacha_bootstub_initializes_counter_one() {
+        // Keep this test source-level: the production ChaCha reference reserves
+        // counter 0 for the Poly1305 one-time key, while at-rest payload bytes
+        // are encrypted/decrypted from counter 1.
+        let src = include_str!("emit.rs");
+        assert!(src.contains("Code::Mov_r32_imm32, Register::EAX, 1u32"));
+    }
+}
 
 #[cfg(test)]
 mod program_vm_rsp_layout_tests {

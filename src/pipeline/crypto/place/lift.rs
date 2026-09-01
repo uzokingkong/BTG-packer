@@ -60,11 +60,19 @@ pub(crate) fn lift_program(
             data_lifetime_objects = lift.data_lifetime_objects.clone();
             unsupported_report = lift.unsupported_report.clone();
             vm_prog_ip_map = lift.program.ip_map().cloned();
-            let plan = vm::poly::ProductionFamilyPlan::new(
+            let mut plan = vm::poly::ProductionFamilyPlan::new(
                 ctx.poly_vm_seed,
                 lift.entry_function_id,
                 &lift.virtualized_function_ids,
             );
+            // Diagnostic-only control used to distinguish core commercial
+            // execution from cross-family ABI/state handoff failures.
+            if std::env::var_os("BTG_FORCE_SINGLE_FAMILY").is_some() {
+                for assignment in &mut plan.assignments {
+                    assignment.family = plan.entry_family;
+                    assignment.incoming_bridge = None;
+                }
+            }
             println!(
                 "[+] P2-10 production family plan: {} VM-owned function(s), {} represented family/families, {} cross-family bridge requirement(s), entry={:?}",
                 plan.assignments.len(),
@@ -104,6 +112,7 @@ pub(crate) fn lift_program(
                 .unwrap_or(0);
             if partitioned_ops >= 1_000
                 && (partitions.len() < 3 || max_family_ops.saturating_mul(2) >= partitioned_ops)
+                && std::env::var_os("BTG_FORCE_SINGLE_FAMILY").is_none()
             {
                 return Err(anyhow::anyhow!(
                     "P2-12 runtime-instance ownership gate failed: instances={} max_ops={}/{}",

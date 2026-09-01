@@ -16,7 +16,7 @@ pub(crate) fn emit_payload_copy(seq: &mut Vec<(Instruction, Option<Label>)>, stu
             Instruction::with2(Code::Mov_r64_imm64, Register::R8, stub.payload_va).unwrap(),
             None,
         ));
-        if !stub.no_crypto {
+        if stub.desc_used {
             seq.push((
                 Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.desc_va).unwrap(),
                 None,
@@ -26,6 +26,21 @@ pub(crate) fn emit_payload_copy(seq: &mut Vec<(Instruction, Option<Label>)>, stu
                     Code::Mov_r64_rm64,
                     Register::R9,
                     MemoryOperand::with_base_displ(Register::RAX, 0x00),
+                )
+                .unwrap(),
+                None,
+            ));
+        } else if stub.vm_oep && stub.vm_oep_bc_len > 0 {
+            // VM-OEP relocation destination is the Program-VM bytecode slot,
+            // not the legacy native code_start.  The packer moves the ciphertext
+            // out of [vm_prog_bc_off..] into .vdata and zeroes that original slot;
+            // copying back to stub.code_va here would overwrite VM handler code
+            // and explains the random instruction stream seen at packed+0x8badc.
+            seq.push((
+                Instruction::with2(
+                    Code::Mov_r64_imm64,
+                    Register::R9,
+                    stub.vm_oep_bc_va,
                 )
                 .unwrap(),
                 None,

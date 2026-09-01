@@ -393,6 +393,7 @@ fn cross_family_child_call_stays_on_host_stack_while_native_keeps_guest_stack() 
     let mut saw_child_state_load = false;
     let mut saw_child_host_call = false;
     let mut saw_native_guest_call = false;
+    let mut guest_stack_installed = false;
     let mut decoder = Decoder::with_ip(64, bridge, bridge_ip, DecoderOptions::NONE);
     while decoder.can_decode() {
         let ins = decoder.decode();
@@ -410,9 +411,15 @@ fn cross_family_child_call_stays_on_host_stack_while_native_keeps_guest_stack() 
         {
             saw_child_host_call = true;
         }
-        if ins.code() == Code::Call_rm64
-            && ins.memory_base() == Register::RSP
-            && off == -8
+        if ins.code() == Code::Mov_rm64_r64
+            && ins.op0_register() == Register::RSP
+            && ins.op1_register() == Register::RAX
+        {
+            guest_stack_installed = true;
+        }
+        if ins.mnemonic() == iced_x86::Mnemonic::Call
+            && ins.op0_kind() == iced_x86::OpKind::Register
+            && ins.op0_register() == Register::R11
         {
             saw_native_guest_call = true;
         }
@@ -420,7 +427,8 @@ fn cross_family_child_call_stays_on_host_stack_while_native_keeps_guest_stack() 
 
     assert!(saw_child_state_load, "cross-family child state is not loaded from the host frame");
     assert!(saw_child_host_call, "generated child entry still leaves the isolated VM host stack");
-    assert!(saw_native_guest_call, "ordinary native calls no longer use the architectural guest stack");
+    assert!(guest_stack_installed, "ordinary native calls no longer install the architectural guest stack");
+    assert!(saw_native_guest_call, "ordinary native calls no longer invoke the staged target register");
 }
 
 #[test]

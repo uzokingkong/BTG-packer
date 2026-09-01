@@ -339,7 +339,7 @@ impl MultiFamilyProgramPlan {
             if std::env::var_os("BTG_TRACE_OP_MAP").is_some() {
                 for (local, instruction) in partition.program.instrs.iter().enumerate() {
                     eprintln!(
-                        "BTG_OP_MAP family={:?} local={} offset={:#x} ip={} op={:?}",
+                        "BTG_OP_MAP family={:?} local={} offset={:#x} ip={} op={:?} dst={:?} src1={:?} src2={:?} imm={:#x}",
                         partition.family,
                         local,
                         instruction_offsets[local],
@@ -347,7 +347,11 @@ impl MultiFamilyProgramPlan {
                             .get(&local)
                             .map(|ip| format!("{ip:#x}"))
                             .unwrap_or_else(|| "-".to_string()),
-                        instruction.op
+                        instruction.op,
+                        instruction.dst,
+                        instruction.src1,
+                        instruction.src2,
+                        instruction.imm
                     );
                 }
             }

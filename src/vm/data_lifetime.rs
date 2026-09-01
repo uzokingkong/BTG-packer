@@ -24,7 +24,9 @@ pub const LIFETIME_SYNC_TABLE_SIZE: usize = LIFETIME_SYNC_ENTRY_SIZE * LIFETIME_
 // Keep the process-lifetime table metadata outside the transient cross-family
 // return ABI at 0x5000..0x50a0.  In particular, 0x5020/0x5028 are the RCX/RDX
 // return-slot pointers and are rewritten for every routed invocation.
-pub const LIFETIME_SYNC_PTR_STATE_OFFSET: usize = 0x50A0;
+// Keep the lifetime synchronisation pointer past all cross-family transient
+// bridge metadata (including the CALL/JMP discriminator at 0x50B8).
+pub const LIFETIME_SYNC_PTR_STATE_OFFSET: usize = 0x50C0;
 pub const LIFETIME_SYNC_COUNT_STATE_OFFSET: usize = 0x50A8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

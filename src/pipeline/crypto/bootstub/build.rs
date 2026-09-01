@@ -130,8 +130,37 @@ fn emit_poly1305_verify(
     seq: &mut Vec<(Instruction, Option<super::ctx::Label>)>,
     stub: &BootStubCtx,
 ) {
-    // Generate the RFC 8439 Poly1305 one-time key from ChaCha block 0 into a
-    // zero-initialized runtime scratch buffer.  emit_chacha_init left ctr=0.
+    // Generate the RFC 8439 Poly1305 one-time key from ChaCha block 0.  The
+    // normal decrypt stream starts at counter 1, so reset its state explicitly
+    // before this short, dedicated block-0 derivation.
+    seq.push((
+        Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.chacha_state_va).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Mov_rm64_imm32,
+            MemoryOperand::with_base_displ(
+                Register::RAX,
+                crate::crypto::chacha20::CHA_OFF_CTR as i64,
+            ),
+            0,
+        )
+        .unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Mov_rm32_imm32,
+            MemoryOperand::with_base_displ(
+                Register::RAX,
+                crate::crypto::chacha20::CHA_OFF_KS_OFF as i64,
+            ),
+            0x40,
+        )
+        .unwrap(),
+        None,
+    ));
     seq.push((
         Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.poly_key_va).unwrap(),
         None,
@@ -144,7 +173,13 @@ fn emit_poly1305_verify(
         Instruction::with_branch(Code::Call_rel32_64, stub.chacha_blob_va).unwrap(),
         None,
     ));
-    if !stub.no_crypto {
+    // Descriptor-backed targets are only valid when the descriptor decryptor
+    // was emitted.  ChaCha/VM paths deliberately retire that decryptor
+    // (`desc_used == false`) and must keep using the immediate code region.
+    // Selecting the still-allocated descriptor merely because crypto is on
+    // gives Program-VM builds a zero code_len, so Poly1305 authenticates an
+    // empty message and takes the UD2 failure branch.
+    if stub.desc_used {
         seq.push((
             Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.desc_va).unwrap(),
             None,
@@ -302,8 +337,8 @@ pub(crate) fn build_boot_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     // 암호화)를 KSA(seed)+canonical PRGA로 복호화한다. (base_bind가 먼저여야
     // seed@seed_va = seed_masked.) 이 스테이지의 S-box는 즉시 뒤 main KSA-init이
     // 덮어쓰므로 일시적이며, main 코드/런 키스트림은 byte-identical을 유지한다.
-    if !stub.no_crypto {
-        // [A/B] emit_desc_decrypt temporarily disabled
+    if stub.desc_used {
+        emit_desc_decrypt(&mut seq, stub);
     }
 
     // v60 (--custom-cipher): BTG-C1 경로는 RC4 KSA 대신 C1 상태 초기화를 수행한다.

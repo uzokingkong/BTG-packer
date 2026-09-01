@@ -205,7 +205,7 @@ impl RiscLifter {
         Ok(())
     }
 
-    /// P2 (G3): 8/16비트 연산에서 **레지스터** 피연산자만 폭으로 마스크해 지정
+    /// P2 (G3): 8/16/32비트 연산에서 **레지스터** 피연산자만 폭으로 마스크해 지정
     /// temp에 저장한다 (x86은 low-byte/word만 사용). 메모리/즉시 피연산자는 그대로.
     fn mask_reg_operand(
         &mut self,
@@ -216,7 +216,12 @@ impl RiscLifter {
         if width >= 8 {
             return Ok(op);
         }
-        let mask = if width == 1 { 0xFF } else { 0xFFFF };
+        let mask = match width {
+            1 => 0xFF,
+            2 => 0xFFFF,
+            4 => 0xFFFF_FFFF,
+            _ => return Ok(op),
+        };
         if matches!(op, MicroOperand::VReg(_)) {
             self.desynth.emit_and(temp, op, MicroOperand::Imm64(mask));
             Ok(temp)

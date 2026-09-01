@@ -38,9 +38,14 @@ const STATE_CROSS_FAMILY_VOLATILE_PTRS: [(usize, i64); 6] = [
     (11, 0x5048), // R11
 ];
 const STATE_CROSS_FAMILY_FLAGS_PTR: i64 = 0x5050;
+// The child RET restores architectural RSP after the CALL-side arch push.
+// Propagate that value separately: physical RSP belongs to the VM host stack
+// and can never be used as the native-call fallback for guest vreg[4].
+const STATE_CROSS_FAMILY_RSP_PTR: i64 = 0x5058;
 const STATE_CROSS_FAMILY_XMM_PTR_BASE: i64 = 0x5060;
 const STATE_CROSS_FAMILY_ACTIVE: i64 = 0x5098;
-const STATE_CROSS_FAMILY_TRANSIENT_END: i64 = 0x50A0;
+const STATE_CROSS_FAMILY_TAIL_JUMP: i64 = 0x50B8;
+const STATE_CROSS_FAMILY_TRANSIENT_END: i64 = 0x50C0;
 /// Transient build-local descriptor grammar selected by a super-op envelope.
 /// Dispatch clears it before every opcode; an extension entry arms it only
 /// after validating its encrypted grammar tag.
@@ -1402,6 +1407,8 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
             .chain(std::iter::once(STATE_CROSS_FAMILY_CALLEE_STATE))
             .chain(STATE_CROSS_FAMILY_VOLATILE_PTRS.into_iter().map(|(_, off)| off))
             .chain(std::iter::once(STATE_CROSS_FAMILY_FLAGS_PTR))
+            .chain(std::iter::once(STATE_CROSS_FAMILY_RSP_PTR))
+            .chain(std::iter::once(STATE_CROSS_FAMILY_TAIL_JUMP))
             .chain((0..6i64).map(|slot| STATE_CROSS_FAMILY_XMM_PTR_BASE + slot * 8))
         {
             b.push(Instruction::with2(
@@ -1437,6 +1444,76 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
                 )
                 .unwrap(),
             );
+            if let Some(trace_vip) = std::env::var("BTG_TRACE_DYNAMIC_VIP")
+                .ok()
+                .and_then(|raw| {
+                    let raw = raw.trim();
+                    u64::from_str_radix(raw.trim_start_matches("0x"), 16)
+                        .ok()
+                        .or_else(|| raw.parse::<u64>().ok())
+                })
+            {
+                // Canonical/native entries share this common entry path with
+                // cross-family children.  Restrict this diagnostic to a real
+                // routed child so an all-VIP trace does not stop at the OEP.
+                b.push(Instruction::with2(
+                    Code::Cmp_rm64_imm8,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RDX,
+                        STATE_CROSS_FAMILY_ACTIVE,
+                        8,
+                    ),
+                    0,
+                ).unwrap());
+                let not_cross_family = b.br(Code::Je_rel32_64, usize::MAX);
+                let not_target = if trace_vip == u64::MAX {
+                    None
+                } else {
+                    movi(&mut b, Register::RAX, trace_vip);
+                    b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::RBX, Register::RAX).unwrap());
+                    Some(b.br(Code::Jne_rel32_64, usize::MAX))
+                };
+                b.push(Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RCX,
+                    MemoryOperand::with_base_displ_size(Register::RDX, runtime_layout.vregs[1] as i64, 8),
+                ).unwrap());
+                b.push(Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R9,
+                    MemoryOperand::with_base_displ_size(Register::RDX, runtime_layout.vregs[2] as i64, 8),
+                ).unwrap());
+                b.push(Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R10,
+                    MemoryOperand::with_base_displ_size(Register::RDX, runtime_layout.vregs[4] as i64, 8),
+                ).unwrap());
+                b.push(Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R8,
+                    MemoryOperand::with_base_displ_size(Register::RDX, runtime_layout.vregs[0] as i64, 8),
+                ).unwrap());
+                b.push(Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R11,
+                    MemoryOperand::with_base_displ_size(Register::RDX, runtime_layout.vregs[8] as i64, 8),
+                ).unwrap());
+                b.push(Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RBX,
+                    MemoryOperand::with_base_displ_size(Register::RDX, runtime_layout.flags as i64, 8),
+                ).unwrap());
+                b.push(Instruction::with(Code::Ud2));
+                let after_trace = b.len();
+                if let Some((_, target)) = b.branches.iter_mut().find(|(branch, _)| *branch == not_cross_family) {
+                    *target = after_trace;
+                }
+                if let Some(not_target) = not_target {
+                    if let Some((_, target)) = b.branches.iter_mut().find(|(branch, _)| *branch == not_target) {
+                        *target = after_trace;
+                    }
+                }
+            }
             b.push(
                 Instruction::with2(
                     Code::Mov_rm64_imm32,
@@ -1518,6 +1595,54 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
     // dispatch loop
     let dispatch = b.len();
     {
+        if let Some(trace_vip) = std::env::var("BTG_TRACE_DISPATCH_VIP")
+                .ok()
+                .and_then(|raw| {
+                    let raw = raw.trim();
+                    u64::from_str_radix(raw.trim_start_matches("0x"), 16)
+                        .ok()
+                        .or_else(|| raw.parse::<u64>().ok())
+                })
+        {
+                movi(&mut b, Register::RAX, trace_vip);
+                b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::R12, Register::RAX).unwrap());
+                let not_target = b.br(Code::Jne_rel32_64, usize::MAX);
+                b.push(Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RCX,
+                    MemoryOperand::with_base_displ_size(Register::RDX, runtime_layout.vregs[1] as i64, 8),
+                ).unwrap());
+                b.push(Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R9,
+                    MemoryOperand::with_base_displ_size(Register::RDX, runtime_layout.vregs[2] as i64, 8),
+                ).unwrap());
+                b.push(Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R10,
+                    MemoryOperand::with_base_displ_size(Register::RDX, runtime_layout.vregs[4] as i64, 8),
+                ).unwrap());
+                b.push(Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R8,
+                    MemoryOperand::with_base_displ_size(Register::RDX, runtime_layout.vregs[0] as i64, 8),
+                ).unwrap());
+                b.push(Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R11,
+                    MemoryOperand::with_base_displ_size(Register::RDX, runtime_layout.vregs[8] as i64, 8),
+                ).unwrap());
+                b.push(Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RBX,
+                    MemoryOperand::with_base_displ_size(Register::RDX, runtime_layout.flags as i64, 8),
+                ).unwrap());
+                b.push(Instruction::with(Code::Ud2));
+                let after_trace = b.len();
+                if let Some((_, target)) = b.branches.iter_mut().find(|(branch, _)| *branch == not_target) {
+                    *target = after_trace;
+                }
+        }
         b.push(
             Instruction::with2(
                 Code::Mov_rm8_imm8,
@@ -2210,6 +2335,30 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
                 )
                 .unwrap(),
             );
+            b.push(
+                Instruction::with2(
+                    Code::Lea_r64_m,
+                    Register::RAX,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RCX,
+                        route.target_layout.vregs[4] as i64,
+                        8,
+                    ),
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RDX,
+                        STATE_CROSS_FAMILY_RSP_PTR,
+                        8,
+                    ),
+                    Register::RAX,
+                )
+                .unwrap(),
+            );
             for slot in 0..runtime_layout.xmm_slots.min(route.target_layout.xmm_slots) {
                 for lane in [0i64, 8] {
                     let source_off = runtime_layout.xmm as i64 + slot as i64 * 16 + lane;
@@ -2252,6 +2401,23 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
                     MemoryOperand::with_base_displ_size(
                         Register::RCX,
                         STATE_CROSS_FAMILY_ACTIVE,
+                        8,
+                    ),
+                    Register::RAX,
+                )
+                .unwrap(),
+            );
+            movi(
+                &mut b,
+                Register::RAX,
+                u64::from(route.tail_jump_resume_offset.is_some()),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RDX,
+                        STATE_CROSS_FAMILY_TAIL_JUMP,
                         8,
                     ),
                     Register::RAX,
@@ -2446,8 +2612,10 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
                         .unwrap(),
                     );
                 }
-                let park = b.len();
-                b.br(Code::Jmp_rel32_64, park);
+                // Stop under the debugger after publishing the snapshot.  The
+                // old self-loop made non-interactive CDB sessions hang and hid
+                // the exact bridge that first corrupted architectural state.
+                b.push(Instruction::with(Code::Ud2));
                 let trace_continue = b.len();
                 for &mut (_, ref mut target) in b.branches.iter_mut() {
                     if *target == usize::MAX - 0xBC10 {
@@ -2605,6 +2773,21 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
                 .unwrap(),
             );
             b.push(Instruction::with2(Code::Add_rm64_imm8, Register::RAX, 8).unwrap());
+            // Diagnostic-only invariant: a Win64 CALL site has a 16-byte
+            // aligned pre-call RSP.  Trap at the first bridge that observes a
+            // drift, while RDI still names the native target and R12 the source
+            // state. This localizes the producer instead of failing much later
+            // in an aligned ntdll MOVAPS prologue.
+            if std::env::var_os("BTG_ASSERT_GUEST_RSP_ALIGN").is_some() {
+                b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::RAX).unwrap());
+                b.push(Instruction::with2(Code::And_rm64_imm8, Register::R9, 0x0F).unwrap());
+                let aligned = b.br(Code::Je_rel32_64, usize::MAX);
+                b.push(Instruction::with(Code::Ud2));
+                let aligned_at = b.len();
+                if let Some((_, target)) = b.branches.iter_mut().find(|(branch, _)| *branch == aligned) {
+                    *target = aligned_at;
+                }
+            }
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSP, Register::RAX).unwrap());
 
             // 4. Materialize all program GPRs except RSP. R11 carries state_base
@@ -2737,22 +2920,59 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
                 b.push(Instruction::with2(Code::Movq_xmm_rm64, xmm, gpr).unwrap());
             }
 
-            // 5. The target is staged in the architectural return slot. x86 CALL
-            // resolves [rsp-8] using the pre-instruction RSP, then pushes the
-            // generated bridge return address into that same qword.
+            // 5. Invoke the native target without re-reading it from the
+            // architectural return slot.  The previous `call [rsp-8]` scheme
+            // made the bridge depend on the guest-stack slot containing the
+            // staged target at exactly this point.  In vm-oep/native-entry
+            // paths that slot can be rewritten/aliased by the guest stack
+            // machinery, producing a non-canonical target such as
+            // 0xffff45bec7a5ab96 before the call.
+            //
+            // The authoritative target was saved in the private host frame at
+            // +0xA0 before the guest RSP was installed. Recover it through
+            // XMM15 (which carries the host-frame pointer), place it in R11
+            // (volatile under Win64), then perform a normal register-indirect
+            // call. The physical CALL still pushes its return address at
+            // [guest_rsp-8], preserving the intended architectural stack.
+            // XMM15 carries the private host-frame base P-0xC0.  The staged
+            // target was saved at [P-0x20], i.e. [host_frame+0xA0].  Do not
+            // reload XMM15 into RBX and then add 0xA0 to RBX after RBX has been
+            // repurposed elsewhere; that was the source of the non-canonical
+            // call target seen as ffff45be`c7a5ab96.
+            // XMM registers cannot participate in x86-64 effective-address
+            // calculation. Recover the host-frame pointer into a GPR first,
+            // then load the staged target from [host_frame+0xA0].
             b.push(
-                Instruction::with1(
-                    Code::Call_rm64,
-                    MemoryOperand::with_base_displ_size(Register::RSP, -8, 8),
+                Instruction::with2(Code::Movq_rm64_xmm, Register::RBX, Register::XMM15)
+                    .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R11,
+                    MemoryOperand::with_base_displ_size(Register::RBX, 0xA0, 8),
                 )
                 .unwrap(),
             );
+            b.push(Instruction::with1(Code::Call_rm64, Register::R11).unwrap());
 
-            // Return immediately to the isolated host frame before touching any
-            // bridge metadata. XMM15 is Win64-nonvolatile and its original 128-bit
-            // value is restored from the host frame.
-            b.push(Instruction::with2(Code::Movq_rm64_xmm, Register::RBX, Register::XMM15).unwrap());
-            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSP, Register::RBX).unwrap());
+            // Return to the private host frame.
+            // Do not trust RBX across this boundary. Although it is
+            // nonvolatile in Win64, callbacks can re-enter generated/shuffled
+            // code whose physical register contract is the VM ABI. XMM15 is
+            // the dedicated carrier and native-entry gateways preserve it.
+            b.push(
+                Instruction::with2(Code::Movq_rm64_xmm, Register::RBX, Register::XMM15)
+                    .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RSP,
+                    Register::RBX,
+                )
+                .unwrap(),
+            );
 
             // The generated-child path never left the host stack, so skip the
             // XMM15-based guest->host recovery above and converge here with RSP
@@ -2840,6 +3060,26 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
                     *target = integer_result_ready;
                 }
             }
+            // FP_RET_OFF describes only a native ABI boundary.  A generated
+            // cross-family child publishes both integer and FP results in its
+            // own state, and physical XMM0 at HALT is dispatcher scratch.  The
+            // RSP pointer is still armed here and uniquely identifies that
+            // path, so retain the child RAX loaded above and bypass native FP
+            // extraction.  Also consume the hint below: leaving it armed made
+            // an unrelated later call inherit a stale FP-return classification.
+            b.push(
+                Instruction::with2(
+                    Code::Cmp_rm64_imm8,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RBX,
+                        STATE_CROSS_FAMILY_RSP_PTR,
+                        8,
+                    ),
+                    0,
+                )
+                .unwrap(),
+            );
+            b.br(Code::Jne_rel32_64, usize::MAX - 0xBC04);
             b.push(
                 Instruction::with2(
                     Code::Mov_r64_rm64,
@@ -2860,6 +3100,19 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
             b.br(Code::Jmp_rel32_64, usize::MAX - 0xBC02);
             let fp4_ret = b.len();
             b.push(Instruction::with2(Code::Movd_rm32_xmm, Register::EAX, Register::XMM0).unwrap()); // f32 (low 32)
+            let clear_fp_hint = b.len();
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_imm32,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RBX,
+                        state_disp(FP_RET_OFF) as i64,
+                        8,
+                    ),
+                    0,
+                )
+                .unwrap(),
+            );
             let store_r0 = b.len();
             b.push(
                 Instruction::with2(
@@ -2875,16 +3128,80 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
             );
             for &mut (bi, ref mut ti) in b.branches.iter_mut() {
                 if *ti == usize::MAX - 0xBC00 {
-                    *ti = store_r0;
+                    *ti = clear_fp_hint;
                 } else if *ti == usize::MAX - 0xBC01 {
                     *ti = fp4_ret;
                 } else if *ti == usize::MAX - 0xBC02 {
-                    *ti = store_r0;
+                    *ti = clear_fp_hint;
+                } else if *ti == usize::MAX - 0xBC04 {
+                    *ti = clear_fp_hint;
                 }
             }
             // A generated child returns with dispatcher scratch in the physical
             // volatile registers.  Select the child's authoritative guest slot
             // when a route armed one; ordinary native calls retain ABI sync.
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RDI,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RBX,
+                        STATE_CROSS_FAMILY_RSP_PTR,
+                        8,
+                    ),
+                )
+                .unwrap(),
+            );
+            b.push(Instruction::with2(Code::Test_rm64_r64, Register::RDI, Register::RDI).unwrap());
+            let no_child_rsp = b.br(Code::Je_rel32_64, usize::MAX - 0xBF10);
+            b.push(
+                Instruction::with2(
+                    Code::Cmp_rm64_imm8,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RBX,
+                        STATE_CROSS_FAMILY_TAIL_JUMP,
+                        8,
+                    ),
+                    0,
+                )
+                .unwrap(),
+            );
+            let call_child_rsp = b.br(Code::Je_rel32_64, usize::MAX - 0xBF10);
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RAX,
+                    MemoryOperand::with_base(Register::RDI),
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_r64,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RBX,
+                        state_disp(REGS_OFF + 4 * 8) as i64,
+                        8,
+                    ),
+                    Register::RAX,
+                )
+                .unwrap(),
+            );
+            let child_rsp_done = b.len();
+            if let Some((_, target)) = b
+                .branches
+                .iter_mut()
+                .find(|(branch, _)| *branch == no_child_rsp)
+            {
+                *target = child_rsp_done;
+            }
+            if let Some((_, target)) = b
+                .branches
+                .iter_mut()
+                .find(|(branch, _)| *branch == call_child_rsp)
+            {
+                *target = child_rsp_done;
+            }
             for ((index, ptr_off), physical) in STATE_CROSS_FAMILY_VOLATILE_PTRS
                 .into_iter()
                 .zip([
@@ -3066,7 +3383,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
                         Code::Movups_xmmm128_xmm,
                         MemoryOperand::with_base_displ_size(
                             Register::RBX,
-                            (XMM_OFF + (i as i32) * 16) as i64,
+                            state_disp(XMM_OFF + (i as i32) * 16) as i64,
                             16,
                         ),
                         xmm,
@@ -3143,7 +3460,73 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
                 )
                 .unwrap(),
             );
+            // A generated child executed its lifted RET and therefore already
+            // popped the architectural return slot. An ordinary native call
+            // returned through the physical CALL only, so its guest slot still
+            // needs to be consumed here. Keep RSP_PTR armed until this point to
+            // distinguish those two paths and avoid a double +8.
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RDI,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RDX,
+                        STATE_CROSS_FAMILY_RSP_PTR,
+                        8,
+                    ),
+                )
+                .unwrap(),
+            );
+            b.push(Instruction::with2(Code::Test_rm64_r64, Register::RDI, Register::RDI).unwrap());
+            let native_rsp_pop = b.br(Code::Je_rel32_64, usize::MAX - 0xBF11);
+            b.push(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::RDI,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RDX,
+                        STATE_CROSS_FAMILY_TAIL_JUMP,
+                        8,
+                    ),
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_imm32,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RDX,
+                        STATE_CROSS_FAMILY_RSP_PTR,
+                        8,
+                    ),
+                    0,
+                )
+                .unwrap(),
+            );
+            b.push(
+                Instruction::with2(
+                    Code::Mov_rm64_imm32,
+                    MemoryOperand::with_base_displ_size(
+                        Register::RDX,
+                        STATE_CROSS_FAMILY_TAIL_JUMP,
+                        8,
+                    ),
+                    0,
+                )
+                .unwrap(),
+            );
+            b.push(Instruction::with2(Code::Test_rm64_r64, Register::RDI, Register::RDI).unwrap());
+            let rsp_ready_edge = b.br(Code::Jne_rel32_64, usize::MAX - 0xBF12);
+            let native_rsp_pop_at = b.len();
             b.push(Instruction::with2(Code::Add_rm64_imm8, Register::RAX, 8).unwrap());
+            let rsp_ready = b.len();
+            for (branch, target) in &mut b.branches {
+                if *branch == native_rsp_pop {
+                    *target = native_rsp_pop_at;
+                } else if *branch == rsp_ready_edge {
+                    *target = rsp_ready;
+                }
+            }
             b.push(
                 Instruction::with2(
                     Code::Mov_rm64_r64,
@@ -3171,6 +3554,65 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
                 );
             }
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSP, Register::RBX).unwrap());
+
+            // Diagnostic counterpart to BTG_TRACE_NATIVE_BRIDGE: stop after
+            // the selected call has been fully synchronized back into guest
+            // state, before ret_ip lookup can obscure the first bad value.
+            if let Some(trace_n) = std::env::var("BTG_TRACE_NATIVE_RETURN")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|n| *n > 0)
+            {
+                const SNAP: i64 = crate::vm::interp::STATE_CALL_STACK_BUF as i64;
+                b.push(
+                    Instruction::with2(
+                        Code::Cmp_rm64_imm32,
+                        MemoryOperand::with_base_displ_size(Register::RDX, SNAP + 48, 8),
+                        trace_n,
+                    )
+                    .unwrap(),
+                );
+                let trace_continue = b.br(Code::Jne_rel32_64, usize::MAX);
+                for (slot, state_off) in [
+                    (0i64, state_disp(REGS_OFF) as i64),
+                    (1, state_disp(REGS_OFF + 4 * 8) as i64),
+                    (2, state_disp(FLAGS_OFF) as i64),
+                ] {
+                    b.push(
+                        Instruction::with2(
+                            Code::Mov_r64_rm64,
+                            Register::RAX,
+                            MemoryOperand::with_base_displ_size(Register::RDX, state_off, 8),
+                        )
+                        .unwrap(),
+                    );
+                    b.push(
+                        Instruction::with2(
+                            Code::Mov_rm64_r64,
+                            MemoryOperand::with_base_displ_size(Register::RDX, SNAP + slot * 8, 8),
+                            Register::RAX,
+                        )
+                        .unwrap(),
+                    );
+                }
+                b.push(
+                    Instruction::with2(
+                        Code::Mov_rm64_r64,
+                        MemoryOperand::with_base_displ_size(Register::RDX, SNAP + 24, 8),
+                        Register::RBP,
+                    )
+                    .unwrap(),
+                );
+                b.push(Instruction::with(Code::Ud2));
+                let continue_at = b.len();
+                if let Some((_, target)) = b
+                    .branches
+                    .iter_mut()
+                    .find(|(branch, _)| *branch == trace_continue)
+                {
+                    *target = continue_at;
+                }
+            }
 
             // 9. resume at ret_ip (RBP): branch-map lookup -> byte offset.
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::R15).unwrap());
@@ -3378,7 +3820,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
                     xmm,
                     MemoryOperand::with_base_displ_size(
                         Register::RDX,
-                        (XMM_OFF + i as i32 * 16) as i64,
+                        state_disp(XMM_OFF + i as i32 * 16) as i64,
                         16,
                     ),
                 )
@@ -5533,6 +5975,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
             // consume cond byte -> DEC_COND, then dst/src1/src2 + imms.
             b.call(sub_dec_ops_cond);
             b.call(sub_dec_ops);
+            // Arithmetic handlers defer their status result in RSI/RDI.  A
+            // condition consumer must publish that value before reading the
+            // canonical FLAGS slot. VirtualBranch already does this through
+            // sub_eval_cond; Setcc/CMOV previously read stale flags here.
+            emit_materialize_lazy_flags(b);
             // prelude: flags -> R11, regs[1] -> R9, result R10 = 0, cond -> ECX.
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, m(FLAGS_OFF)).unwrap());
             b.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, m(REGS_OFF + 8)).unwrap());

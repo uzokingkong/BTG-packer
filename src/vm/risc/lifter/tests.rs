@@ -1880,6 +1880,20 @@ fn test_lift_packed_no_flag_write() {
 }
 
 #[test]
+fn test_lift_cmp_eax_uses_all_32_bits() {
+    // Regression: mask_reg_operand used 0xFFFF for every width below 64-bit,
+    // so `cmp eax, 0x103` incorrectly treated 0x0001_0103 as equal.
+    let raw = [
+        0x3D, 0x03, 0x01, 0x00, 0x00, // cmp eax, 0x103
+        0xC3,                         // ret
+    ];
+    let mut init = [0u64; 16];
+    init[0] = 0xDEAD_BEEF_0001_0103;
+    let st = run(&raw, 0x140001000, init);
+    assert_eq!(st.flags & 0x40, 0, "cmp r32 must not truncate its register operand to 16 bits");
+}
+
+#[test]
 fn indexed_effective_address_encodes_scale_as_shift_operand() {
     // mov rax, qword ptr [rbx + rcx*8]
     let prog = lift(&[0x48, 0x8B, 0x04, 0xCB], 0x140001000);

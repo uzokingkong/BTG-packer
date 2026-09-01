@@ -88,11 +88,12 @@ pub(super) fn build_commercial_routes(
             };
             let module = materialized.modules.iter().find(|module| module.family == target_family)
                 .ok_or_else(|| anyhow!("complete indirect target RVA {target_rva:#x} has no materialized {:?} module", target_family))?;
-            let entry_vip = *module.ip_map.get(&target_va).ok_or_else(|| {
-                anyhow!(
-                    "complete indirect target RVA {target_rva:#x} has no family-local entry VIP"
-                )
-            })?;
+            // Family ownership is function-wide, while policy exclusions may
+            // keep this particular target block native.  Only an exact local
+            // VIP proves that the destination is VM-owned.
+            let Some(&entry_vip) = module.ip_map.get(&target_va) else {
+                continue;
+            };
             let gateway = if source_family == target_family {
                 GatewayKind::VmEntry
             } else {
@@ -142,9 +143,12 @@ pub(super) fn build_commercial_routes(
                     target_family
                 )
             })?;
-        let entry_vip = *module.ip_map.get(&target_va).ok_or_else(|| {
-            anyhow!("pointer-table target RVA {target_rva:#x} has no family-local entry VIP")
-        })?;
+        // A partially virtualized function can have native pointer-table
+        // targets.  Leave those original addresses as passthrough entries;
+        // absence of an exact VIP is the block-level ownership signal.
+        let Some(&entry_vip) = module.ip_map.get(&target_va) else {
+            continue;
+        };
         let candidate = (function.id, entry_vip as u64, GatewayKind::VmEntry);
         if let Some(existing) = required.get(&OriginalTargetRva(target_rva)) {
             if existing.0 != candidate.0 || existing.1 != candidate.1 {

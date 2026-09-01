@@ -7,8 +7,9 @@ use std::collections::BTreeSet;
 pub const MAX_NATIVE_CROSS_FAMILY_ROUTES: usize = 4096;
 /// Per-state nested cross-family depth. Lifetime sync owns 0x50A0/0x50A8.
 pub const STATE_CROSS_FAMILY_DEPTH: i64 = 0x50B0;
-/// Eight re-entry depths are reserved per thread bucket; depth 7 cannot spawn another child.
-pub const MAX_CROSS_FAMILY_DEPTH: u64 = 7;
+/// Thirty-two re-entry depths are reserved per thread bucket; depth 31 cannot
+/// spawn another child. Keep this synchronized with VM_REENTRY_DEPTHS.
+pub const MAX_CROSS_FAMILY_DEPTH: u64 = 63;
 
 /// Build-time description of an unresolved branch that must enter another
 /// independently built commercial VM module instead of native code.

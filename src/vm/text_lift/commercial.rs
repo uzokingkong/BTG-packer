@@ -1644,6 +1644,18 @@ pub fn lift_program_cfg_commercial_with_model(
         > = HashMap::new();
         let mut ok = true;
         for i in &real {
+            if std::env::var_os("BTG_TRACE_RIP_LEA").is_some()
+                && i.code() == Code::Lea_r64_m
+                && i.is_ip_rel_memory_operand()
+            {
+                eprintln!(
+                    "[BTG_TRACE_RIP_LEA] ip={:#x} next={:#x} target={:#x} dst={:?}",
+                    i.ip(),
+                    i.next_ip(),
+                    i.ip_rel_memory_address(),
+                    i.op0_register()
+                );
+            }
             local_ip.push((i.ip(), lifter.desynth.instrs.len()));
             let is_call = matches!(
                 i.flow_control(),
@@ -1995,7 +2007,7 @@ pub fn lift_program_cfg_commercial_with_model(
                 .any(|bb| *s <= bb.start_va && bb.start_va < *e)
         })
         .collect();
-    let virtualized_function_ids: Vec<u64> = observed_functions
+    let mut virtualized_function_ids: Vec<u64> = observed_functions
         .iter()
         .filter(|(s, e)| {
             blocks.iter().any(|bb| {
@@ -2006,12 +2018,15 @@ pub fn lift_program_cfg_commercial_with_model(
         })
         .map(|(start, _)| *start)
         .collect();
-    let virtualized_functions = virtualized_function_ids.len();
     raw_function_op_ranges.sort_by_key(|range| (range.function_id, range.start_op));
     let mut function_op_ranges: Vec<crate::vm::poly::FunctionOpRange> = Vec::new();
     for range in raw_function_op_ranges {
+        // Policy exclusions can split a function into native and VM-owned
+        // blocks. The VM-owned blocks remain in `program`/`ip_map` and must
+        // retain a family assignment. Filtering by the old whole-function
+        // coverage metric dropped them from commercial materialization.
         if !virtualized_function_ids.contains(&range.function_id) {
-            continue;
+            virtualized_function_ids.push(range.function_id);
         }
         if let Some(last) = function_op_ranges.last_mut() {
             if last.function_id == range.function_id && last.end_op == range.start_op {
@@ -2022,6 +2037,9 @@ pub fn lift_program_cfg_commercial_with_model(
         function_op_ranges.push(range);
     }
     function_op_ranges.sort_by_key(|range| range.start_op);
+    virtualized_function_ids.sort_unstable();
+    virtualized_function_ids.dedup();
+    let virtualized_functions = virtualized_function_ids.len();
     let entry_function_id = observed_functions
         .iter()
         .find(|(start, end)| *start <= entry_point_va && entry_point_va < *end)

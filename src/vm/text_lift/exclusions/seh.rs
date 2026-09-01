@@ -32,7 +32,13 @@ fn seh_ownership_mode(full_seh_virtualize: bool) -> SehOwnershipMode {
             // safety-net behavior must request BTG_SEH_OWNERSHIP=guarded.
             SehOwnershipMode::Full
         }
-        _ => SehOwnershipMode::Full,
+        // The whole-program bridge covers unwind metadata, but a block-level
+        // dispatcher cannot safely enter the middle of a function that relies
+        // on a prologue-created frame local (notably Rust Once cleanup
+        // switch-dispatch frames).  Keep those narrowly identified functions
+        // native by default.  `full` remains available as an explicit
+        // conformance/diagnostic mode.
+        _ => SehOwnershipMode::Guarded,
     }
 }
 
