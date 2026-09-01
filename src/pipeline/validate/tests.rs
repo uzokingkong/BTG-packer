@@ -27,7 +27,8 @@ fn route_gate_fixture() -> (
             gateway: GatewayKind::CrossFamily,
         },
     )]);
-    let bytes = table.to_metadata().unwrap().bytes;
+    let _canonical = table.to_metadata().unwrap().bytes;
+    let bytes = vec![0xa5; 32];
     let sections = vec![SectionInfo {
         name: ".vmroute".into(),
         rva: 0x5000,
@@ -55,7 +56,7 @@ fn route_gate_fixture() -> (
 fn final_route_gate_accepts_enabled_authoritative_inventory() {
     let (bytes, sections, originals, destinations, ranges) = route_gate_fixture();
     validate_route_metadata_inventory(
-        Some(bytes.len()),
+        Some(&bytes),
         &originals,
         &destinations,
         &ranges,
@@ -66,11 +67,12 @@ fn final_route_gate_accepts_enabled_authoritative_inventory() {
 }
 
 #[test]
-fn final_route_gate_rejects_malformed_metadata() {
+fn final_route_gate_rejects_modified_commitment() {
     let (mut bytes, sections, originals, destinations, ranges) = route_gate_fixture();
+    let staged = bytes.clone();
     bytes[0] ^= 0xff;
     let error = validate_route_metadata_inventory(
-        Some(bytes.len()),
+        Some(&staged),
         &originals,
         &destinations,
         &ranges,
@@ -79,7 +81,7 @@ fn final_route_gate_rejects_malformed_metadata() {
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("InvalidMagic"));
+    assert!(error.contains("differs from staged"));
 }
 
 #[test]

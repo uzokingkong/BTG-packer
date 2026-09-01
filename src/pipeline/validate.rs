@@ -130,7 +130,7 @@ fn validate_route_metadata(
     validate_route_metadata_inventory(
         ctx.route_metadata_section_data
             .as_ref()
-            .map(|metadata| metadata.bytes.len()),
+            .map(|metadata| metadata.bytes.as_slice()),
         &ctx.route_required_original_targets,
         &ctx.route_generated_destinations,
         &ctx.route_generated_executable_ranges,
@@ -140,7 +140,7 @@ fn validate_route_metadata(
 }
 
 fn validate_route_metadata_inventory(
-    staged_len: Option<usize>,
+    staged_bytes: Option<&[u8]>,
     required_original_targets: &[crate::vm::route_table::OriginalTargetRva],
     generated_destinations: &[crate::vm::route_metadata::GeneratedRouteDestination],
     generated_executable_ranges: &[crate::vm::route_metadata::RvaSpan],
@@ -148,7 +148,7 @@ fn validate_route_metadata_inventory(
     sections: &[SectionInfo],
 ) -> Result<()> {
     let placed = sections.iter().find(|section| section.name == ".vmroute");
-    if staged_len.is_none() {
+    if staged_bytes.is_none() {
         if placed.is_some()
             || !required_original_targets.is_empty()
             || !generated_destinations.is_empty()
@@ -161,7 +161,8 @@ fn validate_route_metadata_inventory(
     let section =
         placed.ok_or_else(|| anyhow!("staged VM route metadata is absent from final PE"))?;
     let start = section.raw_ptr as usize;
-    let staged_len = staged_len.unwrap_or(0);
+    let staged_bytes = staged_bytes.unwrap_or_default();
+    let staged_len = staged_bytes.len();
     let end = start
         .checked_add(staged_len)
         .ok_or_else(|| anyhow!("VM route metadata raw range overflow"))?;
@@ -174,16 +175,42 @@ fn validate_route_metadata_inventory(
     {
         bail!("VM route metadata authoritative placement inventory is incomplete");
     }
-    crate::vm::route_metadata::validate_placed_route_metadata(
-        &out[start..end],
-        section.characteristics,
-        required_original_targets,
-        generated_destinations,
-        generated_executable_ranges,
-        required_original_targets.len(),
-        staged_len,
-    )
-    .map_err(|error| anyhow!("final VM route metadata validation failed: {error}"))?;
+    if section.characteristics & crate::vm::route_metadata::IMAGE_SCN_MEM_READ == 0
+        || section.characteristics & crate::vm::route_metadata::IMAGE_SCN_MEM_EXECUTE != 0
+        || section.characteristics & crate::vm::route_metadata::IMAGE_SCN_MEM_WRITE != 0
+    {
+        bail!("sealed VM route commitment must be read-only and non-executable");
+    }
+    if out[start..end] != *staged_bytes {
+        bail!("sealed VM route commitment differs from staged bytes");
+    }
+    if staged_len != 32 || staged_bytes.starts_with(b"VMROUTE\0") {
+        bail!("VM route records were not replaced by an opaque commitment");
+    }
+    let required: std::collections::BTreeSet<_> =
+        required_original_targets.iter().copied().collect();
+    let mut destinations = std::collections::BTreeMap::new();
+    for destination in generated_destinations {
+        if !required.contains(&destination.original)
+            || destinations
+                .insert(destination.original, destination.destination_rva)
+                .is_some()
+        {
+            bail!("VM route generated-destination inventory is inconsistent");
+        }
+    }
+    if destinations.len() != required.len() {
+        bail!("VM route generated-destination inventory is incomplete");
+    }
+    for destination_rva in destinations.values() {
+        if !generated_executable_ranges.iter().any(|range| {
+            range.start < range.end
+                && *destination_rva >= range.start
+                && *destination_rva < range.end
+        }) {
+            bail!("VM route generated destination is not executable");
+        }
+    }
     Ok(())
 }
 

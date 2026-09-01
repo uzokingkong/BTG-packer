@@ -1,6 +1,6 @@
 [package]
 name = "btg-packer"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 authors = ["BTG Security Research Team"]
 description = "Bidirectional Trigger Graph (BTG) Binary Protection & Obfuscation Packer"

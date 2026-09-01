@@ -11,6 +11,7 @@ use crate::pipeline::PipelineContext;
 use crate::vm;
 use anyhow::Result;
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 
 mod lift;
 mod route_orchestration;
@@ -48,6 +49,34 @@ fn route_metadata_section(
         characteristics: 0x4000_0040, // INITIALIZED_DATA | READ
         bytes: metadata.bytes,
     })
+}
+
+/// Replace build-time route records with a keyed, one-way commitment before
+/// final PE synthesis. Generated code does not consume `.vmroute`; retaining
+/// the canonical records in the output only disclosed the protected CFG.
+fn seal_route_metadata(
+    section: &mut crate::pe::builder::SectionData,
+    rng: &mut impl RngCore,
+) {
+    let mut key = [0u8; 32];
+    rng.fill_bytes(&mut key);
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for index in 0..key.len() {
+        ipad[index] ^= key[index];
+        opad[index] ^= key[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(b"BTG/VMROUTE/SEALED/V1");
+    inner.update(&section.bytes);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_digest);
+    section.bytes = outer.finalize().to_vec();
+    section.virtual_size = section.bytes.len() as u32;
+    key.fill(0);
 }
 
 fn collect_native_gateway_targets(
@@ -2528,6 +2557,14 @@ pub(crate) fn place_boot_stub(
             "[+] TLS pre-entry ownership: redirected {} callback slot(s) to generated lifecycle gateway RVA {:#X}",
             tls_gateway_slots.len(),
             dispatcher_rva + gateway_off as u32
+        );
+    }
+
+    if let Some(route) = ctx.route_metadata_section_data.as_mut() {
+        seal_route_metadata(route, rng);
+        println!(
+            "[+] Canonical route metadata sealed to an opaque {}-byte commitment",
+            route.bytes.len()
         );
     }
 

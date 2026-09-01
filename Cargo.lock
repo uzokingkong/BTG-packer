@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "btg-packer"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
