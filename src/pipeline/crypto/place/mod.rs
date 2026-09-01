@@ -913,6 +913,26 @@ pub(crate) fn place_boot_stub(
         Some(off)
     };
 
+    // Keep distributed-integrity metadata in the immutable/file-backed prefix.
+    // The large Program-VM state reservation follows it and can therefore be
+    // emitted as a pure zero-fill `.vstate` section with no raw file payload.
+    const MAX_VM_INTEGRITY_DESCRIPTORS: usize = 12;
+    let vm_integrity_table_off = cursor;
+    let vm_integrity_table_capacity = if integrity_effective && vm_multi_family_active {
+        vm::distributed_integrity::SERIALIZED_TABLE_HEADER_SIZE
+            + MAX_VM_INTEGRITY_DESCRIPTORS * vm::distributed_integrity::SERIALIZED_DESCRIPTOR_SIZE
+    } else {
+        0
+    };
+    cursor += vm_integrity_table_capacity;
+    cursor = (cursor + 7) & !7;
+    ctx.vm_integrity_table_rva = if vm_integrity_table_capacity > 0 {
+        dispatcher_rva + vm_integrity_table_off as u32
+    } else {
+        0
+    };
+    ctx.vm_integrity_table_len = 0;
+
     // ── M6 Phase-2: 프로그램 VM을 KSA/PRGA VM 뒤에 배치 (각각 독립 state) ──────
     let vm_prog_off = cursor;
     let (vm_prog_entry_va, vm_prog_state_va, vm_prog_total) = if let Some(m) = &vm_prog_mod {
@@ -948,25 +968,10 @@ pub(crate) fn place_boot_stub(
             0
         };
     cursor = (cursor + 7) & !7; // align 8
-
-    // Reserve a stable in-image ABI for 4 families × code/table/bytecode.
-    // The exact count is written after final M7 bytes have been sealed.
-    const MAX_VM_INTEGRITY_DESCRIPTORS: usize = 12;
-    let vm_integrity_table_off = cursor;
-    let vm_integrity_table_capacity = if integrity_effective && vm_multi_family_active {
-        vm::distributed_integrity::SERIALIZED_TABLE_HEADER_SIZE
-            + MAX_VM_INTEGRITY_DESCRIPTORS * vm::distributed_integrity::SERIALIZED_DESCRIPTOR_SIZE
-    } else {
-        0
-    };
-    cursor += vm_integrity_table_capacity;
-    cursor = (cursor + 7) & !7;
-    ctx.vm_integrity_table_rva = if vm_integrity_table_capacity > 0 {
-        dispatcher_rva + vm_integrity_table_off as u32
-    } else {
-        0
-    };
-    ctx.vm_integrity_table_len = 0;
+    // Everything up to this point is the mutable Program-VM reservation. Boot
+    // seed/tag/descriptor metadata is allocated below and must remain
+    // file-backed even when the state reservation itself is loader zero-fill.
+    let vm_prog_state_reservation_end = cursor;
 
     // ── P4 (전체 SEH 가상화): Program VM 모듈 위치를 ctx에 기록 — build.rs가
     // .pdata 브리지 UNWIND_INFO로 이 영역을 커버해 OS unwinder가 VM 내부 프레임을
@@ -2526,12 +2531,13 @@ pub(crate) fn place_boot_stub(
         );
     }
 
-    // The Program-VM state is written at the very first boot instructions,
-    // before the transient NtProtect window can be opened.  Materialize its
-    // page-aligned tail as a separate RW/NX PE section while preserving every
-    // generated absolute VA.  The split RVA is unchanged; only section
-    // ownership and loader permissions differ.
-    if ctx.mem_harden && vm_prog_state_va > dispatcher_va {
+    // Materialize the page-aligned Program-VM state tail as a separate RW/NX
+    // PE section while preserving every generated absolute VA. Multi-family
+    // state is initialized by the canonical gateway, so its section is pure
+    // loader zero-fill (VirtualSize with no raw file payload). This removes the
+    // lane state/host-stack reservation from disk without an address-indirection
+    // penalty in every VM handler.
+    if (vm_multi_family_active || ctx.mem_harden) && vm_prog_state_va > dispatcher_va {
         let split_off = (vm_prog_state_va - dispatcher_va) as usize;
         if split_off == 0 || split_off >= btg.bytes.len() || split_off & 0xFFF != 0 {
             anyhow::bail!(
@@ -2540,15 +2546,40 @@ pub(crate) fn place_boot_stub(
                 btg.bytes.len()
             );
         }
+        let state_end_off = vm_prog_state_reservation_end;
+        if state_end_off <= split_off || state_end_off > btg.bytes.len() {
+            anyhow::bail!(
+                "invalid Program-VM state extent: state=[0x{:X},0x{:X}) textb_len=0x{:X}",
+                split_off,
+                state_end_off,
+                btg.bytes.len()
+            );
+        }
+        let metadata_bytes = btg.bytes.split_off(state_end_off);
         let state_bytes = btg.bytes.split_off(split_off);
         btg.virtual_size = btg.bytes.len() as u32;
         ctx.mutable_state_section_data = Some(crate::pe::builder::SectionData {
             name: ".vstate".to_string(),
             virtual_address: ctx.dispatcher_rva + split_off as u32,
             virtual_size: state_bytes.len() as u32,
-            characteristics: 0xC000_0040, // INITIALIZED_DATA | READ | WRITE
-            bytes: state_bytes,
+            characteristics: if vm_multi_family_active {
+                0xC000_0080 // UNINITIALIZED_DATA | READ | WRITE
+            } else {
+                0xC000_0040 // INITIALIZED_DATA | READ | WRITE
+            },
+            bytes: if vm_multi_family_active { Vec::new() } else { state_bytes },
         });
+        ctx.mutable_state_metadata_section_data = if metadata_bytes.is_empty() {
+            None
+        } else {
+            Some(crate::pe::builder::SectionData {
+                name: ".vmeta".to_string(),
+                virtual_address: ctx.dispatcher_rva + state_end_off as u32,
+                virtual_size: metadata_bytes.len() as u32,
+                characteristics: 0xC000_0040, // INITIALIZED_DATA | READ | WRITE
+                bytes: metadata_bytes,
+            })
+        };
     }
 
     Ok(())

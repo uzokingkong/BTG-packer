@@ -231,12 +231,21 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
             })
             .unwrap_or(iat_end)
             .max(iat_end);
+        let state_metadata_end = ctx
+            .mutable_state_metadata_section_data
+            .as_ref()
+            .map(|metadata| {
+                metadata.virtual_address
+                    + align_sec(metadata.virtual_size.max(metadata.bytes.len() as u32))
+            })
+            .unwrap_or(state_end)
+            .max(state_end);
         let payload_end = match &ctx.payload_section_data {
             Some(p) => {
-                let p_va = align_sec(state_end);
+                let p_va = align_sec(state_metadata_end);
                 p_va + align_sec(p.virtual_size.max(p.bytes.len() as u32))
             }
-            None => state_end,
+            None => state_metadata_end,
         };
         let route_end = match &ctx.route_metadata_section_data {
             Some(route) => {
@@ -282,9 +291,12 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
         if let Some(state) = &ctx.mutable_state_section_data {
             final_sections.push(state.clone());
         }
+        if let Some(metadata) = &ctx.mutable_state_metadata_section_data {
+            final_sections.push(metadata.clone());
+        }
         if let Some(p) = &ctx.payload_section_data {
             let mut pf = p.clone();
-            pf.virtual_address = align_sec(state_end);
+            pf.virtual_address = align_sec(state_metadata_end);
             final_sections.push(pf);
         }
         if let Some(route) = &ctx.route_metadata_section_data {
@@ -349,6 +361,8 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     let mut multi_builder = multi_builder;
     multi_builder.bootstrap_iat_section = ctx.bootstrap_iat_section_data.clone();
     multi_builder.mutable_state_section = ctx.mutable_state_section_data.clone();
+    multi_builder.mutable_state_metadata_section =
+        ctx.mutable_state_metadata_section_data.clone();
     multi_builder.route_metadata_section = ctx.route_metadata_section_data.clone();
     multi_builder.preserve_aslr_bits = preserve_aslr_bits;
     multi_builder.reloc_section = reloc_section;

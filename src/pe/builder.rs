@@ -68,6 +68,7 @@ pub struct PeMultiSectionBuilder {
     pub payload_section: Option<SectionData>,
     pub bootstrap_iat_section: Option<SectionData>,
     pub mutable_state_section: Option<SectionData>,
+    pub mutable_state_metadata_section: Option<SectionData>,
     pub route_metadata_section: Option<SectionData>,
     pub original_headers_bytes: Vec<u8>,
     /// P0-⑦: relocation-aware 출력 — `.reloc` data directory(idx 5)가 제공되면
@@ -117,6 +118,7 @@ impl PeMultiSectionBuilder {
             payload_section,
             bootstrap_iat_section: None,
             mutable_state_section: None,
+            mutable_state_metadata_section: None,
             route_metadata_section: None,
             original_headers_bytes,
             // P0-⑦: 기본값은 기존 동작(ASLR 스트립) 유지. relocation-aware 경로가
@@ -144,6 +146,7 @@ impl PeMultiSectionBuilder {
             + 1
             + usize::from(self.bootstrap_iat_section.is_some())
             + usize::from(self.mutable_state_section.is_some())
+            + usize::from(self.mutable_state_metadata_section.is_some())
             + usize::from(self.route_metadata_section.is_some())
             + usize::from(self.payload_section.is_some())
             + usize::from(self.reloc_section.is_some())) as u16;
@@ -263,17 +266,30 @@ impl PeMultiSectionBuilder {
             .unwrap_or(after_iat_va)
             .max(after_iat_va);
 
+        let after_state_metadata_va = self
+            .mutable_state_metadata_section
+            .as_ref()
+            .map(|metadata| {
+                metadata.virtual_address
+                    + align_config.align_size(
+                        metadata.virtual_size.max(metadata.bytes.len() as u32),
+                        AlignmentType::Section,
+                    )
+            })
+            .unwrap_or(after_state_va)
+            .max(after_state_va);
+
         // v4: --payload-relocate — 암호화된 코드 페이로드 섹션(.vdata)을 뒤에 배치
         let mut adjusted_payload_section = self.payload_section;
         let payload_end_va = if let Some(ref mut psec) = adjusted_payload_section {
-            let p_va = align_config.align_size(after_state_va, AlignmentType::Section);
+            let p_va = align_config.align_size(after_state_metadata_va, AlignmentType::Section);
             psec.virtual_address = p_va;
             p_va + align_config.align_size(
                 psec.virtual_size.max(psec.bytes.len() as u32),
                 AlignmentType::Section,
             )
         } else {
-            after_state_va
+            after_state_metadata_va
         };
 
         // Canonical route metadata is always placed after other VM data and
@@ -314,6 +330,9 @@ impl PeMultiSectionBuilder {
         all_sections.push(adjusted_btg_section);
         if let Some(state) = self.mutable_state_section {
             all_sections.push(state);
+        }
+        if let Some(metadata) = self.mutable_state_metadata_section {
+            all_sections.push(metadata);
         }
         if let Some(is) = adjusted_bootstrap_iat_section {
             all_sections.push(is);

@@ -126,12 +126,109 @@ fn build_canonical_oep_gateway(
     entry_va: u64,
     state_va: u64,
     layout: &vm::threaded::VmRuntimeLayout,
+    family_count: usize,
+    invocation_layout: &MultiFamilyInvocationLayout,
+    lifetime_sync: &crate::vm::data_lifetime::LifetimeSyncTable,
+    entry_byte_offset: u64,
     host_stack_pool_va: u64,
 ) -> anyhow::Result<Vec<u8>> {
     let mut ins = Vec::new();
     let host_stack_top = host_stack_pool_va
         .checked_add(VM_HOST_STACK_SIZE as u64)
         .ok_or_else(|| anyhow::anyhow!("canonical host-stack VA overflow"))?;
+
+    // `.vstate` is a loader-backed zero-fill section (VirtualSize only). Build
+    // its sparse pointer/descriptor metadata once at canonical process entry.
+    // Keeping this initialization in generated code removes hundreds of MiB of
+    // repeated zero/pointer records from the packed file.
+    for lane in 0..=VM_INVOCATION_LANES {
+        for family in 0..family_count {
+            let lane_delta = lane
+                .checked_mul(invocation_layout.lane_group_stride)
+                .and_then(|value| value.checked_add(family * MULTI_FAMILY_STATE_STRIDE))
+                .ok_or_else(|| anyhow::anyhow!("runtime state initializer offset overflow"))?;
+            let lane_state_va = state_va
+                .checked_add(lane_delta as u64)
+                .ok_or_else(|| anyhow::anyhow!("runtime state initializer VA overflow"))?;
+            let call_stack_va = lane_state_va
+                .checked_add(
+                    (MULTI_FAMILY_STATE_STRIDE - crate::vm::interp::CALL_STACK_SIZE) as u64,
+                )
+                .ok_or_else(|| anyhow::anyhow!("runtime call-stack VA overflow"))?;
+            ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::R11, lane_state_va)?);
+            ins.push(Instruction::with2(
+                Code::Mov_r64_imm64,
+                Register::RAX,
+                lifetime_sync.base_va,
+            )?);
+            ins.push(Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_displ_size(
+                    Register::R11,
+                    crate::vm::data_lifetime::LIFETIME_SYNC_PTR_STATE_OFFSET as i64,
+                    8,
+                ),
+                Register::RAX,
+            )?);
+            ins.push(Instruction::with2(
+                Code::Mov_rm64_imm32,
+                MemoryOperand::with_base_displ_size(
+                    Register::R11,
+                    crate::vm::data_lifetime::LIFETIME_SYNC_COUNT_STATE_OFFSET as i64,
+                    8,
+                ),
+                lifetime_sync.entries.len() as i32,
+            )?);
+            ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::RAX, call_stack_va)?);
+            ins.push(Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_displ_size(
+                    Register::R11,
+                    crate::vm::interp::STATE_PTR_CALL_STACK as i64,
+                    8,
+                ),
+                Register::RAX,
+            )?);
+        }
+    }
+    for (index, entry) in lifetime_sync.entries.iter().enumerate() {
+        let entry_va = lifetime_sync.base_va
+            + (index * crate::vm::data_lifetime::LIFETIME_SYNC_ENTRY_SIZE) as u64;
+        ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::R11, entry_va)?);
+        ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::RAX, entry.object_va)?);
+        ins.push(Instruction::with2(
+            Code::Mov_rm64_r64,
+            MemoryOperand::with_base_displ_size(Register::R11, 16, 8),
+            Register::RAX,
+        )?);
+        ins.push(Instruction::with2(
+            Code::Mov_rm32_imm32,
+            MemoryOperand::with_base_displ_size(Register::R11, 24, 8),
+            entry.object_len as i32,
+        )?);
+        ins.push(Instruction::with2(
+            Code::Mov_rm32_imm32,
+            MemoryOperand::with_base_displ_size(Register::R11, 28, 8),
+            entry.object_rva as i32,
+        )?);
+        ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::RAX, entry.object_key)?);
+        ins.push(Instruction::with2(
+            Code::Mov_rm64_r64,
+            MemoryOperand::with_base_displ_size(Register::R11, 32, 8),
+            Register::RAX,
+        )?);
+    }
+    ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::R11, state_va)?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_imm64,
+        Register::RAX,
+        entry_byte_offset,
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_rm64_r64,
+        MemoryOperand::with_base_displ_size(Register::R11, 0x5000, 8),
+        Register::RAX,
+    )?);
 
     // The boot stub arrives with physical RSP equal to the architectural OEP
     // stack. Never let dispatcher/helper frames share that address space.
@@ -725,6 +822,10 @@ pub(crate) fn build_multi_family_prog_mod(
             + sized[0].dynamic_state_entry_offset.unwrap_or(0) as u64,
         effective_state_va,
         &entry_runtime_layout,
+        modules.len(),
+        &invocation_layout,
+        &lifetime_sync,
+        entry_byte_offset as u64,
         host_stack_pool_va,
     )?;
     let canonical_gateway_size = sized_canonical_gateway.len();
@@ -895,6 +996,10 @@ pub(crate) fn build_multi_family_prog_mod(
             + built[0].dynamic_state_entry_offset.unwrap_or(0) as u64,
         effective_state_va,
         &entry_runtime_layout,
+        modules.len(),
+        &invocation_layout,
+        &lifetime_sync,
+        entry_byte_offset as u64,
         host_stack_pool_va,
     )?;
     if canonical_gateway.len() != canonical_gateway_size {

@@ -120,6 +120,9 @@ pub struct PipelineContext {
     /// Page-aligned mutable VM state/call-stack tail split from `.textb` for
     /// static W^X: RW and non-executable from the loader's first mapping.
     pub mutable_state_section_data: Option<SectionData>,
+    /// File-backed bootstrap metadata that follows the zero-fill VM state
+    /// reservation at its generated fixed RVA.
+    pub mutable_state_metadata_section_data: Option<SectionData>,
     /// Canonical VM route image. This is immutable runtime metadata and is
     /// emitted in its own read-only, non-executable PE section.
     pub route_metadata_section_data: Option<SectionData>,
@@ -284,6 +287,7 @@ impl PipelineContext {
             payload_section_data: None,
             bootstrap_iat_section_data: None,
             mutable_state_section_data: None,
+            mutable_state_metadata_section_data: None,
             route_metadata_section_data: None,
             route_required_original_targets: Vec::new(),
             route_generated_destinations: Vec::new(),
