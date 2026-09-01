@@ -22,13 +22,13 @@ It combines PE reconstruction, control-flow transformation, x86-64 → RISC lift
 
 The current codebase includes:
 
-- PE32+ parsing and reconstruction, relocations, TLS, load config, resources and x64 unwind metadata;
+- PE32+ parsing and reconstruction, relocations, TLS-directory rewriting, load config, resources and x64 unwind metadata;
 - CFG/function discovery, code-pointer, pointer-table, switch and indirect-target analysis;
 - native basic-block slicing, randomized layout, branch rewriting and RIP-relative repair;
 - x86-64 → internal RISC semantic lifting across arithmetic, control flow, memory, string and selected SIMD operations;
 - function-level VM ownership and measured function/block/instruction coverage;
 - polymorphic Program-VM encoding, build-specific table layouts, rolling-key bytecode and native threaded execution;
-- multi-family VM planning and canonical cross-family routing;
+- multi-family VM planning and canonical cross-family routing, with final route records replaced by an opaque keyed commitment;
 - VM/native bridge and generated unwind/lifetime metadata;
 - ChaCha20 and BTG-C1 crypto paths, integrity, payload relocation and resource registration;
 - IAT hiding, anti-debugging, W^X-oriented memory hardening and dispatcher re-encryption;
@@ -74,16 +74,18 @@ The repository includes a pinned Rust toolchain configuration.
 cargo build --release
 ```
 
+Prebuilt Windows x86-64 packages are available from the [latest GitHub release](https://github.com/uzokingkong/BTG-packer/releases/latest). The standalone executable and ZIP are accompanied by a SHA-256 checksum file.
+
 Basic packing:
 
 ```powershell
-cargo run --release -- --input app.exe --output app.protected.exe
+.\target\release\btg-packer.exe --input .\app.exe --output .\app.protected.exe
 ```
 
 Deterministic build:
 
 ```powershell
-cargo run --release -- --input app.exe --output app.protected.exe --seed 31010
+.\target\release\btg-packer.exe --input .\app.exe --output .\app.protected.exe --seed 31010
 ```
 
 ## Common profiles
@@ -91,28 +93,78 @@ cargo run --release -- --input app.exe --output app.protected.exe --seed 31010
 Native protection example:
 
 ```powershell
-cargo run --release -- \
-  --input app.exe \
-  --output app.protected.exe \
+.\target\release\btg-packer.exe `
+  --input .\app.exe `
+  --output .\app.protected.exe `
   -l 3 --integrity --iat-hide --mem-harden
 ```
 
-Full preset:
+Full native preset (not whole-program virtualization):
 
 ```powershell
-cargo run --release -- --input app.exe --output app.protected.exe --full
+.\target\release\btg-packer.exe --input .\app.exe --output .\app.protected.exe --full
 ```
 
-Commercial Program-VM path:
+### Strict whole-program commercial virtualization
 
 ```powershell
-cargo run --release -- \
-  --input app.exe \
-  --output app.protected.exe \
-  --vm --vm-oep --vm-commercial
+.\target\release\btg-packer.exe `
+  --input .\app.exe `
+  --output .\app.virtualized.exe `
+  --vm `
+  --vm-oep `
+  --vm-commercial `
+  --m7 `
+  --m8 `
+  --iat-hide `
+  --integrity `
+  --payload-relocate `
+  --rsrc-register `
+  --mem-harden `
+  --crypto-mode chacha20 `
+  --crypto-coverage 100 `
+  --obf-level 3 `
+  --anti-debug `
+  --anti-debug-policy trap `
+  --strict-profile `
+  --verify-output `
+  --verify-timeout-secs 60 `
+  --seed 31010
 ```
 
-The commercial path normally requires measured full VM coverage. `--allow-partial-vm` is a development-only escape hatch and conflicts with `--strict-profile`.
+This is the recommended command when "fully virtualized" means that the measured function, basic-block and instruction coverage must all be 100%. It also requires zero unresolved internal edges, unsupported instructions and capability mismatches. The command fails instead of silently producing a partially virtualized commercial image when any gate is not satisfied.
+
+Important profile rules:
+
+- `--vm-oep` implies the Program-VM entry path; `--vm` is included explicitly because `--vm-commercial` documents that combination.
+- Do not add `--full` to this strict command. `--full` requests native dispatcher re-encryption, while `--vm-oep` must disable that feature; `--strict-profile` correctly rejects the resulting downgrade.
+- `--mem-harden` is compatible with `--vm-oep` because generated code, zero-filled mutable `.vstate`, and file-backed `.vmeta` are separated.
+- `--m7` is effective on the commercial `--vm --vm-oep --vm-commercial` path. It is not supported for the selective `--vm` path without commercial Program-VM.
+- `--rsrc-register` requires `--payload-relocate`.
+- `--verify-output` compares exit code, stdout and stderr byte-for-byte. Remove it only when the target cannot run non-interactively during the build.
+
+Coverage-only diagnosis before packing:
+
+```powershell
+.\target\release\btg-packer.exe `
+  --input .\app.exe `
+  --text-vm-oep
+```
+
+Development-only partial commercial build:
+
+```powershell
+.\target\release\btg-packer.exe `
+  --input .\app.exe `
+  --output .\app.partial.exe `
+  --vm --vm-oep --vm-commercial `
+  --m8 --integrity `
+  --crypto-mode chacha20 `
+  --allow-partial-vm `
+  --seed 31010
+```
+
+`--allow-partial-vm` is an explicit development escape hatch. It cannot be combined with `--strict-profile`, and its output must not be described as fully virtualized. Read the emitted `.btgmanifest` and `.ownership.csv` for the exact ownership and coverage results; do not distribute those diagnostic files with a protected binary.
 
 ## Useful diagnostics
 
@@ -154,6 +206,8 @@ Lower-level public modules expose analysis, PE, pipeline, crypto, SDK and VM com
 ## Project status
 
 BTG is actively evolving as a research codebase. The implementation intentionally fails or reports incomplete coverage when a requested transformation cannot be represented safely instead of treating the presence of generated protection code as proof of complete protection.
+
+Known compatibility boundary: the commercial pre-entry TLS lifecycle gateway currently preserves loader safety with an attach-neutral generated stub; it does not yet virtualize arbitrary original TLS callback bodies. A target that depends on custom TLS callback side effects is therefore not currently eligible for a claim of complete behavioral virtualization, even if ordinary OEP coverage reaches 100%.
 
 Bug reports and contributions are welcome.
 

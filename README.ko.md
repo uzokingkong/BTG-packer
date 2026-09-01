@@ -12,13 +12,13 @@ BTG Packer는 Windows x86-64 PE32+ 실행 파일을 분석하고 변환하는 �
 
 ## 현재 구현 영역
 
-- PE32+ 파싱/재구성, relocation, TLS, load config, resource, x64 unwind 처리
+- PE32+ 파싱/재구성, relocation, TLS directory 재작성, load config, resource, x64 unwind 처리
 - 함수/CFG, code pointer, pointer table, switch, indirect target 분석
 - native basic-block slicing, layout shuffle, branch/RIP-relative fixup
 - arithmetic/control-flow/memory/string/일부 SIMD를 포함한 x86-64 → RISC semantic lifting
 - 함수 단위 VM ownership과 function/block/instruction coverage 측정
 - polymorphic Program-VM, build별 table layout, rolling-key bytecode, native threaded runtime
-- multi-family VM 계획과 cross-family route/state 전환
+- multi-family VM 계획과 cross-family route/state 전환, 최종 route record의 keyed commitment 치환
 - VM/native bridge와 generated unwind/lifetime metadata
 - ChaCha20 / BTG-C1, integrity, payload relocation, resource registration
 - IAT hiding, anti-debug, W^X memory hardening, dispatcher re-encryption
@@ -62,16 +62,18 @@ Program-VM 경로는 단순한 `x86 opcode → 고정 VM opcode` 변환기가 �
 cargo build --release
 ```
 
+미리 빌드된 Windows x86-64 패키지는 [최신 GitHub 릴리스](https://github.com/uzokingkong/BTG-packer/releases/latest)에서 받을 수 있습니다. 단독 EXE와 ZIP, SHA-256 checksum 파일을 함께 제공합니다.
+
 기본 사용:
 
 ```powershell
-cargo run --release -- --input app.exe --output app.protected.exe
+.\target\release\btg-packer.exe --input .\app.exe --output .\app.protected.exe
 ```
 
 동일한 변환 결정을 재현하려면:
 
 ```powershell
-cargo run --release -- --input app.exe --output app.protected.exe --seed 31010
+.\target\release\btg-packer.exe --input .\app.exe --output .\app.protected.exe --seed 31010
 ```
 
 ## 자주 사용하는 프로필
@@ -79,28 +81,78 @@ cargo run --release -- --input app.exe --output app.protected.exe --seed 31010
 Native 보호 예시:
 
 ```powershell
-cargo run --release -- \
-  --input app.exe \
-  --output app.protected.exe \
+.\target\release\btg-packer.exe `
+  --input .\app.exe `
+  --output .\app.protected.exe `
   -l 3 --integrity --iat-hide --mem-harden
 ```
 
-Full preset:
+Full native preset (전체 프로그램 가상화가 아님):
 
 ```powershell
-cargo run --release -- --input app.exe --output app.protected.exe --full
+.\target\release\btg-packer.exe --input .\app.exe --output .\app.protected.exe --full
 ```
 
-Commercial Program-VM:
+### 엄격한 전체 프로그램 Commercial 가상화
 
 ```powershell
-cargo run --release -- \
-  --input app.exe \
-  --output app.protected.exe \
-  --vm --vm-oep --vm-commercial
+.\target\release\btg-packer.exe `
+  --input .\app.exe `
+  --output .\app.virtualized.exe `
+  --vm `
+  --vm-oep `
+  --vm-commercial `
+  --m7 `
+  --m8 `
+  --iat-hide `
+  --integrity `
+  --payload-relocate `
+  --rsrc-register `
+  --mem-harden `
+  --crypto-mode chacha20 `
+  --crypto-coverage 100 `
+  --obf-level 3 `
+  --anti-debug `
+  --anti-debug-policy trap `
+  --strict-profile `
+  --verify-output `
+  --verify-timeout-secs 60 `
+  --seed 31010
 ```
 
-Commercial 경로는 기본적으로 측정된 VM coverage 정책을 통과해야 합니다. 개발 중 부분 coverage를 허용하려면 `--allow-partial-vm`을 명시할 수 있으며 `--strict-profile`과는 함께 사용할 수 없습니다.
+여기서 "전체 가상화"는 측정된 function/basic-block/instruction coverage가 모두 100%라는 뜻입니다. unresolved internal edge, unsupported instruction, capability mismatch도 모두 0이어야 합니다. 조건을 만족하지 못하면 부분 가상화 결과를 성공으로 포장하지 않고 명령 자체가 실패합니다.
+
+프로필 적용 시 주의할 점:
+
+- `--vm-oep`는 Program-VM 진입 경로를 활성화합니다. `--vm-commercial`의 문서화된 조합을 명확히 보여주기 위해 `--vm`도 함께 적었습니다.
+- 이 엄격한 명령에 `--full`을 추가하지 마세요. `--full`은 native dispatcher re-encryption을 요청하지만 `--vm-oep`는 이를 비활성화해야 하므로, `--strict-profile`이 downgrade로 판단해 실패합니다.
+- `--mem-harden`은 generated code, zero-fill `.vstate`, file-backed `.vmeta`가 분리된 `--vm-oep` 경로와 함께 사용할 수 있습니다.
+- `--m7`은 commercial `--vm --vm-oep --vm-commercial` 조합에서 유효합니다. Commercial Program-VM이 없는 selective `--vm` 경로에서는 지원되지 않습니다.
+- `--rsrc-register`는 `--payload-relocate`가 필요합니다.
+- `--verify-output`은 exit code/stdout/stderr를 byte 단위로 비교합니다. 빌드 중 비대화형 실행이 불가능한 타깃에서만 제거하세요.
+
+패킹 전 coverage 진단:
+
+```powershell
+.\target\release\btg-packer.exe `
+  --input .\app.exe `
+  --text-vm-oep
+```
+
+개발 전용 부분 coverage 빌드:
+
+```powershell
+.\target\release\btg-packer.exe `
+  --input .\app.exe `
+  --output .\app.partial.exe `
+  --vm --vm-oep --vm-commercial `
+  --m8 --integrity `
+  --crypto-mode chacha20 `
+  --allow-partial-vm `
+  --seed 31010
+```
+
+`--allow-partial-vm`은 개발용 명시적 escape hatch이며 `--strict-profile`과 같이 사용할 수 없습니다. 이 결과를 전체 가상화라고 표현해서는 안 됩니다. 정확한 ownership/coverage는 생성된 `.btgmanifest`와 `.ownership.csv`에서 확인하고, 해당 진단 파일은 보호된 바이너리와 함께 배포하지 마세요.
 
 ## 주요 진단 옵션
 
@@ -140,6 +192,8 @@ let protected: Vec<u8> = btg_packer::pack(&input_pe_bytes)?;
 ## 상태
 
 BTG는 계속 개발 중인 연구 프로젝트입니다. 요청한 변환을 안전하게 표현하지 못하는 경우 단순히 보호 코드가 생성되었다는 이유로 성공 처리하기보다 coverage/validation 단계에서 불완전 상태를 드러내는 방향을 사용합니다.
+
+현재 호환성 경계: commercial pre-entry TLS lifecycle gateway는 loader 안전성을 위해 attach-neutral generated stub을 사용하며, 임의의 원본 TLS callback body를 아직 가상화하지 않습니다. 따라서 custom TLS callback side effect에 의존하는 타깃은 일반 OEP coverage가 100%여도 완전한 동작 가상화를 달성했다고 볼 수 없습니다.
 
 버그 리포트와 기여는 언제든 환영합니다.
 
