@@ -629,123 +629,123 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
             // the live crypto state whenever a debugger was attached, producing
             // a later 0xC0000005 that looked like a payload/layout fault.
             if stub.anti_debug {
-            // ── v7 Phase 0.1: 환경 인증 게이트 (정적 에뮬레이터/디버거 차단) ────────
-            // PEB 3검(BeingDebugged/NtGlobalFlag/Heap.Flags) + RDTSC 타이밍.
-            // 실패 시 **시드를 XOR 변조**해 체인 복호화를 쓰레기로 유도 — "깨끗한 감지"
-            // 대신 자연스러운 오류로 동작(fail-deceptive). 정적 에뮬레이터는 gs:[0x60]
-            // PEB 컨텍스트가 없어 이 검사에서 실패한다.
-            seq.push((
-                Instruction::with2(
-                    Code::Mov_r64_rm64,
-                    Register::RAX,
-                    MemoryOperand::with_base_displ_bcst_seg(
-                        Register::None,
-                        0x60,
-                        false,
-                        Register::GS,
-                    ),
-                )
-                .unwrap(),
-                None,
-            )); // PEB
-            seq.push((
-                Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(),
-                Some(Label::AttestFail),
-            ));
-            seq.push((
-                Instruction::with2(
-                    Code::Movzx_r32_rm8,
-                    Register::EAX,
-                    MemoryOperand::with_base_displ(Register::RAX, 2),
-                )
-                .unwrap(),
-                None,
-            )); // BeingDebugged
-            seq.push((
-                Instruction::with2(Code::Test_rm32_r32, Register::EAX, Register::EAX).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
-                Some(Label::AttestFail),
-            ));
-            // NtGlobalFlag describes configured instrumentation and can remain
-            // set without an attached debugger. BeingDebugged above is the
-            // stable loader-owned presence signal.
-            // ProcessHeap internals are not a stable anti-debug ABI (segment
-            // heap in particular does not provide legacy Flags at +0x70).
-            // BeingDebugged and NtGlobalFlag above remain the loader-stable
-            // probes; omit the heap-layout-dependent false-positive source.
-            // 타이밍: 10만회 루프가 너무 빠르면(에뮬/튜닝) 실패
-            seq.push((Instruction::with(Code::Rdtsc), None));
-            seq.push((
-                Instruction::with2(Code::Mov_r32_rm32, Register::ESI, Register::EAX).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 0x186A0).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with1(Code::Dec_rm32, Register::ECX).unwrap(),
-                Some(Label::AttestTiming),
-            ));
-            seq.push((
-                Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
-                Some(Label::AttestTiming),
-            ));
-            seq.push((Instruction::with(Code::Rdtsc), None));
-            seq.push((
-                Instruction::with2(Code::Sub_rm32_r32, Register::EAX, Register::ESI).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 5000).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(),
-                Some(Label::AttestFail),
-            ));
-            seq.push((
-                Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap(),
-                Some(Label::AttestOk),
-            ));
-            // AttestFail: 시드 256B를 0x5A로 XOR → 체인 anchor 파괴
-            seq.push((
-                Instruction::with2(Code::Mov_r64_imm64, Register::RDI, stub.seed_va).unwrap(),
-                Some(Label::AttestFail),
-            ));
-            seq.push((
-                Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 0x100).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with2(
-                    Code::Xor_rm8_imm8,
-                    MemoryOperand::with_base(Register::RDI),
-                    0x5Au32,
-                )
-                .unwrap(),
-                Some(Label::AttestMutLoop),
-            ));
-            seq.push((
-                Instruction::with1(Code::Inc_rm64, Register::RDI).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with1(Code::Dec_rm32, Register::ECX).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
-                Some(Label::AttestMutLoop),
-            ));
-            seq.push((Instruction::with(Code::Nopd), Some(Label::AttestOk)));
+                // ── v7 Phase 0.1: 환경 인증 게이트 (정적 에뮬레이터/디버거 차단) ────────
+                // PEB 3검(BeingDebugged/NtGlobalFlag/Heap.Flags) + RDTSC 타이밍.
+                // 실패 시 **시드를 XOR 변조**해 체인 복호화를 쓰레기로 유도 — "깨끗한 감지"
+                // 대신 자연스러운 오류로 동작(fail-deceptive). 정적 에뮬레이터는 gs:[0x60]
+                // PEB 컨텍스트가 없어 이 검사에서 실패한다.
+                seq.push((
+                    Instruction::with2(
+                        Code::Mov_r64_rm64,
+                        Register::RAX,
+                        MemoryOperand::with_base_displ_bcst_seg(
+                            Register::None,
+                            0x60,
+                            false,
+                            Register::GS,
+                        ),
+                    )
+                    .unwrap(),
+                    None,
+                )); // PEB
+                seq.push((
+                    Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(),
+                    Some(Label::AttestFail),
+                ));
+                seq.push((
+                    Instruction::with2(
+                        Code::Movzx_r32_rm8,
+                        Register::EAX,
+                        MemoryOperand::with_base_displ(Register::RAX, 2),
+                    )
+                    .unwrap(),
+                    None,
+                )); // BeingDebugged
+                seq.push((
+                    Instruction::with2(Code::Test_rm32_r32, Register::EAX, Register::EAX).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
+                    Some(Label::AttestFail),
+                ));
+                // NtGlobalFlag describes configured instrumentation and can remain
+                // set without an attached debugger. BeingDebugged above is the
+                // stable loader-owned presence signal.
+                // ProcessHeap internals are not a stable anti-debug ABI (segment
+                // heap in particular does not provide legacy Flags at +0x70).
+                // BeingDebugged and NtGlobalFlag above remain the loader-stable
+                // probes; omit the heap-layout-dependent false-positive source.
+                // 타이밍: 10만회 루프가 너무 빠르면(에뮬/튜닝) 실패
+                seq.push((Instruction::with(Code::Rdtsc), None));
+                seq.push((
+                    Instruction::with2(Code::Mov_r32_rm32, Register::ESI, Register::EAX).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 0x186A0).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with1(Code::Dec_rm32, Register::ECX).unwrap(),
+                    Some(Label::AttestTiming),
+                ));
+                seq.push((
+                    Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
+                    Some(Label::AttestTiming),
+                ));
+                seq.push((Instruction::with(Code::Rdtsc), None));
+                seq.push((
+                    Instruction::with2(Code::Sub_rm32_r32, Register::EAX, Register::ESI).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 5000).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(),
+                    Some(Label::AttestFail),
+                ));
+                seq.push((
+                    Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap(),
+                    Some(Label::AttestOk),
+                ));
+                // AttestFail: 시드 256B를 0x5A로 XOR → 체인 anchor 파괴
+                seq.push((
+                    Instruction::with2(Code::Mov_r64_imm64, Register::RDI, stub.seed_va).unwrap(),
+                    Some(Label::AttestFail),
+                ));
+                seq.push((
+                    Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 0x100).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with2(
+                        Code::Xor_rm8_imm8,
+                        MemoryOperand::with_base(Register::RDI),
+                        0x5Au32,
+                    )
+                    .unwrap(),
+                    Some(Label::AttestMutLoop),
+                ));
+                seq.push((
+                    Instruction::with1(Code::Inc_rm64, Register::RDI).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with1(Code::Dec_rm32, Register::ECX).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
+                    Some(Label::AttestMutLoop),
+                ));
+                seq.push((Instruction::with(Code::Nopd), Some(Label::AttestOk)));
             }
 
             // ── v7 chained-crypto: 코드 영역 256B 청크 순차 복호화 ────────────────
@@ -964,121 +964,121 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
             // chained path above: without --anti-debug it must not mutate the
             // live crypto state merely because the process is being debugged.
             if stub.anti_debug {
-            // v15: 비-chained(재암호화/평문/VM) 경로에도 fail-deceptive 인증 게이트를
-            // 적용한다. chained 경로와 동일한 PEB 3검 + RDTSC 타이밍으로 디버거/에뮬레이터를
-            // 탐지하고, 실패 시 **S-box(스택 프레임, RBX)를 0x5A로 XOR 변조**해 이후 모든
-            // PRGA/문자열/리졸브 복호화를 쓰레기로 만든다. (이 경로는 KSA를 1회만 수행하므로
-            // 시드 대신 이미 생성된 S-box를 깨야 한다.) cdb/에뮬레이터로 실행하면 깨끗한
-            // 감지 대신 자연스러운 오류로 동작(fail-deceptive).
-            seq.push((
-                Instruction::with2(
-                    Code::Mov_r64_rm64,
-                    Register::RAX,
-                    MemoryOperand::with_base_displ_bcst_seg(
-                        Register::None,
-                        0x60,
-                        false,
-                        Register::GS,
-                    ),
-                )
-                .unwrap(),
-                None,
-            )); // PEB
-            seq.push((
-                Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(),
-                Some(Label::AttestFail),
-            ));
-            seq.push((
-                Instruction::with2(
-                    Code::Movzx_r32_rm8,
-                    Register::EAX,
-                    MemoryOperand::with_base_displ(Register::RAX, 2),
-                )
-                .unwrap(),
-                None,
-            )); // BeingDebugged
-            seq.push((
-                Instruction::with2(Code::Test_rm32_r32, Register::EAX, Register::EAX).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
-                Some(Label::AttestFail),
-            ));
-            // Configured GFlags are not an attached-debugger signal.
-            // Do not infer debugger state from undocumented ProcessHeap
-            // offsets. Modern segment heaps make the legacy +0x70 probe an
-            // ordinary-execution false positive.
-            // 타이밍: 10만회 루프가 너무 빠르면(에뮬/튜닝) 실패
-            seq.push((Instruction::with(Code::Rdtsc), None));
-            seq.push((
-                Instruction::with2(Code::Mov_r32_rm32, Register::ESI, Register::EAX).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 0x186A0).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with1(Code::Dec_rm32, Register::ECX).unwrap(),
-                Some(Label::AttestTiming),
-            ));
-            seq.push((
-                Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
-                Some(Label::AttestTiming),
-            ));
-            seq.push((Instruction::with(Code::Rdtsc), None));
-            seq.push((
-                Instruction::with2(Code::Sub_rm32_r32, Register::EAX, Register::ESI).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 5000).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(),
-                Some(Label::AttestFail),
-            ));
-            seq.push((
-                Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap(),
-                Some(Label::AttestOk),
-            ));
-            // AttestFail: S-box(RBX, 256B)를 0x5A로 XOR → 이후 복호화 전부 쓰레기
-            seq.push((
-                Instruction::with2(Code::Mov_r64_rm64, Register::RDI, Register::RBX).unwrap(),
-                Some(Label::AttestFail),
-            ));
-            seq.push((
-                Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 0x100).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with2(
-                    Code::Xor_rm8_imm8,
-                    MemoryOperand::with_base(Register::RDI),
-                    0x5Au32,
-                )
-                .unwrap(),
-                Some(Label::AttestMutLoop),
-            ));
-            seq.push((
-                Instruction::with1(Code::Inc_rm64, Register::RDI).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with1(Code::Dec_rm32, Register::ECX).unwrap(),
-                None,
-            ));
-            seq.push((
-                Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
-                Some(Label::AttestMutLoop),
-            ));
-            seq.push((Instruction::with(Code::Nopd), Some(Label::AttestOk)));
+                // v15: 비-chained(재암호화/평문/VM) 경로에도 fail-deceptive 인증 게이트를
+                // 적용한다. chained 경로와 동일한 PEB 3검 + RDTSC 타이밍으로 디버거/에뮬레이터를
+                // 탐지하고, 실패 시 **S-box(스택 프레임, RBX)를 0x5A로 XOR 변조**해 이후 모든
+                // PRGA/문자열/리졸브 복호화를 쓰레기로 만든다. (이 경로는 KSA를 1회만 수행하므로
+                // 시드 대신 이미 생성된 S-box를 깨야 한다.) cdb/에뮬레이터로 실행하면 깨끗한
+                // 감지 대신 자연스러운 오류로 동작(fail-deceptive).
+                seq.push((
+                    Instruction::with2(
+                        Code::Mov_r64_rm64,
+                        Register::RAX,
+                        MemoryOperand::with_base_displ_bcst_seg(
+                            Register::None,
+                            0x60,
+                            false,
+                            Register::GS,
+                        ),
+                    )
+                    .unwrap(),
+                    None,
+                )); // PEB
+                seq.push((
+                    Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(),
+                    Some(Label::AttestFail),
+                ));
+                seq.push((
+                    Instruction::with2(
+                        Code::Movzx_r32_rm8,
+                        Register::EAX,
+                        MemoryOperand::with_base_displ(Register::RAX, 2),
+                    )
+                    .unwrap(),
+                    None,
+                )); // BeingDebugged
+                seq.push((
+                    Instruction::with2(Code::Test_rm32_r32, Register::EAX, Register::EAX).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
+                    Some(Label::AttestFail),
+                ));
+                // Configured GFlags are not an attached-debugger signal.
+                // Do not infer debugger state from undocumented ProcessHeap
+                // offsets. Modern segment heaps make the legacy +0x70 probe an
+                // ordinary-execution false positive.
+                // 타이밍: 10만회 루프가 너무 빠르면(에뮬/튜닝) 실패
+                seq.push((Instruction::with(Code::Rdtsc), None));
+                seq.push((
+                    Instruction::with2(Code::Mov_r32_rm32, Register::ESI, Register::EAX).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 0x186A0).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with1(Code::Dec_rm32, Register::ECX).unwrap(),
+                    Some(Label::AttestTiming),
+                ));
+                seq.push((
+                    Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
+                    Some(Label::AttestTiming),
+                ));
+                seq.push((Instruction::with(Code::Rdtsc), None));
+                seq.push((
+                    Instruction::with2(Code::Sub_rm32_r32, Register::EAX, Register::ESI).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with2(Code::Cmp_rm32_imm32, Register::EAX, 5000).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(),
+                    Some(Label::AttestFail),
+                ));
+                seq.push((
+                    Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap(),
+                    Some(Label::AttestOk),
+                ));
+                // AttestFail: S-box(RBX, 256B)를 0x5A로 XOR → 이후 복호화 전부 쓰레기
+                seq.push((
+                    Instruction::with2(Code::Mov_r64_rm64, Register::RDI, Register::RBX).unwrap(),
+                    Some(Label::AttestFail),
+                ));
+                seq.push((
+                    Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 0x100).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with2(
+                        Code::Xor_rm8_imm8,
+                        MemoryOperand::with_base(Register::RDI),
+                        0x5Au32,
+                    )
+                    .unwrap(),
+                    Some(Label::AttestMutLoop),
+                ));
+                seq.push((
+                    Instruction::with1(Code::Inc_rm64, Register::RDI).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with1(Code::Dec_rm32, Register::ECX).unwrap(),
+                    None,
+                ));
+                seq.push((
+                    Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
+                    Some(Label::AttestMutLoop),
+                ));
+                seq.push((Instruction::with(Code::Nopd), Some(Label::AttestOk)));
             }
 
             // PRGA i,j 초기화 (canonical RC4: j=0에서 시작) — 복사 블록 이후에 수행해
@@ -1103,7 +1103,8 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
             if !stub.reencrypt {
                 if stub.desc_used {
                     seq.push((
-                        Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.desc_va).unwrap(),
+                        Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.desc_va)
+                            .unwrap(),
                         None,
                     ));
                     seq.push((
@@ -1125,8 +1126,16 @@ pub(crate) fn emit_code_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
                         None,
                     ));
                 } else {
-                    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.code_va).unwrap(), None));
-                    seq.push((Instruction::with2(Code::Mov_r32_imm32, Register::EDX, stub.code_len).unwrap(), None));
+                    seq.push((
+                        Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.code_va)
+                            .unwrap(),
+                        None,
+                    ));
+                    seq.push((
+                        Instruction::with2(Code::Mov_r32_imm32, Register::EDX, stub.code_len)
+                            .unwrap(),
+                        None,
+                    ));
                 }
                 if stub.c1_mode() {
                     emit_c1_call(seq, stub);
@@ -1169,18 +1178,18 @@ pub(crate) fn emit_run_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stub
                     Register::R11,
                     MemoryOperand::with_base_displ(Register::RAX, 0x18),
                 )
-            .unwrap(),
-            None,
-        ));
-    } else {
-        seq.push((
-            Instruction::with2(Code::Mov_r64_imm64, Register::RBP, stub.runs_va).unwrap(),
-            Some(Label::CrcOk),
-        ));
-        seq.push((
-            Instruction::with2(Code::Mov_r32_imm32, Register::R11D, stub.num_runs).unwrap(),
-            None,
-        ));
+                .unwrap(),
+                None,
+            ));
+        } else {
+            seq.push((
+                Instruction::with2(Code::Mov_r64_imm64, Register::RBP, stub.runs_va).unwrap(),
+                Some(Label::CrcOk),
+            ));
+            seq.push((
+                Instruction::with2(Code::Mov_r32_imm32, Register::R11D, stub.num_runs).unwrap(),
+                None,
+            ));
         }
     }
     seq.push((
@@ -1330,8 +1339,7 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
         // ChaCha's key and nonce fields are immutable across apply calls, so
         // retain the authoritative initial state and reset only stream position.
         seq.push((
-            Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.chacha_state_va)
-                .unwrap(),
+            Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.chacha_state_va).unwrap(),
             None,
         ));
         seq.push((
@@ -1353,7 +1361,10 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
             None,
         ));
     } else if stub.vm_oep {
-        debug_assert!(stub.c1_mode(), "VM-OEP rest cipher must be ChaCha20 or experimental C1");
+        debug_assert!(
+            stub.c1_mode(),
+            "VM-OEP rest cipher must be ChaCha20 or experimental C1"
+        );
         emit_c1_init(seq, stub);
     }
     // P5: loop over .text at-rest decrypt run-table (va,len u64 pairs). Fresh
@@ -1709,7 +1720,6 @@ pub(crate) fn emit_dispatcher_entry(
         ));
     }
 }
-
 
 #[cfg(test)]
 mod chacha_bootstub_ctr_tests {

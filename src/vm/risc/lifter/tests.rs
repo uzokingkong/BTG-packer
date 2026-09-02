@@ -463,8 +463,7 @@ fn test_lift_jp_jnp_parity() {
     let raw_jp = [
         0x48, 0x83, 0xF8, 0x03, // cmp rax, 3
         0x7A, 0x01, // jp +1 ??0x140001007
-        0xC3,
-        0x48, 0xC7, 0xC3, 0x07, 0x00, 0x00, 0x00, // mov rbx, 7 (0x140001007)
+        0xC3, 0x48, 0xC7, 0xC3, 0x07, 0x00, 0x00, 0x00, // mov rbx, 7 (0x140001007)
         0xC3,
     ];
     let mut init = [0u64; 16];
@@ -550,7 +549,11 @@ fn test_lift_prologue_epilogue_leave() {
     let st = run(&raw, 0x140001000, init);
     assert_eq!(regs(&st)[0], 5, "rax = 5");
     assert_eq!(regs(&st)[5], 0x200, "rbp restored by leave pop");
-    assert_eq!(regs(&st)[4], 0x1008, "leave restores frame and RET pops return slot");
+    assert_eq!(
+        regs(&st)[4],
+        0x1008,
+        "leave restores frame and RET pops return slot"
+    );
     assert_eq!(st.stack.len(), 0, "push/pop balanced");
 }
 
@@ -659,7 +662,6 @@ fn test_lift_32bit_shift_count_masked_mod32() {
     let st3 = run(&raw_shl_cl, 0x140001000, init2);
     assert_eq!(regs(&st3)[0], 0x8000_0000, "shl eax,cl(32) == shl eax,0");
 }
-
 
 /// MUL r64 ??RDX:RAX = RAX * rm (unsigned). low ??dst(RAX), high ??RDX.
 #[test]
@@ -873,7 +875,11 @@ fn test_lift_ret_imm16() {
     // 0x140001000: ret 8 (C2 08 00)
     let raw = [0xC2, 0x08, 0x00];
     let st = run(&raw, 0x140001000, [0u64; 16]);
-    assert_eq!(regs(&st)[4], 16, "RET 8 pops the return slot and then 8 argument bytes");
+    assert_eq!(
+        regs(&st)[4],
+        16,
+        "RET 8 pops the return slot and then 8 argument bytes"
+    );
 }
 
 /// PUSH r64 / POP r64 ??stack roundtrip.
@@ -896,10 +902,25 @@ fn test_arch_push_pop_tracks_rsp_and_memory() {
     init[0] = 0xCAFE_BABE_D00D_F00D;
     init[4] = 0x1000;
     let st = run(&raw, 0x140001000, init);
-    assert_eq!(regs(&st)[3], 0x0FF8, "PUSH must decrement architectural RSP before the next instruction");
-    assert_eq!(regs(&st)[1], init[0], "POP must reload the value through guest memory");
-    assert_eq!(regs(&st)[4], 0x1008, "POP balances PUSH and top-level RET consumes its return slot");
-    assert_eq!(st.vsp, 0, "ordinary x86 PUSH/POP must not consume the VM continuation stack");
+    assert_eq!(
+        regs(&st)[3],
+        0x0FF8,
+        "PUSH must decrement architectural RSP before the next instruction"
+    );
+    assert_eq!(
+        regs(&st)[1],
+        init[0],
+        "POP must reload the value through guest memory"
+    );
+    assert_eq!(
+        regs(&st)[4],
+        0x1008,
+        "POP balances PUSH and top-level RET consumes its return slot"
+    );
+    assert_eq!(
+        st.vsp, 0,
+        "ordinary x86 PUSH/POP must not consume the VM continuation stack"
+    );
 }
 
 /// CMPXCHG (mem form) ??lift path emits CompareExchange micro-op.
@@ -991,7 +1012,6 @@ fn test_lift_andn() {
     let st = run(&enc.code_buffer, 0x140001000, init);
     assert_eq!(regs(&st)[0], 0xF0, "ANDN = ~rbx & rcx = ~0x0F & 0xFF");
 }
-
 
 fn seed_mem(mem: &mut HashMap<u64, u8>, addr: u64, width: u8, val: u64) {
     for i in 0..width {
@@ -1246,7 +1266,6 @@ fn test_lift_repne_cmpsw_stops_on_match() {
     );
 }
 
-
 /// ADDSD xmm0, xmm1 ??1.5 + 2.25 = 3.75.
 #[test]
 fn test_lift_addsd() {
@@ -1401,7 +1420,6 @@ fn test_lift_movsd_mem_load_store() {
         "loaded back to xmm1"
     );
 }
-
 
 /// BLSR r64 ??x & (x-1) (lowest set bit clear).
 #[test]
@@ -1885,12 +1903,16 @@ fn test_lift_cmp_eax_uses_all_32_bits() {
     // so `cmp eax, 0x103` incorrectly treated 0x0001_0103 as equal.
     let raw = [
         0x3D, 0x03, 0x01, 0x00, 0x00, // cmp eax, 0x103
-        0xC3,                         // ret
+        0xC3, // ret
     ];
     let mut init = [0u64; 16];
     init[0] = 0xDEAD_BEEF_0001_0103;
     let st = run(&raw, 0x140001000, init);
-    assert_eq!(st.flags & 0x40, 0, "cmp r32 must not truncate its register operand to 16 bits");
+    assert_eq!(
+        st.flags & 0x40,
+        0,
+        "cmp r32 must not truncate its register operand to 16 bits"
+    );
 }
 
 #[test]

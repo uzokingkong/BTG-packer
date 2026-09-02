@@ -192,8 +192,9 @@ pub fn resolve(req: &RequestedConfig) -> ResolveOutcome {
     // RX 전환과 배타적. Program-VM bytecode is ciphertext/read-only at runtime
     // and mutable VM state is separately owned, so vm-oep itself is not a
     // reason to suppress the post-bootstrap RX seal (P1-5).
-    let mem_harden = (req.mem_harden || full) && !dispatcher_reencrypt;
-    if (req.mem_harden || full) && dispatcher_reencrypt {
+    let commercial_requested = req.vm_commercial && req.vm_oep && !req.no_crypto;
+    let mem_harden = (req.mem_harden || full || commercial_requested) && !dispatcher_reencrypt;
+    if (req.mem_harden || full || commercial_requested) && dispatcher_reencrypt {
         warnings.push(
             "--dispatcher-reencrypt takes precedence over --mem-harden: runtime per-block decryption needs writable .textb (RX transition skipped)".into(),
         );
@@ -347,7 +348,10 @@ mod tests {
             "crypto on by default -> boot stub needed"
         );
         assert_eq!(c.obf_level, 2);
-        assert!(!c.custom_cipher, "default cipher must not enable experimental C1");
+        assert!(
+            !c.custom_cipher,
+            "default cipher must not enable experimental C1"
+        );
     }
 
     /// --full → 최대 보호 스택 (+ obf 3, boot stub 필요).
@@ -490,6 +494,10 @@ mod tests {
         assert!(o.config.vm_oep);
         assert!(o.config.vm_commercial);
         assert!(
+            o.config.mem_harden,
+            "commercial profile must force post-bootstrap RX sealing"
+        );
+        assert!(
             !o.config.reencrypt,
             "Program-VM M7 must not select native block reencrypt"
         );
@@ -578,7 +586,10 @@ mod tests {
         r.crypto_mode = Some(CryptoModeCli::ChaCha20);
         let o = resolve(&r);
         assert_eq!(o.config.crypto_mode, CryptoMode::ChaCha20);
-        assert!(!o.config.custom_cipher, "ChaCha20 must not enable experimental C1");
+        assert!(
+            !o.config.custom_cipher,
+            "ChaCha20 must not enable experimental C1"
+        );
     }
 
     /// 기본 (플래그 없음) → RFC 8439 ChaCha20-Poly1305 경로.

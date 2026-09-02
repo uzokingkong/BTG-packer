@@ -917,7 +917,10 @@ mod tests {
         let mut b = BytecodeBuilder::new();
         lift_one(&mut b, &inst).unwrap();
         let dis = disassemble(&b.finish());
-        assert!(dis.contains("shr64"), "high byte must be shifted down: {dis}");
+        assert!(
+            dis.contains("shr64"),
+            "high byte must be shifted down: {dis}"
+        );
         assert!(dis.contains("(u8)"), "extracted byte must be stored: {dis}");
     }
 }

@@ -23,9 +23,17 @@ pub struct RollingKeyEngine {
 }
 
 impl RollingKeyEngine {
+    pub fn initial_key(initial_seed: u64) -> u64 {
+        crate::vm::key_domains::derive_u64(
+            initial_seed,
+            crate::vm::key_domains::VmKeyDomain::Rolling,
+            b"stream-0",
+        )
+    }
+
     pub fn new(initial_seed: u64) -> Self {
         Self {
-            current_key: initial_seed.wrapping_mul(0x9E3779B97F4A7C15) ^ 0x517CC1B727220A95,
+            current_key: Self::initial_key(initial_seed),
         }
     }
 

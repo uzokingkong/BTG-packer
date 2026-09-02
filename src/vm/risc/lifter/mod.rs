@@ -290,7 +290,8 @@ impl RiscLifter {
                 .with_dst(MicroOperand::Temp(6))
                 .with_src1(value),
         );
-        self.desynth.emit_sub(rsp, rsp, MicroOperand::Imm64(width as u64));
+        self.desynth
+            .emit_sub(rsp, rsp, MicroOperand::Imm64(width as u64));
         self.desynth.instrs.push(
             MicroInstr::new(RiscOp::MemoryWrite { width })
                 .with_src1(rsp)
@@ -318,7 +319,8 @@ impl RiscLifter {
                 .with_dst(MicroOperand::Temp(6))
                 .with_src1(rsp),
         );
-        self.desynth.emit_add(rsp, rsp, MicroOperand::Imm64(width as u64));
+        self.desynth
+            .emit_add(rsp, rsp, MicroOperand::Imm64(width as u64));
         if width < 8 {
             // For POP SP, upper bits are taken from the already-incremented RSP.
             self.desynth.instrs.push(
@@ -354,7 +356,8 @@ impl RiscLifter {
                 .with_dst(MicroOperand::Temp(6))
                 .with_src1(rsp),
         );
-        self.desynth.emit_add(rsp, rsp, MicroOperand::Imm64(width as u64));
+        self.desynth
+            .emit_add(rsp, rsp, MicroOperand::Imm64(width as u64));
         // Intel POP computes an RSP-based destination EA after the increment.
         let addr = MicroOperand::Temp(4);
         self.lower_effective_address(inst, addr)?;
@@ -383,11 +386,8 @@ impl RiscLifter {
                 .with_dst(MicroOperand::Temp(6))
                 .with_src1(rsp),
         );
-        self.desynth.emit_add(
-            rsp,
-            rsp,
-            MicroOperand::Imm64(width as u64 + extra as u64),
-        );
+        self.desynth
+            .emit_add(rsp, rsp, MicroOperand::Imm64(width as u64 + extra as u64));
         self.desynth
             .instrs
             .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
@@ -579,7 +579,6 @@ impl RiscLifter {
             _ => Err(anyhow!("risc lifter: unsupported operand kind {:?}", kind)),
         }
     }
-
 
     /// Lift an instruction while preserving its guest location and decoded
     /// shape in every error. Encoded bytes are unavailable at this API layer;

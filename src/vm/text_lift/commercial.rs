@@ -1116,9 +1116,7 @@ pub fn lift_program_cfg_commercial_with_model(
                 })
                 .collect()
         })
-        .unwrap_or_else(|| {
-            pdata_function_ranges.clone()
-        });
+        .unwrap_or_else(|| pdata_function_ranges.clone());
     // Leaf/tiny PE images legitimately omit .pdata. Their entry-reachable text
     // is still one canonical original function; treating it as zero functions
     // made full-coverage validation impossible and left the original .text

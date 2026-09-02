@@ -15,8 +15,8 @@ use anyhow::Result;
 // module payload all share this tail reservation.  The 32-depth runtime needs
 // about 0x65D0000 bytes for the current QA image before final trimming.
 pub const BOOT_AREA_RESERVE: usize = 0x12000000;
-                                                //          crypto.rs truncates the section to actual boot_end, so final file size
-                                                //          is unaffected.
+//          crypto.rs truncates the section to actual boot_end, so final file size
+//          is unaffected.
 
 ///
 pub fn run(

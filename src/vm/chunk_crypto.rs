@@ -4,11 +4,10 @@
 //! can therefore decrypt one complete instruction window without exposing an
 //! adjacent chunk or handling a cross-chunk operand fetch.
 
+use crate::vm::key_domains::{derive_u64, VmKeyDomain};
 use crate::vm::seed_lifecycle::derive_seed;
 
 pub const DEFAULT_CHUNK_BYTES: usize = 4096;
-const MODULE_DOMAIN: u64 = 0x4254_472D_5056_4D37; // "BTG-PVM7"
-const CHUNK_DOMAIN: u64 = 0x4348_554E_4B2D_4B31; // "CHUNK-K1"
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ChunkLookupTopology {
@@ -36,11 +35,23 @@ impl ChunkLookupTopology {
 }
 
 pub fn module_key(build_seed: u64) -> u64 {
-    derive_seed(build_seed, MODULE_DOMAIN)
+    derive_u64(build_seed, VmKeyDomain::BytecodeEpoch, b"module")
 }
 
 pub fn chunk_key_from_module(module_key: u64, chunk_index: u64) -> u64 {
-    derive_seed(module_key, CHUNK_DOMAIN ^ chunk_index)
+    derive_u64(
+        module_key,
+        VmKeyDomain::BytecodeEpoch,
+        &chunk_index.to_le_bytes(),
+    )
+}
+
+pub fn ratchet_epoch_key(parent_key: u64, epoch_index: u64) -> u64 {
+    derive_u64(
+        parent_key,
+        VmKeyDomain::BytecodeEpoch,
+        &[b"ratchet/".as_slice(), &epoch_index.to_le_bytes()].concat(),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +81,7 @@ pub fn plan_chunks(
     boundaries.dedup();
 
     let module_key = module_key(build_seed);
+    let mut ratchet_key = module_key;
     let mut chunks = Vec::new();
     let mut start = 0usize;
     while start < bytecode_len {
@@ -88,10 +100,11 @@ pub fn plan_chunks(
                     .unwrap_or(bytecode_len)
             });
         let index = chunks.len() as u64;
+        ratchet_key = ratchet_epoch_key(ratchet_key, index);
         chunks.push(BytecodeChunk {
             offset: start as u32,
             len: (end - start) as u32,
-            key: chunk_key_from_module(module_key, index),
+            key: ratchet_key,
         });
         start = end;
     }
@@ -160,8 +173,10 @@ mod tests {
         let seed = 0x1234_5678_9ABC_DEF0;
         let module = module_key(seed);
         let chunks = plan_chunks(96, &[0, 32, 64], seed, 32);
+        let mut ratchet = module;
         for (index, chunk) in chunks.iter().enumerate() {
-            assert_eq!(chunk.key, chunk_key_from_module(module, index as u64));
+            ratchet = ratchet_epoch_key(ratchet, index as u64);
+            assert_eq!(chunk.key, ratchet);
         }
     }
 

@@ -37,12 +37,7 @@ pub(crate) fn emit_payload_copy(seq: &mut Vec<(Instruction, Option<Label>)>, stu
             // copying back to stub.code_va here would overwrite VM handler code
             // and explains the random instruction stream seen at packed+0x8badc.
             seq.push((
-                Instruction::with2(
-                    Code::Mov_r64_imm64,
-                    Register::R9,
-                    stub.vm_oep_bc_va,
-                )
-                .unwrap(),
+                Instruction::with2(Code::Mov_r64_imm64, Register::R9, stub.vm_oep_bc_va).unwrap(),
                 None,
             ));
         } else {

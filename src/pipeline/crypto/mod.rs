@@ -135,9 +135,7 @@ pub fn run(
     // v63 (--crypto-mode chacha20): chained/reencrypt/--vm/--vm-oep 경로는
     //     RC4/C1 전용 서브루틴·디스패처를 쓰므로 이 조합에서는 chacha를 무시하고
     //     폴백한다 (chacha는 평문 bulk at-rest 경로 전용).
-    let chacha_mode = ctx.crypto_mode == CryptoMode::ChaCha20
-        && !chained_effective
-        && !reencrypt;
+    let chacha_mode = ctx.crypto_mode == CryptoMode::ChaCha20 && !chained_effective && !reencrypt;
     // C1 is reachable only through the explicit experimental selection.
     let c1_mode = ctx.custom_cipher && !chacha_mode;
     if c1_mode {

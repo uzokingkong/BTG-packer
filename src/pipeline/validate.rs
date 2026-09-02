@@ -1161,8 +1161,7 @@ pub(crate) fn validate_function_ownership(ctx: &PipelineContext, out: &[u8]) -> 
         ctx.vm_prog_rva,
         ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total)
     );
-    if !ctx.vm_prog_native_bridges.is_empty()
-        && !ctx.target_info.original_pdata_entries.is_empty()
+    if !ctx.vm_prog_native_bridges.is_empty() && !ctx.target_info.original_pdata_entries.is_empty()
     {
         let handler = ctx.vm_prog_lifetime_cleanup_handler_rva;
         let vm_end = ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total);

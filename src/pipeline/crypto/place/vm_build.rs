@@ -6,7 +6,9 @@
 // else the plain builder. Used by both the sizing pass and the final placement.
 
 use crate::vm;
-use iced_x86::{BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, MemoryOperand, Register};
+use iced_x86::{
+    BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, MemoryOperand, Register,
+};
 use rand::RngCore;
 use std::collections::BTreeMap;
 
@@ -155,7 +157,11 @@ fn build_canonical_oep_gateway(
                     (MULTI_FAMILY_STATE_STRIDE - crate::vm::interp::CALL_STACK_SIZE) as u64,
                 )
                 .ok_or_else(|| anyhow::anyhow!("runtime call-stack VA overflow"))?;
-            ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::R11, lane_state_va)?);
+            ins.push(Instruction::with2(
+                Code::Mov_r64_imm64,
+                Register::R11,
+                lane_state_va,
+            )?);
             ins.push(Instruction::with2(
                 Code::Mov_r64_imm64,
                 Register::RAX,
@@ -179,7 +185,11 @@ fn build_canonical_oep_gateway(
                 ),
                 lifetime_sync.entries.len() as i32,
             )?);
-            ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::RAX, call_stack_va)?);
+            ins.push(Instruction::with2(
+                Code::Mov_r64_imm64,
+                Register::RAX,
+                call_stack_va,
+            )?);
             ins.push(Instruction::with2(
                 Code::Mov_rm64_r64,
                 MemoryOperand::with_base_displ_size(
@@ -194,8 +204,16 @@ fn build_canonical_oep_gateway(
     for (index, entry) in lifetime_sync.entries.iter().enumerate() {
         let entry_va = lifetime_sync.base_va
             + (index * crate::vm::data_lifetime::LIFETIME_SYNC_ENTRY_SIZE) as u64;
-        ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::R11, entry_va)?);
-        ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::RAX, entry.object_va)?);
+        ins.push(Instruction::with2(
+            Code::Mov_r64_imm64,
+            Register::R11,
+            entry_va,
+        )?);
+        ins.push(Instruction::with2(
+            Code::Mov_r64_imm64,
+            Register::RAX,
+            entry.object_va,
+        )?);
         ins.push(Instruction::with2(
             Code::Mov_rm64_r64,
             MemoryOperand::with_base_displ_size(Register::R11, 16, 8),
@@ -211,14 +229,22 @@ fn build_canonical_oep_gateway(
             MemoryOperand::with_base_displ_size(Register::R11, 28, 8),
             entry.object_rva as i32,
         )?);
-        ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::RAX, entry.object_key)?);
+        ins.push(Instruction::with2(
+            Code::Mov_r64_imm64,
+            Register::RAX,
+            entry.object_key,
+        )?);
         ins.push(Instruction::with2(
             Code::Mov_rm64_r64,
             MemoryOperand::with_base_displ_size(Register::R11, 32, 8),
             Register::RAX,
         )?);
     }
-    ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::R11, state_va)?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_imm64,
+        Register::R11,
+        state_va,
+    )?);
     ins.push(Instruction::with2(
         Code::Mov_r64_imm64,
         Register::RAX,
@@ -233,41 +259,69 @@ fn build_canonical_oep_gateway(
     // The boot stub arrives with physical RSP equal to the architectural OEP
     // stack. Never let dispatcher/helper frames share that address space.
     // Slot zero is reserved for the canonical OEP invocation.
-    ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RSP)?);
-    ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::R11, state_va)?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::RAX,
+        Register::RSP,
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_imm64,
+        Register::R11,
+        state_va,
+    )?);
     ins.push(Instruction::with2(
         Code::Mov_rm64_r64,
         MemoryOperand::with_base_displ_size(Register::R11, layout.vregs[4] as i64, 8),
         Register::RAX,
     )?);
-    ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::R11, host_stack_top)?);
-    ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSP, Register::R11)?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_imm64,
+        Register::R11,
+        host_stack_top,
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::RSP,
+        Register::R11,
+    )?);
     // Win64 caller shadow space. H is page/16-byte aligned, so pre-call RSP is
     // 0 mod 16 and the dynamic entry observes the required 8 mod 16.
-    ins.push(Instruction::with2(Code::Sub_rm64_imm8, Register::RSP, 0x20)?);
-    ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::RDX, state_va)?);
+    ins.push(Instruction::with2(
+        Code::Sub_rm64_imm8,
+        Register::RSP,
+        0x20,
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_imm64,
+        Register::RDX,
+        state_va,
+    )?);
     ins.push(Instruction::with_branch(Code::Call_rel32_64, entry_va)?);
 
     // A top-level lifted RET has already consumed the architectural return slot,
     // so vRSP points at the caller's post-return stack. Recover the original
     // native return target from [vRSP-8], restore physical RSP to vRSP, and tail
     // jump without clobbering virtual RAX (the process/thread entry result).
-    ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::R11, state_va)?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_imm64,
+        Register::R11,
+        state_va,
+    )?);
     ins.push(Instruction::with2(
         Code::Mov_r64_rm64,
         Register::R11,
-        MemoryOperand::with_base_displ_size(
-            Register::R11,
-            layout.vregs[4] as i64,
-            8,
-        ),
+        MemoryOperand::with_base_displ_size(Register::R11, layout.vregs[4] as i64, 8),
     )?);
     ins.push(Instruction::with2(
         Code::Mov_r64_rm64,
         Register::R10,
         MemoryOperand::with_base_displ_size(Register::R11, -8, 8),
     )?);
-    ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSP, Register::R11)?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::RSP,
+        Register::R11,
+    )?);
     ins.push(Instruction::with1(Code::Jmp_rm64, Register::R10)?);
 
     Ok(BlockEncoder::encode(
@@ -290,12 +344,30 @@ fn build_native_entry_gateway(
 ) -> anyhow::Result<Vec<u8>> {
     let mut ins = Vec::new();
     ins.push(Instruction::with(Code::Pushfq));
-    for reg in [Register::RAX, Register::RCX, Register::RDX, Register::RBX, Register::RBP,
-        Register::RSI, Register::RDI, Register::R8, Register::R9, Register::R10,
-        Register::R11, Register::R12, Register::R13, Register::R14, Register::R15] {
+    for reg in [
+        Register::RAX,
+        Register::RCX,
+        Register::RDX,
+        Register::RBX,
+        Register::RBP,
+        Register::RSI,
+        Register::RDI,
+        Register::R8,
+        Register::R9,
+        Register::R10,
+        Register::R11,
+        Register::R12,
+        Register::R13,
+        Register::R14,
+        Register::R15,
+    ] {
         ins.push(Instruction::with1(Code::Push_r64, reg)?);
     }
-    ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::R10, state_va)?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_imm64,
+        Register::R10,
+        state_va,
+    )?);
     // Select (thread bucket, recursive depth) with an atomic depth counter.
     // Lane zero is reserved for the canonical OEP invocation.
     let mut read_tid = Instruction::with2(
@@ -305,15 +377,34 @@ fn build_native_entry_gateway(
     )?;
     read_tid.set_segment_prefix(Register::GS);
     ins.push(read_tid);
-    ins.push(Instruction::with2(Code::And_rm32_imm32, Register::EAX, (VM_THREAD_BUCKETS - 1) as i32)?);
-    ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::RBX, lane_control_va)?);
-    ins.push(Instruction::with2(Code::Lea_r64_m, Register::RBX,
-        MemoryOperand::with_base_index_scale(Register::RBX, Register::RAX, 4))?);
+    ins.push(Instruction::with2(
+        Code::And_rm32_imm32,
+        Register::EAX,
+        (VM_THREAD_BUCKETS - 1) as i32,
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_imm64,
+        Register::RBX,
+        lane_control_va,
+    )?);
+    ins.push(Instruction::with2(
+        Code::Lea_r64_m,
+        Register::RBX,
+        MemoryOperand::with_base_index_scale(Register::RBX, Register::RAX, 4),
+    )?);
     ins.push(Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 1)?);
-    let mut xadd = Instruction::with2(Code::Xadd_rm32_r32, MemoryOperand::with_base(Register::RBX), Register::ECX)?;
+    let mut xadd = Instruction::with2(
+        Code::Xadd_rm32_r32,
+        MemoryOperand::with_base(Register::RBX),
+        Register::ECX,
+    )?;
     xadd.set_has_lock_prefix(true);
     ins.push(xadd);
-    ins.push(Instruction::with2(Code::And_rm32_imm32, Register::ECX, (VM_REENTRY_DEPTHS - 1) as i32)?);
+    ins.push(Instruction::with2(
+        Code::And_rm32_imm32,
+        Register::ECX,
+        (VM_REENTRY_DEPTHS - 1) as i32,
+    )?);
     // One thread bucket owns VM_REENTRY_DEPTHS consecutive lanes. Keep this
     // scale derived from the configured power-of-two depth count; the old
     // hard-coded x8 overlapped buckets after depths grew to 32.
@@ -322,7 +413,11 @@ fn build_native_entry_gateway(
         Register::EAX,
         VM_REENTRY_DEPTHS.trailing_zeros() as i32,
     )?);
-    ins.push(Instruction::with2(Code::Add_rm32_r32, Register::EAX, Register::ECX)?);
+    ins.push(Instruction::with2(
+        Code::Add_rm32_r32,
+        Register::EAX,
+        Register::ECX,
+    )?);
     ins.push(Instruction::with2(
         Code::Add_rm32_imm32,
         Register::EAX,
@@ -331,7 +426,11 @@ fn build_native_entry_gateway(
     // EAX now names a lane beyond the canonical OEP depth window. Build its
     // lane-private native
     // stack top in R11 before scaling RAX into the family-state group.
-    ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::R11, Register::RAX)?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::R11,
+        Register::RAX,
+    )?);
     // Slot zero belongs to canonical OEP. Invocation lane N uses host-stack
     // slot N, whose top is pool + (N + 1) * VM_HOST_STACK_SIZE.
     ins.push(Instruction::with1(Code::Inc_rm64, Register::R11)?);
@@ -343,10 +442,27 @@ fn build_native_entry_gateway(
     )?);
     // Absolute pool base: generated images normally live far outside signed
     // imm32 range, so materialize it explicitly instead of `add r11, imm32`.
-    ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::R9, host_stack_pool_va)?);
-    ins.push(Instruction::with2(Code::Add_rm64_r64, Register::R11, Register::R9)?);
-    ins.push(Instruction::with3(Code::Imul_r64_rm64_imm32, Register::RAX, Register::RAX, lane_group_stride as i32)?);
-    ins.push(Instruction::with2(Code::Add_rm64_r64, Register::R10, Register::RAX)?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_imm64,
+        Register::R9,
+        host_stack_pool_va,
+    )?);
+    ins.push(Instruction::with2(
+        Code::Add_rm64_r64,
+        Register::R11,
+        Register::R9,
+    )?);
+    ins.push(Instruction::with3(
+        Code::Imul_r64_rm64_imm32,
+        Register::RAX,
+        Register::RAX,
+        lane_group_stride as i32,
+    )?);
+    ins.push(Instruction::with2(
+        Code::Add_rm64_r64,
+        Register::R10,
+        Register::RAX,
+    )?);
     // Preserve the gateway-selected re-entry depth in the lane state. Internal
     // cross-family calls advance to the next lane and increment this value,
     // preventing cyclic family routes from reusing an ancestor state.
@@ -360,37 +476,82 @@ fn build_native_entry_gateway(
         Register::RCX,
     )?);
     // Saved stack from low to high: r15..rax, rflags; original RSP is +0x80.
-    let saved = [112i64, 104, 96, 88, 128, 80, 72, 64, 56, 48, 40, 32, 24, 16, 8, 0];
+    let saved = [
+        112i64, 104, 96, 88, 128, 80, 72, 64, 56, 48, 40, 32, 24, 16, 8, 0,
+    ];
     for (index, stack_off) in saved.into_iter().enumerate() {
         if index == 4 {
-            ins.push(Instruction::with2(Code::Lea_r64_m, Register::RAX,
-                MemoryOperand::with_base_displ_size(Register::RSP, stack_off, 8))?);
+            ins.push(Instruction::with2(
+                Code::Lea_r64_m,
+                Register::RAX,
+                MemoryOperand::with_base_displ_size(Register::RSP, stack_off, 8),
+            )?);
         } else {
-            ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX,
-                MemoryOperand::with_base_displ_size(Register::RSP, stack_off, 8))?);
+            ins.push(Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base_displ_size(Register::RSP, stack_off, 8),
+            )?);
         }
-        ins.push(Instruction::with2(Code::Mov_rm64_r64,
+        ins.push(Instruction::with2(
+            Code::Mov_rm64_r64,
             MemoryOperand::with_base_displ_size(Register::R10, layout.vregs[index] as i64, 8),
-            Register::RAX)?);
+            Register::RAX,
+        )?);
     }
-    ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX,
-        MemoryOperand::with_base_displ_size(Register::RSP, 120, 8))?);
-    ins.push(Instruction::with2(Code::And_rm64_imm32, Register::RAX, 0xCD5)?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::RAX,
+        MemoryOperand::with_base_displ_size(Register::RSP, 120, 8),
+    )?);
+    ins.push(Instruction::with2(
+        Code::And_rm64_imm32,
+        Register::RAX,
+        0xCD5,
+    )?);
     ins.push(Instruction::with2(Code::Or_rm64_imm8, Register::RAX, 2)?);
-    ins.push(Instruction::with2(Code::Mov_rm64_r64,
-        MemoryOperand::with_base_displ_size(Register::R10, layout.flags as i64, 8), Register::RAX)?);
+    ins.push(Instruction::with2(
+        Code::Mov_rm64_r64,
+        MemoryOperand::with_base_displ_size(Register::R10, layout.flags as i64, 8),
+        Register::RAX,
+    )?);
     for i in 0..layout.xmm_slots.min(6) {
-        let xmm = [Register::XMM0, Register::XMM1, Register::XMM2, Register::XMM3, Register::XMM4, Register::XMM5][i];
-        ins.push(Instruction::with2(Code::Movups_xmmm128_xmm,
-            MemoryOperand::with_base_displ_size(Register::R10, layout.xmm as i64 + i as i64 * 16, 16), xmm)?);
+        let xmm = [
+            Register::XMM0,
+            Register::XMM1,
+            Register::XMM2,
+            Register::XMM3,
+            Register::XMM4,
+            Register::XMM5,
+        ][i];
+        ins.push(Instruction::with2(
+            Code::Movups_xmmm128_xmm,
+            MemoryOperand::with_base_displ_size(
+                Register::R10,
+                layout.xmm as i64 + i as i64 * 16,
+                16,
+            ),
+            xmm,
+        )?);
     }
-    ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::RAX, entry_byte_offset)?);
-    ins.push(Instruction::with2(Code::Mov_rm64_r64,
-        MemoryOperand::with_base_displ_size(Register::R10, 0x5000, 8), Register::RAX)?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_imm64,
+        Register::RAX,
+        entry_byte_offset,
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_rm64_r64,
+        MemoryOperand::with_base_displ_size(Register::R10, 0x5000, 8),
+        Register::RAX,
+    )?);
     // Every external callback is a fresh top-level VM invocation. Reusing the
     // family state must not reuse a previous invocation's virtual return stack
     // or cross-family result plumbing.
-    ins.push(Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::RAX)?);
+    ins.push(Instruction::with2(
+        Code::Xor_rm64_r64,
+        Register::RAX,
+        Register::RAX,
+    )?);
     for off in [
         layout.vsp as i64,
         layout.fp_return as i64,
@@ -419,9 +580,30 @@ fn build_native_entry_gateway(
             Register::RAX,
         )?);
     }
-    for reg in [Register::R15, Register::R14, Register::R13, Register::R12, Register::R11,
-        Register::R10, Register::R9, Register::R8, Register::RDI, Register::RSI,
-        Register::RBP, Register::RBX, Register::RDX, Register::RCX, Register::RAX] {
+    for &(_, off) in &vm::threaded::poly_direct::STATE_CROSS_FAMILY_NONVOLATILE_PTRS {
+        ins.push(Instruction::with2(
+            Code::Mov_rm64_r64,
+            MemoryOperand::with_base_displ_size(Register::R10, off, 8),
+            Register::RAX,
+        )?);
+    }
+    for reg in [
+        Register::R15,
+        Register::R14,
+        Register::R13,
+        Register::R12,
+        Register::R11,
+        Register::R10,
+        Register::R9,
+        Register::R8,
+        Register::RDI,
+        Register::RSI,
+        Register::RBP,
+        Register::RBX,
+        Register::RDX,
+        Register::RCX,
+        Register::RAX,
+    ] {
         if reg == Register::R10 || reg == Register::R11 {
             // R10 carries the selected state and R11 carries the lane-private
             // native stack top.  Their guest values already live in the lane's
@@ -432,21 +614,37 @@ fn build_native_entry_gateway(
         }
     }
     ins.push(Instruction::with(Code::Popfq));
-    ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::RDX, Register::R10)?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::RDX,
+        Register::R10,
+    )?);
 
     // Switch away from the architectural guest stack before entering the VM.
     // The previous implementation called the dynamic entry while physical RSP
     // still equalled the saved guest RSP, so lifted `push/sub rsp/[rsp+off]`
     // operations could overwrite the gateway return address/nonvolatile frame.
     // R11 points at a 16-byte-aligned lane-private stack top in `.vstate`.
-    ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RSP)?);
-    ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSP, Register::R11)?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::RAX,
+        Register::RSP,
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::RSP,
+        Register::R11,
+    )?);
     // Reserve Win64 shadow space, bridge metadata, and 10 x 16 bytes for the
     // nonvolatile XMM6..XMM15 register set.  A native entry gateway is itself a
     // Win64 callee; the Program VM is free to use every physical XMM register,
     // so failing to preserve XMM15 corrupted an enclosing native-call bridge's
     // host-frame carrier during recursive callback entry.
-    ins.push(Instruction::with2(Code::Sub_rm64_imm32, Register::RSP, 0xE0)?);
+    ins.push(Instruction::with2(
+        Code::Sub_rm64_imm32,
+        Register::RSP,
+        0xE0,
+    )?);
     // Persistent host frame: +0x20 guest RSP, +0x28 original RBX,
     // +0x30 depth-counter VA, +0x38 selected architectural state.
     ins.push(Instruction::with2(
@@ -493,8 +691,16 @@ fn build_native_entry_gateway(
     )?;
     read_tid_release.set_segment_prefix(Register::GS);
     ins.push(read_tid_release);
-    ins.push(Instruction::with2(Code::And_rm32_imm32, Register::EAX, (VM_THREAD_BUCKETS - 1) as i32)?);
-    ins.push(Instruction::with2(Code::Mov_r64_imm64, Register::RBX, lane_control_va)?);
+    ins.push(Instruction::with2(
+        Code::And_rm32_imm32,
+        Register::EAX,
+        (VM_THREAD_BUCKETS - 1) as i32,
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_imm64,
+        Register::RBX,
+        lane_control_va,
+    )?);
     ins.push(Instruction::with2(
         Code::Lea_r64_m,
         Register::RBX,
@@ -570,9 +776,18 @@ fn build_native_entry_gateway(
         Register::RBX,
         MemoryOperand::with_base_displ_size(Register::RSP, 0x28, 8),
     )?);
-    ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::RSP, Register::R11)?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::RSP,
+        Register::R11,
+    )?);
     ins.push(Instruction::with(Code::Retnq));
-    Ok(BlockEncoder::encode(64, InstructionBlock::new(&ins, gateway_va), BlockEncoderOptions::NONE)?.code_buffer)
+    Ok(BlockEncoder::encode(
+        64,
+        InstructionBlock::new(&ins, gateway_va),
+        BlockEncoderOptions::NONE,
+    )?
+    .code_buffer)
 }
 
 pub(crate) fn build_multi_family_prog_mod(
@@ -581,7 +796,7 @@ pub(crate) fn build_multi_family_prog_mod(
     entry_va: u64,
     code_va: u64,
     state_va: u64,
-    enable_m7: bool,
+    _enable_m7: bool,
     image_base: u64,
     lifetime_key: u64,
     lifetime_objects: &[crate::vm::data_lifetime::LiteralObject],
@@ -652,16 +867,12 @@ pub(crate) fn build_multi_family_prog_mod(
     let chunk_plans: Vec<Vec<vm::chunk_crypto::BytecodeChunk>> = modules
         .iter()
         .map(|module| {
-            if enable_m7 {
-                vm::chunk_crypto::plan_chunks(
-                    module.bytecode.len(),
-                    &module.instruction_offsets,
-                    module.module_domain,
-                    vm::chunk_crypto::DEFAULT_CHUNK_BYTES,
-                )
-            } else {
-                Vec::new()
-            }
+            vm::chunk_crypto::plan_chunks(
+                module.bytecode.len(),
+                &module.instruction_offsets,
+                module.module_domain,
+                vm::chunk_crypto::DEFAULT_CHUNK_BYTES,
+            )
         })
         .collect();
 
@@ -679,7 +890,9 @@ pub(crate) fn build_multi_family_prog_mod(
     // state anchors within RIP-relative disp32 range as well.
     const SIZING_STATE_BASE: u64 = 0x1000_0000;
 
-    let dummy_routes = |source_family| -> anyhow::Result<Vec<vm::threaded::poly_direct::NativeCrossFamilyRoute>> {
+    let dummy_routes = |source_family| -> anyhow::Result<
+        Vec<vm::threaded::poly_direct::NativeCrossFamilyRoute>,
+    > {
         let source_index = index_by_family[&source_family];
         let source = modules[source_index];
         let mut routes: Vec<_> = materialized
@@ -818,7 +1031,8 @@ pub(crate) fn build_multi_family_prog_mod(
     let entry_runtime_layout = vm::threaded::VmRuntimeLayout::from_seed(entry_module.module_domain);
     let sized_canonical_gateway = build_canonical_oep_gateway(
         effective_code_va + code_total as u64,
-        effective_code_va + code_offsets[0] as u64
+        effective_code_va
+            + code_offsets[0] as u64
             + sized[0].dynamic_state_entry_offset.unwrap_or(0) as u64,
         effective_state_va,
         &entry_runtime_layout,
@@ -837,7 +1051,11 @@ pub(crate) fn build_multi_family_prog_mod(
             .iter()
             .enumerate()
             .find(|(_, module)| module.ip_map.contains_key(&target_va))
-            .ok_or_else(|| anyhow::anyhow!("native gateway target {target_va:#x} has no materialized family entry"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "native gateway target {target_va:#x} has no materialized family entry"
+                )
+            })?;
         let local_op = target.ip_map[&target_va];
         let entry_offset = target.instruction_offsets[local_op] as u64;
         let gateway_off = code_total + canonical_gateway_size + sized_gateway_total;
@@ -890,9 +1108,11 @@ pub(crate) fn build_multi_family_prog_mod(
                 Ok(vm::threaded::poly_direct::NativeCrossFamilyRoute {
                     target_va: route.target_va,
                     source_next_byte_offset: Some(source_next_byte_offset),
-                    target_entry_va: effective_code_va + code_offsets[target_index] as u64
+                    target_entry_va: effective_code_va
+                        + code_offsets[target_index] as u64
                         + sized[target_index].dynamic_state_entry_offset.unwrap_or(0) as u64,
-                    target_state_va: effective_state_va + (target_index * MULTI_FAMILY_STATE_STRIDE) as u64,
+                    target_state_va: effective_state_va
+                        + (target_index * MULTI_FAMILY_STATE_STRIDE) as u64,
                     child_lane_stride: invocation_layout.lane_group_stride as u64,
 
                     target_byte_offset: target.instruction_offsets[route.target_local_op] as u64,
@@ -919,7 +1139,8 @@ pub(crate) fn build_multi_family_prog_mod(
                 routes.push(vm::threaded::poly_direct::NativeCrossFamilyRoute {
                     target_va,
                     source_next_byte_offset: None,
-                    target_entry_va: effective_code_va + code_offsets[target_index] as u64
+                    target_entry_va: effective_code_va
+                        + code_offsets[target_index] as u64
                         + sized[target_index].dynamic_state_entry_offset.unwrap_or(0) as u64,
                     target_state_va: effective_state_va
                         + (target_index * MULTI_FAMILY_STATE_STRIDE) as u64,
@@ -934,7 +1155,8 @@ pub(crate) fn build_multi_family_prog_mod(
             routes.push(vm::threaded::poly_direct::NativeCrossFamilyRoute {
                 target_va: u64::MAX,
                 source_next_byte_offset: None,
-                target_entry_va: effective_code_va + code_offsets[index] as u64
+                target_entry_va: effective_code_va
+                    + code_offsets[index] as u64
                     + sized[index].dynamic_state_entry_offset.unwrap_or(0) as u64,
                 target_state_va: effective_state_va + (index * MULTI_FAMILY_STATE_STRIDE) as u64,
                 child_lane_stride: invocation_layout.lane_group_stride as u64,
@@ -992,7 +1214,8 @@ pub(crate) fn build_multi_family_prog_mod(
     let canonical_entry_gateway_offset = code.len();
     let canonical_gateway = build_canonical_oep_gateway(
         effective_code_va + canonical_entry_gateway_offset as u64,
-        effective_code_va + code_offsets[0] as u64
+        effective_code_va
+            + code_offsets[0] as u64
             + built[0].dynamic_state_entry_offset.unwrap_or(0) as u64,
         effective_state_va,
         &entry_runtime_layout,
@@ -1028,7 +1251,8 @@ pub(crate) fn build_multi_family_prog_mod(
         }
         let bytes = build_native_entry_gateway(
             effective_code_va + gateway_off as u64,
-            effective_code_va + code_offsets[target_index] as u64
+            effective_code_va
+                + code_offsets[target_index] as u64
                 + built[target_index].dynamic_state_entry_offset.unwrap_or(0) as u64,
             effective_state_va + (target_index * MULTI_FAMILY_STATE_STRIDE) as u64,
             target.instruction_offsets[local_op] as u64,
@@ -1041,7 +1265,11 @@ pub(crate) fn build_multi_family_prog_mod(
         native_entry_gateways.insert(target_va, gateway_off);
     }
     if code.len() != full_code_total {
-        return Err(anyhow::anyhow!("native gateway sizing drift: {} != {}", code.len(), full_code_total));
+        return Err(anyhow::anyhow!(
+            "native gateway sizing drift: {} != {}",
+            code.len(),
+            full_code_total
+        ));
     }
     for module in &built {
         table_ranges.push((table.len(), module.table.len()));
@@ -1191,7 +1419,8 @@ mod invocation_layout_tests {
             0x0000_0001_4100_0000,
             iced_x86::DecoderOptions::NONE,
         );
-        let instructions: Vec<_> = std::iter::from_fn(|| decoder.can_decode().then(|| decoder.decode())).collect();
+        let instructions: Vec<_> =
+            std::iter::from_fn(|| decoder.can_decode().then(|| decoder.decode())).collect();
         assert!(instructions.iter().any(|instruction| {
             instruction.code() == Code::Add_rm32_imm32
                 && instruction.op0_register() == Register::EAX
@@ -1207,18 +1436,21 @@ mod invocation_layout_tests {
         let state_va = 0x0000_0001_6000_0000u64;
         let families = 4usize;
         let layout = multi_family_invocation_layout(state_va, families).unwrap();
-        let groups_end = state_va
-            + ((VM_INVOCATION_LANES + 1) * families * MULTI_FAMILY_STATE_STRIDE) as u64;
-        let sync_end = layout.lifetime_sync_va
-            + crate::vm::data_lifetime::LIFETIME_SYNC_TABLE_SIZE as u64;
-        let host_end = layout.host_stack_pool_va
-            + (VM_HOST_STACK_SLOTS * VM_HOST_STACK_SIZE) as u64;
+        let groups_end =
+            state_va + ((VM_INVOCATION_LANES + 1) * families * MULTI_FAMILY_STATE_STRIDE) as u64;
+        let sync_end =
+            layout.lifetime_sync_va + crate::vm::data_lifetime::LIFETIME_SYNC_TABLE_SIZE as u64;
+        let host_end =
+            layout.host_stack_pool_va + (VM_HOST_STACK_SLOTS * VM_HOST_STACK_SIZE) as u64;
         let reserve_end = state_va + layout.reserve_size as u64;
 
         assert!(layout.lane_control_va >= groups_end);
         assert!(layout.lifetime_sync_va >= layout.lane_control_va + VM_LANE_CONTROL_SIZE as u64);
         assert!(layout.host_stack_pool_va >= sync_end);
         assert!(host_end <= reserve_end);
-        assert_eq!(layout.host_stack_pool_va & (VM_STATE_TAIL_ALIGN as u64 - 1), 0);
+        assert_eq!(
+            layout.host_stack_pool_va & (VM_STATE_TAIL_ALIGN as u64 - 1),
+            0
+        );
     }
 }

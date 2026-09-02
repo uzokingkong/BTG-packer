@@ -43,8 +43,7 @@ fn compact_immediates_preserve_rolling_key_in_every_family() {
                 .with_dst(MicroOperand::Temp(4))
                 .with_src1(MicroOperand::Temp(4))
                 .with_src2(MicroOperand::Imm64(u64::MAX - 15)),
-            MicroInstr::new(RiscOp::VirtualPush)
-                .with_src1(MicroOperand::Imm64(0x1400_1ff28)),
+            MicroInstr::new(RiscOp::VirtualPush).with_src1(MicroOperand::Imm64(0x1400_1ff28)),
             MicroInstr::new(RiscOp::VirtualPop).with_dst(MicroOperand::Temp(0)),
             MicroInstr::new(RiscOp::Halt),
         ],
@@ -62,15 +61,14 @@ fn compact_immediates_preserve_rolling_key_in_every_family() {
         let seed = 0xA531_7C29_D40B_1100 ^ ordinal as u64;
         let mut encoder = PolymorphicEncoder::new_for_family(seed, family);
         let bytecode = encoder.encode(&program).unwrap();
-        let state = run_native_poly_direct_for_family(
-            &bytecode,
-            seed,
-            family,
-            &[0; 16],
-            program.ip_map(),
-        )
-        .unwrap();
-        assert_eq!(state.stack.len(), 0, "{family:?} lost stream synchronization");
+        let state =
+            run_native_poly_direct_for_family(&bytecode, seed, family, &[0; 16], program.ip_map())
+                .unwrap();
+        assert_eq!(
+            state.stack.len(),
+            0,
+            "{family:?} lost stream synchronization"
+        );
     }
 }
 
@@ -110,9 +108,8 @@ fn explicit_setflag_barrier_restores_lazy_cmp_flags_across_mov32_lowering() {
         MicroOperand::VReg(3),
         MicroOperand::Imm64(0xFFFF_FFFF),
     );
-    d.instrs.push(
-        MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)),
-    );
+    d.instrs
+        .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
     d.instrs.push(
         MicroInstr::new(RiscOp::VirtualBranch {
             cond: BranchCondition::NotZero,
@@ -133,10 +130,7 @@ fn explicit_setflag_barrier_restores_lazy_cmp_flags_across_mov32_lowering() {
     );
     d.instrs.push(MicroInstr::new(RiscOp::Halt));
 
-    let program = RiscProgram::with_ip_map(
-        d.instrs,
-        HashMap::from([(0x2000, taken_index)]),
-    );
+    let program = RiscProgram::with_ip_map(d.instrs, HashMap::from([(0x2000, taken_index)]));
     let mut init_regs = [0u64; 16];
     init_regs[1] = 1; // internal 32-bit mask path produces ZF=0 if it leaks.
 
@@ -210,10 +204,8 @@ fn explicit_setflag_preserves_direction_flag_in_every_family() {
             expected,
             "{family:?}: native SetFlag dropped DF/ZF",
         );
-
     }
 }
-
 
 #[test]
 fn explicit_setflag_preserves_direction_flag_in_native_runtime() {
@@ -240,16 +232,19 @@ fn explicit_setflag_preserves_direction_flag_in_native_runtime() {
         let seed = 0xDF00_2026_0828_0000 ^ ordinal as u64;
         let mut encoder = PolymorphicEncoder::new_for_family(seed, family);
         let bytecode = encoder.encode(&program).unwrap();
-        let state = run_native_poly_direct_for_family(
-            &bytecode,
-            seed,
-            family,
-            &[0; 16],
-            program.ip_map(),
-        )
-        .unwrap();
-        assert_eq!(state.flags & VFLAG_DF, VFLAG_DF, "{family:?}: SetFlag dropped DF");
-        assert_eq!(state.regs[0] & VFLAG_DF, VFLAG_DF, "{family:?}: Vflags read lost DF");
+        let state =
+            run_native_poly_direct_for_family(&bytecode, seed, family, &[0; 16], program.ip_map())
+                .unwrap();
+        assert_eq!(
+            state.flags & VFLAG_DF,
+            VFLAG_DF,
+            "{family:?}: SetFlag dropped DF"
+        );
+        assert_eq!(
+            state.regs[0] & VFLAG_DF,
+            VFLAG_DF,
+            "{family:?}: Vflags read lost DF"
+        );
     }
 }
 
@@ -281,14 +276,9 @@ fn long_entry_resync_preserves_full_width_vip() {
     let family = VmArchitectureFamily::Register;
     let mut encoder = PolymorphicEncoder::new_for_family(seed, family);
     let bytecode = encoder.encode(&program).unwrap();
-    let state = run_native_poly_direct_for_family(
-        &bytecode,
-        seed,
-        family,
-        &[0; 16],
-        program.ip_map(),
-    )
-    .unwrap();
+    let state =
+        run_native_poly_direct_for_family(&bytecode, seed, family, &[0; 16], program.ip_map())
+            .unwrap();
     assert_eq!(state.regs[0], 0x5A);
 }
 
@@ -405,10 +395,7 @@ fn cross_family_child_call_stays_on_host_stack_while_native_keeps_guest_stack() 
         {
             saw_child_state_load = true;
         }
-        if ins.code() == Code::Call_rm64
-            && ins.memory_base() == Register::RSP
-            && off == 0xC8
-        {
+        if ins.code() == Code::Call_rm64 && ins.memory_base() == Register::RSP && off == 0xC8 {
             saw_child_host_call = true;
         }
         if ins.code() == Code::Mov_rm64_r64
@@ -425,10 +412,22 @@ fn cross_family_child_call_stays_on_host_stack_while_native_keeps_guest_stack() 
         }
     }
 
-    assert!(saw_child_state_load, "cross-family child state is not loaded from the host frame");
-    assert!(saw_child_host_call, "generated child entry still leaves the isolated VM host stack");
-    assert!(guest_stack_installed, "ordinary native calls no longer install the architectural guest stack");
-    assert!(saw_native_guest_call, "ordinary native calls no longer invoke the staged target register");
+    assert!(
+        saw_child_state_load,
+        "cross-family child state is not loaded from the host frame"
+    );
+    assert!(
+        saw_child_host_call,
+        "generated child entry still leaves the isolated VM host stack"
+    );
+    assert!(
+        guest_stack_installed,
+        "ordinary native calls no longer install the architectural guest stack"
+    );
+    assert!(
+        saw_native_guest_call,
+        "ordinary native calls no longer invoke the staged target register"
+    );
 }
 
 #[test]

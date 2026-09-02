@@ -8,6 +8,99 @@ use crate::pipeline::PipelineContext;
 use crate::vm;
 use anyhow::Result;
 
+fn coalesce_cross_family_fallthroughs(
+    plan: &mut vm::poly::ProductionFamilyPlan,
+    ranges: &[vm::poly::FunctionOpRange],
+    program: &vm::risc::RiscProgram,
+) -> usize {
+    let mut ordered: Vec<_> = ranges.iter().collect();
+    ordered.sort_by_key(|range| range.start_op);
+    let mut changed = 0;
+    // Walk backwards so a split function's body family propagates through thin
+    // entry/prologue fragments while preserving its explicit incoming call edge.
+    for pair in ordered.windows(2).rev() {
+        let source = pair[0];
+        let target = pair[1];
+        if source.end_op != target.start_op || source.end_op == 0 {
+            continue;
+        }
+        let Some(last) = program.instrs.get(source.end_op - 1) else {
+            continue;
+        };
+        if matches!(
+            last.op,
+            vm::risc::RiscOp::VirtualBranch {
+                cond: vm::risc::BranchCondition::Always
+            } | vm::risc::RiscOp::VirtualRet
+                | vm::risc::RiscOp::VirtualIndirectJump
+                | vm::risc::RiscOp::Halt
+                | vm::risc::RiscOp::Trap
+        ) {
+            continue;
+        }
+        let Some(target_family) = plan
+            .assignment_for(target.function_id)
+            .map(|assignment| assignment.family)
+        else {
+            continue;
+        };
+        let Some(source_assignment) = plan
+            .assignments
+            .iter_mut()
+            .find(|assignment| assignment.function_id == source.function_id)
+        else {
+            continue;
+        };
+        if source_assignment.family != target_family {
+            source_assignment.family = target_family;
+            source_assignment.incoming_bridge = None;
+            changed += 1;
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::poly::{FunctionOpRange, VmArchitectureFamily};
+    use crate::vm::risc::{MicroInstr, RiscOp, RiscProgram};
+
+    #[test]
+    fn linear_fallthrough_uses_the_body_family() {
+        let functions = [0x1000, 0x1002];
+        let mut plan = vm::poly::ProductionFamilyPlan::new(7, functions[0], &functions);
+        plan.assignments[0].family = VmArchitectureFamily::Stack;
+        plan.assignments[1].family = VmArchitectureFamily::FusedCisc;
+        let ranges = [
+            FunctionOpRange {
+                function_id: functions[0],
+                start_op: 0,
+                end_op: 1,
+            },
+            FunctionOpRange {
+                function_id: functions[1],
+                start_op: 1,
+                end_op: 2,
+            },
+        ];
+        let program = RiscProgram::new(vec![
+            MicroInstr::new(RiscOp::Mov),
+            MicroInstr::new(RiscOp::VirtualRet),
+        ]);
+
+        assert_eq!(coalesce_cross_family_fallthroughs(&mut plan, &ranges, &program), 1);
+        assert_eq!(
+            plan.assignment_for(functions[0]).unwrap().family,
+            VmArchitectureFamily::FusedCisc
+        );
+        assert_eq!(
+            plan.assignment_for(functions[1]).unwrap().family,
+            VmArchitectureFamily::FusedCisc
+        );
+    }
+}
+
 pub(crate) fn lift_program(
     ctx: &PipelineContext,
     image_base: u64,
@@ -72,6 +165,17 @@ pub(crate) fn lift_program(
                     assignment.family = plan.entry_family;
                     assignment.incoming_bridge = None;
                 }
+            }
+            let coalesced_fallthroughs = coalesce_cross_family_fallthroughs(
+                &mut plan,
+                &lift.function_op_ranges,
+                &lift.program,
+            );
+            if coalesced_fallthroughs != 0 {
+                println!(
+                    "[+] P2-10 coalesced {} linear cross-family fallthrough region(s)",
+                    coalesced_fallthroughs
+                );
             }
             println!(
                 "[+] P2-10 production family plan: {} VM-owned function(s), {} represented family/families, {} cross-family bridge requirement(s), entry={:?}",
@@ -221,7 +325,7 @@ pub(crate) fn lift_program(
                 );
                 enc.encode_with_offsets(&lift.program)?
             };
-            if ctx.m7 {
+            if vm_commercial {
                 vm_prog_chunks = vm::chunk_crypto::plan_chunks(
                     bc.len(),
                     &offsets,
@@ -229,7 +333,7 @@ pub(crate) fn lift_program(
                     vm::chunk_crypto::DEFAULT_CHUNK_BYTES,
                 );
                 println!(
-                    "[+] P1-4 Program-VM M7: planned {} instruction-aligned bytecode chunk(s), max {}B",
+                    "[+] commercial VM: planned {} instruction-aligned bytecode key epoch(s), max {}B",
                     vm_prog_chunks.len(),
                     vm::chunk_crypto::DEFAULT_CHUNK_BYTES
                 );

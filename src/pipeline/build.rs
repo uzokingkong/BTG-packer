@@ -361,8 +361,7 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     let mut multi_builder = multi_builder;
     multi_builder.bootstrap_iat_section = ctx.bootstrap_iat_section_data.clone();
     multi_builder.mutable_state_section = ctx.mutable_state_section_data.clone();
-    multi_builder.mutable_state_metadata_section =
-        ctx.mutable_state_metadata_section_data.clone();
+    multi_builder.mutable_state_metadata_section = ctx.mutable_state_metadata_section_data.clone();
     multi_builder.route_metadata_section = ctx.route_metadata_section_data.clone();
     multi_builder.preserve_aslr_bits = preserve_aslr_bits;
     multi_builder.reloc_section = reloc_section;

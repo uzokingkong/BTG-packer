@@ -152,7 +152,9 @@ pub(super) fn build_commercial_routes(
         let candidate = (function.id, entry_vip as u64, GatewayKind::VmEntry);
         if let Some(existing) = required.get(&OriginalTargetRva(target_rva)) {
             if existing.0 != candidate.0 || existing.1 != candidate.1 {
-                bail!("pointer-table target RVA {target_rva:#x} conflicts with indirect-site route");
+                bail!(
+                    "pointer-table target RVA {target_rva:#x} conflicts with indirect-site route"
+                );
             }
         } else {
             required.insert(OriginalTargetRva(target_rva), candidate);

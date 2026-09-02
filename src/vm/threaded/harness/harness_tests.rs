@@ -195,7 +195,6 @@ fn test_native_poly_matches_interpreter_and_reference() {
     }
 }
 
-
 /// TEMP isolated static branch.
 #[test]
 fn temp_static_branch_only() {

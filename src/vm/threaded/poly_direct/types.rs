@@ -7,6 +7,21 @@ use std::collections::BTreeSet;
 pub const MAX_NATIVE_CROSS_FAMILY_ROUTES: usize = 4096;
 /// Per-state nested cross-family depth. Lifetime sync owns 0x50A0/0x50A8.
 pub const STATE_CROSS_FAMILY_DEPTH: i64 = 0x50B0;
+/// Per-transition child-state key. It is never copied from the parent rolling
+/// state and is overwritten on every cross-family entry.
+pub const STATE_CROSS_FAMILY_KEY: i64 = 0x5150;
+/// Authoritative child-state pointers for guest nonvolatile GPRs. Guest RSP
+/// uses the older CALL/tail-JUMP-aware `STATE_CROSS_FAMILY_RSP_PTR` path.
+pub(crate) const STATE_CROSS_FAMILY_NONVOLATILE_PTRS: [(usize, i64); 8] = [
+    (3, 0x5160),  // RBX
+    (5, 0x5170),  // RBP
+    (6, 0x5178),  // RSI
+    (7, 0x5180),  // RDI
+    (12, 0x5188), // R12
+    (13, 0x5190), // R13
+    (14, 0x5198), // R14
+    (15, 0x51A0), // R15
+];
 /// Thirty-two re-entry depths are reserved per thread bucket; depth 31 cannot
 /// spawn another child. Keep this synchronized with VM_REENTRY_DEPTHS.
 pub const MAX_CROSS_FAMILY_DEPTH: u64 = 63;

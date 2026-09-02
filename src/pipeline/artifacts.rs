@@ -28,7 +28,11 @@ pub struct ValidatedStage;
 
 impl StagedPipeline<InputStage> {
     pub fn new(ctx: PipelineContext) -> Self {
-        Self { ctx, output: None, _stage: PhantomData }
+        Self {
+            ctx,
+            output: None,
+            _stage: PhantomData,
+        }
     }
 
     pub fn analyze(mut self) -> Result<StagedPipeline<AnalyzedStage>> {
@@ -91,7 +95,9 @@ impl StagedPipeline<ProtectedStage> {
 
 impl StagedPipeline<ValidatedStage> {
     pub fn emit(mut self, output: Option<&Path>) -> Result<Vec<u8>> {
-        let bytes = self.output.take()
+        let bytes = self
+            .output
+            .take()
             .ok_or_else(|| anyhow::anyhow!("validated pipeline lost its output artifact"))?;
         if let Some(path) = output {
             std::fs::write(path, &bytes)?;
@@ -102,7 +108,11 @@ impl StagedPipeline<ValidatedStage> {
 
 impl<S> StagedPipeline<S> {
     fn advance<T>(self) -> StagedPipeline<T> {
-        StagedPipeline { ctx: self.ctx, output: self.output, _stage: PhantomData }
+        StagedPipeline {
+            ctx: self.ctx,
+            output: self.output,
+            _stage: PhantomData,
+        }
     }
 }
 

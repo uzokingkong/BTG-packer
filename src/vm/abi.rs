@@ -35,7 +35,7 @@ pub struct VmAbi {
     pub nonvolatile_gprs: &'static [Register],
     pub volatile_gprs: &'static [Register],
     pub nonvolatile_xmm_start: u8, // XMM6
-    pub nonvolatile_xmm_end: u8, // XMM15
+    pub nonvolatile_xmm_end: u8,   // XMM15
     pub stack_alignment: usize,
     /// shadow space (32B).
     pub shadow_space: usize,

@@ -239,7 +239,7 @@ pub fn build_dispatcher_m7(
         Instruction::with_branch(Code::Je_rel32_64, 0)?,
         Some(L::EnterReady),
     );
-       // EnterLoop: st = state[target]
+    // EnterLoop: st = state[target]
     push_seq(
         Instruction::with2(
             Code::Mov_r32_rm32,

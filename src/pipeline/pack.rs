@@ -9,8 +9,8 @@
 // ==============================================================================
 
 use crate::pe::TargetPeInfo;
-use crate::pipeline::PipelineContext;
 use crate::pipeline::artifacts::StagedPipeline;
+use crate::pipeline::PipelineContext;
 use anyhow::Result;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
@@ -90,7 +90,10 @@ pub fn run_full(
     };
     let resolved = crate::protection_profile::resolve(&requested);
     if !resolved.errors.is_empty() {
-        anyhow::bail!("library protection profile resolution failed: {:?}", resolved.errors);
+        anyhow::bail!(
+            "library protection profile resolution failed: {:?}",
+            resolved.errors
+        );
     }
     // Typestate is the library API boundary: only a `ValidatedStage` can emit
     // bytes, so `run_full` cannot accidentally acquire weaker guarantees than
@@ -107,7 +110,9 @@ pub fn run_full(
 mod tests {
     use super::*;
     use crate::manifest::sha256_hex;
-    use crate::pipeline::{build, crypto, pass1_slice, pass2_shuffle, pass3_encode, pass4_section, patch_data};
+    use crate::pipeline::{
+        build, crypto, pass1_slice, pass2_shuffle, pass3_encode, pass4_section, patch_data,
+    };
 
     #[test]
     fn programmatic_context_defaults_to_non_rc4_cipher() {

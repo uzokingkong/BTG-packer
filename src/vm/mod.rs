@@ -35,6 +35,7 @@ pub mod handler_poly;
 pub mod handlers;
 pub mod import_key;
 pub mod interp;
+pub mod key_domains;
 pub mod ksa;
 pub mod lifter;
 pub mod mapper;

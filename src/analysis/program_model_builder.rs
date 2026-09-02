@@ -451,17 +451,19 @@ impl<'a> ProgramModelBuilder<'a> {
                 },
             )
         });
-        let get_proc_address_slots = crate::pipeline::iat_hide::collect_from_pe(
-            &self.target.original_pe_bytes,
-        )
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|import| match import.func {
-            crate::pipeline::iat_hide::FuncRef::Name(name)
-                if name.eq_ignore_ascii_case("GetProcAddress") => Some(import.slot_rva),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
+        let get_proc_address_slots =
+            crate::pipeline::iat_hide::collect_from_pe(&self.target.original_pe_bytes)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|import| match import.func {
+                    crate::pipeline::iat_hide::FuncRef::Name(name)
+                        if name.eq_ignore_ascii_case("GetProcAddress") =>
+                    {
+                        Some(import.slot_rva)
+                    }
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
         let load_config_slots = self
             .target
             .load_config
@@ -565,16 +567,12 @@ impl<'a> ProgramModelBuilder<'a> {
                 .extend(stack_callback_entries.iter().copied());
             split_blocks_at_targets(&mut model, image_base, &stack_callback_entries);
             for entry in &stack_callback_entries {
-                if let Some(function) = model
-                    .functions
-                    .values_mut()
-                    .find(|function| {
-                        function
-                            .ranges
-                            .iter()
-                            .any(|range| range.start <= *entry && *entry < range.end)
-                    })
-                {
+                if let Some(function) = model.functions.values_mut().find(|function| {
+                    function
+                        .ranges
+                        .iter()
+                        .any(|range| range.start <= *entry && *entry < range.end)
+                }) {
                     function.entries.insert(*entry);
                 }
             }
@@ -615,8 +613,7 @@ impl<'a> ProgramModelBuilder<'a> {
         {
             if !explicit_sites.contains(&internal.site) {
                 crate::analysis::indirect_resolver::apply_indirect_resolution(
-                    &mut model,
-                    &internal,
+                    &mut model, &internal,
                 )?;
                 crate::analysis::indirect_resolver::apply_external_indirect_resolution(
                     &mut model,
@@ -707,8 +704,7 @@ impl<'a> ProgramModelBuilder<'a> {
         }
         for (site, runtime_identity) in
             crate::analysis::pointer_tables::produce_runtime_stack_callback_dispatches(
-                &model,
-                image_base,
+                &model, image_base,
             )
         {
             if !explicit_sites.contains(&site) {
@@ -731,16 +727,12 @@ impl<'a> ProgramModelBuilder<'a> {
             .sites
             .values()
             .filter(|site| {
-                site.status
-                    != crate::analysis::indirect_targets::ResolutionStatus::Complete
+                site.status != crate::analysis::indirect_targets::ResolutionStatus::Complete
             })
             .map(|site| site.id)
             .collect::<Vec<_>>();
         for site in runtime_sites {
-            crate::analysis::indirect_resolver::apply_runtime_route_resolution(
-                &mut model,
-                site,
-            )?;
+            crate::analysis::indirect_resolver::apply_runtime_route_resolution(&mut model, site)?;
         }
         model.indirect_targets.validate(&model)?;
         model.validate()?;
@@ -762,7 +754,10 @@ fn infer_point_function_end(
         .end;
     let section = target.relayed_sections.iter().find(|section| {
         section.virtual_address <= start
-            && start < section.virtual_address.saturating_add(section.bytes.len() as u32)
+            && start
+                < section
+                    .virtual_address
+                    .saturating_add(section.bytes.len() as u32)
     })?;
     let offset = start.checked_sub(section.virtual_address)? as usize;
     let available = section.bytes.len().saturating_sub(offset).min(0x1000);

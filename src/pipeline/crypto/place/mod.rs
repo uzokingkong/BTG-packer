@@ -54,10 +54,7 @@ fn route_metadata_section(
 /// Replace build-time route records with a keyed, one-way commitment before
 /// final PE synthesis. Generated code does not consume `.vmroute`; retaining
 /// the canonical records in the output only disclosed the protected CFG.
-fn seal_route_metadata(
-    section: &mut crate::pe::builder::SectionData,
-    rng: &mut impl RngCore,
-) {
+fn seal_route_metadata(section: &mut crate::pe::builder::SectionData, rng: &mut impl RngCore) {
     let mut key = [0u8; 32];
     rng.fill_bytes(&mut key);
     let mut ipad = [0x36u8; 64];
@@ -242,9 +239,7 @@ fn rewrite_native_gateway_pointers(
     // address-taken callbacks were included in the gateway inventory.
     let replacements: std::collections::HashMap<u64, u64> = gateways
         .iter()
-        .map(|(&original_va, &gateway_off)| {
-            (original_va, program_vm_va + gateway_off as u64)
-        })
+        .map(|(&original_va, &gateway_off)| (original_va, program_vm_va + gateway_off as u64))
         .collect();
 
     let mut rewritten = 0usize;
@@ -262,8 +257,7 @@ fn rewrite_native_gateway_pointers(
                     .expect("8-byte PE pointer window"),
             );
             if let Some(&replacement) = replacements.get(&candidate) {
-                section.bytes[cursor..cursor + 8]
-                    .copy_from_slice(&replacement.to_le_bytes());
+                section.bytes[cursor..cursor + 8].copy_from_slice(&replacement.to_le_bytes());
                 rewritten += 1;
                 cursor += 8;
             } else {
@@ -997,9 +991,9 @@ pub(crate) fn place_boot_stub(
             0
         };
     cursor = (cursor + 7) & !7; // align 8
-    // Everything up to this point is the mutable Program-VM reservation. Boot
-    // seed/tag/descriptor metadata is allocated below and must remain
-    // file-backed even when the state reservation itself is loader zero-fill.
+                                // Everything up to this point is the mutable Program-VM reservation. Boot
+                                // seed/tag/descriptor metadata is allocated below and must remain
+                                // file-backed even when the state reservation itself is loader zero-fill.
     let vm_prog_state_reservation_end = cursor;
 
     // ── P4 (전체 SEH 가상화): Program VM 모듈 위치를 ctx에 기록 — build.rs가
@@ -1018,9 +1012,7 @@ pub(crate) fn place_boot_stub(
     // `None` and no route metadata section should exist at all.
     let route_metadata_active = ctx.route_metadata_section_data.is_some();
     if route_metadata_active != !ctx.route_required_original_targets.is_empty() {
-        anyhow::bail!(
-            "canonical route metadata staging/inventory lifecycle mismatch"
-        );
+        anyhow::bail!("canonical route metadata staging/inventory lifecycle mismatch");
     }
     ctx.route_generated_executable_ranges =
         if route_metadata_active && ctx.vm_prog_rva != 0 && ctx.vm_prog_total != 0 {
@@ -1204,13 +1196,13 @@ pub(crate) fn place_boot_stub(
     // program-VM bytecode. No TLS callbacks -> a single run over the whole
     // `.text` (identical to the previous whole-region behaviour).
     let mut text_enc_runs: Vec<(u64, u32)> = Vec::new(); // (VA, len)
-    // A PE with TLS callbacks must not have its original .text encrypted at rest: the
-    // Windows loader invokes TLS callbacks before our boot stub has a chance to decrypt
-    // anything.  Keep the whole .text plaintext for this case; VM-OEP still protects
-    // the actual OEP path through the Program VM, while native TLS/CRT startup remains
-    // loader-safe.  The previous code computed `has_tls_cb` but did not use it to gate
-    // the encryption pass, so `--crypto-coverage 100` could encrypt loader-reachable
-    // code and trigger an immediate c0000005 before OEP.
+                                                         // A PE with TLS callbacks must not have its original .text encrypted at rest: the
+                                                         // Windows loader invokes TLS callbacks before our boot stub has a chance to decrypt
+                                                         // anything.  Keep the whole .text plaintext for this case; VM-OEP still protects
+                                                         // the actual OEP path through the Program VM, while native TLS/CRT startup remains
+                                                         // loader-safe.  The previous code computed `has_tls_cb` but did not use it to gate
+                                                         // the encryption pass, so `--crypto-coverage 100` could encrypt loader-reachable
+                                                         // code and trigger an immediate c0000005 before OEP.
     if vm_oep_effective && !ctx.mem_harden && !has_tls_cb {
         let base_va = image_base + ctx.target_info.text_rva as u64;
         let excl = crate::vm::text_lift::detect_tls_callback_ranges(
@@ -1350,8 +1342,7 @@ pub(crate) fn place_boot_stub(
     // mem-harden actually needs it. Installing a dummy directory merely because
     // this cache is empty replaces the target's loader-owned Import Directory;
     // the original IAT then remains full of IMAGE_IMPORT_BY_NAME RVAs.
-    let needs_dummy_bootstrap =
-        ctx.iat_hide || (ctx.mem_harden && ctx.original_imports.is_empty());
+    let needs_dummy_bootstrap = ctx.iat_hide || (ctx.mem_harden && ctx.original_imports.is_empty());
     // The dummy directory belongs exclusively to IAT hiding.  Mem-harden by
     // itself must retain the loader-populated original IAT (notably for TLS
     // callbacks that run before OEP).
@@ -1992,7 +1983,8 @@ pub(crate) fn place_boot_stub(
             // lifetime table, then 128 lane-private native runtime stacks.
             // Keeping this table outside every 0x8000 family stride removes the
             // previous 0x2000..0x3060 overlap with the commercial virtual stack.
-            let lane_control_off = (multi.invocation_layout.lane_control_va - dispatcher_va) as usize;
+            let lane_control_off =
+                (multi.invocation_layout.lane_control_va - dispatcher_va) as usize;
             let lane_control_end = lane_control_off + VM_THREAD_BUCKETS * 4;
             if lane_control_end > btg.bytes.len() {
                 anyhow::bail!("multi-family lane-control tail exceeds .textb/.vstate backing");
@@ -2006,8 +1998,8 @@ pub(crate) fn place_boot_stub(
             }
             btg.bytes[sync_start..sync_end].fill(0);
             for (entry_index, entry) in multi.lifetime_sync.entries.iter().enumerate() {
-                let entry_off = sync_start
-                    + entry_index * crate::vm::data_lifetime::LIFETIME_SYNC_ENTRY_SIZE;
+                let entry_off =
+                    sync_start + entry_index * crate::vm::data_lifetime::LIFETIME_SYNC_ENTRY_SIZE;
                 btg.bytes[entry_off + 16..entry_off + 24]
                     .copy_from_slice(&entry.object_va.to_le_bytes());
                 btg.bytes[entry_off + 24..entry_off + 28]
@@ -2025,7 +2017,8 @@ pub(crate) fn place_boot_stub(
                 );
             }
 
-            let host_pool_off = (multi.invocation_layout.host_stack_pool_va - dispatcher_va) as usize;
+            let host_pool_off =
+                (multi.invocation_layout.host_stack_pool_va - dispatcher_va) as usize;
             let host_pool_len = VM_HOST_STACK_SLOTS * VM_HOST_STACK_SIZE;
             let host_pool_end = host_pool_off
                 .checked_add(host_pool_len)
@@ -2051,15 +2044,16 @@ pub(crate) fn place_boot_stub(
                     let lane_delta = lane * lane_group_stride + state_delta;
                     let state_off = (vm_prog_state_va - dispatcher_va) as usize + lane_delta;
                     btg.bytes[state_off..state_off + MULTI_FAMILY_STATE_STRIDE].fill(0);
-                    let sync_ptr_off = state_off
-                        + crate::vm::data_lifetime::LIFETIME_SYNC_PTR_STATE_OFFSET;
+                    let sync_ptr_off =
+                        state_off + crate::vm::data_lifetime::LIFETIME_SYNC_PTR_STATE_OFFSET;
                     btg.bytes[sync_ptr_off..sync_ptr_off + 8]
                         .copy_from_slice(&multi.lifetime_sync.base_va.to_le_bytes());
-                    let sync_count_off = state_off
-                        + crate::vm::data_lifetime::LIFETIME_SYNC_COUNT_STATE_OFFSET;
+                    let sync_count_off =
+                        state_off + crate::vm::data_lifetime::LIFETIME_SYNC_COUNT_STATE_OFFSET;
                     btg.bytes[sync_count_off..sync_count_off + 8]
                         .copy_from_slice(&(multi.lifetime_sync.entries.len() as u64).to_le_bytes());
-                    let call_stack_va = vm_prog_state_va + lane_delta as u64
+                    let call_stack_va = vm_prog_state_va
+                        + lane_delta as u64
                         + (MULTI_FAMILY_STATE_STRIDE - crate::vm::interp::CALL_STACK_SIZE) as u64;
                     let ptr = state_off + crate::vm::interp::STATE_PTR_CALL_STACK;
                     btg.bytes[ptr..ptr + 8].copy_from_slice(&call_stack_va.to_le_bytes());
@@ -2083,7 +2077,7 @@ pub(crate) fn place_boot_stub(
     }
 
     // ── M6 Phase-2.3: at-rest 암호화 적용 ───────────────────────────────────
-    if ctx.m7 && !vm_multi_family_chunks.is_empty() && vm_prog_bc_len > 0 {
+    if !vm_multi_family_chunks.is_empty() && vm_prog_bc_len > 0 {
         for (module_bytecode_start, chunk) in &vm_multi_family_chunks {
             let start = vm_prog_bc_off + module_bytecode_start + chunk.offset as usize;
             let end = start + chunk.len as usize;
@@ -2100,7 +2094,7 @@ pub(crate) fn place_boot_stub(
         let runtime_cipher = &btg.bytes[vm_prog_bc_off..vm_prog_bc_off + vm_prog_bc_len as usize];
         ctx.vm_prog_runtime_cipher_hash = Some(crate::manifest::sha256_hex(runtime_cipher));
         println!(
-            "[+] P2-10 family M7: {} independent instruction-aligned chunk(s) encrypted across {} family stream(s)",
+            "[+] commercial family key epochs: {} independent instruction-aligned epoch(s) encrypted across {} family stream(s)",
             vm_multi_family_chunks.len(),
             vm_multi_family_sizing
                 .as_ref()
@@ -2111,7 +2105,7 @@ pub(crate) fn place_boot_stub(
     // P1-4 M7 outer layer. The boot RC4 below wraps these bytes for at-rest
     // transport and removes only that wrapper at startup; the per-chunk layer
     // remains in memory and is unmasked byte-by-byte by the Program-VM decoder.
-    if ctx.m7 && !ctx.vm_prog_chunks.is_empty() && vm_prog_bc_len > 0 {
+    if !ctx.vm_prog_chunks.is_empty() && vm_prog_bc_len > 0 {
         for chunk in &ctx.vm_prog_chunks {
             let start = vm_prog_bc_off + chunk.offset as usize;
             let end = start + chunk.len as usize;
@@ -2128,7 +2122,7 @@ pub(crate) fn place_boot_stub(
         let runtime_cipher = &btg.bytes[vm_prog_bc_off..vm_prog_bc_off + vm_prog_bc_len as usize];
         ctx.vm_prog_runtime_cipher_hash = Some(crate::manifest::sha256_hex(runtime_cipher));
         println!(
-            "[+] P1-4 Program-VM M7: outer encryption ACTIVE for {} chunk(s); runtime decoder unmasks fetched bytes only",
+            "[+] commercial VM key epochs: outer encryption ACTIVE for {} epoch(s); runtime decoder unmasks fetched bytes only",
             ctx.vm_prog_chunks.len()
         );
     }
@@ -2136,7 +2130,7 @@ pub(crate) fn place_boot_stub(
     // manifest/strict-profile contract describes the concatenated bytecode
     // region. Publish a flattened, ordered view only after encryption so it
     // cannot accidentally enter the legacy single-stream encryption path.
-    if ctx.m7 && !vm_multi_family_chunks.is_empty() {
+    if !vm_multi_family_chunks.is_empty() {
         ctx.vm_prog_chunks = vm_multi_family_chunks
             .iter()
             .map(
@@ -2510,7 +2504,9 @@ pub(crate) fn place_boot_stub(
         if dst_off < vm_prog_off || dst_end > btg.bytes.len() {
             anyhow::bail!(
                 "relocated payload destination outside .textb: dst=[0x{:X},0x{:X}) section=0x{:X}",
-                dst_off, dst_end, btg.bytes.len()
+                dst_off,
+                dst_end,
+                btg.bytes.len()
             );
         }
         let payload_rva = (payload_va - image_base) as u32;
@@ -2549,7 +2545,9 @@ pub(crate) fn place_boot_stub(
                         && (*slot_rva as u64 + 8)
                             <= section.virtual_address as u64 + section.bytes.len() as u64
                 })
-                .ok_or_else(|| anyhow::anyhow!("TLS callback slot RVA {slot_rva:#x} is not file-backed"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("TLS callback slot RVA {slot_rva:#x} is not file-backed")
+                })?;
             let offset = (*slot_rva - section.virtual_address) as usize;
             section.bytes[offset..offset + 8].copy_from_slice(&gateway_va.to_le_bytes());
         }
@@ -2604,7 +2602,11 @@ pub(crate) fn place_boot_stub(
             } else {
                 0xC000_0040 // INITIALIZED_DATA | READ | WRITE
             },
-            bytes: if vm_multi_family_active { Vec::new() } else { state_bytes },
+            bytes: if vm_multi_family_active {
+                Vec::new()
+            } else {
+                state_bytes
+            },
         });
         ctx.mutable_state_metadata_section_data = if metadata_bytes.is_empty() {
             None

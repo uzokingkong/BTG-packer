@@ -139,10 +139,9 @@ pub fn apply_runtime_route_resolution(
     };
     next.edges.remove(*index);
     let target_site = next.indirect_targets.sites.get_mut(&site_id).unwrap();
-    target_site.targets.insert(
-        IndirectTarget::RuntimeRoute,
-        TargetProvenance::RuntimeRoute,
-    );
+    target_site
+        .targets
+        .insert(IndirectTarget::RuntimeRoute, TargetProvenance::RuntimeRoute);
     target_site.status = ResolutionStatus::Complete;
     next.edges.push(EdgeModel {
         source: site.source_block,

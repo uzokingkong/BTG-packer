@@ -159,7 +159,7 @@ impl MaterializedMultiFamilyProgram {
                 source_next_byte_offset: None,
                 target_entry_va: destination.entry_va,
                 target_state_va: destination.state_va,
-            child_lane_stride: 0,
+                child_lane_stride: 0,
                 target_byte_offset: byte_offset as u64,
                 target_layout: VmRuntimeLayout::from_seed(module.module_domain),
                 tail_jump_resume_offset,
@@ -318,12 +318,17 @@ impl MultiFamilyProgramPlan {
     pub fn materialize(&self, seed: u64) -> Result<MaterializedMultiFamilyProgram, String> {
         let mut modules = Vec::with_capacity(self.partitions.len());
         for partition in &self.partitions {
+            let module_domain = crate::vm::key_domains::derive_u64(
+                seed,
+                crate::vm::key_domains::VmKeyDomain::FamilyState,
+                &[partition.family as u8],
+            );
             let mut routed_program = partition.program.clone();
             routed_program
                 .instrs
                 .push(crate::vm::risc::MicroInstr::new(RiscOp::Halt));
             let mut encoder = crate::vm::poly::PolymorphicEncoder::new_for_family(
-                seed ^ family_domain(partition.family),
+                module_domain,
                 partition.family,
             );
             let (bytecode, instruction_offsets) = encoder
@@ -453,7 +458,7 @@ impl MultiFamilyProgramPlan {
                 bytecode,
                 instruction_offsets,
                 ip_map: partition.program.ip_map().cloned().unwrap_or_default(),
-                module_domain: seed ^ family_domain(partition.family),
+                module_domain,
                 exit_byte_offset,
             });
         }
@@ -523,15 +528,6 @@ impl MultiFamilyProgramPlan {
             modules,
             route_table,
         })
-    }
-}
-
-fn family_domain(family: VmArchitectureFamily) -> u64 {
-    match family {
-        VmArchitectureFamily::Stack => 0x5354_4143_4B00_0001,
-        VmArchitectureFamily::Register => 0x5245_4749_5354_0002,
-        VmArchitectureFamily::MixedRisc => 0x4D49_5845_4452_0003,
-        VmArchitectureFamily::FusedCisc => 0x4655_5345_4443_0004,
     }
 }
 

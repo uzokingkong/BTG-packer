@@ -243,7 +243,12 @@ impl VirtualIsaSpec {
     }
 
     pub fn from_seed_and_family(seed: u64, family: VmArchitectureFamily) -> Self {
-        let mut rng = StdRng::seed_from_u64(family_isa_seed(seed, family));
+        let isa_seed = crate::vm::key_domains::derive_u64(
+            seed,
+            crate::vm::key_domains::VmKeyDomain::IsaLayout,
+            &[family as u8],
+        );
+        let mut rng = StdRng::seed_from_u64(family_isa_seed(isa_seed, family));
 
         // 1. Generate unique random opcodes for the ENTIRE reachable RiscOp set.
         //    기존 11개 매핑(Nor/AddWithCarry/ShiftRight/ShiftLeft/VirtualPush/

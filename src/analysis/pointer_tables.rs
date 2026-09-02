@@ -11,9 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use iced_x86::{Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register};
 
 use super::indirect_resolver::IndirectResolution;
-use super::indirect_targets::{ResolutionStatus, TargetProvenance};
 #[cfg(test)]
 use super::indirect_targets::IndirectKind;
+use super::indirect_targets::{ResolutionStatus, TargetProvenance};
 use super::program_model::{CodePointerEncoding, ProgramModel, RvaRange};
 use crate::pe::builder::SectionData;
 
@@ -298,25 +298,31 @@ pub fn produce_dynamic_import_resolutions(
     get_proc_address_slots: &BTreeSet<u32>,
     sections: &[SectionData],
 ) -> Vec<(crate::analysis::indirect_targets::IndirectSiteId, u64)> {
-    let dynamic_slots = discover_dynamic_import_slots(
-        program,
-        image_base,
-        get_proc_address_slots,
-        sections,
-    );
+    let dynamic_slots =
+        discover_dynamic_import_slots(program, image_base, get_proc_address_slots, sections);
     if dynamic_slots.is_empty() {
         return Vec::new();
     }
     let identity = image_base + u64::from(*get_proc_address_slots.iter().next().unwrap());
     let mut out = Vec::new();
-    for site in program.indirect_targets.sites.values().filter(|site| {
-        site.status == ResolutionStatus::Unresolved
-    }) {
-        let Some(block) = program.blocks.get(&site.source_block) else { continue };
+    for site in program
+        .indirect_targets
+        .sites
+        .values()
+        .filter(|site| site.status == ResolutionStatus::Unresolved)
+    {
+        let Some(block) = program.blocks.get(&site.source_block) else {
+            continue;
+        };
         let Some(index) = block.instructions.iter().position(|instruction| {
-            instruction.ip().checked_sub(image_base)
-                .and_then(|rva| u32::try_from(rva).ok()) == Some(site.instruction_rva)
-        }) else { continue };
+            instruction
+                .ip()
+                .checked_sub(image_base)
+                .and_then(|rva| u32::try_from(rva).ok())
+                == Some(site.instruction_rva)
+        }) else {
+            continue;
+        };
         let transfer = &block.instructions[index];
         if transfer.op0_kind() != OpKind::Register {
             continue;
@@ -348,7 +354,9 @@ fn discover_dynamic_import_slots(
 ) -> BTreeSet<u32> {
     let mut candidates = BTreeMap::<u32, BTreeSet<u64>>::new();
     for function in program.functions.keys() {
-        let mut instructions = program.blocks.values()
+        let mut instructions = program
+            .blocks
+            .values()
             .filter(|block| block.function_id == *function)
             .flat_map(|block| block.instructions.iter())
             .collect::<Vec<_>>();
@@ -365,7 +373,10 @@ fn discover_dynamic_import_slots(
             }
             let mut aliases = BTreeSet::from([Register::RAX]);
             for instruction in instructions.iter().skip(index + 1).take(12) {
-                if matches!(instruction.flow_control(), iced_x86::FlowControl::Call | iced_x86::FlowControl::IndirectCall) {
+                if matches!(
+                    instruction.flow_control(),
+                    iced_x86::FlowControl::Call | iced_x86::FlowControl::IndirectCall
+                ) {
                     break;
                 }
                 if instruction.mnemonic() != Mnemonic::Mov {
@@ -390,18 +401,22 @@ fn discover_dynamic_import_slots(
     }
     candidates.retain(|slot, proven_stores| {
         read_u64(sections, *slot) == Some(0)
-            && program.blocks.values().flat_map(|block| block.instructions.iter()).all(|instruction| {
-                if instruction.mnemonic() != Mnemonic::Mov
-                    || instruction.op0_kind() != OpKind::Memory
-                    || instruction.memory_index() != Register::None
-                    || memory_operand_rva(instruction, image_base) != Some(*slot)
-                {
-                    true
-                } else {
-                    proven_stores.contains(&instruction.ip())
-                        || unsigned_immediate(instruction, 1) == Some(0)
-                }
-            })
+            && program
+                .blocks
+                .values()
+                .flat_map(|block| block.instructions.iter())
+                .all(|instruction| {
+                    if instruction.mnemonic() != Mnemonic::Mov
+                        || instruction.op0_kind() != OpKind::Memory
+                        || instruction.memory_index() != Register::None
+                        || memory_operand_rva(instruction, image_base) != Some(*slot)
+                    {
+                        true
+                    } else {
+                        proven_stores.contains(&instruction.ip())
+                            || unsigned_immediate(instruction, 1) == Some(0)
+                    }
+                })
     });
     candidates.into_keys().collect()
 }
@@ -422,7 +437,9 @@ fn prove_dynamic_external_register(
     if !visiting.insert(key) {
         return false;
     }
-    let Some(block) = program.blocks.get(&block_id) else { return false };
+    let Some(block) = program.blocks.get(&block_id) else {
+        return false;
+    };
     for (index, instruction) in block.instructions[..before].iter().enumerate().rev() {
         if register == Register::RAX
             && instruction.flow_control() == iced_x86::FlowControl::IndirectCall
@@ -439,8 +456,14 @@ fn prove_dynamic_external_register(
                 && instruction.op1_kind() == OpKind::Register
             {
                 prove_dynamic_external_register(
-                    program, block_id, index, instruction.op1_register().full_register(),
-                    image_base, resolver_slots, dynamic_slots, visiting,
+                    program,
+                    block_id,
+                    index,
+                    instruction.op1_register().full_register(),
+                    image_base,
+                    resolver_slots,
+                    dynamic_slots,
+                    visiting,
                 )
             } else if instruction.mnemonic() == Mnemonic::Mov
                 && instruction.op1_kind() == OpKind::Memory
@@ -454,23 +477,57 @@ fn prove_dynamic_external_register(
             visiting.remove(&key);
             return result;
         }
-        if matches!(instruction.flow_control(), iced_x86::FlowControl::Call | iced_x86::FlowControl::IndirectCall)
-            && matches!(register, Register::RAX | Register::RCX | Register::RDX | Register::R8 | Register::R9 | Register::R10 | Register::R11)
-        {
+        if matches!(
+            instruction.flow_control(),
+            iced_x86::FlowControl::Call | iced_x86::FlowControl::IndirectCall
+        ) && matches!(
+            register,
+            Register::RAX
+                | Register::RCX
+                | Register::RDX
+                | Register::R8
+                | Register::R9
+                | Register::R10
+                | Register::R11
+        ) {
             visiting.remove(&key);
             return false;
         }
     }
     let function = block.function_id;
-    let predecessors = program.edges.iter().filter_map(|edge| match edge.target {
-        EdgeTarget::Block(target) if target == block_id
-            && program.blocks.get(&edge.source).is_some_and(|source| source.function_id == function) => Some(edge.source),
-        _ => None,
-    }).collect::<BTreeSet<_>>();
-    let result = !predecessors.is_empty() && predecessors.into_iter().all(|predecessor| {
-        let len = program.blocks.get(&predecessor).map_or(0, |owner| owner.instructions.len());
-        prove_dynamic_external_register(program, predecessor, len, register, image_base, resolver_slots, dynamic_slots, visiting)
-    });
+    let predecessors = program
+        .edges
+        .iter()
+        .filter_map(|edge| match edge.target {
+            EdgeTarget::Block(target)
+                if target == block_id
+                    && program
+                        .blocks
+                        .get(&edge.source)
+                        .is_some_and(|source| source.function_id == function) =>
+            {
+                Some(edge.source)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let result = !predecessors.is_empty()
+        && predecessors.into_iter().all(|predecessor| {
+            let len = program
+                .blocks
+                .get(&predecessor)
+                .map_or(0, |owner| owner.instructions.len());
+            prove_dynamic_external_register(
+                program,
+                predecessor,
+                len,
+                register,
+                image_base,
+                resolver_slots,
+                dynamic_slots,
+                visiting,
+            )
+        });
     visiting.remove(&key);
     result
 }
@@ -726,13 +783,19 @@ pub fn produce_stack_spill_resolutions(
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
     {
-        let Some(block) = program.blocks.get(&site.source_block) else { continue };
+        let Some(block) = program.blocks.get(&site.source_block) else {
+            continue;
+        };
         let Some(call) = block.instructions.iter().find(|instruction| {
-            instruction.ip().checked_sub(image_base)
-                .and_then(|rva| u32::try_from(rva).ok()) == Some(site.instruction_rva)
-        }) else { continue };
-        if call.op0_kind() != OpKind::Memory
-            || call.memory_base().full_register() != Register::RBP
+            instruction
+                .ip()
+                .checked_sub(image_base)
+                .and_then(|rva| u32::try_from(rva).ok())
+                == Some(site.instruction_rva)
+        }) else {
+            continue;
+        };
+        if call.op0_kind() != OpKind::Memory || call.memory_base().full_register() != Register::RBP
         {
             continue;
         }
@@ -752,17 +815,25 @@ pub fn produce_stack_spill_resolutions(
             }
             continue;
         }
-        let mut instructions = program.blocks.values()
+        let mut instructions = program
+            .blocks
+            .values()
             .filter(|candidate| candidate.function_id == site.source_function)
             .flat_map(|candidate| candidate.instructions.iter())
             .collect::<Vec<_>>();
         instructions.sort_by_key(|instruction| instruction.ip());
-        let Some(call_index) = instructions.iter().position(|instruction| instruction.ip() == call.ip()) else {
+        let Some(call_index) = instructions
+            .iter()
+            .position(|instruction| instruction.ip() == call.ip())
+        else {
             continue;
         };
         let displacement = call.memory_displacement64();
         let mut store = None;
-        for instruction in instructions[call_index.saturating_sub(64)..call_index].iter().rev() {
+        for instruction in instructions[call_index.saturating_sub(64)..call_index]
+            .iter()
+            .rev()
+        {
             if !matches!(instruction.flow_control(), iced_x86::FlowControl::Next) {
                 break;
             }
@@ -775,7 +846,8 @@ pub fn produce_stack_spill_resolutions(
                 break;
             }
         }
-        let Some(store) = store.filter(|instruction| instruction.mnemonic() == Mnemonic::Mov) else {
+        let Some(store) = store.filter(|instruction| instruction.mnemonic() == Mnemonic::Mov)
+        else {
             continue;
         };
         let target_rva = if store.op1_kind() == OpKind::Register {
@@ -783,15 +855,20 @@ pub fn produce_stack_spill_resolutions(
             let Some(definition) = find_contiguous_register_definition(
                 program,
                 site.source_function,
-                u32::try_from(store.ip().checked_sub(image_base).unwrap_or(u64::MAX)).unwrap_or(u32::MAX),
+                u32::try_from(store.ip().checked_sub(image_base).unwrap_or(u64::MAX))
+                    .unwrap_or(u32::MAX),
                 source,
                 image_base,
-            ) else { continue };
+            ) else {
+                continue;
+            };
             direct_definition_target(program, definition, image_base)
         } else {
             direct_definition_target(program, &store, image_base)
         };
-        let Some(target_rva) = target_rva else { continue };
+        let Some(target_rva) = target_rva else {
+            continue;
+        };
         out.push(IndirectResolution {
             site: site.id,
             target_rvas: BTreeSet::from([target_rva]),
@@ -824,7 +901,9 @@ fn resolve_bounded_stack_callback_table(
         .collect::<Vec<_>>();
     instructions.sort_by_key(|instruction| instruction.ip());
     instructions.dedup_by_key(|instruction| instruction.ip());
-    let call_index = instructions.iter().position(|candidate| candidate.ip() == call.ip())?;
+    let call_index = instructions
+        .iter()
+        .position(|candidate| candidate.ip() == call.ip())?;
     let before = &instructions[call_index.saturating_sub(96)..call_index];
     let bound = before.iter().rev().find_map(|instruction| {
         (instruction.mnemonic() == Mnemonic::Cmp
@@ -872,16 +951,17 @@ fn resolve_bounded_stack_callback_table(
                 .iter()
                 .position(|instruction| instruction.ip() == store.ip())?;
             let mut expected_ip = store.ip();
-            let definition = instructions[..store_index]
-                .iter()
-                .rev()
-                .take(8)
-                .find(|instruction| {
-                    let contiguous = instruction.ip().checked_add(instruction.len() as u64)
-                        == Some(expected_ip);
-                    expected_ip = instruction.ip();
-                    contiguous && writes_op0_register(instruction, source)
-                })?;
+            let definition =
+                instructions[..store_index]
+                    .iter()
+                    .rev()
+                    .take(8)
+                    .find(|instruction| {
+                        let contiguous = instruction.ip().checked_add(instruction.len() as u64)
+                            == Some(expected_ip);
+                        expected_ip = instruction.ip();
+                        contiguous && writes_op0_register(instruction, source)
+                    })?;
             direct_definition_target(program, definition, image_base)?
         } else {
             direct_definition_target(program, store, image_base)?
@@ -911,17 +991,31 @@ fn direct_definition_target(
     image_base: u64,
 ) -> Option<u32> {
     let target_va = match definition.mnemonic() {
-        Mnemonic::Lea if definition.op1_kind() == OpKind::Memory
-            && definition.is_ip_rel_memory_operand() => definition.ip_rel_memory_address(),
+        Mnemonic::Lea
+            if definition.op1_kind() == OpKind::Memory && definition.is_ip_rel_memory_operand() =>
+        {
+            definition.ip_rel_memory_address()
+        }
         Mnemonic::Mov if definition.op1_kind() == OpKind::Immediate64 => definition.immediate64(),
         Mnemonic::Mov if definition.op1_kind() == OpKind::Immediate32to64 => {
             definition.immediate32to64() as u64
         }
-        Mnemonic::Mov if definition.op1_kind() == OpKind::Memory
-            && definition.is_ip_rel_memory_operand() => {
-            let slot = u32::try_from(definition.ip_rel_memory_address().checked_sub(image_base)?).ok()?;
-            let pointer = program.code_pointers.values().find(|pointer| pointer.location.start == slot)?;
-            return program.functions.get(&pointer.target)?.entries.iter().next().copied();
+        Mnemonic::Mov
+            if definition.op1_kind() == OpKind::Memory && definition.is_ip_rel_memory_operand() =>
+        {
+            let slot =
+                u32::try_from(definition.ip_rel_memory_address().checked_sub(image_base)?).ok()?;
+            let pointer = program
+                .code_pointers
+                .values()
+                .find(|pointer| pointer.location.start == slot)?;
+            return program
+                .functions
+                .get(&pointer.target)?
+                .entries
+                .iter()
+                .next()
+                .copied();
         }
         _ => return None,
     };
@@ -930,7 +1024,10 @@ fn direct_definition_target(
         .functions
         .values()
         .any(|function| function.entries.contains(&rva))
-        || program.blocks.values().any(|block| block.range.start == rva))
+        || program
+            .blocks
+            .values()
+            .any(|block| block.range.start == rva))
     .then_some(rva)
 }
 
@@ -1060,50 +1157,91 @@ pub fn produce_optional_runtime_callbacks(
     sections: &[SectionData],
 ) -> Vec<MixedRuntimeDispatch> {
     let mut out = Vec::new();
-    for site in program.indirect_targets.sites.values().filter(|site| {
-        site.status == ResolutionStatus::Unresolved
-    }) {
-        let Some(block) = program.blocks.get(&site.source_block) else { continue };
+    for site in program
+        .indirect_targets
+        .sites
+        .values()
+        .filter(|site| site.status == ResolutionStatus::Unresolved)
+    {
+        let Some(block) = program.blocks.get(&site.source_block) else {
+            continue;
+        };
         let Some(call_index) = block.instructions.iter().position(|instruction| {
-            instruction.ip().checked_sub(image_base)
-                .and_then(|rva| u32::try_from(rva).ok()) == Some(site.instruction_rva)
-        }) else { continue };
+            instruction
+                .ip()
+                .checked_sub(image_base)
+                .and_then(|rva| u32::try_from(rva).ok())
+                == Some(site.instruction_rva)
+        }) else {
+            continue;
+        };
         let call = &block.instructions[call_index];
         if call.op0_kind() != OpKind::Register {
             continue;
         }
         let target = call.op0_register().full_register();
         let Some((cmov_index, cmov)) = block.instructions[..call_index]
-            .iter().enumerate().rev()
+            .iter()
+            .enumerate()
+            .rev()
             .find(|(_, instruction)| writes_op0_register(instruction, target))
-        else { continue };
+        else {
+            continue;
+        };
         if !matches!(cmov.mnemonic(), Mnemonic::Cmove | Mnemonic::Cmovne)
             || cmov.op1_kind() != OpKind::Register
         {
             continue;
         }
         let candidate = cmov.op1_register().full_register();
-        let Some(fallback) = block.instructions[..cmov_index].iter().rev().find(|instruction| {
-            writes_op0_register(instruction, target)
-                && instruction.mnemonic() == Mnemonic::Lea
-                && instruction.op1_kind() == OpKind::Memory
-                && instruction.is_ip_rel_memory_operand()
-        }) else { continue };
-        let fallback_rva = u32::try_from(fallback.ip_rel_memory_address().checked_sub(image_base).unwrap_or(u64::MAX)).ok();
+        let Some(fallback) = block.instructions[..cmov_index]
+            .iter()
+            .rev()
+            .find(|instruction| {
+                writes_op0_register(instruction, target)
+                    && instruction.mnemonic() == Mnemonic::Lea
+                    && instruction.op1_kind() == OpKind::Memory
+                    && instruction.is_ip_rel_memory_operand()
+            })
+        else {
+            continue;
+        };
+        let fallback_rva = u32::try_from(
+            fallback
+                .ip_rel_memory_address()
+                .checked_sub(image_base)
+                .unwrap_or(u64::MAX),
+        )
+        .ok();
         let Some(fallback_rva) = fallback_rva.filter(|rva| {
-            program.functions.values().any(|function| function.entries.contains(rva))
-        }) else { continue };
-        let Some(load) = block.instructions[..cmov_index].iter().rev().find(|instruction| {
-            writes_op0_register(instruction, candidate)
-                && instruction.mnemonic() == Mnemonic::Mov
-                && instruction.op1_kind() == OpKind::Memory
-                && instruction.memory_index() == Register::None
-        }) else { continue };
-        let Some(slot_rva) = memory_operand_rva(load, image_base) else { continue };
+            program
+                .functions
+                .values()
+                .any(|function| function.entries.contains(rva))
+        }) else {
+            continue;
+        };
+        let Some(load) = block.instructions[..cmov_index]
+            .iter()
+            .rev()
+            .find(|instruction| {
+                writes_op0_register(instruction, candidate)
+                    && instruction.mnemonic() == Mnemonic::Mov
+                    && instruction.op1_kind() == OpKind::Memory
+                    && instruction.memory_index() == Register::None
+            })
+        else {
+            continue;
+        };
+        let Some(slot_rva) = memory_operand_rva(load, image_base) else {
+            continue;
+        };
         if read_u64(sections, slot_rva) != Some(0) {
             continue;
         }
-        let writes_are_external_or_zero = program.blocks.values()
+        let writes_are_external_or_zero = program
+            .blocks
+            .values()
             .flat_map(|owner| owner.instructions.iter())
             .all(|instruction| {
                 memory_operand_rva(instruction, image_base) != Some(slot_rva)
@@ -1137,26 +1275,37 @@ pub fn produce_runtime_global_callbacks(
     sections: &[SectionData],
 ) -> Vec<(crate::analysis::indirect_targets::IndirectSiteId, u64)> {
     let mut out = Vec::new();
-    for site in program.indirect_targets.sites.values().filter(|site| {
-        site.status == ResolutionStatus::Unresolved
-    }) {
-        let Some(block) = program.blocks.get(&site.source_block) else { continue };
+    for site in program
+        .indirect_targets
+        .sites
+        .values()
+        .filter(|site| site.status == ResolutionStatus::Unresolved)
+    {
+        let Some(block) = program.blocks.get(&site.source_block) else {
+            continue;
+        };
         let Some(site_index) = block.instructions.iter().position(|instruction| {
-            instruction.ip().checked_sub(image_base)
-                .and_then(|rva| u32::try_from(rva).ok()) == Some(site.instruction_rva)
-        }) else { continue };
+            instruction
+                .ip()
+                .checked_sub(image_base)
+                .and_then(|rva| u32::try_from(rva).ok())
+                == Some(site.instruction_rva)
+        }) else {
+            continue;
+        };
         let transfer = &block.instructions[site_index];
         if transfer.op0_kind() != OpKind::Register {
             continue;
         }
         let target = transfer.op0_register().full_register();
-        let Some((definition_block, definition_index)) = find_unique_register_definition(
-            program,
-            site.source_block,
-            site_index,
-            target,
-        ) else { continue };
-        let Some(owner) = program.blocks.get(&definition_block) else { continue };
+        let Some((definition_block, definition_index)) =
+            find_unique_register_definition(program, site.source_block, site_index, target)
+        else {
+            continue;
+        };
+        let Some(owner) = program.blocks.get(&definition_block) else {
+            continue;
+        };
         let definition = &owner.instructions[definition_index];
         if definition.mnemonic() != Mnemonic::Mov
             || definition.op1_kind() != OpKind::Memory
@@ -1164,11 +1313,15 @@ pub fn produce_runtime_global_callbacks(
         {
             continue;
         }
-        let Some(slot_rva) = memory_operand_rva(definition, image_base) else { continue };
+        let Some(slot_rva) = memory_operand_rva(definition, image_base) else {
+            continue;
+        };
         if read_u64(sections, slot_rva) != Some(0) {
             continue;
         }
-        let no_internal_store = program.blocks.values()
+        let no_internal_store = program
+            .blocks
+            .values()
             .flat_map(|candidate| candidate.instructions.iter())
             .all(|instruction| {
                 instruction.op0_kind() != OpKind::Memory
@@ -1191,23 +1344,40 @@ pub fn produce_runtime_stack_callback_dispatches(
     image_base: u64,
 ) -> Vec<(crate::analysis::indirect_targets::IndirectSiteId, u64)> {
     let mut out = Vec::new();
-    for site in program.indirect_targets.sites.values().filter(|site| {
-        site.status == ResolutionStatus::Unresolved
-    }) {
-        let Some(block) = program.blocks.get(&site.source_block) else { continue };
+    for site in program
+        .indirect_targets
+        .sites
+        .values()
+        .filter(|site| site.status == ResolutionStatus::Unresolved)
+    {
+        let Some(block) = program.blocks.get(&site.source_block) else {
+            continue;
+        };
         let Some(call) = block.instructions.iter().find(|instruction| {
-            instruction.ip().checked_sub(image_base)
-                .and_then(|rva| u32::try_from(rva).ok()) == Some(site.instruction_rva)
-        }) else { continue };
+            instruction
+                .ip()
+                .checked_sub(image_base)
+                .and_then(|rva| u32::try_from(rva).ok())
+                == Some(site.instruction_rva)
+        }) else {
+            continue;
+        };
         if call.op0_kind() != OpKind::Memory
             || call.memory_base().full_register() != Register::RBP
             || call.memory_index() != Register::None
         {
             continue;
         }
-        let mut candidates = program.blocks.values()
+        let mut candidates = program
+            .blocks
+            .values()
             .filter(|candidate| candidate.function_id == site.source_function)
-            .flat_map(|candidate| candidate.instructions.iter().map(move |instruction| (candidate.id, instruction)))
+            .flat_map(|candidate| {
+                candidate
+                    .instructions
+                    .iter()
+                    .map(move |instruction| (candidate.id, instruction))
+            })
             .filter(|(_, instruction)| instruction.ip() < call.ip())
             .collect::<Vec<_>>();
         candidates.sort_by_key(|(_, instruction)| instruction.ip());
@@ -1219,15 +1389,27 @@ pub fn produce_runtime_stack_callback_dispatches(
                 && instruction.memory_index() == Register::None
                 && instruction.memory_displacement64() == displacement
                 && instruction.op1_kind() == OpKind::Register
-        }) else { continue };
-        let Some(owner) = program.blocks.get(&store_block) else { continue };
-        let Some(store_index) = owner.instructions.iter().position(|instruction| instruction.ip() == store.ip()) else { continue };
+        }) else {
+            continue;
+        };
+        let Some(owner) = program.blocks.get(&store_block) else {
+            continue;
+        };
+        let Some(store_index) = owner
+            .instructions
+            .iter()
+            .position(|instruction| instruction.ip() == store.ip())
+        else {
+            continue;
+        };
         if trace_register_copy_origin(
             program,
             store_block,
             store_index,
             store.op1_register().full_register(),
-        ).is_none() {
+        )
+        .is_none()
+        {
             continue;
         }
         out.push((site.id, image_base + u64::from(site.instruction_rva)));
@@ -1251,45 +1433,47 @@ pub fn produce_runtime_abi_dispatches(
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
     {
-        let Some(block) = program.blocks.get(&site.source_block) else { continue };
+        let Some(block) = program.blocks.get(&site.source_block) else {
+            continue;
+        };
         let Some(site_index) = block.instructions.iter().position(|instruction| {
-            instruction.ip().checked_sub(image_base)
-                .and_then(|rva| u32::try_from(rva).ok()) == Some(site.instruction_rva)
-        }) else { continue };
+            instruction
+                .ip()
+                .checked_sub(image_base)
+                .and_then(|rva| u32::try_from(rva).ok())
+                == Some(site.instruction_rva)
+        }) else {
+            continue;
+        };
         let transfer = &block.instructions[site_index];
         let origin = match transfer.op0_kind() {
             OpKind::Register => {
                 let target = transfer.op0_register().full_register();
-                trace_register_copy_origin(
-                    program,
-                    site.source_block,
-                    site_index,
-                    target,
-                )
-                .or_else(|| {
-                    let (definition_block, definition_index) =
-                        find_unique_register_definition(
+                trace_register_copy_origin(program, site.source_block, site_index, target).or_else(
+                    || {
+                        let (definition_block, definition_index) = find_unique_register_definition(
                             program,
                             site.source_block,
                             site_index,
                             target,
                         )?;
-                    let owner = program.blocks.get(&definition_block)?;
-                    let definition = &owner.instructions[definition_index];
-                    (definition.mnemonic() == Mnemonic::Mov
-                        && definition.op1_kind() == OpKind::Memory
-                        && definition.memory_base() != Register::RIP
-                        && definition.memory_base() != Register::RSP)
-                        .then(|| {
-                            trace_register_copy_origin(
-                                program,
-                                definition_block,
-                                definition_index,
-                                definition.memory_base().full_register(),
-                            )
-                        })
-                        .flatten()
-                })
+                        let owner = program.blocks.get(&definition_block)?;
+                        let definition = &owner.instructions[definition_index];
+                        (definition.mnemonic() == Mnemonic::Mov
+                            && definition.op1_kind() == OpKind::Memory
+                            && definition.memory_base() != Register::RIP
+                            && definition.memory_base() != Register::RSP)
+                            .then(|| {
+                                trace_register_copy_origin(
+                                    program,
+                                    definition_block,
+                                    definition_index,
+                                    definition.memory_base().full_register(),
+                                )
+                            })
+                            .flatten()
+                    },
+                )
             }
             OpKind::Memory
                 if transfer.memory_base() != Register::RIP
@@ -1574,20 +1758,19 @@ pub fn produce_rust_vtable_resolutions(
                 || (*offset == 0
                     && call.op0_kind() == OpKind::Register
                     && (has_rust_drop_load_chain(
-                            program,
-                            site.source_function,
-                            site.instruction_rva,
-                            call.op0_register().full_register(),
-                            image_base,
-                        ) || has_rust_drop_layout_prefix(
-                            program,
-                            site.source_function,
-                            site.instruction_rva,
-                            call.op0_register().full_register(),
-                            image_base,
-                        )))
-        })
-        else {
+                        program,
+                        site.source_function,
+                        site.instruction_rva,
+                        call.op0_register().full_register(),
+                        image_base,
+                    ) || has_rust_drop_layout_prefix(
+                        program,
+                        site.source_function,
+                        site.instruction_rva,
+                        call.op0_register().full_register(),
+                        image_base,
+                    )))
+        }) else {
             continue;
         };
         let mut target_rvas = BTreeSet::new();
@@ -1626,24 +1809,30 @@ fn find_linear_vtable_method_load(
     image_base: u64,
 ) -> Option<u32> {
     let site_va = image_base.checked_add(u64::from(site_rva))?;
-    let mut instructions = program.blocks.values()
+    let mut instructions = program
+        .blocks
+        .values()
         .filter(|block| block.function_id == function)
         .flat_map(|block| block.instructions.iter())
         .filter(|instruction| instruction.ip() < site_va)
         .collect::<Vec<_>>();
     instructions.sort_by_key(|instruction| instruction.ip());
-    instructions.into_iter().rev().take(16).find_map(|instruction| {
-        writes_op0_register(instruction, target)
-            .then(|| {
-                (instruction.mnemonic() == Mnemonic::Mov
-                    && instruction.op1_kind() == OpKind::Memory
-                    && instruction.memory_index() == Register::None
-                    && instruction.memory_base() != Register::None)
-                    .then(|| u32::try_from(instruction.memory_displacement64()).ok())
-                    .flatten()
-            })
-            .flatten()
-    })
+    instructions
+        .into_iter()
+        .rev()
+        .take(16)
+        .find_map(|instruction| {
+            writes_op0_register(instruction, target)
+                .then(|| {
+                    (instruction.mnemonic() == Mnemonic::Mov
+                        && instruction.op1_kind() == OpKind::Memory
+                        && instruction.memory_index() == Register::None
+                        && instruction.memory_base() != Register::None)
+                        .then(|| u32::try_from(instruction.memory_displacement64()).ok())
+                        .flatten()
+                })
+                .flatten()
+        })
 }
 
 fn has_rust_drop_load_chain(
@@ -1713,7 +1902,9 @@ fn has_rust_drop_layout_prefix(
         .collect::<Vec<_>>();
     instructions.sort_by_key(|instruction| instruction.ip());
     instructions.dedup_by_key(|instruction| instruction.ip());
-    let Some(site_index) = instructions.iter().position(|instruction| instruction.ip() == site_va)
+    let Some(site_index) = instructions
+        .iter()
+        .position(|instruction| instruction.ip() == site_va)
     else {
         return false;
     };
@@ -1845,26 +2036,31 @@ fn provenance_for(encoding: CodePointerEncoding) -> TargetProvenance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iced_x86::{Decoder, DecoderOptions};
     use crate::analysis::indirect_targets::IndirectSiteId;
     use crate::analysis::indirect_targets::{IndirectSite, ResolutionStatus, TargetSet};
     use crate::analysis::program_model::{
         BlockId, BlockModel, ByteClass, CodePointerId, CodePointerModel, FunctionId, FunctionModel,
         FunctionProvenance,
     };
+    use iced_x86::{Decoder, DecoderOptions};
 
     #[test]
     fn register_uses_do_not_hide_the_reaching_definition() {
-        let decode = |bytes: &[u8]| {
-            Decoder::with_ip(64, bytes, 0x140001000, DecoderOptions::NONE).decode()
-        };
+        let decode =
+            |bytes: &[u8]| Decoder::with_ip(64, bytes, 0x140001000, DecoderOptions::NONE).decode();
         assert!(writes_op0_register(
             &decode(&[0x48, 0x8B, 0x3D, 0, 0, 0, 0]),
             Register::RDI
         ));
         assert!(!writes_op0_register(&decode(&[0xFF, 0xD7]), Register::RDI));
-        assert!(!writes_op0_register(&decode(&[0x48, 0x85, 0xFF]), Register::RDI));
-        assert!(!writes_op0_register(&decode(&[0x48, 0x39, 0xF7]), Register::RDI));
+        assert!(!writes_op0_register(
+            &decode(&[0x48, 0x85, 0xFF]),
+            Register::RDI
+        ));
+        assert!(!writes_op0_register(
+            &decode(&[0x48, 0x39, 0xF7]),
+            Register::RDI
+        ));
         assert!(!writes_op0_register(&decode(&[0x57]), Register::RDI));
     }
 
@@ -2020,7 +2216,12 @@ mod tests {
             Register::RAX,
             BASE,
         ));
-        program.blocks.get_mut(&BlockId(1)).unwrap().instructions.pop();
+        program
+            .blocks
+            .get_mut(&BlockId(1))
+            .unwrap()
+            .instructions
+            .pop();
         assert!(!has_rust_drop_layout_prefix(
             &program,
             FunctionId(1),

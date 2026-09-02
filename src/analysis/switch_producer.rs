@@ -315,9 +315,7 @@ fn selector_copy_origin(ins: &[Instruction], load_index: usize, index: Register)
         if !writes_register(instruction, current) {
             continue;
         }
-        if instruction.mnemonic() == Mnemonic::Mov
-            && instruction.op1_kind() == OpKind::Register
-        {
+        if instruction.mnemonic() == Mnemonic::Mov && instruction.op1_kind() == OpKind::Register {
             current = instruction.op1_register().full_register();
         }
         break;

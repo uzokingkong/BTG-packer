@@ -400,29 +400,102 @@ pub(crate) fn emit_distributed_integrity(
 /// 초기화하므로 스크래치로 안전.)
 /// Capture the seed-derived whitening key before cipher setup reuses `seed_va`
 /// as mutable working state.  Every later integrity site consumes this slot.
-pub(crate) fn emit_integrity_whiten(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
+pub(crate) fn emit_integrity_whiten(
+    seq: &mut Vec<(Instruction, Option<Label>)>,
+    stub: &BootStubCtx,
+) {
     use iced_x86::MemoryOperand as M;
     if !stub.integrity {
         return;
     }
-    seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::R15D, Register::R15D).unwrap(), None));
-    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RSI, stub.seed_va).unwrap(), None));
-    seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::R8D, Register::R8D).unwrap(), None));
-    seq.push((Instruction::with2(Code::Xor_r32_rm32, Register::ECX, Register::ECX).unwrap(), None));
-    seq.push((Instruction::with2(Code::Movzx_r32_rm8, Register::EAX, M::with_base(Register::RSI)).unwrap(), Some(Label::WhitenLoop)));
-    seq.push((Instruction::with3(Code::Imul_r32_rm32_imm32, Register::EAX, Register::EAX, 0x9E37_79B9u32 as i32).unwrap(), None));
-    seq.push((Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::ECX).unwrap(), None));
-    seq.push((Instruction::with2(Code::Rol_rm32_imm8, Register::R15D, 3).unwrap(), None));
-    seq.push((Instruction::with2(Code::Xor_rm32_r32, Register::R15D, Register::EAX).unwrap(), None));
-    seq.push((Instruction::with1(Code::Inc_rm64, Register::RSI).unwrap(), None));
-    seq.push((Instruction::with1(Code::Inc_rm32, Register::R8D).unwrap(), None));
-    seq.push((Instruction::with2(Code::Add_rm32_imm32, Register::ECX, 0x9E37_79B9u32 as i32).unwrap(), None));
-    seq.push((Instruction::with2(Code::Cmp_rm32_imm32, Register::R8D, 256).unwrap(), None));
-    seq.push((Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(), Some(Label::WhitenLoop)));
-    seq.push((Instruction::with2(Code::Rol_rm32_imm8, Register::R15D, 13).unwrap(), None));
-    seq.push((Instruction::with2(Code::Xor_rm32_imm32, Register::R15D, 0xA5A5_5A5Au32).unwrap(), None));
-    seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.w32_slot_va).unwrap(), None));
-    seq.push((Instruction::with2(Code::Mov_rm32_r32, M::with_base(Register::RAX), Register::R15D).unwrap(), None));
+    seq.push((
+        Instruction::with2(Code::Xor_r32_rm32, Register::R15D, Register::R15D).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Mov_r64_imm64, Register::RSI, stub.seed_va).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Xor_r32_rm32, Register::R8D, Register::R8D).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Xor_r32_rm32, Register::ECX, Register::ECX).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Movzx_r32_rm8,
+            Register::EAX,
+            M::with_base(Register::RSI),
+        )
+        .unwrap(),
+        Some(Label::WhitenLoop),
+    ));
+    seq.push((
+        Instruction::with3(
+            Code::Imul_r32_rm32_imm32,
+            Register::EAX,
+            Register::EAX,
+            0x9E37_79B9u32 as i32,
+        )
+        .unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::ECX).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Rol_rm32_imm8, Register::R15D, 3).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Xor_rm32_r32, Register::R15D, Register::EAX).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with1(Code::Inc_rm64, Register::RSI).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with1(Code::Inc_rm32, Register::R8D).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Add_rm32_imm32, Register::ECX, 0x9E37_79B9u32 as i32).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Cmp_rm32_imm32, Register::R8D, 256).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(),
+        Some(Label::WhitenLoop),
+    ));
+    seq.push((
+        Instruction::with2(Code::Rol_rm32_imm8, Register::R15D, 13).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Xor_rm32_imm32, Register::R15D, 0xA5A5_5A5Au32).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.w32_slot_va).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Mov_rm32_r32,
+            M::with_base(Register::RAX),
+            Register::R15D,
+        )
+        .unwrap(),
+        None,
+    ));
 }
 
 pub(crate) fn emit_integrity_mac(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
@@ -447,106 +520,107 @@ pub(crate) fn emit_integrity_mac(seq: &mut Vec<(Instruction, Option<Label>)>, st
         // Legacy in-place derivation is intentionally disabled: cipher setup
         // has already reused seed_va as mutable state at this point.
         if false {
-        // ── W32 whiten-key 유도 (R15D): seed_va(런타임 seed_masked)를 폴드해
-        //    derive_whiten_key(seed_masked)와 동일 값을 만든다. 저장된 CRC/MAC
-        //    값은 이 값으로 whiten되므로 파일에서 평문이 아니다. R15는 여기서부터
-        //    site-2(emit_integrity_crc2)까지 생존한다 (run/rest decrypt는 R15를
-        //    건드리지 않는다). RSI/R8D/EAX는 이후 Phase A가 재초기화하므로 스크래치.
-        //    (imul/rol/cmp/jb — 전부 고정 길이, 값과 무관)
-        seq.push((
-            Instruction::with2(Code::Xor_r32_rm32, Register::R15D, Register::R15D).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Mov_r64_imm64, Register::RSI, stub.seed_va).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Xor_r32_rm32, Register::R8D, Register::R8D).unwrap(),
-            None,
-        )); // i = 0 (카운터)
-        seq.push((
-            Instruction::with2(Code::Xor_r32_rm32, Register::ECX, Register::ECX).unwrap(),
-            None,
-        )); // i*PHI = 0 (누적)
-            // WhitenLoop:
-        seq.push((
-            Instruction::with2(
-                Code::Movzx_r32_rm8,
-                Register::EAX,
-                M::with_base(Register::RSI),
-            )
-            .unwrap(),
-            Some(Label::WhitenLoop),
-        ));
-        seq.push((
-            Instruction::with3(
-                Code::Imul_r32_rm32_imm32,
-                Register::EAX,
-                Register::EAX,
-                0x9E37_79B9u32 as i32,
-            )
-            .unwrap(),
-            None,
-        )); // b*PHI32
-        seq.push((
-            Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::ECX).unwrap(),
-            None,
-        )); // ^ (i*PHI32)
-        seq.push((
-            Instruction::with2(Code::Rol_rm32_imm8, Register::R15D, 3).unwrap(),
-            None,
-        )); // w=rol(w,3)
-        seq.push((
-            Instruction::with2(Code::Xor_rm32_r32, Register::R15D, Register::EAX).unwrap(),
-            None,
-        )); // w ^= ...
-        seq.push((
-            Instruction::with1(Code::Inc_rm64, Register::RSI).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with1(Code::Inc_rm32, Register::R8D).unwrap(),
-            None,
-        )); // i++
-        seq.push((
-            Instruction::with2(Code::Add_rm32_imm32, Register::ECX, 0x9E37_79B9u32 as i32).unwrap(),
-            None,
-        )); // i*PHI += PHI
-        seq.push((
-            Instruction::with2(Code::Cmp_rm32_imm32, Register::R8D, 256).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(),
-            Some(Label::WhitenLoop),
-        ));
-        seq.push((
-            Instruction::with2(Code::Rol_rm32_imm8, Register::R15D, 13).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(Code::Xor_rm32_imm32, Register::R15D, 0xA5A5_5A5Au32).unwrap(),
-            None,
-        ));
-        // Load address is deliberately absent from W32. ASLR changes it before
-        // bootstrap, while the authenticated image/region identity is stable.
-        // S3/S4 확장: W32(R15)를 스크래치 슬롯(w32_slot)에 저장 — 사이트 3/4가
-        // R15가 IAT 리졸브 등에서 클로버된 뒤에도 같은 runtime-derived whiten을
-        // 재사용한다. RAX는 직후 bind_byte 유도에서 즉시 덮어쓰므로 안전.
-        seq.push((
-            Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.w32_slot_va).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(
-                Code::Mov_rm32_r32,
-                MemoryOperand::with_base(Register::RAX),
-                Register::R15D,
-            )
-            .unwrap(),
-            None,
-        ));
+            // ── W32 whiten-key 유도 (R15D): seed_va(런타임 seed_masked)를 폴드해
+            //    derive_whiten_key(seed_masked)와 동일 값을 만든다. 저장된 CRC/MAC
+            //    값은 이 값으로 whiten되므로 파일에서 평문이 아니다. R15는 여기서부터
+            //    site-2(emit_integrity_crc2)까지 생존한다 (run/rest decrypt는 R15를
+            //    건드리지 않는다). RSI/R8D/EAX는 이후 Phase A가 재초기화하므로 스크래치.
+            //    (imul/rol/cmp/jb — 전부 고정 길이, 값과 무관)
+            seq.push((
+                Instruction::with2(Code::Xor_r32_rm32, Register::R15D, Register::R15D).unwrap(),
+                None,
+            ));
+            seq.push((
+                Instruction::with2(Code::Mov_r64_imm64, Register::RSI, stub.seed_va).unwrap(),
+                None,
+            ));
+            seq.push((
+                Instruction::with2(Code::Xor_r32_rm32, Register::R8D, Register::R8D).unwrap(),
+                None,
+            )); // i = 0 (카운터)
+            seq.push((
+                Instruction::with2(Code::Xor_r32_rm32, Register::ECX, Register::ECX).unwrap(),
+                None,
+            )); // i*PHI = 0 (누적)
+                // WhitenLoop:
+            seq.push((
+                Instruction::with2(
+                    Code::Movzx_r32_rm8,
+                    Register::EAX,
+                    M::with_base(Register::RSI),
+                )
+                .unwrap(),
+                Some(Label::WhitenLoop),
+            ));
+            seq.push((
+                Instruction::with3(
+                    Code::Imul_r32_rm32_imm32,
+                    Register::EAX,
+                    Register::EAX,
+                    0x9E37_79B9u32 as i32,
+                )
+                .unwrap(),
+                None,
+            )); // b*PHI32
+            seq.push((
+                Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::ECX).unwrap(),
+                None,
+            )); // ^ (i*PHI32)
+            seq.push((
+                Instruction::with2(Code::Rol_rm32_imm8, Register::R15D, 3).unwrap(),
+                None,
+            )); // w=rol(w,3)
+            seq.push((
+                Instruction::with2(Code::Xor_rm32_r32, Register::R15D, Register::EAX).unwrap(),
+                None,
+            )); // w ^= ...
+            seq.push((
+                Instruction::with1(Code::Inc_rm64, Register::RSI).unwrap(),
+                None,
+            ));
+            seq.push((
+                Instruction::with1(Code::Inc_rm32, Register::R8D).unwrap(),
+                None,
+            )); // i++
+            seq.push((
+                Instruction::with2(Code::Add_rm32_imm32, Register::ECX, 0x9E37_79B9u32 as i32)
+                    .unwrap(),
+                None,
+            )); // i*PHI += PHI
+            seq.push((
+                Instruction::with2(Code::Cmp_rm32_imm32, Register::R8D, 256).unwrap(),
+                None,
+            ));
+            seq.push((
+                Instruction::with_branch(Code::Jb_rel32_64, 0).unwrap(),
+                Some(Label::WhitenLoop),
+            ));
+            seq.push((
+                Instruction::with2(Code::Rol_rm32_imm8, Register::R15D, 13).unwrap(),
+                None,
+            ));
+            seq.push((
+                Instruction::with2(Code::Xor_rm32_imm32, Register::R15D, 0xA5A5_5A5Au32).unwrap(),
+                None,
+            ));
+            // Load address is deliberately absent from W32. ASLR changes it before
+            // bootstrap, while the authenticated image/region identity is stable.
+            // S3/S4 확장: W32(R15)를 스크래치 슬롯(w32_slot)에 저장 — 사이트 3/4가
+            // R15가 IAT 리졸브 등에서 클로버된 뒤에도 같은 runtime-derived whiten을
+            // 재사용한다. RAX는 직후 bind_byte 유도에서 즉시 덮어쓰므로 안전.
+            seq.push((
+                Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.w32_slot_va).unwrap(),
+                None,
+            ));
+            seq.push((
+                Instruction::with2(
+                    Code::Mov_rm32_r32,
+                    MemoryOperand::with_base(Register::RAX),
+                    Register::R15D,
+                )
+                .unwrap(),
+                None,
+            ));
         }
         seq.push((
             Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.w32_slot_va).unwrap(),

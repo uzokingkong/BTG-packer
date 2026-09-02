@@ -93,9 +93,7 @@ impl CodePointerScan<'_> {
                 let Some(location_end) = location.checked_add(8) else {
                     continue;
                 };
-                if self.is_protected(location, 8)
-                    || self.overlaps_dir64(location, location_end)
-                {
+                if self.is_protected(location, 8) || self.overlaps_dir64(location, location_end) {
                     continue;
                 }
                 let value =

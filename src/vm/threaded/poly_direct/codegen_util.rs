@@ -339,7 +339,9 @@ impl CodeBuilder {
                 return Err(anyhow!("branch instruction index {bi} is out of range"));
             }
             if ti >= self.instrs.len() {
-                return Err(anyhow!("branch target instruction index {ti} is out of range"));
+                return Err(anyhow!(
+                    "branch target instruction index {ti} is out of range"
+                ));
             }
             self.instrs[bi].set_near_branch64(base_va);
         }
@@ -377,9 +379,9 @@ impl CodeBuilder {
             }
         }
         let code = encoder.take_buffer();
-        let expected_len = ip
-            .checked_sub(base_va)
-            .ok_or_else(|| anyhow!("CodeBuilder final size underflow"))? as usize;
+        let expected_len =
+            ip.checked_sub(base_va)
+                .ok_or_else(|| anyhow!("CodeBuilder final size underflow"))? as usize;
         if code.len() != expected_len {
             return Err(anyhow!(
                 "fixed-width CodeBuilder size drift: measured {expected_len} byte(s), encoded {} byte(s)",
