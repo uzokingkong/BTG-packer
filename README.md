@@ -1,4 +1,5 @@
 # BTG Packer
+<img width="280" height="268" alt="image" src="https://github.com/user-attachments/assets/5b80e8e9-e05d-4a7d-a743-bba663cfc0b7" />
 
 ### Windows x86-64 PE Transformation & Program Virtualization Framework
 
