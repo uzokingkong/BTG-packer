@@ -709,6 +709,12 @@ fn build_native_entry_gateway(
             Register::RAX,
         )?);
     }
+    // Carry claim metadata across restoration of the architectural argument
+    // registers. R8/R9 are Win64 volatile and their guest values are already in
+    // the selected VM state, so they can safely transport bitmap VA / slot until
+    // the lane-private host frame has been established.
+    ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::R8, Register::RBX)?);
+    ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::RCX)?);
     for reg in [
         Register::R15,
         Register::R14,
@@ -726,10 +732,10 @@ fn build_native_entry_gateway(
         Register::RCX,
         Register::RAX,
     ] {
-        if reg == Register::R10 || reg == Register::R11 {
-            // R10 carries the selected state and R11 carries the lane-private
-            // native stack top.  Their guest values already live in the lane's
-            // architectural state and both registers are volatile in Win64.
+        if matches!(reg, Register::R8 | Register::R9 | Register::R10 | Register::R11) {
+            // R10 = selected state, R11 = lane-private stack top, R8 = occupancy
+            // bitmap VA, R9 = exact claimed slot. All four are Win64 volatile;
+            // their guest values have already been copied into VM state.
             ins.push(Instruction::with2(Code::Add_rm64_imm8, Register::RSP, 8)?);
         } else {
             ins.push(Instruction::with1(Code::Pop_r64, reg)?);
@@ -787,12 +793,12 @@ fn build_native_entry_gateway(
     ins.push(Instruction::with2(
         Code::Mov_rm64_r64,
         MemoryOperand::with_base_displ_size(Register::RSP, 0x30, 8),
-        Register::RBX,
+        Register::R8,
     )?);
     ins.push(Instruction::with2(
         Code::Mov_rm64_r64,
         MemoryOperand::with_base_displ_size(Register::RSP, 0xE0, 8),
-        Register::RCX,
+        Register::R9,
     )?);
     for (index, xmm) in [
         Register::XMM6,
