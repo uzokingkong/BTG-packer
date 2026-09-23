@@ -1558,6 +1558,40 @@ mod invocation_layout_tests {
     }
 
     #[test]
+    fn native_gateway_uses_live_occupancy_not_depth_counter() {
+        let layout = vm::threaded::VmRuntimeLayout::from_seed(11);
+        let bytes = build_native_entry_gateway(
+            0x0000_0001_4200_0000,
+            0x0000_0001_4201_0000,
+            0x0000_0001_5200_0000,
+            0,
+            &layout,
+            0x0000_0001_6200_0000,
+            0x20_000,
+            0x0000_0001_7200_0000,
+        )
+        .unwrap();
+        let mut decoder = iced_x86::Decoder::with_ip(
+            64,
+            &bytes,
+            0x0000_0001_4200_0000,
+            iced_x86::DecoderOptions::NONE,
+        );
+        let instructions: Vec<_> =
+            std::iter::from_fn(|| decoder.can_decode().then(|| decoder.decode())).collect();
+
+        assert!(instructions
+            .iter()
+            .any(|instruction| instruction.code() == Code::Bts_rm64_r64 && instruction.has_lock_prefix()));
+        assert!(instructions
+            .iter()
+            .any(|instruction| instruction.code() == Code::Btr_rm64_r64 && instruction.has_lock_prefix()));
+        assert!(!instructions
+            .iter()
+            .any(|instruction| matches!(instruction.code(), Code::Xadd_rm32_r32 | Code::Dec_rm32)));
+    }
+
+    #[test]
     fn global_tail_does_not_overlap_family_states_or_host_stacks() {
         let state_va = 0x0000_0001_6000_0000u64;
         let families = 4usize;
