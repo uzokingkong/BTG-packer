@@ -342,6 +342,11 @@ fn build_native_entry_gateway(
     lane_group_stride: u64,
     host_stack_pool_va: u64,
 ) -> anyhow::Result<Vec<u8>> {
+    // IMUL r64,r/m64,imm32 sign-extends its immediate. Reject layouts that
+    // cannot be represented exactly instead of silently truncating a usize/u64
+    // stride and selecting an unrelated family-state address at runtime.
+    let lane_group_stride_i32 = i32::try_from(lane_group_stride)
+        .map_err(|_| anyhow::anyhow!("native gateway lane-group stride exceeds signed imm32: {lane_group_stride:#x}"))?;
     let mut ins = Vec::new();
     ins.push(Instruction::with(Code::Pushfq));
     for reg in [
@@ -456,7 +461,7 @@ fn build_native_entry_gateway(
         Code::Imul_r64_rm64_imm32,
         Register::RAX,
         Register::RAX,
-        lane_group_stride as i32,
+        lane_group_stride_i32,
     )?);
     ins.push(Instruction::with2(
         Code::Add_rm64_r64,
