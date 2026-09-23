@@ -33,7 +33,11 @@ pub(crate) const VM_INVOCATION_LANES: usize =
 /// the gateway return address or the dynamic-entry nonvolatile frame.
 pub(crate) const VM_HOST_STACK_SIZE: usize = 0x1_0000;
 pub(crate) const VM_HOST_STACK_SLOTS: usize = VM_INVOCATION_LANES + 1;
-const VM_LANE_CONTROL_SIZE: usize = VM_THREAD_BUCKETS * core::mem::size_of::<u32>();
+// Each hashed thread bucket owns a 64-bit live-slot bitmap. A set bit means
+// the corresponding native-entry root lane (and its host stack) is currently
+// in use. This is occupancy, not a nesting counter: out-of-order returns can
+// therefore release their exact slot without making another live slot reusable.
+const VM_LANE_CONTROL_SIZE: usize = VM_THREAD_BUCKETS * core::mem::size_of::<u64>();
 const VM_STATE_TAIL_ALIGN: usize = 0x1000;
 
 #[derive(Debug, Clone, Copy)]
@@ -332,6 +336,110 @@ fn build_canonical_oep_gateway(
     .code_buffer)
 }
 
+fn encode_native_lane_claim(claim_va: u64) -> anyhow::Result<Vec<u8>> {
+    use std::collections::HashMap;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    enum L {
+        Retry,
+        Exhausted,
+        Acquired,
+    }
+
+    fn is_branch(code: Code) -> bool {
+        matches!(code, Code::Je_rel32_64 | Code::Jb_rel32_64 | Code::Jmp_rel32_64)
+    }
+
+    fn measure(inst: &Instruction, ip: u64) -> usize {
+        let one = [*inst];
+        BlockEncoder::encode(
+            64,
+            InstructionBlock::new(&one, ip),
+            BlockEncoderOptions::DONT_FIX_BRANCHES,
+        )
+        .map(|encoded| encoded.code_buffer.len())
+        .unwrap_or_else(|_| if inst.len() != 0 { inst.len() } else { 6 })
+    }
+
+    // RBX = bucket bitmap address. Preserve EAX (bucket index); return the
+    // exclusively claimed slot in ECX. BSF chooses a currently clear bit and
+    // LOCK BTS performs the actual atomic claim. If another thread wins the
+    // same bit between the snapshot and BTS, retry from a fresh snapshot.
+    let mut seq: Vec<(Instruction, Option<L>)> = vec![
+        (
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RDX,
+                MemoryOperand::with_base(Register::RBX),
+            )?,
+            Some(L::Retry),
+        ),
+        (
+            Instruction::with1(Code::Not_rm64, Register::RDX)?,
+            None,
+        ),
+        (
+            Instruction::with2(Code::Bsf_r64_rm64, Register::RCX, Register::RDX)?,
+            None,
+        ),
+        (
+            Instruction::with_branch(Code::Je_rel32_64, 0)?,
+            Some(L::Exhausted),
+        ),
+    ];
+    let mut claim = Instruction::with2(
+        Code::Bts_rm64_r64,
+        MemoryOperand::with_base(Register::RBX),
+        Register::RCX,
+    )?;
+    claim.set_has_lock_prefix(true);
+    seq.push((claim, None));
+    seq.push((
+        Instruction::with_branch(Code::Jb_rel32_64, 0)?,
+        Some(L::Retry),
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Jmp_rel32_64, 0)?,
+        Some(L::Acquired),
+    ));
+    // All 64 roots in this bucket are live. Never wrap and alias a live state:
+    // fail closed instead of turning state/stack corruption into a later AV.
+    seq.push((Instruction::with(Code::Ud2), Some(L::Exhausted)));
+    seq.push((Instruction::with(Code::Nopd), Some(L::Acquired)));
+
+    let mut ip = claim_va;
+    let mut labels = HashMap::new();
+    for (inst, label) in &seq {
+        let mut measured = *inst;
+        if label.is_some() && is_branch(inst.code()) {
+            measured = Instruction::with_branch(inst.code(), ip)?;
+        }
+        if let Some(label) = label {
+            if !is_branch(inst.code()) {
+                labels.insert(*label, ip);
+            }
+        }
+        ip += measure(&measured, ip) as u64;
+    }
+    for (inst, label) in &mut seq {
+        if let Some(label) = label {
+            if is_branch(inst.code()) {
+                let target = *labels
+                    .get(label)
+                    .ok_or_else(|| anyhow::anyhow!("native lane claim unresolved label {label:?}"))?;
+                *inst = Instruction::with_branch(inst.code(), target)?;
+            }
+        }
+    }
+    let instructions: Vec<_> = seq.into_iter().map(|(inst, _)| inst).collect();
+    Ok(BlockEncoder::encode(
+        64,
+        InstructionBlock::new(&instructions, claim_va),
+        BlockEncoderOptions::DONT_FIX_BRANCHES,
+    )?
+    .code_buffer)
+}
+
 fn build_native_entry_gateway(
     gateway_va: u64,
     entry_va: u64,
@@ -342,6 +450,11 @@ fn build_native_entry_gateway(
     lane_group_stride: u64,
     host_stack_pool_va: u64,
 ) -> anyhow::Result<Vec<u8>> {
+    // IMUL r64,r/m64,imm32 sign-extends its immediate. Reject layouts that
+    // cannot be represented exactly instead of silently truncating a usize/u64
+    // stride and selecting an unrelated family-state address at runtime.
+    let lane_group_stride_i32 = i32::try_from(lane_group_stride)
+        .map_err(|_| anyhow::anyhow!("native gateway lane-group stride exceeds signed imm32: {lane_group_stride:#x}"))?;
     let mut ins = Vec::new();
     ins.push(Instruction::with(Code::Pushfq));
     for reg in [
@@ -368,8 +481,12 @@ fn build_native_entry_gateway(
         Register::R10,
         state_va,
     )?);
-    // Select (thread bucket, recursive depth) with an atomic depth counter.
-    // Lane zero is reserved for the canonical OEP invocation.
+    // Hash the current thread into a control bucket, then claim one of that
+    // bucket's 64 native roots by live occupancy. The old depth-counter scheme
+    // assumed LIFO completion: if A and B were live and A returned first, a
+    // later C could reuse B's still-live slot. A bitmap records the lifetime of
+    // each root independently, so non-LIFO callbacks cannot alias VM state or
+    // lane-private host stacks.
     let mut read_tid = Instruction::with2(
         Code::Mov_r32_rm32,
         Register::EAX,
@@ -390,24 +507,29 @@ fn build_native_entry_gateway(
     ins.push(Instruction::with2(
         Code::Lea_r64_m,
         Register::RBX,
-        MemoryOperand::with_base_index_scale(Register::RBX, Register::RAX, 4),
+        MemoryOperand::with_base_index_scale(Register::RBX, Register::RAX, 8),
     )?);
-    ins.push(Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 1)?);
-    let mut xadd = Instruction::with2(
-        Code::Xadd_rm32_r32,
-        MemoryOperand::with_base(Register::RBX),
-        Register::ECX,
-    )?;
-    xadd.set_has_lock_prefix(true);
-    ins.push(xadd);
-    ins.push(Instruction::with2(
-        Code::And_rm32_imm32,
-        Register::ECX,
-        (VM_REENTRY_DEPTHS - 1) as i32,
-    )?);
-    // One thread bucket owns VM_REENTRY_DEPTHS consecutive lanes. Keep this
-    // scale derived from the configured power-of-two depth count; the old
-    // hard-coded x8 overlapped buckets after depths grew to 32.
+
+    // Encode the small retry loop as its own block so its local branches are
+    // resolved exactly while the rest of the gateway can keep using the normal
+    // straight-line BlockEncoder path.
+    let prefix = BlockEncoder::encode(
+        64,
+        InstructionBlock::new(&ins, gateway_va),
+        BlockEncoderOptions::NONE,
+    )?
+    .code_buffer;
+    let claim_va = gateway_va
+        .checked_add(prefix.len() as u64)
+        .ok_or_else(|| anyhow::anyhow!("native lane-claim VA overflow"))?;
+    let claim = encode_native_lane_claim(claim_va)?;
+    let suffix_va = claim_va
+        .checked_add(claim.len() as u64)
+        .ok_or_else(|| anyhow::anyhow!("native gateway suffix VA overflow"))?;
+    ins.clear();
+    // One thread bucket owns VM_REENTRY_DEPTHS consecutive native roots.
+    // ECX is the exact live slot claimed above; it is not a recursive-depth
+    // counter and must be released by bit number when this invocation returns.
     ins.push(Instruction::with2(
         Code::Shl_rm32_imm8,
         Register::EAX,
@@ -456,7 +578,7 @@ fn build_native_entry_gateway(
         Code::Imul_r64_rm64_imm32,
         Register::RAX,
         Register::RAX,
-        lane_group_stride as i32,
+        lane_group_stride_i32,
     )?);
     ins.push(Instruction::with2(
         Code::Add_rm64_r64,
@@ -587,6 +709,12 @@ fn build_native_entry_gateway(
             Register::RAX,
         )?);
     }
+    // Carry claim metadata across restoration of the architectural argument
+    // registers. R8/R9 are Win64 volatile and their guest values are already in
+    // the selected VM state, so they can safely transport bitmap VA / slot until
+    // the lane-private host frame has been established.
+    ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::R8, Register::RBX)?);
+    ins.push(Instruction::with2(Code::Mov_r64_rm64, Register::R9, Register::RCX)?);
     for reg in [
         Register::R15,
         Register::R14,
@@ -604,10 +732,10 @@ fn build_native_entry_gateway(
         Register::RCX,
         Register::RAX,
     ] {
-        if reg == Register::R10 || reg == Register::R11 {
-            // R10 carries the selected state and R11 carries the lane-private
-            // native stack top.  Their guest values already live in the lane's
-            // architectural state and both registers are volatile in Win64.
+        if matches!(reg, Register::R8 | Register::R9 | Register::R10 | Register::R11) {
+            // R10 = selected state, R11 = lane-private stack top, R8 = occupancy
+            // bitmap VA, R9 = exact claimed slot. All four are Win64 volatile;
+            // their guest values have already been copied into VM state.
             ins.push(Instruction::with2(Code::Add_rm64_imm8, Register::RSP, 8)?);
         } else {
             ins.push(Instruction::with1(Code::Pop_r64, reg)?);
@@ -635,18 +763,18 @@ fn build_native_entry_gateway(
         Register::RSP,
         Register::R11,
     )?);
-    // Reserve Win64 shadow space, bridge metadata, and 10 x 16 bytes for the
-    // nonvolatile XMM6..XMM15 register set.  A native entry gateway is itself a
-    // Win64 callee; the Program VM is free to use every physical XMM register,
-    // so failing to preserve XMM15 corrupted an enclosing native-call bridge's
-    // host-frame carrier during recursive callback entry.
+    // Reserve Win64 shadow space, bridge metadata, 10 x 16 bytes for the
+    // nonvolatile XMM6..XMM15 register set, and one final qword containing the
+    // exact occupancy bit claimed for this invocation. 0xF0 preserves the
+    // required 16-byte pre-call alignment.
     ins.push(Instruction::with2(
         Code::Sub_rm64_imm32,
         Register::RSP,
-        0xE0,
+        0xF0,
     )?);
     // Persistent host frame: +0x20 guest RSP, +0x28 original RBX,
-    // +0x30 depth-counter VA, +0x38 selected architectural state.
+    // +0x30 occupancy-bitmap VA, +0x38 selected architectural state,
+    // +0xE0 claimed slot index.
     ins.push(Instruction::with2(
         Code::Mov_rm64_r64,
         MemoryOperand::with_base_displ_size(Register::RSP, 0x20, 8),
@@ -661,6 +789,16 @@ fn build_native_entry_gateway(
         Code::Mov_rm64_r64,
         MemoryOperand::with_base_displ_size(Register::RSP, 0x38, 8),
         Register::R10,
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_rm64_r64,
+        MemoryOperand::with_base_displ_size(Register::RSP, 0x30, 8),
+        Register::R8,
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_rm64_r64,
+        MemoryOperand::with_base_displ_size(Register::RSP, 0xE0, 8),
+        Register::R9,
     )?);
     for (index, xmm) in [
         Register::XMM6,
@@ -684,43 +822,27 @@ fn build_native_entry_gateway(
         )?);
     }
 
-    let mut read_tid_release = Instruction::with2(
-        Code::Mov_r32_rm32,
-        Register::EAX,
-        MemoryOperand::with_displ(0x48, 8),
-    )?;
-    read_tid_release.set_segment_prefix(Register::GS);
-    ins.push(read_tid_release);
-    ins.push(Instruction::with2(
-        Code::And_rm32_imm32,
-        Register::EAX,
-        (VM_THREAD_BUCKETS - 1) as i32,
-    )?);
-    ins.push(Instruction::with2(
-        Code::Mov_r64_imm64,
-        Register::RBX,
-        lane_control_va,
-    )?);
-    ins.push(Instruction::with2(
-        Code::Lea_r64_m,
-        Register::RBX,
-        MemoryOperand::with_base_index_scale(Register::RBX, Register::RAX, 4),
-    )?);
-    ins.push(Instruction::with2(
-        Code::Mov_rm64_r64,
-        MemoryOperand::with_base_displ_size(Register::RSP, 0x30, 8),
-        Register::RBX,
-    )?);
     ins.push(Instruction::with_branch(Code::Call_rel32_64, entry_va)?);
 
+    // Release exactly the root this invocation claimed. LOCK BTR is independent
+    // of completion order: returning A clears only A even while B remains live.
     ins.push(Instruction::with2(
         Code::Mov_r64_rm64,
         Register::RBX,
         MemoryOperand::with_base_displ_size(Register::RSP, 0x30, 8),
     )?);
-    let mut dec = Instruction::with1(Code::Dec_rm32, MemoryOperand::with_base(Register::RBX))?;
-    dec.set_has_lock_prefix(true);
-    ins.push(dec);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::RCX,
+        MemoryOperand::with_base_displ_size(Register::RSP, 0xE0, 8),
+    )?);
+    let mut release = Instruction::with2(
+        Code::Btr_rm64_r64,
+        MemoryOperand::with_base(Register::RBX),
+        Register::RCX,
+    )?;
+    release.set_has_lock_prefix(true);
+    ins.push(release);
     // HALT guarantees virtual RAX in physical RAX, but Win64 aggregate returns
     // also use RDX and FP/vector returns use XMM0. The dynamic entry's physical
     // RDX is its state-base ABI argument, so publish all return channels from
@@ -782,12 +904,16 @@ fn build_native_entry_gateway(
         Register::R11,
     )?);
     ins.push(Instruction::with(Code::Retnq));
-    Ok(BlockEncoder::encode(
+    let suffix = BlockEncoder::encode(
         64,
-        InstructionBlock::new(&ins, gateway_va),
+        InstructionBlock::new(&ins, suffix_va),
         BlockEncoderOptions::NONE,
     )?
-    .code_buffer)
+    .code_buffer;
+    let mut code = prefix;
+    code.extend_from_slice(&claim);
+    code.extend_from_slice(&suffix);
+    Ok(code)
 }
 
 pub(crate) fn build_multi_family_prog_mod(
@@ -1429,6 +1555,40 @@ mod invocation_layout_tests {
         assert!(!instructions.iter().any(|instruction| {
             instruction.code() == Code::Inc_rm32 && instruction.op0_register() == Register::EAX
         }));
+    }
+
+    #[test]
+    fn native_gateway_uses_live_occupancy_not_depth_counter() {
+        let layout = vm::threaded::VmRuntimeLayout::from_seed(11);
+        let bytes = build_native_entry_gateway(
+            0x0000_0001_4200_0000,
+            0x0000_0001_4201_0000,
+            0x0000_0001_5200_0000,
+            0,
+            &layout,
+            0x0000_0001_6200_0000,
+            0x20_000,
+            0x0000_0001_7200_0000,
+        )
+        .unwrap();
+        let mut decoder = iced_x86::Decoder::with_ip(
+            64,
+            &bytes,
+            0x0000_0001_4200_0000,
+            iced_x86::DecoderOptions::NONE,
+        );
+        let instructions: Vec<_> =
+            std::iter::from_fn(|| decoder.can_decode().then(|| decoder.decode())).collect();
+
+        assert!(instructions
+            .iter()
+            .any(|instruction| instruction.code() == Code::Bts_rm64_r64 && instruction.has_lock_prefix()));
+        assert!(instructions
+            .iter()
+            .any(|instruction| instruction.code() == Code::Btr_rm64_r64 && instruction.has_lock_prefix()));
+        assert!(!instructions
+            .iter()
+            .any(|instruction| matches!(instruction.code(), Code::Xadd_rm32_r32 | Code::Dec_rm32)));
     }
 
     #[test]
