@@ -55,6 +55,7 @@ pub enum OwnershipReason {
     LegacyHighByteRegister,
     SemanticDependencyPropagation,
     IntegrationQuarantine,
+    PerformanceCriticalNative,
     UnsupportedVmOpcode,
     FunctionAtomicityPropagation,
     AnalysisFailure,
@@ -80,6 +81,7 @@ impl OwnershipReason {
             Self::LegacyHighByteRegister => "legacy-high-byte-register",
             Self::SemanticDependencyPropagation => "semantic-dependency-propagation",
             Self::IntegrationQuarantine => "integration-quarantine",
+            Self::PerformanceCriticalNative => "performance-critical-native",
             Self::UnsupportedVmOpcode => "unsupported-vm-opcode",
             Self::FunctionAtomicityPropagation => "function-atomicity-propagation",
             Self::AnalysisFailure => "analysis-failure",
@@ -108,6 +110,9 @@ impl OwnershipReason {
             "native-import-gateway" | "native_import_gateway" => Self::NativeImportGateway,
             "native-callback-gateway" | "native_callback_gateway" => Self::NativeCallbackGateway,
             "data-code-overlap" | "data_code_overlap" => Self::DataCodeOverlap,
+            "performance-critical-native" | "performance_critical_native" => {
+                Self::PerformanceCriticalNative
+            }
             "analysis-failure" | "analysis_failure" => Self::AnalysisFailure,
             _ => Self::AnalysisFailure,
         }

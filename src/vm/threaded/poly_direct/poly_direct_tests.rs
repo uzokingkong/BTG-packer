@@ -18,6 +18,49 @@ use iced_x86::{
 };
 use std::collections::HashMap;
 
+#[test]
+fn galois_mul2_survives_all_native_family_backends() {
+    use crate::vm::poly::VmArchitectureFamily;
+    use crate::vm::risc::RiscLifter;
+
+    // test cl,cl; movzx eax,al; cmovns eax,edx
+    //
+    // This is a linear native-backend test, so terminate it with the VM's
+    // explicit Halt instead of lifting a guest RET without a guest return slot.
+    let raw = [0x84, 0xC9, 0x0F, 0xB6, 0xC0, 0x0F, 0x49, 0xC2];
+    let mut decoder = Decoder::with_ip(64, &raw, 0x140001000, DecoderOptions::NONE);
+    let mut lifter = RiscLifter::new();
+    let mut ip_map = HashMap::new();
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        ip_map.insert(instruction.ip(), lifter.desynth.instrs.len());
+        lifter.lift_instruction(&instruction).unwrap();
+    }
+    lifter.desynth.instrs.push(MicroInstr::new(RiscOp::Halt));
+    let program = RiscProgram::with_ip_map(lifter.desynth.instrs, ip_map);
+    let mut initial = [0u64; 16];
+    initial[0] = 0x1B;
+    initial[1] = 0x80;
+
+    for (ordinal, family) in [
+        VmArchitectureFamily::Stack,
+        VmArchitectureFamily::Register,
+        VmArchitectureFamily::MixedRisc,
+        VmArchitectureFamily::FusedCisc,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seed = 0xA35E_2026_0917_0000 ^ ordinal as u64;
+        let mut encoder = PolymorphicEncoder::new_for_family(seed, family);
+        let bytecode = encoder.encode(&program).unwrap();
+        let state =
+            run_native_poly_direct_for_family(&bytecode, seed, family, &initial, program.ip_map())
+                .unwrap();
+        assert_eq!(state.regs[0], 0x1B, "{family:?} leaked MOVZX flags");
+    }
+}
+
 fn install_operand_offsets(buf: &mut [u8], base: usize, offsets: &[u16]) {
     for (index, value) in offsets.iter().copied().enumerate() {
         buf[base + index * 2..base + index * 2 + 2].copy_from_slice(&value.to_le_bytes());
@@ -398,7 +441,7 @@ fn cross_family_child_call_stays_on_host_stack_while_native_keeps_guest_stack() 
         if ins.code() == Code::Call_rm64 && ins.memory_base() == Register::RSP && off == 0xC8 {
             saw_child_host_call = true;
         }
-        if ins.code() == Code::Mov_rm64_r64
+        if matches!(ins.code(), Code::Mov_rm64_r64 | Code::Mov_r64_rm64)
             && ins.op0_register() == Register::RSP
             && ins.op1_register() == Register::RAX
         {

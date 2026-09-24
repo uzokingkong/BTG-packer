@@ -193,6 +193,10 @@ pub struct PipelineContext {
     pub vm_prog_rva: u32,
     /// P4: whole-program VM 모듈 총 길이 (code+table+bytecode+state).
     pub vm_prog_total: u32,
+    /// Executable prefix length of the Program-VM module.  `vm_prog_total`
+    /// also reserves mutable state, which must never be advertised as a
+    /// RUNTIME_FUNCTION range.
+    pub vm_prog_code_len: u32,
     /// Code-relative VM→native bridge range requiring its private-frame unwind.
     pub vm_prog_native_bridge: Option<(u32, u32)>,
     pub vm_prog_native_bridges: Vec<(u32, u32)>,
@@ -320,6 +324,7 @@ impl PipelineContext {
             keep_pdata: false,
             vm_prog_rva: 0,
             vm_prog_total: 0,
+            vm_prog_code_len: 0,
             vm_prog_native_bridge: None,
             vm_prog_native_bridges: Vec::new(),
             vm_prog_lifetime_cleanup_handler_rva: 0,

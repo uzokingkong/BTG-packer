@@ -662,7 +662,7 @@ mod tests {
             "cd".repeat(16),
         );
         let body = m.render();
-        assert!(body.contains("version = 1.0.0"));
+        assert!(body.contains(concat!("version = ", env!("CARGO_PKG_VERSION"))));
         assert!(body.contains("build_id = BTG-"));
         assert!(body.contains("seed_id = 0x0000000000001234"));
         assert!(body.contains("vm_version = 31"));

@@ -457,6 +457,43 @@ fn test_lift_movsx_sign_extension() {
 }
 
 #[test]
+fn movzx_and_movsx_preserve_test_flags() {
+    // TEST CL,CL sets SF from bit 7. MOVZX must not clear it, so CMOVNS must
+    // not overwrite EAX. This is the AES mul2 sequence used by the QA image.
+    let movzx = [0x84, 0xC9, 0x0F, 0xB6, 0xC0, 0x0F, 0x49, 0xC2, 0xC3];
+    let mut init = [0u64; 16];
+    init[0] = 0x1B;
+    init[1] = 0x80;
+    init[2] = 0;
+    assert_eq!(regs(&run(&movzx, 0x140001000, init))[0], 0x1B);
+
+    // MOVSX has the same flag-transparent architectural contract even though
+    // its canonical expansion uses two flag-producing shifts.
+    let movsx = [0x84, 0xC9, 0x0F, 0xBE, 0xD8, 0x0F, 0x49, 0xC2, 0xC3];
+    let mut init = [0u64; 16];
+    init[0] = 0x80;
+    init[1] = 0x80;
+    init[2] = 0xDEAD_BEEF;
+    let state = run(&movsx, 0x140001000, init);
+    assert_eq!(regs(&state)[0], 0x80);
+    assert_eq!(regs(&state)[3], 0xFFFF_FF80);
+}
+
+#[test]
+fn narrow_test_uses_architectural_sign_bit() {
+    // TEST AL,AL must source SF from bit 7 rather than the canonical VM's bit
+    // 63. CMOVS therefore copies RDX when AL is 0x80.
+    let raw = [0x84, 0xC0, 0x48, 0x0F, 0x48, 0xC2, 0xC3];
+    let mut init = [0u64; 16];
+    init[0] = 0x80;
+    init[2] = 0x1234_5678_9ABC_DEF0;
+    assert_eq!(
+        regs(&run(&raw, 0x140001000, init))[0],
+        0x1234_5678_9ABC_DEF0
+    );
+}
+
+#[test]
 fn test_lift_jp_jnp_parity() {
     // 0x14000100B: mov rbx, 7
     // 3 - 3 = 0 ??low byte 0b0 (0 ones, even) ??PF=1 ??JP taken.

@@ -40,6 +40,7 @@ pub enum CommercialExclusionReason {
     LegacyHighByteRegister,
     SemanticDependencyClosure,
     IntegrationQuarantine,
+    PerformanceCriticalNative,
     AmbiguousFunctionBoundary,
     UnsupportedInstruction,
     UnsupportedVmOpcode,
@@ -54,6 +55,7 @@ impl CommercialExclusionReason {
             Self::LegacyHighByteRegister => "legacy-high-byte-register",
             Self::SemanticDependencyClosure => "semantic-dependency-closure",
             Self::IntegrationQuarantine => "integration-quarantine",
+            Self::PerformanceCriticalNative => "performance-critical-native",
             Self::AmbiguousFunctionBoundary => "ambiguous-function-boundary",
             Self::UnsupportedInstruction => "unsupported-instruction",
             Self::UnsupportedVmOpcode => "unsupported-vm-opcode",
@@ -252,6 +254,10 @@ fn build_ownership_report(
                 OwnershipReason::IntegrationQuarantine,
                 "integration-quarantine",
             ),
+            Some(CommercialExclusionReason::PerformanceCriticalNative) => (
+                OwnershipReason::PerformanceCriticalNative,
+                "performance-critical-native",
+            ),
             Some(CommercialExclusionReason::AmbiguousFunctionBoundary) => (
                 OwnershipReason::AmbiguousFunctionBoundary,
                 "ambiguous-function-boundary",
@@ -359,6 +365,139 @@ fn dependency_dfs_collect(
             dependency_dfs_collect(caller, reverse, visited, component);
         }
     }
+}
+
+fn performance_native_import_class(name: &str) -> Option<&'static str> {
+    let name = name.to_ascii_lowercase();
+    if matches!(
+        name.as_str(),
+        // GUI message pump and dispatch.
+        "getmessagea"
+            | "getmessagew"
+            | "peekmessagea"
+            | "peekmessagew"
+            | "dispatchmessagea"
+            | "dispatchmessagew"
+            | "translatemessage"
+            | "msgwaitformultipleobjects"
+            | "msgwaitformultipleobjectsex"
+    ) {
+        Some("gui")
+    } else if matches!(
+        name.as_str(),
+        "sleep"
+            | "sleepex"
+            | "switchtothread"
+            | "waitforsingleobject"
+            | "waitforsingleobjectex"
+            | "waitformultipleobjects"
+            | "waitformultipleobjectsex"
+            | "waitonaddress"
+            | "wakebyaddresssingle"
+            | "wakebyaddressall"
+            | "signalobjectandwait"
+    ) {
+        Some("wait")
+    } else if matches!(
+        name.as_str(),
+        "settimer"
+            | "killtimer"
+            | "createtimerqueuetimer"
+            | "deletetimerqueuetimer"
+            | "setwaitabletimer"
+            | "setwaitabletimerex"
+            | "cancelwaitabletimer"
+            | "gettickcount"
+            | "gettickcount64"
+            | "queryperformancecounter"
+            | "queryperformancefrequency"
+    ) {
+        Some("timer")
+    } else if matches!(
+        name.as_str(),
+        "heapalloc"
+            | "heaprealloc"
+            | "heapfree"
+            | "getprocessheap"
+            | "rtlallocateheap"
+            | "rtlreallocateheap"
+            | "rtlfreeheap"
+            | "virtualalloc"
+            | "virtualalloc2"
+            | "virtualfree"
+            | "ntallocatevirtualmemory"
+            | "ntfreevirtualmemory"
+    ) {
+        Some("allocator")
+    } else if matches!(
+        name.as_str(),
+        "multibytetowidechar"
+            | "widechartomultibyte"
+            | "lstrlena"
+            | "lstrlenw"
+            | "comparestringa"
+            | "comparestringw"
+    ) {
+        Some("string")
+    } else {
+        None
+    }
+}
+
+fn performance_native_roots(
+    function_ranges: &[(u64, u64)],
+    blocks: &[BasicBlock],
+    imports: &[crate::pipeline::iat_hide::OriginalImport],
+    image_base: u64,
+) -> HashMap<(u64, u64), CommercialFirstBlocker> {
+    let enabled = std::env::var("BTG_NATIVE_HOT_CLASSES")
+        .unwrap_or_else(|_| "gui,wait,spin,timer".to_string())
+        .to_ascii_lowercase();
+    let class_enabled = |class: &str| enabled.split(',').any(|item| item.trim() == class);
+    let hot_slots: HashMap<u64, &str> = imports
+        .iter()
+        .filter_map(|import| match &import.func {
+            crate::pipeline::iat_hide::FuncRef::Name(name)
+                if performance_native_import_class(name).is_some_and(&class_enabled) =>
+            {
+                Some((image_base + u64::from(import.slot_rva), name.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut roots = HashMap::new();
+    for &range in function_ranges {
+        let mut evidence = blocks
+            .iter()
+            .filter(|block| range.0 <= block.start_va && block.start_va < range.1)
+            .flat_map(|block| block.instructions.iter())
+            .filter_map(|instruction| {
+                let detail = if class_enabled("spin") && instruction.code() == Code::Pause {
+                    Some("PAUSE-based spin/backoff loop".to_string())
+                } else if matches!(
+                    instruction.flow_control(),
+                    FlowControl::Call | FlowControl::IndirectCall
+                ) && instruction.is_ip_rel_memory_operand()
+                {
+                    hot_slots
+                        .get(&instruction.ip_rel_memory_address())
+                        .map(|name| format!("performance-critical native import {name}"))
+                } else {
+                    None
+                }?;
+                Some(CommercialFirstBlocker {
+                    rva: instruction.ip(),
+                    code: instruction.code(),
+                    detail,
+                })
+            })
+            .collect::<Vec<_>>();
+        evidence.sort_by_key(|item| item.rva);
+        if let Some(first) = evidence.into_iter().next() {
+            roots.insert(range, first);
+        }
+    }
+    roots
 }
 
 fn build_semantic_dependency_report(
@@ -948,6 +1087,7 @@ pub fn lift_program_cfg_commercial(
         lifetime_objects,
         lifetime_key,
         None,
+        &[],
     )
 }
 
@@ -962,6 +1102,7 @@ pub fn lift_program_cfg_commercial_with_model(
     lifetime_objects: &[crate::vm::data_lifetime::LiteralObject],
     lifetime_key: u64,
     canonical_model: Option<&crate::analysis::program_model::ProgramModel>,
+    original_imports: &[crate::pipeline::iat_hide::OriginalImport],
 ) -> Result<ProgramLiftCommercial> {
     let marker_regions = crate::sdk::MarkerScanner::scan_markers(text_bytes);
     let mut marker_normalized;
@@ -1136,6 +1277,61 @@ pub fn lift_program_cfg_commercial_with_model(
     all_function_ranges.sort_by_key(|range| (range.0, range.1));
     all_function_ranges.dedup();
     let mut native_function_ranges = excl.func_ranges.clone();
+
+    // Keep latency-sensitive runtime plumbing native. These functions execute
+    // very small bodies at very high frequency, so per-micro-op dispatch costs
+    // dominate and can turn a short GUI/channel wait into seconds of VM work.
+    // Only the function containing direct evidence is excluded; callers remain
+    // VM-owned and cross the normal function-entry bridge.
+    let performance_roots =
+        performance_native_roots(&all_function_ranges, &blocks, original_imports, image_base);
+    let performance_root_ranges = performance_roots.keys().copied().collect::<HashSet<_>>();
+    let needs_dependency_closure = std::env::var("BTG_NATIVE_HOT_CLASSES")
+        .unwrap_or_else(|_| "gui,wait,spin,timer".to_string())
+        .split(',')
+        .any(|class| {
+            matches!(
+                class.trim().to_ascii_lowercase().as_str(),
+                "allocator" | "string"
+            )
+        });
+    let performance_quarantine = if needs_dependency_closure {
+        build_semantic_dependency_report(
+            &all_function_ranges,
+            &blocks,
+            &performance_root_ranges,
+            canonical_model,
+            image_base,
+        )
+        .sccs
+        .iter()
+        .flat_map(|scc| scc.functions.iter().copied())
+        .filter_map(|start| {
+            all_function_ranges
+                .iter()
+                .copied()
+                .find(|range| range.0 == start)
+        })
+        .collect::<HashSet<_>>()
+    } else {
+        performance_root_ranges
+    };
+    for range in performance_quarantine.iter().copied() {
+        if !native_function_ranges.contains(&range) {
+            native_function_ranges.push(range);
+        }
+        for block in &blocks {
+            if range.0 <= block.start_va && block.start_va < range.1 {
+                excluded_blocks.insert(block.start_va);
+            }
+        }
+    }
+    if !performance_roots.is_empty() {
+        println!(
+            "[+] --vm-commercial performance native-preservation: {} selected latency-critical function(s)",
+            performance_roots.len(),
+        );
+    }
 
     // A function that uses a legacy high-byte register is kept native together
     // with its direct-call dependency closure.  Mixing its native frame with
@@ -1383,6 +1579,14 @@ pub fn lift_program_cfg_commercial_with_model(
             (CommercialExclusionReason::SehOrPanicPolicy, None, 0)
         } else if setjmp_func_ranges.contains(&(function_start, function_end)) {
             (CommercialExclusionReason::SetjmpLongjmpPolicy, None, 0)
+        } else if performance_quarantine.contains(&(function_start, function_end)) {
+            (
+                CommercialExclusionReason::PerformanceCriticalNative,
+                performance_roots
+                    .get(&(function_start, function_end))
+                    .cloned(),
+                usize::from(performance_roots.contains_key(&(function_start, function_end))),
+            )
         } else if semantic_quarantine_roots.contains(&(function_start, function_end)) {
             let mut failures: Vec<_> = function_blocks
                     .iter()
@@ -1461,6 +1665,7 @@ pub fn lift_program_cfg_commercial_with_model(
             CommercialExclusionReason::LegacyHighByteRegister
             | CommercialExclusionReason::SemanticDependencyClosure
             | CommercialExclusionReason::IntegrationQuarantine
+            | CommercialExclusionReason::PerformanceCriticalNative
             | CommercialExclusionReason::AmbiguousFunctionBoundary
             | CommercialExclusionReason::UnsupportedInstruction
             | CommercialExclusionReason::UnsupportedVmOpcode => {
@@ -2217,6 +2422,30 @@ pub fn lift_program_cfg_commercial_with_model(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn performance_native_imports_are_typed_by_hot_path_class() {
+        use super::performance_native_import_class;
+
+        assert_eq!(performance_native_import_class("PeekMessageW"), Some("gui"));
+        assert_eq!(
+            performance_native_import_class("WaitForSingleObject"),
+            Some("wait")
+        );
+        assert_eq!(
+            performance_native_import_class("QueryPerformanceCounter"),
+            Some("timer")
+        );
+        assert_eq!(
+            performance_native_import_class("HeapAlloc"),
+            Some("allocator")
+        );
+        assert_eq!(
+            performance_native_import_class("WideCharToMultiByte"),
+            Some("string")
+        );
+        assert_eq!(performance_native_import_class("CreateFileW"), None);
+    }
 
     /// Provide a real writable backing range for architectural x86 RSP during
     /// native-harness differential tests. The reference evaluator treats

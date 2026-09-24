@@ -89,7 +89,10 @@ mod tests {
             MicroInstr::new(RiscOp::VirtualRet),
         ]);
 
-        assert_eq!(coalesce_cross_family_fallthroughs(&mut plan, &ranges, &program), 1);
+        assert_eq!(
+            coalesce_cross_family_fallthroughs(&mut plan, &ranges, &program),
+            1
+        );
         assert_eq!(
             plan.assignment_for(functions[0]).unwrap().family,
             VmArchitectureFamily::FusedCisc
@@ -149,6 +152,8 @@ pub(crate) fn lift_program(
                 &ctx.vm_data_lifetime_objects,
                 ctx.poly_vm_seed,
                 ctx.program_model.as_ref(),
+                &crate::pipeline::iat_hide::collect_from_pe(&ctx.target_info.original_pe_bytes)
+                    .unwrap_or_default(),
             )?;
             data_lifetime_objects = lift.data_lifetime_objects.clone();
             unsupported_report = lift.unsupported_report.clone();

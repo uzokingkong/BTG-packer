@@ -92,6 +92,19 @@ pub(super) fn build_commercial_routes(
             // keep this particular target block native.  Only an exact local
             // VIP proves that the destination is VM-owned.
             let Some(&entry_vip) = module.ip_map.get(&target_va) else {
+                let function_entry_va = program
+                    .functions
+                    .get(&function_id)
+                    .and_then(|function| function.entries.iter().next())
+                    .map(|rva| image_base + u64::from(*rva));
+                if function_entry_va.is_some_and(|entry| module.function_ids.contains(&entry)) {
+                    return Err(anyhow!(
+                        "complete indirect target RVA {target_rva:#x} has no materialized entry VIP"
+                    ));
+                }
+                // The family plan is function-wide, but ownership policy kept
+                // this destination function native. Its original address is
+                // the valid passthrough target and must not get a VM route.
                 continue;
             };
             let gateway = if source_family == target_family {

@@ -1085,10 +1085,10 @@ fn derive_ownership_model(
     // Ownership model: the program-VM module region (which build.rs wraps in a
     // bridge UNWIND_INFO) is the VM-owned set; the region must be fully covered.
     let mut model: Vec<FunctionOwnership> = Vec::new();
-    if ctx.vm_prog_rva > 0 && ctx.vm_prog_total > 0 {
+    if ctx.vm_prog_rva > 0 && ctx.vm_prog_code_len > 0 {
         model.push(FunctionOwnership {
             start_rva: ctx.vm_prog_rva,
-            end_rva: ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total),
+            end_rva: ctx.vm_prog_rva.saturating_add(ctx.vm_prog_code_len),
             owned_by_vm: true,
             enforce_entry_begin: false,
             reason: "program-vm-module",
@@ -1097,7 +1097,7 @@ fn derive_ownership_model(
     for rf in &runtime_functions {
         let in_vm = ctx.vm_prog_rva > 0
             && rf.begin_rva >= ctx.vm_prog_rva
-            && rf.begin_rva < ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total);
+            && rf.begin_rva < ctx.vm_prog_rva.saturating_add(ctx.vm_prog_code_len);
         if !in_vm && !model.iter().any(|m| m.start_rva == rf.begin_rva) {
             model.push(FunctionOwnership {
                 start_rva: rf.begin_rva,
@@ -1139,10 +1139,10 @@ pub(crate) fn validate_function_ownership(ctx: &PipelineContext, out: &[u8]) -> 
             .map(|record| record.function)
             .collect::<Vec<_>>()
     };
-    if authoritative && ctx.vm_prog_rva > 0 && ctx.vm_prog_total > 0 {
+    if authoritative && ctx.vm_prog_rva > 0 && ctx.vm_prog_code_len > 0 {
         model.push(FunctionOwnership {
             start_rva: ctx.vm_prog_rva,
-            end_rva: ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total),
+            end_rva: ctx.vm_prog_rva.saturating_add(ctx.vm_prog_code_len),
             owned_by_vm: true,
             enforce_entry_begin: false,
             reason: "program-vm-module",
@@ -1159,12 +1159,12 @@ pub(crate) fn validate_function_ownership(ctx: &PipelineContext, out: &[u8]) -> 
     println!(
         "           program-VM module 0x{:X}..0x{:X} fully covered by RUNTIME_FUNCTION",
         ctx.vm_prog_rva,
-        ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total)
+        ctx.vm_prog_rva.saturating_add(ctx.vm_prog_code_len)
     );
     if !ctx.vm_prog_native_bridges.is_empty() && !ctx.target_info.original_pdata_entries.is_empty()
     {
         let handler = ctx.vm_prog_lifetime_cleanup_handler_rva;
-        let vm_end = ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total);
+        let vm_end = ctx.vm_prog_rva.saturating_add(ctx.vm_prog_code_len);
         if handler < ctx.vm_prog_rva || handler >= vm_end {
             bail!(
                 "lifetime cleanup handler RVA 0x{handler:X} outside Program-VM 0x{:X}..0x{vm_end:X}",

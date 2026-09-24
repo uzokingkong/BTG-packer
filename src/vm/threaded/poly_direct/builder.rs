@@ -2658,6 +2658,17 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
                 );
             }
             if let Some(resume_offset) = route.tail_jump_resume_offset {
+                // A tail transfer reached underneath an existing VM CALL must
+                // inherit that pending continuation. Pushing the family-exit
+                // sentinel in front of a negative/non-empty VSP makes the child
+                // return to module exit and skips the caller's post-CALL code
+                // (notably String::write_char after reserve()). Only a true
+                // top-level tail root with an empty VSP needs a sentinel.
+                mov_m(&mut b, Register::RAX, VSP_OFF);
+                b.push(
+                    Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap(),
+                );
+                let inherited_continuation = b.br(Code::Jne_rel32_64, usize::MAX);
                 b.push(Instruction::with2(Code::Sub_rm64_imm8, Register::R13, 8).unwrap());
                 movi(&mut b, Register::RAX, resume_offset);
                 b.push(
@@ -2671,6 +2682,14 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
                 mov_m(&mut b, Register::RAX, VSP_OFF);
                 b.push(Instruction::with2(Code::Sub_rm64_imm8, Register::RAX, 8).unwrap());
                 store_m(&mut b, VSP_OFF, Register::RAX);
+                let continuation_ready = b.len();
+                if let Some((_, target)) = b
+                    .branches
+                    .iter_mut()
+                    .find(|(branch, _)| *branch == inherited_continuation)
+                {
+                    *target = continuation_ready;
+                }
             }
             // Generated VM dynamic entries use RDX as their state-base ABI.
             // Preserve the selected child state before the shared native bridge
@@ -7659,16 +7678,21 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
     b.push(
         Instruction::with2(
             Code::Mov_r64_rm64,
-            Register::R13,
-            MemoryOperand::with_base_displ_size(Register::R12, 8, 8),
+            Register::R12,
+            MemoryOperand::with_base(Register::R12),
         )
         .unwrap(),
+    );
+    rip_anchor(
+        &mut b,
+        Register::R13,
+        state_base + crate::vm::data_lifetime::LIFETIME_SYNC_COUNT_STATE_OFFSET as u64,
     );
     b.push(
         Instruction::with2(
             Code::Mov_r64_rm64,
-            Register::R12,
-            MemoryOperand::with_base(Register::R12),
+            Register::R13,
+            MemoryOperand::with_base(Register::R13),
         )
         .unwrap(),
     );

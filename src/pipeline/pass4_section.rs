@@ -11,10 +11,11 @@ use crate::pipeline::PipelineContext;
 use crate::util::MAX_PADDING_SIZE;
 use anyhow::Result;
 
-// Commercial multi-family depth lanes, their isolated host stacks, and the
-// module payload all share this tail reservation.  The 32-depth runtime needs
-// about 0x65D0000 bytes for the current QA image before final trimming.
-pub const BOOT_AREA_RESERVE: usize = 0x12000000;
+// Commercial multi-family root/depth lanes, their isolated host stacks, and
+// the module payload all share this temporary tail reservation. Four live
+// roots per bucket with 64 depths require just over 0x31370000 for the current
+// QA image. The section is truncated to actual file-backed bytes afterwards.
+pub const BOOT_AREA_RESERVE: usize = 0x34000000;
 //          crypto.rs truncates the section to actual boot_end, so final file size
 //          is unaffected.
 

@@ -24,6 +24,12 @@ fn exit_code(status: ExitStatus) -> i32 {
 fn run_captured(path: &Path, timeout: Duration) -> anyhow::Result<ExecutionSnapshot> {
     let executable = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut child = Command::new(&executable)
+        // Differential verification must exercise a finite deterministic path.
+        // The bundled QA target accepts this conventional switch to skip its
+        // interactive GUI loop; unknown switches are intentionally left to the
+        // target's own argument policy rather than treating GUI liveness as a
+        // semantic execution failure.
+        .arg("--headless")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

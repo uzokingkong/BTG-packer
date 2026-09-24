@@ -499,10 +499,21 @@ impl RiscLifter {
     /// MOVZX: 8/16-bit 소스를 0-확장해 64비트 결과로. AND 마스크로 표현.
 
     pub(super) fn lift_movzx(&mut self, inst: &Instruction, mask: u64) -> Result<()> {
+        // MOVZX is flag-transparent.  The canonical AND used to synthesize the
+        // extension is not, and memory effective-address lowering may also use
+        // flag-producing primitives, so save before evaluating the source.
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::Mov)
+                .with_dst(MicroOperand::Temp(7))
+                .with_src1(MicroOperand::Vflags),
+        );
         let dst =
             Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid movzx dst"))?;
         let src = self.operand_value(inst, 1)?;
         self.desynth.emit_and(dst, src, MicroOperand::Imm64(mask));
+        self.desynth
+            .instrs
+            .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
         Ok(())
     }
 
@@ -511,6 +522,13 @@ impl RiscLifter {
     /// 부호 비트를 복제한다. (MOVSX는 논리 시프트만으로는 표현 불가 — 산술 시프트 필요)
 
     pub(super) fn lift_movsx(&mut self, inst: &Instruction, src_bits: u8) -> Result<()> {
+        // MOVSX/MOVSXD preserve RFLAGS even though their shift-based canonical
+        // expansion does not. Save flags before source/address evaluation.
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::Mov)
+                .with_dst(MicroOperand::Temp(7))
+                .with_src1(MicroOperand::Vflags),
+        );
         let dst =
             Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid movsx dst"))?;
         let src = self.operand_value(inst, 1)?;
@@ -532,6 +550,9 @@ impl RiscLifter {
         );
         // 32비트 목적지(Movsx_r32_*/Movsxd_r32_*)는 상위 32비트를 0으로.
         self.zero_extend_dst_if32(inst, dst);
+        self.desynth
+            .instrs
+            .push(MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)));
         Ok(())
     }
 
@@ -747,6 +768,15 @@ impl RiscLifter {
         let b = self.mask_operand_into(v1, w, MicroOperand::Temp(2))?;
         let scratch = MicroOperand::Temp(7);
         self.desynth.emit_and(scratch, a, b);
+        // NOR synthesis computes ZF/PF correctly for the masked result but its
+        // SF is inherently bit 63. Re-evaluate result-0 at the architectural
+        // TEST width to obtain bit 7/15/31 SF while keeping CF=OF=0.
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::SubWithBorrow { width: w })
+                .with_dst(scratch)
+                .with_src1(scratch)
+                .with_src2(MicroOperand::Imm64(0)),
+        );
         Ok(())
     }
 

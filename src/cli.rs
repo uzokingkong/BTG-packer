@@ -32,8 +32,8 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false, conflicts_with = "strict_profile")]
     pub allow_partial_vm: bool,
 
-    /// Execute the original and protected binaries after packing and fail when
-    /// exit code, stdout, or stderr differ byte-for-byte.
+    /// Execute the original and protected binaries with `--headless` after
+    /// packing and fail when exit code, stdout, or stderr differ byte-for-byte.
     #[arg(long, default_value_t = false)]
     pub verify_output: bool,
 

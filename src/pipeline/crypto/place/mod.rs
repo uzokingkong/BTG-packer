@@ -1005,6 +1005,14 @@ pub(crate) fn place_boot_stub(
         0
     };
     ctx.vm_prog_total = vm_prog_total as u32;
+    // Only generated native handler/gateway code is executable.  The module
+    // reservation also contains tables, bytecode and a large RW state arena;
+    // exposing that whole reservation through .pdata makes the Windows
+    // unwinder treat data pages as one enormous function.
+    ctx.vm_prog_code_len = vm_prog_mod
+        .as_ref()
+        .map(|module| module.code.len() as u32)
+        .unwrap_or(0);
 
     // Executable-route inventory only exists when a `.vmroute` image was
     // actually staged. A commercial VM can legitimately have no proven
@@ -1015,10 +1023,10 @@ pub(crate) fn place_boot_stub(
         anyhow::bail!("canonical route metadata staging/inventory lifecycle mismatch");
     }
     ctx.route_generated_executable_ranges =
-        if route_metadata_active && ctx.vm_prog_rva != 0 && ctx.vm_prog_total != 0 {
+        if route_metadata_active && ctx.vm_prog_rva != 0 && ctx.vm_prog_code_len != 0 {
             vec![crate::vm::route_metadata::RvaSpan {
                 start: ctx.vm_prog_rva,
-                end: ctx.vm_prog_rva.saturating_add(ctx.vm_prog_total),
+                end: ctx.vm_prog_rva.saturating_add(ctx.vm_prog_code_len),
             }]
         } else {
             Vec::new()
@@ -2501,7 +2509,7 @@ pub(crate) fn place_boot_stub(
         let dst_end = dst_off
             .checked_add(payload_bytes.len())
             .ok_or_else(|| anyhow::anyhow!("relocated payload destination overflow"))?;
-        if dst_off < vm_prog_off || dst_end > btg.bytes.len() {
+        if dst_end > btg.bytes.len() {
             anyhow::bail!(
                 "relocated payload destination outside .textb: dst=[0x{:X},0x{:X}) section=0x{:X}",
                 dst_off,

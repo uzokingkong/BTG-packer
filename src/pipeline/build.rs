@@ -119,19 +119,20 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     // OS unwinder가 걷는 유일한 .textb 프레임이 **Program VM 엔트리 프레임**이다.
     // 여기에 정확한 엔트리 프로로그(sub rsp,0xA0 + 15 push) UNWIND_INFO를 등록해
     // 더미 핸들러(리프 프레임 가정)에 의존하지 않고 결정적으로 VM 밖으로 unwind
-    // 하게 한다. 커버 범위 = [vm_prog_rva .. vm_prog_rva+vm_prog_total).
-    let vm_prog_unwind: Option<Vec<u8>> = if ctx.vm_prog_rva > 0 && ctx.vm_prog_total > 0 {
+    // 하게 한다. 커버 범위는 generated native code로 한정한다. `vm_prog_total`
+    // 는 뒤따르는 RW 상태 arena까지 포함하므로 .pdata에 쓰면 안 된다.
+    let vm_prog_unwind: Option<Vec<u8>> = if ctx.vm_prog_rva > 0 && ctx.vm_prog_code_len > 0 {
         ctx.btg_section_data.as_ref().and_then(|sec| {
             let off = (ctx.vm_prog_rva as u64).saturating_sub(dispatcher_rva as u64) as usize;
-            let end = (off + ctx.vm_prog_total as usize).min(sec.bytes.len());
+            let end = (off + ctx.vm_prog_code_len as usize).min(sec.bytes.len());
             if end > off && off < sec.bytes.len() {
                 let (ops, prolog_len) = vm_entry_unwind_ops(&sec.bytes[off..end]);
                 if !ops.is_empty() {
                     println!(
                         "[+] P4 .pdata: Program-VM bridge UNWIND_INFO — covering 0x{:X}..0x{:X} ({}B), prolog_len=0x{:X}, {} code(s)",
                         ctx.vm_prog_rva,
-                        ctx.vm_prog_rva + ctx.vm_prog_total,
-                        ctx.vm_prog_total,
+                        ctx.vm_prog_rva + ctx.vm_prog_code_len,
+                        ctx.vm_prog_code_len,
                         prolog_len,
                         ops.len()
                     );
@@ -157,7 +158,7 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
             boot_area_len,
             bridge_unwind.as_ref(),
             ctx.vm_prog_rva,
-            ctx.vm_prog_total,
+            ctx.vm_prog_code_len,
             vm_prog_unwind.as_ref().map(|v| v.as_slice()),
             &ctx.vm_prog_native_bridges,
             ctx.vm_prog_lifetime_cleanup_handler_rva,

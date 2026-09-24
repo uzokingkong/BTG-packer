@@ -373,7 +373,7 @@ pub(crate) fn build_boot_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     // stages legitimately reuse both registers and mutable VM scratch. A
     // balanced stack save is private to the bootstrap frame and survives the
     // intervening calls without expanding the public VM state ABI.
-    if false && stub.integrity {
+    if stub.integrity {
         // The MAC mixer legitimately clobbers R15. Reload the authoritative
         // pre-cipher W32 before preserving it across run/rest decryptors;
         // otherwise the MAC accumulator is written back as the CRC key.
@@ -408,7 +408,7 @@ pub(crate) fn build_boot_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     emit_run_decrypt(&mut seq, stub);
     emit_rest_decrypt(&mut seq, stub);
     integrity::emit_distributed_integrity(&mut seq, stub);
-    if false && stub.integrity {
+    if stub.integrity {
         seq.push((
             Instruction::with2(
                 Code::Mov_r64_rm64,

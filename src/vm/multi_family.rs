@@ -342,6 +342,12 @@ impl MultiFamilyProgramPlan {
                 .map(|(&ip, &local)| (local, ip))
                 .collect();
             if std::env::var_os("BTG_TRACE_OP_MAP").is_some() {
+                eprintln!(
+                    "BTG_OP_LAYOUT family={:?} domain={:#x} layout={:?}",
+                    partition.family,
+                    module_domain,
+                    crate::vm::threaded::VmRuntimeLayout::from_seed(module_domain)
+                );
                 for (local, instruction) in partition.program.instrs.iter().enumerate() {
                     eprintln!(
                         "BTG_OP_MAP family={:?} local={} offset={:#x} ip={} op={:?} dst={:?} src1={:?} src2={:?} imm={:#x}",
