@@ -250,6 +250,14 @@ pub struct EffectiveProfileReport {
     /// Executable bytes still covered by the original application's `.text`
     /// RVA interval. `Some(0)` is required by the strict 100% VM contract.
     pub original_text_exec_bytes: Option<u64>,
+    /// Same-RVA bytes still identical to the input `.text`. `Some(0)` proves
+    /// that an NX-but-intact copy of the original code was not retained.
+    pub original_text_plain_bytes: Option<u64>,
+    /// Phase-B relocation inventory measurements. These describe the native
+    /// code that must move before a partial build may discard original `.text`.
+    pub native_island_functions: Option<u64>,
+    pub native_island_bytes: Option<u64>,
+    pub native_island_blockers: Option<u64>,
 }
 
 impl EffectiveProfileReport {
@@ -275,7 +283,10 @@ impl EffectiveProfileReport {
     }
 
     pub fn ensure_vm_full_coverage(&self) -> Result<()> {
-        if self.vm_full_coverage && self.original_text_exec_bytes == Some(0) {
+        if self.vm_full_coverage
+            && self.original_text_exec_bytes == Some(0)
+            && self.original_text_plain_bytes == Some(0)
+        {
             Ok(())
         } else {
             bail!(
@@ -350,6 +361,36 @@ pub fn original_text_exec_bytes(ctx: &PipelineContext, out: &[u8]) -> Result<u64
     Ok(covered)
 }
 
+/// Count bytes at their original `.text` RVA that remain byte-identical to the
+/// input image. This complements the executable-range check: NX alone does not
+/// remove function signatures or make original/protected diffing harder.
+pub fn original_text_plain_bytes(ctx: &PipelineContext, out: &[u8]) -> Result<u64> {
+    let pe = PE::parse(out).map_err(|e| anyhow!("original .text plaintext measurement: {e}"))?;
+    let text_rva = ctx.target_info.text_rva as u64;
+    let comparable = ctx
+        .target_info
+        .text_bytes
+        .len()
+        .min(ctx.target_info.text_vsize);
+    let mut equal = 0u64;
+    for (index, original) in ctx.target_info.text_bytes[..comparable].iter().enumerate() {
+        let rva = text_rva + index as u64;
+        let Some(section) = pe.sections.iter().find(|section| {
+            let start = section.virtual_address as u64;
+            let end = start.saturating_add(section.size_of_raw_data as u64);
+            start <= rva && rva < end
+        }) else {
+            continue;
+        };
+        let raw =
+            section.pointer_to_raw_data as usize + (rva - section.virtual_address as u64) as usize;
+        if out.get(raw).is_some_and(|byte| byte == original) {
+            equal += 1;
+        }
+    }
+    Ok(equal)
+}
+
 /// Validate that resolved protection capabilities were actually materialized.
 /// Unlike `run`, this checks feature semantics rather than generic PE shape.
 pub fn validate_effective_profile(
@@ -385,11 +426,24 @@ pub fn validate_effective_profile(
     if cfg.vm_commercial {
         let (coverage_complete, evidence) = complete_vm_coverage(ctx.vm_coverage.as_ref());
         let original_exec = original_text_exec_bytes(ctx, out)?;
+        let original_plain = original_text_plain_bytes(ctx, out)?;
         report.vm_full_coverage = coverage_complete;
         report.original_text_exec_bytes = Some(original_exec);
-        let evidence = format!("{evidence},original_text_exec_bytes={original_exec}");
+        report.original_text_plain_bytes = Some(original_plain);
+        if let Some(plan) = ctx.native_island_plan.as_ref() {
+            report.native_island_functions = Some(plan.functions.len() as u64);
+            report.native_island_bytes = Some(plan.native_bytes());
+            report.native_island_blockers = Some(plan.blockers.len() as u64);
+        }
+        let evidence = format!(
+            "{evidence},original_text_exec_bytes={original_exec},original_text_plain_bytes={original_plain}"
+        );
         report.vm_coverage_evidence = Some(evidence.clone());
-        if ctx.vm_prog_bytecode_len > 0 && coverage_complete && original_exec == 0 {
+        if ctx.vm_prog_bytecode_len > 0
+            && coverage_complete
+            && original_exec == 0
+            && original_plain == 0
+        {
             report.effective("vm_commercial");
         } else {
             report.ineffective(
@@ -398,8 +452,10 @@ pub fn validate_effective_profile(
                     format!("missing-bytecode;{evidence}")
                 } else if !coverage_complete {
                     format!("incomplete-coverage;{evidence}")
-                } else {
+                } else if original_exec != 0 {
                     format!("original-text-still-executable;{evidence}")
+                } else {
+                    format!("original-text-plaintext-remains;{evidence}")
                 },
             );
         }

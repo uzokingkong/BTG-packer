@@ -19,11 +19,11 @@ pub(crate) const VM_THREAD_BUCKETS: usize = 16;
 // application work).  Each depth needs an independent family-state group and
 // host stack; wrapping or trapping at eight either aliases a suspended parent
 // or executes the router's depth-guard UD2.
-pub(crate) const VM_REENTRY_DEPTHS: usize = 64;
+pub(crate) const VM_REENTRY_DEPTHS: usize = 32;
 /// Independently live native callback roots per hashed thread bucket. Each root
 /// owns a full `VM_REENTRY_DEPTHS` window so its cross-family children can never
 /// alias a sibling root that happens to be live at the same time.
-pub(crate) const VM_NATIVE_ROOTS_PER_BUCKET: usize = 4;
+pub(crate) const VM_NATIVE_ROOTS_PER_BUCKET: usize = 8;
 /// Lane zero plus the following depth window belong exclusively to the
 /// canonical OEP chain. Native-entry roots begin after that window; otherwise
 /// bucket-0 workers alias OEP children at identical cross-family depths.
@@ -414,7 +414,7 @@ fn encode_native_lane_claim(claim_va: u64) -> anyhow::Result<Vec<u8>> {
         Instruction::with_branch(Code::Jmp_rel32_64, 0)?,
         Some(L::Acquired),
     ));
-    // All 64 roots in this bucket are live. Never wrap and alias a live state:
+    // All configured roots in this bucket are live. Never wrap and alias a live state:
     // fail closed instead of turning state/stack corruption into a later AV.
     seq.push((Instruction::with(Code::Ud2), Some(L::Exhausted)));
     seq.push((Instruction::with(Code::Nopd), Some(L::Acquired)));
@@ -615,6 +615,24 @@ fn build_native_entry_gateway(
         ),
         0,
     )?);
+    ins.push(Instruction::with2(
+        Code::Mov_rm64_r64,
+        MemoryOperand::with_base_displ_size(
+            Register::R10,
+            vm::threaded::poly_direct::STATE_NATIVE_CLAIM_BITMAP,
+            8,
+        ),
+        Register::RBX,
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_rm64_r64,
+        MemoryOperand::with_base_displ_size(
+            Register::R10,
+            vm::threaded::poly_direct::STATE_NATIVE_CLAIM_SLOT,
+            8,
+        ),
+        Register::RCX,
+    )?);
     // Saved stack from low to high: r15..rax, rflags; original RSP is +0x80.
     let saved = [
         112i64, 104, 96, 88, 128, 80, 72, 64, 56, 48, 40, 32, 24, 16, 8, 0,
@@ -655,7 +673,13 @@ fn build_native_entry_gateway(
         MemoryOperand::with_base_displ_size(Register::R10, layout.flags as i64, 8),
         Register::RAX,
     )?);
-    for i in 0..layout.xmm_slots.min(6) {
+    // Preserve the complete Win64 SIMD register file at a native-entry
+    // boundary.  XMM6..XMM15 are nonvolatile, and the native-call bridge uses
+    // XMM15 as its private host-frame carrier while a callback re-enters the
+    // VM.  Initializing only XMM0..XMM5 made the nested VM return publish a
+    // zero XMM15, so the outer bridge recovered its frame through RBX=0 and
+    // faulted in cross-family cleanup.
+    for i in 0..layout.xmm_slots.min(16) {
         let xmm = [
             Register::XMM0,
             Register::XMM1,
@@ -663,6 +687,16 @@ fn build_native_entry_gateway(
             Register::XMM3,
             Register::XMM4,
             Register::XMM5,
+            Register::XMM6,
+            Register::XMM7,
+            Register::XMM8,
+            Register::XMM9,
+            Register::XMM10,
+            Register::XMM11,
+            Register::XMM12,
+            Register::XMM13,
+            Register::XMM14,
+            Register::XMM15,
         ][i];
         ins.push(Instruction::with2(
             Code::Movups_xmmm128_xmm,
@@ -944,6 +978,7 @@ pub(crate) fn build_multi_family_prog_mod(
     lifetime_key: u64,
     lifetime_objects: &[crate::vm::data_lifetime::LiteralObject],
     native_gateway_targets: &[u64],
+    native_call_rewrites: &[(u64, u64)],
 ) -> anyhow::Result<MultiFamilyVmModule> {
     // `place/mod.rs` intentionally calls this function once with both bases set
     // to zero to measure the complete multi-family module before its final PE
@@ -1033,6 +1068,10 @@ pub(crate) fn build_multi_family_prog_mod(
     // state anchors within RIP-relative disp32 range as well.
     const SIZING_STATE_BASE: u64 = 0x1000_0000;
 
+    let mut gateway_targets = native_gateway_targets.to_vec();
+    gateway_targets.sort_unstable();
+    gateway_targets.dedup();
+
     let dummy_routes = |source_family| -> anyhow::Result<
         Vec<vm::threaded::poly_direct::NativeCrossFamilyRoute>,
     > {
@@ -1074,10 +1113,19 @@ pub(crate) fn build_multi_family_prog_mod(
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         for (target_index, target) in modules.iter().enumerate() {
-            if target.family == source_family {
-                continue;
-            }
-            for &target_va in &target.function_ids {
+            let mut dynamic_targets = target.function_ids.clone();
+            dynamic_targets.extend(
+                gateway_targets
+                    .iter()
+                    .copied()
+                    .filter(|target_va| target.ip_map.contains_key(target_va)),
+            );
+            dynamic_targets.sort_unstable();
+            dynamic_targets.dedup();
+            for target_va in dynamic_targets {
+                if target.family == source_family && !gateway_targets.contains(&target_va) {
+                    continue;
+                }
                 if routes.iter().any(|route| {
                     route.target_va == target_va && route.source_next_byte_offset.is_none()
                 }) {
@@ -1102,10 +1150,6 @@ pub(crate) fn build_multi_family_prog_mod(
         }
         Ok(routes)
     };
-
-    let mut gateway_targets = native_gateway_targets.to_vec();
-    gateway_targets.sort_unstable();
-    gateway_targets.dedup();
     let dummy_native_pointer_rewrites: Vec<(u64, u64)> = gateway_targets
         .iter()
         .enumerate()
@@ -1116,6 +1160,17 @@ pub(crate) fn build_multi_family_prog_mod(
             )
         })
         .collect();
+    let dummy_native_call_rewrites: Vec<(u64, u64)> = native_call_rewrites
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            (
+                SIZING_ENTRY_BASE + 0x0200_0000 + (index as u64) * 0x20,
+                SIZING_ENTRY_BASE + 0x0300_0000 + (index as u64) * 0x20,
+            )
+        })
+        .collect();
+    let dummy_native_callable_rewrites = dummy_native_call_rewrites;
 
     let mut sized = Vec::with_capacity(modules.len());
     for (module_index, module) in modules.iter().enumerate() {
@@ -1153,6 +1208,7 @@ pub(crate) fn build_multi_family_prog_mod(
                 &chunk_plans[module_index],
                 &routes,
                 &dummy_native_pointer_rewrites,
+                &dummy_native_callable_rewrites,
             )?,
         );
     }
@@ -1225,6 +1281,7 @@ pub(crate) fn build_multi_family_prog_mod(
             )
         })
         .collect();
+    let native_callable_rewrites = native_call_rewrites.to_vec();
 
     let mut built = Vec::with_capacity(modules.len());
     let mut native_bridge_ranges = Vec::new();
@@ -1267,10 +1324,19 @@ pub(crate) fn build_multi_family_prog_mod(
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         for (target_index, target) in modules.iter().enumerate() {
-            if target.family == module.family {
-                continue;
-            }
-            for &target_va in &target.function_ids {
+            let mut dynamic_targets = target.function_ids.clone();
+            dynamic_targets.extend(
+                gateway_targets
+                    .iter()
+                    .copied()
+                    .filter(|target_va| target.ip_map.contains_key(target_va)),
+            );
+            dynamic_targets.sort_unstable();
+            dynamic_targets.dedup();
+            for target_va in dynamic_targets {
+                if target.family == module.family && !gateway_targets.contains(&target_va) {
+                    continue;
+                }
                 if routes.iter().any(|route| {
                     route.target_va == target_va && route.source_next_byte_offset.is_none()
                 }) {
@@ -1323,6 +1389,7 @@ pub(crate) fn build_multi_family_prog_mod(
                 &chunk_plans[index],
                 &routes,
                 &native_pointer_rewrites,
+                &native_callable_rewrites,
             )?;
         if built_module.code.len() != sized[index].code.len()
             || built_module.table.len() != sized[index].table.len()

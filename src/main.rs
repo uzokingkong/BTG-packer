@@ -648,27 +648,39 @@ fn main() -> error::Result<()> {
     } else {
         None
     };
-    let evidence = pipeline::reports::EvidenceReportBundle::render(&ctx.unsupported_instructions);
-    let evidence_artifacts = evidence.artifacts_for(&output_path);
-    pipeline::reports::write_evidence_artifacts(&evidence_artifacts)?;
-    println!(
-        "[+] unsupported-instruction evidence written: {}",
-        evidence_artifacts[0].path.display()
-    );
-    // WS2.1: emit the function-ownership ↔ .pdata mapping CSV on program-VM paths.
-    if let Some(own_csv) = pipeline::validate::ownership_csv(&ctx, &output_pe_bytes)? {
-        let mut own_path = output_path.clone();
-        own_path.set_extension(format!(
-            "{}.ownership.csv",
-            output_path
-                .extension()
-                .map(|e| e.to_string_lossy().to_string())
-                .unwrap_or_else(|| "out".into())
-        ));
-        std::fs::write(&own_path, own_csv)?;
+    let emit_private_evidence = args.debug
+        || args.map
+        || args.sym_map
+        || std::env::var_os("BTG_EMIT_PRIVATE_EVIDENCE").is_some();
+    if emit_private_evidence {
+        let evidence =
+            pipeline::reports::EvidenceReportBundle::render(&ctx.unsupported_instructions);
+        let evidence_artifacts = evidence.artifacts_for(&output_path);
+        pipeline::reports::write_evidence_artifacts(&evidence_artifacts)?;
         println!(
-            "[+] WS2.1 function-ownership map written: {}",
-            own_path.display()
+            "[+] private unsupported-instruction evidence written: {}",
+            evidence_artifacts[0].path.display()
+        );
+        // Ownership is an original-RVA mapping artifact and must never be
+        // emitted beside a normal production binary by default.
+        if let Some(own_csv) = pipeline::validate::ownership_csv(&ctx, &output_pe_bytes)? {
+            let mut own_path = output_path.clone();
+            own_path.set_extension(format!(
+                "{}.ownership.csv",
+                output_path
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "out".into())
+            ));
+            std::fs::write(&own_path, own_csv)?;
+            println!(
+                "[+] private function-ownership map written: {}",
+                own_path.display()
+            );
+        }
+    } else {
+        println!(
+            "[+] Private mapping/evidence artifacts suppressed (use --debug, --map, --sym-map, or BTG_EMIT_PRIVATE_EVIDENCE=1 for an isolated analysis build)"
         );
     }
 
@@ -757,6 +769,10 @@ fn main() -> error::Result<()> {
                                 as u64,
                         ),
                         original_text_exec_bytes: effective_profile.original_text_exec_bytes,
+                        original_text_plain_bytes: effective_profile.original_text_plain_bytes,
+                        native_island_functions: effective_profile.native_island_functions,
+                        native_island_bytes: effective_profile.native_island_bytes,
+                        native_island_blockers: effective_profile.native_island_blockers,
                         unresolved_edges: coverage.unresolved_internal_edges,
                     }
                 } else {

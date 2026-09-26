@@ -32,6 +32,21 @@ impl ChunkLookupTopology {
             Self::BinaryEnds => 0x4249_4E2D_454E_4453,
         }
     }
+
+    /// Keep the seed-selected linear layouts for small programs, where they
+    /// provide useful structural diversity at negligible cost.  A lookup is
+    /// performed for every decoded byte, however, so a linear walk over the
+    /// hundreds of chunks produced by a large lifted image makes execution
+    /// effectively stall.  Bound that hot-path cost by selecting the masked
+    /// binary topology once the chunk inventory is no longer small.
+    pub fn for_chunk_count(build_seed: u64, chunk_count: usize) -> Self {
+        const MAX_LINEAR_CHUNKS: usize = 32;
+        if chunk_count > MAX_LINEAR_CHUNKS {
+            Self::BinaryEnds
+        } else {
+            Self::from_seed(build_seed)
+        }
+    }
 }
 
 pub fn module_key(build_seed: u64) -> u64 {
@@ -198,6 +213,20 @@ mod tests {
         assert!(
             counts.values().copied().max().unwrap_or_default() < 10,
             "one normalized lookup template dominates N=20: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn large_chunk_inventories_use_bounded_lookup() {
+        for seed in 1..=20 {
+            assert_eq!(
+                ChunkLookupTopology::for_chunk_count(seed, 33),
+                ChunkLookupTopology::BinaryEnds
+            );
+        }
+        assert_eq!(
+            ChunkLookupTopology::for_chunk_count(2, 32),
+            ChunkLookupTopology::from_seed(2)
         );
     }
 }

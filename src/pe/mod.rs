@@ -1,4 +1,5 @@
 pub mod builder;
+pub mod cxx_eh;
 pub mod dummy_gen;
 pub mod exports;
 pub mod load_config;

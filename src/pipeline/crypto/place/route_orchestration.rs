@@ -20,7 +20,15 @@ pub(super) fn build_commercial_routes(
     materialized: &MaterializedMultiFamilyProgram,
     image_base: u64,
 ) -> Result<Option<MaterializedRouteTable>> {
-    let mut required = BTreeMap::<OriginalTargetRva, (FunctionId, u64, GatewayKind)>::new();
+    let mut required = BTreeMap::<
+        OriginalTargetRva,
+        (
+            FunctionId,
+            u64,
+            GatewayKind,
+            crate::vm::poly::VmArchitectureFamily,
+        ),
+    >::new();
 
     for site in program.indirect_targets.sites.values() {
         if site.status != ResolutionStatus::Complete {
@@ -92,19 +100,13 @@ pub(super) fn build_commercial_routes(
             // keep this particular target block native.  Only an exact local
             // VIP proves that the destination is VM-owned.
             let Some(&entry_vip) = module.ip_map.get(&target_va) else {
-                let function_entry_va = program
-                    .functions
-                    .get(&function_id)
-                    .and_then(|function| function.entries.iter().next())
-                    .map(|rva| image_base + u64::from(*rva));
-                if function_entry_va.is_some_and(|entry| module.function_ids.contains(&entry)) {
-                    return Err(anyhow!(
-                        "complete indirect target RVA {target_rva:#x} has no materialized entry VIP"
-                    ));
-                }
                 // The family plan is function-wide, but ownership policy kept
-                // this destination function native. Its original address is
-                // the valid passthrough target and must not get a VM route.
+                // this destination function/block native. `function_ids` is
+                // intentionally only planning metadata and can still contain
+                // a function whose complete body was removed by the later
+                // performance/SEH ownership gate. The exact ip_map is the
+                // execution authority, so absence here means native-island
+                // passthrough rather than a malformed VM route.
                 continue;
             };
             let gateway = if source_family == target_family {
@@ -112,13 +114,16 @@ pub(super) fn build_commercial_routes(
             } else {
                 GatewayKind::CrossFamily
             };
-            let candidate = (function_id, entry_vip as u64, gateway);
+            let candidate = (function_id, entry_vip as u64, gateway, target_family);
             if let Some(existing) = required.get_mut(&OriginalTargetRva(target_rva)) {
                 if existing.0 != candidate.0 || existing.1 != candidate.1 {
                     bail!("complete indirect target RVA {target_rva:#x} requires conflicting route identities");
                 }
                 if existing.2 != candidate.2 {
                     existing.2 = GatewayKind::CrossFamily;
+                }
+                if existing.3 != candidate.3 {
+                    bail!("complete indirect target RVA {target_rva:#x} has conflicting family ownership");
                 }
             } else {
                 required.insert(OriginalTargetRva(target_rva), candidate);
@@ -143,26 +148,28 @@ pub(super) fn build_commercial_routes(
         let target_va = image_base
             .checked_add(u64::from(target_rva))
             .ok_or_else(|| anyhow!("pointer-table target VA overflow at RVA {target_rva:#x}"))?;
-        let Some(target_family) = plan.assignment_for(target_va).map(|a| a.family) else {
-            continue;
-        };
-        let module = materialized
+        // Address-taken alternate entries need not be the representative
+        // function id stored in ProductionFamilyPlan. The materialized ip_map
+        // is the exact execution authority; select the owning module directly
+        // instead of dropping a real entry when assignment_for(target_va)
+        // cannot resolve that alias-free boundary.
+        let Some(module) = materialized
             .modules
             .iter()
-            .find(|module| module.family == target_family)
-            .ok_or_else(|| {
-                anyhow!(
-                    "pointer-table target RVA {target_rva:#x} has no materialized {:?} module",
-                    target_family
-                )
-            })?;
+            .find(|module| module.ip_map.contains_key(&target_va))
+        else {
+            continue;
+        };
         // A partially virtualized function can have native pointer-table
         // targets.  Leave those original addresses as passthrough entries;
         // absence of an exact VIP is the block-level ownership signal.
-        let Some(&entry_vip) = module.ip_map.get(&target_va) else {
-            continue;
-        };
-        let candidate = (function.id, entry_vip as u64, GatewayKind::VmEntry);
+        let entry_vip = module.ip_map[&target_va];
+        let candidate = (
+            function.id,
+            entry_vip as u64,
+            GatewayKind::VmEntry,
+            module.family,
+        );
         if let Some(existing) = required.get(&OriginalTargetRva(target_rva)) {
             if existing.0 != candidate.0 || existing.1 != candidate.1 {
                 bail!(
@@ -178,12 +185,7 @@ pub(super) fn build_commercial_routes(
         return Ok(None);
     }
     let mut table = RouteTable::default();
-    for (rva, (function_id, entry_vip, gateway)) in required {
-        let target_va = image_base + u64::from(rva.0);
-        let family = plan
-            .assignment_for(target_va)
-            .ok_or_else(|| anyhow!("route target RVA {:#x} lost its family assignment", rva.0))?
-            .family;
+    for (rva, (function_id, entry_vip, gateway, family)) in required {
         table.register(
             program,
             rva,
@@ -313,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn no_indirect_proof_emits_no_route_section_and_missing_vip_fails_closed() {
+    fn no_indirect_proof_or_native_owned_target_emits_no_route_section() {
         let (mut program, plan, mut multi) = fixture();
         program.indirect_targets.sites.clear();
         assert!(build_commercial_routes(&program, &plan, &multi, BASE)
@@ -322,8 +324,7 @@ mod tests {
         let (program, plan, _) = fixture();
         multi.modules[0].ip_map.clear();
         assert!(build_commercial_routes(&program, &plan, &multi, BASE)
-            .unwrap_err()
-            .to_string()
-            .contains("entry VIP"));
+            .unwrap()
+            .is_none());
     }
 }

@@ -139,6 +139,10 @@ pub struct ProgramModel {
     /// partition was refined. Pass-1 feeds these RVAs back into CFG extraction.
     pub discovered_indirect_code_targets: BTreeSet<u32>,
     pub code_pointers: BTreeMap<CodePointerId, CodePointerModel>,
+    /// Pointer-slot RVAs whose container and consumption path were proven by
+    /// a typed indirect-target producer (for example a Rust vtable method
+    /// slot). This is deliberately separate from heuristic code pointers.
+    pub typed_pointer_slots: BTreeMap<u32, crate::analysis::indirect_targets::TargetProvenance>,
     pub tls_callbacks: BTreeSet<FunctionId>,
     pub crt_entries: BTreeSet<FunctionId>,
     pub exports: BTreeSet<FunctionId>,

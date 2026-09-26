@@ -187,12 +187,12 @@ pub struct CliArgs {
 
     /// Generate instruction-level VM bytecode mapping file (<output>.map).
     /// Maps bytecode offsets to original VAs and disassemblies for crash triage.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "strict_profile")]
     pub map: bool,
 
     /// Generate block-level symbolic mapping file (<output>.sym).
     /// Records bytecode offset ranges, original block VAs, and function ownership.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "strict_profile")]
     pub sym_map: bool,
 
     /// Preserve original .pdata SEH exception table without adding dispatcher leaf entries.

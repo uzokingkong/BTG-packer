@@ -165,7 +165,10 @@ pub(crate) fn collect_code_materialized_target_ids(
         if inst.memory_base() == iced_x86::Register::RIP
             && inst.memory_index() == iced_x86::Register::None
         {
-            let target = inst.ip() + inst.len() as u64 + inst.memory_displacement64();
+            // iced-x86 exposes RIP-relative memory_displacement64() as the
+            // already resolved linear address.  Adding IP/length again turns
+            // every materialized code pointer into a bogus out-of-image VA.
+            let target = inst.ip_rel_memory_address();
             if let Some(id) = resolve_block_id(va_to_trigger_id, target, text_start_va, text_end_va)
             {
                 out.insert(id);

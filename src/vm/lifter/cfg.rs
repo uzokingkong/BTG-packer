@@ -306,7 +306,13 @@ pub fn lift_cfg_switch(
                         if let Some(&lbl) = block_label.get(&t) {
                             b.jmp32(lbl);
                         } else {
-                            b.mov_r_imm64(SCRATCH, func_entry_for(t, excluded_func_ranges));
+                            // Preserve the exact architectural destination.
+                            // A single .pdata range can contain multiple
+                            // callable import thunks/alternate entries; folding
+                            // those targets to the range start calls a different
+                            // function (for example _initterm_e became
+                            // __CxxFrameHandler3).
+                            b.mov_r_imm64(SCRATCH, t);
                             b.native_call(SCRATCH);
                             b.halt();
                         }
@@ -328,7 +334,7 @@ pub fn lift_cfg_switch(
                             if let Some(&lbl) = block_label.get(&t) {
                                 b.jcc32(COND_JE, lbl);
                             } else {
-                                b.mov_r_imm64(SCRATCH, func_entry_for(t, excluded_func_ranges));
+                                b.mov_r_imm64(SCRATCH, t);
                                 b.native_call(SCRATCH);
                                 b.halt();
                             }
@@ -337,7 +343,7 @@ pub fn lift_cfg_switch(
                             if let Some(&lbl) = block_label.get(&t) {
                                 b.jcc32(jcc_cond(code), lbl);
                             } else {
-                                b.mov_r_imm64(SCRATCH, func_entry_for(t, excluded_func_ranges));
+                                b.mov_r_imm64(SCRATCH, t);
                                 b.native_call(SCRATCH);
                                 b.halt();
                             }
@@ -352,7 +358,7 @@ pub fn lift_cfg_switch(
                             b.push_r(SCRATCH);
                             b.call32(lbl);
                         } else {
-                            b.mov_r_imm64(SCRATCH, func_entry_for(t, excluded_func_ranges));
+                            b.mov_r_imm64(SCRATCH, t);
                             b.native_call(SCRATCH);
                             b.halt();
                         }

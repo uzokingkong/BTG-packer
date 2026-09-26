@@ -70,6 +70,9 @@ pub struct PeMultiSectionBuilder {
     pub mutable_state_section: Option<SectionData>,
     pub mutable_state_metadata_section: Option<SectionData>,
     pub route_metadata_section: Option<SectionData>,
+    /// Phase-B relocated native code. Its RVA is fixed by the emitter because
+    /// every PC-relative fixup was encoded against that exact address.
+    pub native_island_section: Option<SectionData>,
     pub original_headers_bytes: Vec<u8>,
     /// P0-⑦: relocation-aware 출력 — `.reloc` data directory(idx 5)가 제공되면
     /// ASLR(DYNAMIC_BASE 0x0040)/HIGH_ENTROPY_VA(0x0020) 비트를 보존한다.
@@ -120,6 +123,7 @@ impl PeMultiSectionBuilder {
             mutable_state_section: None,
             mutable_state_metadata_section: None,
             route_metadata_section: None,
+            native_island_section: None,
             original_headers_bytes,
             // P0-⑦: 기본값은 기존 동작(ASLR 스트립) 유지. relocation-aware 경로가
             // .reloc data directory를 채우고 이 플래그를 켠다.
@@ -148,6 +152,7 @@ impl PeMultiSectionBuilder {
             + usize::from(self.mutable_state_section.is_some())
             + usize::from(self.mutable_state_metadata_section.is_some())
             + usize::from(self.route_metadata_section.is_some())
+            + usize::from(self.native_island_section.is_some())
             + usize::from(self.payload_section.is_some())
             + usize::from(self.reloc_section.is_some())) as u16;
         let original_e_lfanew = self
@@ -306,11 +311,31 @@ impl PeMultiSectionBuilder {
             payload_end_va
         };
 
+        let adjusted_native_island_section = self.native_island_section;
+        let native_island_end_va = if let Some(ref island) = adjusted_native_island_section {
+            let required_rva = align_config.align_size(route_end_va, AlignmentType::Section);
+            if island.virtual_address != required_rva {
+                return Err(anyhow::anyhow!(
+                    "native-island RVA drift: emitted=0x{:X}, required=0x{:X}",
+                    island.virtual_address,
+                    required_rva
+                ));
+            }
+            island.virtual_address
+                + align_config.align_size(
+                    island.virtual_size.max(island.bytes.len() as u32),
+                    AlignmentType::Section,
+                )
+        } else {
+            route_end_va
+        };
+
         // P0-⑦: 별도 .reloc 섹션을 payload/btg 뒤에 배치 (relayed에 넣으면 .textb가
         // 밀려 entry point/절대 VA 기준이 깨지므로 여기서 붙인다).
         let mut adjusted_reloc_section = self.reloc_section;
         if let Some(ref mut rsec) = adjusted_reloc_section {
-            rsec.virtual_address = align_config.align_size(route_end_va, AlignmentType::Section);
+            rsec.virtual_address =
+                align_config.align_size(native_island_end_va, AlignmentType::Section);
         }
 
         // Write Section Headers
@@ -342,6 +367,9 @@ impl PeMultiSectionBuilder {
         }
         if let Some(route) = adjusted_route_metadata_section {
             all_sections.push(route);
+        }
+        if let Some(island) = adjusted_native_island_section {
+            all_sections.push(island);
         }
         if let Some(rs) = adjusted_reloc_section {
             all_sections.push(rs);

@@ -11,12 +11,70 @@ use anyhow::Result;
 use std::fs;
 use std::path::Path;
 
+fn scrub_fully_owned_original_text(ctx: &PipelineContext, sections: &mut [SectionData]) -> u64 {
+    let text_start = ctx.target_info.text_rva as u64;
+    let text_end = text_start.saturating_add(ctx.target_info.text_vsize as u64);
+    let mut state = ctx.poly_vm_seed ^ 0x4254_472F_5445_5854;
+    let mut scrubbed = 0u64;
+    for section in sections {
+        let section_start = section.virtual_address as u64;
+        let section_end = section_start.saturating_add(section.bytes.len() as u64);
+        let start = text_start.max(section_start);
+        let end = text_end.min(section_end);
+        if start >= end {
+            continue;
+        }
+        for rva in start..end {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut word = state;
+            word = (word ^ (word >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            word = (word ^ (word >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            word ^= word >> 31;
+            let section_offset = (rva - section_start) as usize;
+            let original_offset = (rva - text_start) as usize;
+            let mut decoy = word as u8;
+            if ctx
+                .target_info
+                .text_bytes
+                .get(original_offset)
+                .is_some_and(|original| *original == decoy)
+            {
+                decoy ^= 0xA5;
+            }
+            section.bytes[section_offset] = decoy;
+            scrubbed += 1;
+        }
+    }
+    scrubbed
+}
+
+fn retire_original_text_execute(ctx: &PipelineContext, sections: &mut [SectionData]) -> u64 {
+    let text_start = ctx.target_info.text_rva;
+    let text_end = text_start.saturating_add(ctx.target_info.text_vsize as u32);
+    let mut retired = 0u64;
+    for section in sections {
+        let section_end = section
+            .virtual_address
+            .saturating_add(section.virtual_size.max(section.bytes.len() as u32));
+        let start = section.virtual_address.max(text_start);
+        let end = section_end.min(text_end);
+        if start >= end {
+            continue;
+        }
+        if section.characteristics & 0x2000_0000 != 0 {
+            section.characteristics &= !(0x2000_0000 | 0x0000_0020);
+            retired += u64::from(end - start);
+        }
+    }
+    retired
+}
+
 ///
 ///
 ///
 pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>> {
     ctx.layout()?;
-    let btg_section = ctx
+    let mut btg_section = ctx
         .btg_section_data
         .clone()
         .ok_or_else(|| anyhow::anyhow!("btg_section_data not set ??run Pass 4 first"))?;
@@ -88,6 +146,11 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
             !(section.virtual_address < text_end && text_start < end)
                 || section.characteristics & 0x2000_0000 == 0
         }));
+        let scrubbed = scrub_fully_owned_original_text(ctx, &mut relayed_sections);
+        println!(
+            "[+] Semantic leakage hardening: scrubbed {} fully VM-owned original .text byte(s)",
+            scrubbed
+        );
     }
     // Pillar 1: Sanitize sensitive metadata, source paths, and PDB signatures from data sections
     let stripped = crate::pipeline::rdata_strip::RdataMetadataStripper::sanitize_sections(
@@ -162,10 +225,345 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
             vm_prog_unwind.as_ref().map(|v| v.as_slice()),
             &ctx.vm_prog_native_bridges,
             ctx.vm_prog_lifetime_cleanup_handler_rva,
+            &[],
+            &[],
         );
     }
 
     let entry_point_rva = dispatcher_rva + ctx.boot_entry_offset;
+
+    // Phase-B publication is opt-in until external code pointers and unwind
+    // consumers are switched atomically. Compute the same fixed RVA used by
+    // PeMultiSectionBuilder and encode every PC-relative fixup against it.
+    let mut native_island_runtime_functions = Vec::new();
+    let mut native_island_original_unwind_starts = Vec::new();
+    let native_island_section = if std::env::var_os("BTG_EMIT_NATIVE_ISLAND").is_some() {
+        if let Some(plan) = ctx
+            .native_island_plan
+            .as_ref()
+            .filter(|plan| plan.is_ready_for_emission())
+        {
+            let sec_align = if ctx.target_info.section_alignment == 0 {
+                0x1000
+            } else {
+                ctx.target_info.section_alignment
+            };
+            let align_sec = |value: u32| value.div_ceil(sec_align) * sec_align;
+            let section_end = |section: &SectionData| {
+                section.virtual_address
+                    + align_sec(section.virtual_size.max(section.bytes.len() as u32))
+            };
+            let max_existing = relayed_sections
+                .iter()
+                .map(section_end)
+                .max()
+                .unwrap_or(0x1000);
+            let btg_rva = btg_section.virtual_address.max(align_sec(max_existing));
+            let btg_end =
+                btg_rva + align_sec(btg_section.virtual_size.max(btg_section.bytes.len() as u32));
+            let iat_end = ctx
+                .bootstrap_iat_section_data
+                .as_ref()
+                .map(|section| {
+                    let rva = section.virtual_address.max(align_sec(btg_end));
+                    rva + align_sec(section.virtual_size.max(section.bytes.len() as u32))
+                })
+                .unwrap_or(btg_end);
+            let state_end = ctx
+                .mutable_state_section_data
+                .as_ref()
+                .map(|section| section_end(section).max(iat_end))
+                .unwrap_or(iat_end);
+            let metadata_end = ctx
+                .mutable_state_metadata_section_data
+                .as_ref()
+                .map(|section| section_end(section).max(state_end))
+                .unwrap_or(state_end);
+            let payload_end = ctx
+                .payload_section_data
+                .as_ref()
+                .map(|section| {
+                    align_sec(metadata_end)
+                        + align_sec(section.virtual_size.max(section.bytes.len() as u32))
+                })
+                .unwrap_or(metadata_end);
+            let route_end = ctx
+                .route_metadata_section_data
+                .as_ref()
+                .map(|section| {
+                    align_sec(payload_end)
+                        + align_sec(section.virtual_size.max(section.bytes.len() as u32))
+                })
+                .unwrap_or(payload_end);
+            let island_rva = align_sec(route_end);
+            let image = plan.emit_with_external_redirects(
+                &ctx.target_info,
+                island_rva,
+                ctx.poly_vm_seed,
+                &ctx.vm_native_entry_rewrites,
+            )?;
+            if std::env::var_os("BTG_TRACE_NATIVE_ISLAND").is_some() {
+                for placement in &image.placements {
+                    println!(
+                        "[TRACE native-island] placement original=0x{:X}..0x{:X} island=0x{:X}..0x{:X}",
+                        placement.original_start_rva,
+                        placement.original_end_rva,
+                        placement.island_start_rva,
+                        placement.island_start_rva.saturating_add(
+                            placement
+                                .original_end_rva
+                                .saturating_sub(placement.original_start_rva),
+                        ),
+                    );
+                }
+            }
+            let mut native_call_rewrites =
+                plan.native_call_rewrites(ctx.target_info.image_base, &image)?;
+            native_call_rewrites.extend(
+                ctx.vm_native_entry_rewrites
+                    .iter()
+                    .map(|(&original_va, &gateway_va)| (original_va, gateway_va)),
+            );
+            native_call_rewrites.sort_unstable();
+            native_call_rewrites.dedup_by_key(|rewrite| rewrite.0);
+            if std::env::var_os("BTG_ACTIVATE_NATIVE_ISLAND_CALLS").is_some() {
+                let mut replacements = 0u64;
+                let activation_limit = std::env::var("BTG_NATIVE_ISLAND_REWRITE_LIMIT")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(native_call_rewrites.len())
+                    .min(native_call_rewrites.len());
+                for (index, &(original_va, island_va)) in native_call_rewrites
+                    .iter()
+                    .take(activation_limit)
+                    .enumerate()
+                {
+                    if std::env::var_os("BTG_TRACE_NATIVE_ISLAND").is_some() {
+                        println!(
+                            "[TRACE native-island] rewrite[{index}] original=0x{original_va:X} island=0x{island_va:X}"
+                        );
+                    }
+                    let reserved_source = 0x0000_7FFE_0000_0000u64 + (index as u64) * 0x20;
+                    let reserved_destination = reserved_source + 0x10;
+                    for (reserved, actual) in [
+                        (reserved_source.to_le_bytes(), original_va.to_le_bytes()),
+                        (reserved_destination.to_le_bytes(), island_va.to_le_bytes()),
+                    ] {
+                        for offset in 0..=btg_section.bytes.len().saturating_sub(8) {
+                            if btg_section.bytes[offset..offset + 8] == reserved {
+                                btg_section.bytes[offset..offset + 8].copy_from_slice(&actual);
+                                replacements += 1;
+                            }
+                        }
+                    }
+                }
+                if replacements == 0 {
+                    anyhow::bail!("native-call rewrite activation found no reserved VM immediates");
+                }
+                println!(
+                    "[+] Phase-B native-call bridge: activated {} immediate rewrite site(s) for {} entry pair(s)",
+                    replacements,
+                    activation_limit
+                );
+            }
+            if std::env::var_os("BTG_REDIRECT_NATIVE_ISLAND_CXX_EH").is_some() {
+                let patched = plan.redirect_unwind_handlers(
+                    &ctx.target_info,
+                    &image,
+                    &mut relayed_sections,
+                )?;
+                println!(
+                    "[+] Phase-B native island: redirected {} UNWIND_INFO handler RVA(s)",
+                    patched
+                );
+            }
+            for function in &plan.functions {
+                let Some(unwind) = function.unwind else {
+                    continue;
+                };
+                let placement = image
+                    .placements
+                    .iter()
+                    .find(|placement| placement.original_start_rva == function.start_rva)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "native-island unwind placement missing for RVA {:#x}",
+                            function.start_rva
+                        )
+                    })?;
+                native_island_runtime_functions.push(RuntimeFunction {
+                    begin_address: placement.island_start_rva,
+                    end_address: placement
+                        .island_start_rva
+                        .saturating_add(function.end_rva.saturating_sub(function.start_rva)),
+                    unwind_info_address: unwind.unwind_info_rva,
+                });
+                native_island_original_unwind_starts.push(function.start_rva);
+            }
+            if std::env::var_os("BTG_REDIRECT_NATIVE_ISLAND_POINTERS").is_some() {
+                let program = ctx.program_model.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("native-island pointer redirect requires ProgramModel")
+                })?;
+                let patched = plan.redirect_code_pointers(
+                    &ctx.target_info,
+                    program,
+                    &image,
+                    &mut relayed_sections,
+                )?;
+                println!(
+                    "[+] Phase-B native island: redirected {} canonical external code pointer(s)",
+                    patched
+                );
+            }
+            if std::env::var_os("BTG_REDIRECT_NATIVE_ISLAND_TABLES").is_some() {
+                let program = ctx.program_model.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("native-island table redirect requires ProgramModel")
+                })?;
+                let patched = plan.redirect_indirect_tables(
+                    &ctx.target_info,
+                    program,
+                    &image,
+                    &mut relayed_sections,
+                )?;
+                println!(
+                    "[+] Phase-B native island: redirected {} typed indirect-table entry(s)",
+                    patched
+                );
+            }
+            let program = ctx.program_model.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("native-island reference audit requires ProgramModel")
+            })?;
+            let reference_audit = plan.audit_native_code_pointers(
+                &ctx.target_info,
+                program,
+                &image,
+                &relayed_sections,
+            );
+            println!(
+                "[+] Phase-B native reference audit: {} canonical slot(s), {} island, {} original, {} other, {} unsupported",
+                reference_audit.inventoried_slots,
+                reference_audit.relocated_slots,
+                reference_audit.original_slots,
+                reference_audit.other_slots,
+                reference_audit.unsupported_slots,
+            );
+            if !reference_audit.original_by_provenance.is_empty() {
+                let summary = reference_audit
+                    .original_by_provenance
+                    .iter()
+                    .map(|(provenance, count)| format!("{provenance}={count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("[+] Phase-B remaining original native pointers by provenance: {summary}");
+                println!(
+                    "[+] Phase-B remaining pointers overlapping typed UNWIND_INFO: {}",
+                    reference_audit.original_unwind_metadata_slots
+                );
+                println!(
+                    "[+] Phase-B remaining pointers proven by typed C++ EH graph: {}",
+                    reference_audit.original_cxx_eh_slots
+                );
+            }
+            if std::env::var_os("BTG_TRACE_NATIVE_ISLAND").is_some() {
+                for (location, provenance, encoding) in &reference_audit.original_locations {
+                    println!(
+                        "[TRACE native-island] remaining pointer slot={location:#x} provenance={provenance} encoding={encoding:?}"
+                    );
+                }
+            }
+            if std::env::var_os("BTG_RETIRE_ORIGINAL_TEXT").is_some() {
+                let required_switches = [
+                    "BTG_ACTIVATE_NATIVE_ISLAND_CALLS",
+                    "BTG_REDIRECT_NATIVE_ISLAND_POINTERS",
+                    "BTG_REDIRECT_NATIVE_ISLAND_TABLES",
+                    "BTG_REDIRECT_NATIVE_ISLAND_DIR64_POINTERS",
+                    "BTG_REDIRECT_NATIVE_ISLAND_CXX_EH",
+                ];
+                let missing = required_switches
+                    .iter()
+                    .filter(|name| std::env::var_os(name).is_none())
+                    .copied()
+                    .collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    anyhow::bail!(
+                        "original .text retirement requires all Phase-B switches; missing {}",
+                        missing.join(", ")
+                    );
+                }
+                let activation_limit = std::env::var("BTG_NATIVE_ISLAND_REWRITE_LIMIT")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(native_call_rewrites.len());
+                if activation_limit < native_call_rewrites.len() {
+                    anyhow::bail!(
+                        "original .text retirement rejects partial native-call activation ({}/{})",
+                        activation_limit,
+                        native_call_rewrites.len()
+                    );
+                }
+                if reference_audit.original_slots != 0 || reference_audit.unsupported_slots != 0 {
+                    anyhow::bail!(
+                        "original .text retirement blocked by native references: {} original, {} unsupported",
+                        reference_audit.original_slots,
+                        reference_audit.unsupported_slots
+                    );
+                }
+                let retired = retire_original_text_execute(ctx, &mut relayed_sections);
+                if retired == 0 {
+                    anyhow::bail!(
+                        "original .text retirement changed no executable bytes; refusing ambiguous output"
+                    );
+                }
+                println!(
+                    "[+] Phase-B original .text retirement: removed execute permission from {} byte(s)",
+                    retired
+                );
+            }
+            println!(
+                "[+] Phase-B native island staged: RVA 0x{:X}, {} byte(s), {} function(s), {} native-call rewrite(s), {} RIP fixup(s), {} direct-edge fixup(s), {} DIR64 fixup(s)",
+                island_rva,
+                image.bytes.len(),
+                image.placements.len(),
+                native_call_rewrites.len(),
+                image.patched_rip_references,
+                image.patched_direct_edges,
+                image.patched_dir64_slots,
+            );
+            Some(SectionData {
+                name: ".nisland".to_string(),
+                virtual_address: island_rva,
+                virtual_size: image.bytes.len() as u32,
+                characteristics: 0x6000_0020,
+                bytes: image.bytes,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if !native_island_runtime_functions.is_empty() && !ctx.keep_pdata {
+        update_pdata_seh(
+            &mut relayed_sections,
+            &mut clean_data_dirs,
+            &ctx.target_info.original_pdata_entries,
+            dispatcher_rva,
+            boot_area_len,
+            bridge_unwind.as_ref(),
+            ctx.vm_prog_rva,
+            ctx.vm_prog_code_len,
+            vm_prog_unwind.as_ref().map(|value| value.as_slice()),
+            &ctx.vm_prog_native_bridges,
+            ctx.vm_prog_lifetime_cleanup_handler_rva,
+            &native_island_runtime_functions,
+            &native_island_original_unwind_starts,
+        );
+        println!(
+            "[+] Phase-B native island: published {} relocated RUNTIME_FUNCTION record(s)",
+            native_island_runtime_functions.len()
+        );
+    }
 
     // ── P0-⑦ (T0-3): relocation-aware 출력 — 암호화 경로에서도 ASLR 보존 ──────────
     // 기존 코드는 `at_rest_encrypted=true`이면 .reloc 생성을 포기해 ASLR이 완전히
@@ -255,6 +653,13 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
             }
             None => payload_end,
         };
+        let native_island_end = match &native_island_section {
+            Some(island) => {
+                let island_va = align_sec(route_end);
+                island_va + align_sec(island.virtual_size.max(island.bytes.len() as u32))
+            }
+            None => route_end,
+        };
 
         // T0-3: 암호화된 RVA 범위를 파앙한다.
         // 코드 블록 영역: dispatcher_rva + first_block_offset .. + code_len
@@ -275,7 +680,7 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
         }
 
         let image_base = ctx.target_info.image_base;
-        let size_of_image = route_end;
+        let size_of_image = native_island_end;
 
         // 모든 최종 섹션 목록 (VA 확정본) — .reloc 자체는 제외하고 스캔.
         let mut final_sections: Vec<SectionData> = relayed_sections.clone();
@@ -305,6 +710,9 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
             placed.virtual_address = align_sec(payload_end);
             final_sections.push(placed);
         }
+        if let Some(island) = &native_island_section {
+            final_sections.push(island.clone());
+        }
 
         let reloc = build_reloc_directory(
             &final_sections,
@@ -314,7 +722,7 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
         );
 
         if let Some(mut ro) = reloc {
-            let reloc_va = align_sec(route_end);
+            let reloc_va = align_sec(native_island_end);
             ro.section.virtual_address = reloc_va;
             if clean_data_dirs.len() > 5 {
                 clean_data_dirs[5] = DataDirectory {
@@ -364,6 +772,7 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     multi_builder.mutable_state_section = ctx.mutable_state_section_data.clone();
     multi_builder.mutable_state_metadata_section = ctx.mutable_state_metadata_section_data.clone();
     multi_builder.route_metadata_section = ctx.route_metadata_section_data.clone();
+    multi_builder.native_island_section = native_island_section;
     multi_builder.preserve_aslr_bits = preserve_aslr_bits;
     multi_builder.reloc_section = reloc_section;
 
@@ -595,13 +1004,31 @@ fn update_pdata_seh(
     vm_prog_unwind: Option<&[u8]>,
     vm_native_bridges: &[(u32, u32)],
     vm_lifetime_cleanup_handler_rva: u32,
+    additional_runtime_functions: &[RuntimeFunction],
+    relocated_original_unwind_starts: &[u32],
 ) {
     if let Some(pdata_sec) = relayed_sections.iter_mut().find(|s| s.name == ".pdata") {
+        // Never publish both halves of an original -> native-island mapping:
+        // besides wasting .pdata capacity, that duplicate pair directly leaks
+        // the relocation relation.  Other original unwind rows are retained
+        // for now because typed C++/Rust unwind metadata can chain through
+        // them even after the code entry itself has been retired.
+        let retire_original_text = std::env::var_os("BTG_RETIRE_ORIGINAL_TEXT").is_some();
         let mut rf_list: Vec<RuntimeFunction> = original_pdata_entries
             .iter()
             .filter(|rf| rf.begin_address > 0 && rf.end_address > rf.begin_address)
+            .filter(|rf| {
+                !retire_original_text
+                    || !relocated_original_unwind_starts.contains(&rf.begin_address)
+            })
             .copied()
             .collect();
+        rf_list.extend(
+            additional_runtime_functions
+                .iter()
+                .filter(|rf| rf.begin_address > 0 && rf.end_address > rf.begin_address)
+                .copied(),
+        );
 
         let bridge_begin = dispatcher_rva + 0x20;
         let mut added_bridge = false;
@@ -743,7 +1170,9 @@ fn update_pdata_seh(
         pdata_bytes.extend_from_slice(&native_bridge_unwind);
 
         pdata_sec.bytes = pdata_bytes.clone();
-        pdata_sec.virtual_size = array_len;
+        // The exception directory describes only the RUNTIME_FUNCTION array,
+        // but the section also owns the appended UNWIND_INFO blobs.
+        pdata_sec.virtual_size = pdata_bytes.len() as u32;
 
         if clean_data_dirs.len() > 3 {
             clean_data_dirs[3] = DataDirectory {
@@ -776,6 +1205,66 @@ fn update_pdata_seh(
 mod tests {
     use super::*;
     use crate::dispatcher::{build_dispatcher, build_dispatcher_reencrypt, UNWIND_ALLOC8};
+
+    #[test]
+    fn fully_owned_text_scrub_removes_every_same_rva_original_byte() {
+        let input = crate::pe::generate_dummy_target_pe().unwrap();
+        let info = crate::pe::parser::TargetPeInfo::parse(&input).unwrap();
+        let text_rva = info.text_rva;
+        let original = info.text_bytes.clone();
+        let mut ctx = crate::pipeline::PipelineContext::new(
+            info,
+            0x1400_0000 + u64::from(text_rva),
+            text_rva,
+            2,
+        );
+        ctx.poly_vm_seed = 0xA531_2026_0924_0001;
+        let text_vsize = ctx.target_info.text_vsize;
+        let mut sections = ctx.target_info.relayed_sections.clone();
+        let scrubbed = scrub_fully_owned_original_text(&ctx, &mut sections);
+        assert!(scrubbed > 0);
+        let text = sections
+            .iter()
+            .find(|section| section.virtual_address == text_rva)
+            .unwrap();
+        for (index, (&before, &after)) in original
+            .iter()
+            .zip(&text.bytes)
+            .take(text_vsize)
+            .enumerate()
+        {
+            assert_ne!(before, after, "original byte survived at .text+{index:#x}");
+        }
+    }
+
+    #[test]
+    fn original_text_retirement_removes_execute_without_changing_bytes() {
+        let input = crate::pe::generate_dummy_target_pe().unwrap();
+        let info = crate::pe::parser::TargetPeInfo::parse(&input).unwrap();
+        let text_rva = info.text_rva;
+        let ctx = crate::pipeline::PipelineContext::new(
+            info,
+            0x1400_0000 + u64::from(text_rva),
+            text_rva,
+            2,
+        );
+        let mut sections = ctx.target_info.relayed_sections.clone();
+        let before = sections
+            .iter()
+            .find(|section| section.virtual_address == text_rva)
+            .unwrap()
+            .bytes
+            .clone();
+        let retired = retire_original_text_execute(&ctx, &mut sections);
+        let text = sections
+            .iter()
+            .find(|section| section.virtual_address == text_rva)
+            .unwrap();
+        assert!(retired > 0);
+        assert_eq!(text.characteristics & 0x2000_0000, 0);
+        assert_eq!(text.characteristics & 0x0000_0020, 0);
+        assert_eq!(text.bytes, before);
+    }
 
     #[test]
     fn pdata_rebuild_preserves_native_entries_and_adds_bridge_leaf() {
@@ -819,12 +1308,14 @@ mod tests {
             None,
             &[],
             0,
+            &[],
+            &[],
         );
 
         assert_eq!(sections[0].bytes.len(), 44);
         assert_eq!(directories[3].virtual_address, 0x4000);
         assert_eq!(directories[3].size, 36);
-        assert_eq!(sections[0].virtual_size, 36);
+        assert_eq!(sections[0].virtual_size, 44);
 
         let words: Vec<u32> = sections[0].bytes[..36]
             .chunks_exact(4)
@@ -881,6 +1372,8 @@ mod tests {
             None,
             &[],
             0,
+            &[],
+            &[],
         );
 
         assert_eq!(sections[0].bytes.len(), 40);
@@ -953,6 +1446,8 @@ mod tests {
             None,
             &[],
             0,
+            &[],
+            &[],
         );
 
         let pdata = &sections[0].bytes;

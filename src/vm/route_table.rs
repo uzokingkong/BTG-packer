@@ -60,7 +60,7 @@ impl std::error::Error for RouteTableError {}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RouteTable {
-    by_original_rva: BTreeMap<OriginalTargetRva, FunctionId>,
+    by_original_rva: BTreeMap<OriginalTargetRva, FunctionRoute>,
     by_function: BTreeMap<FunctionId, FunctionRoute>,
 }
 
@@ -94,23 +94,20 @@ impl RouteTable {
         if self.by_original_rva.contains_key(&original_rva) {
             return Err(RouteTableError::DuplicateOriginalTarget(original_rva));
         }
-        if let Some(existing) = self.by_function.get(&route.function_id) {
-            if existing != &route {
-                return Err(RouteTableError::ConflictingFunctionRoute(route.function_id));
-            }
-        }
-        self.by_original_rva.insert(original_rva, route.function_id);
+        // Alternate entries of one canonical function can have distinct VIPs.
+        // The original RVA is therefore the execution identity; by_function
+        // retains only a stable representative for diagnostics/legacy lookup.
+        self.by_original_rva.insert(original_rva, route);
         self.by_function.entry(route.function_id).or_insert(route);
         Ok(())
     }
 
     /// Resolve the complete typed chain RVA -> FunctionId -> VM destination.
     pub fn resolve(&self, rva: OriginalTargetRva) -> Result<FunctionRoute, RouteTableError> {
-        let function_id = *self
-            .by_original_rva
+        self.by_original_rva
             .get(&rva)
-            .ok_or(RouteTableError::UnknownOriginalTarget(rva))?;
-        self.route_for_function(function_id)
+            .copied()
+            .ok_or(RouteTableError::UnknownOriginalTarget(rva))
     }
 
     pub fn route_for_function(
@@ -142,8 +139,8 @@ impl RouteTable {
             });
         }
         let mut entries = Vec::with_capacity(self.by_original_rva.len());
-        for (&rva, &function_id) in &self.by_original_rva {
-            entries.push((rva, self.route_for_function(function_id)?));
+        for (&rva, &route) in &self.by_original_rva {
+            entries.push((rva, route));
         }
         Ok(MaterializedRouteTable { entries })
     }
@@ -249,19 +246,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_conflicting_metadata_for_one_function() {
+    fn preserves_distinct_vips_for_alternate_entries() {
         let mut table = RouteTable::default();
         table
             .register(&program(), OriginalTargetRva(0x1000), route())
             .unwrap();
         let mut conflict = route();
         conflict.entry_vip = EntryVip(99);
-        assert_eq!(
-            table
-                .register(&program(), OriginalTargetRva(0x1080), conflict)
-                .unwrap_err(),
-            RouteTableError::ConflictingFunctionRoute(FunctionId(7))
-        );
+        table
+            .register(&program(), OriginalTargetRva(0x1080), conflict)
+            .unwrap();
+        assert_eq!(table.resolve(OriginalTargetRva(0x1000)).unwrap(), route());
+        assert_eq!(table.resolve(OriginalTargetRva(0x1080)).unwrap(), conflict);
     }
 
     #[test]

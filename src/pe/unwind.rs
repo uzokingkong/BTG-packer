@@ -28,7 +28,10 @@ pub struct UnwindCode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnwindTrailer {
     None,
-    Handler { handler_rva: u32 },
+    Handler {
+        handler_rva: u32,
+        language_data_rva: u32,
+    },
     Chain(RuntimeFunction),
 }
 
@@ -187,6 +190,7 @@ pub fn parse_unwind_info(
         require(unwind_rva, bytes, trailer_offset + 4)?;
         UnwindTrailer::Handler {
             handler_rva: read_u32(&bytes[trailer_offset..trailer_offset + 4]),
+            language_data_rva: unwind_rva.saturating_add((trailer_offset + 4) as u32),
         }
     } else {
         UnwindTrailer::None
@@ -329,7 +333,8 @@ mod tests {
         assert_eq!(
             info.trailer,
             UnwindTrailer::Handler {
-                handler_rva: 0x12345678
+                handler_rva: 0x12345678,
+                language_data_rva: 0x500C,
             }
         );
     }
@@ -401,7 +406,8 @@ mod tests {
         assert_eq!(
             chain[1].1.trailer,
             UnwindTrailer::Handler {
-                handler_rva: 0x87654321
+                handler_rva: 0x87654321,
+                language_data_rva: 0x5018,
             }
         );
     }

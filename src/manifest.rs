@@ -43,6 +43,11 @@ pub struct VmOriginalMetrics {
     pub native_original_functions: Option<u64>,
     /// Original application `.text` bytes that remain executable in the output.
     pub original_text_exec_bytes: Option<u64>,
+    /// Original `.text` bytes still present byte-for-byte at their input RVA.
+    pub original_text_plain_bytes: Option<u64>,
+    pub native_island_functions: Option<u64>,
+    pub native_island_bytes: Option<u64>,
+    pub native_island_blockers: Option<u64>,
     /// Internal control-flow edges whose targets remain unresolved.
     pub unresolved_edges: Option<u64>,
 }
@@ -63,6 +68,10 @@ impl VmOriginalMetrics {
             vm_original_instructions: Some(vm_original_instructions),
             native_original_functions: Some(native_original_functions),
             original_text_exec_bytes: Some(original_text_exec_bytes),
+            original_text_plain_bytes: None,
+            native_island_functions: None,
+            native_island_bytes: None,
+            native_island_blockers: None,
             unresolved_edges: Some(unresolved_edges),
         }
     }
@@ -414,6 +423,22 @@ impl BuildManifest {
         out.push_str(&format!(
             "original_text_exec_bytes = {}\n",
             render_optional_metric(original.original_text_exec_bytes)
+        ));
+        out.push_str(&format!(
+            "original_text_plain_bytes = {}\n",
+            render_optional_metric(original.original_text_plain_bytes)
+        ));
+        out.push_str(&format!(
+            "native_island_functions = {}\n",
+            render_optional_metric(original.native_island_functions)
+        ));
+        out.push_str(&format!(
+            "native_island_bytes = {}\n",
+            render_optional_metric(original.native_island_bytes)
+        ));
+        out.push_str(&format!(
+            "native_island_blockers = {}\n",
+            render_optional_metric(original.native_island_blockers)
         ));
         out.push_str(&format!(
             "unresolved_edges = {}\n",

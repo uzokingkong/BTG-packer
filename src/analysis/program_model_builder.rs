@@ -7,7 +7,7 @@ use super::program_model::{
 };
 use crate::graph::cfg::BasicBlock;
 use crate::pe::{load_config::LoadConfig64, parser::TargetPeInfo, tls::TlsDirectory64};
-use iced_x86::{Decoder, DecoderOptions, FlowControl};
+use iced_x86::{Code, Decoder, DecoderOptions, FlowControl};
 use std::collections::{BTreeMap, BTreeSet};
 
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
@@ -119,6 +119,61 @@ impl<'a> ProgramModelBuilder<'a> {
                 rva: pointer.target_rva,
                 provenance: FunctionProvenance::DataCodePointer,
                 pointer: Some((pointer.location, pointer.encoding, provenance)),
+            });
+        }
+        // Compiler runtimes (notably Rust's lang_start path) commonly pass the
+        // real application entry as `lea reg,[rip+function]` rather than via a
+        // data relocation or direct CALL.  Promote only strong code-boundary
+        // evidence: an executable target immediately following INT3/NOP
+        // padding.  This avoids treating ordinary RIP-relative constants as
+        // functions while making the materialized entry available to CFG
+        // extraction and ownership before VM partitioning.
+        let mut materialized_entries = BTreeSet::new();
+        for section in target.executable_sections() {
+            let section_va = target.image_base + u64::from(section.virtual_address);
+            let mut decoder =
+                Decoder::with_ip(64, &section.bytes, section_va, DecoderOptions::NONE);
+            while decoder.can_decode() {
+                let instruction = decoder.decode();
+                if instruction.is_invalid() {
+                    continue;
+                }
+                let candidate_va = match instruction.code() {
+                    Code::Lea_r64_m if instruction.is_ip_rel_memory_operand() => {
+                        Some(instruction.ip_rel_memory_address())
+                    }
+                    Code::Mov_r64_imm64 => Some(instruction.immediate64()),
+                    _ => None,
+                };
+                let Some(candidate_rva) = candidate_va
+                    .and_then(|va| va.checked_sub(target.image_base))
+                    .and_then(|rva| u32::try_from(rva).ok())
+                else {
+                    continue;
+                };
+                if !executable_ranges
+                    .iter()
+                    .any(|range| range.start <= candidate_rva && candidate_rva < range.end)
+                    || candidate_rva <= section.virtual_address
+                {
+                    continue;
+                }
+                let offset = (candidate_rva - section.virtual_address) as usize;
+                if offset >= section.bytes.len() {
+                    continue;
+                }
+                let previous = section.bytes[offset - 1];
+                let first = section.bytes[offset];
+                if matches!(previous, 0x90 | 0xCC) && !matches!(first, 0x00 | 0x90 | 0xCC) {
+                    materialized_entries.insert(candidate_rva);
+                }
+            }
+        }
+        for rva in materialized_entries {
+            builder.points.push(PointSeed {
+                rva,
+                provenance: FunctionProvenance::DataCodePointer,
+                pointer: None,
             });
         }
         for table in crate::analysis::crt::discover_callback_tables(
@@ -336,10 +391,17 @@ impl<'a> ProgramModelBuilder<'a> {
         let mut pointer_id = 0;
         let mut seen_pointers = BTreeSet::new();
         for seed in &self.points {
-            if let (Some(target), Some((location, encoding, provenance))) =
-                (rva_to_function.get(&seed.rva).copied(), seed.pointer)
-            {
+            let mapped_target = rva_to_function.get(&seed.rva).copied();
+            if mapped_target.is_some() && seed.provenance == FunctionProvenance::DataCodePointer {
+                // Both data-backed pointers and executable code that
+                // materializes a function address are canonical indirect
+                // entry evidence. Only the former has a writable pointer
+                // slot, but both must reach CFG refinement and VM routing.
                 model.discovered_indirect_code_targets.insert(seed.rva);
+            }
+            if let (Some(target), Some((location, encoding, provenance))) =
+                (mapped_target, seed.pointer)
+            {
                 if !seen_pointers.insert((location, encoding, target)) {
                     continue;
                 }
@@ -592,14 +654,24 @@ impl<'a> ProgramModelBuilder<'a> {
         )?;
         let vtable_bases =
             crate::analysis::pointer_tables::discover_rust_vtable_bases(&model, &relayed_sections);
-        let vtable_resolutions = crate::analysis::pointer_tables::produce_rust_vtable_resolutions(
-            &model,
-            image_base,
-            &vtable_bases,
-        )
-        .into_iter()
-        .filter(|p| !explicit_sites.contains(&p.site))
-        .collect::<Vec<_>>();
+        let (vtable_resolutions, vtable_slots) =
+            crate::analysis::pointer_tables::produce_rust_vtable_resolutions_with_slots(
+                &model,
+                image_base,
+                &vtable_bases,
+            );
+        model
+            .typed_pointer_slots
+            .extend(vtable_slots.into_iter().map(|slot| {
+                (
+                    slot,
+                    crate::analysis::indirect_targets::TargetProvenance::Vtable,
+                )
+            }));
+        let vtable_resolutions = vtable_resolutions
+            .into_iter()
+            .filter(|p| !explicit_sites.contains(&p.site))
+            .collect::<Vec<_>>();
         crate::analysis::indirect_resolver::apply_indirect_resolutions(
             &mut model,
             &vtable_resolutions,

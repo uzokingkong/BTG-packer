@@ -187,6 +187,7 @@ pub fn build_program_vm_commercial_with_routes_for_family(
         chunks,
         routes,
         &[],
+        &[],
     )
 }
 
@@ -203,6 +204,7 @@ pub fn build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
     chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
     routes: &[crate::vm::threaded::poly_direct::NativeCrossFamilyRoute],
     native_pointer_rewrites: &[(u64, u64)],
+    native_call_rewrites: &[(u64, u64)],
 ) -> Result<VmModule> {
     // Virtual stack top: right after the state buffer (COMMERCIAL_STATE_SIZE),
     // growing down into the reserved VIRTUAL_STACK_SIZE region. Keeps the
@@ -238,6 +240,7 @@ pub fn build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
             chunks,
             routes,
             native_pointer_rewrites,
+            native_call_rewrites,
         )?
     } else {
         crate::vm::threaded::poly_direct::build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_rewrites(
@@ -257,6 +260,7 @@ pub fn build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
             chunks,
             routes,
             native_pointer_rewrites,
+            native_call_rewrites,
         )?
     };
 

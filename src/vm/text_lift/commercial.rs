@@ -378,6 +378,16 @@ fn performance_native_import_class(name: &str) -> Option<&'static str> {
             | "peekmessagew"
             | "dispatchmessagea"
             | "dispatchmessagew"
+            // Window procedures are reverse-call roots owned by USER32. Keep
+            // them on the same native side of the boundary as the message
+            // pump; otherwise a native DispatchMessageW loop re-enters a VM
+            // gateway for every message and turns a latency-critical callback
+            // into a stateful cross-ABI transition.
+            | "defwindowproca"
+            | "defwindowprocw"
+            | "callwindowproca"
+            | "callwindowprocw"
+            | "postquitmessage"
             | "translatemessage"
             | "msgwaitformultipleobjects"
             | "msgwaitformultipleobjectsex"
@@ -451,7 +461,7 @@ fn performance_native_roots(
     image_base: u64,
 ) -> HashMap<(u64, u64), CommercialFirstBlocker> {
     let enabled = std::env::var("BTG_NATIVE_HOT_CLASSES")
-        .unwrap_or_else(|_| "gui,wait,spin,timer".to_string())
+        .unwrap_or_else(|_| "gui,wait,spin,timer,allocator,string".to_string())
         .to_ascii_lowercase();
     let class_enabled = |class: &str| enabled.split(',').any(|item| item.trim() == class);
     let hot_slots: HashMap<u64, &str> = imports
@@ -498,6 +508,287 @@ fn performance_native_roots(
         }
     }
     roots
+}
+
+fn expand_performance_native_wrappers(
+    function_ranges: &[(u64, u64)],
+    blocks: &[BasicBlock],
+    roots: &mut HashMap<(u64, u64), CommercialFirstBlocker>,
+    preexisting_native: &HashSet<(u64, u64)>,
+) {
+    const MAX_WRAPPER_INSTRUCTIONS: usize = 256;
+    const MAX_WRAPPER_DEPTH: usize = 4;
+
+    let owner_of = |va: u64| {
+        function_ranges
+            .iter()
+            .copied()
+            .find(|(start, end)| *start <= va && va < *end)
+    };
+    for _ in 0..MAX_WRAPPER_DEPTH {
+        let selected = roots.keys().copied().collect::<HashSet<_>>();
+        let mut additions = Vec::new();
+        for &range in function_ranges {
+            if selected.contains(&range) || preexisting_native.contains(&range) {
+                continue;
+            }
+            let instructions = blocks
+                .iter()
+                .filter(|block| range.0 <= block.start_va && block.start_va < range.1)
+                .flat_map(|block| block.instructions.iter())
+                .collect::<Vec<_>>();
+            if instructions.is_empty() || instructions.len() > MAX_WRAPPER_INSTRUCTIONS {
+                continue;
+            }
+
+            let mut direct_callees = Vec::new();
+            for instruction in instructions {
+                match instruction.flow_control() {
+                    FlowControl::Call => {
+                        if let Some(callee) = owner_of(instruction.near_branch_target()) {
+                            direct_callees.push((callee, instruction));
+                        }
+                    }
+                    FlowControl::UnconditionalBranch => {
+                        if let Some(callee) = owner_of(instruction.near_branch_target()) {
+                            if callee != range {
+                                direct_callees.push((callee, instruction));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some((_, first_call)) = direct_callees
+                .iter()
+                .filter(|(callee, _)| selected.contains(callee))
+                .min_by_key(|(_, instruction)| instruction.ip())
+            else {
+                continue;
+            };
+            additions.push((
+                range,
+                CommercialFirstBlocker {
+                    rva: first_call.ip(),
+                    code: first_call.code(),
+                    detail: "small wrapper around performance-critical native path".to_string(),
+                },
+            ));
+        }
+        if additions.is_empty() {
+            break;
+        }
+        for (range, evidence) in additions {
+            roots.insert(range, evidence);
+        }
+    }
+}
+
+fn expand_performance_native_callees(
+    function_ranges: &[(u64, u64)],
+    blocks: &[BasicBlock],
+    roots: &mut HashMap<(u64, u64), CommercialFirstBlocker>,
+) {
+    // GUI frame/render paths and allocator-backed formatting routinely exceed
+    // four direct-call layers. Cutting the native closure at that arbitrary
+    // depth leaves a VM gateway in the middle of the very hot path this policy
+    // promises to keep native (and, for reverse-called window procedures, in
+    // the middle of an OS-owned callback stack). Sixteen remains strictly
+    // bounded while covering the observed message/render/formatting chains.
+    const MAX_CALLEE_DEPTH: usize = 16;
+    let owner_of = |va: u64| {
+        function_ranges
+            .iter()
+            .copied()
+            .find(|(start, end)| *start <= va && va < *end)
+    };
+    for _ in 0..MAX_CALLEE_DEPTH {
+        let selected = roots.keys().copied().collect::<HashSet<_>>();
+        let mut additions = Vec::new();
+        for &range in &selected {
+            let owned_blocks = blocks
+                .iter()
+                .filter(|block| range.0 <= block.start_va && block.start_va < range.1)
+                .collect::<Vec<_>>();
+            for instruction in owned_blocks
+                .iter()
+                .flat_map(|block| block.instructions.iter())
+            {
+                let target = match instruction.flow_control() {
+                    FlowControl::Call => Some(instruction.near_branch_target()),
+                    FlowControl::UnconditionalBranch => {
+                        let target = instruction.near_branch_target();
+                        owner_of(target)
+                            .filter(|callee| *callee != range)
+                            .map(|_| target)
+                    }
+                    _ => None,
+                };
+                let Some(callee) = target.and_then(owner_of) else {
+                    continue;
+                };
+                if !selected.contains(&callee) {
+                    additions.push((
+                        callee,
+                        CommercialFirstBlocker {
+                            rva: instruction.ip(),
+                            code: instruction.code(),
+                            detail: "bounded callee of performance-critical native path"
+                                .to_string(),
+                        },
+                    ));
+                }
+            }
+            for target in owned_blocks
+                .iter()
+                .flat_map(|block| block.successor_vas.iter().copied())
+            {
+                let Some(continuation) = owner_of(target).filter(|owner| *owner != range) else {
+                    continue;
+                };
+                if !selected.contains(&continuation) {
+                    additions.push((
+                        continuation,
+                        CommercialFirstBlocker {
+                            rva: target,
+                            code: Code::INVALID,
+                            detail: "CFG continuation of performance-critical native path"
+                                .to_string(),
+                        },
+                    ));
+                }
+            }
+        }
+        if additions.is_empty() {
+            break;
+        }
+        for (range, evidence) in additions {
+            roots.entry(range).or_insert(evidence);
+        }
+    }
+}
+
+/// Keep direct tail-jump ownership atomic across the native/VM boundary.
+/// A native `jmp callee` does not create the return slot expected by the
+/// callable native-entry VM gateway. Redirecting such an edge to that gateway
+/// therefore inverts Win64 stack alignment and makes the gateway's `ret`
+/// consume the caller's return address under the wrong contract.
+fn close_native_tail_targets(
+    all_function_ranges: &[(u64, u64)],
+    blocks: &[BasicBlock],
+    native_ranges: &mut Vec<(u64, u64)>,
+) {
+    loop {
+        let native_snapshot: HashSet<(u64, u64)> = native_ranges.iter().copied().collect();
+        let mut added = Vec::new();
+        for &(start, end) in &native_snapshot {
+            for block in blocks
+                .iter()
+                .filter(|block| start <= block.start_va && block.start_va < end)
+            {
+                let Some(last) = block
+                    .instructions
+                    .iter()
+                    .rev()
+                    .find(|instruction| !is_zero_padding(instruction))
+                else {
+                    continue;
+                };
+                if last.flow_control() != FlowControl::UnconditionalBranch {
+                    continue;
+                }
+                let target = last.near_branch_target();
+                if let Some(range) = all_function_ranges
+                    .iter()
+                    .copied()
+                    .find(|(callee_start, callee_end)| {
+                        *callee_start <= target && target < *callee_end
+                    })
+                    .filter(|range| !native_snapshot.contains(range))
+                {
+                    added.push(range);
+                }
+            }
+        }
+        added.sort_unstable();
+        added.dedup();
+        if added.is_empty() {
+            break;
+        }
+        native_ranges.extend(added);
+    }
+    native_ranges.sort_unstable();
+    native_ranges.dedup();
+}
+
+fn add_special_native_abi_functions(
+    all_function_ranges: &[(u64, u64)],
+    blocks: &[BasicBlock],
+    relayed_sections: &[crate::pe::builder::SectionData],
+    native_ranges: &mut Vec<(u64, u64)>,
+) {
+    let native_snapshot: HashSet<(u64, u64)> = native_ranges.iter().copied().collect();
+    for &range @ (start, end) in all_function_ranges {
+        if native_snapshot.contains(&range) {
+            continue;
+        }
+        let mut instructions = blocks
+            .iter()
+            .filter(|block| start <= block.start_va && block.start_va < end)
+            .flat_map(|block| block.instructions.iter())
+            .filter(|instruction| !is_zero_padding(instruction))
+            .collect::<Vec<_>>();
+        instructions.sort_by_key(|instruction| instruction.ip());
+        let is_unwind_funclet = instructions.first().is_some_and(|instruction| {
+            instruction.code() == Code::Mov_rm64_r64
+                && instruction.memory_base() == Register::RSP
+                && instruction.memory_displacement64() == 0x10
+                && instruction.op1_register() == Register::RDX
+        });
+        let is_small_noreturn_wrapper = end.saturating_sub(start) <= 0x80
+            && instructions
+                .last()
+                .is_some_and(|instruction| instruction.code() == Code::Ud2)
+            && instructions.iter().any(|instruction| {
+                instruction.flow_control() == FlowControl::Call
+                    && all_function_ranges
+                        .iter()
+                        .copied()
+                        .find(|(callee_start, callee_end)| {
+                            *callee_start <= instruction.near_branch_target()
+                                && instruction.near_branch_target() < *callee_end
+                        })
+                        .is_some_and(|callee| native_snapshot.contains(&callee))
+            });
+        let address_taken = relayed_sections.iter().any(|section| {
+            section.name != ".text"
+                && section
+                    .bytes
+                    .windows(8)
+                    .any(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()) == start)
+        });
+        let native_or_external_tail_wrapper = instructions.last().is_some_and(|instruction| {
+            if instruction.flow_control() != FlowControl::UnconditionalBranch {
+                return false;
+            }
+            let target = instruction.near_branch_target();
+            all_function_ranges
+                .iter()
+                .copied()
+                .find(|(callee_start, callee_end)| {
+                    *callee_start <= target && target < *callee_end
+                })
+                .is_none_or(|callee| native_snapshot.contains(&callee))
+        });
+        if is_unwind_funclet
+            || is_small_noreturn_wrapper
+            || (address_taken && native_or_external_tail_wrapper)
+        {
+            native_ranges.push(range);
+        }
+    }
+    native_ranges.sort_unstable();
+    native_ranges.dedup();
 }
 
 fn build_semantic_dependency_report(
@@ -1030,6 +1321,7 @@ fn bridge_to_function_entries(
     program: &mut RiscProgram,
     ip_map: &HashMap<u64, usize>,
     excluded_func_ranges: &[(u64, u64)],
+    exact_native_entries: &HashSet<u64>,
 ) -> usize {
     if excluded_func_ranges.is_empty() {
         return 0;
@@ -1048,6 +1340,26 @@ fn bridge_to_function_entries(
             let target = ins.imm;
             // 가상화된 블록이면 VM 내부 분기 (ip_map 존재) → 유지.
             if ip_map.contains_key(&target) {
+                continue;
+            }
+            // Direct CALL targets are architectural callable entries even when
+            // several tiny import thunks share one coarse canonical/.pdata
+            // range. Collapsing such an entry to the range start changes the
+            // callee (for example _initterm_e -> __CxxFrameHandler3).
+            if exact_native_entries.contains(&target) {
+                continue;
+            }
+            // Direct CALL and direct JMP both lower to an unconditional
+            // VirtualBranch. Their exact destination is architectural: it may
+            // be an alternate entry or one thunk in a shared coarse range.
+            // Only conditional escapes are safe to fold back to the enclosing
+            // function prologue.
+            if matches!(
+                ins.op,
+                RiscOp::VirtualBranch {
+                    cond: BranchCondition::Always
+                }
+            ) {
                 continue;
             }
             let entry = entry_for(target);
@@ -1118,8 +1430,20 @@ pub fn lift_program_cfg_commercial_with_model(
     };
     let canonical_starts = canonical_model
         .map(|model| {
-            model
-                .direct_entry_rvas()
+            let mut starts = model.direct_entry_rvas();
+            // Address-taken callbacks, vtable methods and cold/alternate
+            // entries are canonical callable boundaries even when no direct
+            // CFG edge names them. Feed the real addresses into extraction so
+            // materialization obtains an encoder-produced ip_map entry. Never
+            // synthesize an alias from the primary function entry to an
+            // unrelated cold block.
+            starts.extend(
+                model
+                    .functions
+                    .values()
+                    .flat_map(|function| function.entries.iter().copied()),
+            );
+            starts
                 .into_iter()
                 .map(|rva| image_base + u64::from(rva))
                 .collect::<Vec<_>>()
@@ -1283,11 +1607,10 @@ pub fn lift_program_cfg_commercial_with_model(
     // dominate and can turn a short GUI/channel wait into seconds of VM work.
     // Only the function containing direct evidence is excluded; callers remain
     // VM-owned and cross the normal function-entry bridge.
-    let performance_roots =
+    let mut performance_roots =
         performance_native_roots(&all_function_ranges, &blocks, original_imports, image_base);
-    let performance_root_ranges = performance_roots.keys().copied().collect::<HashSet<_>>();
     let needs_dependency_closure = std::env::var("BTG_NATIVE_HOT_CLASSES")
-        .unwrap_or_else(|_| "gui,wait,spin,timer".to_string())
+        .unwrap_or_else(|_| "gui,wait,spin,timer,allocator,string".to_string())
         .split(',')
         .any(|class| {
             matches!(
@@ -1295,27 +1618,33 @@ pub fn lift_program_cfg_commercial_with_model(
                 "allocator" | "string"
             )
         });
-    let performance_quarantine = if needs_dependency_closure {
-        build_semantic_dependency_report(
+    if needs_dependency_closure {
+        expand_performance_native_wrappers(
             &all_function_ranges,
             &blocks,
-            &performance_root_ranges,
-            canonical_model,
-            image_base,
-        )
-        .sccs
-        .iter()
-        .flat_map(|scc| scc.functions.iter().copied())
-        .filter_map(|start| {
-            all_function_ranges
-                .iter()
-                .copied()
-                .find(|range| range.0 == start)
-        })
-        .collect::<HashSet<_>>()
-    } else {
-        performance_root_ranges
-    };
+            &mut performance_roots,
+            &native_function_ranges.iter().copied().collect(),
+        );
+        expand_performance_native_callees(&all_function_ranges, &blocks, &mut performance_roots);
+    }
+    // The OEP has its own ownership decision below. Promoting it as a hot-path
+    // wrapper makes it a dependency root before the entry family is built and
+    // can remove the entry VA from every VM family.
+    performance_roots.retain(|&(start, end), _| !(start <= entry_point_va && entry_point_va < end));
+    if std::env::var_os("BTG_TRACE_NATIVE_HOT_ROOTS").is_some() {
+        let mut traced = performance_roots.keys().copied().collect::<Vec<_>>();
+        traced.sort_unstable();
+        for (start, end) in traced {
+            println!("[TRACE native-hot-root] 0x{start:X}..0x{end:X}");
+        }
+    }
+    let performance_root_ranges = performance_roots.keys().copied().collect::<HashSet<_>>();
+    // Wrapper expansion already walks toward the import-backed hot roots and
+    // records each required thunk/wrapper. A forward dependency closure from
+    // every promoted caller pulls unrelated application helpers into the
+    // native island and can cross fragmented pdata ranges. Preserve only the
+    // functions with direct or reverse-path performance evidence.
+    let performance_quarantine = performance_root_ranges;
     for range in performance_quarantine.iter().copied() {
         if !native_function_ranges.contains(&range) {
             native_function_ranges.push(range);
@@ -1517,6 +1846,31 @@ pub fn lift_program_cfg_commercial_with_model(
         if added == 0 {
             break;
         }
+    }
+    let native_before_tail_closure = native_function_ranges.len();
+    close_native_tail_targets(
+        &all_function_ranges,
+        &blocks,
+        &mut native_function_ranges,
+    );
+    add_special_native_abi_functions(
+        &all_function_ranges,
+        &blocks,
+        relayed_sections,
+        &mut native_function_ranges,
+    );
+    if native_function_ranges.len() != native_before_tail_closure {
+        for &(start, end) in &native_function_ranges {
+            for block in &blocks {
+                if start <= block.start_va && block.start_va < end {
+                    excluded_blocks.insert(block.start_va);
+                }
+            }
+        }
+        println!(
+            "[+] --vm-commercial native tail ownership: promoted {} tail target function(s)",
+            native_function_ranges.len() - native_before_tail_closure
+        );
     }
     // OEP-force (lift_program_cfg와 동일): entry 블록이 RISC로 온전히 lift되고
     // 폴리 인코딩 가능하면 OEP를 VM에 포함해 entry_native=false를 만든다.
@@ -2021,8 +2375,24 @@ pub fn lift_program_cfg_commercial_with_model(
     let ip_map_snapshot = ip_map.clone();
     let mut program = RiscProgram::with_ip_map(instrs, ip_map);
     let lifted_ops = program.instrs.len();
-    let redirected =
-        bridge_to_function_entries(&mut program, &ip_map_snapshot, &native_function_ranges);
+    let exact_native_entries: HashSet<u64> = blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+        .filter(|instruction| instruction.flow_control() == FlowControl::Call)
+        .map(|instruction| instruction.near_branch_target())
+        .filter(|target| {
+            !ip_map_snapshot.contains_key(target)
+                && native_function_ranges
+                    .iter()
+                    .any(|(start, end)| *start <= *target && *target < *end)
+        })
+        .collect();
+    let redirected = bridge_to_function_entries(
+        &mut program,
+        &ip_map_snapshot,
+        &native_function_ranges,
+        &exact_native_entries,
+    );
     if redirected > 0 {
         println!(
             "[+] P0-① boundary atomicity: redirected {} direct branch(es) to excluded function entry (prologue-preserving native bridge)",
@@ -2428,6 +2798,8 @@ mod tests {
         use super::performance_native_import_class;
 
         assert_eq!(performance_native_import_class("PeekMessageW"), Some("gui"));
+        assert_eq!(performance_native_import_class("DefWindowProcW"), Some("gui"));
+        assert_eq!(performance_native_import_class("PostQuitMessage"), Some("gui"));
         assert_eq!(
             performance_native_import_class("WaitForSingleObject"),
             Some("wait")
@@ -2445,6 +2817,39 @@ mod tests {
             Some("string")
         );
         assert_eq!(performance_native_import_class("CreateFileW"), None);
+    }
+
+    #[test]
+    fn performance_native_wrapper_expansion_reaches_small_allocator_chain() {
+        use iced_x86::{Decoder, DecoderOptions};
+
+        let block = |id, ip, raw: &[u8]| BasicBlock {
+            id,
+            start_va: ip,
+            instructions: Decoder::with_ip(64, raw, ip, DecoderOptions::NONE)
+                .iter()
+                .collect(),
+            successor_vas: Vec::new(),
+        };
+        let ranges = vec![(0x1000, 0x1010), (0x1100, 0x1110), (0x1200, 0x1210)];
+        let blocks = vec![
+            block(0, 0x1000, &[0xE8, 0xFB, 0x00, 0x00, 0x00, 0xC3]),
+            block(1, 0x1100, &[0xE8, 0xFB, 0x00, 0x00, 0x00, 0xC3]),
+            block(2, 0x1200, &[0xC3]),
+        ];
+        let mut roots = HashMap::from([(
+            (0x1200, 0x1210),
+            CommercialFirstBlocker {
+                rva: 0x1200,
+                code: Code::Retnq,
+                detail: "allocator root".to_string(),
+            },
+        )]);
+
+        expand_performance_native_wrappers(&ranges, &blocks, &mut roots, &HashSet::new());
+
+        assert!(roots.contains_key(&(0x1100, 0x1110)));
+        assert!(roots.contains_key(&(0x1000, 0x1010)));
     }
 
     /// Provide a real writable backing range for architectural x86 RSP during
@@ -3018,7 +3423,7 @@ mod tests {
 
         let mut prog = RiscProgram::new(vec![
             MicroInstr::new(RiscOp::VirtualBranch {
-                cond: BranchCondition::Always,
+                cond: BranchCondition::Zero,
             })
             .with_imm(0x140002028), // → 함수 중간 (리다이렉트)
             MicroInstr::new(RiscOp::VirtualBranch {
@@ -3033,13 +3438,18 @@ mod tests {
                 cond: BranchCondition::Always,
             })
             .with_src1(MicroOperand::VReg(1)), // 간접 (유지)
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::Always,
+            })
+            .with_imm(0x140002030), // 증명된 alternate CALL entry (유지)
         ]);
 
-        let n = bridge_to_function_entries(&mut prog, &ip_map, &func_ranges);
+        let exact_native_entries = HashSet::from([0x140002030]);
+        let n = bridge_to_function_entries(&mut prog, &ip_map, &func_ranges, &exact_native_entries);
         assert_eq!(n, 1, "exactly the mid-function branch is redirected");
         assert_eq!(
             prog.instrs[0].imm, 0x140002000,
-            "redirected to function entry (prologue)"
+            "conditional escape redirected to function entry (prologue)"
         );
         assert_eq!(
             prog.instrs[1].imm, 0x140001000,
@@ -3050,5 +3460,9 @@ mod tests {
             "out-of-range branch untouched"
         );
         assert!(prog.instrs[3].src1.is_some(), "indirect branch untouched");
+        assert_eq!(
+            prog.instrs[4].imm, 0x140002030,
+            "exact native alternate entry untouched"
+        );
     }
 }

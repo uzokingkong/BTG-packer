@@ -1704,12 +1704,24 @@ pub fn produce_rust_vtable_resolutions(
     image_base: u64,
     vtable_bases: &BTreeSet<u32>,
 ) -> Vec<IndirectResolution> {
+    produce_rust_vtable_resolutions_with_slots(program, image_base, vtable_bases).0
+}
+
+/// Variant used by ProgramModel construction to preserve the exact vtable
+/// slots that justified each resolution. Keeping this container evidence is
+/// required for later native-island pointer rewriting.
+pub fn produce_rust_vtable_resolutions_with_slots(
+    program: &ProgramModel,
+    image_base: u64,
+    vtable_bases: &BTreeSet<u32>,
+) -> (Vec<IndirectResolution>, BTreeSet<u32>) {
     let pointers = program
         .code_pointers
         .values()
         .map(|pointer| (pointer.location.start, pointer))
         .collect::<BTreeMap<_, _>>();
     let mut out = Vec::new();
+    let mut consumed_slots = BTreeSet::new();
     for site in program
         .indirect_targets
         .sites
@@ -1786,6 +1798,7 @@ pub fn produce_rust_vtable_resolutions(
             };
             if let Some(&entry) = function.entries.iter().next() {
                 target_rvas.insert(entry);
+                consumed_slots.insert(slot);
             }
         }
         if !target_rvas.is_empty() {
@@ -1798,7 +1811,7 @@ pub fn produce_rust_vtable_resolutions(
         }
     }
     out.sort_by_key(|resolution| resolution.site);
-    out
+    (out, consumed_slots)
 }
 
 fn find_linear_vtable_method_load(

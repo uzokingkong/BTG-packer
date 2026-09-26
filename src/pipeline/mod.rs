@@ -7,6 +7,7 @@ pub mod build;
 pub mod config;
 pub mod crypto;
 pub mod iat_hide;
+pub mod native_island;
 pub mod ondemand;
 pub mod ownership;
 pub mod pack;
@@ -209,6 +210,13 @@ pub struct PipelineContext {
     /// Validation and artifact writers must consume this instead of deriving
     /// ownership from the rewritten PE layout.
     pub ownership_report: Vec<ownership::FunctionOwnershipDiagnostic>,
+    /// Phase-B fail-closed relocation inventory for original functions that
+    /// intentionally remain native in a partial commercial VM build.
+    pub native_island_plan: Option<native_island::NativeIslandPlan>,
+    /// Original VM-owned entry VA -> generated callable gateway VA. Phase-B
+    /// uses this to prevent relocated native code from branching back into
+    /// the retired original `.text` image.
+    pub vm_native_entry_rewrites: std::collections::BTreeMap<u64, u64>,
     /// P1-4: instruction-aligned Program-VM bytecode chunks for M7 runtime.
     pub vm_prog_chunks: Vec<crate::vm::chunk_crypto::BytecodeChunk>,
     /// P2-10 function-stable production family ownership plan.
@@ -330,6 +338,8 @@ impl PipelineContext {
             vm_prog_lifetime_cleanup_handler_rva: 0,
             vm_coverage: None,
             ownership_report: Vec::new(),
+            native_island_plan: None,
+            vm_native_entry_rewrites: std::collections::BTreeMap::new(),
             vm_prog_chunks: Vec::new(),
             vm_family_plan: None,
             vm_family_partitions: None,

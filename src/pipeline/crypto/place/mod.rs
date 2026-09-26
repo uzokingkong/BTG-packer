@@ -81,6 +81,7 @@ fn collect_native_gateway_targets(
     image_base: u64,
     multi: &crate::vm::multi_family::MaterializedMultiFamilyProgram,
     required_original_targets: &[crate::vm::route_table::OriginalTargetRva],
+    native_island: Option<&crate::pipeline::native_island::NativeIslandPlan>,
 ) -> Vec<u64> {
     // Native code can re-enter VM-owned code through address-taken callbacks
     // that never appear in the static cross-family route table. Inventory both
@@ -100,11 +101,58 @@ fn collect_native_gateway_targets(
                 .filter(|entry| module.ip_map.contains_key(entry))
         })
         .collect();
+    let vm_instruction_ips: std::collections::HashSet<u64> = multi
+        .modules
+        .iter()
+        .flat_map(|module| module.ip_map.keys().copied())
+        .collect();
     let mut targets: std::collections::BTreeSet<u64> = required_original_targets
         .iter()
         .map(|target| image_base + u64::from(target.0))
-        .filter(|target| vm_entries.contains(target))
+        // Required targets are canonical call/route evidence, so an exact
+        // lifted instruction boundary is sufficient even when it is a cold
+        // or alternate entry not selected as the family's representative
+        // function id.  Never manufacture an alias: the IP must physically
+        // exist in a materialized module.
+        .filter(|target| vm_instruction_ips.contains(target))
         .collect();
+    if std::env::var_os("BTG_RETIRE_ORIGINAL_TEXT").is_some() {
+        // With the original image non-executable, an unresolved indirect CALL
+        // may legally name any VM-owned function entry. Publish the complete
+        // typed entry set so the runtime classifier never falls through to the
+        // native bridge merely because the address was not statically taken.
+        targets.extend(vm_entries.iter().copied());
+    }
+
+    // Relocated native functions may directly call or materialize the address
+    // of VM-owned functions. Those edges are not necessarily address-taken in
+    // the original data graph, but become mandatory callable-VM gateways once
+    // original `.text` loses execute permission.
+    if let Some(plan) = native_island {
+        for target_rva in plan.functions.iter().flat_map(|function| {
+            function
+                .direct_edges
+                .iter()
+                .map(|edge| edge.target_rva)
+                .chain(function.fallthrough_target_rva)
+                .chain(
+                    function
+                        .rip_relative_references
+                        .iter()
+                        .filter_map(|reference| {
+                            reference
+                                .target_va
+                                .checked_sub(image_base)
+                                .and_then(|rva| u32::try_from(rva).ok())
+                        }),
+                )
+        }) {
+            let target_va = image_base + u64::from(target_rva);
+            if vm_instruction_ips.contains(&target_va) {
+                targets.insert(target_va);
+            }
+        }
+    }
 
     for section in sections {
         if section.characteristics & 0x2000_0000 != 0 {
@@ -125,7 +173,7 @@ fn collect_native_gateway_targets(
                     _ => None,
                 };
                 if let Some(candidate) = candidate {
-                    if vm_entries.contains(&candidate) {
+                    if vm_instruction_ips.contains(&candidate) {
                         targets.insert(candidate);
                     }
                 }
@@ -143,13 +191,32 @@ fn collect_native_gateway_targets(
                     .try_into()
                     .expect("8-byte PE pointer window"),
             );
-            if vm_entries.contains(&candidate) {
+            if vm_instruction_ips.contains(&candidate) {
                 targets.insert(candidate);
                 cursor += 8;
             } else {
                 cursor += 1;
             }
         }
+    }
+
+    if let Some(plan) = native_island {
+        // The retirement ownership gate can demote an address-taken range
+        // after VM materialization.  Such a range may still have stale
+        // ip_map evidence, but its externally callable owner is now the
+        // native island.  Publishing both destinations makes data-pointer
+        // rewriting prefer a VM gateway and defeats the demotion.
+        targets.retain(|target_va| {
+            target_va
+                .checked_sub(image_base)
+                .and_then(|rva| u32::try_from(rva).ok())
+                .is_none_or(|rva| {
+                    !plan
+                        .functions
+                        .iter()
+                        .any(|function| function.start_rva <= rva && rva < function.end_rva)
+                })
+        });
     }
 
     targets.into_iter().collect()
@@ -184,6 +251,7 @@ mod native_gateway_target_tests {
             image_base,
             &multi,
             &[crate::vm::route_table::OriginalTargetRva(0x3000)],
+            None,
         );
         assert!(!targets.contains(&native_target));
     }
@@ -222,7 +290,7 @@ mod native_gateway_target_tests {
         };
 
         assert_eq!(
-            collect_native_gateway_targets(&sections, image_base, &multi, &[]),
+            collect_native_gateway_targets(&sections, image_base, &multi, &[], None),
             vec![target],
         );
     }
@@ -322,7 +390,7 @@ pub(crate) fn place_boot_stub(
         vm_prog_ip_map,
         vm_prog_superops,
         vm_coverage,
-        ownership_report,
+        mut ownership_report,
         vm_prog_chunks,
         vm_family_plan,
         vm_family_partitions,
@@ -330,8 +398,165 @@ pub(crate) fn place_boot_stub(
         data_lifetime_objects,
         unsupported_instructions,
     ) = lift_program(ctx, image_base, vm_oep_effective, vm_commercial)?;
+    if std::env::var_os("BTG_RETIRE_ORIGINAL_TEXT").is_some() {
+        if let Some(multi) = vm_multi_family.as_ref() {
+            // A raw ip_map key may be an interior/cold block that happens to
+            // share an original function boundary.  It is not callable from
+            // native code unless the family materializer also published it as
+            // a function id.  Use exactly the same predicate as
+            // collect_native_gateway_targets; otherwise retirement can leave
+            // a target neither behind a VM gateway nor in the native island.
+            let callable = multi
+                .modules
+                .iter()
+                .flat_map(|module| {
+                    module
+                        .function_ids
+                        .iter()
+                        .copied()
+                        .filter(|entry| module.ip_map.contains_key(entry))
+                })
+                .collect::<std::collections::HashSet<_>>();
+            let lifted_ips = multi
+                .modules
+                .iter()
+                .flat_map(|module| module.ip_map.keys().copied())
+                .collect::<std::collections::HashSet<_>>();
+            if std::env::var_os("BTG_TRACE_NATIVE_ISLAND").is_some() {
+                if let Some(program) = ctx.program_model.as_ref() {
+                    for function in program.functions.values() {
+                        let missing = function
+                            .entries
+                            .iter()
+                            .copied()
+                            .filter(|rva| !lifted_ips.contains(&(image_base + u64::from(*rva))))
+                            .collect::<Vec<_>>();
+                        if !missing.is_empty() {
+                            println!(
+                                "[TRACE ownership-model] function={:?} missing-entries={missing:?} ranges={:?} provenance={:?}",
+                                function.id, function.ranges, function.provenance
+                            );
+                        }
+                    }
+                    for range in &program.unknown_ranges {
+                        println!(
+                            "[TRACE ownership-model] unknown-range={:#x}..{:#x}",
+                            range.start, range.end
+                        );
+                    }
+                }
+            }
+            let required_unlifted_entries =
+                ctx.program_model
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|program| {
+                        program
+                            .indirect_targets
+                            .sites
+                            .values()
+                            .filter(|site| {
+                                site.status
+                                    == crate::analysis::indirect_targets::ResolutionStatus::Complete
+                            })
+                            .flat_map(|site| site.targets.targets.keys())
+                            .filter_map(|target| match *target {
+                                crate::analysis::indirect_targets::IndirectTarget::Function(id) => {
+                                    program.functions.get(&id).and_then(|function| {
+                                        function.entries.iter().next().copied()
+                                    })
+                                }
+                                crate::analysis::indirect_targets::IndirectTarget::Block(id) => {
+                                    program.blocks.get(&id).map(|block| block.range.start)
+                                }
+                                _ => None,
+                            })
+                    })
+                    .filter(|entry_rva| !lifted_ips.contains(&(image_base + u64::from(*entry_rva))))
+                    .collect::<std::collections::HashSet<_>>();
+            let mut demoted = 0usize;
+            for diagnostic in &mut ownership_report {
+                let entry_va = image_base + u64::from(diagnostic.function.start_rva);
+                if diagnostic.origin == crate::pipeline::ownership::OwnershipOrigin::Original
+                    && diagnostic.function.owned_by_vm
+                    && (!callable.contains(&entry_va)
+                        || required_unlifted_entries.iter().any(|entry_rva| {
+                            diagnostic.function.start_rva <= *entry_rva
+                                && *entry_rva < diagnostic.function.end_rva
+                        }))
+                {
+                    diagnostic.function.owned_by_vm = false;
+                    diagnostic.function.reason = "ambiguous-function-boundary";
+                    diagnostic.reason =
+                        crate::pipeline::ownership::OwnershipReason::AmbiguousFunctionBoundary;
+                    diagnostic.first_blocker =
+                        Some(crate::pipeline::ownership::OwnershipBlocker::new(
+                            diagnostic.function.start_rva,
+                            None,
+                        ));
+                    demoted += 1;
+                }
+            }
+            if demoted > 0 {
+                println!(
+                    "[+] Phase-B ownership gate: demoted {} VM function(s) without an exact callable entry to native island",
+                    demoted
+                );
+            }
+        }
+    }
     ctx.vm_coverage = vm_coverage;
     ctx.ownership_report = ownership_report;
+    ctx.native_island_plan = if vm_commercial {
+        match ctx.program_model.as_ref() {
+            Some(program) => {
+                let plan = crate::pipeline::native_island::NativeIslandPlan::build(
+                    &ctx.target_info,
+                    program,
+                    &ctx.ownership_report,
+                );
+                if !plan.functions.is_empty() || !plan.blockers.is_empty() {
+                    println!(
+                        "[+] Phase-B native-island inventory: {} function(s), {} byte(s), {} blocker(s)",
+                        plan.functions.len(),
+                        plan.native_bytes(),
+                        plan.blockers.len(),
+                    );
+                }
+                if std::env::var_os("BTG_VALIDATE_NATIVE_ISLAND_EMITTER").is_some()
+                    && plan.is_ready_for_emission()
+                {
+                    let max_input_rva = ctx
+                        .target_info
+                        .relayed_sections
+                        .iter()
+                        .map(|section| {
+                            section.virtual_address.saturating_add(
+                                section.virtual_size.max(section.bytes.len() as u32),
+                            )
+                        })
+                        .max()
+                        .unwrap_or(0x1000);
+                    let dry_run_rva = max_input_rva
+                        .saturating_add(0x10_0000)
+                        .saturating_add(0xFFF)
+                        & !0xFFF;
+                    let image = plan.emit(&ctx.target_info, dry_run_rva, ctx.poly_vm_seed)?;
+                    println!(
+                        "[+] Phase-B native-island emitter dry-run: {} byte(s), {} placement(s), {} RIP fixup(s), {} direct-edge fixup(s)",
+                        image.bytes.len(),
+                        image.placements.len(),
+                        image.patched_rip_references,
+                        image.patched_direct_edges,
+                    );
+                }
+                Some(plan)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     ctx.vm_prog_chunks = vm_prog_chunks;
     ctx.vm_family_plan = vm_family_plan;
     ctx.vm_family_partitions = vm_family_partitions;
@@ -705,6 +930,7 @@ pub(crate) fn place_boot_stub(
             image_base,
             ctx.vm_multi_family.as_ref().unwrap(),
             &ctx.route_required_original_targets,
+            ctx.native_island_plan.as_ref(),
         );
         println!(
             "[+] Canonical native gateway inventory: {} route/address-taken target(s)",
@@ -714,6 +940,36 @@ pub(crate) fn place_boot_stub(
     } else {
         Vec::new()
     };
+    // Reserve the exact final native-call rewrite shape before `.vdata`
+    // resources and the `.nisland` RVA are known. These sources are outside
+    // the input image and can never match a real guest target. The final
+    // publication pass replaces only their values, never their count, keeping
+    // every generated code/table/state offset stable.
+    let native_island_rewrite_count = ctx
+        .native_island_plan
+        .as_ref()
+        .filter(|plan| plan.is_ready_for_emission())
+        .map(|plan| plan.entry_count())
+        .unwrap_or_default();
+    // The final native-call classifier is the last NX safety boundary. Reserve
+    // slots for both relocated native entries and VM-owned callable gateways;
+    // dynamic routing remains the fast path, but a miss can never fall through
+    // to an original `.text` address.
+    let native_call_rewrite_count = native_island_rewrite_count
+        .checked_add(native_gateway_targets.len())
+        .ok_or_else(|| anyhow::anyhow!("native-call rewrite reservation overflow"))?;
+    let native_call_rewrite_reservations: Vec<(u64, u64)> = (0..native_call_rewrite_count)
+        .map(|index| {
+            let source = 0x0000_7FFE_0000_0000u64 + (index as u64) * 0x20;
+            (source, source + 0x10)
+        })
+        .collect();
+    if !native_call_rewrite_reservations.is_empty() {
+        println!(
+            "[+] Phase-B native-call bridge: reserved {} rewrite slot(s)",
+            native_call_rewrite_reservations.len()
+        );
+    }
     let vm_multi_family_sizing = if vm_multi_family_active {
         let plan = ctx.vm_family_plan.as_ref().ok_or_else(|| {
             anyhow::anyhow!("multi-family materialization is missing its family plan")
@@ -729,6 +985,7 @@ pub(crate) fn place_boot_stub(
             ctx.poly_vm_seed,
             &ctx.vm_data_lifetime_objects,
             &native_gateway_targets,
+            &native_call_rewrite_reservations,
         )?)
     } else {
         None
@@ -1874,6 +2131,7 @@ pub(crate) fn place_boot_stub(
                 ctx.poly_vm_seed,
                 &ctx.vm_data_lifetime_objects,
                 &native_gateway_targets,
+                &native_call_rewrite_reservations,
             )?)
         } else {
             None
@@ -1893,6 +2151,11 @@ pub(crate) fn place_boot_stub(
                 prva,
                 &multi.native_entry_gateways,
             );
+            ctx.vm_native_entry_rewrites = multi
+                .native_entry_gateways
+                .iter()
+                .map(|(&original_va, &gateway_off)| (original_va, prva + gateway_off as u64))
+                .collect();
             println!(
                 "[+] Canonical native gateways: {} gateway(s), {} function-pointer slot(s) rewritten",
                 multi.native_entry_gateways.len(),
