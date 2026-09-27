@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build and Publish Release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-cargo-
+
+      - name: Check lockfile
+        run: cargo check --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Run library tests
+        run: cargo test --release --locked --lib -- --nocapture --test-threads=1
+
+      - name: Package artifacts
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if (-not $tag) { $tag = "manual" }
+          Write-Host "Packaging release for tag: $tag"
+
+          $pkgDir = "BTG-packer-$tag"
+          New-Item -ItemType Directory -Force -Path $pkgDir | Out-Null
+
+          Copy-Item target\release\btg-packer.exe -Destination "$pkgDir\btg-packer.exe" -Force
+          Copy-Item LICENSE -Destination "$pkgDir\LICENSE" -Force
+          Copy-Item README.md -Destination "$pkgDir\README.md" -Force
+          Copy-Item README.ko.md -Destination "$pkgDir\README.ko.md" -Force
+
+          # Look for release notes in release-$tag directory or repository root
+          if (Test-Path "release-$tag\RELEASE_NOTES.md") {
+            Copy-Item "release-$tag\RELEASE_NOTES.md" -Destination "$pkgDir\RELEASE_NOTES.md" -Force
+            Copy-Item "release-$tag\RELEASE_NOTES.md" -Destination "RELEASE_NOTES.md" -Force
+          } elseif (-not (Test-Path "RELEASE_NOTES.md")) {
+            Set-Content -Path "RELEASE_NOTES.md" -Value "# BTG-packer $tag`r`n`r`nAutomated release build for tag $tag."
+          }
+
+          # Create ZIP archive
+          $zipName = "BTG-packer-$tag-windows-x86_64.zip"
+          Compress-Archive -Path "$pkgDir\*" -DestinationPath $zipName -Force
+
+          # Calculate SHA-256 Checksums
+          $exeHash = (Get-FileHash "$pkgDir\btg-packer.exe" -Algorithm SHA256).Hash.ToUpper()
+          $zipHash = (Get-FileHash $zipName -Algorithm SHA256).Hash.ToUpper()
+          $sumsContent = "$exeHash  btg-packer.exe`r`n$zipHash  $zipName`r`n"
+          $sumsFile = "BTG-packer-$tag-SHA256SUMS.txt"
+          [System.IO.File]::WriteAllText((Join-Path $PWD $sumsFile), $sumsContent, [System.Text.Encoding]::UTF8)
+
+          # Copy standalone binary to root for direct asset upload
+          Copy-Item target\release\btg-packer.exe -Destination "btg-packer.exe" -Force
+
+          Write-Host "Packaged artifacts:"
+          Get-Item btg-packer.exe, $zipName, $sumsFile | Format-Table Name, Length
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: BTG-packer ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: true
+          files: |
+            btg-packer.exe
+            BTG-packer-*-windows-x86_64.zip
+            BTG-packer-*-SHA256SUMS.txt
