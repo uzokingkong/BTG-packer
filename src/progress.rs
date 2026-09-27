@@ -9,6 +9,7 @@
 // ==============================================================================
 
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -64,6 +65,7 @@ impl Default for ProgressState {
     }
 }
 
+static ENABLED: AtomicBool = AtomicBool::new(false);
 static STATE: OnceLock<Mutex<ProgressState>> = OnceLock::new();
 
 fn state() -> &'static Mutex<ProgressState> {
@@ -71,6 +73,7 @@ fn state() -> &'static Mutex<ProgressState> {
 }
 
 pub fn configure(enabled: bool, refresh_ms: u64) {
+    ENABLED.store(enabled, Ordering::Relaxed);
     let mut s = state().lock().expect("progress mutex poisoned");
     let now = Instant::now();
     s.enabled = enabled;
@@ -96,11 +99,14 @@ pub fn configure(enabled: bool, refresh_ms: u64) {
 }
 
 pub fn enabled() -> bool {
-    state().lock().map(|s| s.enabled).unwrap_or(false)
+    ENABLED.load(Ordering::Relaxed)
 }
 
 /// Start a weighted top-level phase. Values are basis points: 0..=10000.
 pub fn begin_phase(base_bp: u32, span_bp: u32, label: impl Into<String>) {
+    if !enabled() {
+        return;
+    }
     let mut s = state().lock().expect("progress mutex poisoned");
     if !s.enabled {
         return;
@@ -125,6 +131,9 @@ pub fn begin_phase(base_bp: u32, span_bp: u32, label: impl Into<String>) {
 /// Select a weighted sub-range within the current top-level phase.
 /// rel_base_bp/rel_span_bp are relative basis points (0..=10000).
 pub fn subphase(rel_base_bp: u32, rel_span_bp: u32, label: impl Into<String>) {
+    if !enabled() {
+        return;
+    }
     let mut s = state().lock().expect("progress mutex poisoned");
     if !s.enabled {
         return;
@@ -157,6 +166,9 @@ pub fn begin_detail_task(label: impl Into<String>, total: u64, unit: impl Into<S
 }
 
 fn begin_task_inner(label: String, total: u64, unit: String, affects_overall: bool) {
+    if !enabled() {
+        return;
+    }
     let mut s = state().lock().expect("progress mutex poisoned");
     if !s.enabled {
         return;
@@ -171,6 +183,9 @@ fn begin_task_inner(label: String, total: u64, unit: String, affects_overall: bo
 }
 
 pub fn set_position(position: u64) {
+    if !enabled() {
+        return;
+    }
     let mut s = state().lock().expect("progress mutex poisoned");
     if !s.enabled {
         return;
@@ -189,6 +204,9 @@ pub fn set_position(position: u64) {
 }
 
 pub fn inc(delta: u64) {
+    if !enabled() {
+        return;
+    }
     let next = {
         let s = state().lock().expect("progress mutex poisoned");
         if !s.enabled {
@@ -200,6 +218,9 @@ pub fn inc(delta: u64) {
 }
 
 pub fn set_task(label: impl Into<String>) {
+    if !enabled() {
+        return;
+    }
     let mut s = state().lock().expect("progress mutex poisoned");
     if !s.enabled {
         return;
@@ -209,6 +230,9 @@ pub fn set_task(label: impl Into<String>) {
 }
 
 pub fn finish_task(label: impl Into<String>) {
+    if !enabled() {
+        return;
+    }
     let mut s = state().lock().expect("progress mutex poisoned");
     if !s.enabled {
         return;
@@ -227,6 +251,9 @@ pub fn finish_task(label: impl Into<String>) {
 
 /// Force the overall position to a completed milestone (basis points).
 pub fn checkpoint(overall_bp: u32, label: impl Into<String>) {
+    if !enabled() {
+        return;
+    }
     let mut s = state().lock().expect("progress mutex poisoned");
     if !s.enabled {
         return;
@@ -241,6 +268,9 @@ pub fn checkpoint(overall_bp: u32, label: impl Into<String>) {
 }
 
 pub fn complete(label: impl Into<String>) {
+    if !enabled() {
+        return;
+    }
     let mut s = state().lock().expect("progress mutex poisoned");
     if !s.enabled {
         return;
