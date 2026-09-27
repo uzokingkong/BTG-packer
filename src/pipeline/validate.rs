@@ -221,6 +221,16 @@ pub(crate) fn section_for_rva<'a>(
     sections.iter().find(|s| s.contains_rva(rva))
 }
 
+fn align_section_rva(value: u32, alignment: u32) -> Option<u32> {
+    let alignment = alignment.max(1) as u64;
+    let value = value as u64;
+    let aligned = value
+        .checked_add(alignment - 1)?
+        .checked_div(alignment)?
+        .checked_mul(alignment)?;
+    u32::try_from(aligned).ok()
+}
+
 mod dirs;
 mod pe;
 mod rsrc;
@@ -753,15 +763,25 @@ pub fn run(ctx: &PipelineContext, out: &[u8]) -> Result<()> {
                 state.characteristics
             );
         }
-        if textb.rva.saturating_add(textb.virtual_size) != state.rva {
+        let section_alignment = ctx.target_info.section_alignment.max(0x1000);
+        let textb_mapped_end = textb
+            .rva
+            .checked_add(textb.virtual_size.max(textb.raw_size))
+            .ok_or_else(|| anyhow!("Program-VM .textb mapped-end RVA overflow"))?;
+        let expected_state_rva = align_section_rva(textb_mapped_end, section_alignment)
+            .ok_or_else(|| anyhow!("Program-VM .vstate aligned RVA overflow"))?;
+        if state.rva != expected_state_rva {
             bail!(
-                "Program-VM W^X split is not contiguous: .textb end=0x{:X}, .vstate=0x{:X}",
-                textb.rva.saturating_add(textb.virtual_size),
+                "Program-VM W^X split is not section-aligned adjacent: .textb mapped_end=0x{:X}, expected .vstate=0x{:X} (alignment=0x{:X}), actual .vstate=0x{:X}",
+                textb_mapped_end,
+                expected_state_rva,
+                section_alignment,
                 state.rva
             );
         }
         println!(
-            "[VALIDATE] OK  Program-VM state split: .textb RX -> .vstate RW/NX @0x{:X}",
+            "[VALIDATE] OK  Program-VM state split: .textb RX -> alignment gap 0x{:X}B -> .vstate RW/NX @0x{:X}",
+            state.rva.saturating_sub(textb_mapped_end),
             state.rva
         );
     }
