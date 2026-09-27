@@ -111,6 +111,19 @@ pub(crate) fn multi_family_invocation_layout(
     })
 }
 
+fn canonical_dynamic_targets(
+    target: &vm::multi_family::EncodedFamilyPartition,
+    gateway_targets: &[u64],
+) -> Vec<u64> {
+    let mut targets: Vec<u64> = gateway_targets
+        .iter()
+        .copied()
+        .filter(|target_va| target.ip_map.contains_key(target_va))
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
 pub(crate) struct MultiFamilyVmModule {
     pub module: vm::VmModule,
     pub families: Vec<vm::poly::VmArchitectureFamily>,
@@ -1159,13 +1172,7 @@ pub(crate) fn build_multi_family_prog_mod(
             // therefore produced 8k-16k+ native routes even when only a small
             // subset was reachable indirectly, tripping the 4096 generated-router
             // safety ceiling and massively inflating generated code.
-            let mut dynamic_targets: Vec<u64> = gateway_targets
-                .iter()
-                .copied()
-                .filter(|target_va| target.ip_map.contains_key(target_va))
-                .collect();
-            dynamic_targets.sort_unstable();
-            dynamic_targets.dedup();
+            let dynamic_targets = canonical_dynamic_targets(target, &gateway_targets);
             for target_va in dynamic_targets {
                 if target.family == source_family && !gateway_targets.contains(&target_va) {
                     continue;
@@ -1418,13 +1425,7 @@ pub(crate) fn build_multi_family_prog_mod(
             // therefore produced 8k-16k+ native routes even when only a small
             // subset was reachable indirectly, tripping the 4096 generated-router
             // safety ceiling and massively inflating generated code.
-            let mut dynamic_targets: Vec<u64> = gateway_targets
-                .iter()
-                .copied()
-                .filter(|target_va| target.ip_map.contains_key(target_va))
-                .collect();
-            dynamic_targets.sort_unstable();
-            dynamic_targets.dedup();
+            let dynamic_targets = canonical_dynamic_targets(target, &gateway_targets);
             for target_va in dynamic_targets {
                 if target.family == module.family && !gateway_targets.contains(&target_va) {
                     continue;
@@ -1726,6 +1727,31 @@ pub(crate) fn build_prog_vm_mod(
 #[cfg(test)]
 mod invocation_layout_tests {
     use super::*;
+
+    #[test]
+    fn dynamic_routes_use_only_canonical_gateway_inventory() {
+        let module = vm::multi_family::EncodedFamilyPartition {
+            family: vm::poly::VmArchitectureFamily::Stack,
+            function_ids: vec![0x1000, 0x2000, 0x3000, 0x4000],
+            bytecode: vec![0],
+            instruction_offsets: vec![0, 1, 2, 3],
+            ip_map: std::collections::HashMap::from([
+                (0x1000, 0usize),
+                (0x2000, 1usize),
+                (0x3000, 2usize),
+                (0x4000, 3usize),
+            ]),
+            module_domain: 1,
+            exit_byte_offset: 0,
+        };
+        let selected = canonical_dynamic_targets(
+            &module,
+            &[0x3000, 0x9999, 0x1000, 0x3000],
+        );
+        assert_eq!(selected, vec![0x1000, 0x3000]);
+        assert!(!selected.contains(&0x2000));
+        assert!(!selected.contains(&0x4000));
+    }
 
     #[test]
     fn native_gateway_starts_after_canonical_cross_family_window() {
