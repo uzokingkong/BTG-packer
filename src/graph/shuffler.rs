@@ -57,7 +57,13 @@ impl LayoutShuffler {
 
         let mut current_offset = first_block_physical_offset;
 
-        for &logical_idx in &physical_order {
+        crate::progress::begin_task(
+            "Pass 2: measuring + shuffling physical block slots",
+            physical_order.len() as u64,
+            "blocks",
+        );
+        for (physical_index, &logical_idx) in physical_order.iter().enumerate() {
+            crate::progress::set_position((physical_index + 1) as u64);
             let block = trigger_blocks[logical_idx].clone();
             let logical_id = block.id as usize;
 
@@ -103,6 +109,10 @@ impl LayoutShuffler {
             shuffled_blocks.push(block);
         }
 
+        crate::progress::finish_task(format!(
+            "Pass 2 complete: {} block slot(s) measured",
+            physical_order.len()
+        ));
         let encrypted_table_entries = table_offsets.clone();
 
         ShuffledLayout {
