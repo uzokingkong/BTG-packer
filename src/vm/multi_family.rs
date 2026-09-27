@@ -349,14 +349,14 @@ impl MultiFamilyProgramPlan {
                 .map(|(&ip, &local)| (local, ip))
                 .collect();
             if std::env::var_os("BTG_TRACE_OP_MAP").is_some() {
-                eprintln!(
+                crate::progress_safe_eprintln!(
                     "BTG_OP_LAYOUT family={:?} domain={:#x} layout={:?}",
                     partition.family,
                     module_domain,
                     crate::vm::threaded::VmRuntimeLayout::from_seed(module_domain)
                 );
                 for (local, instruction) in partition.program.instrs.iter().enumerate() {
-                    eprintln!(
+                    crate::progress_safe_eprintln!(
                         "BTG_OP_MAP family={:?} local={} offset={:#x} ip={} op={:?} dst={:?} src1={:?} src2={:?} imm={:#x}",
                         partition.family,
                         local,
@@ -392,7 +392,7 @@ impl MultiFamilyProgramPlan {
                     }
                     let start = local.saturating_sub(8);
                     let end = (local + 9).min(partition.program.instrs.len());
-                    eprintln!(
+                    crate::progress_safe_eprintln!(
                         "[BTG_OP_MAP_NEAR] family={:?} target={target:#x} local={} start_off={:#x} next_off={}",
                         partition.family,
                         local,
@@ -404,7 +404,7 @@ impl MultiFamilyProgramPlan {
                     );
                     for index in start..end {
                         let instruction = &partition.program.instrs[index];
-                        eprintln!(
+                        crate::progress_safe_eprintln!(
                             "[BTG_OP_MAP_NEAR] family={:?} local={} offset={:#x} ip={} op={:?} dst={:?} src1={:?} src2={:?} imm={:#x}",
                             partition.family,
                             index,
@@ -445,7 +445,7 @@ impl MultiFamilyProgramPlan {
                         continue;
                     }
                     let instruction = &partition.program.instrs[index];
-                    eprintln!(
+                    crate::progress_safe_eprintln!(
                         "[BTG_OP_MAP_RANGE] family={:?} local={} offset={:#x} ip={} op={:?} dst={:?} src1={:?} src2={:?} imm={:#x}",
                         partition.family,
                         index,

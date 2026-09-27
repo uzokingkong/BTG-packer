@@ -581,7 +581,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
             let ip_index = ip_map.and_then(|map| map.get(&target)).copied();
             let resolved = resolve_off(target, &op_offsets, &ip_map);
             let serialized = entries.iter().find(|(key, _)| *key == target).copied();
-            eprintln!(
+            crate::progress_safe_eprintln!(
                 "[BTG_BRANCH_MAP] family={family:?} seed={seed:#x} target={target:#x} ip_index={ip_index:?} resolved={resolved:?} serialized={serialized:?} entries={} prog_ops={} offsets={} bytecode_len={}",
                 entries.len(),
                 prog.instrs.len(),
@@ -8188,7 +8188,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
         ),
     };
     if std::env::var_os("BTG_TRACE_BRIDGE_OFFSETS").is_some() {
-        eprintln!(
+        crate::progress_safe_eprintln!(
             "[VM-BRIDGE-OFFSETS] code_base={code_base:#x} native_call={:#x}..{:#x} native_tail={:#x}",
             ips[native_bridge_instr_begin],
             ips[native_bridge_instr_end],

@@ -29,16 +29,108 @@ impl Drop for LogFlushGuard {
     }
 }
 
+#[cfg(windows)]
+struct StdoutSilencer {
+    original: *mut std::ffi::c_void,
+    nul: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+impl StdoutSilencer {
+    fn activate() -> Option<Self> {
+        const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const OPEN_EXISTING: u32 = 3;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+
+        #[link(name = "Kernel32")]
+        extern "system" {
+            fn GetStdHandle(kind: u32) -> *mut std::ffi::c_void;
+            fn SetStdHandle(kind: u32, handle: *mut std::ffi::c_void) -> i32;
+            fn CreateFileW(
+                name: *const u16,
+                desired_access: u32,
+                share_mode: u32,
+                security_attributes: *mut std::ffi::c_void,
+                creation_disposition: u32,
+                flags_and_attributes: u32,
+                template_file: *mut std::ffi::c_void,
+            ) -> *mut std::ffi::c_void;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+
+        let nul_name: Vec<u16> = "NUL\0".encode_utf16().collect();
+        let nul = unsafe {
+            CreateFileW(
+                nul_name.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        let invalid = (-1isize) as *mut std::ffi::c_void;
+        if nul.is_null() || nul == invalid {
+            return None;
+        }
+
+        let original = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        if unsafe { SetStdHandle(STD_OUTPUT_HANDLE, nul) } == 0 {
+            unsafe {
+                CloseHandle(nul);
+            }
+            return None;
+        }
+        Some(Self { original, nul })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StdoutSilencer {
+    fn drop(&mut self) {
+        const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+        #[link(name = "Kernel32")]
+        extern "system" {
+            fn SetStdHandle(kind: u32, handle: *mut std::ffi::c_void) -> i32;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+        unsafe {
+            let _ = SetStdHandle(STD_OUTPUT_HANDLE, self.original);
+            let _ = CloseHandle(self.nul);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+struct StdoutSilencer;
+
+#[cfg(not(windows))]
+impl StdoutSilencer {
+    fn activate() -> Option<Self> {
+        None
+    }
+}
+
 struct PackProgress;
 
 impl PackProgress {
-    fn new(enabled: bool, refresh_ms: u64) -> Self {
-        btg_packer::progress::configure(enabled, refresh_ms);
+    fn new(enabled: bool, refresh_ms: u64, progress_only: bool) -> Self {
+        btg_packer::progress::configure(enabled, refresh_ms, progress_only);
         Self
     }
 
     fn report(&mut self, percent: u8, stage: &str) {
         btg_packer::progress::checkpoint(u32::from(percent) * 100, stage);
+    }
+}
+
+impl Drop for PackProgress {
+    fn drop(&mut self) {
+        btg_packer::progress::finish_console_line();
     }
 }
 fn main() -> error::Result<()> {
@@ -62,8 +154,10 @@ fn main() -> error::Result<()> {
     // 기존 main.rs 규칙을 의미 보존 — 이하 코드는 오직 해석된 값을 소비한다.
     let profile_req = btg_packer::protection_profile::RequestedConfig::from_cli(&args);
     let profile = btg_packer::protection_profile::resolve(&profile_req);
-    for w in &profile.warnings {
-        eprintln!("[!] {w}");
+    if !args.progress_only {
+        for w in &profile.warnings {
+            eprintln!("[!] {w}");
+        }
     }
     let cfg = &profile.config;
 
@@ -130,6 +224,9 @@ fn main() -> error::Result<()> {
             _log_flush = file.try_clone().ok().map(LogFlushGuard);
             builder.target(env_logger::Target::Pipe(Box::new(file)));
         }
+    } else if args.progress_only {
+        // Keep log:: diagnostics from colliding with the single live gauge.
+        builder.target(env_logger::Target::Pipe(Box::new(std::io::sink())));
     }
     let _ = builder.try_init();
 
@@ -339,23 +436,31 @@ fn main() -> error::Result<()> {
     // v3: 복합 VM 암호화 (기본 ON) — 먼저 정의 (아래 가드에서 사용)
     let crypto_enabled = cfg.crypto_enabled;
 
+    // --progress-only owns the console: ordinary println! diagnostics are sent
+    // to NUL while the progress renderer keeps stderr as the single live line.
+    let _stdout_silencer = if args.progress_only {
+        StdoutSilencer::activate()
+    } else {
+        None
+    };
+
     // ── 재점검 보고서 기반 가드 (H3/H4) ───────────────────────────────────────
     if rsrc_register && !payload_relocate {
         return Err(error::BtgError::Anyhow(anyhow::anyhow!(
             "--rsrc-register requires --payload-relocate (there is no relocated payload to register as RT_RCDATA)"
         )));
     }
-    if args.chained_crypto && args.crypto_coverage < 100 {
+    if !args.progress_only && args.chained_crypto && args.crypto_coverage < 100 {
         eprintln!(
             "[!] --chained-crypto + --crypto-coverage < 100 leaves plaintext code in the file (recommend 100)"
         );
     }
-    if !crypto_enabled && args.chained_crypto {
+    if !args.progress_only && !crypto_enabled && args.chained_crypto {
         eprintln!(
             "[!] --chained-crypto requires the crypto layer; ignoring (use without --no-crypto)"
         );
     }
-    if !crypto_enabled && integrity {
+    if !args.progress_only && !crypto_enabled && integrity {
         eprintln!("[!] --integrity requires the crypto layer; ignoring (use without --no-crypto)");
     }
 
@@ -393,10 +498,10 @@ fn main() -> error::Result<()> {
             "--dispatcher-reencrypt requires the crypto layer (remove --no-crypto)"
         )));
     }
-    if dispatcher_reencrypt && args.chained_crypto {
+    if !args.progress_only && dispatcher_reencrypt && args.chained_crypto {
         eprintln!("[!] --dispatcher-reencrypt takes precedence over --chained-crypto (boot-stub bulk decryption is bypassed)");
     }
-    if dispatcher_reencrypt && args.crypto_coverage < 100 {
+    if !args.progress_only && dispatcher_reencrypt && args.crypto_coverage < 100 {
         eprintln!("[!] --dispatcher-reencrypt overrides --crypto-coverage to 100 (all blocks must be individually encrypted)");
     }
 
@@ -413,7 +518,8 @@ fn main() -> error::Result<()> {
         );
     }
 
-    let mut progress = PackProgress::new(!args.no_progress, args.progress_refresh_ms);
+    let mut progress =
+        PackProgress::new(!args.no_progress, args.progress_refresh_ms, args.progress_only);
     progress.report(1, "Starting pack pipeline");
 
     // ── 입력 PE 로드 ──────────────────────────────────────────────────────────────

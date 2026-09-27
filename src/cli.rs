@@ -108,6 +108,12 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false)]
     pub no_progress: bool,
 
+    /// Show only the live in-place progress gauge during normal packing.
+    /// Ordinary stdout/stderr diagnostics are suppressed from the console;
+    /// --log-file still receives structured logger output.
+    #[arg(long, default_value_t = false, conflicts_with = "no_progress")]
+    pub progress_only: bool,
+
     /// Live progress refresh interval in milliseconds (16..2000).
     /// Lower values make the bar more responsive at a small console-I/O cost.
     #[arg(long, default_value_t = 80)]
@@ -272,5 +278,15 @@ mod crypto_cli_tests {
     fn legacy_rc4_flag_is_preserved_for_explicit_policy_rejection() {
         let args = CliArgs::try_parse_from(["btg-packer", "--rc4"]).unwrap();
         assert!(args.rc4);
+    }
+
+    #[test]
+    fn progress_only_is_parseable_and_conflicts_with_no_progress() {
+        let args = CliArgs::try_parse_from(["btg-packer", "--progress-only"]).unwrap();
+        assert!(args.progress_only);
+        assert!(!args.no_progress);
+
+        CliArgs::try_parse_from(["btg-packer", "--progress-only", "--no-progress"])
+            .expect_err("--progress-only must conflict with --no-progress");
     }
 }
