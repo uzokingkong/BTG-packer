@@ -398,10 +398,17 @@ impl MicroSlicer {
                     chunk.push(Instruction::with_branch(Code::Jmp_rel32_64, dispatcher_va)?);
                 } else if !is_uncond_jmp {
                     let fallthrough_va = current_inst.ip() + current_inst.len() as u64;
-                    if native_starts.contains(&fallthrough_va) {
-                        // Proven shuffled→native edge: make the original
-                        // fallthrough explicit after relocation. This is a
-                        // native bridge, not a synthesized terminal.
+                    if Self::can_preserve_direct_fallthrough(
+                        fallthrough_va,
+                        text_start_va,
+                        text_end_va,
+                        native_starts,
+                    ) {
+                        // Proven shuffled→native edge, or a fallthrough that
+                        // naturally leaves the original .text range. After
+                        // relocation the physical next bytes are unrelated, so
+                        // materialize the original linear flow as an explicit
+                        // jump. This preserves semantics without inventing RET.
                         chunk.push(Instruction::with_branch(
                             Code::Jmp_rel32_64,
                             fallthrough_va,
@@ -411,7 +418,7 @@ impl MicroSlicer {
                         continue;
                     }
                     return Err(anyhow::anyhow!(
-                        "UnresolvedFallthrough: block={} instruction=0x{:X} fallthrough=0x{:X} text=[0x{:X},0x{:X}); refusing to synthesize RET",
+                        "UnresolvedFallthrough: block={} instruction=0x{:X} fallthrough=0x{:X} text=[0x{:X},0x{:X}); unresolved in-text successor; refusing to synthesize RET",
                         block_id,
                         current_inst.ip(),
                         fallthrough_va,
@@ -430,6 +437,24 @@ impl MicroSlicer {
             trigger_blocks.len()
         ));
         Ok((trigger_blocks, va_to_trigger_id, call_target_block_ids))
+    }
+
+    /// Returns true when a relocated block can preserve its original linear
+    /// successor with a direct jump instead of dispatcher routing.
+    ///
+    /// Inside .text we require a proven native block start. At either side of
+    /// the half-open .text range [start, end), there cannot be a TriggerBlock
+    /// successor by definition, so the only semantics-preserving choice is to
+    /// keep the original target address as an explicit branch.
+    fn can_preserve_direct_fallthrough(
+        fallthrough_va: u64,
+        text_start_va: u64,
+        text_end_va: u64,
+        native_starts: &HashSet<u64>,
+    ) -> bool {
+        fallthrough_va < text_start_va
+            || fallthrough_va >= text_end_va
+            || native_starts.contains(&fallthrough_va)
     }
 
     /// Resolves a target VA a lightweight Trigger Block ID using BTreeMap range search.
@@ -466,5 +491,43 @@ impl MicroSlicer {
             return None;
         }
         map.range(..=target_va).next_back().map(|(_, &id)| id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_fallthrough_accepts_text_end_boundary() {
+        let native_starts = HashSet::new();
+        assert!(MicroSlicer::can_preserve_direct_fallthrough(
+            0x1400_F03D0,
+            0x1400_01000,
+            0x1400_F03D0,
+            &native_starts,
+        ));
+    }
+
+    #[test]
+    fn direct_fallthrough_accepts_known_native_start_inside_text() {
+        let native_starts = HashSet::from([0x1400_20000]);
+        assert!(MicroSlicer::can_preserve_direct_fallthrough(
+            0x1400_20000,
+            0x1400_01000,
+            0x1400_F03D0,
+            &native_starts,
+        ));
+    }
+
+    #[test]
+    fn direct_fallthrough_rejects_unknown_gap_inside_text() {
+        let native_starts = HashSet::new();
+        assert!(!MicroSlicer::can_preserve_direct_fallthrough(
+            0x1400_20000,
+            0x1400_01000,
+            0x1400_F03D0,
+            &native_starts,
+        ));
     }
 }
