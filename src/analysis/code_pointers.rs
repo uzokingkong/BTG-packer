@@ -10,6 +10,7 @@
 
 use crate::analysis::program_model::{CodePointerEncoding, RvaRange};
 use crate::pe::builder::SectionData;
+use std::collections::BTreeSet;
 
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
@@ -41,11 +42,39 @@ pub struct CodePointerScan<'a> {
 impl CodePointerScan<'_> {
     pub fn inventory(&self) -> Vec<CodePointerSeed> {
         let mut seeds = Vec::new();
+        let dir64_index = self.dir64_slots.iter().copied().collect::<BTreeSet<_>>();
+        let non_exec = self
+            .sections
+            .iter()
+            .filter(|section| section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0)
+            .collect::<Vec<_>>();
+        let total_probes = self.dir64_slots.len()
+            + non_exec
+                .iter()
+                .map(|section| section.bytes.len().saturating_sub(7).div_ceil(8))
+                .sum::<usize>()
+            + non_exec
+                .iter()
+                .map(|section| section.bytes.len().saturating_sub(3).div_ceil(4))
+                .sum::<usize>();
+        crate::progress::begin_detail_task(
+            "ProgramModel: scanning loader-mapped code pointers",
+            total_probes as u64,
+            "pointer probes",
+        );
+        let mut probes = 0u64;
+        let mut advance = || {
+            probes = probes.saturating_add(1);
+            if probes & 0x0fff == 0 || probes == total_probes as u64 {
+                crate::progress::set_position(probes);
+            }
+        };
 
         // A DIR64 entry is authoritative evidence that this exact slot is an
         // image-base-dependent address. Never heuristically read arbitrary
         // eight-byte data as a VA.
         for &slot in self.dir64_slots {
+            advance();
             let Some(slot_end) = slot.checked_add(8) else {
                 continue;
             };
@@ -81,19 +110,18 @@ impl CodePointerScan<'_> {
         // fixed-base image without a relocation for every absolute slot. Scan
         // aligned loader-mapped data so these real internal entry points become
         // canonical functions instead of falling through to NX original text.
-        for section in self
-            .sections
-            .iter()
-            .filter(|s| s.characteristics & IMAGE_SCN_MEM_EXECUTE == 0)
-        {
+        for section in &non_exec {
             for offset in (0..section.bytes.len().saturating_sub(7)).step_by(8) {
+                advance();
                 let Some(location) = section.virtual_address.checked_add(offset as u32) else {
                     break;
                 };
                 let Some(location_end) = location.checked_add(8) else {
                     continue;
                 };
-                if self.is_protected(location, 8) || self.overlaps_dir64(location, location_end) {
+                if self.is_protected(location, 8)
+                    || Self::overlaps_dir64(&dir64_index, location, location_end)
+                {
                     continue;
                 }
                 let value =
@@ -121,19 +149,18 @@ impl CodePointerScan<'_> {
         // RVA tables have no base relocations. Restrict the heuristic to
         // naturally aligned, non-executable, file-backed data and let typed
         // metadata parsers reserve their ranges.
-        for section in self
-            .sections
-            .iter()
-            .filter(|s| s.characteristics & IMAGE_SCN_MEM_EXECUTE == 0)
-        {
+        for section in &non_exec {
             for offset in (0..section.bytes.len().saturating_sub(3)).step_by(4) {
+                advance();
                 let Some(location) = section.virtual_address.checked_add(offset as u32) else {
                     break;
                 };
                 let Some(location_end) = location.checked_add(4) else {
                     continue;
                 };
-                if self.is_protected(location, 4) || self.overlaps_dir64(location, location_end) {
+                if self.is_protected(location, 4)
+                    || Self::overlaps_dir64(&dir64_index, location, location_end)
+                {
                     continue;
                 }
                 let target =
@@ -152,6 +179,11 @@ impl CodePointerScan<'_> {
             }
         }
 
+        crate::progress::set_position(total_probes as u64);
+        crate::progress::finish_task(format!(
+            "ProgramModel code-pointer scan complete: {} candidate(s)",
+            seeds.len()
+        ));
         seeds.sort_by_key(|s| (s.location.start, s.encoding as u8, s.target_rva));
         seeds.dedup_by_key(|s| (s.location.start, s.encoding as u8, s.target_rva));
         seeds
@@ -172,8 +204,12 @@ impl CodePointerScan<'_> {
             .any(|r| start < r.end && r.start < end)
     }
 
-    fn overlaps_dir64(&self, start: u32, end: u32) -> bool {
-        self.dir64_slots.iter().any(|&slot| {
+    fn overlaps_dir64(slots: &BTreeSet<u32>, start: u32, end: u32) -> bool {
+        // Only relocation slots beginning at most seven bytes before start can
+        // overlap an 8-byte DIR64 cell. Indexed lookup avoids scanning every
+        // relocation for every 4/8-byte candidate on large images.
+        let earliest = start.saturating_sub(7);
+        slots.range(earliest..end).any(|&slot| {
             slot.checked_add(8)
                 .is_some_and(|slot_end| start < slot_end && slot < end)
         })
