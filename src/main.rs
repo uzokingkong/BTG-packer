@@ -801,7 +801,10 @@ fn main() -> error::Result<()> {
                     }
                 } else {
                     btg_packer::manifest::VmOriginalMetrics::default()
-                });
+                })
+                .with_vm_exposure(
+                    btg_packer::analysis::vm_exposure::measure_pe(&output_pe_bytes).ok(),
+                );
         println!("[+] Build manifest (P3-2):");
         for line in manifest.render().lines() {
             println!("      {}", line);

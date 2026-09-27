@@ -211,14 +211,14 @@ pub(crate) fn emit_integrity_crc(seq: &mut Vec<(Instruction, Option<Label>)>, st
     }
 }
 
-/// Verify the serialized BTGI family-region table after the transient boot
+/// Verify the build-local family-region records after the transient boot
 /// cipher has restored the Program-VM bytecode to its persistent M7 form.
 pub(crate) fn emit_distributed_integrity(
     seq: &mut Vec<(Instruction, Option<Label>)>,
     stub: &BootStubCtx,
 ) {
     // In VM/RC4 mode Poly1305 is inactive, so poly_tag_va is an available
-    // build-context carrier for the BTGI table address without widening the
+    // build-context carrier for the integrity record address without widening the
     // already-stable BootStubCtx ABI used by older modes.
     let table_va = stub.poly_tag_va;
     if !stub.integrity || !stub.vm_oep || table_va == 0 || stub.chacha_mode() {
@@ -233,8 +233,10 @@ pub(crate) fn emit_distributed_integrity(
         Register::RDX,
         Register::RBP,
         Register::R8,
+        Register::R9,
         Register::R10,
         Register::R11,
+        Register::R14,
         Register::R15,
     ];
     for register in saved {
@@ -245,22 +247,71 @@ pub(crate) fn emit_distributed_integrity(
         Instruction::with2(Code::Mov_r64_imm64, Register::RBP, table_va).unwrap(),
         None,
     ));
+    // Header: nonce:u64, encoded_count:u32, guard:u32.  There is intentionally
+    // no fixed signature.  Count and every record field are nonce-masked.
     seq.push((
-        Instruction::with2(Code::Cmp_rm32_imm32, m(Register::RBP, 0), 0x4947_5442u32).unwrap(),
+        Instruction::with2(Code::Mov_r64_rm64, Register::R9, m(Register::RBP, 0)).unwrap(),
         None,
     ));
     seq.push((
-        Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(),
+        Instruction::with2(Code::Test_rm64_r64, Register::R9, Register::R9).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
         Some(Label::DistMagicOk),
     ));
     seq.push((Instruction::with(Code::Ud2), None));
     seq.push((Instruction::with(Code::Nopd), Some(Label::DistMagicOk)));
     seq.push((
-        Instruction::with2(Code::Mov_r32_rm32, Register::R15D, m(Register::RBP, 4)).unwrap(),
+        Instruction::with2(Code::Mov_r32_rm32, Register::R15D, m(Register::RBP, 8)).unwrap(),
         None,
     ));
     seq.push((
-        Instruction::with2(Code::Add_rm64_imm32, Register::RBP, 8).unwrap(),
+        Instruction::with2(Code::Mov_r32_rm32, Register::R10D, Register::R15D).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::R9).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Shr_rm64_imm8, Register::R14, 32).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Xor_rm32_r32, Register::R10D, Register::R14D).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(
+            Code::Xor_rm32_imm32,
+            Register::R10D,
+            crate::vm::integrity_layout::HEADER_GUARD_DOMAIN,
+        )
+        .unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Rol_rm32_imm8, Register::R10D, 11).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Cmp_r32_rm32, Register::R10D, m(Register::RBP, 12)).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with_branch(Code::Je_rel32_64, 0).unwrap(),
+        Some(Label::DistCountOk),
+    ));
+    seq.push((Instruction::with(Code::Ud2), None));
+    seq.push((Instruction::with(Code::Nopd), Some(Label::DistCountOk)));
+    seq.push((
+        Instruction::with2(Code::Xor_rm32_r32, Register::R15D, Register::R9D).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Add_rm64_imm32, Register::RBP, 16).unwrap(),
         None,
     ));
     seq.push((
@@ -269,10 +320,9 @@ pub(crate) fn emit_distributed_integrity(
     ));
     seq.push((
         Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
-        Some(Label::DistCountOk),
+        Some(Label::DistDescLoop),
     ));
     seq.push((Instruction::with(Code::Ud2), None));
-    seq.push((Instruction::with(Code::Nopd), Some(Label::DistCountOk)));
     seq.push((
         Instruction::with2(Code::Cmp_rm32_imm32, Register::R15D, 13).unwrap(),
         None,
@@ -287,7 +337,15 @@ pub(crate) fn emit_distributed_integrity(
         Some(Label::DistDescLoop),
     ));
     seq.push((
+        Instruction::with2(Code::Xor_rm64_r64, Register::RCX, Register::R9).unwrap(),
+        None,
+    ));
+    seq.push((
         Instruction::with2(Code::Mov_r64_rm64, Register::RDX, m(Register::RBP, 16)).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Xor_rm64_r64, Register::RDX, Register::R9).unwrap(),
         None,
     ));
     seq.push((
@@ -296,6 +354,10 @@ pub(crate) fn emit_distributed_integrity(
     ));
     seq.push((
         Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::RBP, 32)).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Xor_rm64_r64, Register::RAX, Register::R9).unwrap(),
         None,
     ));
     seq.push((
@@ -353,7 +415,15 @@ pub(crate) fn emit_distributed_integrity(
     ));
     seq.push((Instruction::with(Code::Nopd), Some(Label::DistByteDone)));
     seq.push((
-        Instruction::with2(Code::Cmp_r64_rm64, Register::RAX, m(Register::RBP, 24)).unwrap(),
+        Instruction::with2(Code::Mov_r64_rm64, Register::R14, m(Register::RBP, 24)).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Xor_rm64_r64, Register::R14, Register::R9).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with2(Code::Cmp_rm64_r64, Register::RAX, Register::R14).unwrap(),
         None,
     ));
     seq.push((
@@ -364,6 +434,20 @@ pub(crate) fn emit_distributed_integrity(
     seq.push((
         Instruction::with2(Code::Add_rm64_imm32, Register::RBP, 40).unwrap(),
         Some(Label::DistDescOk),
+    ));
+    seq.push((
+        Instruction::with2(Code::Rol_rm64_imm8, Register::R9, 13).unwrap(),
+        None,
+    ));
+    seq.push((
+        Instruction::with3(
+            Code::Imul_r64_rm64_imm32,
+            Register::R9,
+            Register::R9,
+            0x1E35_A7BD,
+        )
+        .unwrap(),
+        None,
     ));
     seq.push((
         Instruction::with1(Code::Dec_rm64, Register::R15).unwrap(),

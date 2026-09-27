@@ -144,6 +144,8 @@ pub struct BuildManifest {
     pub vm_bytecode_rva: u32,
     pub vm_bytecode_len: u32,
     pub vm_runtime_cipher_hash: Option<String>,
+    /// Read-only attacker-view measurements over the final output image.
+    pub vm_exposure: Option<crate::analysis::vm_exposure::VmExposureReport>,
 }
 
 impl BuildManifest {
@@ -193,6 +195,7 @@ impl BuildManifest {
             vm_bytecode_rva: 0,
             vm_bytecode_len: 0,
             vm_runtime_cipher_hash: None,
+            vm_exposure: None,
         }
     }
 
@@ -236,6 +239,14 @@ impl BuildManifest {
     /// callers compile unchanged while the analysis pipeline is migrated.
     pub fn with_vm_original_metrics(mut self, metrics: VmOriginalMetrics) -> Self {
         self.vm_original_metrics = metrics;
+        self
+    }
+
+    pub fn with_vm_exposure(
+        mut self,
+        exposure: Option<crate::analysis::vm_exposure::VmExposureReport>,
+    ) -> Self {
+        self.vm_exposure = exposure;
         self
     }
 
@@ -469,6 +480,31 @@ impl BuildManifest {
         out.push_str(&format!(
             "vm_runtime_cipher_hash = {}\n",
             self.vm_runtime_cipher_hash.as_deref().unwrap_or("none")
+        ));
+        let exposure = self.vm_exposure.as_ref();
+        out.push_str(&format!(
+            "recoverable_handler_entries = {}\n",
+            exposure
+                .map(|report| report.recoverable_handler_entries.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        out.push_str(&format!(
+            "handler_pointer_table_candidates = {}\n",
+            exposure
+                .map(|report| report.pointer_table_candidates.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        out.push_str(&format!(
+            "state_offset_peak_frequency = {}\n",
+            exposure
+                .map(|report| report.state_offset_peak_frequency.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        out.push_str(&format!(
+            "semantic_anchor_hits = {}\n",
+            exposure
+                .map(|report| report.semantic_anchor_hits.to_string())
+                .unwrap_or_else(|| "none".to_string())
         ));
         out.push_str(&format!(
             "vm_bytecode_chunk_encryption = {}\n",
@@ -704,6 +740,24 @@ mod tests {
         assert!(body.contains("unresolved_internal_edges = none"));
         assert!(body.contains("unsupported_instructions = none"));
         assert!(body.contains("capability_mismatches = none"));
+        assert!(body.contains("recoverable_handler_entries = none"));
+        assert!(body.contains("state_offset_peak_frequency = none"));
+    }
+
+    #[test]
+    fn render_contains_attacker_view_exposure_metrics() {
+        let m = BuildManifest::new(None, vec![], "ab".repeat(16), "cd".repeat(16))
+            .with_vm_exposure(Some(crate::analysis::vm_exposure::VmExposureReport {
+                semantic_anchor_hits: 2,
+                pointer_table_candidates: 1,
+                recoverable_handler_entries: 186,
+                state_offset_peak_frequency: 41,
+            }));
+        let body = m.render();
+        assert!(body.contains("semantic_anchor_hits = 2\n"));
+        assert!(body.contains("handler_pointer_table_candidates = 1\n"));
+        assert!(body.contains("recoverable_handler_entries = 186\n"));
+        assert!(body.contains("state_offset_peak_frequency = 41\n"));
     }
 
     #[test]

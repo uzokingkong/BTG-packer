@@ -1888,7 +1888,7 @@ pub(crate) fn place_boot_stub(
         crc4_va,
         w32_slot_va,
         // RC4 Program-VM mode reuses the otherwise inactive Poly1305 tag
-        // pointer as the BTGI runtime-table carrier.
+        // pointer as the distributed-integrity record carrier.
         poly_tag_va: if vm_integrity_table_capacity > 0 && !chacha_mode {
             dispatcher_va + vm_integrity_table_off as u64
         } else {

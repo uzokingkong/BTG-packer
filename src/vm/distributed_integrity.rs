@@ -31,9 +31,8 @@ pub struct IntegrityDescriptor {
     domain_key: u64,
 }
 
-pub const SERIALIZED_DESCRIPTOR_SIZE: usize = 40;
-pub const SERIALIZED_TABLE_HEADER_SIZE: usize = 8;
-pub const SERIALIZED_TABLE_MAGIC: u32 = u32::from_le_bytes(*b"BTGI");
+pub const SERIALIZED_DESCRIPTOR_SIZE: usize = crate::vm::integrity_layout::RECORD_SIZE;
+pub const SERIALIZED_TABLE_HEADER_SIZE: usize = crate::vm::integrity_layout::HEADER_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntegrityOutcome {
@@ -88,20 +87,29 @@ impl IntegrityDescriptor {
 }
 
 pub fn serialize_table(descriptors: &[IntegrityDescriptor]) -> anyhow::Result<Vec<u8>> {
-    let count = u32::try_from(descriptors.len())?;
+    let _ = u32::try_from(descriptors.len())?;
+    let domains: Vec<u64> = descriptors
+        .iter()
+        .map(IntegrityDescriptor::domain_key)
+        .collect();
+    let plan = crate::vm::integrity_layout::IntegrityLayoutPlan::derive(&domains);
     let mut out = Vec::with_capacity(
         SERIALIZED_TABLE_HEADER_SIZE + descriptors.len() * SERIALIZED_DESCRIPTOR_SIZE,
     );
-    out.extend_from_slice(&SERIALIZED_TABLE_MAGIC.to_le_bytes());
-    out.extend_from_slice(&count.to_le_bytes());
-    for descriptor in descriptors {
+    out.extend_from_slice(&plan.nonce.to_le_bytes());
+    out.extend_from_slice(&plan.encoded_count().to_le_bytes());
+    out.extend_from_slice(&plan.header_guard().to_le_bytes());
+    let mut mask = plan.nonce;
+    for &logical_index in &plan.order {
+        let descriptor = &descriptors[logical_index];
         out.push(descriptor.kind as u8);
         out.push(descriptor.policy as u8);
         out.extend_from_slice(&[0u8; 6]);
-        out.extend_from_slice(&descriptor.offset.to_le_bytes());
-        out.extend_from_slice(&descriptor.len.to_le_bytes());
-        out.extend_from_slice(&descriptor.runtime_tag.to_le_bytes());
-        out.extend_from_slice(&descriptor.domain_key().to_le_bytes());
+        out.extend_from_slice(&(descriptor.offset ^ mask).to_le_bytes());
+        out.extend_from_slice(&(descriptor.len ^ mask).to_le_bytes());
+        out.extend_from_slice(&(descriptor.runtime_tag ^ mask).to_le_bytes());
+        out.extend_from_slice(&(descriptor.domain_key() ^ mask).to_le_bytes());
+        mask = crate::vm::integrity_layout::next_record_mask(mask);
     }
     Ok(out)
 }
@@ -264,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn serialized_table_has_stable_runtime_abi() {
+    fn serialized_table_uses_build_local_opaque_header_and_masked_records() {
         let descriptors = seal_region_set(
             &[0xA5; 32],
             &[(ProtectedRegionKind::HandlerCode, 0, 32)],
@@ -277,22 +285,24 @@ mod tests {
             table.len(),
             SERIALIZED_TABLE_HEADER_SIZE + SERIALIZED_DESCRIPTOR_SIZE
         );
+        let nonce = u64::from_le_bytes(table[0..8].try_into().unwrap());
+        let encoded_count = u32::from_le_bytes(table[8..12].try_into().unwrap());
+        assert_ne!(nonce, 0);
+        assert_eq!(encoded_count ^ nonce as u32, 1);
+        assert_eq!(table[16], ProtectedRegionKind::HandlerCode as u8);
         assert_eq!(
-            u32::from_le_bytes(table[0..4].try_into().unwrap()),
-            SERIALIZED_TABLE_MAGIC
-        );
-        assert_eq!(u32::from_le_bytes(table[4..8].try_into().unwrap()), 1);
-        assert_eq!(table[8], ProtectedRegionKind::HandlerCode as u8);
-        assert_eq!(
-            u64::from_le_bytes(table[16..24].try_into().unwrap()),
+            u64::from_le_bytes(table[24..32].try_into().unwrap()) ^ nonce,
             0x9000
         );
-        assert_eq!(u64::from_le_bytes(table[24..32].try_into().unwrap()), 32);
+        assert_eq!(
+            u64::from_le_bytes(table[32..40].try_into().unwrap()) ^ nonce,
+            32
+        );
     }
 
     #[test]
     fn serialized_runtime_tag_is_keyed_fnv_and_mutation_sensitive() {
-        let bytes = b"BTGI runtime lockstep";
+        let bytes = b"distributed runtime lockstep";
         let key = 0x0123_4567_89AB_CDEF;
         let descriptor = IntegrityDescriptor::seal(
             ProtectedRegionKind::VmBytecode,
@@ -302,8 +312,9 @@ mod tests {
             IntegrityFailurePolicy::FailClosed,
         );
         let table = serialize_table(&[descriptor]).unwrap();
-        let serialized_tag = u64::from_le_bytes(table[32..40].try_into().unwrap());
-        let domain_key = u64::from_le_bytes(table[40..48].try_into().unwrap());
+        let nonce = u64::from_le_bytes(table[0..8].try_into().unwrap());
+        let serialized_tag = u64::from_le_bytes(table[40..48].try_into().unwrap()) ^ nonce;
+        let domain_key = u64::from_le_bytes(table[48..56].try_into().unwrap()) ^ nonce;
         assert_eq!(
             serialized_tag,
             runtime_tag(bytes, domain_key, bytes.len() as u64)

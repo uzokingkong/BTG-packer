@@ -775,9 +775,7 @@ fn add_special_native_abi_functions(
             all_function_ranges
                 .iter()
                 .copied()
-                .find(|(callee_start, callee_end)| {
-                    *callee_start <= target && target < *callee_end
-                })
+                .find(|(callee_start, callee_end)| *callee_start <= target && target < *callee_end)
                 .is_none_or(|callee| native_snapshot.contains(&callee))
         });
         if is_unwind_funclet
@@ -1848,11 +1846,7 @@ pub fn lift_program_cfg_commercial_with_model(
         }
     }
     let native_before_tail_closure = native_function_ranges.len();
-    close_native_tail_targets(
-        &all_function_ranges,
-        &blocks,
-        &mut native_function_ranges,
-    );
+    close_native_tail_targets(&all_function_ranges, &blocks, &mut native_function_ranges);
     add_special_native_abi_functions(
         &all_function_ranges,
         &blocks,
@@ -2798,8 +2792,14 @@ mod tests {
         use super::performance_native_import_class;
 
         assert_eq!(performance_native_import_class("PeekMessageW"), Some("gui"));
-        assert_eq!(performance_native_import_class("DefWindowProcW"), Some("gui"));
-        assert_eq!(performance_native_import_class("PostQuitMessage"), Some("gui"));
+        assert_eq!(
+            performance_native_import_class("DefWindowProcW"),
+            Some("gui")
+        );
+        assert_eq!(
+            performance_native_import_class("PostQuitMessage"),
+            Some("gui")
+        );
         assert_eq!(
             performance_native_import_class("WaitForSingleObject"),
             Some("wait")

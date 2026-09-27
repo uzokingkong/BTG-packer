@@ -4866,9 +4866,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
         emit_synth_identity(&mut b, Register::R11, &plan);
         for &(original_va, gateway_va) in native_pointer_rewrites {
             movi(&mut b, Register::RAX, original_va);
-            b.push(
-                Instruction::with2(Code::Cmp_rm64_r64, Register::R11, Register::RAX).unwrap(),
-            );
+            b.push(Instruction::with2(Code::Cmp_rm64_r64, Register::R11, Register::RAX).unwrap());
             let skip = b.br(Code::Jne_rel32_64, usize::MAX);
             movi(&mut b, Register::R11, gateway_va);
             let after = b.len();

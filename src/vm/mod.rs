@@ -34,6 +34,7 @@ pub mod flags;
 pub mod handler_poly;
 pub mod handlers;
 pub mod import_key;
+pub mod integrity_layout;
 pub mod interp;
 pub mod key_domains;
 pub mod ksa;

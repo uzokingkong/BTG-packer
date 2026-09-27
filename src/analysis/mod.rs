@@ -11,6 +11,7 @@ pub mod program_model_builder;
 pub mod switch_producer;
 pub mod switch_targets;
 pub mod value_flow;
+pub mod vm_exposure;
 
 #[allow(unused_imports)]
 pub use metrics::{CfgEdgeCounts, MetricsAnalyzer, ObfuscationMetrics};
