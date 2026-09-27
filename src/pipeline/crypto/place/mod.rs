@@ -1979,7 +1979,9 @@ pub(crate) fn place_boot_stub(
         mem_code_base: dispatcher_va,
         // Program-VM state starts on its own page.  Seal only the immutable
         // prefix; state/call-stack/import slots remain writable.
-        mem_code_size: if vm_prog_state_va > dispatcher_va {
+        mem_code_size: if vm_multi_family_active {
+            ((new_section_len as u64) + 0xFFF) & !0xFFF
+        } else if vm_prog_state_va > dispatcher_va {
             vm_prog_state_va - dispatcher_va
         } else {
             ((new_section_len as u64) + 0xFFF) & !0xFFF
@@ -1989,7 +1991,9 @@ pub(crate) fn place_boot_stub(
         } else {
             0
         },
-        mem_state_size: if vm_prog_state_va > dispatcher_va {
+        mem_state_size: if vm_multi_family_active && vm_prog_state_va > dispatcher_va {
+            vm_prog_state_reserve as u64
+        } else if vm_prog_state_va > dispatcher_va {
             ((dispatcher_va + new_section_len as u64 + 0xFFF) & !0xFFF)
                 .saturating_sub(vm_prog_state_va)
         } else {
@@ -2253,20 +2257,24 @@ pub(crate) fn place_boot_stub(
                 "Commercial Program-VM: final module placement",
             );
         }
-        let prend = vm_prog_off + prmod.total_len();
+        let pr_immutable_end = vm_prog_off
+            + prmod.code.len()
+            + prmod.table.len()
+            + prmod.bytecode.len();
         println!(
-            "[DEBUG pass2 prmod] code={} table={} bc={} total={} prend={} btg_len={}",
+            "[DEBUG pass2 prmod] code={} table={} bc={} immutable_end={} btg_len={}",
             prmod.code.len(),
             prmod.table.len(),
             prmod.bytecode.len(),
-            prmod.total_len(),
-            prend,
+            pr_immutable_end,
             btg.bytes.len()
         );
-        if prend > boot_off + BOOT_AREA_RESERVE {
+        if pr_immutable_end > boot_off + BOOT_AREA_RESERVE
+            || pr_immutable_end > btg.bytes.len()
+        {
             return Err(anyhow::anyhow!(
-                "Program VM module too large: {} bytes at 0x{:X}",
-                prmod.total_len(),
+                "Program VM immutable module too large: {} bytes at 0x{:X}",
+                prmod.code.len() + prmod.table.len() + prmod.bytecode.len(),
                 vm_prog_off
             ));
         }
