@@ -52,6 +52,57 @@ struct PointSeed {
     pointer: Option<(RvaRange, CodePointerEncoding, &'static str)>,
 }
 
+#[derive(Debug, Default)]
+struct FunctionRangeIndex {
+    ranges: Vec<(u32, u32, FunctionId)>,
+    prefix_max_end: Vec<u32>,
+}
+
+impl FunctionRangeIndex {
+    fn from_model(model: &ProgramModel) -> Self {
+        let mut ranges = model
+            .functions
+            .iter()
+            .flat_map(|(&id, function)| {
+                function
+                    .ranges
+                    .iter()
+                    .map(move |range| (range.start, range.end, id))
+            })
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|(start, _, id)| (*start, id.0));
+        let mut prefix_max_end = Vec::with_capacity(ranges.len());
+        let mut max_end = 0u32;
+        for &(_, end, _) in &ranges {
+            max_end = max_end.max(end);
+            prefix_max_end.push(max_end);
+        }
+        Self {
+            ranges,
+            prefix_max_end,
+        }
+    }
+
+    fn owner(&self, rva: u32) -> Option<FunctionId> {
+        let upper = self.ranges.partition_point(|(start, _, _)| *start <= rva);
+        let mut best = None;
+        let mut index = upper;
+        while index != 0 {
+            index -= 1;
+            let (_, end, id) = self.ranges[index];
+            if rva < end {
+                best = Some(best.map_or(id, |current: FunctionId| {
+                    if id.0 < current.0 { id } else { current }
+                }));
+            }
+            if index == 0 || self.prefix_max_end[index - 1] <= rva {
+                break;
+            }
+        }
+        best
+    }
+}
+
 /// Builds stable IDs by sorted RVA order, independent of discovery order.
 pub struct ProgramModelBuilder<'a> {
     target: &'a TargetPeInfo,
@@ -129,12 +180,31 @@ impl<'a> ProgramModelBuilder<'a> {
         // functions while making the materialized entry available to CFG
         // extraction and ownership before VM partitioning.
         let mut materialized_entries = BTreeSet::new();
+        let executable_scan_bytes = target
+            .executable_sections()
+            .iter()
+            .map(|section| section.bytes.len() as u64)
+            .sum::<u64>();
+        crate::progress::begin_detail_task(
+            "ProgramModel: scanning executable address materializations",
+            executable_scan_bytes,
+            "bytes",
+        );
+        let mut executable_scanned = 0u64;
         for section in target.executable_sections() {
             let section_va = target.image_base + u64::from(section.virtual_address);
             let mut decoder =
                 Decoder::with_ip(64, &section.bytes, section_va, DecoderOptions::NONE);
+            let section_base_scanned = executable_scanned;
+            let mut last_progress = executable_scanned;
             while decoder.can_decode() {
                 let instruction = decoder.decode();
+                executable_scanned =
+                    section_base_scanned.saturating_add(decoder.position() as u64);
+                if executable_scanned.saturating_sub(last_progress) >= 16 * 1024 {
+                    crate::progress::set_position(executable_scanned.min(executable_scan_bytes));
+                    last_progress = executable_scanned;
+                }
                 if instruction.is_invalid() {
                     continue;
                 }
@@ -169,6 +239,11 @@ impl<'a> ProgramModelBuilder<'a> {
                 }
             }
         }
+        crate::progress::set_position(executable_scan_bytes);
+        crate::progress::finish_task(format!(
+            "ProgramModel executable-entry scan complete: {} candidate(s)",
+            materialized_entries.len()
+        ));
         for rva in materialized_entries {
             builder.points.push(PointSeed {
                 rva,
@@ -320,7 +395,15 @@ impl<'a> ProgramModelBuilder<'a> {
 
         // Point-only functions occupy one byte. They intentionally do not claim an
         // inferred body; later disassembly may expand them and shrink unknown_ranges.
-        for seed in &self.points {
+        crate::progress::begin_detail_task(
+            "ProgramModel: deriving function boundaries",
+            self.points.len() as u64,
+            "function seeds",
+        );
+        for (seed_index, seed) in self.points.iter().enumerate() {
+            if seed_index & 0x01ff == 0 || seed_index + 1 == self.points.len() {
+                crate::progress::set_position((seed_index + 1) as u64);
+            }
             if !groups
                 .iter()
                 .any(|(r, _)| r.start <= seed.rva && seed.rva < r.end)
@@ -343,20 +426,29 @@ impl<'a> ProgramModelBuilder<'a> {
                 ));
             }
         }
+        crate::progress::finish_task(format!(
+            "ProgramModel function-boundary derivation complete: {} range(s)",
+            groups.len()
+        ));
         groups.sort_by_key(|(r, _)| *r);
 
         let mut model = ProgramModel {
             executable_ranges,
             ..Default::default()
         };
-        let mut rva_to_function = BTreeMap::new();
+        crate::progress::begin_detail_task(
+            "ProgramModel: materializing canonical functions",
+            groups.len() as u64,
+            "functions",
+        );
         for (index, (range, records)) in groups.iter().enumerate() {
+            if index & 0x00ff == 0 || index + 1 == groups.len() {
+                crate::progress::set_position((index + 1) as u64);
+            }
             let id = FunctionId(index as u32);
-            let matching: Vec<_> = self
-                .points
-                .iter()
-                .filter(|p| range.start <= p.rva && p.rva < range.end)
-                .collect();
+            let matching_start = self.points.partition_point(|point| point.rva < range.start);
+            let matching_end = self.points.partition_point(|point| point.rva < range.end);
+            let matching = &self.points[matching_start..matching_end];
             let mut provenance: BTreeSet<_> = matching.iter().map(|p| p.provenance).collect();
             if !records.is_empty() {
                 provenance.insert(FunctionProvenance::Pdata);
@@ -384,14 +476,16 @@ impl<'a> ProgramModelBuilder<'a> {
                     unwind,
                 },
             );
-            for rva in range.start..range.end {
-                rva_to_function.insert(rva, id);
-            }
         }
+        crate::progress::finish_task(format!(
+            "ProgramModel canonical functions complete: {} function(s)",
+            model.functions.len()
+        ));
+        let function_ranges = FunctionRangeIndex::from_model(&model);
         let mut pointer_id = 0;
         let mut seen_pointers = BTreeSet::new();
         for seed in &self.points {
-            let mapped_target = rva_to_function.get(&seed.rva).copied();
+            let mapped_target = function_ranges.owner(seed.rva);
             if mapped_target.is_some() && seed.provenance == FunctionProvenance::DataCodePointer {
                 // Both data-backed pointers and executable code that
                 // materializes a function address are canonical indirect
