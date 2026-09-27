@@ -80,7 +80,7 @@ impl VmOriginalMetrics {
 /// A fully-qualified description of one pack run.
 #[derive(Debug, Clone)]
 pub struct BuildManifest {
-    /// Packer binary version (`CARGO_PKG_VERSION` = "1.0.0").
+    /// Packer binary version (`CARGO_PKG_VERSION` = "1.0.2").
     pub version: String,
     /// Deterministic build identifier: `BTG-<seed:016X>-<input_hash[..8]>`.
     pub build_id: String,

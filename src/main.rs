@@ -349,7 +349,10 @@ fn main() -> error::Result<()> {
     }
 
     println!("==================================================================");
-    println!(" [BTG PACKER v1.0.0] Bidirectional Trigger Graph Security Framework ");
+    println!(
+        " [BTG PACKER v{}] Bidirectional Trigger Graph Security Framework ",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("==================================================================");
     if full {
         println!("[+] FULL: obf_level=3, anti-debug, dispatcher-reencrypt, integrity, payload-relocate, rsrc-register, iat-hide, mem-harden");

@@ -20,7 +20,7 @@ pub enum SectionNameMode {
 #[command(
     name = "btg-packer",
     author = "BTG Security Research Team",
-    version = "1.0.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Bidirectional Trigger Graph (BTG) Security Framework"
 )]
 pub struct CliArgs {
