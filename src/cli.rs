@@ -103,10 +103,15 @@ pub struct CliArgs {
     #[arg(short = 'g', long)]
     pub log_file: Option<PathBuf>,
 
-    /// Disable stage-based packing progress and ETA lines.
+    /// Disable the detailed live packing progress renderer.
     /// Progress is enabled by default for normal pack operations.
     #[arg(long, default_value_t = false)]
     pub no_progress: bool,
+
+    /// Live progress refresh interval in milliseconds (16..2000).
+    /// Lower values make the bar more responsive at a small console-I/O cost.
+    #[arg(long, default_value_t = 80)]
+    pub progress_refresh_ms: u64,
 
     /// Inject runtime block execution tracer into packed binary
     #[arg(long, default_value_t = false)]
