@@ -1147,13 +1147,23 @@ pub(crate) fn build_multi_family_prog_mod(
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         for (target_index, target) in modules.iter().enumerate() {
-            let mut dynamic_targets = target.function_ids.clone();
-            dynamic_targets.extend(
-                gateway_targets
-                    .iter()
-                    .copied()
-                    .filter(|target_va| target.ip_map.contains_key(target_va)),
-            );
+            // Dynamic cross-family routes come from the canonical callable-target
+            // inventory, not from every VM-owned function. `gateway_targets`
+            // already contains complete indirect targets, externally address-taken
+            // entries, and native-island -> VM callable edges. When
+            // BTG_RETIRE_ORIGINAL_TEXT is explicitly enabled it intentionally
+            // expands to the complete VM-entry set.
+            //
+            // Expanding target.function_ids here manufactured a wildcard route
+            // for every VM-owned function in every other family. Large programs
+            // therefore produced 8k-16k+ native routes even when only a small
+            // subset was reachable indirectly, tripping the 4096 generated-router
+            // safety ceiling and massively inflating generated code.
+            let mut dynamic_targets: Vec<u64> = gateway_targets
+                .iter()
+                .copied()
+                .filter(|target_va| target.ip_map.contains_key(target_va))
+                .collect();
             dynamic_targets.sort_unstable();
             dynamic_targets.dedup();
             for target_va in dynamic_targets {
@@ -1181,6 +1191,20 @@ pub(crate) fn build_multi_family_prog_mod(
                     tail_jump_resume_offset: None,
                 });
             }
+        }
+        if std::env::var_os("BTG_DIAG_ROUTES").is_some() {
+            let callsite_routes = routes
+                .iter()
+                .filter(|route| route.source_next_byte_offset.is_some())
+                .count();
+            let dynamic_routes = routes.len().saturating_sub(callsite_routes);
+            crate::progress_safe_eprintln!(
+                "[VM-ROUTES] family={:?} phase=sizing total={} callsite={} dynamic_gateway={}",
+                source_family,
+                routes.len(),
+                callsite_routes,
+                dynamic_routes
+            );
         }
         Ok(routes)
     };
@@ -1382,13 +1406,23 @@ pub(crate) fn build_multi_family_prog_mod(
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         for (target_index, target) in modules.iter().enumerate() {
-            let mut dynamic_targets = target.function_ids.clone();
-            dynamic_targets.extend(
-                gateway_targets
-                    .iter()
-                    .copied()
-                    .filter(|target_va| target.ip_map.contains_key(target_va)),
-            );
+            // Dynamic cross-family routes come from the canonical callable-target
+            // inventory, not from every VM-owned function. `gateway_targets`
+            // already contains complete indirect targets, externally address-taken
+            // entries, and native-island -> VM callable edges. When
+            // BTG_RETIRE_ORIGINAL_TEXT is explicitly enabled it intentionally
+            // expands to the complete VM-entry set.
+            //
+            // Expanding target.function_ids here manufactured a wildcard route
+            // for every VM-owned function in every other family. Large programs
+            // therefore produced 8k-16k+ native routes even when only a small
+            // subset was reachable indirectly, tripping the 4096 generated-router
+            // safety ceiling and massively inflating generated code.
+            let mut dynamic_targets: Vec<u64> = gateway_targets
+                .iter()
+                .copied()
+                .filter(|target_va| target.ip_map.contains_key(target_va))
+                .collect();
             dynamic_targets.sort_unstable();
             dynamic_targets.dedup();
             for target_va in dynamic_targets {
@@ -1417,6 +1451,20 @@ pub(crate) fn build_multi_family_prog_mod(
                     tail_jump_resume_offset: None,
                 });
             }
+        }
+        if std::env::var_os("BTG_DIAG_ROUTES").is_some() {
+            let callsite_routes = routes
+                .iter()
+                .filter(|route| route.source_next_byte_offset.is_some())
+                .count();
+            let dynamic_routes = routes.len().saturating_sub(callsite_routes);
+            crate::progress_safe_eprintln!(
+                "[VM-ROUTES] family={:?} phase=final total={} callsite={} dynamic_gateway={}",
+                module.family,
+                routes.len(),
+                callsite_routes,
+                dynamic_routes
+            );
         }
         if routes.is_empty() {
             routes.push(vm::threaded::poly_direct::NativeCrossFamilyRoute {
