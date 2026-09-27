@@ -51,6 +51,27 @@ impl MicroSlicer {
         let mut va_to_trigger_id = BTreeMap::new();
         let mut next_trigger_id = 0u32;
 
+        // CFG extraction may intentionally omit non-code alignment/invalid gaps.
+        // Preserve the canonical linear successor selected by the CFG so the
+        // slicer does not try to route a raw fallthrough address that has no
+        // instruction/TriggerBlock entry. Direct/taken branch targets are never
+        // rewritten here.
+        let fallthrough_aliases: HashMap<u64, u64> = basic_blocks
+            .iter()
+            .filter_map(|bb| {
+                let last = bb.instructions.last()?;
+                let raw = last.ip() + last.len() as u64;
+                let canonical = match last.flow_control() {
+                    FlowControl::ConditionalBranch => bb.successor_vas.get(1).copied(),
+                    FlowControl::Call | FlowControl::IndirectCall | FlowControl::Next => {
+                        bb.successor_vas.first().copied()
+                    }
+                    _ => None,
+                }?;
+                (canonical != raw).then_some((raw, canonical))
+            })
+            .collect();
+
         // --------------------------------------------------------------------------
         // PASS A: Actual Chunking & Exact VA -> Trigger ID Mapping Construction
         // -------------------------------------------------------------------------
@@ -251,7 +272,11 @@ impl MicroSlicer {
                 chunk.pop();
 
                 let taken_target_va = current_inst.near_branch_target();
-                let fallthrough_va = current_inst.ip() + current_inst.len() as u64;
+                let raw_fallthrough_va = current_inst.ip() + current_inst.len() as u64;
+                let fallthrough_va = fallthrough_aliases
+                    .get(&raw_fallthrough_va)
+                    .copied()
+                    .unwrap_or(raw_fallthrough_va);
 
                 let taken_id = Self::resolve_target_id(
                     &va_to_trigger_id,
@@ -355,7 +380,12 @@ impl MicroSlicer {
                         }
                         target_id
                     } else {
-                        let fallthrough_va = current_inst.ip() + current_inst.len() as u64;
+                        let raw_fallthrough_va =
+                            current_inst.ip() + current_inst.len() as u64;
+                        let fallthrough_va = fallthrough_aliases
+                            .get(&raw_fallthrough_va)
+                            .copied()
+                            .unwrap_or(raw_fallthrough_va);
                         Self::resolve_target_id(
                             &va_to_trigger_id,
                             fallthrough_va,
@@ -365,9 +395,14 @@ impl MicroSlicer {
                         )
                     }
                 } else {
+                    let raw_fallthrough_va = current_inst.ip() + current_inst.len() as u64;
+                    let fallthrough_va = fallthrough_aliases
+                        .get(&raw_fallthrough_va)
+                        .copied()
+                        .unwrap_or(raw_fallthrough_va);
                     Self::resolve_target_id(
                         &va_to_trigger_id,
-                        current_inst.ip() + current_inst.len() as u64,
+                        fallthrough_va,
                         block_id,
                         text_start_va,
                         text_end_va,
@@ -397,7 +432,11 @@ impl MicroSlicer {
                     chunk.push(Instruction::with1(Code::Pushq_imm32, seed as i32)?);
                     chunk.push(Instruction::with_branch(Code::Jmp_rel32_64, dispatcher_va)?);
                 } else if !is_uncond_jmp {
-                    let fallthrough_va = current_inst.ip() + current_inst.len() as u64;
+                    let raw_fallthrough_va = current_inst.ip() + current_inst.len() as u64;
+                    let fallthrough_va = fallthrough_aliases
+                        .get(&raw_fallthrough_va)
+                        .copied()
+                        .unwrap_or(raw_fallthrough_va);
                     if Self::can_preserve_direct_fallthrough(
                         fallthrough_va,
                         text_start_va,
