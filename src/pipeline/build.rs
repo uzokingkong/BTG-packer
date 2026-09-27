@@ -518,6 +518,17 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
                     "[+] Phase-B original .text retirement: removed execute permission from {} byte(s)",
                     retired
                 );
+                let scrubbed = scrub_fully_owned_original_text(ctx, &mut relayed_sections);
+                if scrubbed != ctx.target_info.text_vsize as u64 {
+                    anyhow::bail!(
+                        "original .text retirement scrubbed {scrubbed}/{} byte(s); refusing partial plaintext retirement",
+                        ctx.target_info.text_vsize
+                    );
+                }
+                println!(
+                    "[+] Phase-B original .text retirement: replaced {} original byte(s) with seed-derived decoy data",
+                    scrubbed
+                );
             }
             println!(
                 "[+] Phase-B native island staged: RVA 0x{:X}, {} byte(s), {} function(s), {} native-call rewrite(s), {} RIP fixup(s), {} direct-edge fixup(s), {} DIR64 fixup(s)",
@@ -1007,19 +1018,50 @@ fn update_pdata_seh(
     additional_runtime_functions: &[RuntimeFunction],
     relocated_original_unwind_starts: &[u32],
 ) {
+    // The first SEH rebuild happens before native-island publication. Keep the
+    // original table intact during that staging pass because the island's
+    // unwind relocation still consumes it. Retire its rows only in the final
+    // rebuild that carries the relocated island records.
+    let retired_text_range = if !additional_runtime_functions.is_empty()
+        && std::env::var_os("BTG_RETIRE_ORIGINAL_TEXT").is_some()
+    {
+        relayed_sections
+            .iter()
+            .find(|section| section.name.eq_ignore_ascii_case(".text"))
+            .map(|section| {
+                (
+                    section.virtual_address,
+                    section.virtual_address.saturating_add(section.virtual_size),
+                )
+            })
+    } else {
+        None
+    };
     if let Some(pdata_sec) = relayed_sections.iter_mut().find(|s| s.name == ".pdata") {
         // Never publish both halves of an original -> native-island mapping:
         // besides wasting .pdata capacity, that duplicate pair directly leaks
-        // the relocation relation.  Other original unwind rows are retained
-        // for now because typed C++/Rust unwind metadata can chain through
-        // them even after the code entry itself has been retired.
+        // the relocation relation. Once retirement has passed the fail-closed
+        // reference audit and the original bytes are scrubbed, no runtime row
+        // may continue to advertise an address in the retired `.text` range.
         let retire_original_text = std::env::var_os("BTG_RETIRE_ORIGINAL_TEXT").is_some();
+        let retired_entry_count = retired_text_range.map_or(0usize, |(start, end)| {
+            original_pdata_entries
+                .iter()
+                .filter(|rf| !relocated_original_unwind_starts.contains(&rf.begin_address))
+                .filter(|rf| rf.begin_address >= start && rf.begin_address < end)
+                .count()
+        });
         let mut rf_list: Vec<RuntimeFunction> = original_pdata_entries
             .iter()
             .filter(|rf| rf.begin_address > 0 && rf.end_address > rf.begin_address)
             .filter(|rf| {
                 !retire_original_text
                     || !relocated_original_unwind_starts.contains(&rf.begin_address)
+            })
+            .filter(|rf| {
+                retired_text_range.is_none_or(|(start, end)| {
+                    rf.begin_address < start || rf.begin_address >= end
+                })
             })
             .copied()
             .collect();
@@ -1125,7 +1167,15 @@ fn update_pdata_seh(
 
         let array_len = rf_list.len() as u32 * 12;
 
-        let mut unwind_rva = pdata_sec.virtual_address + array_len;
+        // Keep generated UNWIND_INFO blobs at their pre-retirement RVA. Some
+        // already-materialized gateways carry those RVAs before this final
+        // table publication. The exception directory ends at `array_len`, so
+        // this zero gap is not exposed as phantom RUNTIME_FUNCTION records.
+        let retired_table_gap = (retired_entry_count as u32).saturating_mul(12);
+        let mut unwind_rva = pdata_sec
+            .virtual_address
+            .saturating_add(array_len)
+            .saturating_add(retired_table_gap);
         let bridge_unwind_rva = unwind_rva;
 
         for rf in rf_list.iter_mut() {
@@ -1165,6 +1215,10 @@ fn update_pdata_seh(
             pdata_bytes.extend_from_slice(&rf.end_address.to_le_bytes());
             pdata_bytes.extend_from_slice(&rf.unwind_info_address.to_le_bytes());
         }
+        pdata_bytes.resize(
+            pdata_bytes.len().saturating_add(retired_table_gap as usize),
+            0,
+        );
         pdata_bytes.extend_from_slice(&unwind_info);
         pdata_bytes.extend_from_slice(&vm_unwind);
         pdata_bytes.extend_from_slice(&native_bridge_unwind);
