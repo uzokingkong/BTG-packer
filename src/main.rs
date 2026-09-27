@@ -35,6 +35,13 @@ fn main() -> error::Result<()> {
     if args.verify_seeds > 0 {
         return btg_packer::multi_seed::run(&args).map_err(error::BtgError::Anyhow);
     }
+    if args.section_name_mode == btg_packer::cli::SectionNameMode::Seeded
+        && args.seed.is_none()
+    {
+        return Err(error::BtgError::Anyhow(anyhow::anyhow!(
+            "--section-name-mode seeded requires an explicit --seed"
+        )));
+    }
 
     // ── P1: feature resolver 리팩터링 — RequestedConfig → ResolvedConfig ─────────
     // CLI 플래그의 정책 결정(--full 확장 · vm-oep/reencrypt/mem-harden 상충 해소 ·
@@ -605,7 +612,7 @@ fn main() -> error::Result<()> {
     let output_path = args.output;
     // Build in memory first. A strict-profile artifact is not committed to its
     // final path until both structural and effective-capability checks pass.
-    let output_pe_bytes = pipeline::build::run(&ctx, None)?;
+    let mut output_pe_bytes = pipeline::build::run(&ctx, None)?;
 
     // ── v4: 섹션별 엔트로피 리포트 (탐지 도구의 엔트로피 지표 확인용) ─────────────
     btg_packer::analysis::entropy::print_entropy_report(&output_pe_bytes);
@@ -618,6 +625,23 @@ fn main() -> error::Result<()> {
         effective_profile.ensure_strict()?;
     } else if cfg.vm_commercial && !args.allow_partial_vm {
         effective_profile.ensure_vm_full_coverage()?;
+    }
+    let existing_section_names = ctx
+        .target_info
+        .relayed_sections
+        .iter()
+        .map(|section| section.name.clone())
+        .collect::<Vec<_>>();
+    if let Some(plan) = pipeline::section_names::SectionNamePlan::create(
+        args.section_name_mode,
+        args.seed,
+        existing_section_names,
+    )? {
+        let rewritten = plan.rewrite_pe_headers(&mut output_pe_bytes)?;
+        println!(
+            "[+] Section-name camouflage: rewrote {} generated section header(s) ({:?})",
+            rewritten, args.section_name_mode
+        );
     }
     std::fs::write(&output_path, &output_pe_bytes)?;
     let verification_report = if args.verify_output {

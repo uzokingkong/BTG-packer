@@ -2,8 +2,19 @@
 // BTG (Bidirectional Trigger Graph) - Security Framework
 // ==============================================================================
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum SectionNameMode {
+    /// Preserve descriptive internal section names (legacy/default behavior).
+    #[default]
+    Semantic,
+    /// Derive reproducible camouflage names from --seed.
+    Seeded,
+    /// Generate fresh camouflage names from OS entropy for every build.
+    Random,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -51,6 +62,11 @@ pub struct CliArgs {
     /// Same input + seed + config produces reproducible, identical output.
     #[arg(long)]
     pub seed: Option<u64>,
+
+    /// Generated-section naming policy: semantic (legacy names), seeded
+    /// (reproducible camouflage; requires --seed), or random (fresh per build).
+    #[arg(long, value_enum, default_value_t = SectionNameMode::Semantic)]
+    pub section_name_mode: SectionNameMode,
 
     /// Obfuscation intensity level (1: Basic, 2: MBA, 3: Overlapping + MBA)
     #[arg(short = 'l', long, default_value_t = 3)]

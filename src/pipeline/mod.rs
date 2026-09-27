@@ -20,6 +20,7 @@ pub mod poly_embed;
 pub mod rdata_strip;
 pub mod reports;
 pub mod rsrc_register;
+pub mod section_names;
 pub mod selective_vm;
 pub mod validate;
 
