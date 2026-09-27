@@ -798,7 +798,7 @@ impl SemanticObfuscator {
             // input→output boundary map. Leave the branch displacement as-is
             // (best-effort) rather than panicking the whole encode.
             let Some(&target_out) = boundaries.get(&target_in) else {
-                eprintln!("[semobf] branch fixup: target 0x{:x} not a boundary (n=0x{:x} width={}) — leaving un-remapped", target_in, n, width);
+                crate::progress_safe_eprintln!("[semobf] branch fixup: target 0x{:x} not a boundary (n=0x{:x} width={}) — leaving un-remapped", target_in, n, width);
                 continue;
             };
             let rel = target_out as i64 - inst_end as i64;
