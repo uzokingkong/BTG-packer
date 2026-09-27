@@ -17,7 +17,6 @@ use rand::{RngCore, SeedableRng};
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::time::{Duration, Instant};
 
 /// Bug-7 fix: env_logger leaks its Pipe writer (log::set_boxed_logger does a
 /// Box::leak), so the log file is never flushed/closed by Drop. Hold a cloned
@@ -30,69 +29,18 @@ impl Drop for LogFlushGuard {
     }
 }
 
-fn format_progress_duration(duration: Duration) -> String {
-    let total = duration.as_secs();
-    let hours = total / 3600;
-    let minutes = (total % 3600) / 60;
-    let seconds = total % 60;
-    if hours > 0 {
-        format!("{hours}h {minutes:02}m {seconds:02}s")
-    } else if minutes > 0 {
-        format!("{minutes}m {seconds:02}s")
-    } else {
-        format!("{seconds}s")
-    }
-}
-
-/// Lightweight stage-based CLI progress reporter.
-///
-/// The percentage is intentionally tied to completed pipeline milestones instead
-/// of a timer, so it never advances while work is actually stalled. ETA is a
-/// rolling estimate derived from elapsed time and the weighted milestone
-/// percentage; it becomes useful after the first few stages have completed.
-struct PackProgress {
-    started: Instant,
-    last_percent: u8,
-    enabled: bool,
-}
+struct PackProgress;
 
 impl PackProgress {
-    fn new(enabled: bool) -> Self {
-        Self {
-            started: Instant::now(),
-            last_percent: 0,
-            enabled,
-        }
+    fn new(enabled: bool, refresh_ms: u64) -> Self {
+        btg_packer::progress::configure(enabled, refresh_ms);
+        Self
     }
 
     fn report(&mut self, percent: u8, stage: &str) {
-        if !self.enabled {
-            return;
-        }
-
-        let percent = percent.min(100).max(self.last_percent);
-        self.last_percent = percent;
-        let elapsed = self.started.elapsed();
-
-        let suffix = if percent >= 100 {
-            format!("done in {}", format_progress_duration(elapsed))
-        } else if percent >= 8 && elapsed.as_secs_f64() >= 1.0 {
-            let elapsed_s = elapsed.as_secs_f64();
-            let eta_s = elapsed_s * (100.0 - f64::from(percent)) / f64::from(percent);
-            format!(
-                "elapsed {} | ETA ~{}",
-                format_progress_duration(elapsed),
-                format_progress_duration(Duration::from_secs_f64(eta_s.max(0.0)))
-            )
-        } else {
-            format!("elapsed {}", format_progress_duration(elapsed))
-        };
-
-        println!("[PROGRESS {:>3}%] {} | {}", percent, stage, suffix);
-        let _ = std::io::stdout().flush();
+        btg_packer::progress::checkpoint(u32::from(percent) * 100, stage);
     }
 }
-
 fn main() -> error::Result<()> {
     let args = CliArgs::parse();
 
@@ -465,7 +413,7 @@ fn main() -> error::Result<()> {
         );
     }
 
-    let mut progress = PackProgress::new(!args.no_progress);
+    let mut progress = PackProgress::new(!args.no_progress, args.progress_refresh_ms);
     progress.report(1, "Starting pack pipeline");
 
     // ── 입력 PE 로드 ──────────────────────────────────────────────────────────────
@@ -600,16 +548,19 @@ fn main() -> error::Result<()> {
 
     // ── Pass 1: CFG 추출 + MicroSlicer ────────────────────────────────────────────
     progress.report(16, "Pass 1/4: CFG extraction + micro-slicing");
+    btg_packer::progress::begin_phase(1600, 1400, "Pass 1/4: CFG extraction + micro-slicing");
     pipeline::pass1_slice::run(&mut ctx)?;
     progress.report(30, "Pass 1/4 complete");
 
     // ── Pass 2: Layout Shuffling ──────────────────────────────────────────────────
     progress.report(31, "Pass 2/4: layout shuffling");
+    btg_packer::progress::begin_phase(3100, 900, "Pass 2/4: physical layout shuffling");
     pipeline::pass2_shuffle::run(&mut ctx)?;
     progress.report(40, "Pass 2/4 complete");
 
     // ── Pass 3: RIP Fixup + BlockEncoder ─────────────────────────────────────────
     progress.report(41, "Pass 3/4: RIP fixups + block encoding");
+    btg_packer::progress::begin_phase(4100, 700, "Pass 3/4: RIP fixups + dense block encoding");
     pipeline::pass3_encode::run(&mut ctx)?;
     progress.report(48, "Pass 3/4 complete");
 
@@ -620,6 +571,7 @@ fn main() -> error::Result<()> {
     let needs_boot_stub = cfg.needs_boot_stub;
     // readccc §4.5: graceful failure 정책을 부트 스텁/디스패처에 전달.
     progress.report(49, "Pass 4/4: assembling protected sections");
+    btg_packer::progress::begin_phase(4900, 600, "Pass 4/4: protected section assembly");
     pipeline::pass4_section::run(
         &mut ctx,
         anti_debug_enabled,
@@ -632,6 +584,7 @@ fn main() -> error::Result<()> {
     // ── Patch: 섹션 재배치 + CFG 픽스업 ──────────────────────────────────────────
     progress.report(56, "Applying section relocation + CFG fixups");
     let relayed_sections = ctx.target_info.relayed_sections.clone();
+    btg_packer::progress::begin_phase(5600, 500, "Relocation + CFG/data fixups");
     pipeline::patch_data::run(&mut ctx, relayed_sections)?;
     progress.report(61, "Relocation + fixups complete");
 
@@ -668,6 +621,7 @@ fn main() -> error::Result<()> {
     // 빌림으로 읽기 전에 값만 캡처한다 (crypto::run이 &mut ctx를 받으므로).
     let reencrypt_effective = ctx.reencrypt;
     progress.report(66, "Applying crypto / Program-VM protection");
+    btg_packer::progress::begin_phase(6600, 1800, "Crypto + Program-VM protection");
     pipeline::crypto::run(
         &mut ctx,
         crypto_enabled,
@@ -694,6 +648,7 @@ fn main() -> error::Result<()> {
     // (마커가 없으면 no-op — 출력은 기존과 동일.)
     if vm_enabled {
         progress.report(85, "Embedding polymorphic VM runtime");
+        btg_packer::progress::begin_phase(8500, 200, "Embedding selective/polymorphic VM runtime");
         let _ = pipeline::poly_embed::embed_poly_vm_into_pipeline(&mut ctx)?;
     }
     progress.report(87, "Runtime/resource embedding complete");
@@ -703,6 +658,7 @@ fn main() -> error::Result<()> {
     // Build in memory first. A strict-profile artifact is not committed to its
     // final path until both structural and effective-capability checks pass.
     progress.report(88, "Building final PE image");
+    btg_packer::progress::begin_phase(8800, 300, "Building final PE image");
     let mut output_pe_bytes = pipeline::build::run(&ctx, None)?;
     progress.report(91, "Final PE image built");
 
@@ -711,6 +667,7 @@ fn main() -> error::Result<()> {
 
     // ── v5: 자체검증 — 출력 PE를 다시 파싱해 구조적 불변식 검증 ──────────────────
     progress.report(92, "Validating protected PE invariants");
+    btg_packer::progress::begin_phase(9200, 300, "Validating protected PE invariants");
     pipeline::validate::run(&ctx, &output_pe_bytes)?;
     let effective_profile =
         pipeline::validate::validate_effective_profile(&ctx, cfg, &output_pe_bytes)?;
@@ -1054,6 +1011,6 @@ fn main() -> error::Result<()> {
         )?;
     }
 
-    progress.report(100, "Pack complete");
+    btg_packer::progress::complete("Pack complete");
     Ok(())
 }
