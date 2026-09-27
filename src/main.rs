@@ -25,7 +25,6 @@ use std::time::{Duration, Instant};
 struct LogFlushGuard(std::fs::File);
 impl Drop for LogFlushGuard {
     fn drop(&mut self) {
-        use std::io::Write;
         let _ = self.0.flush();
         let _ = self.0.sync_all();
     }
@@ -190,7 +189,6 @@ fn main() -> error::Result<()> {
     if args.vm_test {
         // flush stdout so the buffered PASS/FAIL lines survive process exit, and
         // surface the outcome on stderr (unbuffered) for remote/non-tty runs.
-        use std::io::Write;
         let r = vm::run_self_test();
         // Flush so all buffered PASS/FAIL lines are visible even when stdout is a
         // redirected file/pipe (Rust line-buffers stdout only on a TTY).
