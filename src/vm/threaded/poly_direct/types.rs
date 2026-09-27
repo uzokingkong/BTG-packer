@@ -4,7 +4,14 @@ use std::collections::BTreeSet;
 
 /// Hard ceiling keeps generated route scans and code size bounded even when
 /// upstream analysis is malformed or attacker-controlled.
-pub const MAX_NATIVE_CROSS_FAMILY_ROUTES: usize = 4096;
+///
+/// This is intentionally aligned with the canonical commercial-route materializer.
+/// 4096 was an early code-size guard, not an ABI/index-width limit; large legitimate
+/// programs can exceed it after exact ownership recovery. Wildcard per-function
+/// expansion is filtered before this boundary, so reaching this ceiling now means
+/// the canonical/direct route inventory itself is exceptionally large.
+pub const MAX_NATIVE_CROSS_FAMILY_ROUTES: usize = 65_536;
+pub const ROUTE_COUNT_DIAGNOSTIC_THRESHOLD: usize = 4_096;
 /// Per-state nested cross-family depth. Lifetime sync owns 0x50A0/0x50A8.
 pub const STATE_CROSS_FAMILY_DEPTH: i64 = 0x50B0;
 /// Per-transition child-state key. It is never copied from the parent rolling
@@ -54,6 +61,14 @@ pub(crate) fn validate_native_cross_family_routes(routes: &[NativeCrossFamilyRou
             routes.len(),
             MAX_NATIVE_CROSS_FAMILY_ROUTES
         ));
+    }
+    if routes.len() > ROUTE_COUNT_DIAGNOSTIC_THRESHOLD {
+        crate::progress_safe_eprintln!(
+            "[VM-ROUTES] large canonical route inventory: {} route(s) (diagnostic threshold {}, hard ceiling {})",
+            routes.len(),
+            ROUTE_COUNT_DIAGNOSTIC_THRESHOLD,
+            MAX_NATIVE_CROSS_FAMILY_ROUTES
+        );
     }
     let mut runtime_keys = BTreeSet::new();
     for (index, route) in routes.iter().enumerate() {
@@ -282,6 +297,25 @@ mod route_validation_tests {
         let mut second = route(0x1000);
         second.source_next_byte_offset = Some(0x80);
         validate_native_cross_family_routes(&[first, second]).unwrap();
+    }
+
+    #[test]
+    fn route_count_above_legacy_4096_limit_is_allowed() {
+        let routes: Vec<_> = (0..4_097u64)
+            .map(|index| route(0x10_0000 + index))
+            .collect();
+        validate_native_cross_family_routes(&routes).unwrap();
+    }
+
+    #[test]
+    fn hard_route_ceiling_is_still_enforced() {
+        let routes: Vec<_> = (0..=MAX_NATIVE_CROSS_FAMILY_ROUTES)
+            .map(|index| route(0x20_0000 + index as u64))
+            .collect();
+        assert!(validate_native_cross_family_routes(&routes)
+            .unwrap_err()
+            .to_string()
+            .contains("route limit exceeded"));
     }
 
     #[test]
