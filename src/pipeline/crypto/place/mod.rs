@@ -2804,13 +2804,41 @@ pub(crate) fn place_boot_stub(
         );
     }
 
-    // Materialize the page-aligned Program-VM state tail as a separate RW/NX
-    // PE section while preserving every generated absolute VA. Multi-family
-    // state is initialized by the canonical gateway, so its section is pure
-    // loader zero-fill (VirtualSize with no raw file payload). This removes the
-    // lane state/host-stack reservation from disk without an address-indirection
-    // penalty in every VM handler.
-    if (vm_multi_family_active || ctx.mem_harden) && vm_prog_state_va > dispatcher_va {
+    // Publish mutable Program-VM state as a separate RW/NX PE section.
+    // Multi-family state is sparse loader zero-fill and is never part of the
+    // temporary .textb backing. The single-family mem-harden path keeps its
+    // historical physical split because that state can contain file-backed
+    // initialization.
+    if vm_multi_family_active && vm_prog_state_va > dispatcher_va {
+        let state_off = (vm_prog_state_va - dispatcher_va) as usize;
+        if state_off == 0 || state_off & 0xFFF != 0 {
+            anyhow::bail!(
+                "invalid sparse Program-VM state offset: 0x{:X}",
+                state_off
+            );
+        }
+        if vm_prog_state_reservation_end <= state_off {
+            anyhow::bail!(
+                "invalid sparse Program-VM state extent: [0x{:X},0x{:X})",
+                state_off,
+                vm_prog_state_reservation_end
+            );
+        }
+        let state_rva = u32::try_from(
+            u64::from(ctx.dispatcher_rva) + state_off as u64,
+        )
+        .map_err(|_| anyhow::anyhow!("sparse Program-VM state RVA exceeds PE32+ u32 RVA space"))?;
+        let state_size = u32::try_from(vm_prog_state_reserve)
+            .map_err(|_| anyhow::anyhow!("sparse Program-VM state VirtualSize exceeds u32"))?;
+        ctx.mutable_state_section_data = Some(crate::pe::builder::SectionData {
+            name: ".vstate".to_string(),
+            virtual_address: state_rva,
+            virtual_size: state_size,
+            characteristics: 0xC000_0080, // UNINITIALIZED_DATA | READ | WRITE
+            bytes: Vec::new(),
+        });
+        ctx.mutable_state_metadata_section_data = None;
+    } else if ctx.mem_harden && vm_prog_state_va > dispatcher_va {
         let split_off = (vm_prog_state_va - dispatcher_va) as usize;
         if split_off == 0 || split_off >= btg.bytes.len() || split_off & 0xFFF != 0 {
             anyhow::bail!(
@@ -2835,16 +2863,8 @@ pub(crate) fn place_boot_stub(
             name: ".vstate".to_string(),
             virtual_address: ctx.dispatcher_rva + split_off as u32,
             virtual_size: state_bytes.len() as u32,
-            characteristics: if vm_multi_family_active {
-                0xC000_0080 // UNINITIALIZED_DATA | READ | WRITE
-            } else {
-                0xC000_0040 // INITIALIZED_DATA | READ | WRITE
-            },
-            bytes: if vm_multi_family_active {
-                Vec::new()
-            } else {
-                state_bytes
-            },
+            characteristics: 0xC000_0040, // INITIALIZED_DATA | READ | WRITE
+            bytes: state_bytes,
         });
         ctx.mutable_state_metadata_section_data = if metadata_bytes.is_empty() {
             None
