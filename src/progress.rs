@@ -476,3 +476,29 @@ fn format_duration(duration: Duration) -> String {
         format!("{minutes:02}:{seconds:02}")
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::{render_ascii_bar, render_unicode_bar};
+
+    #[test]
+    fn unicode_bar_has_fixed_cell_width_and_partial_resolution() {
+        let bar = render_unicode_bar(0.3827, 32);
+        assert_eq!(bar.chars().count(), 32);
+        assert!(bar.contains('█'));
+        assert!(bar.chars().any(|ch| matches!(ch, '▏' | '▎' | '▍' | '▌' | '▋' | '▊' | '▉')));
+        assert!(bar.contains('░'));
+    }
+
+    #[test]
+    fn unicode_bar_handles_empty_and_complete() {
+        assert_eq!(render_unicode_bar(0.0, 8), "░░░░░░░░");
+        assert_eq!(render_unicode_bar(1.0, 8), "████████");
+    }
+
+    #[test]
+    fn redirected_bar_keeps_ascii_fallback() {
+        assert_eq!(render_ascii_bar(0.5, 8), "====----");
+    }
+}
