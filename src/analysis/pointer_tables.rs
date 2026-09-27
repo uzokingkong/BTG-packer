@@ -17,6 +17,32 @@ use super::indirect_targets::{ResolutionStatus, TargetProvenance};
 use super::program_model::{CodePointerEncoding, ProgramModel, RvaRange};
 use crate::pe::builder::SectionData;
 
+type PredecessorIndex = BTreeMap<super::program_model::BlockId, Vec<super::program_model::BlockId>>;
+
+fn build_predecessor_index(program: &ProgramModel) -> PredecessorIndex {
+    use super::program_model::EdgeTarget;
+    let mut index = PredecessorIndex::new();
+    for edge in &program.edges {
+        let EdgeTarget::Block(target) = edge.target else {
+            continue;
+        };
+        let Some(source) = program.blocks.get(&edge.source) else {
+            continue;
+        };
+        let Some(destination) = program.blocks.get(&target) else {
+            continue;
+        };
+        if source.function_id == destination.function_id {
+            index.entry(target).or_default().push(edge.source);
+        }
+    }
+    for predecessors in index.values_mut() {
+        predecessors.sort_unstable();
+        predecessors.dedup();
+    }
+    index
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProvenPointerTable {
     pub table: RvaRange,
@@ -41,12 +67,15 @@ pub fn produce(
         .collect();
     let mut out = Vec::new();
 
-    for site in program
+    let sites = program
         .indirect_targets
         .sites
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
-    {
+        .collect::<Vec<_>>();
+    crate::progress::begin_detail_task("ProgramModel: analyzing direct pointer-table sites", sites.len() as u64, "sites");
+    for (ordinal, site) in sites.into_iter().enumerate() {
+        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
         let Some(block) = program.blocks.get(&site.source_block) else {
             continue;
         };
@@ -126,6 +155,7 @@ pub fn produce(
         });
     }
     out.sort_by_key(|resolution| resolution.site);
+    crate::progress::finish_task(format!("ProgramModel direct pointer-table analysis complete: {} candidate(s)", out.len()));
     out
 }
 
@@ -137,16 +167,20 @@ pub fn produce_iat_slots(
     image_base: u64,
     iat: RvaRange,
 ) -> Vec<(crate::analysis::indirect_targets::IndirectSiteId, u64)> {
+    let predecessors = build_predecessor_index(program);
     let mut out = Vec::new();
     if iat.start >= iat.end {
         return out;
     }
-    for site in program
+    let sites = program
         .indirect_targets
         .sites
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
-    {
+        .collect::<Vec<_>>();
+    crate::progress::begin_detail_task("ProgramModel: analyzing IAT sites", sites.len() as u64, "sites");
+    for (ordinal, site) in sites.into_iter().enumerate() {
+        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
         let Some(block) = program.blocks.get(&site.source_block) else {
             continue;
         };
@@ -181,7 +215,13 @@ pub fn produce_iat_slots(
             )
             .map(|definition| vec![definition])
             .or_else(|| {
-                find_reaching_register_definitions(program, site.source_block, site_index, register)
+                find_reaching_register_definitions(
+                    program,
+                    &predecessors,
+                    site.source_block,
+                    site_index,
+                    register,
+                )
             })
             .or_else(|| {
                 find_unique_nonvolatile_definition(
@@ -225,6 +265,7 @@ pub fn produce_iat_slots(
         out.push((site.id, image_base + u64::from(slots[0])));
     }
     out.sort_by_key(|(site, _)| *site);
+    crate::progress::finish_task(format!("ProgramModel IAT analysis complete: {} candidate(s)", out.len()));
     out
 }
 
@@ -298,6 +339,7 @@ pub fn produce_dynamic_import_resolutions(
     get_proc_address_slots: &BTreeSet<u32>,
     sections: &[SectionData],
 ) -> Vec<(crate::analysis::indirect_targets::IndirectSiteId, u64)> {
+    let predecessors = build_predecessor_index(program);
     let dynamic_slots =
         discover_dynamic_import_slots(program, image_base, get_proc_address_slots, sections);
     if dynamic_slots.is_empty() {
@@ -305,12 +347,15 @@ pub fn produce_dynamic_import_resolutions(
     }
     let identity = image_base + u64::from(*get_proc_address_slots.iter().next().unwrap());
     let mut out = Vec::new();
-    for site in program
+    let sites = program
         .indirect_targets
         .sites
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
-    {
+        .collect::<Vec<_>>();
+    crate::progress::begin_detail_task("ProgramModel: analyzing dynamic-import sites", sites.len() as u64, "sites");
+    for (ordinal, site) in sites.into_iter().enumerate() {
+        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
         let Some(block) = program.blocks.get(&site.source_block) else {
             continue;
         };
@@ -330,6 +375,7 @@ pub fn produce_dynamic_import_resolutions(
         let mut visiting = BTreeSet::new();
         let proven = prove_dynamic_external_register(
             program,
+            &predecessors,
             site.source_block,
             index,
             transfer.op0_register().full_register(),
@@ -343,6 +389,7 @@ pub fn produce_dynamic_import_resolutions(
         }
     }
     out.sort_by_key(|(site, _)| *site);
+    crate::progress::finish_task(format!("ProgramModel dynamic-import analysis complete: {} candidate(s)", out.len()));
     out
 }
 
@@ -353,13 +400,23 @@ fn discover_dynamic_import_slots(
     sections: &[SectionData],
 ) -> BTreeSet<u32> {
     let mut candidates = BTreeMap::<u32, BTreeSet<u64>>::new();
-    for function in program.functions.keys() {
-        let mut instructions = program
-            .blocks
-            .values()
-            .filter(|block| block.function_id == *function)
-            .flat_map(|block| block.instructions.iter())
-            .collect::<Vec<_>>();
+    let mut instructions_by_function: BTreeMap<
+        super::program_model::FunctionId,
+        Vec<&Instruction>,
+    > = BTreeMap::new();
+    for block in program.blocks.values() {
+        instructions_by_function
+            .entry(block.function_id)
+            .or_insert_with(Vec::new)
+            .extend(block.instructions.iter());
+    }
+    crate::progress::begin_detail_task(
+        "ProgramModel: indexing dynamic-import stores",
+        instructions_by_function.len() as u64,
+        "functions",
+    );
+    for (ordinal, instructions) in instructions_by_function.values_mut().enumerate() {
+        if ordinal & 0xff == 0 { crate::progress::set_position(ordinal as u64); }
         instructions.sort_by_key(|instruction| instruction.ip());
         instructions.dedup_by_key(|instruction| instruction.ip());
         for (index, call) in instructions.iter().enumerate() {
@@ -399,6 +456,8 @@ fn discover_dynamic_import_slots(
             }
         }
     }
+    crate::progress::set_position(instructions_by_function.len() as u64);
+    crate::progress::finish_task("ProgramModel dynamic-import store index complete");
     candidates.retain(|slot, proven_stores| {
         read_u64(sections, *slot) == Some(0)
             && program
@@ -421,9 +480,21 @@ fn discover_dynamic_import_slots(
     candidates.into_keys().collect()
 }
 
+fn nonzero_or_unknown_direct_store_slots(
+    program: &ProgramModel,
+    image_base: u64,
+) -> BTreeSet<u32> {
+    program.blocks.values().flat_map(|block| &block.instructions)
+        .filter(|instruction| instruction.op0_kind() == OpKind::Memory)
+        .filter(|instruction| unsigned_immediate(instruction, 1) != Some(0))
+        .filter_map(|instruction| memory_operand_rva(instruction, image_base))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_dynamic_external_register(
     program: &ProgramModel,
+    predecessors: &PredecessorIndex,
     block_id: super::program_model::BlockId,
     before: usize,
     register: Register,
@@ -457,6 +528,7 @@ fn prove_dynamic_external_register(
             {
                 prove_dynamic_external_register(
                     program,
+                    predecessors,
                     block_id,
                     index,
                     instruction.op1_register().full_register(),
@@ -494,31 +566,19 @@ fn prove_dynamic_external_register(
             return false;
         }
     }
-    let function = block.function_id;
-    let predecessors = program
-        .edges
-        .iter()
-        .filter_map(|edge| match edge.target {
-            EdgeTarget::Block(target)
-                if target == block_id
-                    && program
-                        .blocks
-                        .get(&edge.source)
-                        .is_some_and(|source| source.function_id == function) =>
-            {
-                Some(edge.source)
-            }
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    let result = !predecessors.is_empty()
-        && predecessors.into_iter().all(|predecessor| {
+    let incoming = predecessors
+        .get(&block_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let result = !incoming.is_empty()
+        && incoming.iter().copied().all(|predecessor| {
             let len = program
                 .blocks
                 .get(&predecessor)
                 .map_or(0, |owner| owner.instructions.len());
             prove_dynamic_external_register(
                 program,
+                predecessors,
                 predecessor,
                 len,
                 register,
@@ -538,6 +598,7 @@ fn prove_dynamic_external_register(
 /// after the caller validates every one against the same typed domain (IAT).
 fn find_reaching_register_definitions<'a>(
     program: &'a ProgramModel,
+    predecessors: &PredecessorIndex,
     start_block: super::program_model::BlockId,
     start_index: usize,
     register: Register,
@@ -582,26 +643,14 @@ fn find_reaching_register_definitions<'a>(
             definitions.insert(definition.ip(), definition);
             continue;
         }
-        let predecessors = program
-            .edges
-            .iter()
-            .filter_map(|edge| match edge.target {
-                EdgeTarget::Block(target)
-                    if target == block_id
-                        && program
-                            .blocks
-                            .get(&edge.source)
-                            .is_some_and(|source| source.function_id == function) =>
-                {
-                    Some(edge.source)
-                }
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        if predecessors.is_empty() {
+        let incoming = predecessors
+            .get(&block_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if incoming.is_empty() {
             return None;
         }
-        pending.extend(predecessors.into_iter().map(|predecessor| {
+        pending.extend(incoming.iter().copied().map(|predecessor| {
             let len = program
                 .blocks
                 .get(&predecessor)
@@ -678,13 +727,17 @@ pub fn produce_local_value_flow(
         .values()
         .map(|pointer| (pointer.location.start, pointer))
         .collect();
+    let predecessors = build_predecessor_index(program);
     let mut out = Vec::new();
-    for site in program
+    let sites = program
         .indirect_targets
         .sites
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
-    {
+        .collect::<Vec<_>>();
+    crate::progress::begin_detail_task("ProgramModel: analyzing local value-flow sites", sites.len() as u64, "sites");
+    for (ordinal, site) in sites.into_iter().enumerate() {
+        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
         let Some(block) = program.blocks.get(&site.source_block) else {
             continue;
         };
@@ -712,9 +765,13 @@ pub fn produce_local_value_flow(
             flow.memory_address_before(site_index, call, image_base)
         } else if call.op0_kind() == OpKind::Register {
             let target = call.op0_register().full_register();
-            let Some((definition_block, definition_index)) =
-                find_unique_register_definition(program, site.source_block, site_index, target)
-            else {
+            let Some((definition_block, definition_index)) = find_unique_register_definition(
+                program,
+                &predecessors,
+                site.source_block,
+                site_index,
+                target,
+            ) else {
                 continue;
             };
             let Some(definition_owner) = program.blocks.get(&definition_block) else {
@@ -1044,6 +1101,7 @@ pub fn produce_abi_argument_resolutions(
     use super::program_model::{EdgeKind, EdgeTarget, FunctionId, FunctionProvenance};
 
     const ABI_ARGS: [Register; 4] = [Register::RCX, Register::RDX, Register::R8, Register::R9];
+    let predecessors = build_predecessor_index(program);
     let address_taken = program
         .code_pointers
         .values()
@@ -1125,6 +1183,7 @@ pub fn produce_abi_argument_resolutions(
         }
         let Some(origin) = trace_register_copy_origin(
             program,
+            &predecessors,
             site.source_block,
             site_index,
             call.op0_register().full_register(),
@@ -1157,12 +1216,16 @@ pub fn produce_optional_runtime_callbacks(
     sections: &[SectionData],
 ) -> Vec<MixedRuntimeDispatch> {
     let mut out = Vec::new();
-    for site in program
+    let disqualified_slots = nonzero_or_unknown_direct_store_slots(program, image_base);
+    let sites = program
         .indirect_targets
         .sites
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
-    {
+        .collect::<Vec<_>>();
+    crate::progress::begin_detail_task("ProgramModel: analyzing optional runtime callbacks", sites.len() as u64, "sites");
+    for (ordinal, site) in sites.into_iter().enumerate() {
+        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
         let Some(block) = program.blocks.get(&site.source_block) else {
             continue;
         };
@@ -1239,16 +1302,7 @@ pub fn produce_optional_runtime_callbacks(
         if read_u64(sections, slot_rva) != Some(0) {
             continue;
         }
-        let writes_are_external_or_zero = program
-            .blocks
-            .values()
-            .flat_map(|owner| owner.instructions.iter())
-            .all(|instruction| {
-                memory_operand_rva(instruction, image_base) != Some(slot_rva)
-                    || instruction.op0_kind() != OpKind::Memory
-                    || unsigned_immediate(instruction, 1) == Some(0)
-            });
-        if !writes_are_external_or_zero {
+        if disqualified_slots.contains(&slot_rva) {
             continue;
         }
         out.push((
@@ -1262,6 +1316,7 @@ pub fn produce_optional_runtime_callbacks(
         ));
     }
     out.sort_by_key(|(resolution, _)| resolution.site);
+    crate::progress::finish_task(format!("ProgramModel optional runtime callback analysis complete: {} candidate(s)", out.len()));
     out
 }
 
@@ -1274,13 +1329,18 @@ pub fn produce_runtime_global_callbacks(
     image_base: u64,
     sections: &[SectionData],
 ) -> Vec<(crate::analysis::indirect_targets::IndirectSiteId, u64)> {
+    let predecessors = build_predecessor_index(program);
+    let disqualified_slots = nonzero_or_unknown_direct_store_slots(program, image_base);
     let mut out = Vec::new();
-    for site in program
+    let sites = program
         .indirect_targets
         .sites
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
-    {
+        .collect::<Vec<_>>();
+    crate::progress::begin_detail_task("ProgramModel: analyzing runtime global callbacks", sites.len() as u64, "sites");
+    for (ordinal, site) in sites.into_iter().enumerate() {
+        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
         let Some(block) = program.blocks.get(&site.source_block) else {
             continue;
         };
@@ -1298,9 +1358,13 @@ pub fn produce_runtime_global_callbacks(
             continue;
         }
         let target = transfer.op0_register().full_register();
-        let Some((definition_block, definition_index)) =
-            find_unique_register_definition(program, site.source_block, site_index, target)
-        else {
+        let Some((definition_block, definition_index)) = find_unique_register_definition(
+            program,
+            &predecessors,
+            site.source_block,
+            site_index,
+            target,
+        ) else {
             continue;
         };
         let Some(owner) = program.blocks.get(&definition_block) else {
@@ -1319,20 +1383,12 @@ pub fn produce_runtime_global_callbacks(
         if read_u64(sections, slot_rva) != Some(0) {
             continue;
         }
-        let no_internal_store = program
-            .blocks
-            .values()
-            .flat_map(|candidate| candidate.instructions.iter())
-            .all(|instruction| {
-                instruction.op0_kind() != OpKind::Memory
-                    || memory_operand_rva(instruction, image_base) != Some(slot_rva)
-                    || unsigned_immediate(instruction, 1) == Some(0)
-            });
-        if no_internal_store {
+        if !disqualified_slots.contains(&slot_rva) {
             out.push((site.id, image_base + u64::from(slot_rva)));
         }
     }
     out.sort_by_key(|(site, _)| *site);
+    crate::progress::finish_task(format!("ProgramModel runtime global callback analysis complete: {} candidate(s)", out.len()));
     out
 }
 
@@ -1343,13 +1399,25 @@ pub fn produce_runtime_stack_callback_dispatches(
     program: &ProgramModel,
     image_base: u64,
 ) -> Vec<(crate::analysis::indirect_targets::IndirectSiteId, u64)> {
+    let predecessors = build_predecessor_index(program);
+    let mut instructions_by_function = BTreeMap::new();
+    for block in program.blocks.values() {
+        instructions_by_function.entry(block.function_id).or_insert_with(Vec::new)
+            .extend(block.instructions.iter().map(|instruction| (block.id, instruction)));
+    }
+    for instructions in instructions_by_function.values_mut() {
+        instructions.sort_by_key(|(_, instruction)| instruction.ip());
+    }
     let mut out = Vec::new();
-    for site in program
+    let sites = program
         .indirect_targets
         .sites
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
-    {
+        .collect::<Vec<_>>();
+    crate::progress::begin_detail_task("ProgramModel: analyzing runtime stack callbacks", sites.len() as u64, "sites");
+    for (ordinal, site) in sites.into_iter().enumerate() {
+        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
         let Some(block) = program.blocks.get(&site.source_block) else {
             continue;
         };
@@ -1368,21 +1436,11 @@ pub fn produce_runtime_stack_callback_dispatches(
         {
             continue;
         }
-        let mut candidates = program
-            .blocks
-            .values()
-            .filter(|candidate| candidate.function_id == site.source_function)
-            .flat_map(|candidate| {
-                candidate
-                    .instructions
-                    .iter()
-                    .map(move |instruction| (candidate.id, instruction))
-            })
-            .filter(|(_, instruction)| instruction.ip() < call.ip())
-            .collect::<Vec<_>>();
-        candidates.sort_by_key(|(_, instruction)| instruction.ip());
+        let Some(candidates) = instructions_by_function.get(&site.source_function) else { continue; };
         let displacement = call.memory_displacement64();
-        let Some((store_block, store)) = candidates.into_iter().rev().find(|(_, instruction)| {
+        let Some(&(store_block, store)) = candidates.iter().rev().find(|(_, instruction)| {
+            instruction.ip() < call.ip()
+                &&
             instruction.mnemonic() == Mnemonic::Mov
                 && instruction.op0_kind() == OpKind::Memory
                 && instruction.memory_base().full_register() == Register::RBP
@@ -1404,6 +1462,7 @@ pub fn produce_runtime_stack_callback_dispatches(
         };
         if trace_register_copy_origin(
             program,
+            &predecessors,
             store_block,
             store_index,
             store.op1_register().full_register(),
@@ -1415,6 +1474,7 @@ pub fn produce_runtime_stack_callback_dispatches(
         out.push((site.id, image_base + u64::from(site.instruction_rva)));
     }
     out.sort_by_key(|(site, _)| *site);
+    crate::progress::finish_task(format!("ProgramModel runtime stack callback analysis complete: {} candidate(s)", out.len()));
     out
 }
 
@@ -1426,13 +1486,17 @@ pub fn produce_runtime_abi_dispatches(
     program: &ProgramModel,
     image_base: u64,
 ) -> Vec<(crate::analysis::indirect_targets::IndirectSiteId, u64)> {
+    let predecessors = build_predecessor_index(program);
     let mut out = Vec::new();
-    for site in program
+    let sites = program
         .indirect_targets
         .sites
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
-    {
+        .collect::<Vec<_>>();
+    crate::progress::begin_detail_task("ProgramModel: analyzing runtime ABI dispatches", sites.len() as u64, "sites");
+    for (ordinal, site) in sites.into_iter().enumerate() {
+        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
         let Some(block) = program.blocks.get(&site.source_block) else {
             continue;
         };
@@ -1449,31 +1513,38 @@ pub fn produce_runtime_abi_dispatches(
         let origin = match transfer.op0_kind() {
             OpKind::Register => {
                 let target = transfer.op0_register().full_register();
-                trace_register_copy_origin(program, site.source_block, site_index, target).or_else(
-                    || {
-                        let (definition_block, definition_index) = find_unique_register_definition(
-                            program,
-                            site.source_block,
-                            site_index,
-                            target,
-                        )?;
-                        let owner = program.blocks.get(&definition_block)?;
-                        let definition = &owner.instructions[definition_index];
-                        (definition.mnemonic() == Mnemonic::Mov
-                            && definition.op1_kind() == OpKind::Memory
-                            && definition.memory_base() != Register::RIP
-                            && definition.memory_base() != Register::RSP)
-                            .then(|| {
-                                trace_register_copy_origin(
-                                    program,
-                                    definition_block,
-                                    definition_index,
-                                    definition.memory_base().full_register(),
-                                )
-                            })
-                            .flatten()
-                    },
+                trace_register_copy_origin(
+                    program,
+                    &predecessors,
+                    site.source_block,
+                    site_index,
+                    target,
                 )
+                .or_else(|| {
+                    let (definition_block, definition_index) = find_unique_register_definition(
+                        program,
+                        &predecessors,
+                        site.source_block,
+                        site_index,
+                        target,
+                    )?;
+                    let owner = program.blocks.get(&definition_block)?;
+                    let definition = &owner.instructions[definition_index];
+                    (definition.mnemonic() == Mnemonic::Mov
+                        && definition.op1_kind() == OpKind::Memory
+                        && definition.memory_base() != Register::RIP
+                        && definition.memory_base() != Register::RSP)
+                        .then(|| {
+                            trace_register_copy_origin(
+                                program,
+                                &predecessors,
+                                definition_block,
+                                definition_index,
+                                definition.memory_base().full_register(),
+                            )
+                        })
+                        .flatten()
+                })
             }
             OpKind::Memory
                 if transfer.memory_base() != Register::RIP
@@ -1482,6 +1553,7 @@ pub fn produce_runtime_abi_dispatches(
             {
                 trace_register_copy_origin(
                     program,
+                    &predecessors,
                     site.source_block,
                     site_index,
                     transfer.memory_base().full_register(),
@@ -1497,6 +1569,7 @@ pub fn produce_runtime_abi_dispatches(
         out.push((site.id, image_base + u64::from(site.instruction_rva)));
     }
     out.sort_by_key(|(site, _)| *site);
+    crate::progress::finish_task(format!("ProgramModel runtime ABI analysis complete: {} candidate(s)", out.len()));
     out
 }
 
@@ -1555,6 +1628,7 @@ fn direct_call_argument_target(
 
 fn trace_register_copy_origin(
     program: &ProgramModel,
+    predecessors: &PredecessorIndex,
     mut block_id: super::program_model::BlockId,
     mut before_index: usize,
     mut register: Register,
@@ -1583,29 +1657,17 @@ fn trace_register_copy_origin(
             }
             return None;
         }
-        let predecessors = program
-            .edges
-            .iter()
-            .filter_map(|edge| match edge.target {
-                super::program_model::EdgeTarget::Block(target)
-                    if target == block_id
-                        && program
-                            .blocks
-                            .get(&edge.source)
-                            .is_some_and(|source| source.function_id == function_id) =>
-                {
-                    Some(edge.source)
-                }
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        if predecessors.is_empty() {
+        let incoming = predecessors
+            .get(&block_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if incoming.is_empty() {
             return ABI_ARGS.contains(&register).then_some(register);
         }
-        if predecessors.len() != 1 {
+        if incoming.len() != 1 {
             return None;
         }
-        block_id = *predecessors.iter().next()?;
+        block_id = incoming[0];
         before_index = program.blocks.get(&block_id)?.instructions.len();
     }
     None
@@ -1616,6 +1678,7 @@ fn trace_register_copy_origin(
 /// boundary: different incoming ABI values must never be merged by guessing.
 fn find_unique_register_definition(
     program: &ProgramModel,
+    predecessors: &PredecessorIndex,
     mut block_id: super::program_model::BlockId,
     mut before_index: usize,
     target: Register,
@@ -1635,24 +1698,11 @@ fn find_unique_register_definition(
         {
             return Some((block_id, index));
         }
-        let predecessors = program
-            .edges
-            .iter()
-            .filter_map(|edge| match edge.target {
-                super::program_model::EdgeTarget::Block(predecessor_target)
-                    if predecessor_target == block_id
-                        && program
-                            .blocks
-                            .get(&edge.source)
-                            .is_some_and(|source| source.function_id == function_id) =>
-                {
-                    Some(edge.source)
-                }
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        let predecessors = predecessors.into_iter().collect::<Vec<_>>();
-        let [predecessor] = predecessors.as_slice() else {
+        let incoming = predecessors
+            .get(&block_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let [predecessor] = incoming else {
             return None;
         };
         block_id = *predecessor;

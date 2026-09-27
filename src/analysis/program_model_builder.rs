@@ -91,9 +91,16 @@ impl FunctionRangeIndex {
             index -= 1;
             let (_, end, id) = self.ranges[index];
             if rva < end {
-                best = Some(best.map_or(id, |current: FunctionId| {
-                    if id.0 < current.0 { id } else { current }
-                }));
+                best = Some(best.map_or(
+                    id,
+                    |current: FunctionId| {
+                        if id.0 < current.0 {
+                            id
+                        } else {
+                            current
+                        }
+                    },
+                ));
             }
             if index == 0 || self.prefix_max_end[index - 1] <= rva {
                 break;
@@ -199,8 +206,7 @@ impl<'a> ProgramModelBuilder<'a> {
             let mut last_progress = executable_scanned;
             while decoder.can_decode() {
                 let instruction = decoder.decode();
-                executable_scanned =
-                    section_base_scanned.saturating_add(decoder.position() as u64);
+                executable_scanned = section_base_scanned.saturating_add(decoder.position() as u64);
                 if executable_scanned.saturating_sub(last_progress) >= 16 * 1024 {
                     crate::progress::set_position(executable_scanned.min(executable_scan_bytes));
                     last_progress = executable_scanned;
@@ -568,13 +574,22 @@ impl<'a> ProgramModelBuilder<'a> {
         // Explicit producer results take precedence per site; this prevents
         // two passes from competing for the same unresolved CFG edge.
         let explicit_sites: BTreeSet<_> = resolutions.iter().map(|r| r.site).collect();
-        let mut combined = resolutions.to_vec();
-        combined.extend(
-            crate::analysis::pointer_tables::produce(&model, image_base, &[])
-                .into_iter()
-                .filter(|r| !explicit_sites.contains(&r.site)),
-        );
-        crate::analysis::indirect_resolver::apply_indirect_resolutions(&mut model, &combined)?;
+        let automatic = crate::analysis::pointer_tables::produce(&model, image_base, &[])
+            .into_iter()
+            .filter(|r| !explicit_sites.contains(&r.site))
+            .collect::<Vec<_>>();
+        crate::analysis::indirect_resolver::apply_producer_resolutions(
+            &mut model,
+            "pointer-table",
+            &automatic,
+            false,
+        )?;
+        crate::analysis::indirect_resolver::apply_producer_resolutions(
+            &mut model,
+            "user-supplied",
+            resolutions,
+            true,
+        )?;
         model.indirect_targets.validate(&model)?;
         model.validate()?;
         Ok(model)
@@ -670,13 +685,17 @@ impl<'a> ProgramModelBuilder<'a> {
             }
         }
         produced.retain(|item| !item.resolution.target_rvas.is_empty());
+        let mut producer_indexes =
+            crate::analysis::indirect_resolver::ProducerValidationIndexes::build(&model);
         let explicit_sites = resolutions.iter().map(|r| r.site).collect::<BTreeSet<_>>();
         let automatic = produced
             .iter()
             .filter(|p| !explicit_sites.contains(&p.resolution.site))
             .map(|p| p.resolution.clone())
             .collect::<Vec<_>>();
-        crate::analysis::indirect_resolver::apply_indirect_resolutions(&mut model, &automatic)?;
+        crate::analysis::indirect_resolver::apply_producer_resolutions_with_indexes(
+            &mut model, "switch", &automatic, false, &producer_indexes,
+        )?;
         for p in produced
             .into_iter()
             .filter(|p| !explicit_sites.contains(&p.resolution.site))
@@ -691,23 +710,46 @@ impl<'a> ProgramModelBuilder<'a> {
         // been applied. This producer is site-scoped and only consumes
         // canonical code-pointer inventory; unrelated global candidates are
         // never assigned to an indirect call.
+        crate::progress::begin_detail_task(
+            "ProgramModel: resolving direct pointer-table sites",
+            model.indirect_targets.sites.len() as u64,
+            "sites",
+        );
         let pointer_resolutions = crate::analysis::pointer_tables::produce(&model, image_base, &[])
             .into_iter()
             .filter(|p| !explicit_sites.contains(&p.site))
             .collect::<Vec<_>>();
-        crate::analysis::indirect_resolver::apply_indirect_resolutions(
+        crate::analysis::indirect_resolver::apply_producer_resolutions_with_indexes(
             &mut model,
+            "pointer-table",
             &pointer_resolutions,
+            false,
+            &producer_indexes,
         )?;
+        crate::progress::finish_task("ProgramModel pointer-table resolution complete");
+        crate::progress::begin_detail_task(
+            "ProgramModel: resolving local value-flow sites",
+            model.indirect_targets.sites.len() as u64,
+            "sites",
+        );
         let local_resolutions =
             crate::analysis::pointer_tables::produce_local_value_flow(&model, image_base)
                 .into_iter()
                 .filter(|p| !explicit_sites.contains(&p.site))
                 .collect::<Vec<_>>();
-        crate::analysis::indirect_resolver::apply_indirect_resolutions(
+        crate::analysis::indirect_resolver::apply_producer_resolutions_with_indexes(
             &mut model,
+            "local-value-flow",
             &local_resolutions,
+            false,
+            &producer_indexes,
         )?;
+        crate::progress::finish_task("ProgramModel local value-flow resolution complete");
+        crate::progress::begin_detail_task(
+            "ProgramModel: resolving stack-spill callback sites",
+            model.indirect_targets.sites.len() as u64,
+            "sites",
+        );
         let stack_resolutions =
             crate::analysis::pointer_tables::produce_stack_spill_resolutions(&model, image_base)
                 .into_iter()
@@ -733,19 +775,39 @@ impl<'a> ProgramModelBuilder<'a> {
                 }
             }
         }
-        crate::analysis::indirect_resolver::apply_indirect_resolutions(
+        producer_indexes =
+            crate::analysis::indirect_resolver::ProducerValidationIndexes::build(&model);
+        crate::analysis::indirect_resolver::apply_producer_resolutions_with_indexes(
             &mut model,
+            "stack-spill",
             &stack_resolutions,
+            false,
+            &producer_indexes,
         )?;
+        crate::progress::finish_task("ProgramModel stack-spill resolution complete");
+        crate::progress::begin_detail_task(
+            "ProgramModel: resolving Win64 ABI callback sites",
+            model.indirect_targets.sites.len() as u64,
+            "sites",
+        );
         let abi_resolutions =
             crate::analysis::pointer_tables::produce_abi_argument_resolutions(&model, image_base)
                 .into_iter()
                 .filter(|p| !explicit_sites.contains(&p.site))
                 .collect::<Vec<_>>();
-        crate::analysis::indirect_resolver::apply_indirect_resolutions(
+        crate::analysis::indirect_resolver::apply_producer_resolutions_with_indexes(
             &mut model,
+            "abi-argument",
             &abi_resolutions,
+            false,
+            &producer_indexes,
         )?;
+        crate::progress::finish_task("ProgramModel ABI callback resolution complete");
+        crate::progress::begin_detail_task(
+            "ProgramModel: resolving Rust vtable sites",
+            model.indirect_targets.sites.len() as u64,
+            "sites",
+        );
         let vtable_bases =
             crate::analysis::pointer_tables::discover_rust_vtable_bases(&model, &relayed_sections);
         let (vtable_resolutions, vtable_slots) =
@@ -766,123 +828,92 @@ impl<'a> ProgramModelBuilder<'a> {
             .into_iter()
             .filter(|p| !explicit_sites.contains(&p.site))
             .collect::<Vec<_>>();
-        crate::analysis::indirect_resolver::apply_indirect_resolutions(
+        crate::analysis::indirect_resolver::apply_producer_resolutions_with_indexes(
             &mut model,
+            "rust-vtable",
             &vtable_resolutions,
+            false,
+            &producer_indexes,
         )?;
-        for (internal, runtime_identity) in
+        crate::progress::finish_task("ProgramModel Rust vtable resolution complete");
+        let optional_callbacks =
             crate::analysis::pointer_tables::produce_optional_runtime_callbacks(
                 &model,
                 image_base,
                 &relayed_sections,
-            )
-        {
-            if !explicit_sites.contains(&internal.site) {
-                crate::analysis::indirect_resolver::apply_indirect_resolution(
-                    &mut model, &internal,
-                )?;
-                crate::analysis::indirect_resolver::apply_external_indirect_resolution(
-                    &mut model,
-                    internal.site,
-                    runtime_identity,
-                    crate::analysis::indirect_targets::TargetProvenance::RuntimeCallback,
-                )?;
-            }
-        }
+            ).into_iter()
+            .filter(|(internal, _)| !explicit_sites.contains(&internal.site))
+            .collect::<Vec<_>>();
+        let optional_internal = optional_callbacks.iter().map(|(internal, _)| internal.clone()).collect::<Vec<_>>();
+        crate::analysis::indirect_resolver::apply_producer_resolutions_with_indexes(
+            &mut model, "optional-runtime-callback", &optional_internal, false, &producer_indexes,
+        )?;
+        let optional_external = optional_callbacks.into_iter().map(|(internal, identity)| {
+            (internal.site, identity, crate::analysis::indirect_targets::TargetProvenance::RuntimeCallback)
+        }).collect::<Vec<_>>();
+        crate::analysis::indirect_resolver::apply_external_indirect_resolutions(
+            &mut model, "optional-runtime-callback-external", &optional_external,
+        )?;
         if let Some(iat) = iat {
-            for (site, slot_va) in
+            let resolutions =
                 crate::analysis::pointer_tables::produce_iat_slots(&model, image_base, iat)
-            {
-                if !explicit_sites.contains(&site) {
-                    crate::analysis::indirect_resolver::apply_external_indirect_resolution(
-                        &mut model,
-                        site,
-                        slot_va,
-                        crate::analysis::indirect_targets::TargetProvenance::ImportAddressTable,
-                    )?;
-                }
-            }
+                .into_iter().filter(|(site, _)| !explicit_sites.contains(site))
+                .map(|(site, slot)| (site, slot, crate::analysis::indirect_targets::TargetProvenance::ImportAddressTable))
+                .collect::<Vec<_>>();
+            crate::analysis::indirect_resolver::apply_external_indirect_resolutions(&mut model, "iat", &resolutions)?;
         }
-        for (site, resolver_slot_va) in
+        let dynamic_imports =
             crate::analysis::pointer_tables::produce_dynamic_import_resolutions(
                 &model,
                 image_base,
                 &get_proc_address_slots,
                 &relayed_sections,
             )
-        {
-            if !explicit_sites.contains(&site) {
-                crate::analysis::indirect_resolver::apply_external_indirect_resolution(
-                    &mut model,
-                    site,
-                    resolver_slot_va,
-                    crate::analysis::indirect_targets::TargetProvenance::DynamicImport,
-                )?;
-            }
-        }
+            .into_iter().filter(|(site, _)| !explicit_sites.contains(site))
+            .map(|(site, slot)| (site, slot, crate::analysis::indirect_targets::TargetProvenance::DynamicImport))
+            .collect::<Vec<_>>();
+        crate::analysis::indirect_resolver::apply_external_indirect_resolutions(&mut model, "dynamic-import", &dynamic_imports)?;
         for slot_rva in load_config_slots {
             let range = crate::analysis::program_model::RvaRange {
                 start: slot_rva,
                 end: slot_rva.saturating_add(8),
             };
-            for (site, slot_va) in
+            let resolutions =
                 crate::analysis::pointer_tables::produce_iat_slots(&model, image_base, range)
-            {
-                if !explicit_sites.contains(&site) {
-                    crate::analysis::indirect_resolver::apply_external_indirect_resolution(
-                        &mut model,
-                        site,
-                        slot_va,
-                        crate::analysis::indirect_targets::TargetProvenance::LoadConfig,
-                    )?;
-                }
-            }
+                .into_iter().filter(|(site, _)| !explicit_sites.contains(site))
+                .map(|(site, slot)| (site, slot, crate::analysis::indirect_targets::TargetProvenance::LoadConfig))
+                .collect::<Vec<_>>();
+            crate::analysis::indirect_resolver::apply_external_indirect_resolutions(&mut model, "load-config", &resolutions)?;
         }
         // Opaque runtime dispatch is deliberately last: precise internal,
         // vtable, IAT, dynamic-import and load-config evidence always wins.
-        for (site, runtime_identity) in
+        let runtime_abi =
             crate::analysis::pointer_tables::produce_runtime_abi_dispatches(&model, image_base)
-        {
-            if !explicit_sites.contains(&site) {
-                crate::analysis::indirect_resolver::apply_external_indirect_resolution(
-                    &mut model,
-                    site,
-                    runtime_identity,
-                    crate::analysis::indirect_targets::TargetProvenance::RuntimeCallback,
-                )?;
-            }
-        }
-        for (site, runtime_identity) in
+            .into_iter().filter(|(site, _)| !explicit_sites.contains(site))
+            .map(|(site, identity)| (site, identity, crate::analysis::indirect_targets::TargetProvenance::RuntimeCallback)).collect::<Vec<_>>();
+        crate::analysis::indirect_resolver::apply_external_indirect_resolutions(&mut model, "runtime-abi", &runtime_abi)?;
+        let runtime_global =
             crate::analysis::pointer_tables::produce_runtime_global_callbacks(
                 &model,
                 image_base,
                 &relayed_sections,
-            )
-        {
-            if !explicit_sites.contains(&site) {
-                crate::analysis::indirect_resolver::apply_external_indirect_resolution(
-                    &mut model,
-                    site,
-                    runtime_identity,
-                    crate::analysis::indirect_targets::TargetProvenance::RuntimeCallback,
-                )?;
-            }
-        }
-        for (site, runtime_identity) in
+            ).into_iter().filter(|(site, _)| !explicit_sites.contains(site))
+            .map(|(site, identity)| (site, identity, crate::analysis::indirect_targets::TargetProvenance::RuntimeCallback)).collect::<Vec<_>>();
+        crate::analysis::indirect_resolver::apply_external_indirect_resolutions(&mut model, "runtime-global", &runtime_global)?;
+        let runtime_stack =
             crate::analysis::pointer_tables::produce_runtime_stack_callback_dispatches(
                 &model, image_base,
             )
-        {
-            if !explicit_sites.contains(&site) {
-                crate::analysis::indirect_resolver::apply_external_indirect_resolution(
-                    &mut model,
-                    site,
-                    runtime_identity,
-                    crate::analysis::indirect_targets::TargetProvenance::RuntimeCallback,
-                )?;
-            }
-        }
-        crate::analysis::indirect_resolver::apply_indirect_resolutions(&mut model, resolutions)?;
+            .into_iter().filter(|(site, _)| !explicit_sites.contains(site))
+            .map(|(site, identity)| (site, identity, crate::analysis::indirect_targets::TargetProvenance::RuntimeCallback)).collect::<Vec<_>>();
+        crate::analysis::indirect_resolver::apply_external_indirect_resolutions(&mut model, "runtime-stack", &runtime_stack)?;
+        crate::analysis::indirect_resolver::apply_producer_resolutions_with_indexes(
+            &mut model,
+            "user-supplied",
+            resolutions,
+            true,
+            &producer_indexes,
+        )?;
         // The runtime dispatcher performs an exhaustive address partition for
         // the residue left by static producers: canonical image addresses are
         // resolved through the ProgramModel route and non-image addresses use
@@ -897,9 +928,7 @@ impl<'a> ProgramModelBuilder<'a> {
             })
             .map(|site| site.id)
             .collect::<Vec<_>>();
-        for site in runtime_sites {
-            crate::analysis::indirect_resolver::apply_runtime_route_resolution(&mut model, site)?;
-        }
+        crate::analysis::indirect_resolver::apply_runtime_route_resolutions(&mut model, &runtime_sites)?;
         model.indirect_targets.validate(&model)?;
         model.validate()?;
         Ok(model)
@@ -957,70 +986,79 @@ fn infer_point_function_end(
 /// already correspond to decoded instructions. Incoming edges continue to
 /// enter the old prefix; terminal outgoing edges move to the new suffix.
 fn split_blocks_at_targets(model: &mut ProgramModel, image_base: u64, targets: &BTreeSet<u32>) {
-    for &target in targets {
-        if model
-            .blocks
-            .values()
-            .any(|block| block.range.start == target)
-        {
-            continue;
+    let mut plans = BTreeMap::<BlockId, Vec<(u32, usize)>>::new();
+    // One decoded-instruction pass replaces one complete block scan per target.
+    for (&block_id, block) in &model.blocks {
+        for (index, instruction) in block.instructions.iter().enumerate().skip(1) {
+            let Some(rva) = instruction
+                .ip()
+                .checked_sub(image_base)
+                .and_then(|rva| u32::try_from(rva).ok())
+            else {
+                continue;
+            };
+            if targets.contains(&rva) {
+                plans.entry(block_id).or_default().push((rva, index));
+            }
         }
-        let Some((block_id, split_index)) = model.blocks.iter().find_map(|(&id, block)| {
-            block
-                .instructions
-                .iter()
-                .position(|instruction| {
-                    instruction
-                        .ip()
-                        .checked_sub(image_base)
-                        .and_then(|rva| u32::try_from(rva).ok())
-                        == Some(target)
-                })
-                .filter(|&index| index > 0)
-                .map(|index| (id, index))
-        }) else {
-            continue;
-        };
-        let Some(mut prefix) = model.blocks.remove(&block_id) else {
-            continue;
-        };
-        let suffix_instructions = prefix.instructions.split_off(split_index);
-        let old_end = prefix.range.end;
-        prefix.range.end = target;
-        let function_id = prefix.function_id;
-        let new_id = crate::analysis::program_model::BlockId(
-            model.blocks.keys().next_back().map_or(0, |id| id.0 + 1),
-        );
-        let suffix = crate::analysis::program_model::BlockModel {
-            id: new_id,
-            function_id,
-            range: crate::analysis::program_model::RvaRange {
-                start: target,
-                end: old_end,
-            },
-            instructions: suffix_instructions,
-            byte_class: prefix.byte_class,
-        };
-        model.blocks.insert(block_id, prefix);
-        model.blocks.insert(new_id, suffix);
-        if let Some(function) = model.functions.get_mut(&function_id) {
-            function.blocks.insert(new_id);
+    }
+    let mut next_id = model.blocks.keys().next_back().map_or(0, |id| id.0 + 1);
+    for (block_id, mut splits) in plans {
+        let Some(original) = model.blocks.remove(&block_id) else { continue };
+        splits.sort_unstable_by_key(|(_, index)| *index);
+        splits.dedup_by_key(|(_, index)| *index);
+        let mut boundaries = Vec::with_capacity(splits.len() + 2);
+        boundaries.push((original.range.start, 0usize));
+        boundaries.extend(splits);
+        boundaries.push((original.range.end, original.instructions.len()));
+        let mut segment_ids = Vec::with_capacity(boundaries.len() - 1);
+        for segment in 0..boundaries.len() - 1 {
+            let id = if segment == 0 {
+                block_id
+            } else {
+                let id = BlockId(next_id);
+                next_id += 1;
+                id
+            };
+            let (start, first) = boundaries[segment];
+            let (end, last) = boundaries[segment + 1];
+            model.blocks.insert(
+                id,
+                crate::analysis::program_model::BlockModel {
+                    id,
+                    function_id: original.function_id,
+                    range: crate::analysis::program_model::RvaRange { start, end },
+                    instructions: original.instructions[first..last].to_vec(),
+                    byte_class: original.byte_class,
+                },
+            );
+            segment_ids.push(id);
+            if segment != 0 {
+                if let Some(function) = model.functions.get_mut(&original.function_id) {
+                    function.blocks.insert(id);
+                }
+            }
         }
+        let terminal_id = *segment_ids.last().unwrap();
         for edge in &mut model.edges {
             if edge.source == block_id {
-                edge.source = new_id;
+                edge.source = terminal_id;
             }
         }
         for site in model.indirect_targets.sites.values_mut() {
-            if site.source_block == block_id && site.instruction_rva >= target {
-                site.source_block = new_id;
-            }
+            if site.source_block != block_id { continue; }
+            let segment = boundaries[..boundaries.len() - 1]
+                .partition_point(|(start, _)| *start <= site.instruction_rva)
+                .saturating_sub(1);
+            site.source_block = segment_ids[segment];
         }
-        model.edges.push(crate::analysis::program_model::EdgeModel {
-            source: block_id,
-            kind: crate::analysis::program_model::EdgeKind::Fallthrough,
-            target: crate::analysis::program_model::EdgeTarget::Block(new_id),
-        });
+        for pair in segment_ids.windows(2) {
+            model.edges.push(crate::analysis::program_model::EdgeModel {
+                source: pair[0],
+                kind: crate::analysis::program_model::EdgeKind::Fallthrough,
+                target: crate::analysis::program_model::EdgeTarget::Block(pair[1]),
+            });
+        }
     }
 }
 
@@ -1171,12 +1209,9 @@ fn merge_basic_blocks(
         if ordinal & 0x03ff == 0 || ordinal + 1 == decoded.len() {
             crate::progress::set_position((ordinal + 1) as u64);
         }
-        let owner = function_ranges.owner(*start).or_else(|| {
-            entry_last
-                .range(..=*start)
-                .next_back()
-                .map(|(_, id)| *id)
-        });
+        let owner = function_ranges
+            .owner(*start)
+            .or_else(|| entry_last.range(..=*start).next_back().map(|(_, id)| *id));
         let Some(owner) = owner else { continue };
         let id = BlockId(ordinal as u32);
         let function = model.functions.get_mut(&owner).unwrap();

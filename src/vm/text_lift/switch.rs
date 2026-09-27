@@ -39,10 +39,15 @@ pub fn resolve_switch_cases(
     let text_end = base_va + text_bytes.len() as u64;
     let mut dec = Decoder::with_ip(64, text_bytes, base_va, DecoderOptions::NONE);
     let mut insts: Vec<iced_x86::Instruction> = Vec::new();
+    crate::progress::begin_detail_task("Commercial VM: decoding legacy switch evidence", text_bytes.len() as u64, "bytes");
     while dec.can_decode() {
         let i = dec.decode();
+        let position = i.next_ip().saturating_sub(base_va);
+        if position & 0xffff < i.len() as u64 { crate::progress::set_position(position); }
         insts.push(i);
     }
+    crate::progress::set_position(text_bytes.len() as u64);
+    crate::progress::finish_task(format!("Commercial VM switch decode complete: {} instruction(s)", insts.len()));
     let mut last_def: [Option<usize>; 16] = [None; 16];
     let mut out = Vec::new();
     fn reg_idx(r: Register) -> Option<usize> {
@@ -52,7 +57,9 @@ pub fn resolve_switch_cases(
             None
         }
     }
+    crate::progress::begin_detail_task("Commercial VM: resolving legacy switch sites", insts.len() as u64, "instructions");
     for (i, inst) in insts.iter().enumerate() {
+        if i & 0x3fff == 0 { crate::progress::set_position(i as u64); }
         if inst.code() == Code::Jmp_rm64 {
             resolve_one(
                 &insts, &last_def, i, &mut out, relayed, image_base, base_va, text_end,
@@ -64,6 +71,8 @@ pub fn resolve_switch_cases(
             }
         }
     }
+    crate::progress::set_position(insts.len() as u64);
+    crate::progress::finish_task(format!("Commercial VM legacy switch resolution complete: {} switch(es)", out.len()));
     out
 }
 

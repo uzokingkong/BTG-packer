@@ -141,11 +141,12 @@ pub fn detect_runtime_shared_global_functions(
     }
 
     // 2) .pdata function ranges
-    let funcs = parse_pdata_functions(relayed_sections, image_base);
+    let mut funcs = parse_pdata_functions(relayed_sections, image_base);
+    funcs.sort_unstable_by_key(|(start, end, _)| (*start, *end));
     let func_of = |va: u64| -> Option<(u64, u64)> {
-        funcs
-            .iter()
-            .copied()
+        let upper = funcs.partition_point(|(start, _, _)| *start <= va);
+        funcs[..upper]
+            .iter().rev().copied()
             .find(|&(s, e, _)| s <= va && va < e)
             .map(|(s, e, _)| (s, e))
     };
@@ -153,8 +154,12 @@ pub fn detect_runtime_shared_global_functions(
     // 3) decode .text: panic-string reference sites -> seed function starts.
     let mut refs: Vec<u64> = Vec::new();
     let mut dec = Decoder::with_ip(64, text_bytes, base_va, DecoderOptions::NONE);
+    crate::progress::begin_detail_task("Commercial VM: scanning SEH call graph", text_bytes.len() as u64, "bytes");
+    let mut decoded = 0usize;
     while dec.can_decode() {
         let inst = dec.decode();
+        decoded = inst.next_ip().saturating_sub(base_va) as usize;
+        if decoded & 0xffff < inst.len() { crate::progress::set_position(decoded as u64); }
         if inst.is_invalid() {
             continue;
         }
@@ -167,6 +172,8 @@ pub fn detect_runtime_shared_global_functions(
             }
         }
     }
+    crate::progress::set_position(text_bytes.len() as u64);
+    crate::progress::finish_task(format!("Commercial VM SEH call graph scan complete: {} site(s)", refs.len()));
     let mut seed_starts: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for &r in &refs {
         if let Some((s, _)) = func_of(r) {
@@ -425,11 +432,15 @@ pub fn detect_seh_native_functions(
 
     // 5) reverse reachability over direct call edges (caller graph)
     let mut callers: HashMap<u64, Vec<u64>> = HashMap::new(); // callee -> callers
-    for &(caller, callee) in &call_edges {
+    crate::progress::begin_detail_task("Commercial VM: indexing SEH callers", call_edges.len() as u64, "edges");
+    for (ordinal, &(caller, callee)) in call_edges.iter().enumerate() {
+        if ordinal & 0x3ff == 0 { crate::progress::set_position(ordinal as u64); }
         if let (Some((cs, _)), Some((ks, _))) = (func_of(caller), func_of(callee)) {
             callers.entry(ks).or_default().push(cs);
         }
     }
+    crate::progress::set_position(call_edges.len() as u64);
+    crate::progress::finish_task("Commercial VM SEH caller index complete");
     let reverse_reach = |seeds: &HashSet<u64>| -> HashSet<u64> {
         let mut out: HashSet<u64> = seeds.clone();
         let mut queue: VecDeque<u64> = seeds.iter().copied().collect();

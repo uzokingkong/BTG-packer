@@ -95,11 +95,11 @@ pub fn setjmp_longjmp_function_ranges(
     if sites.use_vas.is_empty() && sites.thunk_vas.is_empty() {
         return Vec::new();
     }
-    let funcs = parse_pdata_functions(relayed_sections, image_base);
+    let mut funcs = parse_pdata_functions(relayed_sections, image_base);
+    funcs.sort_unstable_by_key(|(start, end, _)| (*start, *end));
     let func_of = |va: u64| -> Option<(u64, u64)> {
-        funcs
-            .iter()
-            .copied()
+        let upper = funcs.partition_point(|(start, _, _)| *start <= va);
+        funcs[..upper].iter().rev().copied()
             .find(|&(s, e, _)| s <= va && va < e)
             .map(|(s, e, _)| (s, e))
     };
@@ -119,30 +119,19 @@ pub fn setjmp_longjmp_function_ranges(
         }
     }
 
-    // bidirectional closure over direct call edges.
+    // Bidirectional closure over a function-level adjacency index. The old
+    // fixed-point loop rescanned every instruction edge once per expansion.
+    let mut adjacency = HashMap::<u64, Vec<u64>>::new();
+    for &(caller, callee) in &sites.call_edges {
+        let (Some((caller, _)), Some((callee, _))) = (func_of(caller), func_of(callee)) else { continue; };
+        adjacency.entry(caller).or_default().push(callee);
+        adjacency.entry(callee).or_default().push(caller);
+    }
     let mut excluded: HashSet<u64> = seeds;
-    loop {
-        let mut changed = false;
-        for &(caller, callee) in &sites.call_edges {
-            let caller_start = func_of(caller).map(|(s, _)| s);
-            let callee_start = func_of(callee).map(|(s, _)| s);
-            let caller_in = caller_start.map_or(false, |s| excluded.contains(&s));
-            let callee_in = callee_start.map_or(false, |s| excluded.contains(&s));
-            if caller_in != callee_in {
-                let to_add = if caller_in {
-                    callee_start
-                } else {
-                    caller_start
-                };
-                if let Some(s) = to_add {
-                    if excluded.insert(s) {
-                        changed = true;
-                    }
-                }
-            }
-        }
-        if !changed {
-            break;
+    let mut queue: VecDeque<u64> = excluded.iter().copied().collect();
+    while let Some(function) = queue.pop_front() {
+        for &neighbor in adjacency.get(&function).into_iter().flatten() {
+            if excluded.insert(neighbor) { queue.push_back(neighbor); }
         }
     }
 

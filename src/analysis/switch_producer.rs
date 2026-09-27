@@ -36,7 +36,31 @@ pub fn produce_switch_resolutions(
     sections: &[SwitchSection<'_>],
 ) -> Vec<ProducedSwitchResolution> {
     let mut out = Vec::new();
-    for site in program.indirect_targets.sites.values() {
+    // Materialize each function's instruction stream once. The old site-local
+    // reconstruction repeatedly collected and sorted the same blocks for every
+    // indirect jump, which became quadratic on large system binaries.
+    let mut instructions_by_function = std::collections::BTreeMap::new();
+    for function in program.functions.values() {
+        let mut instructions = function
+            .blocks
+            .iter()
+            .filter_map(|block_id| program.blocks.get(block_id))
+            .flat_map(|block| block.instructions.iter().cloned())
+            .collect::<Vec<_>>();
+        instructions.sort_by_key(|instruction| instruction.ip());
+        instructions.dedup_by_key(|instruction| instruction.ip());
+        instructions_by_function.insert(function.id, instructions);
+    }
+    let sites = program.indirect_targets.sites.values().collect::<Vec<_>>();
+    crate::progress::begin_detail_task(
+        "ProgramModel: resolving bounded switch sites",
+        sites.len() as u64,
+        "sites",
+    );
+    for (site_index, site) in sites.into_iter().enumerate() {
+        if site_index & 0x3f == 0 {
+            crate::progress::set_position(site_index as u64);
+        }
         if site.kind != IndirectKind::Jump {
             continue;
         }
@@ -44,17 +68,10 @@ pub fn produce_switch_resolutions(
         // three-instruction table dispatch itself. Reconstruct an ordered,
         // function-local instruction view; pattern recovery still requires
         // adjacent load/add/jump instructions and an explicit bound proof.
-        let Some(function) = program.functions.get(&site.source_function) else {
+        let Some(function_instructions) = instructions_by_function.get(&site.source_function)
+        else {
             continue;
         };
-        let mut function_instructions = function
-            .blocks
-            .iter()
-            .filter_map(|block_id| program.blocks.get(block_id))
-            .flat_map(|block| block.instructions.iter().cloned())
-            .collect::<Vec<_>>();
-        function_instructions.sort_by_key(|instruction| instruction.ip());
-        function_instructions.dedup_by_key(|instruction| instruction.ip());
         let Some(global_jump_index) = function_instructions.iter().position(|i| {
             i.ip()
                 .checked_sub(image_base)
@@ -167,6 +184,11 @@ pub fn produce_switch_resolutions(
             table,
         });
     }
+    crate::progress::set_position(program.indirect_targets.sites.len() as u64);
+    crate::progress::finish_task(format!(
+        "ProgramModel switch resolution complete: {} candidate(s)",
+        out.len()
+    ));
     out
 }
 
