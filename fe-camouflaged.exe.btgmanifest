@@ -4,7 +4,7 @@ seed_id = 0x0000000000000002
 vm_version = 31
 crypto_version = 63
 input_hash = e09e6c5410cab8c47b25d676fe15d5fa0f718c45378700c90e80e8d80539bfa2
-output_hash = 6c23743211957a5cb967728d83123a8f315e3d02d010b0c81abe2e20fb748c84
+output_hash = ab450ac3adb75c006963ee0c6516831b4289907d62f42947dbeb882403f59b52
 feature_flags = anti_debug,vm,vm_oep,vm_commercial,m8,integrity,payload_relocate,rsrc_register,iat_hide,mem_harden,chacha20,seed
 effective_features = aead,payload_relocate,rsrc_register,iat_hide,integrity,mem_harden,anti_debug
 ineffective_features = vm_commercial:incomplete-coverage;functions=319/874,blocks=4541/12286,instructions=17879/51189,unresolved_internal_edges=0,unsupported_instructions=0,capability_mismatches=0,original_text_exec_bytes=186872,original_text_plain_bytes=186872
