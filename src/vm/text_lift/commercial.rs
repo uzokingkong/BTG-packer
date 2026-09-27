@@ -28,6 +28,8 @@ use crate::vm::risc::{UnsupportedInstruction, UnsupportedInstructionReport, Unsu
 use anyhow::Result;
 use iced_x86::{Code, FlowControl, Instruction, Register};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::io::Write;
+use std::time::Instant;
 
 /// Stable, machine-readable reason why a commercial-VM function remains native.
 ///
@@ -2171,7 +2173,41 @@ pub fn lift_program_cfg_commercial_with_model(
     let mut total_inst = 0usize;
     let mut virtualized_inst = 0usize;
     let mut raw_function_op_ranges: Vec<crate::vm::poly::FunctionOpRange> = Vec::new();
-    for bb in &blocks {
+
+    // Large commercial Program-VM builds can spend most of the pack time in
+    // this second-pass RISC lift. Emit coarse block-based progress (5% steps)
+    // so the CLI does not appear frozen between the outer 66% and 84% stages.
+    // Keep tiny/test programs quiet to avoid noisy unit-test output.
+    let commercial_lift_started = Instant::now();
+    let commercial_progress_enabled = blocks.len() >= 64;
+    let commercial_progress_stride = (blocks.len() / 20).max(1);
+    for (block_index, bb) in blocks.iter().enumerate() {
+        if commercial_progress_enabled
+            && (block_index == 0 || block_index % commercial_progress_stride == 0)
+        {
+            let done = block_index;
+            let percent = done.saturating_mul(100) / blocks.len().max(1);
+            let elapsed = commercial_lift_started.elapsed().as_secs_f64();
+            if done == 0 || elapsed < 0.25 {
+                println!(
+                    "[VM-PROGRESS {:>3}%] commercial RISC lift: {}/{} blocks | ETA calculating",
+                    percent,
+                    done,
+                    blocks.len()
+                );
+            } else {
+                let eta = elapsed * (blocks.len().saturating_sub(done)) as f64 / done as f64;
+                println!(
+                    "[VM-PROGRESS {:>3}%] commercial RISC lift: {}/{} blocks | elapsed {:.1}s | ETA ~{:.1}s",
+                    percent,
+                    done,
+                    blocks.len(),
+                    elapsed,
+                    eta
+                );
+            }
+            let _ = std::io::stdout().flush();
+        }
         let real: Vec<Instruction> = bb
             .instructions
             .iter()
@@ -2360,6 +2396,15 @@ pub fn lift_program_cfg_commercial_with_model(
         } else {
             native_blocks += 1;
         }
+    }
+    if commercial_progress_enabled {
+        println!(
+            "[VM-PROGRESS 100%] commercial RISC lift: {}/{} blocks | done in {:.1}s",
+            blocks.len(),
+            blocks.len(),
+            commercial_lift_started.elapsed().as_secs_f64()
+        );
+        let _ = std::io::stdout().flush();
     }
 
     // P0-①: VM↔native 경계 함수 원자성 — 제외 함수 범위로 나가는 직접 분기 타깃을
