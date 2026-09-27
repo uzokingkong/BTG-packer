@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 struct ProgressState {
     enabled: bool,
     tty: bool,
+    single_line: bool,
     refresh: Duration,
     started: Instant,
     phase_started: Instant,
@@ -43,6 +44,7 @@ impl Default for ProgressState {
         Self {
             enabled: false,
             tty: io::stderr().is_terminal(),
+            single_line: false,
             refresh: Duration::from_millis(80),
             started: now,
             phase_started: now,
@@ -66,18 +68,21 @@ impl Default for ProgressState {
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static PROGRESS_ONLY: AtomicBool = AtomicBool::new(false);
 static STATE: OnceLock<Mutex<ProgressState>> = OnceLock::new();
 
 fn state() -> &'static Mutex<ProgressState> {
     STATE.get_or_init(|| Mutex::new(ProgressState::default()))
 }
 
-pub fn configure(enabled: bool, refresh_ms: u64) {
+pub fn configure(enabled: bool, refresh_ms: u64, progress_only: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
+    PROGRESS_ONLY.store(enabled && progress_only, Ordering::Relaxed);
     let mut s = state().lock().expect("progress mutex poisoned");
     let now = Instant::now();
     s.enabled = enabled;
     s.tty = io::stderr().is_terminal();
+    s.single_line = enabled && progress_only;
     s.refresh = Duration::from_millis(refresh_ms.clamp(16, 2_000));
     s.started = now;
     s.phase_started = now;
@@ -100,6 +105,11 @@ pub fn configure(enabled: bool, refresh_ms: u64) {
 
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+/// True when the CLI requested a clean console containing only the live gauge.
+pub fn progress_only() -> bool {
+    PROGRESS_ONLY.load(Ordering::Relaxed)
 }
 
 /// Start a weighted top-level phase. Values are basis points: 0..=10000.
@@ -126,7 +136,7 @@ pub fn begin_phase(base_bp: u32, span_bp: u32, label: impl Into<String>) {
     s.total = 0;
     s.task_affects_overall = true;
     render_locked(&mut s, true);
-    finalize_tty_line(&mut s);
+    finalize_tty_line(&mut s, false);
 }
 
 /// Select a weighted sub-range within the current top-level phase.
@@ -154,7 +164,7 @@ pub fn subphase(rel_base_bp: u32, rel_span_bp: u32, label: impl Into<String>) {
     s.unit.clear();
     s.task_affects_overall = true;
     render_locked(&mut s, true);
-    finalize_tty_line(&mut s);
+    finalize_tty_line(&mut s, false);
 }
 
 pub fn begin_task(label: impl Into<String>, total: u64, unit: impl Into<String>) {
@@ -249,7 +259,7 @@ pub fn finish_task(label: impl Into<String>) {
     }
     s.task = label.into();
     render_locked(&mut s, true);
-    finalize_tty_line(&mut s);
+    finalize_tty_line(&mut s, false);
 }
 
 /// Force the overall position to a completed milestone (basis points).
@@ -268,7 +278,7 @@ pub fn checkpoint(overall_bp: u32, label: impl Into<String>) {
     s.total = 0;
     s.unit.clear();
     render_locked(&mut s, true);
-    finalize_tty_line(&mut s);
+    finalize_tty_line(&mut s, false);
 }
 
 pub fn complete(label: impl Into<String>) {
@@ -286,11 +296,11 @@ pub fn complete(label: impl Into<String>) {
     s.total = 0;
     s.unit.clear();
     render_locked(&mut s, true);
-    finalize_tty_line(&mut s);
+    finalize_tty_line(&mut s, true);
 }
 
-fn finalize_tty_line(s: &mut ProgressState) {
-    if s.tty {
+fn finalize_tty_line(s: &mut ProgressState, final_line: bool) {
+    if s.tty && (!s.single_line || final_line) {
         eprintln!();
         s.last_line_len = 0;
     }
