@@ -90,7 +90,7 @@ The current selectable primitives are:
 --crypto-mode c1
 ```
 
-ChaCha20 is the default. The legacy `--rc4` flag remains parseable only so old scripts receive an explicit retirement error.
+ChaCha20 is the default. Selecting C1 requires a build with `--features experimental-custom-crypto`; default builds reject `--crypto-mode c1` and `--custom-cipher`. The legacy `--rc4` flag remains parseable only so old scripts receive an explicit retirement error.
 
 The crypto layer is enabled by default. Disable it with:
 

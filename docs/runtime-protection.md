@@ -14,14 +14,15 @@ This avoids spreading feature-conflict logic throughout PE building and VM code.
 
 ## Crypto layer
 
-The crypto layer is enabled by default. The current selectable primitives are:
+The crypto layer is enabled by default. The current selections are:
 
 ```text
-chacha20  default modern stream-cipher path
-c1        BTG-C1 custom research cipher path
+chacha20  default ChaCha20-based authenticated path
+c1        BTG-C1 custom research cipher (requires experimental-custom-crypto build feature)
 ```
 
 RC4 has been retired. `--rc4` is retained only as a compatibility input that produces a hard migration error.
+In a default build, `--crypto-mode c1` and `--custom-cipher` are rejected. Build with `--features experimental-custom-crypto` to enable that research path.
 
 Crypto-related source is under `src/crypto/`, including ChaCha20, Poly1305/MAC support, key scheduling, native generated implementations, provider selection, region encryption and tests.
 
