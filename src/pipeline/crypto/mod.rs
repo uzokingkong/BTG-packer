@@ -221,7 +221,7 @@ pub fn run(
         );
     }
 
-    crate::progress::subphase(0, 300, "Crypto pre-placement: keys + at-rest encryption");
+    crate::progress::subphase(0, 500, "Crypto pre-placement: keys + at-rest encryption");
     let (block_keys, total_blocks) = perblock::collect_block_keys(ctx, &layout, reencrypt);
 
     // ── 2. 키 상수 생성 ──────────────────────────────────────────────────────
