@@ -127,6 +127,12 @@ impl PackProgress {
         btg_packer::progress::checkpoint(u32::from(percent) * 100, stage);
     }
 }
+
+impl Drop for PackProgress {
+    fn drop(&mut self) {
+        btg_packer::progress::finish_console_line();
+    }
+}
 fn main() -> error::Result<()> {
     let args = CliArgs::parse();
 
