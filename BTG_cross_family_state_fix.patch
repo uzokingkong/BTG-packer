@@ -1,0 +1,136 @@
+diff --git a/src/vm/threaded/poly_direct/types.rs b/src/vm/threaded/poly_direct/types.rs
+--- a/src/vm/threaded/poly_direct/types.rs
++++ b/src/vm/threaded/poly_direct/types.rs
+@@
+ /// Per-state nested cross-family depth. Lifetime sync owns 0x50A0/0x50A8.
+ pub const STATE_CROSS_FAMILY_DEPTH: i64 = 0x50B0;
++/// Child-state pointers for guest registers that are nonvolatile in the native
++/// Win64 ABI but are still architectural VM state across family transitions.
++///
++/// A generated child can be reached through a tail-jump or through nested
++/// family transitions, so the native ABI's "callee preserves RBX/RBP/..." rule
++/// is not sufficient to reconstruct the parent VM state.  These slots let the
++/// shared return bridge pull the authoritative values directly from the child
++/// family state, exactly like the existing RAX/volatile pointer plumbing.
++///
++/// 0x50A0/0x50A8 are lifetime-sync, 0x50B0 is depth; keep this table above
++/// those fixed control slots and below the 0x8000 family-state stride.
++pub const STATE_CROSS_FAMILY_NONVOLATILE_PTRS: [(usize, i64); 9] = [
++    (3, 0x50C0),  // RBX
++    (4, 0x50C8),  // RSP
++    (5, 0x50D0),  // RBP
++    (6, 0x50D8),  // RSI
++    (7, 0x50E0),  // RDI
++    (12, 0x50E8), // R12
++    (13, 0x50F0), // R13
++    (14, 0x50F8), // R14
++    (15, 0x5100), // R15
++];
+ /// Eight re-entry depths are reserved per thread bucket; depth 7 cannot spawn another child.
+ pub const MAX_CROSS_FAMILY_DEPTH: u64 = 7;
+diff --git a/src/vm/threaded/poly_direct/builder.rs b/src/vm/threaded/poly_direct/builder.rs
+--- a/src/vm/threaded/poly_direct/builder.rs
++++ b/src/vm/threaded/poly_direct/builder.rs
+@@
+-            for (index, return_ptr_off) in std::iter::once((0, STATE_CROSS_FAMILY_RETURN_PTR))
+-                .chain(STATE_CROSS_FAMILY_VOLATILE_PTRS)
++            for (index, return_ptr_off) in std::iter::once((0, STATE_CROSS_FAMILY_RETURN_PTR))
++                .chain(STATE_CROSS_FAMILY_VOLATILE_PTRS)
++                .chain(STATE_CROSS_FAMILY_NONVOLATILE_PTRS)
+             {
+                 b.push(
+                     Instruction::with2(
+@@
+             for ((index, ptr_off), physical) in STATE_CROSS_FAMILY_VOLATILE_PTRS
+                 .into_iter()
+                 .zip([
+@@
+                 }
+             }
++            // A family transition is an implementation boundary, not a native
++            // ABI boundary.  Generated children reached by tail-jumps or nested
++            // cross-family routes may legitimately carry different values in
++            // guest RBX/RSP/RBP/RSI/RDI/R12-R15 even though those registers are
++            // nonvolatile for an ordinary Win64 native CALL.  Pull those values
++            // from the child family's authoritative state whenever route setup
++            // armed a pointer.  Ordinary native calls leave these slots zero and
++            // therefore preserve the previous behavior.
++            for (index, ptr_off) in STATE_CROSS_FAMILY_NONVOLATILE_PTRS {
++                b.push(
++                    Instruction::with2(
++                        Code::Mov_r64_rm64,
++                        Register::RDI,
++                        MemoryOperand::with_base_displ_size(Register::RBX, ptr_off, 8),
++                    )
++                    .unwrap(),
++                );
++                b.push(
++                    Instruction::with2(Code::Test_rm64_r64, Register::RDI, Register::RDI)
++                        .unwrap(),
++                );
++                let skip = 0xC200_0000usize + index;
++                b.br(Code::Je_rel32_64, skip);
++                b.push(
++                    Instruction::with2(
++                        Code::Mov_r64_rm64,
++                        Register::RAX,
++                        MemoryOperand::with_base(Register::RDI),
++                    )
++                    .unwrap(),
++                );
++                b.push(
++                    Instruction::with2(
++                        Code::Mov_rm64_imm32,
++                        MemoryOperand::with_base_displ_size(Register::RBX, ptr_off, 8),
++                        0,
++                    )
++                    .unwrap(),
++                );
++                b.push(
++                    Instruction::with2(
++                        Code::Mov_rm64_r64,
++                        MemoryOperand::with_base_displ_size(
++                            Register::RBX,
++                            state_disp(REGS_OFF + index as i32 * 8) as i64,
++                            8,
++                        ),
++                        Register::RAX,
++                    )
++                    .unwrap(),
++                );
++                let synced = b.len();
++                for &mut (_, ref mut target) in b.branches.iter_mut() {
++                    if *target == skip {
++                        *target = synced;
++                    }
++                }
++            }
+             // Generated children publish architectural flags through their
+             // state. Physical RFLAGS at HALT belongs to the dispatcher.
+diff --git a/src/pipeline/crypto/place/vm_build.rs b/src/pipeline/crypto/place/vm_build.rs
+--- a/src/pipeline/crypto/place/vm_build.rs
++++ b/src/pipeline/crypto/place/vm_build.rs
+@@
+     for off in [
+         layout.vsp as i64,
+         layout.fp_return as i64,
+@@
+         ins.push(Instruction::with2(
+             Code::Mov_rm64_r64,
+             MemoryOperand::with_base_displ_size(Register::R10, off, 8),
+             Register::RAX,
+         )?);
+     }
++    // Fresh external callback lanes must not inherit child-result pointers from
++    // an earlier invocation that reused the same (thread, depth) lane.
++    for &(_, off) in
++        &vm::threaded::poly_direct::STATE_CROSS_FAMILY_NONVOLATILE_PTRS
++    {
++        ins.push(Instruction::with2(
++            Code::Mov_rm64_r64,
++            MemoryOperand::with_base_displ_size(Register::R10, off, 8),
++            Register::RAX,
++        )?);
++    }
+     for reg in [Register::R15, Register::R14, Register::R13, Register::R12, Register::R11,
+         Register::R10, Register::R9, Register::R8, Register::RDI, Register::RSI,
