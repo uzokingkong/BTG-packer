@@ -108,6 +108,12 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false)]
     pub no_progress: bool,
 
+    /// Show only the live in-place progress gauge during normal packing.
+    /// Ordinary stdout/stderr diagnostics are suppressed from the console;
+    /// --log-file still receives structured logger output.
+    #[arg(long, default_value_t = false, conflicts_with = "no_progress")]
+    pub progress_only: bool,
+
     /// Live progress refresh interval in milliseconds (16..2000).
     /// Lower values make the bar more responsive at a small console-I/O cost.
     #[arg(long, default_value_t = 80)]
