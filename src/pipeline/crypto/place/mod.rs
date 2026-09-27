@@ -1834,11 +1834,24 @@ pub(crate) fn place_boot_stub(
         old_section_len.saturating_sub(new_section_len)
     );
 
-    // Finalize the loader-owned import section only after `.textb` trimming.
-    // Basing this RVA on pass4's large reservation left a ~63 MiB virtual gap;
-    // Windows rejected that synthesized image before OEP with ERROR_BAD_EXE_FORMAT.
-    let final_dummy_base_rva =
-        align_section(dispatcher_rva.saturating_add(btg.bytes.len().max(1) as u32));
+    // Finalize following sections only after .textb trimming.  Sparse .vstate
+    // has no raw bytes but still occupies virtual address space, so fixed-RVA
+    // sections such as .idata/.vdata must be placed after its VirtualSize.
+    let textb_end_rva = u64::from(dispatcher_rva)
+        .checked_add(btg.bytes.len().max(1) as u64)
+        .ok_or_else(|| anyhow::anyhow!("generated .textb RVA end overflow"))?;
+    let sparse_state_end_rva = if vm_multi_family_active && vm_prog_state_va != 0 {
+        vm_prog_state_va
+            .checked_sub(image_base)
+            .and_then(|rva| rva.checked_add(vm_prog_state_reserve as u64))
+            .ok_or_else(|| anyhow::anyhow!("sparse .vstate RVA end overflow"))?
+    } else {
+        textb_end_rva
+    };
+    let generated_virtual_tail_rva = textb_end_rva.max(sparse_state_end_rva);
+    let generated_virtual_tail_rva_u32 = u32::try_from(generated_virtual_tail_rva)
+        .map_err(|_| anyhow::anyhow!("generated section tail exceeds PE u32 RVA space"))?;
+    let final_dummy_base_rva = align_section(generated_virtual_tail_rva_u32);
     let (dummy_blob, dummy_dir_rva, dummy_dir_size, iat_ll_slot_rva, iat_gpa_slot_rva) =
         if needs_dummy_bootstrap {
             crate::pipeline::iat_hide::build_dummy_import_block(final_dummy_base_rva)
@@ -1902,7 +1915,7 @@ pub(crate) fn place_boot_stub(
         if !dummy_blob.is_empty() {
             image_base + align(final_dummy_base_rva as u64 + dummy_blob.len() as u64)
         } else {
-            dispatcher_va + align(btg.bytes.len() as u64)
+            image_base + align(generated_virtual_tail_rva)
         }
     } else {
         0
