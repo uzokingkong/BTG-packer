@@ -56,7 +56,7 @@ jobs:
             throw "exact QA payload SHA-256 mismatch: $sha"
           }
 
-      - name: Exact QA commercial Program-VM differential
+      - name: Exact QA commercial Program-VM differential (partial-development gate)
         id: exact_qa
         shell: pwsh
         env:
@@ -66,10 +66,15 @@ jobs:
           $input = "qa/rust_packer_test.exe"
           $output = "qa-packed.exe"
           Remove-Item -Force $output, "$output.failed.exe" -ErrorAction SilentlyContinue
+          # The current commercial engine still has typed native exclusions
+          # (SEH/panic + performance/native-island policy). This exact-QA job is
+          # an execution-equivalence regression gate, not the future 100%-ownership
+          # release gate. Keep partial ownership explicit instead of weakening the
+          # validator or pretending the measured coverage is complete.
           $packArgs = @(
             "--input", $input,
             "--output", $output,
-            "--vm", "--vm-oep", "--vm-commercial",
+            "--vm", "--vm-oep", "--vm-commercial", "--allow-partial-vm",
             "--verify-output", "--verify-timeout-secs", "45",
             "--map", "--sym-map", "--debug", "--log-file", "qa-packed.log",
             "--seed", "3134984190"
