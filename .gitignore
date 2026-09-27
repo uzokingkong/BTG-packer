@@ -19,6 +19,11 @@ packed_*.sym
 packed_*.riscmap.csv
 *.btgmanifest
 *.csv
+release-*/
+BTG-packer-*.txt
+*.patch
+BTG_cross_family_*
+apply_fix.*
 
 # Archives / scratch
 *.zip
