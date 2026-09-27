@@ -157,7 +157,9 @@ impl PolymorphicEncoder {
             "stream items",
         );
         for (item_index, item) in rewrite.instrs.iter().enumerate() {
-            crate::progress::set_position((item_index + 1) as u64);
+            if item_index & 0x3f == 0 || item_index + 1 == rewrite.instrs.len() {
+                crate::progress::set_position((item_index + 1) as u64);
+            }
             offsets.push(out.len());
             match item {
                 SuperOpStreamInstr::Primitive(ins) => {
@@ -215,7 +217,9 @@ impl PolymorphicEncoder {
             "micro-ops",
         );
         for (op_index, ins) in prog.instrs.iter().enumerate() {
-            crate::progress::set_position((op_index + 1) as u64);
+            if op_index & 0x3f == 0 || op_index + 1 == prog.instrs.len() {
+                crate::progress::set_position((op_index + 1) as u64);
+            }
             offsets.push(out.len());
             // opcode — VirtualBranch 는 조건과 무관한 단일 canonical opcode.
             let opcode_byte = self.spec.opcode_for(ins.op).ok_or_else(|| {
