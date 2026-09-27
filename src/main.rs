@@ -16,6 +16,8 @@ use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use std::env;
 use std::fs;
+use std::io::Write;
+use std::time::{Duration, Instant};
 
 /// Bug-7 fix: env_logger leaks its Pipe writer (log::set_boxed_logger does a
 /// Box::leak), so the log file is never flushed/closed by Drop. Hold a cloned
@@ -26,6 +28,70 @@ impl Drop for LogFlushGuard {
         use std::io::Write;
         let _ = self.0.flush();
         let _ = self.0.sync_all();
+    }
+}
+
+
+fn format_progress_duration(duration: Duration) -> String {
+    let total = duration.as_secs();
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Lightweight stage-based CLI progress reporter.
+///
+/// The percentage is intentionally tied to completed pipeline milestones instead
+/// of a timer, so it never advances while work is actually stalled. ETA is a
+/// rolling estimate derived from elapsed time and the weighted milestone
+/// percentage; it becomes useful after the first few stages have completed.
+struct PackProgress {
+    started: Instant,
+    last_percent: u8,
+    enabled: bool,
+}
+
+impl PackProgress {
+    fn new(enabled: bool) -> Self {
+        Self {
+            started: Instant::now(),
+            last_percent: 0,
+            enabled,
+        }
+    }
+
+    fn report(&mut self, percent: u8, stage: &str) {
+        if !self.enabled {
+            return;
+        }
+
+        let percent = percent.min(100).max(self.last_percent);
+        self.last_percent = percent;
+        let elapsed = self.started.elapsed();
+
+        let suffix = if percent >= 100 {
+            format!("done in {}", format_progress_duration(elapsed))
+        } else if percent >= 8 && elapsed.as_secs_f64() >= 1.0 {
+            let elapsed_s = elapsed.as_secs_f64();
+            let eta_s = elapsed_s * (100.0 - f64::from(percent)) / f64::from(percent);
+            format!(
+                "elapsed {} | ETA ~{}",
+                format_progress_duration(elapsed),
+                format_progress_duration(Duration::from_secs_f64(eta_s.max(0.0)))
+            )
+        } else {
+            format!("elapsed {}", format_progress_duration(elapsed))
+        };
+
+        println!("[PROGRESS {:>3}%] {} | {}", percent, stage, suffix);
+        let _ = std::io::stdout().flush();
     }
 }
 
@@ -402,6 +468,9 @@ fn main() -> error::Result<()> {
         );
     }
 
+    let mut progress = PackProgress::new(!args.no_progress);
+    progress.report(1, "Starting pack pipeline");
+
     // ── 입력 PE 로드 ──────────────────────────────────────────────────────────────
     let input_path = args.input;
     if !input_path.exists() {
@@ -419,6 +488,7 @@ fn main() -> error::Result<()> {
         input_path.display(),
         input_pe_bytes.len()
     );
+    progress.report(4, "Input PE loaded");
 
     // ── PE 파싱 ──────────────────────────────────────────────────────────────────
     let target_info = TargetPeInfo::parse(&input_pe_bytes)?;
@@ -429,6 +499,7 @@ fn main() -> error::Result<()> {
         "[+] Relayed {} original PE sections.",
         target_info.relayed_sections.len()
     );
+    progress.report(7, "PE parsed and section map loaded");
 
     // ── Dispatcher RVA 동적 계산 (원본 섹션 끝 이후) ──────────────────────────────
     let section_alignment = if target_info.section_alignment == 0 {
@@ -505,9 +576,11 @@ fn main() -> error::Result<()> {
     // (m7_effective는 위에서 crypto/vm/reencrypt 배타성과 함께 판정됨.
     //  ⚠ pass2가 상태 테이블을 예약하므로 **pass1 이전에** 설정해야 한다.)
     ctx.m7 = m7_effective;
+    progress.report(10, "Pipeline context initialized");
 
     // ── Phase 6: SDK Marker Selective VM Pass (if markers present) ───────────────
     if vm_enabled {
+        progress.report(11, "Preparing VM analysis / selective virtualization");
         // T1-1: 폴리모픽 VM 시드 — --seed 주어지면 단일 시드 RNG에서 파생(결정적),
         // 아니면 OsRng 엔트로피와 동등한 랜덤 값.
         let poly_seed: u64 = ctx.rng.next_u64();
@@ -526,15 +599,22 @@ fn main() -> error::Result<()> {
             let _ = pipeline::selective_vm::SelectiveVmPass::run(&mut ctx, poly_seed);
         }
     }
+    progress.report(15, "VM preparation complete");
 
     // ── Pass 1: CFG 추출 + MicroSlicer ────────────────────────────────────────────
+    progress.report(16, "Pass 1/4: CFG extraction + micro-slicing");
     pipeline::pass1_slice::run(&mut ctx)?;
+    progress.report(30, "Pass 1/4 complete");
 
     // ── Pass 2: Layout Shuffling ──────────────────────────────────────────────────
+    progress.report(31, "Pass 2/4: layout shuffling");
     pipeline::pass2_shuffle::run(&mut ctx)?;
+    progress.report(40, "Pass 2/4 complete");
 
     // ── Pass 3: RIP Fixup + BlockEncoder ─────────────────────────────────────────
+    progress.report(41, "Pass 3/4: RIP fixups + block encoding");
     pipeline::pass3_encode::run(&mut ctx)?;
+    progress.report(48, "Pass 3/4 complete");
 
     // ── Pass 4: .btg 섹션 조립 (anti_debug + crypto + iat/mem 플래그 전달) ────────
     let anti_debug_enabled = anti_debug || args.trace_blocks;
@@ -542,6 +622,7 @@ fn main() -> error::Result<()> {
     // 부트 스텁 영역을 예약해야 한다.
     let needs_boot_stub = cfg.needs_boot_stub;
     // readccc §4.5: graceful failure 정책을 부트 스텁/디스패처에 전달.
+    progress.report(49, "Pass 4/4: assembling protected sections");
     pipeline::pass4_section::run(
         &mut ctx,
         anti_debug_enabled,
@@ -549,16 +630,21 @@ fn main() -> error::Result<()> {
         needs_boot_stub,
         args.trace_blocks,
     )?;
+    progress.report(55, "Pass 4/4 complete");
 
     // ── Patch: 섹션 재배치 + CFG 픽스업 ──────────────────────────────────────────
+    progress.report(56, "Applying section relocation + CFG fixups");
     let relayed_sections = ctx.target_info.relayed_sections.clone();
     pipeline::patch_data::run(&mut ctx, relayed_sections)?;
+    progress.report(61, "Relocation + fixups complete");
 
     // ── v6: IAT 은닉 + 메모리 하드닝 준비 (원본 import 추출/제거) — crypto 앞에서 실행 ──
     if iat_hide || mem_harden {
+        progress.report(62, "Preparing IAT hiding / memory-hardening metadata");
         ctx.original_imports = pipeline::iat_hide::collect_from_pe(&input_pe_bytes)?;
         pipeline::iat_hide::run(&mut ctx)?;
     }
+    progress.report(65, "Pre-crypto preparation complete");
 
     // ── M6 Phase-2: OEP→VM entry 전환 — 부트 스텁이 원본 .text를 평문 복호화하지
     // 않고 lift된 프로그램 VM 모듈로 디스패치. (--vm 필요, 기본 false → 기존 경로 유지)
@@ -584,6 +670,7 @@ fn main() -> error::Result<()> {
     // v61: --dispatcher-reencrypt OR --m7 (둘 다 per-block) — ctx.reencrypt를
     // 빌림으로 읽기 전에 값만 캡처한다 (crypto::run이 &mut ctx를 받으므로).
     let reencrypt_effective = ctx.reencrypt;
+    progress.report(66, "Applying crypto / Program-VM protection");
     pipeline::crypto::run(
         &mut ctx,
         crypto_enabled,
@@ -596,6 +683,7 @@ fn main() -> error::Result<()> {
         args.chained_crypto,
         reencrypt_effective,
     )?;
+    progress.report(84, "Crypto / Program-VM protection complete");
 
     // ── v4: RT_RCDATA 정식 리소스 등록 (--payload-relocate 필요) ─────────────
     if rsrc_register {
@@ -608,19 +696,24 @@ fn main() -> error::Result<()> {
     // 시작을 VM 진입 스텁으로 redirect하는 트램펄린이 .text에 패치된다.
     // (마커가 없으면 no-op — 출력은 기존과 동일.)
     if vm_enabled {
+        progress.report(85, "Embedding polymorphic VM runtime");
         let _ = pipeline::poly_embed::embed_poly_vm_into_pipeline(&mut ctx)?;
     }
+    progress.report(87, "Runtime/resource embedding complete");
 
     // ── Build: PE 합성 + 파일 기록 ───────────────────────────────────────────────
     let output_path = args.output;
     // Build in memory first. A strict-profile artifact is not committed to its
     // final path until both structural and effective-capability checks pass.
+    progress.report(88, "Building final PE image");
     let mut output_pe_bytes = pipeline::build::run(&ctx, None)?;
+    progress.report(91, "Final PE image built");
 
     // ── v4: 섹션별 엔트로피 리포트 (탐지 도구의 엔트로피 지표 확인용) ─────────────
     btg_packer::analysis::entropy::print_entropy_report(&output_pe_bytes);
 
     // ── v5: 자체검증 — 출력 PE를 다시 파싱해 구조적 불변식 검증 ──────────────────
+    progress.report(92, "Validating protected PE invariants");
     pipeline::validate::run(&ctx, &output_pe_bytes)?;
     let effective_profile =
         pipeline::validate::validate_effective_profile(&ctx, cfg, &output_pe_bytes)?;
@@ -646,8 +739,11 @@ fn main() -> error::Result<()> {
             rewritten, args.section_name_mode
         );
     }
+    progress.report(95, "Validation complete");
     std::fs::write(&output_path, &output_pe_bytes)?;
+    progress.report(96, "Protected output written");
     let verification_report = if args.verify_output {
+        progress.report(97, "Running execution-equivalence verification");
         match btg_packer::differential::verify_equivalent(
             &input_path,
             &output_path,
@@ -675,6 +771,7 @@ fn main() -> error::Result<()> {
     } else {
         None
     };
+    progress.report(98, "Output verification stage complete");
     let emit_private_evidence = args.debug
         || args.map
         || args.sym_map
@@ -940,6 +1037,8 @@ fn main() -> error::Result<()> {
         }
     }
 
+    progress.report(99, "Writing manifests / optional analysis artifacts");
+
     // ── 디버그 출력 ───────────────────────────────────────────────────────────────
     if args.debug || args.trace_blocks {
         debug::export_debug_layout_log(
@@ -958,5 +1057,6 @@ fn main() -> error::Result<()> {
         )?;
     }
 
+    progress.report(100, "Pack complete");
     Ok(())
 }
