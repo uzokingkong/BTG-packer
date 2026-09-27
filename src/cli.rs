@@ -279,4 +279,14 @@ mod crypto_cli_tests {
         let args = CliArgs::try_parse_from(["btg-packer", "--rc4"]).unwrap();
         assert!(args.rc4);
     }
+
+    #[test]
+    fn progress_only_is_parseable_and_conflicts_with_no_progress() {
+        let args = CliArgs::try_parse_from(["btg-packer", "--progress-only"]).unwrap();
+        assert!(args.progress_only);
+        assert!(!args.no_progress);
+
+        CliArgs::try_parse_from(["btg-packer", "--progress-only", "--no-progress"])
+            .expect_err("--progress-only must conflict with --no-progress");
+    }
 }
