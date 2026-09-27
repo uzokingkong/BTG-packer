@@ -30,27 +30,57 @@ const DIR_SECURITY: usize = 4;
 /// 재배치 디렉터리 인덱스 — 패커가 0으로 지움 (ASLR off)
 const DIR_RELOC: usize = 5;
 
-/// 섹션 RVA가 겹치지 않는지 (정렬 순 정렬 후 검사).
-fn check_section_overlap(sections: &[SectionInfo]) -> Result<()> {
+fn align_up_u32(value: u32, alignment: u32) -> Option<u32> {
+    let alignment = alignment.max(1) as u64;
+    let value = value as u64;
+    let aligned = value
+        .checked_add(alignment - 1)?
+        .checked_div(alignment)?
+        .checked_mul(alignment)?;
+    u32::try_from(aligned).ok()
+}
+
+/// Validate the loader-visible section map. Image sections must be ordered,
+/// non-overlapping and adjacent after SectionAlignment rounding. The mapped
+/// extent uses max(VirtualSize, SizeOfRawData), matching the bytes the image
+/// loader must account for when the raw footprint is larger than VirtualSize.
+fn check_section_layout(sections: &[SectionInfo], section_alignment: u32) -> Result<()> {
     let mut spans: Vec<(u32, u32, &str)> = sections
         .iter()
-        .map(|s| (s.rva, s.rva.saturating_add(s.virtual_size), s.name.as_str()))
+        .filter_map(|s| {
+            let mapped_len = s.virtual_size.max(s.raw_size);
+            (mapped_len != 0).then_some((s.rva, mapped_len, s.name.as_str()))
+        })
         .collect();
     spans.sort_by_key(|s| s.0);
+
     for w in spans.windows(2) {
-        // 빈 섹션(virtual_size 0)은 무시
-        if w[0].1 <= w[0].0 || w[1].1 <= w[1].0 {
-            continue;
-        }
-        if w[0].1 > w[1].0 {
+        let prev_end = w[0]
+            .0
+            .checked_add(w[0].1)
+            .ok_or_else(|| anyhow::anyhow!("PE structural: section mapped-end overflow"))?;
+        let expected_next = align_up_u32(prev_end, section_alignment)
+            .ok_or_else(|| anyhow::anyhow!("PE structural: section alignment overflow"))?;
+        if w[1].0 < expected_next {
             bail!(
-                "PE structural: section '{}' [0x{:X},0x{:X}) overlaps '{}' [0x{:X},0x{:X})",
+                "PE structural: section '{}' mapped [0x{:X},0x{:X}) overlaps/alignment-collides with '{}' @0x{:X} (expected >=0x{:X})",
                 w[0].2,
                 w[0].0,
-                w[0].1,
+                prev_end,
                 w[1].2,
                 w[1].0,
-                w[1].1
+                expected_next
+            );
+        }
+        if w[1].0 != expected_next {
+            bail!(
+                "PE structural: image section RVA gap after '{}': mapped_end=0x{:X}, aligned_end=0x{:X}, next '{}'=0x{:X} (gap=0x{:X})",
+                w[0].2,
+                prev_end,
+                expected_next,
+                w[1].2,
+                w[1].0,
+                w[1].0.saturating_sub(expected_next)
             );
         }
     }
@@ -160,7 +190,7 @@ pub fn validate_pe_structure(
             }
         }
     }
-    check_section_overlap(sections)?;
+    check_section_layout(sections, sa)?;
 
     // SizeOfImage ≥ 마지막 섹션 virtual 끝
     let last_end = sections
@@ -249,7 +279,7 @@ mod tests {
             sec(".text", 0x1000, 0x1000, 0x400, 0x1000),
             sec(".data", 0x1800, 0x1000, 0x1400, 0x1000), // overlaps .text
         ];
-        let e = check_section_overlap(&sections).unwrap_err();
+        let e = check_section_layout(&sections, 0x1000).unwrap_err();
         assert!(
             e.to_string().contains("overlap"),
             "expected overlap error, got {e}"
@@ -257,12 +287,25 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_sections_no_overlap() {
+    fn adjacent_sections_are_accepted() {
         let sections = vec![
             sec(".text", 0x1000, 0x1000, 0x400, 0x1000),
             sec(".data", 0x2000, 0x1000, 0x1400, 0x1000),
         ];
-        check_section_overlap(&sections).expect("adjacent sections must not overlap");
+        check_section_layout(&sections, 0x1000).expect("adjacent sections must be accepted");
+    }
+
+    #[test]
+    fn loader_rejectable_section_gap_is_detected() {
+        let sections = vec![
+            sec(".rsrc", 0x70B000, 0x142D8, 0x1000, 0x14400),
+            sec(".textb", 0x729000, 0x1000, 0x20000, 0x1000),
+        ];
+        let error = check_section_layout(&sections, 0x1000)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("RVA gap"));
+        assert!(error.contains("0x9000"));
     }
 
     #[test]
