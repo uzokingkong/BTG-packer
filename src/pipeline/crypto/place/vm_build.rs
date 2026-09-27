@@ -151,8 +151,17 @@ fn build_canonical_oep_gateway(
     // its sparse pointer/descriptor metadata once at canonical process entry.
     // Keeping this initialization in generated code removes hundreds of MiB of
     // repeated zero/pointer records from the packed file.
+    let state_init_total = (VM_INVOCATION_LANES + 1).saturating_mul(family_count);
+    crate::progress::begin_detail_task(
+        "Generating canonical OEP lane/family state initializer",
+        state_init_total as u64,
+        "lane-states",
+    );
+    let mut state_init_done = 0usize;
     for lane in 0..=VM_INVOCATION_LANES {
         for family in 0..family_count {
+            state_init_done += 1;
+            crate::progress::set_position(state_init_done as u64);
             let lane_delta = lane
                 .checked_mul(invocation_layout.lane_group_stride)
                 .and_then(|value| value.checked_add(family * MULTI_FAMILY_STATE_STRIDE))
@@ -209,7 +218,17 @@ fn build_canonical_oep_gateway(
             )?);
         }
     }
+    crate::progress::finish_task(format!(
+        "Canonical state initializer complete: {} lane-state(s)",
+        state_init_total
+    ));
+    crate::progress::begin_detail_task(
+        "Generating lifetime synchronization descriptors",
+        lifetime_sync.entries.len() as u64,
+        "entries",
+    );
     for (index, entry) in lifetime_sync.entries.iter().enumerate() {
+        crate::progress::set_position((index + 1) as u64);
         let entry_va = lifetime_sync.base_va
             + (index * crate::vm::data_lifetime::LIFETIME_SYNC_ENTRY_SIZE) as u64;
         ins.push(Instruction::with2(
@@ -248,6 +267,10 @@ fn build_canonical_oep_gateway(
             Register::RAX,
         )?);
     }
+    crate::progress::finish_task(format!(
+        "Lifetime descriptors complete: {} entrie(s)",
+        lifetime_sync.entries.len()
+    ));
     ins.push(Instruction::with2(
         Code::Mov_r64_imm64,
         Register::R11,
@@ -1004,6 +1027,7 @@ pub(crate) fn build_multi_family_prog_mod(
     const OUTER_SIZING_CODE_BASE: u64 = 0x0000_0001_4000_0000;
     const OUTER_SIZING_STATE_BASE: u64 = OUTER_SIZING_CODE_BASE + 0x2000_0000;
     let sizing_only = code_va == 0;
+    let build_kind = if sizing_only { "sizing" } else { "final placement" };
     let effective_code_va = if sizing_only {
         OUTER_SIZING_CODE_BASE
     } else {
@@ -1042,9 +1066,16 @@ pub(crate) fn build_multi_family_prog_mod(
     let lane_group_stride = invocation_layout.lane_group_stride;
     let lane_control_va = invocation_layout.lane_control_va;
     let host_stack_pool_va = invocation_layout.host_stack_pool_va;
+    crate::progress::begin_detail_task(
+        format!("Program-VM {build_kind}: planning family bytecode chunks"),
+        modules.len() as u64,
+        "families",
+    );
     let chunk_plans: Vec<Vec<vm::chunk_crypto::BytecodeChunk>> = modules
         .iter()
-        .map(|module| {
+        .enumerate()
+        .map(|(module_index, module)| {
+            crate::progress::set_position((module_index + 1) as u64);
             vm::chunk_crypto::plan_chunks(
                 module.bytecode.len(),
                 &module.instruction_offsets,
@@ -1053,6 +1084,9 @@ pub(crate) fn build_multi_family_prog_mod(
             )
         })
         .collect();
+    crate::progress::finish_task(format!(
+        "Program-VM {build_kind}: chunk planning complete"
+    ));
 
     // The first build below is a sizing-only pass.  Cross-family routes still
     // flow through the production route validator, so their address fields must
@@ -1173,7 +1207,13 @@ pub(crate) fn build_multi_family_prog_mod(
     let dummy_native_callable_rewrites = dummy_native_call_rewrites;
 
     let mut sized = Vec::with_capacity(modules.len());
+    crate::progress::begin_detail_task(
+        format!("Program-VM {build_kind}: sizing family runtimes"),
+        modules.len() as u64,
+        "families",
+    );
     for (module_index, module) in modules.iter().enumerate() {
+        crate::progress::set_position((module_index + 1) as u64);
         let mut routes = dummy_routes(module.family)?;
         if routes.is_empty() {
             // Keep one unreachable route so the sizing pass and final pass use
@@ -1212,6 +1252,9 @@ pub(crate) fn build_multi_family_prog_mod(
             )?,
         );
     }
+    crate::progress::finish_task(format!(
+        "Program-VM {build_kind}: family runtime sizing complete"
+    ));
     let code_total: usize = sized.iter().map(|module| module.code.len()).sum();
     let table_total: usize = sized.iter().map(|module| module.table.len()).sum();
     let mut code_offsets = Vec::with_capacity(modules.len());
@@ -1245,7 +1288,13 @@ pub(crate) fn build_multi_family_prog_mod(
 
     let mut sized_gateway_total = 0usize;
     let mut gateway_offsets = std::collections::BTreeMap::new();
-    for &target_va in &gateway_targets {
+    crate::progress::begin_detail_task(
+        format!("Program-VM {build_kind}: sizing native entry gateways"),
+        gateway_targets.len() as u64,
+        "gateways",
+    );
+    for (gateway_index, &target_va) in gateway_targets.iter().enumerate() {
+        crate::progress::set_position((gateway_index + 1) as u64);
         let (target_index, target) = modules
             .iter()
             .enumerate()
@@ -1271,6 +1320,9 @@ pub(crate) fn build_multi_family_prog_mod(
         )?;
         sized_gateway_total += bytes.len();
     }
+    crate::progress::finish_task(format!(
+        "Program-VM {build_kind}: native gateway sizing complete"
+    ));
     let full_code_total = code_total + canonical_gateway_size + sized_gateway_total;
     let native_pointer_rewrites: Vec<(u64, u64)> = gateway_targets
         .iter()
@@ -1286,7 +1338,13 @@ pub(crate) fn build_multi_family_prog_mod(
     let mut built = Vec::with_capacity(modules.len());
     let mut native_bridge_ranges = Vec::new();
     let mut lifetime_cleanup_handler_offset = None;
+    crate::progress::begin_detail_task(
+        format!("Program-VM {build_kind}: generating family runtimes"),
+        modules.len() as u64,
+        "families",
+    );
     for (index, module) in modules.iter().enumerate() {
+        crate::progress::set_position((index + 1) as u64);
         let mut routes = materialized
             .route_table
             .iter()
@@ -1409,6 +1467,9 @@ pub(crate) fn build_multi_family_prog_mod(
         }
         built.push(built_module);
     }
+    crate::progress::finish_task(format!(
+        "Program-VM {build_kind}: family runtime generation complete"
+    ));
 
     let mut code = Vec::with_capacity(full_code_total);
     let mut table = Vec::with_capacity(table_total);
@@ -1445,7 +1506,13 @@ pub(crate) fn build_multi_family_prog_mod(
     code.extend_from_slice(&canonical_gateway);
 
     let mut native_entry_gateways = BTreeMap::new();
-    for &target_va in &gateway_targets {
+    crate::progress::begin_detail_task(
+        format!("Program-VM {build_kind}: emitting native entry gateways"),
+        gateway_targets.len() as u64,
+        "gateways",
+    );
+    for (gateway_index, &target_va) in gateway_targets.iter().enumerate() {
+        crate::progress::set_position((gateway_index + 1) as u64);
         let (target_index, target) = modules
             .iter()
             .enumerate()
@@ -1474,6 +1541,9 @@ pub(crate) fn build_multi_family_prog_mod(
         code.extend_from_slice(&bytes);
         native_entry_gateways.insert(target_va, gateway_off);
     }
+    crate::progress::finish_task(format!(
+        "Program-VM {build_kind}: native entry gateways complete"
+    ));
     if code.len() != full_code_total {
         return Err(anyhow::anyhow!(
             "native gateway sizing drift: {} != {}",
