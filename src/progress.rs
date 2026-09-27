@@ -30,6 +30,7 @@ struct ProgressState {
     unit: String,
     position: u64,
     total: u64,
+    task_affects_overall: bool,
     last_render: Instant,
     last_line_len: usize,
     last_log_bucket: u32,
@@ -55,6 +56,7 @@ impl Default for ProgressState {
             unit: String::new(),
             position: 0,
             total: 0,
+            task_affects_overall: true,
             last_render: now,
             last_line_len: 0,
             last_log_bucket: u32::MAX,
@@ -87,6 +89,7 @@ pub fn configure(enabled: bool, refresh_ms: u64) {
     s.unit.clear();
     s.position = 0;
     s.total = 0;
+    s.task_affects_overall = true;
     s.last_render = now.checked_sub(s.refresh).unwrap_or(now);
     s.last_line_len = 0;
     s.last_log_bucket = u32::MAX;
@@ -115,6 +118,7 @@ pub fn begin_phase(base_bp: u32, span_bp: u32, label: impl Into<String>) {
     s.unit.clear();
     s.position = 0;
     s.total = 0;
+    s.task_affects_overall = true;
     render_locked(&mut s, true);
 }
 
@@ -138,18 +142,30 @@ pub fn subphase(rel_base_bp: u32, rel_span_bp: u32, label: impl Into<String>) {
     s.position = 0;
     s.total = 0;
     s.unit.clear();
+    s.task_affects_overall = true;
     render_locked(&mut s, true);
 }
 
 pub fn begin_task(label: impl Into<String>, total: u64, unit: impl Into<String>) {
+    begin_task_inner(label.into(), total, unit.into(), true);
+}
+
+/// Start an exact local counter without moving the weighted overall percentage.
+/// Use this for nested scans inside a larger weighted phase.
+pub fn begin_detail_task(label: impl Into<String>, total: u64, unit: impl Into<String>) {
+    begin_task_inner(label.into(), total, unit.into(), false);
+}
+
+fn begin_task_inner(label: String, total: u64, unit: String, affects_overall: bool) {
     let mut s = state().lock().expect("progress mutex poisoned");
     if !s.enabled {
         return;
     }
-    s.task = label.into();
-    s.unit = unit.into();
+    s.task = label;
+    s.unit = unit;
     s.position = 0;
     s.total = total;
+    s.task_affects_overall = affects_overall;
     s.task_started = Instant::now();
     render_locked(&mut s, true);
 }
@@ -164,7 +180,7 @@ pub fn set_position(position: u64) {
     } else {
         position.min(s.total)
     };
-    if s.total != 0 {
+    if s.total != 0 && s.task_affects_overall {
         let local = (u128::from(s.active_span_bp) * u128::from(s.position)
             / u128::from(s.total)) as u32;
         s.overall_bp = s.overall_bp.max((s.active_base_bp + local).min(10_000));
@@ -199,9 +215,11 @@ pub fn finish_task(label: impl Into<String>) {
     }
     if s.total != 0 {
         s.position = s.total;
+        if s.task_affects_overall {
         s.overall_bp = s
             .overall_bp
             .max((s.active_base_bp + s.active_span_bp).min(10_000));
+        }
     }
     s.task = label.into();
     render_locked(&mut s, true);
@@ -256,13 +274,19 @@ fn render_locked(s: &mut ProgressState, force: bool) {
     }
 
     let width = 32usize;
-    let filled = ((u64::from(s.overall_bp) * width as u64) / 10_000) as usize;
+    let local_fraction = if s.total == 0 {
+        f64::from(s.overall_bp) / 10_000.0
+    } else {
+        (s.position as f64 / s.total as f64).clamp(0.0, 1.0)
+    };
+    let filled = (local_fraction * width as f64).floor() as usize;
     let bar = format!(
         "{}{}",
         "=".repeat(filled.min(width)),
         "-".repeat(width.saturating_sub(filled))
     );
     let overall = f64::from(s.overall_bp) / 100.0;
+    let local_percent = local_fraction * 100.0;
     let elapsed = now.duration_since(s.started);
 
     let detail = if s.total != 0 {
@@ -294,13 +318,24 @@ fn render_locked(s: &mut ProgressState, force: bool) {
         format!("{} | {}", s.phase, s.task)
     };
 
-    let line = format!(
-        "[{}] {:>6.2}% | {} | elapsed {}",
-        bar,
-        overall,
-        detail,
-        format_duration(elapsed),
-    );
+    let line = if s.total != 0 {
+        format!(
+            "[{}] task {:>6.2}% | overall {:>6.2}% | {} | elapsed {}",
+            bar,
+            local_percent,
+            overall,
+            detail,
+            format_duration(elapsed),
+        )
+    } else {
+        format!(
+            "[{}] overall {:>6.2}% | {} | elapsed {}",
+            bar,
+            overall,
+            detail,
+            format_duration(elapsed),
+        )
+    };
 
     if s.tty {
         let pad = s.last_line_len.saturating_sub(line.chars().count());
