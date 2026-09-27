@@ -1225,45 +1225,53 @@ pub(crate) fn place_boot_stub(
     };
     ctx.vm_integrity_table_len = 0;
 
-    // ── M6 Phase-2: 프로그램 VM을 KSA/PRGA VM 뒤에 배치 (각각 독립 state) ──────
+    // ── M6 Phase-2: Program-VM immutable image first; mutable state is separate ──
     let vm_prog_off = cursor;
-    let (vm_prog_entry_va, vm_prog_state_va, vm_prog_total) = if let Some(m) = &vm_prog_mod {
-        // P1-5: keep mutable Program-VM state on a page that does not overlap
-        // generated code, immutable tables, or ciphertext bytecode.  This lets
-        // mem-harden seal the preceding pages RX without making state writes
-        // fault.  The zero-filled alignment gap is intentional.
-        let immutable_end = vm_prog_off + m.code.len() + m.table.len() + m.bytecode.len();
-        let state_off = (immutable_end + 0xFFF) & !0xFFF;
-        let sva = dispatcher_va + state_off as u64;
-        let entry_gateway_off = vm_multi_family_sizing
-            .as_ref()
-            .map(|multi| multi.canonical_entry_gateway_offset)
-            .unwrap_or(0);
-        (
-            dispatcher_va + vm_prog_off as u64 + entry_gateway_off as u64,
-            sva,
-            state_off - vm_prog_off
-                + if let Some(multi) = &vm_multi_family_sizing {
-                    multi.invocation_layout.reserve_size
-                } else {
-                    vm::VM_STATE_SIZE
-                },
-        )
+    let vm_prog_immutable_len = vm_prog_mod
+        .as_ref()
+        .map(|m| m.code.len() + m.table.len() + m.bytecode.len())
+        .unwrap_or(0);
+    let entry_gateway_off = vm_multi_family_sizing
+        .as_ref()
+        .map(|multi| multi.canonical_entry_gateway_offset)
+        .unwrap_or(0);
+    let vm_prog_entry_va = if vm_prog_mod.is_some() {
+        dispatcher_va + vm_prog_off as u64 + entry_gateway_off as u64
     } else {
-        (0, 0, 0)
+        0
     };
-    // reserve the dedicated bytecode return-IP stack (CALL_STACK_SIZE) for the program VM
-    cursor += vm_prog_total
-        + if vm_prog_mod.is_some() && !vm_multi_family_active {
-            crate::vm::interp::CALL_STACK_SIZE
-        } else {
-            0
-        };
-    cursor = (cursor + 7) & !7; // align 8
-                                // Everything up to this point is the mutable Program-VM reservation. Boot
-                                // seed/tag/descriptor metadata is allocated below and must remain
-                                // file-backed even when the state reservation itself is loader zero-fill.
-    let vm_prog_state_reservation_end = cursor;
+    let vm_prog_state_reserve = if vm_prog_mod.is_some() {
+        vm_multi_family_sizing
+            .as_ref()
+            .map(|multi| multi.invocation_layout.reserve_size)
+            .unwrap_or(vm::VM_STATE_SIZE)
+    } else {
+        0
+    };
+
+    // Multi-family state is loader-backed sparse RW/NX memory. Do not advance
+    // the file-backed boot cursor through hundreds of MiB of zero-fill state:
+    // runs/seed/descriptor metadata must remain adjacent to the immutable
+    // Program-VM image. The actual .vstate VA is selected after all boot
+    // metadata has been sized below.
+    let mut vm_prog_state_va = 0u64;
+    let mut vm_prog_total = vm_prog_immutable_len;
+    let mut vm_prog_state_reservation_end = 0usize;
+    if vm_prog_mod.is_some() && !vm_multi_family_active {
+        // Legacy/single-family path keeps its state contiguous with the module.
+        let immutable_end = vm_prog_off + vm_prog_immutable_len;
+        let state_off = (immutable_end + 0xFFF) & !0xFFF;
+        vm_prog_state_va = dispatcher_va + state_off as u64;
+        vm_prog_total = state_off - vm_prog_off + vm_prog_state_reserve;
+        cursor = vm_prog_off
+            + vm_prog_total
+            + crate::vm::interp::CALL_STACK_SIZE;
+        cursor = (cursor + 7) & !7;
+        vm_prog_state_reservation_end = cursor;
+    } else {
+        cursor = vm_prog_off + vm_prog_immutable_len;
+        cursor = (cursor + 7) & !7;
+    }
 
     // ── P4 (전체 SEH 가상화): Program VM 모듈 위치를 ctx에 기록 — build.rs가
     // .pdata 브리지 UNWIND_INFO로 이 영역을 커버해 OS unwinder가 VM 내부 프레임을
