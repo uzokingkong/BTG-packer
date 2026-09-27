@@ -324,8 +324,22 @@ fn render_locked(s: &mut ProgressState, force: bool) {
         "-".repeat(width.saturating_sub(filled))
     );
     let overall = f64::from(s.overall_bp) / 100.0;
+    let overall_fraction = f64::from(s.overall_bp) / 10_000.0;
     let local_percent = local_fraction * 100.0;
     let elapsed = now.duration_since(s.started);
+    let overall_eta = if overall_fraction > 0.01
+        && overall_fraction < 1.0
+        && elapsed.as_secs_f64() >= 1.0
+    {
+        Some(Duration::from_secs_f64(
+            elapsed.as_secs_f64() * (1.0 - overall_fraction) / overall_fraction,
+        ))
+    } else {
+        None
+    };
+    let overall_eta_text = overall_eta
+        .map(format_duration)
+        .unwrap_or_else(|| "--:--".to_string());
 
     let detail = if s.total != 0 {
         let task_elapsed = now.duration_since(s.task_started).as_secs_f64();
@@ -358,19 +372,21 @@ fn render_locked(s: &mut ProgressState, force: bool) {
 
     let line = if s.total != 0 {
         format!(
-            "[{}] task {:>6.2}% | overall {:>6.2}% | {} | elapsed {}",
+            "[{}] task {:>6.2}% | overall {:>6.2}% | {} | total ETA ~{} | elapsed {}",
             bar,
             local_percent,
             overall,
             detail,
+            overall_eta_text,
             format_duration(elapsed),
         )
     } else {
         format!(
-            "[{}] overall {:>6.2}% | {} | elapsed {}",
+            "[{}] overall {:>6.2}% | {} | total ETA ~{} | elapsed {}",
             bar,
             overall,
             detail,
+            overall_eta_text,
             format_duration(elapsed),
         )
     };
