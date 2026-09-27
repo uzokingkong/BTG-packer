@@ -31,7 +31,6 @@ impl Drop for LogFlushGuard {
     }
 }
 
-
 fn format_progress_duration(duration: Duration) -> String {
     let total = duration.as_secs();
     let hours = total / 3600;
@@ -599,7 +598,7 @@ fn main() -> error::Result<()> {
             let _ = pipeline::selective_vm::SelectiveVmPass::run(&mut ctx, poly_seed);
         }
     }
-    progress.report(15, "VM preparation complete");
+    progress.report(15, "Pre-pass preparation complete");
 
     // ── Pass 1: CFG 추출 + MicroSlicer ────────────────────────────────────────────
     progress.report(16, "Pass 1/4: CFG extraction + micro-slicing");
@@ -1037,7 +1036,7 @@ fn main() -> error::Result<()> {
         }
     }
 
-    progress.report(99, "Writing manifests / optional analysis artifacts");
+    progress.report(99, "Finalizing optional diagnostics");
 
     // ── 디버그 출력 ───────────────────────────────────────────────────────────────
     if args.debug || args.trace_blocks {
