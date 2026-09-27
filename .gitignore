@@ -17,6 +17,8 @@ _*.diff
 packed_*.map
 packed_*.sym
 packed_*.riscmap.csv
+*.btgmanifest
+*.csv
 
 # Archives / scratch
 *.zip
