@@ -27,6 +27,7 @@ pub fn run_with_indirect_resolutions(
     let target_base_va = ctx.target_info.image_base + ctx.target_info.text_rva as u64;
     let target_ep_va = ctx.target_info.image_base + ctx.target_info.entry_point_rva as u64;
 
+    crate::progress::subphase(0, 4000, "Pass 1: CFG extraction");
     let (mut basic_blocks, mut bi_graph) = CfgExtractor::extract(
         &ctx.target_info.text_bytes,
         target_base_va,
@@ -35,6 +36,12 @@ pub fn run_with_indirect_resolutions(
         ctx.target_info.image_base,
     )?;
 
+    crate::progress::subphase(4000, 2500, "Pass 1: canonical ProgramModel analysis");
+    crate::progress::begin_detail_task(
+        "ProgramModel analysis",
+        basic_blocks.len() as u64,
+        "basic blocks",
+    );
     let mut program_model =
         crate::analysis::program_model_builder::ProgramModelBuilder::new(&ctx.target_info)
             .build_with_basic_blocks_and_auto_indirect_resolutions(
@@ -42,6 +49,10 @@ pub fn run_with_indirect_resolutions(
                 indirect_resolutions,
             )
             .map_err(|error| anyhow::anyhow!(error))?;
+    crate::progress::finish_task(format!(
+        "ProgramModel initial analysis complete: {} function(s)",
+        program_model.functions.len()
+    ));
     let existing_starts = basic_blocks
         .iter()
         .map(|block| block.start_va)
@@ -279,6 +290,7 @@ pub fn run_with_indirect_resolutions(
     let (text_start_va, text_end_va) = ctx.text_va_range();
 
     // dispatcher_va + 0x20 = 실제 셸코드 시작점 (OEP Stub 0x00~0x1F 이후)
+    crate::progress::subphase(6500, 2500, "Pass 1: MicroSlicer + dispatcher routing");
     let (trigger_blocks, va_to_trigger_id, mut call_target_block_ids) = slicer.slice_blocks(
         &basic_blocks,
         ctx.dispatcher_va + 0x20,
@@ -287,6 +299,7 @@ pub fn run_with_indirect_resolutions(
         &native_starts,
     )?;
 
+    crate::progress::subphase(9000, 1000, "Pass 1: reference inventory + metrics");
     // v13: 데이터/코드 **직접 참조** 블록도 평문 유지 대상에 추가한다.
     // 디스패처를 거치지 않고 직접 실행되는 경로:
     //   - .rdata/.data 함수 포인터 (CRT init 테이블, vtable, SEH 핸들러, 점프 테이블)
