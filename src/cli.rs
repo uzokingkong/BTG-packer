@@ -103,6 +103,11 @@ pub struct CliArgs {
     #[arg(short = 'g', long)]
     pub log_file: Option<PathBuf>,
 
+    /// Disable stage-based packing progress and ETA lines.
+    /// Progress is enabled by default for normal pack operations.
+    #[arg(long, default_value_t = false)]
+    pub no_progress: bool,
+
     /// Inject runtime block execution tracer into packed binary
     #[arg(long, default_value_t = false)]
     pub trace_blocks: bool,
