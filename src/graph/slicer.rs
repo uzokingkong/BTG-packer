@@ -54,7 +54,13 @@ impl MicroSlicer {
         // --------------------------------------------------------------------------
         // PASS A: Actual Chunking & Exact VA -> Trigger ID Mapping Construction
         // -------------------------------------------------------------------------
-        for bb in basic_blocks {
+        crate::progress::begin_detail_task(
+            "MicroSlicer pass A: block chunking + VA map",
+            basic_blocks.len() as u64,
+            "basic blocks",
+        );
+        for (bb_index, bb) in basic_blocks.iter().enumerate() {
+            crate::progress::set_position((bb_index + 1) as u64);
             let mut chunk = Vec::new();
             let mut first_block_for_bb = true;
 
@@ -94,6 +100,11 @@ impl MicroSlicer {
             }
         }
 
+        crate::progress::finish_task(format!(
+            "MicroSlicer pass A complete: {} draft block(s)",
+            draft_blocks.len()
+        ));
+
         // ---------------------------------------------------------------------------
         // v11: 직접 call 타깃 블록 수집 (재암호화 모드 평문 유지 대상)
         // ---------------------------------------------------------------------------
@@ -103,7 +114,13 @@ impl MicroSlicer {
         // 발생한다 (full.exe Block 3920 재현). 이 집합의 블록은 암호화되지 않고
         // 디스패처가 길이 0 센티널로 암호화/복호화를 건너뛴다.
         let mut call_target_block_ids: HashSet<u32> = HashSet::new();
-        for bb in basic_blocks {
+        crate::progress::begin_detail_task(
+            "MicroSlicer: direct-call target analysis",
+            basic_blocks.len() as u64,
+            "basic blocks",
+        );
+        for (bb_index, bb) in basic_blocks.iter().enumerate() {
+            crate::progress::set_position((bb_index + 1) as u64);
             for inst in &bb.instructions {
                 if inst.flow_control() == FlowControl::Call {
                     let tgt = inst.near_branch_target();
@@ -134,12 +151,26 @@ impl MicroSlicer {
             }
         }
 
+        crate::progress::finish_task(format!(
+            "Direct-call analysis complete: {} target block(s)",
+            call_target_block_ids.len()
+        ));
+
         // ---------------------------------------------------------------------------
         // PASS B: Branch Target Resolution & Dispatcher Stub Generation
         // --------------------------------------------------------------------------
-        let mut trigger_blocks = Vec::with_capacity(draft_blocks.len());
+        let draft_count = draft_blocks.len();
+        let mut trigger_blocks = Vec::with_capacity(draft_count);
+        crate::progress::begin_detail_task(
+            "MicroSlicer pass B: dispatcher stubs + branch routing",
+            draft_count as u64,
+            "trigger blocks",
+        );
 
-        for (mut tb, mut chunk, is_last_inst, flow, current_inst, block_id) in draft_blocks {
+        for (draft_index, (mut tb, mut chunk, is_last_inst, flow, current_inst, block_id)) in
+            draft_blocks.into_iter().enumerate()
+        {
+            crate::progress::set_position((draft_index + 1) as u64);
             let cpu_state = CpuState {
                 registers: HashMap::new(),
                 flags: 0,
@@ -394,6 +425,10 @@ impl MicroSlicer {
             trigger_blocks.push(tb);
         }
 
+        crate::progress::finish_task(format!(
+            "MicroSlicer complete: {} trigger block(s)",
+            trigger_blocks.len()
+        ));
         Ok((trigger_blocks, va_to_trigger_id, call_target_block_ids))
     }
 
