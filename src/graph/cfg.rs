@@ -324,7 +324,7 @@ impl CfgExtractor {
             let inst_va = inst.ip();
 
             if block_starts.contains(&inst_va) && !current_insts.is_empty() {
-                let successors = Self::compute_successors(&current_insts);
+                let successors = Self::compute_successors(&current_insts, &pad_runs);
                 basic_blocks.push(BasicBlock {
                     id: current_block_id,
                     start_va: current_start_va,
@@ -339,7 +339,7 @@ impl CfgExtractor {
         }
 
         if !current_insts.is_empty() {
-            let successors = Self::compute_successors(&current_insts);
+            let successors = Self::compute_successors(&current_insts, &pad_runs);
             basic_blocks.push(BasicBlock {
                 id: current_block_id,
                 start_va: current_start_va,
@@ -375,16 +375,14 @@ impl CfgExtractor {
                         }
                     }
                     FlowControl::ConditionalBranch => {
-                        let taken = last.near_branch_target();
-                        let fallthrough = last.ip() + last.len() as u64;
-                        let taken_id = basic_blocks
-                            .iter()
-                            .find(|b| b.start_va == taken)
+                        let taken = bb.successor_vas.first().copied();
+                        let fallthrough = bb.successor_vas.get(1).copied();
+                        let taken_id = taken
+                            .and_then(|target| basic_blocks.iter().find(|b| b.start_va == target))
                             .map(|b| b.id)
                             .unwrap_or(u32::MAX);
-                        let fallthrough_id = basic_blocks
-                            .iter()
-                            .find(|b| b.start_va == fallthrough)
+                        let fallthrough_id = fallthrough
+                            .and_then(|target| basic_blocks.iter().find(|b| b.start_va == target))
                             .map(|b| b.id)
                             .unwrap_or(u32::MAX);
 
@@ -395,15 +393,26 @@ impl CfgExtractor {
                             graph.add_edge(bb.id, fallthrough_id, EdgeType::ConditionalFalse, 1);
                         }
                     }
-                    FlowControl::Call => {
-                        let return_site = last.ip() + last.len() as u64;
-                        let return_id = basic_blocks
-                            .iter()
-                            .find(|b| b.start_va == return_site)
+                    FlowControl::Call | FlowControl::IndirectCall => {
+                        let return_id = bb
+                            .successor_vas
+                            .first()
+                            .and_then(|target| basic_blocks.iter().find(|b| b.start_va == *target))
                             .map(|b| b.id)
                             .unwrap_or(u32::MAX);
                         if return_id != u32::MAX {
                             graph.add_edge(bb.id, return_id, EdgeType::Call, 1);
+                        }
+                    }
+                    FlowControl::Next => {
+                        let next_id = bb
+                            .successor_vas
+                            .first()
+                            .and_then(|target| basic_blocks.iter().find(|b| b.start_va == *target))
+                            .map(|b| b.id)
+                            .unwrap_or(u32::MAX);
+                        if next_id != u32::MAX {
+                            graph.add_edge(bb.id, next_id, EdgeType::Unconditional, 1);
                         }
                     }
                     FlowControl::Return => {
@@ -420,19 +429,31 @@ impl CfgExtractor {
         Ok((basic_blocks, graph))
     }
 
-    fn compute_successors(insts: &[Instruction]) -> Vec<u64> {
+    fn normalize_linear_fallthrough(target: u64, pad_runs: &[(u64, u64)]) -> u64 {
+        pad_runs
+            .iter()
+            .find_map(|&(pad_start, first_real)| {
+                (pad_start <= target && target < first_real).then_some(first_real)
+            })
+            .unwrap_or(target)
+    }
+
+    fn compute_successors(insts: &[Instruction], pad_runs: &[(u64, u64)]) -> Vec<u64> {
         let mut successors = Vec::new();
         if let Some(last) = insts.last() {
+            let linear = || {
+                Self::normalize_linear_fallthrough(last.ip() + last.len() as u64, pad_runs)
+            };
             match last.flow_control() {
                 FlowControl::UnconditionalBranch => {
                     successors.push(last.near_branch_target());
                 }
                 FlowControl::ConditionalBranch => {
                     successors.push(last.near_branch_target()); // Taken path target
-                    successors.push(last.ip() + last.len() as u64); // Fallthrough path target
+                    successors.push(linear()); // Canonical fallthrough after skipped padding
                 }
-                FlowControl::Call => {
-                    successors.push(last.ip() + last.len() as u64); // Return site
+                FlowControl::Call | FlowControl::IndirectCall | FlowControl::Next => {
+                    successors.push(linear());
                 }
                 _ => {}
             }
@@ -444,6 +465,27 @@ impl CfgExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linear_fallthrough_skips_only_known_padding_run() {
+        let pads = [(0x104E, 0x1050)];
+        assert_eq!(
+            CfgExtractor::normalize_linear_fallthrough(0x104E, &pads),
+            0x1050
+        );
+        assert_eq!(
+            CfgExtractor::normalize_linear_fallthrough(0x104F, &pads),
+            0x1050
+        );
+        assert_eq!(
+            CfgExtractor::normalize_linear_fallthrough(0x104D, &pads),
+            0x104D
+        );
+        assert_eq!(
+            CfgExtractor::normalize_linear_fallthrough(0x1050, &pads),
+            0x1050
+        );
+    }
 
     #[test]
     fn reachable_int3_is_preserved() {
