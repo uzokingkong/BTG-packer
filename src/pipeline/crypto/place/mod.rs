@@ -971,6 +971,11 @@ pub(crate) fn place_boot_stub(
         );
     }
     let vm_multi_family_sizing = if vm_multi_family_active {
+        crate::progress::subphase(
+            8000,
+            700,
+            "Commercial Program-VM: runtime sizing pass",
+        );
         let plan = ctx.vm_family_plan.as_ref().ok_or_else(|| {
             anyhow::anyhow!("multi-family materialization is missing its family plan")
         })?;
@@ -1022,6 +1027,13 @@ pub(crate) fn place_boot_stub(
         None
     };
 
+    if vm_multi_family_active {
+        crate::progress::subphase(
+            8700,
+            500,
+            "Commercial Program-VM: boot/runtime layout planning",
+        );
+    }
     let mut cursor = boot_off + stub_code_len + ad_bytes.len();
     if vm_mod.is_some() {
         cursor = (cursor + 15) & !15; // align 16 (VM 모듈 시작)
@@ -2120,6 +2132,11 @@ pub(crate) fn place_boot_stub(
     if let Some(m) = vm_prog_mod {
         let prva = dispatcher_va + vm_prog_off as u64;
         let multi_built = if vm_multi_family_active {
+            crate::progress::subphase(
+                9200,
+                700,
+                "Commercial Program-VM: final runtime code generation",
+            );
             Some(build_multi_family_prog_mod(
                 ctx.vm_multi_family.as_ref().unwrap(),
                 ctx.vm_family_plan.as_ref().unwrap().entry_family,
@@ -2184,6 +2201,13 @@ pub(crate) fn place_boot_stub(
                 rng,
             )?
         };
+        if vm_multi_family_active {
+            crate::progress::subphase(
+                9900,
+                100,
+                "Commercial Program-VM: final module placement",
+            );
+        }
         let prend = vm_prog_off + prmod.total_len();
         println!(
             "[DEBUG pass2 prmod] code={} table={} bc={} total={} prend={} btg_len={}",

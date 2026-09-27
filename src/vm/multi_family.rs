@@ -317,7 +317,14 @@ impl MultiFamilyProgramPlan {
 
     pub fn materialize(&self, seed: u64) -> Result<MaterializedMultiFamilyProgram, String> {
         let mut modules = Vec::with_capacity(self.partitions.len());
-        for partition in &self.partitions {
+        for (partition_index, partition) in self.partitions.iter().enumerate() {
+            crate::progress::set_task(format!(
+                "Preparing {:?} VM family module {}/{} ({} micro-op(s))",
+                partition.family,
+                partition_index + 1,
+                self.partitions.len(),
+                partition.program.instrs.len()
+            ));
             let module_domain = crate::vm::key_domains::derive_u64(
                 seed,
                 crate::vm::key_domains::VmKeyDomain::FamilyState,
@@ -470,6 +477,11 @@ impl MultiFamilyProgramPlan {
         }
 
         let mut route_table = Vec::with_capacity(self.routes.len());
+        crate::progress::begin_detail_task(
+            "Materializing cross-family route table",
+            self.routes.len() as u64,
+            "routes",
+        );
 
         // Runtime routing must retain source-callsite identity.  A single source
         // family can legitimately CALL and tail-JUMP to the same target function;
@@ -480,7 +492,8 @@ impl MultiFamilyProgramPlan {
             (VmArchitectureFamily, usize, CrossFamilyRouteKind),
         > = HashMap::new();
 
-        for route in &self.routes {
+        for (route_index, route) in self.routes.iter().enumerate() {
+            crate::progress::set_position((route_index + 1) as u64);
             let source = self
                 .partitions
                 .iter()
@@ -530,6 +543,11 @@ impl MultiFamilyProgramPlan {
                 kind: route.kind,
             });
         }
+        crate::progress::finish_task(format!(
+            "Multi-family materialization complete: {} module(s), {} route(s)",
+            modules.len(),
+            route_table.len()
+        ));
         Ok(MaterializedMultiFamilyProgram {
             modules,
             route_table,

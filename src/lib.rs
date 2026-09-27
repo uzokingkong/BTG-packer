@@ -31,6 +31,7 @@ pub mod obfuscation;
 pub mod pe;
 pub mod pipeline;
 pub mod protection_profile;
+pub mod progress;
 pub mod qa;
 pub mod sdk;
 pub mod util;

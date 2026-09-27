@@ -221,6 +221,7 @@ pub fn run(
         );
     }
 
+    crate::progress::subphase(0, 500, "Crypto pre-placement: keys + at-rest encryption");
     let (block_keys, total_blocks) = perblock::collect_block_keys(ctx, &layout, reencrypt);
 
     // ── 2. 키 상수 생성 ──────────────────────────────────────────────────────
@@ -296,21 +297,35 @@ pub fn run(
         // v61: --custom-cipher면 per-block 키(key4)를 BTG-C1 키(8회 반복)로
         // 확장해 BtgCipher로 암호화한다 — M7/reencrypt C1 디스패처가 동일 재생.
         if c1_mode {
-            for (off, len, key_u32) in &block_keys {
+            crate::progress::begin_detail_task(
+                "Per-block BTG-C1 encryption",
+                block_keys.len() as u64,
+                "blocks",
+            );
+            for (block_index, (off, len, key_u32)) in block_keys.iter().enumerate() {
+                crate::progress::set_position((block_index + 1) as u64);
                 let key32 = cipher::repeat4(*key_u32);
                 let mut c1b = crate::crypto::BtgCipher::new(&key32, 0);
                 c1b.crypt(&mut btg.bytes[*off..*off + *len]);
             }
+            crate::progress::finish_task("Per-block BTG-C1 encryption complete");
             // 문자열 런 키스트림: seed 유도 C1 (부트 스텁 c1 blob과 동일)
             let (c1_key, c1_nonce) = cipher::derive_c1_key_nonce(&seed_masked);
             c1 = Some(crate::crypto::BtgCipher::new(&c1_key, c1_nonce));
         } else {
-            for (off, len, key_u32) in &block_keys {
+            crate::progress::begin_detail_task(
+                "Per-block stream encryption",
+                block_keys.len() as u64,
+                "blocks",
+            );
+            for (block_index, (off, len, key_u32)) in block_keys.iter().enumerate() {
+                crate::progress::set_position((block_index + 1) as u64);
                 let meta = BlockCryptoMeta::new(*off as u32, *off as u64, *len as u32);
                 let mut rc4b = <Rc4 as CryptoProvider>::from_key(&key_u32.to_le_bytes());
                 rc4b.encrypt_block(&meta, &mut btg.bytes[*off..*off + *len])
                     .map_err(|e| anyhow::anyhow!("reencrypt block {}: {}", meta.block_id, e))?;
             }
+            crate::progress::finish_task("Per-block stream encryption complete");
         }
         if integrity_effective {
             crc_source = Some(btg.bytes[code_start..code_end].to_vec());
@@ -399,7 +414,13 @@ pub fn run(
     );
 
     // 5b. 문자열 런 (부트 스텁 런 테이블과 같은 순서) — CryptoProvider.apply
-    for run in &runs {
+    crate::progress::begin_detail_task(
+        "Encrypting protected data/string runs",
+        runs.len() as u64,
+        "runs",
+    );
+    for (run_index, run) in runs.iter().enumerate() {
+        crate::progress::set_position((run_index + 1) as u64);
         let sec = &mut ctx.patched_sections[run.sec_idx];
         if let Some(c) = c1.as_mut() {
             c.crypt(&mut sec.bytes[run.offset..run.offset + run.len]);
@@ -409,6 +430,10 @@ pub fn run(
             rc4.apply(&mut sec.bytes[run.offset..run.offset + run.len]);
         }
     }
+    crate::progress::finish_task(format!(
+        "Protected data encryption complete: {} run(s)",
+        runs.len()
+    ));
 
     // v60: place_boot_stub로 넘길 연속 키스트림 (코드 영역 + 런을 이미 소모한 인스턴스)
     let mut stream: BootStreamCipher = if let Some(c) = c1.take() {

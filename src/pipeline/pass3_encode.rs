@@ -210,10 +210,24 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
     let mut dense_offsets = layout.table_offsets.clone();
 
     for _iter in 0..MAX_ITERS {
+        let iter_base = (_iter as u32 * 7000) / MAX_ITERS as u32;
+        let iter_span = (7000 / MAX_ITERS as u32).max(1);
+        crate::progress::subphase(
+            iter_base,
+            iter_span,
+            format!("Pass 3: dense-layout convergence {}/{}", _iter + 1, MAX_ITERS),
+        );
+        crate::progress::begin_task(
+            format!("Encoding convergence iteration {}/{}", _iter + 1, MAX_ITERS),
+            num_blocks as u64,
+            "blocks",
+        );
+
         // (a) 현재 오프셋 기준 모든 블록 인코딩 길이 측정
         let mut lens: Vec<usize> = Vec::with_capacity(num_blocks);
 
-        for block in layout.shuffled_blocks.iter() {
+        for (block_index, block) in layout.shuffled_blocks.iter().enumerate() {
+            crate::progress::set_position((block_index + 1) as u64);
             let logical_id = block.id as usize;
             let phys_offset = dense_offsets[logical_id] as usize;
             let mut wb = block.clone();
@@ -230,6 +244,11 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
             )?;
             lens.push(wb.instructions.len());
         }
+        crate::progress::finish_task(format!(
+            "Convergence iteration {} encoded {} block(s)",
+            _iter + 1,
+            num_blocks
+        ));
 
         // (b) 밀집 배치: 첫 블록은 기존 시작 오프셋(최소 오프셋) 유지
         // v4: 크기 최적화 — 16B 정렬은 실제로 정렬된 SIMD 메모리 접근을 포함한
@@ -256,7 +275,14 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
     }
 
     // ── 최종 인코딩 & 테이블 갱신 ────────────────────────────────────────────────
-    for block in layout.shuffled_blocks.iter_mut() {
+    crate::progress::subphase(7000, 2000, "Pass 3: final block encoding");
+    crate::progress::begin_task(
+        "Final RIP-fixup + BlockEncoder pass",
+        num_blocks as u64,
+        "blocks",
+    );
+    for (block_index, block) in layout.shuffled_blocks.iter_mut().enumerate() {
+        crate::progress::set_position((block_index + 1) as u64);
         let logical_id = block.id as usize;
         let phys_offset = dense_offsets[logical_id] as usize;
         let mut wb = block.clone();
@@ -288,6 +314,7 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         layout.table_offsets[logical_id] = real_off;
         layout.encrypted_table_entries[logical_id] = real_off ^ key;
     }
+    crate::progress::finish_task("Final block encoding complete");
 
     println!(
         "[+] Pass 3 Complete: {} blocks densely packed; table entries encrypted.",
@@ -299,11 +326,18 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
     // 평문 유지 집합(call_target_block_ids)에 없는 블록을 가리키면, 런타임에 그 블록은
     // 암호문 상태로 실행되어 0xC000001D 크래시가 발생한다. 여기서 전수 검사한다.
     if ctx.reencrypt {
+        crate::progress::subphase(9000, 1000, "Pass 3: encrypted direct-reference validation");
+        crate::progress::begin_task(
+            "Validating direct references against encrypted block ownership",
+            num_blocks as u64,
+            "blocks",
+        );
         let dispatcher = ctx.dispatcher_va;
         let sec_start = dispatcher;
         let sec_end = dispatcher + 0x80000u64; // .btg 영역 상한 (대략)
         let mut refs_bad = Vec::new();
-        for block in &layout.shuffled_blocks {
+        for (validation_index, block) in layout.shuffled_blocks.iter().enumerate() {
+            crate::progress::set_position((validation_index + 1) as u64);
             let id = block.id;
             let off = layout.table_offsets[id as usize] as usize;
             let bva = dispatcher + off as u64;
@@ -394,6 +428,7 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
                 }
             }
         }
+        crate::progress::finish_task("Encrypted direct-reference validation complete");
         if !refs_bad.is_empty() {
             println!(
                 "[!] v13.1-VALIDATE: {} direct reference(s) from blocks to ENCRYPTED blocks found:",

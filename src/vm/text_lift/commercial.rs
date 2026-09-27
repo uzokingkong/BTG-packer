@@ -2171,7 +2171,14 @@ pub fn lift_program_cfg_commercial_with_model(
     let mut total_inst = 0usize;
     let mut virtualized_inst = 0usize;
     let mut raw_function_op_ranges: Vec<crate::vm::poly::FunctionOpRange> = Vec::new();
-    for bb in &blocks {
+
+    crate::progress::begin_task(
+        "Commercial Program-VM: RISC lifting original blocks",
+        blocks.len() as u64,
+        "blocks",
+    );
+    for (block_index, bb) in blocks.iter().enumerate() {
+        crate::progress::set_position((block_index + 1) as u64);
         let real: Vec<Instruction> = bb
             .instructions
             .iter()
@@ -2361,6 +2368,11 @@ pub fn lift_program_cfg_commercial_with_model(
             native_blocks += 1;
         }
     }
+    crate::progress::finish_task(format!(
+        "Commercial RISC lift complete: {} VM block(s), {} native block(s)",
+        virtualized,
+        native_blocks
+    ));
 
     // P0-①: VM↔native 경계 함수 원자성 — 제외 함수 범위로 나가는 직접 분기 타깃을
     // 함수 진입(프롤로그)으로 리다이렉트해, 네이티브 브리지가 함수 중간(에필로그)

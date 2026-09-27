@@ -53,14 +53,30 @@ impl CfgExtractor {
             .unwrap_or(text_bytes.len())
             .min(text_bytes.len());
         let text_bytes = &text_bytes[..logical_len];
+        crate::progress::begin_detail_task(
+            "CFG pre-scan: discovering explicit branch/call targets",
+            logical_len as u64,
+            "bytes",
+        );
         // Collect explicit control-flow targets before classifying 0xCC runs. A
         // branch-targeted INT3 is executable program semantics, never padding.
         let mut explicit_code_targets = std::collections::BTreeSet::new();
         explicit_code_targets.insert(entry_point_va);
         explicit_code_targets.extend(additional_starts.iter().copied());
         let mut target_decoder = Decoder::with_ip(64, text_bytes, base_va, DecoderOptions::NONE);
+        let mut target_progress_mark = 0u64;
         while target_decoder.can_decode() {
             let inst = target_decoder.decode();
+            let scanned = target_decoder
+                .ip()
+                .saturating_sub(base_va)
+                .min(logical_len as u64);
+            if scanned.saturating_sub(target_progress_mark) >= 16 * 1024
+                || scanned == logical_len as u64
+            {
+                target_progress_mark = scanned;
+                crate::progress::set_position(scanned);
+            }
             if !inst.is_invalid()
                 && matches!(
                     inst.flow_control(),
@@ -75,8 +91,16 @@ impl CfgExtractor {
                 }
             }
         }
+        crate::progress::set_position(logical_len as u64);
+        crate::progress::finish_task("CFG pre-scan complete");
 
+        crate::progress::begin_detail_task(
+            "CFG decode: instructions + padding classification",
+            logical_len as u64,
+            "bytes",
+        );
         let mut decoder = Decoder::with_ip(64, text_bytes, base_va, DecoderOptions::NONE);
+        let mut decode_progress_mark = 0u64;
 
         let mut instructions = Vec::new();
         // (pad_start_ip, first_real_ip): 0xCC padding runs and the first real
@@ -87,6 +111,13 @@ impl CfgExtractor {
 
         while decoder.can_decode() {
             let inst = decoder.decode();
+            let scanned = decoder.ip().saturating_sub(base_va).min(logical_len as u64);
+            if scanned.saturating_sub(decode_progress_mark) >= 16 * 1024
+                || scanned == logical_len as u64
+            {
+                decode_progress_mark = scanned;
+                crate::progress::set_position(scanned);
+            }
 
             if inst.is_invalid() {
                 // Invalid decode gaps are not valid instructions. Keep their
@@ -131,6 +162,11 @@ impl CfgExtractor {
         if let Some(ps) = pad_start.take() {
             pad_runs.push((ps, base_va + text_bytes.len() as u64));
         }
+        crate::progress::set_position(logical_len as u64);
+        crate::progress::finish_task(format!(
+            "CFG decode complete: {} instruction(s)",
+            instructions.len()
+        ));
 
         if instructions.is_empty() {
             return Ok((Vec::new(), BidirectionalGraph::new()));
@@ -151,6 +187,18 @@ impl CfgExtractor {
                 .filter(|target| *target >= base_va && *target < text_end_va),
         );
 
+        let data_scan_total = relayed_sections
+            .iter()
+            .filter(|sec| sec.name == ".rdata" || sec.name == ".data" || sec.name == ".pdata")
+            .map(|sec| sec.bytes.len() as u64)
+            .sum::<u64>();
+        crate::progress::begin_detail_task(
+            "CFG data scan: function pointers / RVA / VA targets",
+            data_scan_total,
+            "bytes",
+        );
+        let mut data_scan_done = 0u64;
+
         // CRITICAL FIX: Scan .rdata, .data, .pdata for function pointers and RVA/VA table targets
         // that are referenced only from data sections (e.g. CRT init tables, vtables, SEH scope tables).
         // Adding them to block_starts ensures every indirect function entry becomes a discrete TriggerBlock
@@ -159,6 +207,11 @@ impl CfgExtractor {
             if sec.name == ".rdata" || sec.name == ".data" || sec.name == ".pdata" {
                 if sec.bytes.len() >= 4 {
                     for off in (0..sec.bytes.len().saturating_sub(3)).step_by(4) {
+                        if off & 0x3ff == 0 {
+                            crate::progress::set_position(
+                                data_scan_done.saturating_add(off as u64),
+                            );
+                        }
                         // Check 32-bit RVA
                         let val32 = u32::from_le_bytes(
                             sec.bytes[off..off + 4].try_into().unwrap_or([0; 4]),
@@ -179,10 +232,21 @@ impl CfgExtractor {
                         }
                     }
                 }
+                data_scan_done = data_scan_done.saturating_add(sec.bytes.len() as u64);
+                crate::progress::set_position(data_scan_done);
             }
         }
+        crate::progress::finish_task("CFG data scan complete");
 
-        for inst in &instructions {
+        crate::progress::begin_detail_task(
+            "CFG boundary discovery",
+            instructions.len() as u64,
+            "instructions",
+        );
+        for (instruction_index, inst) in instructions.iter().enumerate() {
+            if instruction_index & 0xff == 0 || instruction_index + 1 == instructions.len() {
+                crate::progress::set_position((instruction_index + 1) as u64);
+            }
             match inst.flow_control() {
                 FlowControl::UnconditionalBranch
                 | FlowControl::ConditionalBranch
@@ -222,6 +286,11 @@ impl CfgExtractor {
             }
         }
 
+        crate::progress::finish_task(format!(
+            "CFG boundaries complete: {} candidate start(s)",
+            block_starts.len()
+        ));
+
         // Re-materialize block boundaries that fell inside 0xCC padding: when a
         // terminator's fall-through IP (e.g. the byte right after `ret`) is 0xCC
         // padding, the padding is skipped and the next real function (e.g. a CRT
@@ -237,12 +306,21 @@ impl CfgExtractor {
         }
 
         // Construct Basic Blocks & Successor Edges
+        let instruction_count = instructions.len();
+        crate::progress::begin_detail_task(
+            "CFG block construction",
+            instruction_count as u64,
+            "instructions",
+        );
         let mut basic_blocks = Vec::new();
         let mut current_block_id = 0u32;
         let mut current_insts = Vec::new();
         let mut current_start_va = base_va;
 
-        for inst in instructions {
+        for (instruction_index, inst) in instructions.into_iter().enumerate() {
+            if instruction_index & 0xff == 0 || instruction_index + 1 == instruction_count {
+                crate::progress::set_position((instruction_index + 1) as u64);
+            }
             let inst_va = inst.ip();
 
             if block_starts.contains(&inst_va) && !current_insts.is_empty() {
@@ -270,8 +348,19 @@ impl CfgExtractor {
             });
         }
 
+        crate::progress::finish_task(format!(
+            "CFG block construction complete: {} block(s)",
+            basic_blocks.len()
+        ));
+
+        crate::progress::begin_detail_task(
+            "CFG edge construction",
+            basic_blocks.len() as u64,
+            "blocks",
+        );
         let mut graph = BidirectionalGraph::new();
-        for bb in &basic_blocks {
+        for (block_index, bb) in basic_blocks.iter().enumerate() {
+            crate::progress::set_position((block_index + 1) as u64);
             if let Some(last) = bb.instructions.last() {
                 match last.flow_control() {
                     FlowControl::UnconditionalBranch => {
@@ -327,6 +416,7 @@ impl CfgExtractor {
             }
         }
 
+        crate::progress::finish_task("CFG extraction complete");
         Ok((basic_blocks, graph))
     }
 
