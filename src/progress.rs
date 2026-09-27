@@ -309,6 +309,19 @@ pub fn complete(label: impl Into<String>) {
     finalize_tty_line(&mut s, true);
 }
 
+/// Finish an active in-place line without changing progress state.
+/// Used by CLI RAII so errors are printed on a fresh line.
+pub fn finish_console_line() {
+    if !enabled() {
+        return;
+    }
+    let mut s = state().lock().expect("progress mutex poisoned");
+    if s.tty && s.last_line_len != 0 {
+        eprintln!();
+        s.last_line_len = 0;
+    }
+}
+
 fn finalize_tty_line(s: &mut ProgressState, final_line: bool) {
     if s.tty && (!s.single_line || final_line) {
         eprintln!();
