@@ -126,6 +126,7 @@ pub fn begin_phase(base_bp: u32, span_bp: u32, label: impl Into<String>) {
     s.total = 0;
     s.task_affects_overall = true;
     render_locked(&mut s, true);
+    finalize_tty_line(&mut s);
 }
 
 /// Select a weighted sub-range within the current top-level phase.
@@ -153,6 +154,7 @@ pub fn subphase(rel_base_bp: u32, rel_span_bp: u32, label: impl Into<String>) {
     s.unit.clear();
     s.task_affects_overall = true;
     render_locked(&mut s, true);
+    finalize_tty_line(&mut s);
 }
 
 pub fn begin_task(label: impl Into<String>, total: u64, unit: impl Into<String>) {
@@ -240,13 +242,14 @@ pub fn finish_task(label: impl Into<String>) {
     if s.total != 0 {
         s.position = s.total;
         if s.task_affects_overall {
-        s.overall_bp = s
-            .overall_bp
-            .max((s.active_base_bp + s.active_span_bp).min(10_000));
+            s.overall_bp = s
+                .overall_bp
+                .max((s.active_base_bp + s.active_span_bp).min(10_000));
         }
     }
     s.task = label.into();
     render_locked(&mut s, true);
+    finalize_tty_line(&mut s);
 }
 
 /// Force the overall position to a completed milestone (basis points).
@@ -265,6 +268,7 @@ pub fn checkpoint(overall_bp: u32, label: impl Into<String>) {
     s.total = 0;
     s.unit.clear();
     render_locked(&mut s, true);
+    finalize_tty_line(&mut s);
 }
 
 pub fn complete(label: impl Into<String>) {
@@ -282,6 +286,10 @@ pub fn complete(label: impl Into<String>) {
     s.total = 0;
     s.unit.clear();
     render_locked(&mut s, true);
+    finalize_tty_line(&mut s);
+}
+
+fn finalize_tty_line(s: &mut ProgressState) {
     if s.tty {
         eprintln!();
         s.last_line_len = 0;
