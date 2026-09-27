@@ -317,12 +317,11 @@ fn render_locked(s: &mut ProgressState, force: bool) {
     } else {
         (s.position as f64 / s.total as f64).clamp(0.0, 1.0)
     };
-    let filled = (local_fraction * width as f64).floor() as usize;
-    let bar = format!(
-        "{}{}",
-        "=".repeat(filled.min(width)),
-        "-".repeat(width.saturating_sub(filled))
-    );
+    let bar = if s.tty {
+        render_unicode_bar(local_fraction, width)
+    } else {
+        render_ascii_bar(local_fraction, width)
+    };
     let overall = f64::from(s.overall_bp) / 100.0;
     let overall_fraction = f64::from(s.overall_bp) / 10_000.0;
     let local_percent = local_fraction * 100.0;
@@ -401,6 +400,43 @@ fn render_locked(s: &mut ProgressState, force: bool) {
         s.last_log_bucket = bucket;
     }
     s.last_render = now;
+}
+
+fn render_ascii_bar(fraction: f64, width: usize) -> String {
+    let filled = (fraction.clamp(0.0, 1.0) * width as f64).floor() as usize;
+    format!(
+        "{}{}",
+        "=".repeat(filled.min(width)),
+        "-".repeat(width.saturating_sub(filled))
+    )
+}
+
+/// Render a high-resolution terminal bar using Unicode block elements.
+/// Each cell has 8 sub-steps: ▏▎▍▌▋▊▉█.
+fn render_unicode_bar(fraction: f64, width: usize) -> String {
+    const PARTIAL: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+
+    let clamped = fraction.clamp(0.0, 1.0);
+    let eighths = (clamped * width as f64 * 8.0).round() as usize;
+    let full = (eighths / 8).min(width);
+    let partial = eighths % 8;
+
+    let mut out = String::with_capacity(width * 3);
+    out.push_str(&"█".repeat(full));
+
+    if full < width {
+        if partial != 0 {
+            out.push(PARTIAL[partial]);
+        } else {
+            out.push('░');
+        }
+        let used = full + 1;
+        if used < width {
+            out.push_str(&"░".repeat(width - used));
+        }
+    }
+
+    out
 }
 
 fn format_count(value: u64) -> String {
