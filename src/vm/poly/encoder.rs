@@ -151,7 +151,13 @@ impl PolymorphicEncoder {
         let mut out = Vec::new();
         let mut offsets = Vec::with_capacity(rewrite.instrs.len());
         let mut vip = 0u64;
-        for item in &rewrite.instrs {
+        crate::progress::begin_detail_task(
+            format!("Polymorphic super-op encoding ({:?})", self.spec.family),
+            rewrite.instrs.len() as u64,
+            "stream items",
+        );
+        for (item_index, item) in rewrite.instrs.iter().enumerate() {
+            crate::progress::set_position((item_index + 1) as u64);
             offsets.push(out.len());
             match item {
                 SuperOpStreamInstr::Primitive(ins) => {
@@ -184,6 +190,10 @@ impl PolymorphicEncoder {
                 }
             }
         }
+        crate::progress::finish_task(format!(
+            "Super-op encoding complete: {} byte(s)",
+            out.len()
+        ));
         Ok((out, offsets))
     }
 
@@ -199,7 +209,13 @@ impl PolymorphicEncoder {
         let mut offsets = Vec::with_capacity(prog.instrs.len());
         let mut vip = 0u64;
 
-        for ins in &prog.instrs {
+        crate::progress::begin_detail_task(
+            format!("Polymorphic bytecode encoding ({:?})", self.spec.family),
+            prog.instrs.len() as u64,
+            "micro-ops",
+        );
+        for (op_index, ins) in prog.instrs.iter().enumerate() {
+            crate::progress::set_position((op_index + 1) as u64);
             offsets.push(out.len());
             // opcode — VirtualBranch 는 조건과 무관한 단일 canonical opcode.
             let opcode_byte = self.spec.opcode_for(ins.op).ok_or_else(|| {
@@ -302,6 +318,10 @@ impl PolymorphicEncoder {
             }
         }
 
+        crate::progress::finish_task(format!(
+            "Polymorphic encoding complete: {} byte(s)",
+            out.len()
+        ));
         Ok((out, offsets))
     }
 }
