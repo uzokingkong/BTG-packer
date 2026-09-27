@@ -2275,116 +2275,27 @@ pub(crate) fn place_boot_stub(
                 multi.table_ranges.clone(),
                 multi.bytecode_ranges.clone(),
             ));
-            for (index, state_delta) in multi.state_offsets.iter().copied().enumerate() {
-                let state_off = (vm_prog_state_va - dispatcher_va) as usize + state_delta;
-                let call_stack_va = vm_prog_state_va
-                    + state_delta as u64
-                    + (MULTI_FAMILY_STATE_STRIDE - crate::vm::interp::CALL_STACK_SIZE) as u64;
-                btg.bytes[state_off
-                    ..state_off + crate::vm::commercial_build::COMMERCIAL_STATE_SIZE as usize]
-                    .fill(0);
-                btg.bytes[state_off + 0x5000..state_off + 0x5030].fill(0);
-                let sync_ptr_off =
-                    state_off + crate::vm::data_lifetime::LIFETIME_SYNC_PTR_STATE_OFFSET;
-                btg.bytes[sync_ptr_off..sync_ptr_off + 8]
-                    .copy_from_slice(&multi.lifetime_sync.base_va.to_le_bytes());
-                let sync_count_off =
-                    state_off + crate::vm::data_lifetime::LIFETIME_SYNC_COUNT_STATE_OFFSET;
-                btg.bytes[sync_count_off..sync_count_off + 8]
-                    .copy_from_slice(&(multi.lifetime_sync.entries.len() as u64).to_le_bytes());
-                if index == 0 {
-                    btg.bytes[state_off + 0x5000..state_off + 0x5008]
-                        .copy_from_slice(&(multi.entry_byte_offset as u64).to_le_bytes());
-                }
-                let ptr = state_off + crate::vm::interp::STATE_PTR_CALL_STACK;
-                btg.bytes[ptr..ptr + 8].copy_from_slice(&call_stack_va.to_le_bytes());
-                println!(
-                    "[+] P2-10 family module #{index} {:?}: state_va=0x{:X} call_stack_va=0x{:X}",
-                    multi.families[index],
-                    vm_prog_state_va + state_delta as u64,
-                    call_stack_va,
-                );
-            }
 
-            // Global `.vstate` tail: bucket counters, one process-shared
-            // lifetime table, then 128 lane-private native runtime stacks.
-            // Keeping this table outside every 0x8000 family stride removes the
-            // previous 0x2000..0x3060 overlap with the commercial virtual stack.
-            let lane_control_off =
-                (multi.invocation_layout.lane_control_va - dispatcher_va) as usize;
-            let lane_control_end = lane_control_off + VM_THREAD_BUCKETS * 4;
-            if lane_control_end > btg.bytes.len() {
-                anyhow::bail!("multi-family lane-control tail exceeds .textb/.vstate backing");
-            }
-            btg.bytes[lane_control_off..lane_control_end].fill(0);
-
-            let sync_start = (multi.lifetime_sync.base_va - dispatcher_va) as usize;
-            let sync_end = sync_start + crate::vm::data_lifetime::LIFETIME_SYNC_TABLE_SIZE;
-            if sync_end > btg.bytes.len() {
-                anyhow::bail!("P2-14 global lifetime sync table exceeds .vstate backing");
-            }
-            btg.bytes[sync_start..sync_end].fill(0);
-            for (entry_index, entry) in multi.lifetime_sync.entries.iter().enumerate() {
-                let entry_off =
-                    sync_start + entry_index * crate::vm::data_lifetime::LIFETIME_SYNC_ENTRY_SIZE;
-                btg.bytes[entry_off + 16..entry_off + 24]
-                    .copy_from_slice(&entry.object_va.to_le_bytes());
-                btg.bytes[entry_off + 24..entry_off + 28]
-                    .copy_from_slice(&entry.object_len.to_le_bytes());
-                btg.bytes[entry_off + 28..entry_off + 32]
-                    .copy_from_slice(&entry.object_rva.to_le_bytes());
-                btg.bytes[entry_off + 32..entry_off + 40]
-                    .copy_from_slice(&entry.object_key.to_le_bytes());
-            }
+            // .vstate is UNINITIALIZED_DATA (VirtualSize only). Do not touch
+            // its hundreds-of-MiB zero-fill range in the temporary .textb Vec.
+            // build_canonical_oep_gateway initializes every lane/family state
+            // pointer, call-stack pointer, entry VIP, lifetime descriptor and
+            // shared descriptor record before the first VM dispatch. Loader
+            // zero-fill supplies lane-control words and host stacks.
+            println!(
+                "[+] Sparse .vstate runtime: {} family state(s), {} lane(s), reserve=0x{:X}, host-stacks={} x 0x{:X}",
+                multi.families.len(),
+                VM_INVOCATION_LANES + 1,
+                multi.invocation_layout.reserve_size,
+                VM_HOST_STACK_SLOTS,
+                VM_HOST_STACK_SIZE,
+            );
             if !multi.lifetime_sync.entries.is_empty() {
                 println!(
-                    "[+] P2-14 shared lifetime sync: {} global lock/depth/owner entry(s) @0x{:X}",
+                    "[+] P2-14 shared lifetime sync: {} runtime-initialized entry(s) @0x{:X}",
                     multi.lifetime_sync.entries.len(),
                     multi.lifetime_sync.base_va,
                 );
-            }
-
-            let host_pool_off =
-                (multi.invocation_layout.host_stack_pool_va - dispatcher_va) as usize;
-            let host_pool_len = VM_HOST_STACK_SLOTS * VM_HOST_STACK_SIZE;
-            let host_pool_end = host_pool_off
-                .checked_add(host_pool_len)
-                .ok_or_else(|| anyhow::anyhow!("native host-stack pool range overflow"))?;
-            if host_pool_end > btg.bytes.len() {
-                anyhow::bail!("native host-stack pool exceeds .vstate backing");
-            }
-            btg.bytes[host_pool_off..host_pool_end].fill(0);
-            println!(
-                "[+] native gateway host stacks: {} slot(s) (canonical + {} lanes) x 0x{:X} bytes @0x{:X}",
-                VM_HOST_STACK_SLOTS,
-                VM_INVOCATION_LANES,
-                VM_HOST_STACK_SIZE,
-                multi.invocation_layout.host_stack_pool_va,
-            );
-
-            // Initialize every gateway invocation lane. Lifetime coordination
-            // remains process-shared, while architectural state and call stacks
-            // are lane-private.
-            let lane_group_stride = multi.invocation_layout.lane_group_stride;
-            for lane in 1..=VM_INVOCATION_LANES {
-                for state_delta in multi.state_offsets.iter().copied() {
-                    let lane_delta = lane * lane_group_stride + state_delta;
-                    let state_off = (vm_prog_state_va - dispatcher_va) as usize + lane_delta;
-                    btg.bytes[state_off..state_off + MULTI_FAMILY_STATE_STRIDE].fill(0);
-                    let sync_ptr_off =
-                        state_off + crate::vm::data_lifetime::LIFETIME_SYNC_PTR_STATE_OFFSET;
-                    btg.bytes[sync_ptr_off..sync_ptr_off + 8]
-                        .copy_from_slice(&multi.lifetime_sync.base_va.to_le_bytes());
-                    let sync_count_off =
-                        state_off + crate::vm::data_lifetime::LIFETIME_SYNC_COUNT_STATE_OFFSET;
-                    btg.bytes[sync_count_off..sync_count_off + 8]
-                        .copy_from_slice(&(multi.lifetime_sync.entries.len() as u64).to_le_bytes());
-                    let call_stack_va = vm_prog_state_va
-                        + lane_delta as u64
-                        + (MULTI_FAMILY_STATE_STRIDE - crate::vm::interp::CALL_STACK_SIZE) as u64;
-                    let ptr = state_off + crate::vm::interp::STATE_PTR_CALL_STACK;
-                    btg.bytes[ptr..ptr + 8].copy_from_slice(&call_stack_va.to_le_bytes());
-                }
             }
         }
         let placed_state_bytes = multi_built
