@@ -112,6 +112,16 @@ pub fn progress_only() -> bool {
     PROGRESS_ONLY.load(Ordering::Relaxed)
 }
 
+/// stderr diagnostic that disappears while --progress-only owns the console.
+#[macro_export]
+macro_rules! progress_safe_eprintln {
+    ($($arg:tt)*) => {{
+        if !$crate::progress::progress_only() {
+            eprintln!($($arg)*);
+        }
+    }};
+}
+
 /// Start a weighted top-level phase. Values are basis points: 0..=10000.
 pub fn begin_phase(base_bp: u32, span_bp: u32, label: impl Into<String>) {
     if !enabled() {
