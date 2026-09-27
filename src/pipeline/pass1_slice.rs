@@ -37,11 +37,7 @@ pub fn run_with_indirect_resolutions(
     )?;
 
     crate::progress::subphase(4000, 2500, "Pass 1: canonical ProgramModel analysis");
-    crate::progress::begin_detail_task(
-        "ProgramModel analysis",
-        basic_blocks.len() as u64,
-        "basic blocks",
-    );
+    crate::progress::set_task("ProgramModel: initializing metadata + analysis indexes");
     let mut program_model =
         crate::analysis::program_model_builder::ProgramModelBuilder::new(&ctx.target_info)
             .build_with_basic_blocks_and_auto_indirect_resolutions(
