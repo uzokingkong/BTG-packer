@@ -1686,6 +1686,30 @@ pub(crate) fn place_boot_stub(
     }
     let iat_end = iat_cursor;
 
+    // Multi-family .vstate is a sparse virtual section, not part of .textb.
+    // Place it after every file-backed boot metadata object so the boot cursor
+    // never traverses the huge zero-fill reservation.  Generated code uses
+    // absolute/relative state VAs and is rebuilt below with this final address.
+    if vm_multi_family_active && vm_prog_mod.is_some() {
+        let state_off = iat_end
+            .checked_add(0xFFF)
+            .ok_or_else(|| anyhow::anyhow!("multi-family state offset overflow"))?
+            & !0xFFF;
+        vm_prog_state_va = dispatcher_va
+            .checked_add(state_off as u64)
+            .ok_or_else(|| anyhow::anyhow!("multi-family state VA overflow"))?;
+        vm_prog_state_reservation_end = state_off
+            .checked_add(vm_prog_state_reserve)
+            .ok_or_else(|| anyhow::anyhow!("multi-family state reservation overflow"))?;
+        println!(
+            "[+] Sparse .vstate layout: file-backed-end=0x{:X} state=[0x{:X},0x{:X}) reserve=0x{:X}",
+            iat_end,
+            state_off,
+            vm_prog_state_reservation_end,
+            vm_prog_state_reserve
+        );
+    }
+
     // v6: 더미 import 디렉터리/슬롯/테이블/문자열 RVA·VA 기록 (build.rs/validate가 사용)
     if ctx.iat_hide || ctx.mem_harden {
         if ctx.iat_hide {
