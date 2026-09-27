@@ -464,8 +464,7 @@ fn test_scan_ascii_runs_still_work() {
 fn test_scan_utf16_runs_detected() {
     // FIX 회귀 테스트: UTF-16LE 문자열("Hello World\0", 22바이트)이 감지되어야 한다.
     // 과거 구현은 ASCII 스캔이 첫 문자를 소비해 wide 런을 절대 찾지 못했다.
-    // Bug-1 fix: 런은 4바이트 정렬 경계로 절단되므로 22바이트 -> 20바이트(4-정렬)로
-    // 감지된다(usize 상태 워드가 런 경계에 걸치지 않도록).
+    // Length-delimited wide literals are encrypted at their exact byte length.
     let mut sec = SectionData {
         name: ".rdata".to_string(),
         virtual_address: 0x5000,
@@ -483,10 +482,53 @@ fn test_scan_utf16_runs_detected() {
     let runs = scan_string_runs(std::slice::from_mut(&mut sec), 0x140000000, &[]);
     assert!(!runs.is_empty(), "UTF-16LE string run should be detected");
     assert_eq!(
-        runs[0].len, 20,
-        "Hello World = 22B, truncated to 4-aligned 20B"
+        runs[0].len, 22,
+        "Hello World must be encrypted at its exact UTF-16 byte length"
     );
     assert_eq!(runs[0].va, 0x140005000);
+}
+
+#[test]
+fn test_scan_string_runs_excludes_loader_metadata_ranges() {
+    let mut sec = SectionData {
+        name: ".rdata".to_string(),
+        virtual_address: 0x5000,
+        virtual_size: 0x100,
+        characteristics: 0x40000040,
+        bytes: {
+            let mut b = vec![0u8; 0x100];
+            b[0x20..0x30].copy_from_slice(b"LoaderMetadata!!");
+            b[0x40..0x50].copy_from_slice(b"UserVisibleText!");
+            b
+        },
+    };
+    let runs = scan_string_runs(
+        std::slice::from_mut(&mut sec),
+        0x140000000,
+        &[(0x5020, 0x5030)],
+    );
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].va, 0x140005040);
+    assert_eq!(runs[0].len, 16);
+}
+
+#[test]
+fn test_scan_rust_length_delimited_literal_without_nul() {
+    let mut bytes = vec![0u8; 64];
+    bytes[7..25].copy_from_slice(b"RustLiteralNoNul!!");
+    bytes[25] = b'\n';
+    let mut sections = vec![SectionData {
+        name: ".rdata".into(),
+        virtual_address: 0x6000,
+        virtual_size: bytes.len() as u32,
+        characteristics: 0,
+        bytes,
+    }];
+
+    let runs = scan_string_runs(&mut sections, 0x140000000, &[]);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].va, 0x140006007);
+    assert_eq!(runs[0].len, 18);
 }
 
 #[test]

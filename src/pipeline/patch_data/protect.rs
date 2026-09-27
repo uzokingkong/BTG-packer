@@ -54,6 +54,30 @@ pub(crate) fn collect_protected_rva_ranges(
     sections: &[SectionData],
     cookie_rva: u32,
 ) -> Vec<(u32, u32)> {
+    collect_protected_rva_ranges_impl(ctx, sections, cookie_rva, false)
+}
+
+/// Protected ranges used by the literal-only crypto pass.
+///
+/// Unlike whole-section transforms, a literal scan does not need the old 0x40
+/// byte safety halo around every UNWIND_INFO record.  Those halos frequently
+/// overlap and merge into most of `.rdata`, hiding real user strings from the
+/// scanner.  Keep only the bytes that are structurally consumed by the Windows
+/// unwinder (plus the handler-data RVA) while retaining all other loader ranges.
+pub(crate) fn collect_string_protected_rva_ranges(
+    ctx: &PipelineContext,
+    sections: &[SectionData],
+    cookie_rva: u32,
+) -> Vec<(u32, u32)> {
+    collect_protected_rva_ranges_impl(ctx, sections, cookie_rva, true)
+}
+
+fn collect_protected_rva_ranges_impl(
+    ctx: &PipelineContext,
+    sections: &[SectionData],
+    cookie_rva: u32,
+    exact_unwind: bool,
+) -> Vec<(u32, u32)> {
     let mut raw_ranges = Vec::new();
 
     // DataDirectory 0: Export Directory
@@ -210,11 +234,34 @@ pub(crate) fn collect_protected_rva_ranges(
     // 를 읽는다. UNWIND_INFO가 v14 .rdata run에 포함돼 부트-복호화가 부분적으로
     // 어긋나면(keystream 정렬) UI 바이트가 손상되어 EHANDLER를 인식하지 못하고
     // catch_unwind가 panic을 못 잡는다. 메타데이터이므로 평문 유지가 안전하다.
-    for rf in &ctx.target_info.original_pdata_entries {
-        let ui = rf.unwind_info_address;
-        if ui > 0 {
-            // 각 UNWIND_INFO 블록을 보호 (평균 ~16-32B; 여유 0x40)
-            raw_ranges.push((ui, ui.saturating_add(0x40)));
+    if exact_unwind {
+        use crate::pe::unwind::UnwindTrailer;
+        for parsed in &ctx.target_info.unwind_functions {
+            for (ui, info) in &parsed.chain {
+                // Four-byte header, an even number of two-byte unwind-code
+                // slots, then the optional OS-consumed trailer.  Handler data
+                // begins with a four-byte language-specific metadata RVA, so
+                // retain that word as well.
+                let code_bytes = ((info.codes.len() + 1) & !1).saturating_mul(2);
+                let trailer_bytes = match info.trailer {
+                    UnwindTrailer::None => 0,
+                    UnwindTrailer::Handler { .. } => 8,
+                    UnwindTrailer::Chain(_) => 12,
+                };
+                let len = 4usize
+                    .saturating_add(code_bytes)
+                    .saturating_add(trailer_bytes)
+                    .min(u32::MAX as usize) as u32;
+                raw_ranges.push((*ui, ui.saturating_add(len)));
+            }
+        }
+    } else {
+        for rf in &ctx.target_info.original_pdata_entries {
+            let ui = rf.unwind_info_address;
+            if ui > 0 {
+                // 각 UNWIND_INFO 블록을 보호 (평균 ~16-32B; 여유 0x40)
+                raw_ranges.push((ui, ui.saturating_add(0x40)));
+            }
         }
     }
 

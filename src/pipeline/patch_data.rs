@@ -425,7 +425,9 @@ pub(crate) use imports::{
     collect_delay_import_directory_ranges, collect_import_directory_ranges,
     get_ascii_string_rva_range, is_rva_range_protected, rva_to_slice,
 };
-pub(crate) use protect::{collect_protected_rva_ranges, locate_security_cookie};
+pub(crate) use protect::{
+    collect_protected_rva_ranges, collect_string_protected_rva_ranges, locate_security_cookie,
+};
 pub(crate) use refs::{
     collect_code_materialized_target_ids, collect_data_reference_target_ids, resolve_block_id,
 };
