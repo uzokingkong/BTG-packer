@@ -1031,7 +1031,15 @@ fn merge_basic_blocks(
 ) -> Result<(), ProgramModelBuildError> {
     let va_to_rva = |va: u64| u32::try_from(va.checked_sub(image_base)?).ok();
     let mut decoded = Vec::new();
-    for block in blocks {
+    crate::progress::begin_detail_task(
+        "ProgramModel: filtering decoded CFG blocks",
+        blocks.len() as u64,
+        "blocks",
+    );
+    for (block_index, block) in blocks.iter().enumerate() {
+        if block_index & 0x03ff == 0 || block_index + 1 == blocks.len() {
+            crate::progress::set_position((block_index + 1) as u64);
+        }
         let Some(start) = va_to_rva(block.start_va) else {
             continue;
         };
@@ -1053,10 +1061,23 @@ fn merge_basic_blocks(
         }
     }
     decoded.sort_by_key(|(start, _, _)| *start);
+    crate::progress::finish_task(format!(
+        "ProgramModel decoded CFG filter complete: {} block(s)",
+        decoded.len()
+    ));
 
     // Direct calls and cross-function unconditional branches are function-entry evidence.
+    let function_ranges = FunctionRangeIndex::from_model(model);
     let mut seeds = BTreeMap::<u32, FunctionProvenance>::new();
-    for (_, _, block) in &decoded {
+    crate::progress::begin_detail_task(
+        "ProgramModel: collecting direct-call/tail-call function seeds",
+        decoded.len() as u64,
+        "blocks",
+    );
+    for (decoded_index, (start, _, block)) in decoded.iter().enumerate() {
+        if decoded_index & 0x03ff == 0 || decoded_index + 1 == decoded.len() {
+            crate::progress::set_position((decoded_index + 1) as u64);
+        }
         let Some(last) = block.instructions.last() else {
             continue;
         };
@@ -1070,21 +1091,8 @@ fn merge_basic_blocks(
                     .iter()
                     .any(|x| x.start <= target && target < x.end)
                 {
-                    let source_owner = model
-                        .functions
-                        .iter()
-                        .find(|(_, f)| {
-                            f.ranges.iter().any(|r| {
-                                r.start <= va_to_rva(block.start_va).unwrap_or(u32::MAX)
-                                    && va_to_rva(block.start_va).unwrap_or(u32::MAX) < r.end
-                            })
-                        })
-                        .map(|(id, _)| *id);
-                    let target_owner = model
-                        .functions
-                        .iter()
-                        .find(|(_, f)| f.ranges.iter().any(|r| r.start <= target && target < r.end))
-                        .map(|(id, _)| *id);
+                    let source_owner = function_ranges.owner(*start);
+                    let target_owner = function_ranges.owner(target);
                     if last.flow_control() == FlowControl::Call
                         || (source_owner.is_some() && source_owner != target_owner)
                     {
@@ -1101,12 +1109,24 @@ fn merge_basic_blocks(
             }
         }
     }
-    for (rva, provenance) in seeds {
-        if let Some(function) = model
-            .functions
-            .values_mut()
-            .find(|f| f.ranges.iter().any(|r| r.start <= rva && rva < r.end))
-        {
+    crate::progress::finish_task(format!(
+        "ProgramModel function-seed discovery complete: {} seed(s)",
+        seeds.len()
+    ));
+    crate::progress::begin_detail_task(
+        "ProgramModel: applying function-entry seeds",
+        seeds.len() as u64,
+        "seeds",
+    );
+    for (seed_index, (rva, provenance)) in seeds.into_iter().enumerate() {
+        if seed_index & 0x00ff == 0 {
+            crate::progress::set_position((seed_index + 1) as u64);
+        }
+        if let Some(owner) = function_ranges.owner(rva) {
+            let function = model
+                .functions
+                .get_mut(&owner)
+                .expect("indexed ProgramModel owner must exist");
             function.entries.insert(rva);
             function.provenance.insert(provenance);
         } else {
@@ -1129,26 +1149,34 @@ fn merge_basic_blocks(
             );
         }
     }
+    crate::progress::set_position(model.functions.len() as u64);
+    crate::progress::finish_task("ProgramModel function-entry seeds applied");
 
-    let entries: Vec<(u32, FunctionId)> = model
-        .functions
-        .iter()
-        .flat_map(|(id, f)| f.entries.iter().map(move |rva| (*rva, *id)))
-        .collect();
+    let function_ranges = FunctionRangeIndex::from_model(model);
+    let mut entry_first = BTreeMap::<u32, FunctionId>::new();
+    let mut entry_last = BTreeMap::<u32, FunctionId>::new();
+    for (&id, function) in &model.functions {
+        for &entry in &function.entries {
+            entry_first.entry(entry).or_insert(id);
+            entry_last.insert(entry, id);
+        }
+    }
     let mut starts = BTreeMap::new();
+    crate::progress::begin_detail_task(
+        "ProgramModel: assigning canonical blocks to functions",
+        decoded.len() as u64,
+        "blocks",
+    );
     for (ordinal, (start, range, block)) in decoded.iter().enumerate() {
-        let owner = model
-            .functions
-            .iter()
-            .find(|(_, f)| f.ranges.iter().any(|r| r.start <= *start && *start < r.end))
-            .map(|(id, _)| *id)
-            .or_else(|| {
-                entries
-                    .iter()
-                    .filter(|(entry, _)| entry <= start)
-                    .max_by_key(|(entry, _)| *entry)
-                    .map(|(_, id)| *id)
-            });
+        if ordinal & 0x03ff == 0 || ordinal + 1 == decoded.len() {
+            crate::progress::set_position((ordinal + 1) as u64);
+        }
+        let owner = function_ranges.owner(*start).or_else(|| {
+            entry_last
+                .range(..=*start)
+                .next_back()
+                .map(|(_, id)| *id)
+        });
         let Some(owner) = owner else { continue };
         let id = BlockId(ordinal as u32);
         let function = model.functions.get_mut(&owner).unwrap();
@@ -1176,7 +1204,19 @@ fn merge_basic_blocks(
         );
         starts.insert(*start, id);
     }
-    for (start, _, block) in &decoded {
+    crate::progress::finish_task(format!(
+        "ProgramModel block ownership complete: {} canonical block(s)",
+        model.blocks.len()
+    ));
+    crate::progress::begin_detail_task(
+        "ProgramModel: constructing canonical CFG edges",
+        decoded.len() as u64,
+        "blocks",
+    );
+    for (decoded_index, (start, _, block)) in decoded.iter().enumerate() {
+        if decoded_index & 0x03ff == 0 || decoded_index + 1 == decoded.len() {
+            crate::progress::set_position((decoded_index + 1) as u64);
+        }
         let Some(&source) = starts.get(start) else {
             continue;
         };
@@ -1226,13 +1266,8 @@ fn merge_basic_blocks(
                     .map(EdgeTarget::Block)
                     .unwrap_or_else(|| {
                         target
-                            .and_then(|r| {
-                                model
-                                    .functions
-                                    .iter()
-                                    .find(|(_, f)| f.entries.contains(&r))
-                                    .map(|(id, _)| EdgeTarget::Function(*id))
-                            })
+                            .and_then(|r| entry_first.get(&r).copied())
+                            .map(EdgeTarget::Function)
                             .unwrap_or(EdgeTarget::Unresolved)
                     }),
             })
@@ -1248,13 +1283,7 @@ fn merge_basic_blocks(
                         .get(&rva)
                         .and_then(|block| model.blocks.get(block))
                         .map(|block| block.function_id)
-                        .or_else(|| {
-                            model
-                                .functions
-                                .iter()
-                                .find(|(_, function)| function.entries.contains(&rva))
-                                .map(|(id, _)| *id)
-                        })
+                        .or_else(|| entry_first.get(&rva).copied())
                 });
                 let tail = target_owner.is_some()
                     && target_owner != Some(model.blocks[&source].function_id);
@@ -1323,6 +1352,10 @@ fn merge_basic_blocks(
             }
         }
     }
+    crate::progress::finish_task(format!(
+        "ProgramModel canonical CFG complete: {} edge(s)",
+        model.edges.len()
+    ));
     model.unknown_ranges = complement(
         &model.executable_ranges,
         &model.blocks.values().map(|b| b.range).collect::<Vec<_>>(),
