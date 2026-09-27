@@ -64,11 +64,19 @@ impl CfgExtractor {
         explicit_code_targets.insert(entry_point_va);
         explicit_code_targets.extend(additional_starts.iter().copied());
         let mut target_decoder = Decoder::with_ip(64, text_bytes, base_va, DecoderOptions::NONE);
+        let mut target_progress_mark = 0u64;
         while target_decoder.can_decode() {
             let inst = target_decoder.decode();
-            crate::progress::set_position(
-                target_decoder.ip().saturating_sub(base_va).min(logical_len as u64),
-            );
+            let scanned = target_decoder
+                .ip()
+                .saturating_sub(base_va)
+                .min(logical_len as u64);
+            if scanned.saturating_sub(target_progress_mark) >= 16 * 1024
+                || scanned == logical_len as u64
+            {
+                target_progress_mark = scanned;
+                crate::progress::set_position(scanned);
+            }
             if !inst.is_invalid()
                 && matches!(
                     inst.flow_control(),
@@ -83,6 +91,7 @@ impl CfgExtractor {
                 }
             }
         }
+        crate::progress::set_position(logical_len as u64);
         crate::progress::finish_task("CFG pre-scan complete");
 
         crate::progress::begin_detail_task(
@@ -91,6 +100,7 @@ impl CfgExtractor {
             "bytes",
         );
         let mut decoder = Decoder::with_ip(64, text_bytes, base_va, DecoderOptions::NONE);
+        let mut decode_progress_mark = 0u64;
 
         let mut instructions = Vec::new();
         // (pad_start_ip, first_real_ip): 0xCC padding runs and the first real
@@ -101,9 +111,13 @@ impl CfgExtractor {
 
         while decoder.can_decode() {
             let inst = decoder.decode();
-            crate::progress::set_position(
-                decoder.ip().saturating_sub(base_va).min(logical_len as u64),
-            );
+            let scanned = decoder.ip().saturating_sub(base_va).min(logical_len as u64);
+            if scanned.saturating_sub(decode_progress_mark) >= 16 * 1024
+                || scanned == logical_len as u64
+            {
+                decode_progress_mark = scanned;
+                crate::progress::set_position(scanned);
+            }
 
             if inst.is_invalid() {
                 // Invalid decode gaps are not valid instructions. Keep their
@@ -148,6 +162,7 @@ impl CfgExtractor {
         if let Some(ps) = pad_start.take() {
             pad_runs.push((ps, base_va + text_bytes.len() as u64));
         }
+        crate::progress::set_position(logical_len as u64);
         crate::progress::finish_task(format!(
             "CFG decode complete: {} instruction(s)",
             instructions.len()
@@ -229,7 +244,9 @@ impl CfgExtractor {
             "instructions",
         );
         for (instruction_index, inst) in instructions.iter().enumerate() {
-            crate::progress::set_position((instruction_index + 1) as u64);
+            if instruction_index & 0xff == 0 || instruction_index + 1 == instructions.len() {
+                crate::progress::set_position((instruction_index + 1) as u64);
+            }
             match inst.flow_control() {
                 FlowControl::UnconditionalBranch
                 | FlowControl::ConditionalBranch
@@ -301,7 +318,9 @@ impl CfgExtractor {
         let mut current_start_va = base_va;
 
         for (instruction_index, inst) in instructions.into_iter().enumerate() {
-            crate::progress::set_position((instruction_index + 1) as u64);
+            if instruction_index & 0xff == 0 || instruction_index + 1 == instruction_count {
+                crate::progress::set_position((instruction_index + 1) as u64);
+            }
             let inst_va = inst.ip();
 
             if block_starts.contains(&inst_va) && !current_insts.is_empty() {
