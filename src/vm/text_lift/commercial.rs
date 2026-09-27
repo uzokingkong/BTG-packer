@@ -2206,7 +2206,7 @@ pub fn lift_program_cfg_commercial_with_model(
                 && i.code() == Code::Lea_r64_m
                 && i.is_ip_rel_memory_operand()
             {
-                eprintln!(
+                crate::progress_safe_eprintln!(
                     "[BTG_TRACE_RIP_LEA] ip={:#x} next={:#x} target={:#x} dst={:?}",
                     i.ip(),
                     i.next_ip(),
