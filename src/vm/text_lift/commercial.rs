@@ -2794,7 +2794,7 @@ mod tests {
 
     #[test]
     fn trailing_zero_op_source_ip_is_not_published_past_block_end() {
-        let mut map = HashMap::new();
+        let mut map = std::collections::HashMap::new();
         let local = vec![
             (0x1000, 0usize),
             (0x1001, 1usize),
@@ -2810,7 +2810,7 @@ mod tests {
 
     #[test]
     fn internal_zero_op_source_ip_aliases_next_semantic_op() {
-        let mut map = HashMap::new();
+        let mut map = std::collections::HashMap::new();
         let local = vec![
             (0x2000, 0usize),
             // Zero-op NOP followed by a semantic instruction: both map to the
