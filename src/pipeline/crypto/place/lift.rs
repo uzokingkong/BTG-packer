@@ -144,8 +144,8 @@ pub(crate) fn lift_program(
         let ep_va = image_base + ctx.target_info.entry_point_rva as u64;
         let (prog_bytecode, entry_native): (Vec<u8>, bool) = if vm_commercial {
             crate::progress::subphase(
-                300,
-                4900,
+                500,
+                5000,
                 "Commercial Program-VM: whole-program analysis + RISC lift",
             );
             let lift = vm::text_lift::lift_program_cfg_commercial_with_model(
@@ -164,8 +164,8 @@ pub(crate) fn lift_program(
             unsupported_report = lift.unsupported_report.clone();
             vm_prog_ip_map = lift.program.ip_map().cloned();
             crate::progress::subphase(
-                5200,
-                900,
+                5500,
+                500,
                 "Commercial Program-VM: function-family planning",
             );
             crate::progress::begin_detail_task(
@@ -267,8 +267,8 @@ pub(crate) fn lift_program(
                 partitions.len(),
             );
             crate::progress::subphase(
-                6100,
-                1500,
+                6000,
+                800,
                 "Commercial Program-VM: multi-family materialization",
             );
             let multi_family =
@@ -310,8 +310,8 @@ pub(crate) fn lift_program(
             });
             ownership_report = lift.ownership_report.clone();
             crate::progress::subphase(
-                7600,
-                900,
+                6800,
+                400,
                 "Commercial Program-VM: super-operator synthesis",
             );
             if let Some(model) = ctx.program_model.as_ref() {
@@ -351,8 +351,8 @@ pub(crate) fn lift_program(
                 );
             }
             crate::progress::subphase(
-                8500,
-                800,
+                7200,
+                500,
                 "Commercial Program-VM: final polymorphic stream",
             );
             let (bc, offsets) = if let Some(ref p) = prepared {
@@ -366,8 +366,8 @@ pub(crate) fn lift_program(
             };
             if vm_commercial {
                 crate::progress::subphase(
-                    9300,
-                    500,
+                    7700,
+                    200,
                     "Commercial Program-VM: bytecode key-epoch planning",
                 );
                 vm_prog_chunks = vm::chunk_crypto::plan_chunks(
@@ -383,8 +383,8 @@ pub(crate) fn lift_program(
                 );
             }
             crate::progress::subphase(
-                9800,
-                200,
+                7900,
+                100,
                 "Commercial Program-VM: lift finalization",
             );
             vm_prog_superops = prepared;
