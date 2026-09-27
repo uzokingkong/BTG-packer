@@ -1,6 +1,16 @@
 use super::*;
 
 #[test]
+fn wx_split_accepts_section_alignment_padding_gap() {
+    assert_eq!(align_section_rva(0x0641_3B00, 0x1000), Some(0x0641_4000));
+}
+
+#[test]
+fn wx_split_keeps_already_aligned_boundary_exact() {
+    assert_eq!(align_section_rva(0x0641_4000, 0x1000), Some(0x0641_4000));
+}
+
+#[test]
 fn final_route_gate_accepts_absent_disabled_metadata() {
     validate_route_metadata_inventory(None, &[], &[], &[], &[], &[]).unwrap();
 }
