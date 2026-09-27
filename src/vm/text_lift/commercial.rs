@@ -449,6 +449,29 @@ fn performance_native_import_class(name: &str) -> Option<&'static str> {
     }
 }
 
+fn commit_block_ip_map(
+    global: &mut HashMap<u64, usize>,
+    local: &[(u64, usize)],
+    base: usize,
+    block_ops: usize,
+) -> usize {
+    let mut skipped_zero_op_tail = 0usize;
+    for &(ip, local_op) in local {
+        // NOP/PAUSE lower to zero RISC operations. If such an instruction is
+        // the final semantic item in a block, local_op == block_ops. Publishing
+        // base + local_op would point one-past the block (and at the end of the
+        // program, one-past the entire RISC stream). Internal zero-op
+        // instructions remain mappable because a later semantic instruction in
+        // the same block makes local_op < block_ops and shares that next op.
+        if local_op >= block_ops {
+            skipped_zero_op_tail += 1;
+            continue;
+        }
+        global.insert(ip, base + local_op);
+    }
+    skipped_zero_op_tail
+}
+
 fn indexed_function_owner(function_ranges: &[(u64, u64)], va: u64) -> Option<(u64, u64)> {
     let end = function_ranges.partition_point(|(start, _)| *start <= va);
     function_ranges[..end]
@@ -2279,10 +2302,16 @@ pub fn lift_program_cfg_commercial_with_model(
         }
         if ok {
             let base = instrs.len();
-            for &(ip, idx) in &local_ip {
-                ip_map.insert(ip, base + idx);
-            }
             let block_ops = lifter.desynth.instrs.len();
+            let skipped_zero_op_tail =
+                commit_block_ip_map(&mut ip_map, &local_ip, base, block_ops);
+            if skipped_zero_op_tail != 0 && std::env::var_os("BTG_DIAG_IP_MAP").is_some() {
+                crate::progress_safe_eprintln!(
+                    "[IP-MAP] block={:#x}: omitted {} trailing zero-op source IP(s)",
+                    bb.start_va,
+                    skipped_zero_op_tail
+                );
+            }
             instrs.extend(lifter.desynth.instrs);
             if block_ops != 0 {
                 // Canonical ProgramModel functions may own multiple discontiguous
@@ -2762,6 +2791,38 @@ pub fn lift_program_cfg_commercial_with_model(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn trailing_zero_op_source_ip_is_not_published_past_block_end() {
+        let mut map = HashMap::new();
+        let local = vec![
+            (0x1000, 0usize),
+            (0x1001, 1usize),
+            // Trailing NOP/PAUSE: no RISC op emitted after this source IP.
+            (0x1002, 2usize),
+        ];
+        let skipped = super::commit_block_ip_map(&mut map, &local, 10, 2);
+        assert_eq!(skipped, 1);
+        assert_eq!(map.get(&0x1000), Some(&10));
+        assert_eq!(map.get(&0x1001), Some(&11));
+        assert!(!map.contains_key(&0x1002));
+    }
+
+    #[test]
+    fn internal_zero_op_source_ip_aliases_next_semantic_op() {
+        let mut map = HashMap::new();
+        let local = vec![
+            (0x2000, 0usize),
+            // Zero-op NOP followed by a semantic instruction: both map to the
+            // same next RISC op and remain valid branch-map entries.
+            (0x2001, 1usize),
+            (0x2002, 1usize),
+        ];
+        let skipped = super::commit_block_ip_map(&mut map, &local, 20, 2);
+        assert_eq!(skipped, 0);
+        assert_eq!(map.get(&0x2001), Some(&21));
+        assert_eq!(map.get(&0x2002), Some(&21));
+    }
 
     #[test]
     fn performance_native_imports_are_typed_by_hot_path_class() {
