@@ -2291,17 +2291,33 @@ pub fn lift_program_cfg_commercial_with_model(
                 // blocks (the tiny QA JG target at 0x140001039 was the minimal
                 // reproducer) from multi-family materialization even though the
                 // block itself lifted and was counted as VM-owned.
-                let canonical_function_id = canonical_function_by_block_start.get(&bb.start_va).copied();
-                let function_id = canonical_function_id.or_else(|| {
-                    indexed_function_owner(&all_function_ranges, bb.start_va).map(|(start, _)| start)
+                let canonical_function_id =
+                    canonical_function_by_block_start.get(&bb.start_va).copied();
+                // Every successfully lifted block that contributes source-IP
+                // entries must have a stable family owner. Some legitimate
+                // executable blocks are absent from both the canonical
+                // function inventory and .pdata (for example unwind-less leaf
+                // fragments or tail islands). Previously those blocks still
+                // populated ip_map, but no FunctionOpRange was emitted, so the
+                // multi-family partition dropped their RISC ops and failed with
+                // "canonical source IP ... maps to unowned RISC op".
+                //
+                // Use the block start as a synthetic function id only when no
+                // stronger canonical/.pdata owner exists. The later
+                // virtualized_function_ids pass already promotes every emitted
+                // FunctionOpRange into the family plan, keeping the ownership
+                // contract gapless without guessing an enclosing function.
+                let function_id = canonical_function_id
+                    .or_else(|| {
+                        indexed_function_owner(&all_function_ranges, bb.start_va)
+                            .map(|(start, _)| start)
+                    })
+                    .unwrap_or(bb.start_va);
+                raw_function_op_ranges.push(crate::vm::poly::FunctionOpRange {
+                    function_id,
+                    start_op: base,
+                    end_op: base + block_ops,
                 });
-                if let Some(function_id) = function_id {
-                    raw_function_op_ranges.push(crate::vm::poly::FunctionOpRange {
-                        function_id,
-                        start_op: base,
-                        end_op: base + block_ops,
-                    });
-                }
             }
             virtualized += 1;
             virtualized_inst += real.len();
