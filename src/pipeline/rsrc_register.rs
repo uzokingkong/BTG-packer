@@ -410,14 +410,36 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         // structure (offsets recomputed), internal blobs are relocated and their
         // data-entry RVAs rewritten, and the RT_RCDATA payload subtree is
         // appended. DataDirectory[2] = .rsrc VA.
-        let rebuilt = rebuild_rsrc_section(&sec.bytes, sec.virtual_address, &chunks);
+        let original_raw_len = sec.bytes.len();
+        let original_virtual_size = sec.virtual_size as usize;
+        let original_layout_span = original_raw_len.max(original_virtual_size);
+        let mut rebuilt = rebuild_rsrc_section(&sec.bytes, sec.virtual_address, &chunks);
+        let resource_tree_len = rebuilt.len();
+
+        // Generated VAs are frozen before resource registration. Rebuilding
+        // .rsrc must not change its pre-layout footprint. Some PE images have
+        // SizeOfRawData > VirtualSize; shrinking the raw bytes here previously
+        // moved the effective mapped end backwards while .textb kept its old
+        // RVA, creating a section-address hole rejected by the Windows loader.
+        if resource_tree_len > original_layout_span {
+            anyhow::bail!(
+                "--rsrc-register rebuilt resource tree (0x{:X}B) exceeds frozen .rsrc layout span (0x{:X}B; raw=0x{:X}, virtual=0x{:X}); refusing to move generated sections after VA fixup",
+                resource_tree_len,
+                original_layout_span,
+                original_raw_len,
+                original_virtual_size
+            );
+        }
+        rebuilt.resize(original_raw_len.max(resource_tree_len), 0);
         sec.bytes = rebuilt;
-        sec.virtual_size = sec.virtual_size.max(sec.bytes.len() as u32);
+        sec.virtual_size = sec.virtual_size.max(resource_tree_len as u32);
         ctx.rsrc_dir_rva = sec.virtual_address;
-        ctx.rsrc_dir_size = sec.bytes.len() as u32;
+        ctx.rsrc_dir_size = resource_tree_len as u32;
         println!(
-            "[+] RT_RCDATA: resource directory @RVA 0x{:X} ({} bytes) rebuilt at .rsrc start (original resources preserved)",
-            ctx.rsrc_dir_rva, ctx.rsrc_dir_size
+            "[+] RT_RCDATA: resource directory @RVA 0x{:X} ({} bytes) rebuilt at .rsrc start; frozen raw footprint 0x{:X}B preserved",
+            ctx.rsrc_dir_rva,
+            ctx.rsrc_dir_size,
+            original_raw_len
         );
     } else if let Some(ps) = ctx.payload_section_data.as_mut() {
         let base_off = align4(ps.bytes.len());
