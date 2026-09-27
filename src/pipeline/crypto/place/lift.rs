@@ -143,6 +143,11 @@ pub(crate) fn lift_program(
         let base_va = image_base + ctx.target_info.text_rva as u64;
         let ep_va = image_base + ctx.target_info.entry_point_rva as u64;
         let (prog_bytecode, entry_native): (Vec<u8>, bool) = if vm_commercial {
+            crate::progress::subphase(
+                300,
+                4900,
+                "Commercial Program-VM: whole-program analysis + RISC lift",
+            );
             let lift = vm::text_lift::lift_program_cfg_commercial_with_model(
                 &ctx.target_info.text_bytes,
                 base_va,
@@ -158,6 +163,16 @@ pub(crate) fn lift_program(
             data_lifetime_objects = lift.data_lifetime_objects.clone();
             unsupported_report = lift.unsupported_report.clone();
             vm_prog_ip_map = lift.program.ip_map().cloned();
+            crate::progress::subphase(
+                5200,
+                900,
+                "Commercial Program-VM: function-family planning",
+            );
+            crate::progress::begin_detail_task(
+                "Assigning VM-owned functions to architecture families",
+                lift.virtualized_function_ids.len() as u64,
+                "functions",
+            );
             let mut plan = vm::poly::ProductionFamilyPlan::new(
                 ctx.poly_vm_seed,
                 lift.entry_function_id,
@@ -189,6 +204,10 @@ pub(crate) fn lift_program(
                 plan.cross_family_bridge_count(),
                 plan.entry_family,
             );
+            crate::progress::finish_task(format!(
+                "Family plan complete: {} function(s)",
+                plan.assignments.len()
+            ));
             let entry_family = plan.entry_family;
             let partitions = plan
                 .partition_regions(&lift.function_op_ranges, lift.program.instrs.len())
@@ -247,6 +266,11 @@ pub(crate) fn lift_program(
                 if partitioned_ops == 0 { 0.0 } else { max_family_ops as f64 * 100.0 / partitioned_ops as f64 },
                 partitions.len(),
             );
+            crate::progress::subphase(
+                6100,
+                1500,
+                "Commercial Program-VM: multi-family materialization",
+            );
             let multi_family =
                 vm::multi_family::MultiFamilyProgramPlan::build(&lift.program, &plan, &partitions)
                     .map_err(anyhow::Error::msg)?;
@@ -285,6 +309,11 @@ pub(crate) fn lift_program(
                 sensitive_regions: lift.sensitive_regions,
             });
             ownership_report = lift.ownership_report.clone();
+            crate::progress::subphase(
+                7600,
+                900,
+                "Commercial Program-VM: super-operator synthesis",
+            );
             if let Some(model) = ctx.program_model.as_ref() {
                 crate::pipeline::ownership::apply_canonical_indirect_ownership(
                     model,
@@ -321,6 +350,11 @@ pub(crate) fn lift_program(
                     "[+] --vm-commercial P5: no profitable super-op sequence; using primitive polymorphic stream"
                 );
             }
+            crate::progress::subphase(
+                8500,
+                800,
+                "Commercial Program-VM: final polymorphic stream",
+            );
             let (bc, offsets) = if let Some(ref p) = prepared {
                 (p.bytecode.clone(), p.metadata.original_byte_offsets.clone())
             } else {
@@ -331,6 +365,11 @@ pub(crate) fn lift_program(
                 enc.encode_with_offsets(&lift.program)?
             };
             if vm_commercial {
+                crate::progress::subphase(
+                    9300,
+                    500,
+                    "Commercial Program-VM: bytecode key-epoch planning",
+                );
                 vm_prog_chunks = vm::chunk_crypto::plan_chunks(
                     bc.len(),
                     &offsets,
@@ -343,6 +382,11 @@ pub(crate) fn lift_program(
                     vm::chunk_crypto::DEFAULT_CHUNK_BYTES
                 );
             }
+            crate::progress::subphase(
+                9800,
+                200,
+                "Commercial Program-VM: lift finalization",
+            );
             vm_prog_superops = prepared;
             // P3/P5 mapping: offsets always correspond to original micro-op
             // indices, even when multiple fused body members share one offset.
