@@ -7,7 +7,7 @@
 use super::desynth::RiscDesynthesizer;
 use super::opcodes::{BranchCondition, MicroInstr, MicroOperand, RiscOp};
 use anyhow::{anyhow, Result};
-use iced_x86::{Code, Instruction, OpKind, Register};
+use iced_x86::{Code, FlowControl, Instruction, OpKind, Register};
 use std::fmt;
 
 mod arith;
@@ -90,6 +90,10 @@ enum FPArith {
 
 pub struct RiscLifter {
     pub desynth: RiscDesynthesizer,
+    // Indices of branches generated inside a non-control-flow x86 instruction
+    // (REP loops). Their targets name this lifter's local micro-op positions,
+    // not original machine-code addresses.
+    internal_branch_sites: Vec<usize>,
 }
 
 /// Structured diagnostic returned when an x86 instruction cannot be lifted.
@@ -210,7 +214,40 @@ impl RiscLifter {
     pub fn new() -> Self {
         Self {
             desynth: RiscDesynthesizer::new(),
+            internal_branch_sites: Vec::new(),
         }
+    }
+
+    /// Relocate generated loop labels when committing a separately lifted
+    /// block into a larger program. Native CALL/JMP/Jcc targets stay untouched.
+    pub(crate) fn rebase_internal_branches(
+        &mut self,
+        base: usize,
+        fallthrough_va: Option<u64>,
+    ) -> Result<()> {
+        for &site in &self.internal_branch_sites {
+            let target = usize::try_from(self.desynth.instrs[site].imm)
+                .map_err(|_| anyhow!("internal branch target does not fit usize"))?;
+            if target > self.desynth.instrs.len() {
+                return Err(anyhow!(
+                    "internal branch at op {site} targets out-of-range op {target}"
+                ));
+            }
+            if target == self.desynth.instrs.len() {
+                if let Some(fallthrough_va) = fallthrough_va {
+                    // A REP at the end of a canonical block continues at the
+                    // original next IP, not whichever block was appended next.
+                    self.desynth.instrs[site].imm = fallthrough_va;
+                    continue;
+                }
+            }
+            self.desynth.instrs[site].imm = base
+                .checked_add(target)
+                .ok_or_else(|| anyhow!("internal branch relocation overflow"))?
+                as u64;
+        }
+        self.internal_branch_sites.clear();
+        Ok(())
     }
 
     pub fn reg_to_vreg(reg: Register) -> Option<MicroOperand> {
@@ -603,16 +640,24 @@ impl RiscLifter {
         inst: &Instruction,
         raw_bytes: Option<&[u8]>,
     ) -> Result<()> {
+        let first_op = self.desynth.instrs.len();
         self.lift_instruction_inner(inst).map_err(|error| {
-            RiscLiftError {
+            anyhow::Error::from(RiscLiftError {
                 ip: inst.ip(),
                 raw_bytes: raw_bytes.map(<[u8]>::to_vec),
                 code: inst.code(),
                 operands: inst.to_string(),
                 reason: format!("{error:#}"),
-            }
-            .into()
-        })
+            })
+        })?;
+        if inst.flow_control() == FlowControl::Next {
+            self.internal_branch_sites
+                .extend((first_op..self.desynth.instrs.len()).filter(|&site| {
+                    let op = &self.desynth.instrs[site];
+                    matches!(op.op, RiscOp::VirtualBranch { .. }) && op.src1.is_none()
+                }));
+        }
+        Ok(())
     }
 
     fn lift_instruction_inner(&mut self, inst: &Instruction) -> Result<()> {

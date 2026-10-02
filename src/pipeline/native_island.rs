@@ -806,10 +806,11 @@ impl NativeIslandPlan {
                     section.virtual_address <= slot_rva
                         && end.is_some_and(|end| slot_rva.saturating_add(4) <= end)
                 })
-                .ok_or_else(|| anyhow!("UNWIND_INFO handler slot RVA {slot_rva:#x} is not file-backed"))?;
+                .ok_or_else(|| {
+                    anyhow!("UNWIND_INFO handler slot RVA {slot_rva:#x} is not file-backed")
+                })?;
             let offset = (slot_rva - section.virtual_address) as usize;
-            section.bytes[offset..offset + 4]
-                .copy_from_slice(&relocated_handler.to_le_bytes());
+            section.bytes[offset..offset + 4].copy_from_slice(&relocated_handler.to_le_bytes());
             patched += 1;
         }
         Ok(patched)

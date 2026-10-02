@@ -698,8 +698,14 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
             // ciphertext while selecting the VIP's instruction-aligned chunk.
             // Only the fetched byte is unmasked in a register; bytecode memory
             // remains encrypted for the entire process lifetime.
-            b.push(Instruction::with1(Code::Push_r64, Register::RAX).unwrap());
-            b.push(Instruction::with1(Code::Push_r64, Register::RCX).unwrap());
+            // Keep the byte keystream and ciphertext off the physical stack.
+            // This helper is shared by every dispatcher handler and executes
+            // on lane-private host stacks; any lookup edge that reaches RET
+            // with these PUSHes still live turns the ciphertext byte into a
+            // return address. XMM4/XMM5 are Win64-volatile and no VM handler
+            // keeps architectural SIMD state in physical registers.
+            b.push(Instruction::with2(Code::Movq_xmm_rm64, Register::XMM4, Register::RAX).unwrap());
+            b.push(Instruction::with2(Code::Movq_xmm_rm64, Register::XMM5, Register::RCX).unwrap());
             // Boundaries are emitted as independently masked descriptors.  In
             // particular, do not emit `cmp vip, imm32`: that instruction form
             // turned the helper into a plaintext chunk-map oracle.
@@ -869,7 +875,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
             b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::R11, 29).unwrap());
             b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R10, Register::R11).unwrap());
             b.push(Instruction::with2(Code::Shr_rm64_imm8, Register::R10, 56).unwrap());
-            b.push(Instruction::with1(Code::Pop_r64, Register::RCX).unwrap());
+            b.push(Instruction::with2(Code::Movq_rm64_xmm, Register::RCX, Register::XMM5).unwrap());
             b.push(Instruction::with2(Code::Xor_rm32_r32, Register::ECX, Register::R10D).unwrap());
             // Operational chunk key/mix state is dead after the fetched byte
             // has been unmasked. Clear all three scratch registers before the
@@ -877,7 +883,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
             b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R9, Register::R9).unwrap());
             b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R10, Register::R10).unwrap());
             b.push(Instruction::with2(Code::Xor_rm64_r64, Register::R11, Register::R11).unwrap());
-            b.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
+            b.push(Instruction::with2(Code::Movq_rm64_xmm, Register::RAX, Register::XMM4).unwrap());
         }
         b.push(Instruction::with2(Code::Xor_rm32_r32, Register::EAX, Register::ECX).unwrap()); // al = orig
                                                                                                // save orig in R11D (low byte)
@@ -2805,7 +2811,40 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
                 }
             }
         }
+        // A direct JMP to native code can arrive without any virtual CALL
+        // continuation. Do not pop an empty VSP and resume at byte offset zero:
+        // that restarts an unrelated function and advances guest RSP by eight.
+        // Routed children bypass this gate and retain their prepared metadata.
+        mov_m(&mut b, Register::RAX, VSP_OFF);
+        b.push(Instruction::with2(Code::Test_rm64_r64, Register::RAX, Register::RAX).unwrap());
+        let native_has_caller = b.br(Code::Js_rel32_64, usize::MAX);
+        b.push(
+            Instruction::with2(Code::Cmp_rm64_imm8, m(STATE_CROSS_FAMILY_ACTIVE as i32), 0)
+                .unwrap(),
+        );
+        let native_is_child = b.br(Code::Jne_rel32_64, usize::MAX);
+        b.br(Code::Jmp_rel32_64, usize::MAX - 0xBC20);
+        let child_native_tail = b.len();
+        b.push(Instruction::with2(Code::Sub_rm64_imm8, Register::R13, 8).unwrap());
+        movi(&mut b, Register::RAX, top_level_exit_byte_offset);
+        b.push(
+            Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base(Register::R13),
+                Register::RAX,
+            )
+            .unwrap(),
+        );
+        movi(&mut b, Register::RAX, u64::MAX - 7);
+        store_m(&mut b, VSP_OFF, Register::RAX);
         let nf_real = b.len();
+        for (branch, target) in &mut b.branches {
+            if *branch == native_has_caller {
+                *target = nf_real;
+            } else if *branch == native_is_child {
+                *target = child_native_tail;
+            }
+        }
         native_bridge_entry = nf_real;
         for &mut (_, ref mut target) in b.branches.iter_mut() {
             if *target == 0xEFFF_FFFE {
@@ -3084,7 +3123,7 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
                 (14, Register::R14),
                 (15, Register::R15),
             ] {
-                b.push(
+                b.push_abi_registers(
                     Instruction::with2(
                         Code::Mov_r64_rm64,
                         reg,
@@ -4094,6 +4133,11 @@ pub fn build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_
     // guest RSP.  This preserves the original caller's return address and does
     // not invent CALL/return semantics for import thunks and tail calls.
     let native_tail_bridge_entry = b.len();
+    for (_, target) in &mut b.branches {
+        if *target == usize::MAX - 0xBC20 {
+            *target = native_tail_bridge_entry;
+        }
+    }
     {
         emit_materialize_lazy_flags(&mut b);
 

@@ -201,15 +201,23 @@ fn build_ownership_report(
     ranges.sort_unstable();
     ranges.dedup();
     let blocks_by_function = index_blocks_by_function(&ranges, blocks);
-    let exclusions_by_range = exclusions.functions.iter()
+    let exclusions_by_range = exclusions
+        .functions
+        .iter()
         .map(|item| ((item.function_start, item.function_end), item))
         .collect::<HashMap<_, _>>();
     let function_range_set = function_ranges.iter().copied().collect::<HashSet<_>>();
     let mut callers = HashMap::<u64, Vec<u64>>::new();
     let mut callees = HashMap::<u64, Vec<u64>>::new();
     for edge in &dependencies.edges {
-        callers.entry(edge.callee_start).or_default().push(edge.caller_start);
-        callees.entry(edge.caller_start).or_default().push(edge.callee_start);
+        callers
+            .entry(edge.callee_start)
+            .or_default()
+            .push(edge.caller_start);
+        callees
+            .entry(edge.caller_start)
+            .or_default()
+            .push(edge.callee_start);
     }
 
     let to_rva = |va: u64| -> Result<u32> {
@@ -222,13 +230,22 @@ fn build_ownership_report(
     };
 
     let mut report = Vec::with_capacity(ranges.len());
-    crate::progress::begin_detail_task("Commercial VM: building ownership report", ranges.len() as u64, "functions");
+    crate::progress::begin_detail_task(
+        "Commercial VM: building ownership report",
+        ranges.len() as u64,
+        "functions",
+    );
     for (ordinal, (start, end)) in ranges.into_iter().enumerate() {
-        if ordinal & 0xff == 0 { crate::progress::set_position(ordinal as u64); }
+        if ordinal & 0xff == 0 {
+            crate::progress::set_position(ordinal as u64);
+        }
         let exclusion = exclusions_by_range.get(&(start, end)).copied();
         let start_rva = to_rva(start)?;
         let end_rva = to_rva(end)?;
-        let function_blocks = blocks_by_function.get(&(start, end)).map(Vec::as_slice).unwrap_or(&[]);
+        let function_blocks = blocks_by_function
+            .get(&(start, end))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let instruction_count = function_blocks
             .iter()
             .map(|block| {
@@ -290,8 +307,10 @@ fn build_ownership_report(
             reason = OwnershipReason::FunctionAtomicityPropagation;
             legacy_reason = "function-atomicity-propagation";
         }
-        let has_native_unwind_entry = pdata_function_ranges.binary_search_by_key(&start, |range| range.0)
-            .ok().is_some_and(|index| end <= pdata_function_ranges[index].1);
+        let has_native_unwind_entry = pdata_function_ranges
+            .binary_search_by_key(&start, |range| range.0)
+            .ok()
+            .is_some_and(|index| end <= pdata_function_ranges[index].1);
         let function = FunctionOwnership {
             start_rva,
             end_rva,
@@ -313,18 +332,35 @@ fn build_ownership_report(
                     OwnershipBlocker::new(to_rva(first.rva).unwrap_or(start_rva), Some(first.code))
                 })
                 .unwrap_or_else(|| OwnershipBlocker::new(start_rva, None));
-            blocker.pdata_range = function_range_set.contains(&(start, end))
-                .then_some(RuntimeFunction {
-                    begin_rva: start_rva,
-                    end_rva,
-                });
-            blocker.caller_rvas.extend(callers.get(&start).into_iter().flatten().filter_map(|&va| to_rva(va).ok()));
-            blocker.callee_rvas.extend(callees.get(&start).into_iter().flatten().filter_map(|&va| to_rva(va).ok()));
+            blocker.pdata_range =
+                function_range_set
+                    .contains(&(start, end))
+                    .then_some(RuntimeFunction {
+                        begin_rva: start_rva,
+                        end_rva,
+                    });
+            blocker.caller_rvas.extend(
+                callers
+                    .get(&start)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|&va| to_rva(va).ok()),
+            );
+            blocker.callee_rvas.extend(
+                callees
+                    .get(&start)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|&va| to_rva(va).ok()),
+            );
             diagnostic = diagnostic.with_first_blocker(blocker);
         }
         report.push(diagnostic);
     }
-    crate::progress::finish_task(format!("Commercial VM ownership report complete: {} function(s)", report.len()));
+    crate::progress::finish_task(format!(
+        "Commercial VM ownership report complete: {} function(s)",
+        report.len()
+    ));
     Ok(report)
 }
 
@@ -523,7 +559,9 @@ fn performance_native_roots(
         "functions",
     );
     for (ordinal, &range) in function_ranges.iter().enumerate() {
-        if ordinal & 0xff == 0 { crate::progress::set_position(ordinal as u64); }
+        if ordinal & 0xff == 0 {
+            crate::progress::set_position(ordinal as u64);
+        }
         let mut evidence = blocks_by_function
             .get(&range)
             .into_iter()
@@ -556,7 +594,10 @@ fn performance_native_roots(
         }
     }
     crate::progress::set_position(function_ranges.len() as u64);
-    crate::progress::finish_task(format!("Commercial VM performance-native roots complete: {} root(s)", roots.len()));
+    crate::progress::finish_task(format!(
+        "Commercial VM performance-native roots complete: {} root(s)",
+        roots.len()
+    ));
     roots
 }
 
@@ -575,12 +616,17 @@ fn expand_performance_native_wrappers(
         let selected = roots.keys().copied().collect::<HashSet<_>>();
         let mut additions = Vec::new();
         crate::progress::begin_detail_task(
-            format!("Commercial VM: expanding native wrappers depth {}", depth + 1),
+            format!(
+                "Commercial VM: expanding native wrappers depth {}",
+                depth + 1
+            ),
             function_ranges.len() as u64,
             "functions",
         );
         for (ordinal, &range) in function_ranges.iter().enumerate() {
-            if ordinal & 0xff == 0 { crate::progress::set_position(ordinal as u64); }
+            if ordinal & 0xff == 0 {
+                crate::progress::set_position(ordinal as u64);
+            }
             if selected.contains(&range) || preexisting_native.contains(&range) {
                 continue;
             }
@@ -629,7 +675,11 @@ fn expand_performance_native_wrappers(
             ));
         }
         crate::progress::set_position(function_ranges.len() as u64);
-        crate::progress::finish_task(format!("Commercial VM native wrapper depth {} complete: {} addition(s)", depth + 1, additions.len()));
+        crate::progress::finish_task(format!(
+            "Commercial VM native wrapper depth {} complete: {} addition(s)",
+            depth + 1,
+            additions.len()
+        ));
         if additions.is_empty() {
             break;
         }
@@ -657,13 +707,21 @@ fn expand_performance_native_callees(
         let selected = roots.keys().copied().collect::<HashSet<_>>();
         let mut additions = Vec::new();
         crate::progress::begin_detail_task(
-            format!("Commercial VM: expanding native callees depth {}", depth + 1),
+            format!(
+                "Commercial VM: expanding native callees depth {}",
+                depth + 1
+            ),
             selected.len() as u64,
             "functions",
         );
         for (ordinal, &range) in selected.iter().enumerate() {
-            if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
-            let owned_blocks = blocks_by_function.get(&range).map(Vec::as_slice).unwrap_or(&[]);
+            if ordinal & 0x3f == 0 {
+                crate::progress::set_position(ordinal as u64);
+            }
+            let owned_blocks = blocks_by_function
+                .get(&range)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             for instruction in owned_blocks
                 .iter()
                 .flat_map(|block| block.instructions.iter())
@@ -714,7 +772,11 @@ fn expand_performance_native_callees(
             }
         }
         crate::progress::set_position(selected.len() as u64);
-        crate::progress::finish_task(format!("Commercial VM native callee depth {} complete: {} addition(s)", depth + 1, additions.len()));
+        crate::progress::finish_task(format!(
+            "Commercial VM native callee depth {} complete: {} addition(s)",
+            depth + 1,
+            additions.len()
+        ));
         if additions.is_empty() {
             break;
         }
@@ -778,14 +840,21 @@ fn add_special_native_abi_functions(
 ) {
     let native_snapshot: HashSet<(u64, u64)> = native_ranges.iter().copied().collect();
     let blocks_by_function = index_blocks_by_function(all_function_ranges, blocks);
-    let address_values = relayed_sections.iter()
+    let address_values = relayed_sections
+        .iter()
         .filter(|section| section.name != ".text")
         .flat_map(|section| section.bytes.windows(8))
         .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
         .collect::<HashSet<_>>();
-    crate::progress::begin_detail_task("Commercial VM: classifying special native ABI functions", all_function_ranges.len() as u64, "functions");
+    crate::progress::begin_detail_task(
+        "Commercial VM: classifying special native ABI functions",
+        all_function_ranges.len() as u64,
+        "functions",
+    );
     for (ordinal, &range @ (start, end)) in all_function_ranges.iter().enumerate() {
-        if ordinal & 0xff == 0 { crate::progress::set_position(ordinal as u64); }
+        if ordinal & 0xff == 0 {
+            crate::progress::set_position(ordinal as u64);
+        }
         if native_snapshot.contains(&range) {
             continue;
         }
@@ -843,9 +912,15 @@ fn build_semantic_dependency_report(
 ) -> CommercialSemanticDependencyReport {
     let owner_of = |va: u64| indexed_function_owner(all_function_ranges, va);
     let blocks_by_function = index_blocks_by_function(all_function_ranges, blocks);
-    let block_starts = blocks.iter().map(|block| block.start_va).collect::<HashSet<_>>();
+    let block_starts = blocks
+        .iter()
+        .map(|block| block.start_va)
+        .collect::<HashSet<_>>();
     let canonical_sites = canonical_model.map(|model| {
-        model.indirect_targets.sites.values()
+        model
+            .indirect_targets
+            .sites
+            .values()
             .map(|site| (site.instruction_rva, site))
             .collect::<HashMap<_, _>>()
     });
@@ -1036,11 +1111,20 @@ fn build_semantic_dependency_report(
         });
     }
     components.sort_by_key(|component| component.functions[0]);
-    let component_of = components.iter().enumerate()
-        .flat_map(|(index, component)| component.functions.iter().map(move |&function| (function, index)))
+    let component_of = components
+        .iter()
+        .enumerate()
+        .flat_map(|(index, component)| {
+            component
+                .functions
+                .iter()
+                .map(move |&function| (function, index))
+        })
         .collect::<HashMap<_, _>>();
     for edge in &edges {
-        let Some(&caller_component) = component_of.get(&edge.caller_start) else { continue; };
+        let Some(&caller_component) = component_of.get(&edge.caller_start) else {
+            continue;
+        };
         if component_of.get(&edge.callee_start) == Some(&caller_component) {
             components[caller_component].internal_edges += 1;
         } else {
@@ -1638,18 +1722,32 @@ pub fn lift_program_cfg_commercial_with_model(
     all_function_ranges.sort_by_key(|range| (range.0, range.1));
     all_function_ranges.dedup();
     let commercial_blocks_by_function = index_blocks_by_function(&all_function_ranges, &blocks);
-    let function_range_by_start = all_function_ranges.iter().copied()
-        .map(|range| (range.0, range)).collect::<HashMap<_, _>>();
-    let canonical_function_by_block_start = canonical_model.map(|model| {
-        model.blocks.values().filter_map(|block| {
-            let function = model.functions.get(&block.function_id)?;
-            let entry = function.entries.iter().next().copied()?;
-            let primary = function.ranges.iter()
-                .filter(|range| range.start <= entry && entry < range.end)
-                .max_by_key(|range| range.end.saturating_sub(range.start))?;
-            Some((image_base + u64::from(block.range.start), image_base + u64::from(primary.start)))
-        }).collect::<HashMap<_, _>>()
-    }).unwrap_or_default();
+    let function_range_by_start = all_function_ranges
+        .iter()
+        .copied()
+        .map(|range| (range.0, range))
+        .collect::<HashMap<_, _>>();
+    let canonical_function_by_block_start = canonical_model
+        .map(|model| {
+            model
+                .blocks
+                .values()
+                .filter_map(|block| {
+                    let function = model.functions.get(&block.function_id)?;
+                    let entry = function.entries.iter().next().copied()?;
+                    let primary = function
+                        .ranges
+                        .iter()
+                        .filter(|range| range.start <= entry && entry < range.end)
+                        .max_by_key(|range| range.end.saturating_sub(range.start))?;
+                    Some((
+                        image_base + u64::from(block.range.start),
+                        image_base + u64::from(primary.start),
+                    ))
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
     let mut native_function_ranges = excl.func_ranges.clone();
 
     // Keep latency-sensitive runtime plumbing native. These functions execute
@@ -1732,9 +1830,13 @@ pub fn lift_program_cfg_commercial_with_model(
         .iter()
         .copied()
         .filter(|(s, e)| {
-            commercial_blocks_by_function.get(&(*s, *e)).is_some_and(|owned| {
-                owned.iter().any(|bb| bb.instructions.iter().any(has_unsupported_high_byte))
-            })
+            commercial_blocks_by_function
+                .get(&(*s, *e))
+                .is_some_and(|owned| {
+                    owned
+                        .iter()
+                        .any(|bb| bb.instructions.iter().any(has_unsupported_high_byte))
+                })
         })
         .collect();
     let semantic_dependency_report = build_semantic_dependency_report(
@@ -1818,9 +1920,13 @@ pub fn lift_program_cfg_commercial_with_model(
         .iter()
         .copied()
         .filter(|(s, e)| {
-            commercial_blocks_by_function.get(&(*s, *e)).is_some_and(|owned| {
-                owned.iter().any(|bb| bb.instructions.iter().any(integration_sensitive))
-            })
+            commercial_blocks_by_function
+                .get(&(*s, *e))
+                .is_some_and(|owned| {
+                    owned
+                        .iter()
+                        .any(|bb| bb.instructions.iter().any(integration_sensitive))
+                })
         })
         .collect();
     let mut integration_quarantine_blocks = HashSet::new();
@@ -1845,17 +1951,34 @@ pub fn lift_program_cfg_commercial_with_model(
     // 를 호출하면 스택 프레임이 파괴된다(이번 타깃에선 RIP-relative 크래시로 발현).
     // `.pdata` 함수 원자성으로 막을 수 있지만 커버리지가 절반으로 하락해(4513→2317)
     // 채택하지 않음. 함수 원자성 + 경계-브리지 재설계는 후속 P2 항목.
-    crate::progress::begin_detail_task("Commercial VM: enforcing function-atomic liftability", all_function_ranges.len() as u64, "functions");
+    crate::progress::begin_detail_task(
+        "Commercial VM: enforcing function-atomic liftability",
+        all_function_ranges.len() as u64,
+        "functions",
+    );
     for (ordinal, &range) in all_function_ranges.iter().enumerate() {
-        if ordinal & 0xff == 0 { crate::progress::set_position(ordinal as u64); }
-        let Some(owned) = commercial_blocks_by_function.get(&range) else { continue; };
+        if ordinal & 0xff == 0 {
+            crate::progress::set_position(ordinal as u64);
+        }
+        let Some(owned) = commercial_blocks_by_function.get(&range) else {
+            continue;
+        };
         let unliftable = owned.iter().any(|bb| {
-            if excluded_blocks.contains(&bb.start_va) { return false; }
-            let real = bb.instructions.iter().copied().filter(|i| !is_zero_padding(i)).collect::<Vec<_>>();
+            if excluded_blocks.contains(&bb.start_va) {
+                return false;
+            }
+            let real = bb
+                .instructions
+                .iter()
+                .copied()
+                .filter(|i| !is_zero_padding(i))
+                .collect::<Vec<_>>();
             !real.is_empty() && !block_poly_liftable(&real)
         });
         if unliftable {
-            if !native_function_ranges.contains(&range) { native_function_ranges.push(range); }
+            if !native_function_ranges.contains(&range) {
+                native_function_ranges.push(range);
+            }
             excluded_blocks.extend(owned.iter().map(|block| block.start_va));
         }
     }
@@ -1920,7 +2043,9 @@ pub fn lift_program_cfg_commercial_with_model(
     let mut attributed_blocks = HashSet::new();
     for &(function_start, function_end) in &all_function_ranges {
         let function_blocks = commercial_blocks_by_function
-            .get(&(function_start, function_end)).cloned().unwrap_or_default();
+            .get(&(function_start, function_end))
+            .cloned()
+            .unwrap_or_default();
         let excluded_in_function: Vec<_> = function_blocks
             .iter()
             .copied()
@@ -2104,9 +2229,15 @@ pub fn lift_program_cfg_commercial_with_model(
     // instruction. LEA->call scopes are also eligible because every native-call
     // RUNTIME_FUNCTION now carries a language-specific UHANDLER which restores
     // ciphertext and releases every lifetime entry owned by the unwinding TEB.
-    let vm_instruction_by_ip = blocks.iter()
+    let vm_instruction_by_ip = blocks
+        .iter()
         .filter(|block| !excluded_blocks.contains(&block.start_va))
-        .flat_map(|block| block.instructions.iter().map(|instruction| (instruction.ip(), instruction)))
+        .flat_map(|block| {
+            block
+                .instructions
+                .iter()
+                .map(|instruction| (instruction.ip(), instruction))
+        })
         .collect::<HashMap<_, _>>();
     let eligible_lifetime_objects: Vec<_> = lifetime_objects
         .iter()
@@ -2115,16 +2246,24 @@ pub fn lift_program_cfg_commercial_with_model(
                 let va = image_base + *reference as u64;
                 vm_instruction_by_ip.get(&va).is_some_and(|instruction| {
                     if crate::vm::data_lifetime::is_unwind_safe_direct_reference(
-                        instruction, object, image_base,
-                    ) { return true; }
+                        instruction,
+                        object,
+                        image_base,
+                    ) {
+                        return true;
+                    }
                     let destination = instruction.op0_register().full_register();
                     instruction.code() == Code::Lea_r64_m
                         && instruction.is_ip_rel_memory_operand()
-                        && matches!(destination, Register::RCX | Register::RDX | Register::R8 | Register::R9)
+                        && matches!(
+                            destination,
+                            Register::RCX | Register::RDX | Register::R8 | Register::R9
+                        )
                         && {
                             let target = instruction.ip_rel_memory_address();
                             target >= image_base + object.rva as u64
-                                && target < image_base + object.rva.saturating_add(object.len) as u64
+                                && target
+                                    < image_base + object.rva.saturating_add(object.len) as u64
                         }
                 })
             })
@@ -2303,8 +2442,8 @@ pub fn lift_program_cfg_commercial_with_model(
         if ok {
             let base = instrs.len();
             let block_ops = lifter.desynth.instrs.len();
-            let skipped_zero_op_tail =
-                commit_block_ip_map(&mut ip_map, &local_ip, base, block_ops);
+            lifter.rebase_internal_branches(base, real.last().map(Instruction::next_ip))?;
+            let skipped_zero_op_tail = commit_block_ip_map(&mut ip_map, &local_ip, base, block_ops);
             if skipped_zero_op_tail != 0 && std::env::var_os("BTG_DIAG_IP_MAP").is_some() {
                 crate::progress_safe_eprintln!(
                     "[IP-MAP] block={:#x}: omitted {} trailing zero-op source IP(s)",
@@ -2374,8 +2513,7 @@ pub fn lift_program_cfg_commercial_with_model(
     }
     crate::progress::finish_task(format!(
         "Commercial RISC lift complete: {} VM block(s), {} native block(s)",
-        virtualized,
-        native_blocks
+        virtualized, native_blocks
     ));
 
     // P0-①: VM↔native 경계 함수 원자성 — 제외 함수 범위로 나가는 직접 분기 타깃을
@@ -2580,15 +2718,25 @@ pub fn lift_program_cfg_commercial_with_model(
     let observed_functions: Vec<(u64, u64)> = all_function_ranges
         .iter()
         .copied()
-        .filter(|range| commercial_blocks_by_function.get(range).is_some_and(|owned| !owned.is_empty()))
+        .filter(|range| {
+            commercial_blocks_by_function
+                .get(range)
+                .is_some_and(|owned| !owned.is_empty())
+        })
         .collect();
     let mut virtualized_function_ids: Vec<u64> = observed_functions
         .iter()
         .filter(|range| {
-            commercial_blocks_by_function.get(range).is_some_and(|owned| {
-                owned.iter().any(|bb| !excluded_blocks.contains(&bb.start_va))
-                    && !owned.iter().any(|bb| excluded_blocks.contains(&bb.start_va))
-            })
+            commercial_blocks_by_function
+                .get(range)
+                .is_some_and(|owned| {
+                    owned
+                        .iter()
+                        .any(|bb| !excluded_blocks.contains(&bb.start_va))
+                        && !owned
+                            .iter()
+                            .any(|bb| excluded_blocks.contains(&bb.start_va))
+                })
         })
         .map(|(start, _)| *start)
         .collect();

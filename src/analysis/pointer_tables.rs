@@ -73,9 +73,15 @@ pub fn produce(
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
         .collect::<Vec<_>>();
-    crate::progress::begin_detail_task("ProgramModel: analyzing direct pointer-table sites", sites.len() as u64, "sites");
+    crate::progress::begin_detail_task(
+        "ProgramModel: analyzing direct pointer-table sites",
+        sites.len() as u64,
+        "sites",
+    );
     for (ordinal, site) in sites.into_iter().enumerate() {
-        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
+        if ordinal & 0x3f == 0 {
+            crate::progress::set_position(ordinal as u64);
+        }
         let Some(block) = program.blocks.get(&site.source_block) else {
             continue;
         };
@@ -155,7 +161,10 @@ pub fn produce(
         });
     }
     out.sort_by_key(|resolution| resolution.site);
-    crate::progress::finish_task(format!("ProgramModel direct pointer-table analysis complete: {} candidate(s)", out.len()));
+    crate::progress::finish_task(format!(
+        "ProgramModel direct pointer-table analysis complete: {} candidate(s)",
+        out.len()
+    ));
     out
 }
 
@@ -178,9 +187,15 @@ pub fn produce_iat_slots(
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
         .collect::<Vec<_>>();
-    crate::progress::begin_detail_task("ProgramModel: analyzing IAT sites", sites.len() as u64, "sites");
+    crate::progress::begin_detail_task(
+        "ProgramModel: analyzing IAT sites",
+        sites.len() as u64,
+        "sites",
+    );
     for (ordinal, site) in sites.into_iter().enumerate() {
-        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
+        if ordinal & 0x3f == 0 {
+            crate::progress::set_position(ordinal as u64);
+        }
         let Some(block) = program.blocks.get(&site.source_block) else {
             continue;
         };
@@ -265,7 +280,10 @@ pub fn produce_iat_slots(
         out.push((site.id, image_base + u64::from(slots[0])));
     }
     out.sort_by_key(|(site, _)| *site);
-    crate::progress::finish_task(format!("ProgramModel IAT analysis complete: {} candidate(s)", out.len()));
+    crate::progress::finish_task(format!(
+        "ProgramModel IAT analysis complete: {} candidate(s)",
+        out.len()
+    ));
     out
 }
 
@@ -353,9 +371,15 @@ pub fn produce_dynamic_import_resolutions(
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
         .collect::<Vec<_>>();
-    crate::progress::begin_detail_task("ProgramModel: analyzing dynamic-import sites", sites.len() as u64, "sites");
+    crate::progress::begin_detail_task(
+        "ProgramModel: analyzing dynamic-import sites",
+        sites.len() as u64,
+        "sites",
+    );
     for (ordinal, site) in sites.into_iter().enumerate() {
-        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
+        if ordinal & 0x3f == 0 {
+            crate::progress::set_position(ordinal as u64);
+        }
         let Some(block) = program.blocks.get(&site.source_block) else {
             continue;
         };
@@ -389,7 +413,10 @@ pub fn produce_dynamic_import_resolutions(
         }
     }
     out.sort_by_key(|(site, _)| *site);
-    crate::progress::finish_task(format!("ProgramModel dynamic-import analysis complete: {} candidate(s)", out.len()));
+    crate::progress::finish_task(format!(
+        "ProgramModel dynamic-import analysis complete: {} candidate(s)",
+        out.len()
+    ));
     out
 }
 
@@ -416,7 +443,9 @@ fn discover_dynamic_import_slots(
         "functions",
     );
     for (ordinal, instructions) in instructions_by_function.values_mut().enumerate() {
-        if ordinal & 0xff == 0 { crate::progress::set_position(ordinal as u64); }
+        if ordinal & 0xff == 0 {
+            crate::progress::set_position(ordinal as u64);
+        }
         instructions.sort_by_key(|instruction| instruction.ip());
         instructions.dedup_by_key(|instruction| instruction.ip());
         for (index, call) in instructions.iter().enumerate() {
@@ -480,11 +509,11 @@ fn discover_dynamic_import_slots(
     candidates.into_keys().collect()
 }
 
-fn nonzero_or_unknown_direct_store_slots(
-    program: &ProgramModel,
-    image_base: u64,
-) -> BTreeSet<u32> {
-    program.blocks.values().flat_map(|block| &block.instructions)
+fn nonzero_or_unknown_direct_store_slots(program: &ProgramModel, image_base: u64) -> BTreeSet<u32> {
+    program
+        .blocks
+        .values()
+        .flat_map(|block| &block.instructions)
         .filter(|instruction| instruction.op0_kind() == OpKind::Memory)
         .filter(|instruction| unsigned_immediate(instruction, 1) != Some(0))
         .filter_map(|instruction| memory_operand_rva(instruction, image_base))
@@ -735,9 +764,15 @@ pub fn produce_local_value_flow(
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
         .collect::<Vec<_>>();
-    crate::progress::begin_detail_task("ProgramModel: analyzing local value-flow sites", sites.len() as u64, "sites");
+    crate::progress::begin_detail_task(
+        "ProgramModel: analyzing local value-flow sites",
+        sites.len() as u64,
+        "sites",
+    );
     for (ordinal, site) in sites.into_iter().enumerate() {
-        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
+        if ordinal & 0x3f == 0 {
+            crate::progress::set_position(ordinal as u64);
+        }
         let Some(block) = program.blocks.get(&site.source_block) else {
             continue;
         };
@@ -1223,9 +1258,15 @@ pub fn produce_optional_runtime_callbacks(
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
         .collect::<Vec<_>>();
-    crate::progress::begin_detail_task("ProgramModel: analyzing optional runtime callbacks", sites.len() as u64, "sites");
+    crate::progress::begin_detail_task(
+        "ProgramModel: analyzing optional runtime callbacks",
+        sites.len() as u64,
+        "sites",
+    );
     for (ordinal, site) in sites.into_iter().enumerate() {
-        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
+        if ordinal & 0x3f == 0 {
+            crate::progress::set_position(ordinal as u64);
+        }
         let Some(block) = program.blocks.get(&site.source_block) else {
             continue;
         };
@@ -1316,7 +1357,10 @@ pub fn produce_optional_runtime_callbacks(
         ));
     }
     out.sort_by_key(|(resolution, _)| resolution.site);
-    crate::progress::finish_task(format!("ProgramModel optional runtime callback analysis complete: {} candidate(s)", out.len()));
+    crate::progress::finish_task(format!(
+        "ProgramModel optional runtime callback analysis complete: {} candidate(s)",
+        out.len()
+    ));
     out
 }
 
@@ -1338,9 +1382,15 @@ pub fn produce_runtime_global_callbacks(
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
         .collect::<Vec<_>>();
-    crate::progress::begin_detail_task("ProgramModel: analyzing runtime global callbacks", sites.len() as u64, "sites");
+    crate::progress::begin_detail_task(
+        "ProgramModel: analyzing runtime global callbacks",
+        sites.len() as u64,
+        "sites",
+    );
     for (ordinal, site) in sites.into_iter().enumerate() {
-        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
+        if ordinal & 0x3f == 0 {
+            crate::progress::set_position(ordinal as u64);
+        }
         let Some(block) = program.blocks.get(&site.source_block) else {
             continue;
         };
@@ -1388,7 +1438,10 @@ pub fn produce_runtime_global_callbacks(
         }
     }
     out.sort_by_key(|(site, _)| *site);
-    crate::progress::finish_task(format!("ProgramModel runtime global callback analysis complete: {} candidate(s)", out.len()));
+    crate::progress::finish_task(format!(
+        "ProgramModel runtime global callback analysis complete: {} candidate(s)",
+        out.len()
+    ));
     out
 }
 
@@ -1402,8 +1455,15 @@ pub fn produce_runtime_stack_callback_dispatches(
     let predecessors = build_predecessor_index(program);
     let mut instructions_by_function = BTreeMap::new();
     for block in program.blocks.values() {
-        instructions_by_function.entry(block.function_id).or_insert_with(Vec::new)
-            .extend(block.instructions.iter().map(|instruction| (block.id, instruction)));
+        instructions_by_function
+            .entry(block.function_id)
+            .or_insert_with(Vec::new)
+            .extend(
+                block
+                    .instructions
+                    .iter()
+                    .map(|instruction| (block.id, instruction)),
+            );
     }
     for instructions in instructions_by_function.values_mut() {
         instructions.sort_by_key(|(_, instruction)| instruction.ip());
@@ -1415,9 +1475,15 @@ pub fn produce_runtime_stack_callback_dispatches(
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
         .collect::<Vec<_>>();
-    crate::progress::begin_detail_task("ProgramModel: analyzing runtime stack callbacks", sites.len() as u64, "sites");
+    crate::progress::begin_detail_task(
+        "ProgramModel: analyzing runtime stack callbacks",
+        sites.len() as u64,
+        "sites",
+    );
     for (ordinal, site) in sites.into_iter().enumerate() {
-        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
+        if ordinal & 0x3f == 0 {
+            crate::progress::set_position(ordinal as u64);
+        }
         let Some(block) = program.blocks.get(&site.source_block) else {
             continue;
         };
@@ -1436,12 +1502,13 @@ pub fn produce_runtime_stack_callback_dispatches(
         {
             continue;
         }
-        let Some(candidates) = instructions_by_function.get(&site.source_function) else { continue; };
+        let Some(candidates) = instructions_by_function.get(&site.source_function) else {
+            continue;
+        };
         let displacement = call.memory_displacement64();
         let Some(&(store_block, store)) = candidates.iter().rev().find(|(_, instruction)| {
             instruction.ip() < call.ip()
-                &&
-            instruction.mnemonic() == Mnemonic::Mov
+                && instruction.mnemonic() == Mnemonic::Mov
                 && instruction.op0_kind() == OpKind::Memory
                 && instruction.memory_base().full_register() == Register::RBP
                 && instruction.memory_index() == Register::None
@@ -1474,7 +1541,10 @@ pub fn produce_runtime_stack_callback_dispatches(
         out.push((site.id, image_base + u64::from(site.instruction_rva)));
     }
     out.sort_by_key(|(site, _)| *site);
-    crate::progress::finish_task(format!("ProgramModel runtime stack callback analysis complete: {} candidate(s)", out.len()));
+    crate::progress::finish_task(format!(
+        "ProgramModel runtime stack callback analysis complete: {} candidate(s)",
+        out.len()
+    ));
     out
 }
 
@@ -1494,9 +1564,15 @@ pub fn produce_runtime_abi_dispatches(
         .values()
         .filter(|site| site.status == ResolutionStatus::Unresolved)
         .collect::<Vec<_>>();
-    crate::progress::begin_detail_task("ProgramModel: analyzing runtime ABI dispatches", sites.len() as u64, "sites");
+    crate::progress::begin_detail_task(
+        "ProgramModel: analyzing runtime ABI dispatches",
+        sites.len() as u64,
+        "sites",
+    );
     for (ordinal, site) in sites.into_iter().enumerate() {
-        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
+        if ordinal & 0x3f == 0 {
+            crate::progress::set_position(ordinal as u64);
+        }
         let Some(block) = program.blocks.get(&site.source_block) else {
             continue;
         };
@@ -1569,7 +1645,10 @@ pub fn produce_runtime_abi_dispatches(
         out.push((site.id, image_base + u64::from(site.instruction_rva)));
     }
     out.sort_by_key(|(site, _)| *site);
-    crate::progress::finish_task(format!("ProgramModel runtime ABI analysis complete: {} candidate(s)", out.len()));
+    crate::progress::finish_task(format!(
+        "ProgramModel runtime ABI analysis complete: {} candidate(s)",
+        out.len()
+    ));
     out
 }
 

@@ -139,9 +139,7 @@ fn main() -> error::Result<()> {
     if args.verify_seeds > 0 {
         return btg_packer::multi_seed::run(&args).map_err(error::BtgError::Anyhow);
     }
-    if args.section_name_mode == btg_packer::cli::SectionNameMode::Seeded
-        && args.seed.is_none()
-    {
+    if args.section_name_mode == btg_packer::cli::SectionNameMode::Seeded && args.seed.is_none() {
         return Err(error::BtgError::Anyhow(anyhow::anyhow!(
             "--section-name-mode seeded requires an explicit --seed"
         )));
@@ -518,8 +516,11 @@ fn main() -> error::Result<()> {
         );
     }
 
-    let mut progress =
-        PackProgress::new(!args.no_progress, args.progress_refresh_ms, args.progress_only);
+    let mut progress = PackProgress::new(
+        !args.no_progress,
+        args.progress_refresh_ms,
+        args.progress_only,
+    );
     progress.report(1, "Starting pack pipeline");
 
     // ── 입력 PE 로드 ──────────────────────────────────────────────────────────────

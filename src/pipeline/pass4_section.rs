@@ -434,7 +434,8 @@ fn resolve_entry_block_id(ctx: &PipelineContext) -> Result<usize> {
     if let Some((_, &id)) = va_map.range(..=target_ep_va).next_back() {
         crate::progress_safe_eprintln!(
             "[WARN] OEP VA 0x{:X} is inside block ID {}. Using that block.",
-            target_ep_va, id
+            target_ep_va,
+            id
         );
         return Ok(id as usize);
     }

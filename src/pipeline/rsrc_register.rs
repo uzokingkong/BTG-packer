@@ -189,7 +189,12 @@ fn parse_dir(sec: &[u8], off: usize) -> Vec<PEntry> {
 ///
 /// Returns new section bytes. The rebuilt root directory sits at offset 0, so
 /// the caller must set DataDirectory[2] = .rsrc section VA.
-fn rebuild_rsrc_section(sec: &[u8], sec_rva: u32, chunks: &[(u32, u32)]) -> Vec<u8> {
+fn rebuild_rsrc_section(
+    sec: &[u8],
+    source_sec_rva: u32,
+    output_tree_rva: u32,
+    chunks: &[(u32, u32)],
+) -> Vec<u8> {
     fn u32at(d: &[u8], o: usize) -> u32 {
         u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
     }
@@ -351,7 +356,7 @@ fn rebuild_rsrc_section(sec: &[u8], sec_rva: u32, chunks: &[(u32, u32)]) -> Vec<
 
     // ── Parse original tree ────────────────────────────────────────────────────
     let root_entries = parse_dir(sec, 0);
-    let mut nodes = collect(sec, sec_rva, &root_entries);
+    let mut nodes = collect(sec, source_sec_rva, &root_entries);
 
     // ── Append the RT_RCDATA type entry (avoid collision with existing type 10)
     let has_10 = nodes.iter().any(|nd| match nd {
@@ -378,7 +383,7 @@ fn rebuild_rsrc_section(sec: &[u8], sec_rva: u32, chunks: &[(u32, u32)]) -> Vec<
     });
 
     let mut buf: Vec<u8> = Vec::new();
-    emit_nodes(&nodes, sec_rva, &mut buf);
+    emit_nodes(&nodes, output_tree_rva, &mut buf);
     buf
 }
 
@@ -397,23 +402,25 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
     );
 
     // ── Target section: original .rsrc if present, else the .vdata payload sec ──
-    let use_rsrc = ctx.patched_sections.iter().any(|s| s.name == ".rsrc");
+    let rsrc_index = ctx.patched_sections.iter().position(|s| s.name == ".rsrc");
 
-    if use_rsrc {
-        let sec = ctx
-            .patched_sections
-            .iter_mut()
-            .find(|s| s.name == ".rsrc")
-            .expect("checked above");
+    if let Some(rsrc_index) = rsrc_index {
+        // Snapshot the source before borrowing either destination.  If the
+        // rebuilt tree no longer fits the frozen original slot, it is emitted
+        // into the already-placed payload section instead of moving any later
+        // section whose absolute VAs have already been fixed up.
+        let source_bytes = ctx.patched_sections[rsrc_index].bytes.clone();
+        let source_rva = ctx.patched_sections[rsrc_index].virtual_address;
+        let original_raw_len = source_bytes.len();
+        let original_virtual_size = ctx.patched_sections[rsrc_index].virtual_size as usize;
+        let original_layout_span = original_raw_len.max(original_virtual_size);
+
         // Rebuild the whole tree at the .rsrc start so the root IS the resource
         // base: every original resource (icon/version/manifest/...) keeps its
         // structure (offsets recomputed), internal blobs are relocated and their
         // data-entry RVAs rewritten, and the RT_RCDATA payload subtree is
         // appended. DataDirectory[2] = .rsrc VA.
-        let original_raw_len = sec.bytes.len();
-        let original_virtual_size = sec.virtual_size as usize;
-        let original_layout_span = original_raw_len.max(original_virtual_size);
-        let mut rebuilt = rebuild_rsrc_section(&sec.bytes, sec.virtual_address, &chunks);
+        let mut rebuilt = rebuild_rsrc_section(&source_bytes, source_rva, source_rva, &chunks);
         let resource_tree_len = rebuilt.len();
 
         // Generated VAs are frozen before resource registration. Rebuilding
@@ -421,18 +428,49 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         // SizeOfRawData > VirtualSize; shrinking the raw bytes here previously
         // moved the effective mapped end backwards while .textb kept its old
         // RVA, creating a section-address hole rejected by the Windows loader.
+        let mut reclaimed_reloc = false;
+        let mut reclaimed_layout_span = original_layout_span;
         if resource_tree_len > original_layout_span {
-            anyhow::bail!(
-                "--rsrc-register rebuilt resource tree (0x{:X}B) exceeds frozen .rsrc layout span (0x{:X}B; raw=0x{:X}, virtual=0x{:X}); refusing to move generated sections after VA fixup",
-                resource_tree_len,
-                original_layout_span,
-                original_raw_len,
-                original_virtual_size
-            );
+            // The original relocation directory is intentionally discarded for
+            // at-rest encrypted images and rebuilt from scratch when ASLR can be
+            // preserved.  If it immediately follows .rsrc, its frozen RVA span
+            // is therefore safe expansion room: consuming it changes no already
+            // fixed generated VA and avoids growing a later payload section.
+            let resource_end = u64::from(source_rva) + resource_tree_len as u64;
+            let reloc = ctx.patched_sections.iter().find(|s| s.name == ".reloc");
+            let reclaimable = reloc.is_some_and(|reloc| {
+                let reloc_start = u64::from(reloc.virtual_address);
+                let reloc_end =
+                    reloc_start + u64::from(reloc.virtual_size.max(reloc.bytes.len() as u32));
+                reloc_start >= u64::from(source_rva) + original_layout_span as u64
+                    && resource_end <= reloc_end
+            });
+            if !reclaimable {
+                anyhow::bail!(
+                    "--rsrc-register rebuilt resource tree (0x{:X}B) exceeds frozen .rsrc layout span (0x{:X}B; raw=0x{:X}, virtual=0x{:X}) and does not fit in the adjacent disposable .reloc span",
+                    resource_tree_len,
+                    original_layout_span,
+                    original_raw_len,
+                    original_virtual_size
+                );
+            }
+            reclaimed_reloc = true;
+            let reloc = reloc.expect("reclaimable relocation section");
+            let section_alignment = ctx.target_info.section_alignment.max(0x1000) as u64;
+            let reloc_end = u64::from(reloc.virtual_address)
+                + u64::from(reloc.virtual_size.max(reloc.bytes.len() as u32));
+            let aligned_reloc_end = reloc_end.div_ceil(section_alignment) * section_alignment;
+            reclaimed_layout_span =
+                usize::try_from(aligned_reloc_end.saturating_sub(u64::from(source_rva)))
+                    .map_err(|_| anyhow::anyhow!("reclaimed .rsrc/.reloc layout span overflow"))?;
         }
         rebuilt.resize(original_raw_len.max(resource_tree_len), 0);
+        let sec = &mut ctx.patched_sections[rsrc_index];
         sec.bytes = rebuilt;
-        sec.virtual_size = sec.virtual_size.max(resource_tree_len as u32);
+        sec.virtual_size = sec
+            .virtual_size
+            .max(resource_tree_len as u32)
+            .max(reclaimed_layout_span as u32);
         ctx.rsrc_dir_rva = sec.virtual_address;
         ctx.rsrc_dir_size = resource_tree_len as u32;
         println!(
@@ -441,6 +479,14 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
             ctx.rsrc_dir_size,
             original_raw_len
         );
+        if reclaimed_reloc {
+            ctx.patched_sections
+                .retain(|section| section.name != ".reloc");
+            println!(
+                "[+] RT_RCDATA: reclaimed the adjacent obsolete .reloc span for 0x{:X}B of frozen-layout-safe .rsrc growth",
+                resource_tree_len - original_layout_span
+            );
+        }
     } else if let Some(ps) = ctx.payload_section_data.as_mut() {
         let base_off = align4(ps.bytes.len());
         let tree = build_tree(&RootInfo::default(), &chunks, base_off);

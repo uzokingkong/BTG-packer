@@ -99,7 +99,10 @@ pub fn setjmp_longjmp_function_ranges(
     funcs.sort_unstable_by_key(|(start, end, _)| (*start, *end));
     let func_of = |va: u64| -> Option<(u64, u64)> {
         let upper = funcs.partition_point(|(start, _, _)| *start <= va);
-        funcs[..upper].iter().rev().copied()
+        funcs[..upper]
+            .iter()
+            .rev()
+            .copied()
             .find(|&(s, e, _)| s <= va && va < e)
             .map(|(s, e, _)| (s, e))
     };
@@ -123,7 +126,9 @@ pub fn setjmp_longjmp_function_ranges(
     // fixed-point loop rescanned every instruction edge once per expansion.
     let mut adjacency = HashMap::<u64, Vec<u64>>::new();
     for &(caller, callee) in &sites.call_edges {
-        let (Some((caller, _)), Some((callee, _))) = (func_of(caller), func_of(callee)) else { continue; };
+        let (Some((caller, _)), Some((callee, _))) = (func_of(caller), func_of(callee)) else {
+            continue;
+        };
         adjacency.entry(caller).or_default().push(callee);
         adjacency.entry(callee).or_default().push(caller);
     }
@@ -131,7 +136,9 @@ pub fn setjmp_longjmp_function_ranges(
     let mut queue: VecDeque<u64> = excluded.iter().copied().collect();
     while let Some(function) = queue.pop_front() {
         for &neighbor in adjacency.get(&function).into_iter().flatten() {
-            if excluded.insert(neighbor) { queue.push_back(neighbor); }
+            if excluded.insert(neighbor) {
+                queue.push_back(neighbor);
+            }
         }
     }
 

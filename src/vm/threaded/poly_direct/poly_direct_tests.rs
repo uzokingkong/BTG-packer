@@ -19,6 +19,95 @@ use iced_x86::{
 use std::collections::HashMap;
 
 #[test]
+fn rep_loop_labels_survive_block_append_and_family_partition() {
+    use crate::vm::multi_family::MultiFamilyProgramPlan;
+    use crate::vm::poly::{FunctionOpRange, ProductionFamilyPlan, VmArchitectureFamily};
+    use crate::vm::risc::RiscLifter;
+
+    for family in [
+        VmArchitectureFamily::Stack,
+        VmArchitectureFamily::Register,
+        VmArchitectureFamily::MixedRisc,
+        VmArchitectureFamily::FusedCisc,
+    ] {
+        for seed in [2, 7, 19] {
+            let prefix_len = 26;
+            let mut instrs = vec![MicroInstr::new(RiscOp::Halt)];
+            instrs.extend((0..prefix_len).map(|_| {
+                MicroInstr::new(RiscOp::Mov)
+                    .with_dst(MicroOperand::VReg(0))
+                    .with_src1(MicroOperand::Imm64(0x5a))
+            }));
+            let block_base = instrs.len();
+            let mut lifter = RiscLifter::new();
+            let instruction =
+                Decoder::with_ip(64, &[0xf3, 0xaa], 0x2000, DecoderOptions::NONE).decode();
+            lifter.lift_instruction(&instruction).unwrap();
+            lifter.desynth.instrs.push(MicroInstr::new(RiscOp::Halt));
+            lifter.rebase_internal_branches(block_base, None).unwrap();
+            instrs.extend(lifter.desynth.instrs);
+            let total = instrs.len();
+            let program =
+                RiscProgram::with_ip_map(instrs, HashMap::from([(0x1000, 0), (0x2000, 1)]));
+            let mut plan = ProductionFamilyPlan::new(seed, 0x1000, &[0x1000, 0x2000]);
+            plan.assignments[0].family = if family == VmArchitectureFamily::Stack {
+                VmArchitectureFamily::Register
+            } else {
+                VmArchitectureFamily::Stack
+            };
+            plan.assignments[1].family = family;
+            let ranges = [
+                FunctionOpRange {
+                    function_id: 0x1000,
+                    start_op: 0,
+                    end_op: 1,
+                },
+                FunctionOpRange {
+                    function_id: 0x2000,
+                    start_op: 1,
+                    end_op: total,
+                },
+            ];
+            let partitions = plan.partition_regions(&ranges, total).unwrap();
+            let split = MultiFamilyProgramPlan::build(&program, &plan, &partitions).unwrap();
+            let local = &split
+                .partitions
+                .iter()
+                .find(|p| p.family == family)
+                .unwrap()
+                .program;
+            for op in &local.instrs {
+                if matches!(op.op, RiscOp::VirtualBranch { .. }) {
+                    assert!(op.imm >= prefix_len as u64 && op.imm < local.instrs.len() as u64);
+                }
+            }
+            let mut destination = [0u8; 8];
+            let mut initial = [0u64; 16];
+            initial[1] = 3;
+            initial[7] = destination.as_mut_ptr() as u64;
+            let bytecode = PolymorphicEncoder::new_for_family(seed, family)
+                .encode(local)
+                .unwrap();
+            let result = run_native_poly_direct_for_family(
+                &bytecode,
+                seed,
+                family,
+                &initial,
+                local.ip_map(),
+            )
+            .unwrap();
+            assert_eq!(
+                destination,
+                [0x5a, 0x5a, 0x5a, 0, 0, 0, 0, 0],
+                "{family:?} seed={seed}"
+            );
+            assert_eq!(result.regs[1], 0);
+            assert_eq!(result.regs[7], initial[7] + 3);
+        }
+    }
+}
+
+#[test]
 fn galois_mul2_survives_all_native_family_backends() {
     use crate::vm::poly::VmArchitectureFamily;
     use crate::vm::risc::RiscLifter;
@@ -2721,6 +2810,186 @@ fn test_native_bridge_fp_arg_and_return_matches_abi() {
                 "w{w} seed {seed:#x}: callee did not square XMM0 (arg not delivered?)"
             );
         }
+    }
+}
+
+#[test]
+fn native_bridge_preserves_architectural_r12_r15_across_carrier_permutations() {
+    for seed in 0..24u64 {
+        let mut arena = Arena::new(ARENA_SIZE).unwrap();
+        let callee_off = 0x30000;
+        // Return a position-sensitive checksum of the four nonvolatile args.
+        let callee = [
+            Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R12).unwrap(),
+            Instruction::with3(
+                Code::Imul_r64_rm64_imm32,
+                Register::RAX,
+                Register::RAX,
+                10i32,
+            )
+            .unwrap(),
+            Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::R13).unwrap(),
+            Instruction::with3(
+                Code::Imul_r64_rm64_imm32,
+                Register::RAX,
+                Register::RAX,
+                10i32,
+            )
+            .unwrap(),
+            Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::R14).unwrap(),
+            Instruction::with3(
+                Code::Imul_r64_rm64_imm32,
+                Register::RAX,
+                Register::RAX,
+                10i32,
+            )
+            .unwrap(),
+            Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::R15).unwrap(),
+            Instruction::with(Code::Retnq),
+        ];
+        let native = BlockEncoder::encode(
+            64,
+            InstructionBlock::new(&callee, 0),
+            BlockEncoderOptions::NONE,
+        )
+        .unwrap();
+        arena.bytes()[callee_off..callee_off + native.code_buffer.len()]
+            .copy_from_slice(&native.code_buffer);
+        let callee_va = (arena.base + callee_off) as u64;
+        let program = |ret_ip| {
+            RiscProgram::new(vec![
+                MicroInstr::new(RiscOp::VirtualPush).with_src1(MicroOperand::Imm64(ret_ip)),
+                MicroInstr::new(RiscOp::VirtualBranch {
+                    cond: BranchCondition::Always,
+                })
+                .with_imm(callee_va),
+                MicroInstr::new(RiscOp::Halt),
+            ])
+        };
+        let (_, offsets) = PolymorphicEncoder::new(seed)
+            .encode_with_offsets(&program(0))
+            .unwrap();
+        let bytecode = PolymorphicEncoder::new(seed)
+            .encode(&program(offsets[2] as u64))
+            .unwrap();
+        let layout = VmRuntimeLayout::from_seed(seed);
+        let parts = build_self_decoding_parts_with_layouts(
+            &bytecode,
+            seed,
+            (arena.base + OFF_CODE) as u64,
+            (arena.base + OFF_TABLE) as u64,
+            (arena.base + OFF_BYTECODE) as u64,
+            (arena.base + OFF_STATE) as u64,
+            (arena.base + OFF_STACK_BASE) as u64,
+            None,
+            crate::vm::table_layout::TableLayout::legacy(),
+            layout.clone(),
+        )
+        .unwrap();
+        let guest_rsp = (arena.base + OFF_STACK_BASE - 0x100) as u64;
+        let buf = arena.bytes();
+        buf[OFF_CODE..OFF_CODE + parts.code.len()].copy_from_slice(&parts.code);
+        for (i, value) in parts.table.iter().enumerate() {
+            buf[OFF_TABLE + i * 8..OFF_TABLE + i * 8 + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        install_operand_offsets(buf, OFF_OP_OFFS, &parts.offs_tab);
+        buf[OFF_OP_FLAGS..OFF_OP_FLAGS + 256].copy_from_slice(&parts.flags_tab);
+        buf[OFF_COND_CODES..OFF_COND_CODES + 256].copy_from_slice(&parts.cond_codes);
+        buf[OFF_BRANCH_MAP..OFF_BRANCH_MAP + parts.branch_map.len()]
+            .copy_from_slice(&parts.branch_map);
+        buf[OFF_BYTECODE..OFF_BYTECODE + bytecode.len()].copy_from_slice(&bytecode);
+        buf[OFF_STATE..OFF_STATE + layout.total_size].fill(0);
+        for (index, value) in [(4, guest_rsp), (12, 1), (13, 2), (14, 3), (15, 4)] {
+            let offset = OFF_STATE + layout.vregs[index] as usize;
+            buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        arena.call(OFF_CODE);
+        let offset = OFF_STATE + layout.vregs[0] as usize;
+        assert_eq!(
+            u64::from_le_bytes(arena.bytes()[offset..offset + 8].try_into().unwrap()),
+            1234,
+            "seed {seed}"
+        );
+    }
+}
+
+#[test]
+fn direct_native_tail_without_virtual_caller_returns_to_original_caller() {
+    for seed in [2u64, 7, 19] {
+        let mut arena = Arena::new(ARENA_SIZE).unwrap();
+        let callee_off = 0x30000;
+        let wrapper_off = 0x31000;
+        let callee_va = (arena.base + callee_off) as u64;
+        let code_va = (arena.base + OFF_CODE) as u64;
+        let layout = VmRuntimeLayout::from_seed(seed);
+        let rsp_slot = (arena.base + OFF_STATE + layout.vregs[4] as usize) as u64;
+        let program = RiscProgram::new(vec![
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::Always,
+            })
+            .with_imm(callee_va),
+            MicroInstr::new(RiscOp::Halt),
+        ]);
+        let bytecode = PolymorphicEncoder::new(seed).encode(&program).unwrap();
+        let parts = build_self_decoding_parts_with_layouts(
+            &bytecode,
+            seed,
+            code_va,
+            (arena.base + OFF_TABLE) as u64,
+            (arena.base + OFF_BYTECODE) as u64,
+            (arena.base + OFF_STATE) as u64,
+            (arena.base + OFF_STACK_BASE) as u64,
+            None,
+            crate::vm::table_layout::TableLayout::legacy(),
+            layout.clone(),
+        )
+        .unwrap();
+        let callee = [
+            Instruction::with2(Code::Mov_r64_imm64, Register::RAX, 1234u64).unwrap(),
+            Instruction::with(Code::Retnq),
+        ];
+        // Capture the actual caller's RSP without adding a second CALL frame.
+        let wrapper = [
+            Instruction::with2(Code::Mov_r64_imm64, Register::RAX, rsp_slot).unwrap(),
+            Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base(Register::RAX),
+                Register::RSP,
+            )
+            .unwrap(),
+            Instruction::with2(Code::Mov_r64_imm64, Register::RAX, code_va).unwrap(),
+            Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap(),
+        ];
+        let buf = arena.bytes();
+        buf[OFF_CODE..OFF_CODE + parts.code.len()].copy_from_slice(&parts.code);
+        for (i, value) in parts.table.iter().enumerate() {
+            buf[OFF_TABLE + i * 8..OFF_TABLE + i * 8 + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        install_operand_offsets(buf, OFF_OP_OFFS, &parts.offs_tab);
+        buf[OFF_OP_FLAGS..OFF_OP_FLAGS + 256].copy_from_slice(&parts.flags_tab);
+        buf[OFF_COND_CODES..OFF_COND_CODES + 256].copy_from_slice(&parts.cond_codes);
+        buf[OFF_BRANCH_MAP..OFF_BRANCH_MAP + parts.branch_map.len()]
+            .copy_from_slice(&parts.branch_map);
+        buf[OFF_BYTECODE..OFF_BYTECODE + bytecode.len()].copy_from_slice(&bytecode);
+        buf[OFF_STATE..OFF_STATE + layout.total_size].fill(0);
+        for (off, instrs) in [
+            (callee_off, callee.as_slice()),
+            (wrapper_off, wrapper.as_slice()),
+        ] {
+            let encoded = BlockEncoder::encode(
+                64,
+                InstructionBlock::new(instrs, (arena.base + off) as u64),
+                BlockEncoderOptions::NONE,
+            )
+            .unwrap();
+            arena.bytes()[off..off + encoded.code_buffer.len()]
+                .copy_from_slice(&encoded.code_buffer);
+        }
+        assert_eq!(
+            arena.call_u64(wrapper_off),
+            1234,
+            "seed {seed}: tail target did not return directly to caller"
+        );
     }
 }
 

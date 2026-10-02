@@ -192,10 +192,7 @@ impl PolymorphicEncoder {
                 }
             }
         }
-        crate::progress::finish_task(format!(
-            "Super-op encoding complete: {} byte(s)",
-            out.len()
-        ));
+        crate::progress::finish_task(format!("Super-op encoding complete: {} byte(s)", out.len()));
         Ok((out, offsets))
     }
 

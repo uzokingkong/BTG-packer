@@ -52,9 +52,10 @@ pub struct ProducerValidationIndexes {
 impl ProducerValidationIndexes {
     pub fn build(program: &ProgramModel) -> Self {
         let image_delta = program.blocks.values().find_map(|block| {
-            block.instructions.first().and_then(|instruction| {
-                instruction.ip().checked_sub(block.range.start as u64)
-            })
+            block
+                .instructions
+                .first()
+                .and_then(|instruction| instruction.ip().checked_sub(block.range.start as u64))
         });
         let decoded_rvas = image_delta
             .map(|delta| parallel_decoded_rvas(program, delta))
@@ -191,7 +192,10 @@ pub fn apply_external_indirect_resolutions(
     let mut unresolved = BTreeMap::<(BlockId, u8), Vec<usize>>::new();
     for (index, edge) in next.edges.iter().enumerate() {
         if edge.target == EdgeTarget::Unresolved {
-            unresolved.entry((edge.source, edge_kind_id(edge.kind))).or_default().push(index);
+            unresolved
+                .entry((edge.source, edge_kind_id(edge.kind)))
+                .or_default()
+                .push(index);
         }
     }
     crate::progress::begin_detail_task(
@@ -200,29 +204,42 @@ pub fn apply_external_indirect_resolutions(
         "resolutions",
     );
     for (ordinal, &(site_id, slot_va, provenance)) in resolutions.iter().enumerate() {
-        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
-        let site = next.indirect_targets.sites.get(&site_id)
-            .ok_or(IndirectResolveError::MissingSite(site_id))?.clone();
+        if ordinal & 0x3f == 0 {
+            crate::progress::set_position(ordinal as u64);
+        }
+        let site = next
+            .indirect_targets
+            .sites
+            .get(&site_id)
+            .ok_or(IndirectResolveError::MissingSite(site_id))?
+            .clone();
         let edge_kind = match site.kind {
             IndirectKind::Call => EdgeKind::IndirectCall,
             IndirectKind::Jump => EdgeKind::IndirectJump,
         };
-        let indexes = unresolved.get_mut(&(site.source_block, edge_kind_id(edge_kind)))
+        let indexes = unresolved
+            .get_mut(&(site.source_block, edge_kind_id(edge_kind)))
             .ok_or(IndirectResolveError::MissingUnresolvedEdge(site_id))?;
-        let index = indexes.pop().ok_or(IndirectResolveError::MissingUnresolvedEdge(site_id))?;
+        let index = indexes
+            .pop()
+            .ok_or(IndirectResolveError::MissingUnresolvedEdge(site_id))?;
         next.edges[index] = EdgeModel {
             source: site.source_block,
             kind: edge_kind,
             target: EdgeTarget::External(slot_va),
         };
         let target_site = next.indirect_targets.sites.get_mut(&site_id).unwrap();
-        target_site.targets.insert(IndirectTarget::External(slot_va), provenance);
+        target_site
+            .targets
+            .insert(IndirectTarget::External(slot_va), provenance);
         target_site.status = ResolutionStatus::Complete;
     }
     next.edges.sort_by_key(edge_key);
     crate::progress::set_position(resolutions.len() as u64);
     crate::progress::finish_task(format!(
-        "ProgramModel {} producer complete: {} resolution(s)", producer, resolutions.len()
+        "ProgramModel {} producer complete: {} resolution(s)",
+        producer,
+        resolutions.len()
     ));
     *program = next;
     Ok(())
@@ -232,33 +249,62 @@ pub fn apply_runtime_route_resolutions(
     program: &mut ProgramModel,
     site_ids: &[IndirectSiteId],
 ) -> Result<(), IndirectResolveError> {
-    let batch = site_ids.iter().map(|&site| {
-        (site, 0, TargetProvenance::RuntimeRoute)
-    }).collect::<Vec<_>>();
+    let batch = site_ids
+        .iter()
+        .map(|&site| (site, 0, TargetProvenance::RuntimeRoute))
+        .collect::<Vec<_>>();
     let mut next = program.clone();
     let mut unresolved = BTreeMap::<(BlockId, u8), Vec<usize>>::new();
     for (index, edge) in next.edges.iter().enumerate() {
         if edge.target == EdgeTarget::Unresolved {
-            unresolved.entry((edge.source, edge_kind_id(edge.kind))).or_default().push(index);
+            unresolved
+                .entry((edge.source, edge_kind_id(edge.kind)))
+                .or_default()
+                .push(index);
         }
     }
-    crate::progress::begin_detail_task("ProgramModel: closing runtime-route sites", batch.len() as u64, "sites");
+    crate::progress::begin_detail_task(
+        "ProgramModel: closing runtime-route sites",
+        batch.len() as u64,
+        "sites",
+    );
     for (ordinal, &(site_id, _, _)) in batch.iter().enumerate() {
-        if ordinal & 0x3f == 0 { crate::progress::set_position(ordinal as u64); }
-        let site = next.indirect_targets.sites.get(&site_id)
-            .ok_or(IndirectResolveError::MissingSite(site_id))?.clone();
-        let edge_kind = match site.kind { IndirectKind::Call => EdgeKind::IndirectCall, IndirectKind::Jump => EdgeKind::IndirectJump };
-        let indexes = unresolved.get_mut(&(site.source_block, edge_kind_id(edge_kind)))
+        if ordinal & 0x3f == 0 {
+            crate::progress::set_position(ordinal as u64);
+        }
+        let site = next
+            .indirect_targets
+            .sites
+            .get(&site_id)
+            .ok_or(IndirectResolveError::MissingSite(site_id))?
+            .clone();
+        let edge_kind = match site.kind {
+            IndirectKind::Call => EdgeKind::IndirectCall,
+            IndirectKind::Jump => EdgeKind::IndirectJump,
+        };
+        let indexes = unresolved
+            .get_mut(&(site.source_block, edge_kind_id(edge_kind)))
             .ok_or(IndirectResolveError::MissingUnresolvedEdge(site_id))?;
-        let index = indexes.pop().ok_or(IndirectResolveError::MissingUnresolvedEdge(site_id))?;
-        next.edges[index] = EdgeModel { source: site.source_block, kind: edge_kind, target: EdgeTarget::RuntimeRoute };
+        let index = indexes
+            .pop()
+            .ok_or(IndirectResolveError::MissingUnresolvedEdge(site_id))?;
+        next.edges[index] = EdgeModel {
+            source: site.source_block,
+            kind: edge_kind,
+            target: EdgeTarget::RuntimeRoute,
+        };
         let target_site = next.indirect_targets.sites.get_mut(&site_id).unwrap();
-        target_site.targets.insert(IndirectTarget::RuntimeRoute, TargetProvenance::RuntimeRoute);
+        target_site
+            .targets
+            .insert(IndirectTarget::RuntimeRoute, TargetProvenance::RuntimeRoute);
         target_site.status = ResolutionStatus::Complete;
     }
     next.edges.sort_by_key(edge_key);
     crate::progress::set_position(site_ids.len() as u64);
-    crate::progress::finish_task(format!("ProgramModel runtime-route closure complete: {} site(s)", site_ids.len()));
+    crate::progress::finish_task(format!(
+        "ProgramModel runtime-route closure complete: {} site(s)",
+        site_ids.len()
+    ));
     *program = next;
     Ok(())
 }

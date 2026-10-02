@@ -4,6 +4,29 @@ use iced_x86::{BlockEncoder, BlockEncoderOptions, Instruction, InstructionBlock}
 use iced_x86::{Decoder, DecoderOptions};
 use std::collections::HashMap;
 
+#[test]
+fn rep_block_exit_uses_original_fallthrough_not_next_appended_block() {
+    let mut lifter = RiscLifter::new();
+    let instruction = Decoder::with_ip(64, &[0xf3, 0xaa], 0x140001000,
+        DecoderOptions::NONE).decode();
+    lifter.lift_instruction(&instruction).unwrap();
+    let local_end = lifter.desynth.instrs.len() as u64;
+    let branches: Vec<_> = lifter.desynth.instrs.iter().enumerate()
+        .filter(|(_, op)| matches!(op.op, RiscOp::VirtualBranch { .. }))
+        .map(|(index, op)| (index, op.imm)).collect();
+    assert!(branches.iter().any(|(_, target)| *target == local_end));
+    lifter.rebase_internal_branches(1000, Some(instruction.next_ip())).unwrap();
+    for (site, target) in branches {
+        assert_eq!(lifter.desynth.instrs[site].imm, if target == local_end {
+            instruction.next_ip()
+        } else { 1000 + target });
+    }
+    // Rebasing consumes the recorded sites, so a second commit cannot double-add.
+    let relocated = lifter.desynth.instrs.clone();
+    lifter.rebase_internal_branches(1000, None).unwrap();
+    assert_eq!(lifter.desynth.instrs, relocated);
+}
+
 fn lift(raw: &[u8], ip: u64) -> RiscProgram {
     let mut decoder = Decoder::with_ip(64, raw, ip, DecoderOptions::NONE);
     let mut lifter = RiscLifter::new();

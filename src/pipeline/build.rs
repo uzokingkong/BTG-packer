@@ -11,6 +11,38 @@ use anyhow::Result;
 use std::fs;
 use std::path::Path;
 
+fn retire_source_reloc(sections: &mut Vec<SectionData>) -> Result<()> {
+    let retired: Vec<(u32, u32)> = sections
+        .iter()
+        .filter(|section| section.name == ".reloc")
+        .map(|section| {
+            let end = section
+                .virtual_address
+                .checked_add(
+                    section
+                        .virtual_size
+                        .max(u32::try_from(section.bytes.len())?),
+                )
+                .ok_or_else(|| anyhow::anyhow!("source relocation section end overflow"))?;
+            Ok((section.virtual_address, end))
+        })
+        .collect::<Result<_>>()?;
+    sections.retain(|section| section.name != ".reloc");
+    for (start, end) in retired {
+        // Addresses have already been fixed up. Keep the retired virtual span
+        // as zero-filled tail space in its predecessor rather than moving the
+        // generated sections or retaining obsolete relocation bytes.
+        if let Some(previous) = sections
+            .iter_mut()
+            .filter(|section| section.virtual_address < start)
+            .max_by_key(|section| section.virtual_address)
+        {
+            previous.virtual_size = previous.virtual_size.max(end - previous.virtual_address);
+        }
+    }
+    Ok(())
+}
+
 fn scrub_fully_owned_original_text(ctx: &PipelineContext, sections: &mut [SectionData]) -> u64 {
     let text_start = ctx.target_info.text_rva as u64;
     let text_end = text_start.saturating_add(ctx.target_info.text_vsize as u64);
@@ -118,6 +150,15 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
 
     //
     let mut relayed_sections = ctx.patched_sections.clone();
+    // The source relocation directory is never valid for the rebuilt image:
+    // protected sections, entry gateways, and many absolute-address slots have
+    // changed.  Keeping the old, directory-detached `.reloc` section is also
+    // unsafe when a preceding section (notably a rebuilt `.rsrc`) grows, because
+    // its original RVA can then overlap the expanded section.  Drop it here.
+    // The relocation-aware path below emits a fresh `.reloc` at the end of the
+    // final layout; encrypted/non-reloc-aware images already have ASLR and the
+    // relocation data directory disabled.
+    retire_source_reloc(&mut relayed_sections)?;
     let commercial_owns_all_original_text = ctx.vm_commercial
         && ctx.vm_coverage.as_ref().is_some_and(|coverage| {
             coverage.total_functions != 0
@@ -367,11 +408,8 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
                 );
             }
             if std::env::var_os("BTG_REDIRECT_NATIVE_ISLAND_CXX_EH").is_some() {
-                let patched = plan.redirect_unwind_handlers(
-                    &ctx.target_info,
-                    &image,
-                    &mut relayed_sections,
-                )?;
+                let patched =
+                    plan.redirect_unwind_handlers(&ctx.target_info, &image, &mut relayed_sections)?;
                 println!(
                     "[+] Phase-B native island: redirected {} UNWIND_INFO handler RVA(s)",
                     patched
@@ -1059,9 +1097,8 @@ fn update_pdata_seh(
                     || !relocated_original_unwind_starts.contains(&rf.begin_address)
             })
             .filter(|rf| {
-                retired_text_range.is_none_or(|(start, end)| {
-                    rf.begin_address < start || rf.begin_address >= end
-                })
+                retired_text_range
+                    .is_none_or(|(start, end)| rf.begin_address < start || rf.begin_address >= end)
             })
             .copied()
             .collect();
@@ -1226,7 +1263,10 @@ fn update_pdata_seh(
         pdata_sec.bytes = pdata_bytes.clone();
         // The exception directory describes only the RUNTIME_FUNCTION array,
         // but the section also owns the appended UNWIND_INFO blobs.
-        pdata_sec.virtual_size = pdata_bytes.len() as u32;
+        // RVAs of following sections are already frozen. Shrinking the mapped
+        // extent here can undo the retired .reloc reservation and leave a gap.
+        // The exception directory below still advertises only actual records.
+        pdata_sec.virtual_size = pdata_sec.virtual_size.max(pdata_bytes.len() as u32);
 
         if clean_data_dirs.len() > 3 {
             clean_data_dirs[3] = DataDirectory {
@@ -1258,6 +1298,31 @@ fn update_pdata_seh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_reloc_span_stays_mapped_without_source_bytes() {
+        let mut sections = vec![
+            SectionData {
+                name: ".pdata".into(),
+                virtual_address: 0x1000,
+                virtual_size: 0x800,
+                characteristics: 0x40000040,
+                bytes: vec![0x55; 0x800],
+            },
+            SectionData {
+                name: ".reloc".into(),
+                virtual_address: 0x2000,
+                virtual_size: 0x200,
+                characteristics: 0x42000040,
+                bytes: vec![0xAA; 0x200],
+            },
+        ];
+        retire_source_reloc(&mut sections).unwrap();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].virtual_address, 0x1000);
+        assert_eq!(sections[0].virtual_size, 0x1200);
+        assert_eq!(sections[0].bytes, vec![0x55; 0x800]);
+    }
     use crate::dispatcher::{build_dispatcher, build_dispatcher_reencrypt, UNWIND_ALLOC8};
 
     #[test]
@@ -1337,7 +1402,7 @@ mod tests {
         let mut sections = vec![SectionData {
             name: ".pdata".to_string(),
             virtual_address: 0x4000,
-            virtual_size: 24,
+            virtual_size: 0x1200,
             characteristics: 0x4000_0040,
             bytes: vec![0; 24],
         }];
@@ -1369,7 +1434,7 @@ mod tests {
         assert_eq!(sections[0].bytes.len(), 44);
         assert_eq!(directories[3].virtual_address, 0x4000);
         assert_eq!(directories[3].size, 36);
-        assert_eq!(sections[0].virtual_size, 44);
+        assert_eq!(sections[0].virtual_size, 0x1200);
 
         let words: Vec<u32> = sections[0].bytes[..36]
             .chunks_exact(4)

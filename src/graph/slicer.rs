@@ -380,8 +380,7 @@ impl MicroSlicer {
                         }
                         target_id
                     } else {
-                        let raw_fallthrough_va =
-                            current_inst.ip() + current_inst.len() as u64;
+                        let raw_fallthrough_va = current_inst.ip() + current_inst.len() as u64;
                         let fallthrough_va = fallthrough_aliases
                             .get(&raw_fallthrough_va)
                             .copied()

@@ -971,11 +971,7 @@ pub(crate) fn place_boot_stub(
         );
     }
     let vm_multi_family_sizing = if vm_multi_family_active {
-        crate::progress::subphase(
-            8000,
-            700,
-            "Commercial Program-VM: runtime sizing pass",
-        );
+        crate::progress::subphase(8000, 700, "Commercial Program-VM: runtime sizing pass");
         let plan = ctx.vm_family_plan.as_ref().ok_or_else(|| {
             anyhow::anyhow!("multi-family materialization is missing its family plan")
         })?;
@@ -1263,9 +1259,7 @@ pub(crate) fn place_boot_stub(
         let state_off = (immutable_end + 0xFFF) & !0xFFF;
         vm_prog_state_va = dispatcher_va + state_off as u64;
         vm_prog_total = state_off - vm_prog_off + vm_prog_state_reserve;
-        cursor = vm_prog_off
-            + vm_prog_total
-            + crate::vm::interp::CALL_STACK_SIZE;
+        cursor = vm_prog_off + vm_prog_total + crate::vm::interp::CALL_STACK_SIZE;
         cursor = (cursor + 7) & !7;
         vm_prog_state_reservation_end = cursor;
     } else {
@@ -2251,16 +2245,10 @@ pub(crate) fn place_boot_stub(
             )?
         };
         if vm_multi_family_active {
-            crate::progress::subphase(
-                9900,
-                100,
-                "Commercial Program-VM: final module placement",
-            );
+            crate::progress::subphase(9900, 100, "Commercial Program-VM: final module placement");
         }
-        let pr_immutable_end = vm_prog_off
-            + prmod.code.len()
-            + prmod.table.len()
-            + prmod.bytecode.len();
+        let pr_immutable_end =
+            vm_prog_off + prmod.code.len() + prmod.table.len() + prmod.bytecode.len();
         println!(
             "[DEBUG pass2 prmod] code={} table={} bc={} immutable_end={} btg_len={}",
             prmod.code.len(),
@@ -2269,9 +2257,7 @@ pub(crate) fn place_boot_stub(
             pr_immutable_end,
             btg.bytes.len()
         );
-        if pr_immutable_end > boot_off + BOOT_AREA_RESERVE
-            || pr_immutable_end > btg.bytes.len()
-        {
+        if pr_immutable_end > boot_off + BOOT_AREA_RESERVE || pr_immutable_end > btg.bytes.len() {
             return Err(anyhow::anyhow!(
                 "Program VM immutable module too large: {} bytes at 0x{:X}",
                 prmod.code.len() + prmod.table.len() + prmod.bytecode.len(),
@@ -2833,10 +2819,7 @@ pub(crate) fn place_boot_stub(
     if vm_multi_family_active && vm_prog_state_va > dispatcher_va {
         let state_off = (vm_prog_state_va - dispatcher_va) as usize;
         if state_off == 0 || state_off & 0xFFF != 0 {
-            anyhow::bail!(
-                "invalid sparse Program-VM state offset: 0x{:X}",
-                state_off
-            );
+            anyhow::bail!("invalid sparse Program-VM state offset: 0x{:X}", state_off);
         }
         if vm_prog_state_reservation_end <= state_off {
             anyhow::bail!(
@@ -2845,10 +2828,10 @@ pub(crate) fn place_boot_stub(
                 vm_prog_state_reservation_end
             );
         }
-        let state_rva = u32::try_from(
-            u64::from(ctx.dispatcher_rva) + state_off as u64,
-        )
-        .map_err(|_| anyhow::anyhow!("sparse Program-VM state RVA exceeds PE32+ u32 RVA space"))?;
+        let state_rva =
+            u32::try_from(u64::from(ctx.dispatcher_rva) + state_off as u64).map_err(|_| {
+                anyhow::anyhow!("sparse Program-VM state RVA exceeds PE32+ u32 RVA space")
+            })?;
         let state_size = u32::try_from(vm_prog_state_reserve)
             .map_err(|_| anyhow::anyhow!("sparse Program-VM state VirtualSize exceeds u32"))?;
         ctx.mutable_state_section_data = Some(crate::pe::builder::SectionData {

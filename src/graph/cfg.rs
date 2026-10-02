@@ -359,17 +359,21 @@ impl CfgExtractor {
             "blocks",
         );
         let mut graph = BidirectionalGraph::new();
+        // Resolve each successor in constant time. Re-scanning all blocks per
+        // edge made large images quadratic (hundreds of thousands of blocks).
+        let block_ids: std::collections::HashMap<u64, u32> = basic_blocks
+            .iter()
+            .map(|block| (block.start_va, block.id))
+            .collect();
         for (block_index, bb) in basic_blocks.iter().enumerate() {
-            crate::progress::set_position((block_index + 1) as u64);
+            if block_index & 0xff == 0 || block_index + 1 == basic_blocks.len() {
+                crate::progress::set_position((block_index + 1) as u64);
+            }
             if let Some(last) = bb.instructions.last() {
                 match last.flow_control() {
                     FlowControl::UnconditionalBranch => {
                         let target = last.near_branch_target();
-                        let target_id = basic_blocks
-                            .iter()
-                            .find(|b| b.start_va == target)
-                            .map(|b| b.id)
-                            .unwrap_or(u32::MAX);
+                        let target_id = block_ids.get(&target).copied().unwrap_or(u32::MAX);
                         if target_id != u32::MAX {
                             graph.add_edge(bb.id, target_id, EdgeType::Unconditional, 1);
                         }
@@ -378,12 +382,10 @@ impl CfgExtractor {
                         let taken = bb.successor_vas.first().copied();
                         let fallthrough = bb.successor_vas.get(1).copied();
                         let taken_id = taken
-                            .and_then(|target| basic_blocks.iter().find(|b| b.start_va == target))
-                            .map(|b| b.id)
+                            .and_then(|target| block_ids.get(&target).copied())
                             .unwrap_or(u32::MAX);
                         let fallthrough_id = fallthrough
-                            .and_then(|target| basic_blocks.iter().find(|b| b.start_va == target))
-                            .map(|b| b.id)
+                            .and_then(|target| block_ids.get(&target).copied())
                             .unwrap_or(u32::MAX);
 
                         if taken_id != u32::MAX {
@@ -397,8 +399,7 @@ impl CfgExtractor {
                         let return_id = bb
                             .successor_vas
                             .first()
-                            .and_then(|target| basic_blocks.iter().find(|b| b.start_va == *target))
-                            .map(|b| b.id)
+                            .and_then(|target| block_ids.get(target).copied())
                             .unwrap_or(u32::MAX);
                         if return_id != u32::MAX {
                             graph.add_edge(bb.id, return_id, EdgeType::Call, 1);
@@ -408,8 +409,7 @@ impl CfgExtractor {
                         let next_id = bb
                             .successor_vas
                             .first()
-                            .and_then(|target| basic_blocks.iter().find(|b| b.start_va == *target))
-                            .map(|b| b.id)
+                            .and_then(|target| block_ids.get(target).copied())
                             .unwrap_or(u32::MAX);
                         if next_id != u32::MAX {
                             graph.add_edge(bb.id, next_id, EdgeType::Unconditional, 1);
@@ -441,9 +441,8 @@ impl CfgExtractor {
     fn compute_successors(insts: &[Instruction], pad_runs: &[(u64, u64)]) -> Vec<u64> {
         let mut successors = Vec::new();
         if let Some(last) = insts.last() {
-            let linear = || {
-                Self::normalize_linear_fallthrough(last.ip() + last.len() as u64, pad_runs)
-            };
+            let linear =
+                || Self::normalize_linear_fallthrough(last.ip() + last.len() as u64, pad_runs);
             match last.flow_control() {
                 FlowControl::UnconditionalBranch => {
                     successors.push(last.near_branch_target());

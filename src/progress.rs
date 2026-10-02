@@ -161,8 +161,7 @@ pub fn subphase(rel_base_bp: u32, rel_span_bp: u32, label: impl Into<String>) {
     }
     let rel_base = rel_base_bp.min(10_000);
     let rel_span = rel_span_bp.min(10_000 - rel_base);
-    let base = s.root_base_bp
-        + ((u64::from(s.root_span_bp) * u64::from(rel_base)) / 10_000) as u32;
+    let base = s.root_base_bp + ((u64::from(s.root_span_bp) * u64::from(rel_base)) / 10_000) as u32;
     let span = ((u64::from(s.root_span_bp) * u64::from(rel_span)) / 10_000) as u32;
     s.active_base_bp = base;
     s.active_span_bp = span;
@@ -218,8 +217,8 @@ pub fn set_position(position: u64) {
         position.min(s.total)
     };
     if s.total != 0 && s.task_affects_overall {
-        let local = (u128::from(s.active_span_bp) * u128::from(s.position)
-            / u128::from(s.total)) as u32;
+        let local =
+            (u128::from(s.active_span_bp) * u128::from(s.position) / u128::from(s.total)) as u32;
         s.overall_bp = s.overall_bp.max((s.active_base_bp + local).min(10_000));
     }
     render_locked(&mut s, false);
@@ -359,16 +358,14 @@ fn render_locked(s: &mut ProgressState, force: bool) {
     let overall_fraction = f64::from(s.overall_bp) / 10_000.0;
     let local_percent = local_fraction * 100.0;
     let elapsed = now.duration_since(s.started);
-    let overall_eta = if overall_fraction > 0.01
-        && overall_fraction < 1.0
-        && elapsed.as_secs_f64() >= 1.0
-    {
-        Some(Duration::from_secs_f64(
-            elapsed.as_secs_f64() * (1.0 - overall_fraction) / overall_fraction,
-        ))
-    } else {
-        None
-    };
+    let overall_eta =
+        if overall_fraction > 0.01 && overall_fraction < 1.0 && elapsed.as_secs_f64() >= 1.0 {
+            Some(Duration::from_secs_f64(
+                elapsed.as_secs_f64() * (1.0 - overall_fraction) / overall_fraction,
+            ))
+        } else {
+            None
+        };
     let overall_eta_text = overall_eta
         .map(format_duration)
         .unwrap_or_else(|| "--:--".to_string());
@@ -394,7 +391,8 @@ fn render_locked(s: &mut ProgressState, force: bool) {
             format_count(s.total),
             s.unit,
             format_rate(rate),
-            eta.map(format_duration).unwrap_or_else(|| "--:--".to_string()),
+            eta.map(format_duration)
+                .unwrap_or_else(|| "--:--".to_string()),
         )
     } else if s.task.is_empty() {
         s.phase.clone()
@@ -510,7 +508,6 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{render_ascii_bar, render_unicode_bar};
@@ -520,7 +517,9 @@ mod tests {
         let bar = render_unicode_bar(0.3827, 32);
         assert_eq!(bar.chars().count(), 32);
         assert!(bar.contains('█'));
-        assert!(bar.chars().any(|ch| matches!(ch, '▏' | '▎' | '▍' | '▌' | '▋' | '▊' | '▉')));
+        assert!(bar
+            .chars()
+            .any(|ch| matches!(ch, '▏' | '▎' | '▍' | '▌' | '▋' | '▊' | '▉')));
         assert!(bar.contains('░'));
     }
 

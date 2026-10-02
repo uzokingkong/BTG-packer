@@ -181,7 +181,10 @@ pub fn run_with_indirect_resolutions(
                         );
                         crate::progress_safe_eprintln!(
                             "[INDIRECT-DIAG] rva={:#x} kind={:?} status={:?} block={}",
-                            site.instruction_rva, site.kind, site.status, site.source_block.0
+                            site.instruction_rva,
+                            site.kind,
+                            site.status,
+                            site.source_block.0
                         );
                         for instruction in context {
                             crate::progress_safe_eprintln!(

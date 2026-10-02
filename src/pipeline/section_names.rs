@@ -29,9 +29,11 @@ impl SectionNamePlan {
         }
         let mut state = match mode {
             SectionNameMode::Semantic => unreachable!(),
-            SectionNameMode::Seeded => seed.ok_or_else(|| {
-                anyhow!("--section-name-mode seeded requires an explicit --seed")
-            })? ^ 0x5345_4354_4E41_4D45,
+            SectionNameMode::Seeded => {
+                seed.ok_or_else(|| {
+                    anyhow!("--section-name-mode seeded requires an explicit --seed")
+                })? ^ 0x5345_4354_4E41_4D45
+            }
             SectionNameMode::Random => OsRng.next_u64(),
         };
         let mut used: HashSet<String> = existing_names.into_iter().collect();

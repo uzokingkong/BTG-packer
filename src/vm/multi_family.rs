@@ -244,6 +244,24 @@ impl MultiFamilyProgramPlan {
                     instrs.push(program.instrs[original].clone());
                 }
             }
+            // Source-address branches are resolved by the family IP map, but
+            // generated REP loop labels are global micro-op indices. Rebase
+            // those indices as well: copying them unchanged jumped into the
+            // first unrelated function of the destination family.
+            for instruction in &mut instrs {
+                if matches!(instruction.op, RiscOp::VirtualBranch { .. })
+                    && instruction.src1.is_none()
+                    && !global_ip_map.contains_key(&instruction.imm)
+                    && instruction.imm < program.instrs.len() as u64
+                {
+                    let original_target = instruction.imm as usize;
+                    instruction.imm = *original_to_local.get(&original_target)
+                        .ok_or_else(|| format!(
+                            "internal micro-op branch target {original_target} is outside {:?} family partition",
+                            partition.family,
+                        ))? as u64;
+                }
+            }
             let local_ip_map: HashMap<u64, usize> = global_ip_map
                 .iter()
                 .filter_map(|(ip, original)| {

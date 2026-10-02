@@ -215,7 +215,11 @@ pub fn run(ctx: &mut PipelineContext) -> Result<()> {
         crate::progress::subphase(
             iter_base,
             iter_span,
-            format!("Pass 3: dense-layout convergence {}/{}", _iter + 1, MAX_ITERS),
+            format!(
+                "Pass 3: dense-layout convergence {}/{}",
+                _iter + 1,
+                MAX_ITERS
+            ),
         );
         crate::progress::begin_task(
             format!("Encoding convergence iteration {}/{}", _iter + 1, MAX_ITERS),

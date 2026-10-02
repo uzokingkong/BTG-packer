@@ -163,11 +163,7 @@ pub(crate) fn lift_program(
             data_lifetime_objects = lift.data_lifetime_objects.clone();
             unsupported_report = lift.unsupported_report.clone();
             vm_prog_ip_map = lift.program.ip_map().cloned();
-            crate::progress::subphase(
-                5500,
-                500,
-                "Commercial Program-VM: function-family planning",
-            );
+            crate::progress::subphase(5500, 500, "Commercial Program-VM: function-family planning");
             crate::progress::begin_detail_task(
                 "Assigning VM-owned functions to architecture families",
                 lift.virtualized_function_ids.len() as u64,
@@ -309,11 +305,7 @@ pub(crate) fn lift_program(
                 sensitive_regions: lift.sensitive_regions,
             });
             ownership_report = lift.ownership_report.clone();
-            crate::progress::subphase(
-                6800,
-                400,
-                "Commercial Program-VM: super-operator synthesis",
-            );
+            crate::progress::subphase(6800, 400, "Commercial Program-VM: super-operator synthesis");
             if let Some(model) = ctx.program_model.as_ref() {
                 crate::pipeline::ownership::apply_canonical_indirect_ownership(
                     model,
@@ -350,11 +342,7 @@ pub(crate) fn lift_program(
                     "[+] --vm-commercial P5: no profitable super-op sequence; using primitive polymorphic stream"
                 );
             }
-            crate::progress::subphase(
-                7200,
-                500,
-                "Commercial Program-VM: final polymorphic stream",
-            );
+            crate::progress::subphase(7200, 500, "Commercial Program-VM: final polymorphic stream");
             let (bc, offsets) = if let Some(ref p) = prepared {
                 (p.bytecode.clone(), p.metadata.original_byte_offsets.clone())
             } else {
@@ -382,11 +370,7 @@ pub(crate) fn lift_program(
                     vm::chunk_crypto::DEFAULT_CHUNK_BYTES
                 );
             }
-            crate::progress::subphase(
-                7900,
-                100,
-                "Commercial Program-VM: lift finalization",
-            );
+            crate::progress::subphase(7900, 100, "Commercial Program-VM: lift finalization");
             vm_prog_superops = prepared;
             // P3/P5 mapping: offsets always correspond to original micro-op
             // indices, even when multiple fused body members share one offset.

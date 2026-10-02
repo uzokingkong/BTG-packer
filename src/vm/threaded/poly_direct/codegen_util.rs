@@ -165,6 +165,7 @@ pub(crate) const C5: u64 = 0x94D049BB133111EB;
 // ── small code builder (two-pass branch patching, mirroring pass3) ──────────
 pub(crate) struct CodeBuilder {
     instrs: Vec<Instruction>,
+    abi_register_instructions: std::collections::HashSet<usize>,
     /// (branch instruction index, target instruction index)
     pub(crate) branches: Vec<(usize, usize)>,
 }
@@ -173,12 +174,20 @@ impl CodeBuilder {
     pub(crate) fn new() -> Self {
         Self {
             instrs: Vec::new(),
+            abi_register_instructions: std::collections::HashSet::new(),
             branches: Vec::new(),
         }
     }
     pub(crate) fn push(&mut self, i: Instruction) -> usize {
         self.instrs.push(i);
         self.instrs.len() - 1
+    }
+    /// Explicit register operands here are architectural ABI registers, not
+    /// dispatcher carriers. Memory addressing still follows carrier remapping.
+    pub(crate) fn push_abi_registers(&mut self, i: Instruction) -> usize {
+        let index = self.push(i);
+        self.abi_register_instructions.insert(index);
+        index
     }
     pub(crate) fn len(&self) -> usize {
         self.instrs.len()
@@ -227,6 +236,12 @@ impl CodeBuilder {
             .collect();
         let clone_start = self.instrs.len();
         self.instrs.extend(source_instrs);
+        for source in start..end {
+            if self.abi_register_instructions.contains(&source) {
+                self.abi_register_instructions
+                    .insert(clone_start + source - start);
+            }
+        }
         for (branch, target) in source_branches {
             let cloned_branch = clone_start + (branch - start);
             let cloned_target = if target == old_exit {
@@ -265,9 +280,11 @@ impl CodeBuilder {
         &mut self,
         assignment: &crate::vm::threaded::reg_permutation::RegisterAssignment,
     ) {
-        for ins in &mut self.instrs {
+        for (index, ins) in self.instrs.iter_mut().enumerate() {
             for op in 0..ins.op_count() {
-                if ins.op_kind(op) == iced_x86::OpKind::Register {
+                if ins.op_kind(op) == iced_x86::OpKind::Register
+                    && !self.abi_register_instructions.contains(&index)
+                {
                     ins.set_op_register(op, assignment.map_legacy_carrier(ins.op_register(op)));
                 }
             }
@@ -554,6 +571,38 @@ pub(crate) fn emit_read_compact_imm(
 #[cfg(test)]
 mod code_builder_tests {
     use super::*;
+
+    #[test]
+    fn carrier_remapping_preserves_native_abi_registers_and_clones() {
+        use crate::vm::threaded::reg_permutation::RegisterAssignment;
+        for seed in 0..24 {
+            let assignment = RegisterAssignment::production_from_seed(seed);
+            let mut b = CodeBuilder::new();
+            b.push(Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::R12).unwrap());
+            let start = b.push_abi_registers(
+                Instruction::with2(
+                    Code::Mov_r64_rm64,
+                    Register::R12,
+                    MemoryOperand::with_base_displ(Register::R13, 8),
+                )
+                .unwrap(),
+            );
+            let end = b.len();
+            let clone = b.clone_range_retarget_exit(start, end, 0, 0).unwrap();
+            b.remap_legacy_carriers(&assignment);
+            assert_eq!(
+                b.instrs[0].op1_register(),
+                assignment.map_legacy_carrier(Register::R12)
+            );
+            for index in [start, clone] {
+                assert_eq!(b.instrs[index].op0_register(), Register::R12);
+                assert_eq!(
+                    b.instrs[index].memory_base(),
+                    assignment.map_legacy_carrier(Register::R13)
+                );
+            }
+        }
+    }
 
     #[test]
     fn clone_range_rebases_internal_edges_and_retargets_exit() {

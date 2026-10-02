@@ -13,7 +13,14 @@ use rand::RngCore;
 use std::collections::BTreeMap;
 
 pub(crate) const MULTI_FAMILY_STATE_STRIDE: usize = 0x8000;
-pub(crate) const VM_THREAD_BUCKETS: usize = 16;
+// Keep the statically loader-backed arena below the practical Windows image
+// mapping ceiling.  The previous 16 x 8 pool reserved more than 770 MiB of
+// zero-fill state for a four-family image and CreateProcess rejected the PE as
+// ERROR_BAD_EXE_FORMAT before reaching the entry point.  Eight buckets with
+// four independently live native roots still provide 32 concurrent root lanes
+// (each retaining the full 32-level re-entry window) while keeping commercial
+// images in a loader-compatible size range.
+pub(crate) const VM_THREAD_BUCKETS: usize = 8;
 // Commercial programs routinely cross family boundaries more than eight
 // frames deep (the Rust std/MPMC path reaches at least depth 8 before doing any
 // application work).  Each depth needs an independent family-state group and
@@ -23,7 +30,7 @@ pub(crate) const VM_REENTRY_DEPTHS: usize = 32;
 /// Independently live native callback roots per hashed thread bucket. Each root
 /// owns a full `VM_REENTRY_DEPTHS` window so its cross-family children can never
 /// alias a sibling root that happens to be live at the same time.
-pub(crate) const VM_NATIVE_ROOTS_PER_BUCKET: usize = 8;
+pub(crate) const VM_NATIVE_ROOTS_PER_BUCKET: usize = 4;
 /// Lane zero plus the following depth window belong exclusively to the
 /// canonical OEP chain. Native-entry roots begin after that window; otherwise
 /// bucket-0 workers alias OEP children at identical cross-family depths.
@@ -37,6 +44,11 @@ pub(crate) const VM_INVOCATION_LANES: usize =
 /// the gateway return address or the dynamic-entry nonvolatile frame.
 pub(crate) const VM_HOST_STACK_SIZE: usize = 0x1_0000;
 pub(crate) const VM_HOST_STACK_SLOTS: usize = VM_INVOCATION_LANES + 1;
+// Canonical OEP is entered by a tail jump from the boot stub. Preserve its
+// loader-supplied RSP at the top of the dedicated canonical host stack, outside
+// the mutable VM state block. Dispatcher/partial-native execution may reuse
+// otherwise spare state offsets, so a state-relative snapshot is not stable.
+const CANONICAL_HOST_STACK_RSP_SLOT: i64 = -8;
 // Each hashed thread bucket owns a 64-bit live-slot bitmap. A set bit means
 // the corresponding native-entry root lane (and its host stack) is currently
 // in use. This is occupancy, not a nesting counter: out-of-order returns can
@@ -324,16 +336,22 @@ fn build_canonical_oep_gateway(
         host_stack_top,
     )?);
     ins.push(Instruction::with2(
+        Code::Mov_rm64_r64,
+        MemoryOperand::with_base_displ_size(Register::R11, CANONICAL_HOST_STACK_RSP_SLOT, 8),
+        Register::RAX,
+    )?);
+    ins.push(Instruction::with2(
         Code::Mov_r64_rm64,
         Register::RSP,
         Register::R11,
     )?);
-    // Win64 caller shadow space. H is page/16-byte aligned, so pre-call RSP is
-    // 0 mod 16 and the dynamic entry observes the required 8 mod 16.
+    // Reserve the Win64 caller shadow space plus a guard above it. The native
+    // RSP snapshot at H-8 must not overlap the callee-owned H-0x20..H-1 home
+    // area. H is page/16-byte aligned, so H-0x50 preserves pre-call alignment.
     ins.push(Instruction::with2(
         Code::Sub_rm64_imm8,
         Register::RSP,
-        0x20,
+        0x50,
     )?);
     ins.push(Instruction::with2(
         Code::Mov_r64_imm64,
@@ -342,25 +360,27 @@ fn build_canonical_oep_gateway(
     )?);
     ins.push(Instruction::with_branch(Code::Call_rel32_64, entry_va)?);
 
-    // A top-level lifted RET has already consumed the architectural return slot,
-    // so vRSP points at the caller's post-return stack. Recover the original
-    // native return target from [vRSP-8], restore physical RSP to vRSP, and tail
+    // A top-level lifted RET has already consumed the architectural return slot.
+    // Do not recover the native return through guest vRSP: partial VM/native
+    // execution can change or corrupt that architectural value.  Restore the
+    // exact loader-supplied stack snapshot, consume its return slot, and tail
     // jump without clobbering virtual RAX (the process/thread entry result).
     ins.push(Instruction::with2(
         Code::Mov_r64_imm64,
         Register::R11,
-        state_va,
+        host_stack_top,
     )?);
     ins.push(Instruction::with2(
         Code::Mov_r64_rm64,
         Register::R11,
-        MemoryOperand::with_base_displ_size(Register::R11, layout.vregs[4] as i64, 8),
+        MemoryOperand::with_base_displ_size(Register::R11, CANONICAL_HOST_STACK_RSP_SLOT, 8),
     )?);
     ins.push(Instruction::with2(
         Code::Mov_r64_rm64,
         Register::R10,
-        MemoryOperand::with_base_displ_size(Register::R11, -8, 8),
+        MemoryOperand::with_base(Register::R11),
     )?);
+    ins.push(Instruction::with2(Code::Add_rm64_imm8, Register::R11, 8)?);
     ins.push(Instruction::with2(
         Code::Mov_r64_rm64,
         Register::RSP,
@@ -533,7 +553,7 @@ fn build_native_entry_gateway(
         state_va,
     )?);
     // Hash the current thread into a control bucket, then claim one of that
-    // bucket's 64 native roots by live occupancy. The old depth-counter scheme
+    // bucket's native-root slots by live occupancy. The old depth-counter scheme
     // assumed LIFO completion: if A and B were live and A returned first, a
     // later C could reuse B's still-live slot. A bitmap records the lifetime of
     // each root independently, so non-LIFO callbacks cannot alias VM state or
@@ -1040,7 +1060,11 @@ pub(crate) fn build_multi_family_prog_mod(
     const OUTER_SIZING_CODE_BASE: u64 = 0x0000_0001_4000_0000;
     const OUTER_SIZING_STATE_BASE: u64 = OUTER_SIZING_CODE_BASE + 0x2000_0000;
     let sizing_only = code_va == 0;
-    let build_kind = if sizing_only { "sizing" } else { "final placement" };
+    let build_kind = if sizing_only {
+        "sizing"
+    } else {
+        "final placement"
+    };
     let effective_code_va = if sizing_only {
         OUTER_SIZING_CODE_BASE
     } else {
@@ -1097,9 +1121,7 @@ pub(crate) fn build_multi_family_prog_mod(
             )
         })
         .collect();
-    crate::progress::finish_task(format!(
-        "Program-VM {build_kind}: chunk planning complete"
-    ));
+    crate::progress::finish_task(format!("Program-VM {build_kind}: chunk planning complete"));
 
     // The first build below is a sizing-only pass.  Cross-family routes still
     // flow through the production route validator, so their address fields must
@@ -1744,10 +1766,7 @@ mod invocation_layout_tests {
             module_domain: 1,
             exit_byte_offset: 0,
         };
-        let selected = canonical_dynamic_targets(
-            &module,
-            &[0x3000, 0x9999, 0x1000, 0x3000],
-        );
+        let selected = canonical_dynamic_targets(&module, &[0x3000, 0x9999, 0x1000, 0x3000]);
         assert_eq!(selected, vec![0x1000, 0x3000]);
         assert!(!selected.contains(&0x2000));
         assert!(!selected.contains(&0x4000));
