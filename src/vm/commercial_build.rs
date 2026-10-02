@@ -207,6 +207,28 @@ pub fn build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
     native_call_rewrites: &[(u64, u64)],
 ) -> Result<VmModule> {
     // Virtual stack top: right after the state buffer (COMMERCIAL_STATE_SIZE),
+    // Prepared super-op metadata is not yet canonically serializable: never
+    // reuse those modules. Sort maps so process-specific HashMap ordering is
+    // not part of the cache identity.
+    let checkpoint = crate::build_cache::active().filter(|_| prepared.is_none()).map(|cache| {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"commercial-module-v1");
+        hash.update(&bytecode);
+        let mut ips: Vec<_> = ip_map.into_iter().flat_map(|map| map.iter()).map(|(&a, &b)| (a, b)).collect();
+        ips.sort_unstable();
+        hash.update(format!("{code_va}:{table_va}:{bytecode_va}:{state_va}:{seed}:{family:?}:{ips:?}:{}:{chunks:?}:{routes:?}:{native_pointer_rewrites:?}:{native_call_rewrites:?}", ip_map.is_some()).as_bytes());
+        let name = format!("module-{:x}.pkg", hash.finalize());
+        (cache, name)
+    });
+    if let Some((cache, name)) = &checkpoint {
+        if let Some(payload) = cache.read(name) {
+            if let Some(module) = crate::build_cache::decode_module(&payload, &bytecode, TableLayout::from_seed(seed).total_size) {
+                log::info!("Resuming completed commercial VM module: {name}");
+                return Ok(module);
+            }
+        }
+    }
     // growing down into the reserved VIRTUAL_STACK_SIZE region. Keeps the
     // dispatcher's R13-based push/pop isolated from both state and bytecode.
     let stack_base = state_va
@@ -286,7 +308,7 @@ pub fn build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
         .copy_from_slice(&parts.branch_map);
 
     // 상용(poly) 모듈은 bytecode handler 테이블을 쓰지 않으므로 handler_offsets 없음.
-    Ok(VmModule {
+    let module = VmModule {
         code: parts.code,
         table,
         bytecode,
@@ -294,7 +316,13 @@ pub fn build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
         native_bridge_range: parts.native_bridge_range,
         lifetime_cleanup_handler_offset: parts.lifetime_cleanup_handler_offset,
         dynamic_state_entry_offset: Some(parts.dynamic_state_entry_offset),
-    })
+    };
+    if let Some((cache, name)) = checkpoint {
+        if let Err(error) = cache.write(&name, &crate::build_cache::encode_module(&module)) {
+            log::warn!("Could not save VM module checkpoint: {error}");
+        }
+    }
+    Ok(module)
 }
 
 #[cfg(test)]

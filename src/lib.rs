@@ -14,6 +14,7 @@
 #![allow(clippy::erasing_op, clippy::eq_op, clippy::mistyped_literal_suffixes)]
 
 pub mod analysis;
+pub mod build_cache;
 pub mod assembler;
 pub mod cli;
 pub mod core;

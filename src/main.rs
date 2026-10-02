@@ -523,6 +523,11 @@ fn main() -> error::Result<()> {
     );
     progress.report(1, "Starting pack pipeline");
 
+    let cache_args = args.clone();
+    let reuse_completed_package = !args.verify_output && !args.debug && !args.trace_blocks
+        && !args.map && !args.sym_map && args.log_file.is_none()
+        && !std::env::vars_os().any(|(key, _)| key.to_string_lossy().starts_with("BTG_"));
+
     // ── 입력 PE 로드 ──────────────────────────────────────────────────────────────
     let input_path = args.input;
     if !input_path.exists() {
@@ -541,6 +546,17 @@ fn main() -> error::Result<()> {
         input_pe_bytes.len()
     );
     progress.report(4, "Input PE loaded");
+
+    let build_cache = btg_packer::build_cache::BuildCache::open(&cache_args, &input_pe_bytes)?;
+    let _cache_session = build_cache.as_ref().map(|cache| cache.activate());
+    if reuse_completed_package {
+        if let Some(cache) = &build_cache {
+            if cache.restore(&args.output)? {
+                btg_packer::progress::complete("Pack complete (cached package restored)");
+                return Ok(());
+            }
+        }
+    }
 
     // ── PE 파싱 ──────────────────────────────────────────────────────────────────
     let target_info = TargetPeInfo::parse(&input_pe_bytes)?;
@@ -1118,6 +1134,13 @@ fn main() -> error::Result<()> {
         )?;
     }
 
+    if reuse_completed_package {
+        if let Some(cache) = &build_cache {
+            if let Err(error) = cache.save(&output_path, &output_pe_bytes) {
+                log::warn!("Could not save completed build package: {error}");
+            }
+        }
+    }
     btg_packer::progress::complete("Pack complete");
     Ok(())
 }

@@ -16,7 +16,7 @@ pub enum SectionNameMode {
     Random,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "btg-packer",
     author = "BTG Security Research Team",
@@ -24,6 +24,18 @@ pub enum SectionNameMode {
     about = "Bidirectional Trigger Graph (BTG) Security Framework"
 )]
 pub struct CliArgs {
+    /// Reuse completed build packages (requires a fixed --seed).
+    #[arg(long, alias = "resume", requires = "seed")]
+    pub build_cache: bool,
+
+    /// Directory for local, content-addressed build packages.
+    #[arg(long, default_value = ".btg-cache")]
+    pub cache_dir: PathBuf,
+
+    /// Ignore existing packages and regenerate them.
+    #[arg(long, requires = "build_cache")]
+    pub rebuild: bool,
+
     /// Input PE target binary path
     #[arg(short, long, default_value = "dummy_target.exe")]
     pub input: PathBuf,
