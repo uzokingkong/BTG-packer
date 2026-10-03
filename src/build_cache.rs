@@ -29,6 +29,15 @@ impl Drop for Session {
 
 impl BuildCache {
     pub fn open(args: &CliArgs, input: &[u8]) -> Result<Option<Self>> {
+        let map_identity = if args.build_cache {
+            args.literal_map.as_deref().map(|path| {
+                crate::pipeline::literal_audit::read_map_json(path).map(|bytes| Sha256::digest(bytes).into())
+            }).transpose()?
+        } else { None };
+        Self::open_with_literal_identity(args, input, map_identity)
+    }
+
+    pub fn open_with_literal_identity(args: &CliArgs, input: &[u8], map_identity: Option<[u8;32]>) -> Result<Option<Self>> {
         if !args.build_cache {
             return Ok(None);
         }
@@ -38,9 +47,21 @@ impl BuildCache {
             "--build-cache cannot reuse --section-name-mode random; use seeded"
         );
         let mut normalized = args.clone();
+        let handler_identity = crate::vm::handler_table_codec::active()
+            .map(|settings| settings.cache_identity());
+        ensure!(!args.handler_prf || handler_identity.is_some(),
+            "PRF build cache requires an active handler codec configuration");
+        normalized.private_build_key = None;
+        // Paths are not content identities: changing a map must invalidate cache.
+        ensure!(args.literal_map.is_some() == map_identity.is_some(), "literal map cache identity is missing or unexpected");
+        normalized.literal_map = None;
         normalized.input = PathBuf::new();
         normalized.output = PathBuf::new();
         normalized.cache_dir = PathBuf::new();
+        // Export policy changes placement, not the protected EXE/package bytes.
+        normalized.release_dir = None;
+        normalized.private_root.clear();
+        normalized.release_export_only = false;
         normalized.rebuild = false;
         normalized.no_progress = false;
         normalized.progress_only = false;
@@ -52,7 +73,7 @@ impl BuildCache {
         env.sort();
         let executable = fs::read(std::env::current_exe()?)?;
         let identity = format!(
-            "package-v1\n{}\n{}\n{normalized:?}\n{env:?}",
+            "package-v7\n{}\n{}\n{normalized:?}\n{env:?}\n{map_identity:?}\n{handler_identity:?}",
             sha256_hex(input),
             sha256_hex(&executable)
         );
@@ -234,6 +255,25 @@ pub fn blob(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
     out.extend_from_slice(bytes);
 }
+
+/// Private module checkpoint includes the actual selected variant snapshot.
+/// The public release exporter never includes these cache packages.
+pub fn encode_variant_module(module: &crate::vm::VmModule, plan: &crate::vm::poly::VariantPlan) -> Vec<u8> {
+    let mut bytes = b"BTGVARMODULE\x01".to_vec();
+    blob(&mut bytes, &plan.canonical_bytes());
+    blob(&mut bytes, &encode_module(module));
+    bytes
+}
+
+pub fn decode_variant_module(payload: &[u8], expected_bytecode: &[u8], minimum_table: usize,
+    expected_plan: &[u8; 32]) -> Option<(crate::vm::VmModule, crate::vm::poly::VariantPlan)> {
+    let mut reader = Reader(payload.strip_prefix(b"BTGVARMODULE\x01")?);
+    let snapshot = reader.blob()?;
+    let plan = crate::vm::poly::VariantPlan::restore(snapshot, expected_plan).ok()?;
+    let module = decode_module(reader.blob()?, expected_bytecode, minimum_table)?;
+    if !reader.0.is_empty() { return None; }
+    Some((module, plan))
+}
 pub struct Reader<'a>(pub &'a [u8]);
 impl<'a> Reader<'a> {
     pub fn number(&mut self) -> Option<u64> {
@@ -253,6 +293,23 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
     use clap::Parser;
+    #[test]
+    fn variant_module_checkpoint_rejects_wrong_plan_and_truncation() {
+        use crate::vm::poly::{VariantPlan, VariantPolicy, VmArchitectureFamily};
+        let plan = VariantPlan::generate([7; 32], 7, VmArchitectureFamily::Register, VariantPolicy::Stable).unwrap();
+        let other = VariantPlan::generate([8; 32], 8, VmArchitectureFamily::Register, VariantPolicy::Stable).unwrap();
+        let module = crate::vm::VmModule { code: vec![0x90,0xc3], table: vec![0;4096], bytecode: vec![1,2],
+            handler_offsets: vec![1], native_bridge_range: None,
+            lifetime_cleanup_handler_offset: None, dynamic_state_entry_offset: Some(0) };
+        let bytes = encode_variant_module(&module, &plan);
+        let (restored, restored_plan) = decode_variant_module(&bytes, &[1,2], 4096, &plan.digest()).unwrap();
+        assert_eq!(restored.code, module.code);
+        assert_eq!(restored_plan.canonical_bytes(), plan.canonical_bytes());
+        assert!(decode_variant_module(&bytes, &[1,2], 4096, &other.digest()).is_none());
+        assert!(decode_variant_module(&bytes[..bytes.len()-1], &[1,2], 4096, &plan.digest()).is_none());
+        let mut trailing = bytes; trailing.push(0);
+        assert!(decode_variant_module(&trailing, &[1,2], 4096, &plan.digest()).is_none());
+    }
     #[test]
     fn module_roundtrip_and_boundary_validation() {
         let module = crate::vm::VmModule {
@@ -297,6 +354,8 @@ mod tests {
         let first = BuildCache::open(&args, b"input").unwrap().unwrap();
         args.output = PathBuf::from("elsewhere.exe");
         args.progress_only = true;
+        args.release_dir = Some(PathBuf::from("new-release"));
+        args.private_root = vec![PathBuf::from("private-keys")];
         assert_eq!(
             first.root,
             BuildCache::open(&args, b"input").unwrap().unwrap().root

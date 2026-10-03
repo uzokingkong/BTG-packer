@@ -47,6 +47,33 @@ mod perblock;
 mod place;
 mod scan;
 mod vm_embed;
+pub(crate) mod stages;
+
+/// Transient build-only key for authentication sealed after final PE rewrites.
+/// Never serialized into manifests/cache metadata and deliberately not Debug.
+pub(crate) struct PendingNativeAuth {
+    pub(crate) rva: u32,
+    pub(crate) len: usize,
+    pub(crate) tag_offset: usize,
+    pub(crate) key: [u8;32],
+    pub(crate) nonce: [u8;12],
+}
+pub(crate) fn finalize_native_auth(ctx: &PipelineContext,
+    sections: &[crate::pe::builder::SectionData], boot: &mut crate::pe::builder::SectionData) -> anyhow::Result<()> {
+    if let Some(auth) = &ctx.pending_native_auth {
+        let matches: Vec<_> = sections.iter().filter(|s| auth.rva >= s.virtual_address
+            && (auth.rva-s.virtual_address) as usize + auth.len <= s.bytes.len()).collect();
+        anyhow::ensure!(matches.len()==1,"native code authentication lost unique final ownership");
+        let offset = (auth.rva-matches[0].virtual_address) as usize;
+        let block0 = crate::crypto::chacha20::chacha20_block(&auth.key,0,&auth.nonce);
+        let poly = crate::crypto::poly1305::chacha_poly1305_key_from_block0(&block0);
+        let tag = crate::crypto::poly1305::poly1305_aead_tag(&crate::crypto::poly1305::POLY1305_AEAD_AAD,
+            &matches[0].bytes[offset..offset+auth.len],&poly);
+        anyhow::ensure!(auth.tag_offset+16<=boot.bytes.len(),"native code authentication tag out of bounds");
+        boot.bytes[auth.tag_offset..auth.tag_offset+16].copy_from_slice(&tag);
+    }
+    Ok(())
+}
 
 pub use cipher::Rc4;
 pub use integrity::crc32;
@@ -73,12 +100,8 @@ impl<'a> BootStreamCipher<'a> {
     }
 }
 
-/// 문자열 런 최대 개수 / 총 바이트 상한 (성능 보호)
-pub(crate) const MAX_STRING_RUNS: usize = 512;
-
 /// 부트 스탭의 안티디버그 블록 길이 (고정 73바이트)
 pub(crate) const ANTI_DEBUG_BLOCK_LEN: usize = 73;
-pub(crate) const MAX_STRING_TOTAL: usize = 1 << 20;
 pub(crate) const IMPORT_MBA_C: u32 = 0x9E37_79B9;
 
 #[cfg(test)]
@@ -96,6 +119,9 @@ pub fn run(
     chained: bool,
     reencrypt: bool,
 ) -> Result<()> {
+    ctx.pending_native_auth = None;
+    anyhow::ensure!(ctx.literal_catalog.is_none() || (enabled && !reencrypt && !ctx.reencrypt && !chained),
+        "literal map requires enabled bulk boot decryption");
     // v9: crypto가 꺼져 있어도 IAT 은닉/메모리 하드닝/페이로드 재배치가 요청되면
     // 경량 부트 스텁(RC4 없이 안티디버그→복사→IAT 해석→메모리 하드닝→디스패치)을
     // 설치해야 한다. 그 외에는 아무것도 할 게 없다.
@@ -236,7 +262,7 @@ pub fn run(
     let k2 = ((image_base >> 32) as u32).wrapping_add(salt2);
     let k3 = salt3;
 
-    let mut runs = scan::gather_runs(ctx, no_crypto, vm_oep_effective);
+    let mut runs = scan::gather_runs(ctx, no_crypto, vm_oep_effective)?;
     if ctx.mem_harden {
         // Never require writes to an executable input section. Sensitive data
         // in those pages is handled by VM/payload protection; data-run crypto
@@ -249,7 +275,7 @@ pub fn run(
     }
 
     println!(
-        "[+] v3 Crypto: code region 0x{:X}..0x{:X} ({} bytes), {} string runs encrypted.",
+        "[+] v3 Crypto: code region 0x{:X}..0x{:X} ({} bytes), {} string runs selected.",
         first_block_offset,
         max_phys_end,
         code_len,
@@ -353,7 +379,7 @@ pub fn run(
             // v63 (--crypto-mode chacha20): 키/논스는 seed_masked에서 원시 파생
             // (단일 소스 — 부트 스텁 emit_chacha_init과 동일), 카운터 모드 연속
             // 키스트림은 reference `chacha_apply`로 생성 (네이티브 blob과 bit 동일).
-            let (ckey, cnonce) = cipher::derive_chacha_key_nonce_raw(&seed_masked);
+            let (ckey, cnonce) = stages::key_nonce(&seed_masked, stages::Stage::Payload, 0);
             let mut st = [0u8; CHA_STATE_SIZE];
             chacha_init_state(&mut st, &ckey, &cnonce);
             // RFC 8439 reserves counter 0 for the Poly1305 one-time key.
@@ -415,7 +441,7 @@ pub fn run(
 
     // 5b. 문자열 런 (부트 스텁 런 테이블과 같은 순서) — CryptoProvider.apply
     crate::progress::begin_detail_task(
-        "Encrypting protected data/string runs",
+        "Preparing protected data/string runs",
         runs.len() as u64,
         "runs",
     );
@@ -424,14 +450,12 @@ pub fn run(
         let sec = &mut ctx.patched_sections[run.sec_idx];
         if let Some(c) = c1.as_mut() {
             c.crypt(&mut sec.bytes[run.offset..run.offset + run.len]);
-        } else if let Some(st) = chacha_state.as_mut() {
-            chacha_apply(st, &mut sec.bytes[run.offset..run.offset + run.len]);
-        } else {
+        } else if !chacha_mode {
             rc4.apply(&mut sec.bytes[run.offset..run.offset + run.len]);
         }
     }
     crate::progress::finish_task(format!(
-        "Protected data encryption complete: {} run(s)",
+        "Protected data preparation complete: {} run(s)",
         runs.len()
     ));
 

@@ -115,7 +115,7 @@ impl LifetimeSyncTable {
         let end = start
             .checked_add(LIFETIME_SYNC_TABLE_SIZE)
             .ok_or_else(|| anyhow::anyhow!("data-lifetime sync table range overflow"))?;
-        let virtual_stack_start = crate::vm::commercial_build::COMMERCIAL_STATE_SIZE as usize;
+        let virtual_stack_start = crate::vm::threaded::runtime_layout::VIRTUAL_STACK_BOTTOM as usize;
         let virtual_stack_end = virtual_stack_start
             .checked_add(crate::vm::commercial_build::VIRTUAL_STACK_SIZE as usize)
             .ok_or_else(|| anyhow::anyhow!("commercial virtual-stack range overflow"))?;

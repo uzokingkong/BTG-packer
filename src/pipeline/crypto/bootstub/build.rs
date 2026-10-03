@@ -332,6 +332,15 @@ pub(crate) fn build_boot_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     if !stub.no_crypto {
         emit_base_bind_loop(&mut seq, stub.seed_va);
     }
+    if stub.chacha_mode() && !stub.no_crypto {
+        super::stages::prepare(&mut seq, stub);
+    }
+    let phase_start = seq.len();
+    let mut phase_starts = vec![phase_start];
+    if stub.chacha_mode() && !stub.no_crypto {
+        super::stages::metadata(&mut seq, stub);
+    }
+    phase_starts.push(seq.len());
 
     // M12 Decrypt-Descriptor: base_bind 직후 디스크립터(파생 키 = RC4 keystream으로
     // 암호화)를 KSA(seed)+canonical PRGA로 복호화한다. (base_bind가 먼저여야
@@ -340,6 +349,7 @@ pub(crate) fn build_boot_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     if stub.desc_used {
         emit_desc_decrypt(&mut seq, stub);
     }
+    phase_starts.push(seq.len());
 
     // v60 (--custom-cipher): BTG-C1 경로는 RC4 KSA 대신 C1 상태 초기화를 수행한다.
     // Chained mode rekeys the same C1 state per predecessor chunk; VM-OEP also
@@ -359,6 +369,7 @@ pub(crate) fn build_boot_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     } else {
         emit_ksa_init(&mut seq, stub);
     }
+    phase_starts.push(seq.len());
     payload::emit_payload_copy(&mut seq, stub);
     // T3-1 Phase D: chacha 경로는 at-rest 암호문을 복호화 **전에** Poly1305 AEAD
     // 태그로 인증한다 (불일치 시 ud2 — fail-safe, decrypt-and-run 금지). payload
@@ -367,8 +378,10 @@ pub(crate) fn build_boot_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
     if stub.chacha_mode() && stub.chacha_aead {
         emit_poly1305_verify(&mut seq, stub);
     }
+    phase_starts.push(seq.len());
     emit_code_decrypt(&mut seq, stub);
     integrity::emit_integrity_mac(&mut seq, stub);
+    phase_starts.push(seq.len());
     // Preserve the runtime-derived W32 across run/rest decryptors. Those
     // stages legitimately reuse both registers and mutable VM scratch. A
     // balanced stack save is private to the bootstrap frame and survives the
@@ -405,6 +418,7 @@ pub(crate) fn build_boot_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
         ));
     }
     integrity::emit_integrity_crc(&mut seq, stub);
+    phase_starts.push(seq.len());
     emit_run_decrypt(&mut seq, stub);
     emit_rest_decrypt(&mut seq, stub);
     integrity::emit_distributed_integrity(&mut seq, stub);
@@ -437,18 +451,30 @@ pub(crate) fn build_boot_block(stub: &BootStubCtx) -> anyhow::Result<Vec<u8>> {
         ));
     }
     // S2 (--integrity multi-site): run/rest decrypt 직후 두 번째 독립 CRC32 검증.
+    phase_starts.push(seq.len());
     integrity::emit_integrity_crc2(&mut seq, stub);
+    phase_starts.push(seq.len());
+    if stub.chacha_mode() && !stub.no_crypto {
+        super::stages::resolver(&mut seq, stub);
+    }
+    phase_starts.push(seq.len());
     iat::emit_iat_slots(&mut seq, stub);
     iat::emit_iat_resolve(&mut seq, stub);
     // S3 (--integrity 멀티사이트 확장): IAT 리졸브 직후 세 번째 독립 CRC32 검증 —
     // 부트 후반에도 무결성 게이트를 유지한다 (사이트 1/2와 다른 시점).
+    phase_starts.push(seq.len());
     integrity::emit_integrity_crc3(&mut seq, stub);
     // S4 must run before self-wipe: it derives its expected value from
     // w32_slot, which lives in the seed/integrity scratch area erased by
     // emit_self_wipe.  Running this after the wipe made every integrity-enabled
     // image take the CRC4 UD2 path even when the file was untouched.
     integrity::emit_integrity_crc4(&mut seq, stub);
+    phase_starts.push(seq.len());
     emit_self_wipe(&mut seq, stub);
+    phase_starts.push(seq.len());
+    if stub.boot_schedule_auth.is_some() {
+        super::schedule::wrap(&mut seq, phase_start, &phase_starts, stub)?;
+    }
     memharden::emit_mem_harden(&mut seq, stub);
     emit_dispatcher_entry(&mut seq, stub);
     cipher::emit_prga_sub(&mut seq, stub);

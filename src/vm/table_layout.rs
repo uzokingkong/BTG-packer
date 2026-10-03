@@ -7,7 +7,8 @@
 // ==============================================================================
 
 /// Seed-dependent layout for VM dispatcher metadata tables.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TableLayout {
     pub handler_table_off: usize,
     pub operand_offs_off: usize,
@@ -18,6 +19,19 @@ pub struct TableLayout {
 }
 
 impl TableLayout {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let spans = [(self.handler_table_off, 2048usize), (self.operand_offs_off, 512),
+            (self.operand_flags_off, 256), (self.cond_codes_off, 256), (self.branch_map_off, 1024)];
+        let mut end = 0;
+        for (offset, len) in spans {
+            anyhow::ensure!(offset >= end, "VM table spans overlap");
+            end = offset.checked_add(len).ok_or_else(|| anyhow::anyhow!("VM table span overflow"))?;
+            anyhow::ensure!(end <= self.total_size, "VM table span out of bounds");
+        }
+        anyhow::ensure!(self.total_size <= 65536 && self.total_size % 16 == 0, "unsupported VM table size/alignment");
+        Ok(())
+    }
+
     /// Generates a jittered table layout with pseudo-random inter-table padding
     /// based on the seed.
     pub fn from_seed(seed: u64) -> Self {

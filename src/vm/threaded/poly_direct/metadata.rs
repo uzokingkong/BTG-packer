@@ -35,6 +35,13 @@ pub(crate) fn build_operand_tables(spec: &VirtualIsaSpec) -> (Vec<u16>, Vec<u8>)
                 }
             }
         };
+        use crate::vm::poly::{family_lowering as f, VmArchitectureFamily as Family};
+        let (offset, kind) = if raw == 0x50 || (0x51..=0x53).contains(&raw) {
+            (0, if spec.family == Family::Stack { 3 } else { K_NONE })
+        } else if (0x54..=0x55).contains(&raw) {
+            ((f::ACCUMULATORS + (raw-0x54) as i64*8) as u16,
+                if spec.family == Family::MixedRisc { K_REG } else { K_NONE })
+        } else { (offset, kind) };
         offsets[raw as usize] = offset;
         kinds[raw as usize] = kind;
     }

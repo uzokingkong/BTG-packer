@@ -732,7 +732,7 @@ pub fn generate_vm_code(
     muldiv::emit_div_rr16(&mut seq);
     muldiv::emit_idiv_rr8(&mut seq);
     muldiv::emit_idiv_rr16(&mut seq);
-    branch::emit_halt(&mut seq);
+    branch::emit_halt(&mut seq, mode);
 
     // ── Handler-layout obfuscation (item 8) ────────────────────────────────────
     // MBA path only (build-specific): derive the layout seed from the MBA table

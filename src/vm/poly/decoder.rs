@@ -27,6 +27,13 @@ pub struct PolymorphicDecoder {
 }
 
 impl PolymorphicDecoder {
+    pub fn from_variant_plan(plan: &super::VariantPlan) -> Self {
+        Self {
+            spec: plan.isa().clone(),
+            rolling: RollingKeyEngine::new(plan.isa().seed),
+        }
+    }
+
     pub fn new(seed: u64) -> Self {
         Self::new_for_family(seed, VmArchitectureFamily::for_build(seed))
     }
@@ -199,7 +206,11 @@ impl PolymorphicDecoder {
                     0x80 => Some(MicroOperand::VReg(self.spec.decode_reg(payload))),
                     0xC0 => Some(MicroOperand::Temp(payload & 0x07)),
                     0x40 => {
-                        if payload == 0x01 {
+                        if raw == 0x50 { Some(MicroOperand::StackPush) }
+                        else if raw == 0x51 { Some(MicroOperand::StackPop) }
+                        else if (0x52..=0x53).contains(&raw) { Some(MicroOperand::StackPeek(raw-0x52)) }
+                        else if (0x54..=0x55).contains(&raw) { Some(MicroOperand::Accumulator(raw-0x54)) }
+                        else if payload == 0x01 {
                             Some(MicroOperand::Vflags)
                         } else {
                             Some(MicroOperand::Vsp)

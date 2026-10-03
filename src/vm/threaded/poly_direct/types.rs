@@ -114,6 +114,8 @@ pub enum FloatCvtMode {
 
 /// P3 (G1): assembled self-decoding dispatcher pieces (machine code + tables).
 pub struct SelfDecodingParts {
+    /// ABI v2 uses masked relative offsets and initialization-only PRF masks.
+    pub handler_codec: Option<crate::vm::handler_table_codec::HandlerCodec>,
     pub code: Vec<u8>,
     /// Entry stub which saves the Win64 nonvolatiles but keeps RDX supplied by
     /// a native gateway instead of anchoring the canonical state VA.
@@ -125,13 +127,9 @@ pub struct SelfDecodingParts {
     /// Language-specific x64 unwind handler which re-encrypts and releases
     /// call-scoped lifetime objects owned by the unwinding OS thread.
     pub lifetime_cleanup_handler_offset: Option<usize>,
-    /// 256 x u64 handler table (decrypted opcode byte -> handler VA).
+    /// 256 x u64 handler table: legacy masked VAs or ABI v2 masked code offsets.
     pub table: Vec<u64>,
-    /// P6-1: handler 테이블 마스터 키 (시드 유래). P6-3 부터 단일 XOR 상수가 아니라
-    /// per-opcode 파생 키 `key(op) = (op*C1) ^ (op<<17) ^ master` 의 마스터로 쓰인다
-    /// (dispatch 가 opcode byte 로 파생 키를 다시 계산해 `table[op] ^ key(op)` 로
-    /// 복호화). 마스터 K 자체는 평문 상수로 코드에 없고 MBA(a,b)로 런타임 유도된다 —
-    /// 평문 테이블/덤프로부터 opcode↔handler 매핑 복원을 막는다.
+    /// Legacy linear codec master. ABI v2 does not consume this field.
     pub table_key: u64,
     /// P6-3: 테이블 무결성 셀프체크 값 (빌드 시 암호화된 256 항목 checksum). 엔트리
     /// 스텁이 매 VM 진입마다 재계산해 비교하며, 변조/복원된 테이블은 ud2로 실패한다.
@@ -195,7 +193,9 @@ impl SelfDecodingParts {
             .checked_add(self.code.len() as u64)
             .ok_or_else(|| anyhow!("commercial VM code address overflow"))?;
         for (op, encrypted) in self.table.iter().copied().enumerate() {
-            let target = encrypted ^ per_op_key(self.table_key, op as u8);
+            let target = if let Some(codec) = &self.handler_codec {
+                codec.decode(op as u8, encrypted, code_base, self.code.len())?
+            } else { encrypted ^ per_op_key(self.table_key, op as u8) };
             if !(code_base..code_end).contains(&target) {
                 return Err(anyhow!(
                     "commercial VM handler {op:#04x} resolves outside code: {target:#x} not in {code_base:#x}..{code_end:#x}"

@@ -176,7 +176,8 @@ pub(crate) fn lift_program(
             );
             // Diagnostic-only control used to distinguish core commercial
             // execution from cross-family ABI/state handoff failures.
-            if std::env::var_os("BTG_FORCE_SINGLE_FAMILY").is_some() {
+            if ctx.vm_family_policy == crate::cli::VmFamilyPolicy::Single
+                || std::env::var_os("BTG_FORCE_SINGLE_FAMILY").is_some() {
                 for assignment in &mut plan.assignments {
                     assignment.family = plan.entry_family;
                     assignment.incoming_bridge = None;
@@ -236,6 +237,7 @@ pub(crate) fn lift_program(
                 .unwrap_or(0);
             if partitioned_ops >= 1_000
                 && (partitions.len() < 3 || max_family_ops.saturating_mul(2) >= partitioned_ops)
+                && ctx.vm_family_policy != crate::cli::VmFamilyPolicy::Single
                 && std::env::var_os("BTG_FORCE_SINGLE_FAMILY").is_none()
             {
                 return Err(anyhow::anyhow!(
@@ -271,7 +273,7 @@ pub(crate) fn lift_program(
                 vm::multi_family::MultiFamilyProgramPlan::build(&lift.program, &plan, &partitions)
                     .map_err(anyhow::Error::msg)?;
             let materialized = multi_family
-                .materialize(ctx.poly_vm_seed)
+                .materialize_with_variant_policy(ctx.poly_vm_seed, ctx.vm_variant_policy)
                 .map_err(anyhow::Error::msg)?;
             println!(
                 "[+] P2-10 multi-family materialization: {} independent bytecode module(s), {} canonical cross-family route(s)",

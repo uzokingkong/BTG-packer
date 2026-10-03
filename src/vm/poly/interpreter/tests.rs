@@ -1440,6 +1440,7 @@ fn format_prog(prog: &RiscProgram) -> String {
         Some(MicroOperand::Imm64(v)) => format!("0x{v:X}"),
         Some(MicroOperand::Vflags) => "fl".into(),
         Some(MicroOperand::Vsp) => "sp".into(),
+        Some(operand) => format!("{operand:?}"),
         None => "-".into(),
     };
     let mut s = String::new();

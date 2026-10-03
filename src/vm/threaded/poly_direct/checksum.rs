@@ -38,6 +38,7 @@ pub(crate) fn table_checksum(table: &[u64]) -> u64 {
     table_checksum_with_topology(table, TableIntegrityTopology::ForwardSingle)
 }
 
+/// Corruption diagnostic only; this unkeyed checksum is not authentication.
 pub(crate) fn table_checksum_with_topology(table: &[u64], topology: TableIntegrityTopology) -> u64 {
     fn fold<'a>(values: impl Iterator<Item = &'a u64>) -> u64 {
         let mut h: u64 = 0x811C9DC5;

@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum VmArchitectureFamily {
     Stack = 0,
@@ -44,6 +44,7 @@ pub enum VmCallConvention {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VmFamilyProfile {
     pub family: VmArchitectureFamily,
+    /// Explicit ALU register slots; the canonical guest image is always 16 GPRs.
     pub register_count: u8,
     pub native_width: u8,
     pub variable_width_operands: bool,
@@ -66,7 +67,7 @@ impl VmArchitectureFamily {
         match self {
             Self::Stack => VmFamilyProfile {
                 family: self,
-                register_count: 8,
+                register_count: 0,
                 native_width: 8,
                 variable_width_operands: false,
                 flag_model: FlagModel::LazyStack,
@@ -86,8 +87,8 @@ impl VmArchitectureFamily {
             },
             Self::MixedRisc => VmFamilyProfile {
                 family: self,
-                register_count: 24,
-                native_width: 4,
+                register_count: 2,
+                native_width: 8,
                 variable_width_operands: true,
                 flag_model: FlagModel::Split,
                 dispatch: DispatchTopology::IndirectThreaded,
@@ -96,7 +97,7 @@ impl VmArchitectureFamily {
             },
             Self::FusedCisc => VmFamilyProfile {
                 family: self,
-                register_count: 12,
+                register_count: 16,
                 native_width: 8,
                 variable_width_operands: true,
                 flag_model: FlagModel::ProducerToken,

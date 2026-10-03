@@ -10,10 +10,34 @@ pub enum SectionNameMode {
     /// Preserve descriptive internal section names (legacy/default behavior).
     #[default]
     Semantic,
-    /// Derive reproducible camouflage names from --seed.
+    /// Derive reproducible opaque names for all sections from --seed.
     Seeded,
-    /// Generate fresh camouflage names from OS entropy for every build.
+    /// Generate fresh opaque names for all sections for every build.
     Random,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum VmVariantPolicy {
+    #[default]
+    Stable,
+    Seeded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum VmFamilyPolicy {
+    Single,
+    #[default]
+    FunctionPartition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum BootVmPolicy {
+    #[default]
+    Native,
+    Orchestration,
+    SelectedStages,
+    /// Experimental complete ChaCha20 and Poly1305 instruction VM.
+    FullCrypto,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -24,6 +48,45 @@ pub enum SectionNameMode {
     about = "Bidirectional Trigger Graph (BTG) Security Framework"
 )]
 pub struct CliArgs {
+    /// Select authenticated boot stage control and opt-in crypto VM backend.
+    #[arg(long, value_enum, default_value_t = BootVmPolicy::Native)]
+    pub boot_vm_policy: BootVmPolicy,
+    /// Select module-scoped ISA/state variants for the commercial Program VM.
+    #[arg(long, value_enum, default_value_t = VmVariantPolicy::Stable)]
+    pub vm_variant_policy: VmVariantPolicy,
+    /// Assign independently lowered VM families to whole functions.
+    #[arg(long, value_enum, default_value_t = VmFamilyPolicy::FunctionPartition)]
+    pub vm_family_policy: VmFamilyPolicy,
+    /// Initialize PRF handler masks before commercial VM dispatch (codec ABI v2).
+    #[arg(long, requires = "vm_commercial", conflicts_with_all = ["no_crypto", "literal_audit_only", "literal_catalog_only", "release_export_only", "verify_seeds"])]
+    pub handler_prf: bool,
+    /// Optional private 32-byte binary build key; never automatically generated.
+    #[arg(long, requires = "handler_prf")]
+    pub private_build_key: Option<PathBuf>,
+    /// Read-only heuristic literal catalog; never auto-approves encryption.
+    #[arg(long, conflicts_with_all = ["literal_audit_only", "literal_map", "release_dir", "release_export_only", "build_cache", "verify_output", "verify_seeds", "test_qa", "qa_commercial", "qa_gen_corpus", "vm_test", "vm_bench", "text_vm", "text_vm_oep"])]
+    pub literal_catalog_only: bool,
+
+    /// Export an existing final EXE using the two-file release whitelist only.
+    #[arg(long, requires = "release_dir", conflicts_with_all = ["literal_audit_only", "literal_map", "build_cache", "verify_output", "verify_seeds"])]
+    pub release_export_only: bool,
+
+    /// Export the final build (or restored cache) to a new two-file release directory.
+    #[arg(long, conflicts_with_all = ["literal_audit_only", "verify_seeds", "test_qa", "qa_commercial", "qa_gen_corpus", "vm_test", "vm_bench", "text_vm", "text_vm_oep"])]
+    pub release_dir: Option<PathBuf>,
+
+    /// Private map/key/cache directory to exclude (repeatable); cache-dir is always excluded.
+    #[arg(long, requires = "release_dir")]
+    pub private_root: Vec<PathBuf>,
+
+    /// Read-only literal map audit; does not pack or execute the input.
+    #[arg(long, requires = "literal_map", conflicts_with_all = ["build_cache", "verify_output", "verify_seeds"])]
+    pub literal_audit_only: bool,
+
+    /// Private JSON literal map (schema v1); audit or explicit build inventory.
+    #[arg(long, conflicts_with_all = ["no_crypto", "verify_seeds", "dispatcher_reencrypt", "test_qa", "qa_commercial", "qa_gen_corpus", "vm_test", "vm_bench", "text_vm", "text_vm_oep"])]
+    pub literal_map: Option<PathBuf>,
+
     /// Reuse completed build packages (requires a fixed --seed).
     #[arg(long, alias = "resume", requires = "seed")]
     pub build_cache: bool,
@@ -75,8 +138,8 @@ pub struct CliArgs {
     #[arg(long)]
     pub seed: Option<u64>,
 
-    /// Generated-section naming policy: semantic (legacy names), seeded
-    /// (reproducible camouflage; requires --seed), or random (fresh per build).
+    /// All-section naming policy: semantic (legacy names), seeded
+    /// (reproducible opaque names; requires --seed), or random (fresh per build).
     #[arg(long, value_enum, default_value_t = SectionNameMode::Semantic)]
     pub section_name_mode: SectionNameMode,
 
@@ -276,6 +339,64 @@ pub enum CryptoModeCli {
 #[cfg(test)]
 mod crypto_cli_tests {
     use super::*;
+
+    #[test]
+    fn literal_candidate_catalog_cannot_be_combined_with_mutating_modes() {
+        let args = CliArgs::try_parse_from(["btg", "--literal-catalog-only"]).unwrap();
+        assert!(args.literal_catalog_only);
+        for flag in ["--verify-output", "--vm-test", "--test-qa", "--literal-audit-only"] {
+            assert!(CliArgs::try_parse_from(["btg", "--literal-catalog-only", flag]).is_err());
+        }
+        assert!(CliArgs::try_parse_from(["btg", "--literal-catalog-only", "--release-dir", "release"]).is_err());
+    }
+
+    #[test]
+    fn release_export_is_explicit_and_cannot_execute_inputs() {
+        let args = CliArgs::try_parse_from([
+            "btg-packer", "--release-export-only", "--release-dir", "new-release", "--private-root", "keys", "--private-root", "maps",
+        ]).unwrap();
+        assert_eq!(args.private_root.len(), 2);
+        assert!(CliArgs::try_parse_from(["btg-packer", "--release-dir", "release"]).is_ok());
+        assert!(CliArgs::try_parse_from(["btg-packer", "--private-root", "keys"]).is_err());
+        assert!(CliArgs::try_parse_from([
+            "btg-packer", "--release-export-only", "--release-dir", "release", "--verify-output",
+        ]).is_err());
+    }
+
+    #[test]
+    fn normal_release_export_conflicts_with_non_pack_modes() {
+        for flag in ["--literal-audit-only", "--test-qa", "--qa-gen-corpus", "--vm-test", "--vm-bench", "--text-vm", "--text-vm-oep"] {
+            assert!(CliArgs::try_parse_from(["btg", "--release-dir", "release", flag]).is_err());
+        }
+        let args = CliArgs::try_parse_from(["btg", "--release-dir", "release", "--private-root", "keys", "--build-cache", "--seed", "2"]).unwrap();
+        assert!(args.build_cache);
+        assert!(!args.release_export_only);
+    }
+
+    #[test]
+    fn literal_map_supports_audit_and_build() {
+        let args = CliArgs::try_parse_from([
+            "btg-packer",
+            "--literal-map",
+            "private.json",
+            "--literal-audit-only",
+        ])
+        .unwrap();
+        assert!(args.literal_audit_only);
+        assert!(CliArgs::try_parse_from(["btg-packer", "--literal-map", "private.json"]).is_ok());
+        assert!(CliArgs::try_parse_from(["btg-packer", "--literal-audit-only"]).is_err());
+        assert!(CliArgs::try_parse_from([
+            "btg-packer",
+            "--literal-map",
+            "private.json",
+            "--literal-audit-only",
+            "--verify-output",
+        ])
+        .is_err());
+        let default = CliArgs::try_parse_from(["btg-packer"]).unwrap();
+        assert!(!default.literal_audit_only);
+        assert!(default.literal_map.is_none());
+    }
 
     #[test]
     fn crypto_mode_rc4_is_not_a_parseable_value() {

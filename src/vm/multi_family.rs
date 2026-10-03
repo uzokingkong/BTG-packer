@@ -6,6 +6,8 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct EncodedFamilyPartition {
+    /// Shared immutable encoding/runtime/placement contract.
+    pub variant_plan: std::sync::Arc<crate::vm::poly::VariantPlan>,
     pub family: VmArchitectureFamily,
     /// Canonical original function-entry VAs owned by this family. Runtime
     /// indirect calls use these entries to route away from non-executable
@@ -14,12 +16,24 @@ pub struct EncodedFamilyPartition {
     pub bytecode: Vec<u8>,
     pub instruction_offsets: Vec<usize>,
     pub ip_map: HashMap<u64, usize>,
+    pub runtime_ip_map: HashMap<u64, usize>,
+    pub prepared: Option<crate::vm::threaded::PreparedSuperOpProgram>,
     /// Family-separated domains used by the module builder for state layout,
     /// handler table, fetch topology, and runtime key derivation.
     pub module_domain: u64,
     /// Dedicated local continuation used when a cross-family tail jump returns
     /// from its target module.
     pub exit_byte_offset: usize,
+}
+
+impl EncodedFamilyPartition {
+    pub fn validate_variant_contract(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.family == self.variant_plan.isa().family,
+            "family partition differs from its variant plan");
+        anyhow::ensure!(self.module_domain == self.variant_plan.isa().seed,
+            "family partition domain differs from its variant plan");
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,7 +175,7 @@ impl MaterializedMultiFamilyProgram {
                 target_state_va: destination.state_va,
                 child_lane_stride: 0,
                 target_byte_offset: byte_offset as u64,
-                target_layout: VmRuntimeLayout::from_seed(module.module_domain),
+                target_layout: module.variant_plan.runtime_layout().clone(),
                 tail_jump_resume_offset,
             });
         }
@@ -334,6 +348,10 @@ impl MultiFamilyProgramPlan {
     }
 
     pub fn materialize(&self, seed: u64) -> Result<MaterializedMultiFamilyProgram, String> {
+        self.materialize_with_variant_policy(seed, crate::cli::VmVariantPolicy::Stable)
+    }
+
+    pub fn materialize_with_variant_policy(&self, seed: u64, policy: crate::cli::VmVariantPolicy) -> Result<MaterializedMultiFamilyProgram, String> {
         let mut modules = Vec::with_capacity(self.partitions.len());
         for (partition_index, partition) in self.partitions.iter().enumerate() {
             crate::progress::set_task(format!(
@@ -343,7 +361,7 @@ impl MultiFamilyProgramPlan {
                 self.partitions.len(),
                 partition.program.instrs.len()
             ));
-            let module_domain = crate::vm::key_domains::derive_u64(
+            let mut module_domain = crate::vm::key_domains::derive_u64(
                 seed,
                 crate::vm::key_domains::VmKeyDomain::FamilyState,
                 &[partition.family as u8],
@@ -352,13 +370,46 @@ impl MultiFamilyProgramPlan {
             routed_program
                 .instrs
                 .push(crate::vm::risc::MicroInstr::new(RiscOp::Halt));
-            let mut encoder = crate::vm::poly::PolymorphicEncoder::new_for_family(
-                module_domain,
-                partition.family,
-            );
-            let (bytecode, instruction_offsets) = encoder
-                .encode_with_offsets(&routed_program)
+            use sha2::{Digest, Sha256};
+            let mut identity = Sha256::new();
+            identity.update(b"BTG/canonical-family-module/v3\0");
+            let instructions = serde_json::to_vec(&routed_program.instrs)
                 .map_err(|error| error.to_string())?;
+            identity.update((instructions.len() as u64).to_le_bytes());
+            identity.update(instructions);
+            let mut ips: Vec<_> = routed_program.ip_map().into_iter().flatten()
+                .map(|(&ip, &index)| (ip, index)).collect();
+            ips.sort_unstable();
+            identity.update((ips.len() as u64).to_le_bytes());
+            for (ip, index) in ips {
+                identity.update(ip.to_le_bytes());
+                identity.update((index as u64).to_le_bytes());
+            }
+            if policy == crate::cli::VmVariantPolicy::Seeded {
+                if let Some(settings) = crate::vm::handler_table_codec::active() {
+                    let key_identity = settings.cache_identity();
+                    module_domain ^= u64::from_le_bytes(key_identity[..8].try_into().unwrap());
+                }
+            }
+            let variant_plan = std::sync::Arc::new(crate::vm::poly::VariantPlan::generate(
+                identity.finalize().into(), module_domain, partition.family,
+                if policy == crate::cli::VmVariantPolicy::Seeded {
+                    crate::vm::poly::VariantPolicy::Seeded
+                } else { crate::vm::poly::VariantPolicy::Stable })
+                .map_err(|error| error.to_string())?);
+            module_domain = variant_plan.isa().seed;
+            let mut encoder = crate::vm::poly::PolymorphicEncoder::from_variant_plan(&variant_plan);
+            let lowered = crate::vm::poly::family_lowering::lower(&routed_program,partition.family)
+                .map_err(|error|error.to_string())?;
+            let prepared = if partition.family == VmArchitectureFamily::FusedCisc {
+                crate::vm::threaded::SuperOperatorSynthesizer::prepare_commercial_program_with_variant_plan(
+                    &lowered.program,&variant_plan).map_err(|error|error.to_string())?
+            } else { None };
+            let (bytecode, offsets) = if let Some(prepared) = &prepared {
+                (prepared.bytecode.clone(),prepared.metadata.original_byte_offsets.clone())
+            } else { encoder.encode_with_offsets(&lowered.program).map_err(|error|error.to_string())? };
+            let instruction_offsets: Vec<_> = lowered.canonical_entries.iter().map(|&i|offsets[i]).collect();
+            let runtime_ip_map = lowered.program.ip_map().cloned().unwrap_or_default();
             let local_to_ip: HashMap<usize, u64> = partition
                 .program
                 .ip_map()
@@ -371,7 +422,7 @@ impl MultiFamilyProgramPlan {
                     "BTG_OP_LAYOUT family={:?} domain={:#x} layout={:?}",
                     partition.family,
                     module_domain,
-                    crate::vm::threaded::VmRuntimeLayout::from_seed(module_domain)
+                    variant_plan.runtime_layout()
                 );
                 for (local, instruction) in partition.program.instrs.iter().enumerate() {
                     crate::progress_safe_eprintln!(
@@ -484,9 +535,12 @@ impl MultiFamilyProgramPlan {
                 .last()
                 .ok_or_else(|| "family partition emitted no exit offset".to_string())?;
             modules.push(EncodedFamilyPartition {
+                variant_plan,
                 family: partition.family,
                 function_ids: partition.function_ids.clone(),
                 bytecode,
+                runtime_ip_map,
+                prepared,
                 instruction_offsets,
                 ip_map: partition.program.ip_map().cloned().unwrap_or_default(),
                 module_domain,
@@ -659,13 +713,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn partition_rejects_variant_contract_drift() {
+        let mut module = encoded_module(VmArchitectureFamily::Stack, 22);
+        module.validate_variant_contract().unwrap();
+        let cloned = module.clone();
+        assert!(std::sync::Arc::ptr_eq(&module.variant_plan, &cloned.variant_plan));
+        module.module_domain ^= 1;
+        assert!(module.validate_variant_contract().is_err());
+        module.module_domain ^= 1;
+        module.family = VmArchitectureFamily::Register;
+        assert!(module.validate_variant_contract().is_err());
+    }
+
     fn encoded_module(family: VmArchitectureFamily, domain: u64) -> EncodedFamilyPartition {
         EncodedFamilyPartition {
+            variant_plan: std::sync::Arc::new(crate::vm::poly::VariantPlan::generate([0;32], domain, family, crate::vm::poly::VariantPolicy::Stable).unwrap()),
             family,
             function_ids: Vec::new(),
             bytecode: vec![0; 16],
             instruction_offsets: vec![0, 7, 12],
             ip_map: HashMap::new(),
+            runtime_ip_map: HashMap::new(),
+            prepared: None,
             module_domain: domain,
             exit_byte_offset: 12,
         }

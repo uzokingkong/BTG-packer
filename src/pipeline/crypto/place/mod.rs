@@ -237,10 +237,13 @@ mod native_gateway_target_tests {
         let multi = MaterializedMultiFamilyProgram {
             modules: vec![EncodedFamilyPartition {
                 family: VmArchitectureFamily::Stack,
+            variant_plan: std::sync::Arc::new(crate::vm::poly::VariantPlan::generate([0; 32], 1, VmArchitectureFamily::Stack, crate::vm::poly::VariantPolicy::Stable).unwrap()),
                 function_ids: Vec::new(),
                 bytecode: Vec::new(),
                 instruction_offsets: Vec::new(),
                 ip_map: HashMap::new(),
+                runtime_ip_map: HashMap::new(),
+                prepared: None,
                 module_domain: 1,
                 exit_byte_offset: 0,
             }],
@@ -279,10 +282,13 @@ mod native_gateway_target_tests {
         let multi = MaterializedMultiFamilyProgram {
             modules: vec![EncodedFamilyPartition {
                 family: VmArchitectureFamily::Stack,
+            variant_plan: std::sync::Arc::new(crate::vm::poly::VariantPlan::generate([0; 32], 1, VmArchitectureFamily::Stack, crate::vm::poly::VariantPolicy::Stable).unwrap()),
                 function_ids: vec![target],
                 bytecode: Vec::new(),
                 instruction_offsets: vec![0],
                 ip_map: HashMap::from([(target, 0)]),
+                runtime_ip_map: HashMap::from([(target, 0)]),
+                prepared: None,
                 module_domain: 1,
                 exit_byte_offset: 0,
             }],
@@ -378,6 +384,10 @@ pub(crate) fn place_boot_stub(
     let boot_va = dispatcher_va + boot_off as u64;
     let c1_mode = !no_crypto && crypto_mode == crate::crypto::CryptoMode::C1;
     let chacha_mode = !no_crypto && crypto_mode == crate::crypto::CryptoMode::ChaCha20;
+    anyhow::ensure!(ctx.boot_vm_policy == crate::cli::BootVmPolicy::Native || chacha_mode,
+        "Boot VM orchestration requires authenticated ChaCha20 stages");
+    ctx.pending_native_auth = None;
+    let run_stride = if chacha_mode { super::stages::ENTRY_SIZE } else {16};
 
     // M8: VM module builders live in `vm_build` (MBA-variant vs plain routing).
     // P3 (G1): 상용 프로그램 리프트의 ip_map (source-IP -> micro-op index) — the
@@ -691,7 +701,8 @@ pub(crate) fn place_boot_stub(
     // that coupled import resolution to unrelated code/run stream position.
     let table_is_run = false;
     let total_num_runs = runs.len() + usize::from(table_is_run);
-    let num_runs_u32 = total_num_runs as u32;
+    let num_runs_u32 = u32::try_from(total_num_runs)
+        .map_err(|_| anyhow::anyhow!("string run count exceeds boot descriptor capacity"))?;
 
     // ── M6 Phase-2 (--vm-oep): 프로그램 리프트를 1회 수행 ──────────────────────
     // 프로그램 VM 바이트코드와 함께, 원본 entry 블록이 제외(네이티브)인지 여부를
@@ -740,6 +751,34 @@ pub(crate) fn place_boot_stub(
     // state and the existing immediate-backed target metadata.
     let desc_used = false;
     let stub = BootStubCtx {
+        crypto_vm_auth: match ctx.boot_vm_policy {
+            crate::cli::BootVmPolicy::SelectedStages => {
+                let program = crate::crypto::chacha20_native::chacha20_vm_program();
+                Some((dispatcher_va, dispatcher_va, program.len() as u64,
+                    super::stages::authenticate(seed_masked, super::stages::Stage::Metadata, u64::MAX-2, &program)))
+            },
+            crate::cli::BootVmPolicy::FullCrypto => {
+                let blob = crate::crypto::chacha20_native::emit_chacha20_full_vm_blob(0,0)?;
+                let program = &blob.code[blob.program_range];
+                Some((dispatcher_va, dispatcher_va, program.len() as u64,
+                    super::stages::authenticate(seed_masked, super::stages::Stage::Metadata, u64::MAX-2, program)))
+            },
+            _ => None,
+        },
+        poly_vm_auth: if ctx.boot_vm_policy == crate::cli::BootVmPolicy::FullCrypto {
+            let blob = crate::crypto::poly1305_native::emit_poly1305_vm_blob(0)?;
+            let program = &blob.code[blob.program_range];
+            Some((dispatcher_va, dispatcher_va, program.len() as u64,
+                super::stages::authenticate(seed_masked, super::stages::Stage::Metadata, u64::MAX-3, program)))
+        } else { None },
+        boot_schedule_auth: if ctx.boot_vm_policy != crate::cli::BootVmPolicy::Native {
+            Some((0, super::stages::authenticate(seed_masked, super::stages::Stage::Metadata,
+                crate::vm::boot::schedule::AUTH_RECORD, &crate::vm::boot::schedule::bytecode())))
+        } else { None },
+        boot_vm_tag: if ctx.boot_vm_policy != crate::cli::BootVmPolicy::Native {
+            Some(super::stages::authenticate(seed_masked, super::stages::Stage::Metadata,
+                crate::vm::boot::material::MATERIAL_PROGRAM_RECORD, &crate::vm::boot::material::bytecode()))
+        } else { None },
         desc_va: 0,
         desc_size: 0,
         desc_used,
@@ -836,6 +875,15 @@ pub(crate) fn place_boot_stub(
         // v63: ChaCha20 blob도 rel32 call 타깃 — 동일한 자리표시자 방침.
         chacha_blob_va: if chacha_mode { dispatcher_va } else { 0 },
         chacha_state_va: 0,
+        chacha_material_va: 0,
+        poly_runs_tag_va: 0,
+        poly_text_tag_va: 0,
+        poly_bytecode_tag_va: 0,
+        poly_resolver_tag_va: 0,
+        iat_table_len: u32::try_from(iat_table_blob.len())?,
+        native_plain_text_va: 0,
+        native_plain_text_len: 0,
+        poly_plain_text_tag_va: 0,
         // ── T3-1 Phase D: Poly1305 AEAD (chacha 경로) — 1st pass 자리표시자 ──
         chacha_aead: chacha_mode && chacha_aead_tag.is_some(),
         poly_blob_va: if chacha_mode { dispatcher_va } else { 0 },
@@ -1082,7 +1130,11 @@ pub(crate) fn place_boot_stub(
     let mut chacha_blob_off = 0usize;
     let mut chacha_state_off = 0usize;
     let chacha_blob_len = if chacha_mode {
-        let len = crate::crypto::chacha20_native::emit_chacha20_blob(0).len();
+        let len = match ctx.boot_vm_policy {
+            crate::cli::BootVmPolicy::SelectedStages => crate::crypto::chacha20_native::emit_chacha20_vm_blob(0).len(),
+            crate::cli::BootVmPolicy::FullCrypto => crate::crypto::chacha20_native::emit_chacha20_full_vm_blob(0,0)?.code.len(),
+            _ => crate::crypto::chacha20_native::emit_chacha20_blob(0).len(),
+        };
         chacha_blob_off = cursor;
         chacha_state_off = chacha_blob_off + len;
         len
@@ -1104,7 +1156,36 @@ pub(crate) fn place_boot_stub(
     } else {
         cursor
     };
-    cursor = chacha_end;
+    let chacha_material_off = chacha_end;
+    let chacha_material_va = if chacha_mode {dispatcher_va + chacha_material_off as u64} else {0};
+    cursor = chacha_end + if chacha_mode {super::stages::MATERIAL_SIZE} else {0};
+
+    let full_crypto = ctx.boot_vm_policy == crate::cli::BootVmPolicy::FullCrypto;
+    let chacha_vm_state_off = cursor;
+    if full_crypto { cursor += crate::crypto::instruction_vm::STATE_SIZE; }
+    let poly_vm_state_off = cursor;
+    if full_crypto { cursor += crate::crypto::instruction_vm::STATE_SIZE; }
+    let crypto_root_off = cursor;
+    if stub.crypto_vm_auth.is_some() { cursor += crate::crypto::chacha20_native::emit_chacha20_blob(0).len(); }
+    let poly_root_off = cursor;
+    if full_crypto { cursor += crate::crypto::poly1305_native::emit_poly1305_verify_blob(0).len(); }
+    let crypto_vm_auth = if let Some((_, _, len, tag)) = stub.crypto_vm_auth {
+        let offset = if full_crypto {
+            crate::crypto::chacha20_native::emit_chacha20_full_vm_blob(0,0)?.program_range.start
+        } else {
+            let template = crate::crypto::chacha20_native::emit_chacha20_vm_blob(0);
+            let program = crate::crypto::chacha20_native::chacha20_vm_program();
+            template.windows(program.len()).position(|bytes| bytes == program)
+                .ok_or_else(|| anyhow::anyhow!("crypto VM program absent from emitted backend"))?
+        };
+        Some((dispatcher_va + crypto_root_off as u64, chacha_blob_va + offset as u64, len, tag))
+    } else { None };
+
+    let boot_schedule_state_off = cursor;
+    let boot_schedule_auth = stub.boot_schedule_auth.map(|(_, tag)| {
+        cursor += crate::vm::boot::schedule::STATE_SIZE;
+        (dispatcher_va + boot_schedule_state_off as u64, tag)
+    });
 
     // ── T3-1 Phase D (--crypto-mode chacha20 + AEAD): Poly1305 blob + 키/태그 ──
     // RFC 8439 네이티브 Poly1305 verify blob을 chacha 상태 버퍼 뒤에 배치하고,
@@ -1115,7 +1196,8 @@ pub(crate) fn place_boot_stub(
     let mut poly_key_off = 0usize;
     let mut poly_tag_off = 0usize;
     let poly_blob_len = if chacha_mode {
-        let len = crate::crypto::poly1305_native::emit_poly1305_verify_blob(0).len();
+        let len = if full_crypto { crate::crypto::poly1305_native::emit_poly1305_vm_blob(0)?.code.len() }
+            else { crate::crypto::poly1305_native::emit_poly1305_verify_blob(0).len() };
         poly_blob_off = cursor;
         poly_key_off = poly_blob_off + len;
         poly_tag_off = poly_key_off + 32;
@@ -1128,6 +1210,10 @@ pub(crate) fn place_boot_stub(
     } else {
         0
     };
+    let poly_vm_auth = if let Some((_, _, len, tag)) = stub.poly_vm_auth {
+        let offset = crate::crypto::poly1305_native::emit_poly1305_vm_blob(0)?.program_range.start;
+        Some((dispatcher_va + poly_root_off as u64, poly_blob_va + offset as u64, len, tag))
+    } else { None };
     let poly_key_va = if chacha_mode {
         dispatcher_va + poly_key_off as u64
     } else {
@@ -1141,7 +1227,7 @@ pub(crate) fn place_boot_stub(
         0
     };
     let poly_end = if chacha_mode {
-        poly_tag_off + 16
+        poly_tag_off + 6 * 16
     } else {
         cursor
     };
@@ -1543,7 +1629,7 @@ pub(crate) fn place_boot_stub(
     cursor = (cursor + 7) & !7; // align 8
     let runs_off = cursor;
     let runs_va = dispatcher_va + (runs_off + 8) as u64;
-    cursor += 8 + total_num_runs * 16; // header(8) + entries (v6: 리졸브 테이블 run 포함)
+    cursor += 8 + total_num_runs * run_stride;
     cursor = (cursor + 7) & !7; // align 8
     let seed_off = cursor;
     let seed_va = dispatcher_va + seed_off as u64;
@@ -1554,7 +1640,7 @@ pub(crate) fn place_boot_stub(
     let text_runs_block = if text_enc_runs.is_empty() {
         0
     } else {
-        8 + text_enc_runs.len() * 16
+        8 + text_enc_runs.len() * run_stride
     };
     // ── M12 Decrypt-Descriptor: 정적 RC4 decrypt target/size/bytecode/table 주소를
     // 부트 스텁 imm으로 노출하지 않고, 파생 키(RC4 keystream — 키 유도 계층)로 암호화한
@@ -1724,6 +1810,9 @@ pub(crate) fn place_boot_stub(
 
     // 2nd pass: 최종 VA 반영 (payload_va/crc_va는 imm64라 길이 불변 — 아래에서 재생성)
     let stub2 = BootStubCtx {
+        boot_schedule_auth,
+        crypto_vm_auth,
+        poly_vm_auth,
         runs_va,
         seed_va,
         desc_va,
@@ -1740,6 +1829,12 @@ pub(crate) fn place_boot_stub(
         // v63: ChaCha20 blob/상태 VA (rel32/imm64 — 길이 불변)
         chacha_blob_va,
         chacha_state_va,
+        chacha_material_va,
+        poly_runs_tag_va: if chacha_mode {poly_tag_va + 16} else {0},
+        poly_text_tag_va: if chacha_mode {poly_tag_va + 32} else {0},
+        poly_bytecode_tag_va: if chacha_mode {poly_tag_va + 48} else {0},
+        poly_resolver_tag_va: if chacha_mode {poly_tag_va + 64} else {0},
+        poly_plain_text_tag_va: if chacha_mode {poly_tag_va + 80} else {0},
         // T3-1 Phase D: Poly1305 blob/키/태그 VA (rel32/imm64 — 길이 불변)
         poly_blob_va,
         poly_key_va,
@@ -1812,7 +1907,7 @@ pub(crate) fn place_boot_stub(
         .max(vm_prga_off + vm_prga_total)
         .max(vm_prog_off + vm_prog_total + vm_prog_call_stack)
         .max(vm_integrity_table_off + vm_integrity_table_capacity)
-        .max(runs_off + 8 + total_num_runs * 16)
+        .max(runs_off + 8 + total_num_runs * run_stride)
         .max(text_runs_off + text_runs_block)
         .max(boot_data_end);
     let old_section_len = btg.bytes.len();
@@ -1950,6 +2045,12 @@ pub(crate) fn place_boot_stub(
         vm_oep_bc_len: vm_prog_bc_len,
         vm_oep_text_runs_va: text_runs_va,
         vm_oep_text_runs_count: text_runs_count,
+        native_plain_text_va: if vm_oep_effective && text_enc_runs.is_empty() {
+            image_base + ctx.target_info.text_rva as u64
+        } else {0},
+        native_plain_text_len: if vm_oep_effective && text_enc_runs.is_empty() {
+            ctx.patched_sections.iter().find(|s| s.name==".text").map(|s| u32::try_from(s.bytes.len())).transpose()?.unwrap_or(0)
+        } else {0},
         // v6: 배치 확정 후 반영 (모두 imm64 — 길이 불변)
         iat_table_va: if !iat_table_blob.is_empty() {
             dispatcher_va + table_off as u64
@@ -2041,10 +2142,23 @@ pub(crate) fn place_boot_stub(
         );
     }
 
+    if crypto_vm_auth.is_some() {
+        let root = crate::crypto::chacha20_native::emit_chacha20_blob(chacha_state_va);
+        btg.bytes[crypto_root_off..crypto_root_off + root.len()].copy_from_slice(&root);
+    }
+    if full_crypto {
+        let root = crate::crypto::poly1305_native::emit_poly1305_verify_blob(0);
+        btg.bytes[poly_root_off..poly_root_off+root.len()].copy_from_slice(&root);
+    }
     // ── v63 (--crypto-mode chacha20): ChaCha20 blob + 상태 영역 기록 ──────────
     if chacha_mode {
         // blob은 최종 VA(chacha_state_va)로 재생성 — 길이는 1차와 동일.
-        let blob = crate::crypto::chacha20_native::emit_chacha20_blob(chacha_state_va);
+        let blob = match ctx.boot_vm_policy {
+            crate::cli::BootVmPolicy::SelectedStages => crate::crypto::chacha20_native::emit_chacha20_vm_blob(chacha_state_va),
+            crate::cli::BootVmPolicy::FullCrypto => crate::crypto::chacha20_native::emit_chacha20_full_vm_blob(
+                chacha_state_va,dispatcher_va+chacha_vm_state_off as u64)?.code,
+            _ => crate::crypto::chacha20_native::emit_chacha20_blob(chacha_state_va),
+        };
         debug_assert_eq!(
             blob.len(),
             chacha_blob_len,
@@ -2054,6 +2168,7 @@ pub(crate) fn place_boot_stub(
         // 상태 버퍼는 0으로 초기화 (스텁 emit_chacha_init이 런타임에 key/ctr/nonce/ks_off 기록)
         let st_size = crate::crypto::chacha20::CHA_STATE_SIZE;
         btg.bytes[chacha_state_off..chacha_state_off + st_size].fill(0);
+        btg.bytes[chacha_material_off..chacha_material_off + super::stages::MATERIAL_SIZE].fill(0);
         println!(
             "[+] v63 ChaCha20: crypt blob @0x{:X} ({}B), state @0x{:X}",
             chacha_blob_off,
@@ -2064,7 +2179,9 @@ pub(crate) fn place_boot_stub(
 
     // ── T3-1 Phase D: Poly1305 verify blob + 키/태그 기록 (chacha 경로) ────────
     if chacha_mode {
-        let blob = crate::crypto::poly1305_native::emit_poly1305_verify_blob(0);
+        let blob = if full_crypto { crate::crypto::poly1305_native::emit_poly1305_vm_blob(
+            dispatcher_va+poly_vm_state_off as u64)?.code }
+            else { crate::crypto::poly1305_native::emit_poly1305_verify_blob(0) };
         debug_assert_eq!(
             blob.len(),
             poly_blob_len,
@@ -2456,9 +2573,21 @@ pub(crate) fn place_boot_stub(
         }
     }
 
+    // Seal data only after lifetime layering and native-pointer fixups. A tag
+    // over an intermediate representation would reject a legitimate image.
+    let mut chacha_run_tags = Vec::new();
+    if chacha_mode {
+        for (index, run) in runs.iter().enumerate() {
+            let section = &mut ctx.patched_sections[run.sec_idx];
+            chacha_run_tags.push(super::stages::seal(seed_masked, super::stages::Stage::Data,
+                index as u64, &mut section.bytes[run.offset..run.offset+run.len]));
+        }
+    }
     // fresh production stream 하나로 .text → bytecode 순 연속 암호화. 부트 스텁의
     // emit_rest_decrypt가 같은 순서로 복호화한다. (.textb는 RWX, .text는 WRITE
     // 비트 추가로 in-place 복호화를 허용한다.)
+    let mut text_tags = Vec::new();
+    let mut bytecode_tag = if chacha_mode {super::stages::authenticate(seed_masked, super::stages::Stage::Bytecode, 0, &[])} else {[0;16]};
     if vm_oep_effective && (!text_enc_runs.is_empty() || vm_prog_bc_len > 0) {
         if !text_enc_runs.is_empty() {
             if let Some(sec) = ctx.patched_sections.iter_mut().find(|s| s.name == ".text") {
@@ -2471,29 +2600,14 @@ pub(crate) fn place_boot_stub(
             let (key, nonce) = super::cipher::derive_c1_key_nonce(seed_masked);
             Some(crate::crypto::BtgCipher::new(&key, nonce))
         };
-        let mut rest_chacha = if chacha_mode {
-            let (key, nonce) = super::cipher::derive_chacha_key_nonce_raw(seed_masked);
-            let mut state = [0u8; crate::crypto::chacha20::CHA_STATE_SIZE];
-            crate::crypto::chacha20::chacha_init_state(&mut state, &key, &nonce);
-            state[crate::crypto::chacha20::CHA_OFF_CTR..crate::crypto::chacha20::CHA_OFF_CTR + 8]
-                .copy_from_slice(&1u64.to_le_bytes());
-            Some(state)
-        } else {
-            None
-        };
-        let mut crypt_rest = |bytes: &mut [u8]| {
-            if let Some(state) = rest_chacha.as_mut() {
-                crate::crypto::chacha20::chacha_apply(state, bytes);
-            } else if let Some(cipher) = rest_c1.as_mut() {
-                cipher.crypt(bytes);
-            }
-        };
         if !text_enc_runs.is_empty() {
             if let Some(sec) = ctx.patched_sections.iter_mut().find(|s| s.name == ".text") {
                 let sec_start = image_base + sec.virtual_address as u64;
-                for &(va, len) in &text_enc_runs {
+                for (index, &(va, len)) in text_enc_runs.iter().enumerate() {
                     let off = (va - sec_start) as usize;
-                    crypt_rest(&mut sec.bytes[off..off + len as usize]);
+                    if chacha_mode {
+                        text_tags.push(super::stages::seal(seed_masked, super::stages::Stage::NativeText, index as u64, &mut sec.bytes[off..off + len as usize]));
+                    } else if let Some(cipher) = rest_c1.as_mut() {cipher.crypt(&mut sec.bytes[off..off + len as usize]);}
                 }
             }
         }
@@ -2516,7 +2630,9 @@ pub(crate) fn place_boot_stub(
                     new_section_len
                 ));
             }
-            crypt_rest(&mut btg.bytes[vm_prog_bc_off..bc_end]);
+            if chacha_mode {
+                bytecode_tag = super::stages::seal(seed_masked, super::stages::Stage::Bytecode, 0, &mut btg.bytes[vm_prog_bc_off..bc_end]);
+            } else if let Some(cipher) = rest_c1.as_mut() {cipher.crypt(&mut btg.bytes[vm_prog_bc_off..bc_end]);}
         }
         println!(
             "[+] --vm-oep at-rest: fresh-{}(seed) encryption applied (preserved .text {} run(s)/{}B + Program VM bytecode {}B)",
@@ -2530,12 +2646,13 @@ pub(crate) fn place_boot_stub(
     // 런 테이블 헤더 + 엔트리 (절대 VA) — 문자열 런 + v6 리졸브 테이블 run
     btg.bytes[runs_off..runs_off + 4].copy_from_slice(&num_runs_u32.to_le_bytes());
     for (i, run) in runs.iter().enumerate() {
-        let e = runs_off + 8 + i * 16;
+        let e = runs_off + 8 + i * run_stride;
         btg.bytes[e..e + 8].copy_from_slice(&run.va.to_le_bytes());
         btg.bytes[e + 8..e + 16].copy_from_slice(&(run.len as u64).to_le_bytes());
+        if chacha_mode {btg.bytes[e+16..e+32].copy_from_slice(&chacha_run_tags[i]);}
     }
     if table_is_run {
-        let e = runs_off + 8 + runs.len() * 16;
+        let e = runs_off + 8 + runs.len() * run_stride;
         btg.bytes[e..e + 8].copy_from_slice(&(dispatcher_va + table_off as u64).to_le_bytes());
         btg.bytes[e + 8..e + 16].copy_from_slice(&(iat_table_blob.len() as u64).to_le_bytes());
     }
@@ -2582,9 +2699,29 @@ pub(crate) fn place_boot_stub(
     if !text_enc_runs.is_empty() {
         btg.bytes[text_runs_off..text_runs_off + 4].copy_from_slice(&text_runs_count.to_le_bytes());
         for (i, &(va, len)) in text_enc_runs.iter().enumerate() {
-            let e = text_runs_off + 8 + i * 16;
+            let e = text_runs_off + 8 + i * run_stride;
             btg.bytes[e..e + 8].copy_from_slice(&va.to_le_bytes());
             btg.bytes[e + 8..e + 16].copy_from_slice(&(len as u64).to_le_bytes());
+            if chacha_mode {btg.bytes[e+16..e+32].copy_from_slice(&text_tags[i]);}
+        }
+    }
+    if chacha_mode {
+        let tag = super::stages::authenticate(seed_masked, super::stages::Stage::Metadata,
+            0, &btg.bytes[runs_off..runs_off+8+total_num_runs*run_stride]);
+        btg.bytes[poly_tag_off+16..poly_tag_off+32].copy_from_slice(&tag);
+        let tag = super::stages::authenticate(seed_masked, super::stages::Stage::Metadata,
+            1, &btg.bytes[text_runs_off..text_runs_off+text_runs_block]);
+        btg.bytes[poly_tag_off+32..poly_tag_off+48].copy_from_slice(&tag);
+        btg.bytes[poly_tag_off+48..poly_tag_off+64].copy_from_slice(&bytecode_tag);
+        let plaintext = if vm_oep_effective && text_enc_runs.is_empty() {
+            ctx.patched_sections.iter().find(|s| s.name==".text").map(|s| s.bytes.as_slice()).unwrap_or(&[])
+        } else {&[]};
+        let tag = super::stages::authenticate(seed_masked, super::stages::Stage::NativeText, u64::MAX, plaintext);
+        btg.bytes[poly_tag_off+80..poly_tag_off+96].copy_from_slice(&tag);
+        if !plaintext.is_empty() {
+            let (key,nonce) = super::stages::key_nonce(seed_masked, super::stages::Stage::NativeText,u64::MAX);
+            ctx.pending_native_auth = Some(super::PendingNativeAuth {rva:ctx.target_info.text_rva,
+                len:plaintext.len(),tag_offset:poly_tag_off+80,key,nonce});
         }
     }
 
@@ -2655,6 +2792,11 @@ pub(crate) fn place_boot_stub(
             if table_is_run {
                 stream.crypt(&mut btg.bytes[table_off..table_off + iat_table_blob.len()]);
             }
+            if chacha_mode {
+                let tag = super::stages::seal(seed_masked, super::stages::Stage::Resolver,
+                    0, &mut btg.bytes[table_off..table_off+iat_table_blob.len()]);
+                btg.bytes[poly_tag_off+64..poly_tag_off+80].copy_from_slice(&tag);
+            }
         }
         if ctx.mem_harden {
             let dll = b"ntdll.dll\0";
@@ -2695,7 +2837,7 @@ pub(crate) fn place_boot_stub(
                     .push(((run.va - image_base) as u32, run.len as u32));
             }
         }
-        if table_is_run && !iat_table_blob.is_empty() {
+        if (table_is_run || chacha_mode) && !iat_table_blob.is_empty() {
             ctx.at_rest_cipher_ranges.push((
                 ctx.dispatcher_rva + table_off as u32,
                 iat_table_blob.len() as u32,

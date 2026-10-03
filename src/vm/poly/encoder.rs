@@ -17,6 +17,13 @@ pub struct PolymorphicEncoder {
 }
 
 impl PolymorphicEncoder {
+    pub fn from_variant_plan(plan: &super::VariantPlan) -> Self {
+        Self {
+            spec: plan.isa().clone(),
+            rolling: RollingKeyEngine::new(plan.isa().seed),
+        }
+    }
+
     pub fn new(seed: u64) -> Self {
         Self::new_for_family(seed, VmArchitectureFamily::for_build(seed))
     }
@@ -74,6 +81,10 @@ impl PolymorphicEncoder {
         let encode_operand = |op: Option<MicroOperand>, spec: &VirtualIsaSpec| match op {
             Some(MicroOperand::VReg(r)) => (0x80 | spec.encode_reg(r), None),
             Some(MicroOperand::Temp(t)) => (0xC0 | (t & 0x07), None),
+            Some(MicroOperand::StackPush) => (0x50, None),
+            Some(MicroOperand::StackPop) => (0x51, None),
+            Some(MicroOperand::StackPeek(i)) => (0x52 + (i & 1), None),
+            Some(MicroOperand::Accumulator(i)) => (0x54 + (i & 1), None),
             Some(MicroOperand::Imm64(v)) => (spec.immediate_encoding(v).0, Some(v)),
             Some(MicroOperand::Vsp) => (0x40, None),
             Some(MicroOperand::Vflags) => (0x41, None),
@@ -250,6 +261,10 @@ impl PolymorphicEncoder {
                     match op {
                         Some(MicroOperand::VReg(r)) => (0x80 | spec.encode_reg(r), None),
                         Some(MicroOperand::Temp(t)) => (0xC0 | (t & 0x07), None),
+            Some(MicroOperand::StackPush) => (0x50, None),
+            Some(MicroOperand::StackPop) => (0x51, None),
+            Some(MicroOperand::StackPeek(i)) => (0x52 + (i & 1), None),
+            Some(MicroOperand::Accumulator(i)) => (0x54 + (i & 1), None),
                         Some(MicroOperand::Imm64(v)) => (spec.immediate_encoding(v).0, Some(v)),
                         Some(MicroOperand::Vsp) => (0x40, None),
                         Some(MicroOperand::Vflags) => (0x41, None),

@@ -8,6 +8,50 @@ use crate::pe::builder::SectionData;
 use crate::pipeline::PipelineContext;
 
 #[test]
+fn mapped_short_unicode_runs_are_exact_and_fail_closed() {
+    use crate::pipeline::literal_catalog::*;
+    let input = crate::pe::generate_dummy_target_pe().unwrap();
+    let target = crate::pe::TargetPeInfo::parse(&input).unwrap();
+    let mut ctx = PipelineContext::new(target, 0x140009000, 0x9000, 1);
+    ctx.patched_sections = vec![SectionData {
+        name: ".rdata".into(), virtual_address: 0x5000, virtual_size: 16,
+        characteristics: 0x40000040,
+        bytes: vec![b'A', 0, 0xED, 0x95, 0x9C, 0, 0x3D, 0xD8, 0, 0xDE, 0, 0, 1, 2, 3, 4],
+    }];
+    ctx.literal_catalog = Some(LiteralCatalog::from_spans(vec![
+        LiteralSpan { id: 1, rva: 0x5000, byte_len: 1, terminator_len: 1,
+            encoding: Encoding::Ascii, phase: AccessPhase::PostBoot, evidence: Evidence::ExplicitMap },
+        LiteralSpan { id: 2, rva: 0x5002, byte_len: 3, terminator_len: 1,
+            encoding: Encoding::Utf8, phase: AccessPhase::PostBoot, evidence: Evidence::ExplicitMap },
+        LiteralSpan { id: 3, rva: 0x5006, byte_len: 4, terminator_len: 2,
+            encoding: Encoding::Utf16Le, phase: AccessPhase::PostBoot, evidence: Evidence::ExplicitMap },
+        LiteralSpan { id: 4, rva: 0x500C, byte_len: 4, terminator_len: 0,
+            encoding: Encoding::Ascii, phase: AccessPhase::PreBootTls, evidence: Evidence::ExplicitMap },
+    ]).unwrap());
+    for entry in ctx.literal_catalog.as_ref().unwrap().entries() {
+        use sha2::{Digest, Sha256};
+        let offset = (entry.span.rva - 0x5000) as usize;
+        let len = entry.span.byte_len as usize + entry.span.terminator_len as usize;
+        ctx.literal_payload_hashes.insert(entry.span.id,
+            Sha256::digest(&ctx.patched_sections[0].bytes[offset..offset+len]).into());
+    }
+    let runs = super::scan::gather_runs(&mut ctx, false, false).unwrap();
+    assert_eq!(runs.iter().map(|r| (r.offset, r.len)).collect::<Vec<_>>(), vec![(0,1), (2,3), (6,4)]);
+    assert!(super::scan::gather_runs(&mut ctx, true, false).is_err());
+    ctx.patched_sections[0].bytes[1] = 1;
+    assert!(super::scan::gather_runs(&mut ctx, false, false).is_err());
+    ctx.patched_sections[0].bytes[1] = 0;
+    ctx.patched_sections[0].bytes[0] = b'B';
+    assert!(super::scan::gather_runs(&mut ctx, false, false).is_err());
+    ctx.patched_sections[0].bytes[0] = b'A';
+    ctx.patched_sections[0].characteristics |= 0x20000000;
+    assert!(super::scan::gather_runs(&mut ctx, false, false).is_err());
+    ctx.patched_sections[0].characteristics &= !0x20000000;
+    ctx.patched_sections[0].bytes.truncate(8);
+    assert!(super::scan::gather_runs(&mut ctx, false, false).is_err());
+}
+
+#[test]
 fn test_rc4_roundtrip() {
     let key = [0x11u8; 32];
     let mut data = vec![0xABu8; 4096];
@@ -125,6 +169,10 @@ fn test_anti_debug_raw_block_policies() {
 fn test_boot_stub_generates() {
     // build_boot_block + build_anti_debug_raw_block가 패닉 없이 인코딩되는지 검증
     let stub = BootStubCtx {
+        boot_vm_tag: None,
+        boot_schedule_auth: None,
+        crypto_vm_auth: None,
+        poly_vm_auth: None,
         desc_va: 0,
         desc_size: 0,
         desc_used: false,
@@ -188,6 +236,15 @@ fn test_boot_stub_generates() {
         c1_state_va: 0,
         chacha_blob_va: 0,
         chacha_state_va: 0,
+        chacha_material_va: 0,
+        poly_runs_tag_va: 0,
+        poly_text_tag_va: 0,
+        poly_bytecode_tag_va: 0,
+        poly_resolver_tag_va: 0,
+        iat_table_len: 0,
+        native_plain_text_va: 0,
+        native_plain_text_len: 0,
+        poly_plain_text_tag_va: 0,
         chacha_aead: false,
         poly_blob_va: 0,
         poly_key_va: 0,
@@ -217,6 +274,10 @@ fn test_boot_stub_generates_chacha20_mode() {
     // 타깃이라 in-range 자리표시자(dispatcher_va)를 쓴다.
     let stub = BootStubCtx {
         desc_va: 0,
+        boot_vm_tag: None,
+        boot_schedule_auth: None,
+        crypto_vm_auth: None,
+        poly_vm_auth: None,
         desc_size: 0,
         desc_used: false,
         boot_va: 0x140001000,
@@ -279,8 +340,17 @@ fn test_boot_stub_generates_chacha20_mode() {
         c1_state_va: 0,
         chacha_blob_va: 0x140002000,
         chacha_state_va: 0x140002080,
+        chacha_material_va: 0,
+        poly_runs_tag_va: 0,
+        poly_text_tag_va: 0,
+        poly_bytecode_tag_va: 0,
+        poly_resolver_tag_va: 0,
+        iat_table_len: 0,
+        native_plain_text_va: 0,
+        native_plain_text_len: 0,
+        poly_plain_text_tag_va: 0,
         chacha_aead: false,
-        poly_blob_va: 0,
+        poly_blob_va: 0x140006000,
         poly_key_va: 0,
         poly_tag_va: 0,
     };
@@ -296,8 +366,17 @@ fn test_boot_stub_generates_chacha20_mode() {
         desc_used: false,
         chacha_blob_va: 0x140003000,
         chacha_state_va: 0x140003080,
+        chacha_material_va: 0,
+        poly_runs_tag_va: 0,
+        poly_text_tag_va: 0,
+        poly_bytecode_tag_va: 0,
+        poly_resolver_tag_va: 0,
+        iat_table_len: 0,
+        native_plain_text_va: 0,
+        native_plain_text_len: 0,
+        poly_plain_text_tag_va: 0,
         chacha_aead: false,
-        poly_blob_va: 0,
+        poly_blob_va: 0x140007000,
         poly_key_va: 0,
         poly_tag_va: 0,
         ..stub
@@ -368,6 +447,10 @@ fn test_boot_stub_ksa_matches_shared_list() {
     // 부트 스텁 build_rc4_block가 이 리스트를 그대로 소비하는지 (라벨 매핑 스모크)
     let stub = BootStubCtx {
         desc_va: 0,
+        boot_vm_tag: None,
+        boot_schedule_auth: None,
+        crypto_vm_auth: None,
+        poly_vm_auth: None,
         desc_size: 0,
         desc_used: false,
         boot_va: 0x140001000,
@@ -430,6 +513,15 @@ fn test_boot_stub_ksa_matches_shared_list() {
         c1_state_va: 0,
         chacha_blob_va: 0,
         chacha_state_va: 0,
+        chacha_material_va: 0,
+        poly_runs_tag_va: 0,
+        poly_text_tag_va: 0,
+        poly_bytecode_tag_va: 0,
+        poly_resolver_tag_va: 0,
+        iat_table_len: 0,
+        native_plain_text_va: 0,
+        native_plain_text_len: 0,
+        poly_plain_text_tag_va: 0,
         chacha_aead: false,
         poly_blob_va: 0,
         poly_key_va: 0,
@@ -458,6 +550,38 @@ fn test_scan_ascii_runs_still_work() {
     assert_eq!(runs.len(), 1, "ASCII string run should be detected");
     assert_eq!(runs[0].len, 12);
     assert_eq!(runs[0].va, 0x140005000);
+}
+
+#[test]
+fn short_nim_names_and_wide_literals_are_scanned_without_terminators() {
+    let mut bytes = b"os.nim\0IOError\0OSError\0comnim\0".to_vec();
+    let wide_offset = bytes.len();
+    for c in "Help".encode_utf16() {
+        bytes.extend_from_slice(&c.to_le_bytes());
+    }
+    bytes.extend_from_slice(&[0, 0]);
+    let mut sections = vec![SectionData {
+        name: ".rdata".into(), virtual_address: 0x5000,
+        virtual_size: bytes.len() as u32, characteristics: 0x40000040, bytes,
+    }];
+    let runs = scan_string_runs(&mut sections, 0x140000000, &[]);
+    let spans: Vec<_> = runs.iter().map(|r| (r.offset, r.len)).collect();
+    assert_eq!(spans, vec![(0, 6), (7, 7), (15, 7), (23, 6), (wide_offset, 8)]);
+    for run in runs {
+        assert_eq!(sections[0].bytes[run.offset + run.len], 0);
+    }
+}
+
+#[test]
+fn short_literal_scan_preserves_metadata_and_unterminated_binary_runs() {
+    let bytes = b"os.nim\0IOError\0ABCD\x01abc\0".to_vec();
+    let mut sections = vec![SectionData {
+        name: ".rdata".into(), virtual_address: 0x5000,
+        virtual_size: bytes.len() as u32, characteristics: 0x40000040, bytes,
+    }];
+    let runs = scan_string_runs(&mut sections, 0x140000000, &[(0x5000, 0x5006)]);
+    assert_eq!(runs.len(), 1);
+    assert_eq!((runs[0].offset, runs[0].len), (7, 7));
 }
 
 #[test]
@@ -510,6 +634,29 @@ fn test_scan_string_runs_excludes_loader_metadata_ranges() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].va, 0x140005040);
     assert_eq!(runs[0].len, 16);
+}
+
+#[test]
+fn test_string_scan_does_not_stop_at_512_runs_or_one_megabyte() {
+    let mut bytes = Vec::new();
+    for _ in 0..700 {
+        bytes.extend_from_slice(b"ordinary-literal-text");
+        bytes.push(0);
+    }
+    let long_offset = bytes.len();
+    bytes.extend(std::iter::repeat_n(b'A', (1 << 20) + 16));
+    let mut sections = vec![SectionData {
+        name: ".rdata".into(),
+        virtual_address: 0x5000,
+        virtual_size: bytes.len() as u32,
+        characteristics: 0x40000040,
+        bytes,
+    }];
+    let runs = scan_string_runs(&mut sections, 0x140000000, &[]);
+    assert_eq!(runs.len(), 701);
+    assert_eq!(runs.last().unwrap().offset, long_offset);
+    assert_eq!(runs.last().unwrap().len, (1 << 20) + 16);
+    assert!(runs.iter().map(|r| r.len).sum::<usize>() > 1 << 20);
 }
 
 #[test]
@@ -611,6 +758,10 @@ fn test_boot_stub_generates_with_integrity() {
     // --integrity 경로의 부트 스텁이 인코딩 가능하고 길이 불변(VA 픽스업)한지 검증.
     let stub = BootStubCtx {
         desc_va: 0,
+        boot_vm_tag: None,
+        boot_schedule_auth: None,
+        crypto_vm_auth: None,
+        poly_vm_auth: None,
         desc_size: 0,
         desc_used: false,
         boot_va: 0x140001000,
@@ -673,6 +824,15 @@ fn test_boot_stub_generates_with_integrity() {
         c1_state_va: 0,
         chacha_blob_va: 0,
         chacha_state_va: 0,
+        chacha_material_va: 0,
+        poly_runs_tag_va: 0,
+        poly_text_tag_va: 0,
+        poly_bytecode_tag_va: 0,
+        poly_resolver_tag_va: 0,
+        iat_table_len: 0,
+        native_plain_text_va: 0,
+        native_plain_text_len: 0,
+        poly_plain_text_tag_va: 0,
         chacha_aead: false,
         poly_blob_va: 0,
         poly_key_va: 0,
@@ -801,6 +961,10 @@ fn test_boot_stub_generates_chacha20_aead_mode() {
     // 부트 스텁이 인코딩 가능하고 길이 불변(VA 픽스업)해야 한다.
     let stub = BootStubCtx {
         desc_va: 0,
+        boot_vm_tag: None,
+        boot_schedule_auth: None,
+        crypto_vm_auth: None,
+        poly_vm_auth: None,
         desc_size: 0,
         desc_used: false,
         boot_va: 0x140001000,
@@ -863,6 +1027,15 @@ fn test_boot_stub_generates_chacha20_aead_mode() {
         c1_state_va: 0,
         chacha_blob_va: 0x140002000,
         chacha_state_va: 0x140002080,
+        chacha_material_va: 0,
+        poly_runs_tag_va: 0,
+        poly_text_tag_va: 0,
+        poly_bytecode_tag_va: 0,
+        poly_resolver_tag_va: 0,
+        iat_table_len: 0,
+        native_plain_text_va: 0,
+        native_plain_text_len: 0,
+        poly_plain_text_tag_va: 0,
         chacha_aead: true,
         poly_blob_va: 0x140002100,
         poly_key_va: 0x140003000,
@@ -1034,8 +1207,12 @@ fn test_junk_has_real_dependency_and_seed_determinism() {
     );
 }
 
-fn integrity_stub() -> BootStubCtx {
+pub(crate) fn integrity_stub() -> BootStubCtx {
     BootStubCtx {
+        boot_vm_tag: None,
+        boot_schedule_auth: None,
+        crypto_vm_auth: None,
+        poly_vm_auth: None,
         desc_va: 0,
         desc_size: 0,
         desc_used: false,
@@ -1099,6 +1276,15 @@ fn integrity_stub() -> BootStubCtx {
         c1_state_va: 0,
         chacha_blob_va: 0,
         chacha_state_va: 0,
+        chacha_material_va: 0,
+        poly_runs_tag_va: 0,
+        poly_text_tag_va: 0,
+        poly_bytecode_tag_va: 0,
+        poly_resolver_tag_va: 0,
+        iat_table_len: 0,
+        native_plain_text_va: 0,
+        native_plain_text_len: 0,
+        poly_plain_text_tag_va: 0,
         chacha_aead: false,
         poly_blob_va: 0,
         poly_key_va: 0,

@@ -1,17 +1,10 @@
 use crate::cli::SectionNameMode;
 use anyhow::{anyhow, bail, Result};
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::collections::HashSet;
 
-const ROLES: [(&str, &str); 6] = [
-    (".textb", ".text"),
-    (".vstate", ".data"),
-    (".vmeta", ".rdat"),
-    (".vdata", ".blob"),
-    (".vmroute", ".cfg"),
-    (".nisland", ".code"),
-];
+const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 #[derive(Debug, Clone)]
 pub struct SectionNamePlan {
@@ -27,28 +20,29 @@ impl SectionNamePlan {
         if mode == SectionNameMode::Semantic {
             return Ok(None);
         }
-        let mut state = match mode {
+        let mut rng = match mode {
             SectionNameMode::Semantic => unreachable!(),
-            SectionNameMode::Seeded => {
+            SectionNameMode::Seeded => StdRng::seed_from_u64(
                 seed.ok_or_else(|| {
                     anyhow!("--section-name-mode seeded requires an explicit --seed")
-                })? ^ 0x5345_4354_4E41_4D45
-            }
-            SectionNameMode::Random => OsRng.next_u64(),
+                })? ^ 0x5345_4354_4E41_4D45,
+            ),
+            SectionNameMode::Random => StdRng::from_entropy(),
         };
-        let mut used: HashSet<String> = existing_names.into_iter().collect();
-        let mut replacements = Vec::with_capacity(ROLES.len());
-        for (semantic, prefix) in ROLES {
+        let mut originals: Vec<_> = existing_names.into_iter().collect();
+        let mut used: HashSet<String> = originals.iter().cloned().collect();
+        originals.sort_unstable();
+        let mut replacements = Vec::with_capacity(originals.len());
+        for semantic in originals {
             let name = loop {
-                state = splitmix64(state);
-                let width = 8usize.saturating_sub(prefix.len());
-                let suffix = format!("{:016X}", state);
-                let candidate = format!("{}{}", prefix, &suffix[..width]);
-                if candidate.len() <= 8 && used.insert(candidate.clone()) {
+                let candidate: String = (0..8)
+                    .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+                    .collect();
+                if used.insert(candidate.clone()) {
                     break candidate;
                 }
             };
-            replacements.push((semantic.to_string(), name));
+            replacements.push((semantic, name));
         }
         Ok(Some(Self { replacements }))
     }
@@ -77,28 +71,24 @@ impl SectionNamePlan {
         }
 
         let mut rewritten = 0usize;
+        let mut consumed = vec![false; self.replacements.len()];
         for index in 0..section_count {
             let offset = table + index * 40;
             let current = decode_name(&image[offset..offset + 8]);
-            if let Some((_, replacement)) = self
+            if let Some((replacement_index, (_, replacement))) = self
                 .replacements
                 .iter()
-                .find(|(semantic, _)| semantic == &current)
+                .enumerate()
+                .find(|(i, (semantic, _))| !consumed[*i] && semantic == &current)
             {
                 image[offset..offset + 8].fill(0);
                 image[offset..offset + replacement.len()].copy_from_slice(replacement.as_bytes());
                 rewritten += 1;
+                consumed[replacement_index] = true;
             }
         }
         Ok(rewritten)
     }
-}
-
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^ (value >> 31)
 }
 
 fn decode_name(raw: &[u8]) -> String {
@@ -126,21 +116,64 @@ mod tests {
 
     #[test]
     fn seeded_plan_is_reproducible_and_opaque() {
-        let a = SectionNamePlan::create(SectionNameMode::Seeded, Some(7), Vec::new())
+        let originals = vec![
+            ".text".into(),
+            ".rdata".into(),
+            ".textb".into(),
+            ".vstate".into(),
+        ];
+        let a = SectionNamePlan::create(SectionNameMode::Seeded, Some(7), originals.clone())
             .unwrap()
             .unwrap();
-        let b = SectionNamePlan::create(SectionNameMode::Seeded, Some(7), Vec::new())
+        let b = SectionNamePlan::create(SectionNameMode::Seeded, Some(7), originals)
             .unwrap()
             .unwrap();
         assert_eq!(a.replacements, b.replacements);
-        assert!(a
-            .replacements
-            .iter()
-            .all(|(old, new)| old != new && new.len() <= 8));
+        assert!(a.replacements.iter().all(|(old, new)| old != new
+            && new.len() == 8
+            && new.bytes().all(|b| b.is_ascii_alphanumeric())));
+        assert_eq!(a.replacements.len(), 4);
+        assert_eq!(
+            a.replacements
+                .iter()
+                .map(|(_, name)| name)
+                .collect::<HashSet<_>>()
+                .len(),
+            4
+        );
     }
 
     #[test]
     fn seeded_mode_requires_seed() {
         assert!(SectionNamePlan::create(SectionNameMode::Seeded, None, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn all_headers_are_renamed_without_changing_other_bytes() {
+        let mut image = vec![0x55; 512];
+        image[..2].copy_from_slice(b"MZ");
+        image[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        image[0x80..0x84].copy_from_slice(b"PE\0\0");
+        image[0x86..0x88].copy_from_slice(&2u16.to_le_bytes());
+        image[0x94..0x96].copy_from_slice(&0u16.to_le_bytes());
+        for offset in [0x98, 0xc0] {
+            image[offset..offset + 8].fill(0);
+            image[offset..offset + 5].copy_from_slice(b".text");
+        }
+        let before = image.clone();
+        let plan = SectionNamePlan::create(
+            SectionNameMode::Seeded,
+            Some(2),
+            vec![".text".into(), ".text".into()],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.rewrite_pe_headers(&mut image).unwrap(), 2);
+        assert_ne!(&image[0x98..0xa0], &image[0xc0..0xc8]);
+        for index in 0..image.len() {
+            if !(0x98..0xa0).contains(&index) && !(0xc0..0xc8).contains(&index) {
+                assert_eq!(image[index], before[index]);
+            }
+        }
     }
 }

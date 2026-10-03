@@ -11,9 +11,13 @@ const BANK_SLOTS: usize = 16;
 const BANK1_BASE: i32 = 0x400;
 const SPILL_WINDOW_BASE: i32 = 0x800;
 const XMM_WINDOW_BASE: i32 = 0x1000;
-pub const SPLIT_STATE_SIZE: usize = 0x1060;
+/// Complete native state ABI: core, virtual stack, routing, codec and family regions.
+pub const SPLIT_STATE_SIZE: usize = 0x6000;
+pub const VIRTUAL_STACK_BOTTOM: usize = 0x2000;
+pub const VIRTUAL_STACK_TOP: usize = 0x4000;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VmRuntimeLayout {
     pub vregs: [i32; 16],
     pub temps: [i32; 8],
@@ -55,7 +59,7 @@ impl VmRuntimeLayout {
             fp_return: 0xF0,
             xmm: 0x100,
             xmm_slots: 6,
-            total_size: 0x160,
+            total_size: SPLIT_STATE_SIZE,
         }
     }
 
@@ -118,6 +122,9 @@ impl VmRuntimeLayout {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.total_size != SPLIT_STATE_SIZE {
+            return Err(anyhow!("VM state extent differs from native ABI v2"));
+        }
         let mut offsets = Vec::with_capacity(31);
         offsets.extend(self.vregs);
         offsets.extend(self.temps);
@@ -143,23 +150,27 @@ impl VmRuntimeLayout {
         }) {
             return Err(anyhow!("VM runtime layout contains an invalid core offset"));
         }
+        let spill_end = self.spill_window.checked_add(self.temps.len() as i32 * SLOT_SIZE)
+            .ok_or_else(|| anyhow!("VM spill window overflow"))?;
         if self.spill_window < 0
             || self.spill_window % SLOT_SIZE != 0
             || self.temps.iter().any(|off| {
                 *off < self.spill_window
-                    || *off >= self.spill_window + self.temps.len() as i32 * SLOT_SIZE
+                    || *off >= spill_end
             })
             || self.vregs.iter().any(|off| {
                 (*off >= self.spill_window
-                    && *off < self.spill_window + self.temps.len() as i32 * SLOT_SIZE)
+                    && *off < spill_end)
             })
         {
             return Err(anyhow!(
                 "VM transient spill window overlaps a persistent state bank"
             ));
         }
-        let xmm_end = self.xmm as usize + self.xmm_slots * 16;
-        if self.xmm < 0 || self.xmm as usize % 16 != 0 || xmm_end > self.total_size {
+        let xmm_end = self.xmm_slots.checked_mul(16)
+            .and_then(|size| (self.xmm as usize).checked_add(size))
+            .ok_or_else(|| anyhow!("VM runtime XMM area overflow"))?;
+        if self.xmm < 0 || self.xmm as usize % 16 != 0 || xmm_end > VIRTUAL_STACK_BOTTOM {
             return Err(anyhow!("VM runtime XMM area is outside the state buffer"));
         }
         if self.total_size > u16::MAX as usize {

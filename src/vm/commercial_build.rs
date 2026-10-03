@@ -36,14 +36,12 @@ use crate::vm::VmModule;
 use anyhow::Result;
 use std::collections::HashMap;
 
-/// Commercial VM state buffer size (harness layout: REGS 0x80 + TEMPS 0x40 +
-/// FLAGS + VSP + padding = 0x100). Used to place the virtual stack top (R13)
-/// right after the state buffer for the embedded program VM.
+/// Complete native VM state, including private family/control/codec regions.
+/// The independent virtual stack is an internal window in this extent.
 pub const COMMERCIAL_STATE_SIZE: u64 = crate::vm::threaded::runtime_layout::SPLIT_STATE_SIZE as u64;
 
-/// Virtual stack reserved below the state buffer (grows down from
-/// state_va + COMMERCIAL_STATE_SIZE + VIRTUAL_STACK_SIZE). Mirrors the harness
-/// arena's dedicated stack region so push/pop cannot collide with the state.
+/// Virtual stack occupies state+0x2000..0x4000, below routing/codec/family state.
+/// The invocation call-stack pool occupies state+0x6000..0x8000 independently.
 pub const VIRTUAL_STACK_SIZE: u64 = 0x2000;
 
 /// P3 (G1): --vm-oep 상용 엔진 백엔드 프로그램 VM 모듈.
@@ -206,14 +204,45 @@ pub fn build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
     native_pointer_rewrites: &[(u64, u64)],
     native_call_rewrites: &[(u64, u64)],
 ) -> Result<VmModule> {
+    use sha2::{Digest, Sha256};
+    let plan = crate::vm::poly::VariantPlan::generate(Sha256::digest(&bytecode).into(),
+        seed, family, crate::vm::poly::VariantPolicy::Stable)?;
+    build_program_vm_commercial_with_variant_plan(code_va, table_va, bytecode_va,
+        bytecode, state_va, &plan, ip_map, prepared, chunks, routes,
+        native_pointer_rewrites, native_call_rewrites)
+}
+
+pub fn build_program_vm_commercial_with_variant_plan(
+    code_va: u64,
+    table_va: u64,
+    bytecode_va: u64,
+    bytecode: Vec<u8>,
+    state_va: u64,
+    variant_plan: &crate::vm::poly::VariantPlan,
+    ip_map: Option<&HashMap<u64, usize>>,
+    prepared: Option<&PreparedSuperOpProgram>,
+    chunks: &[crate::vm::chunk_crypto::BytecodeChunk],
+    routes: &[crate::vm::threaded::poly_direct::NativeCrossFamilyRoute],
+    native_pointer_rewrites: &[(u64, u64)],
+    native_call_rewrites: &[(u64, u64)],
+) -> Result<VmModule> {
+    let seed = variant_plan.isa().seed;
+    let family = variant_plan.isa().family;
     // Virtual stack top: right after the state buffer (COMMERCIAL_STATE_SIZE),
     // Prepared super-op metadata is not yet canonically serializable: never
     // reuse those modules. Sort maps so process-specific HashMap ordering is
     // not part of the cache identity.
-    let checkpoint = crate::build_cache::active().filter(|_| prepared.is_none()).map(|cache| {
+    let cache = crate::build_cache::active().filter(|_| prepared.is_none());
+    let variant_identity = variant_plan.digest();
+    let checkpoint = cache.map(|cache| {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
-        hash.update(b"commercial-module-v1");
+        hash.update(b"commercial-module-v2");
+        hash.update(variant_identity);
+        if let Some(settings) = crate::vm::handler_table_codec::active() {
+            hash.update(b"handler-codec-v2");
+            hash.update(settings.cache_identity());
+        }
         hash.update(&bytecode);
         let mut ips: Vec<_> = ip_map.into_iter().flat_map(|map| map.iter()).map(|(&a, &b)| (a, b)).collect();
         ips.sort_unstable();
@@ -223,20 +252,18 @@ pub fn build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
     });
     if let Some((cache, name)) = &checkpoint {
         if let Some(payload) = cache.read(name) {
-            if let Some(module) = crate::build_cache::decode_module(&payload, &bytecode, TableLayout::from_seed(seed).total_size) {
+            if let Some((module, _plan)) = crate::build_cache::decode_variant_module(&payload, &bytecode,
+                variant_plan.table_layout().total_size, &variant_identity) {
                 log::info!("Resuming completed commercial VM module: {name}");
                 return Ok(module);
             }
         }
     }
-    // growing down into the reserved VIRTUAL_STACK_SIZE region. Keeps the
-    // dispatcher's R13-based push/pop isolated from both state and bytecode.
     let stack_base = state_va
-        .wrapping_add(COMMERCIAL_STATE_SIZE)
-        .wrapping_add(VIRTUAL_STACK_SIZE);
+        .checked_add(crate::vm::threaded::runtime_layout::VIRTUAL_STACK_TOP as u64)
+        .ok_or_else(||anyhow::anyhow!("commercial virtual stack address overflow"))?;
 
-    let layout = TableLayout::from_seed(seed);
-    let runtime_layout = VmRuntimeLayout::from_seed(seed);
+    let layout = variant_plan.table_layout();
     if let Some(prepared) = prepared {
         if prepared.bytecode != bytecode {
             return Err(anyhow::anyhow!(
@@ -245,18 +272,15 @@ pub fn build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
         }
     }
     let parts = if let Some(prepared) = prepared {
-        crate::vm::threaded::poly_direct::build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_rewrites(
+        crate::vm::threaded::poly_direct::build_self_decoding_parts_with_variant_plan(
             &bytecode,
-            seed,
-            family,
+            variant_plan,
             code_va,
             table_va,
             bytecode_va,
             state_va,
             stack_base,
             ip_map,
-            layout,
-            runtime_layout,
             &prepared.assigned,
             Some(&prepared.metadata),
             chunks,
@@ -265,18 +289,15 @@ pub fn build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
             native_call_rewrites,
         )?
     } else {
-        crate::vm::threaded::poly_direct::build_self_decoding_parts_with_superops_chunks_family_routes_and_pointer_rewrites(
+        crate::vm::threaded::poly_direct::build_self_decoding_parts_with_variant_plan(
             &bytecode,
-            seed,
-            family,
+            variant_plan,
             code_va,
             table_va,
             bytecode_va,
             state_va,
             stack_base,
             ip_map,
-            layout,
-            runtime_layout,
             &[],
             None,
             chunks,
@@ -318,7 +339,8 @@ pub fn build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
         dynamic_state_entry_offset: Some(parts.dynamic_state_entry_offset),
     };
     if let Some((cache, name)) = checkpoint {
-        if let Err(error) = cache.write(&name, &crate::build_cache::encode_module(&module)) {
+        if let Err(error) = cache.write(&name, &crate::build_cache::encode_variant_module(&module,
+            variant_plan)) {
             log::warn!("Could not save VM module checkpoint: {error}");
         }
     }
@@ -328,6 +350,14 @@ pub fn build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prf_commercial_placement_and_nested_family_call_match_reference() {
+        let _guard = crate::vm::handler_table_codec::activate(
+            crate::vm::handler_table_codec::BuildSettings::with_private_key([0x79;32]));
+        test_commercial_module_executes_matches_reference();
+        native_cross_family_route_calls_child_and_resumes_parent();
+    }
     use crate::vm::arena::Arena;
     use crate::vm::poly::PolymorphicEncoder;
     use crate::vm::risc::{MicroInstr, MicroOperand, RiscDesynthesizer, RiscOp, RiscProgram};
@@ -338,6 +368,15 @@ mod tests {
     /// `RiscProgram::eval_state` (linear-block unit equivalence contract).
     #[test]
     fn test_commercial_module_executes_matches_reference() {
+        verify_commercial_module_plan(false);
+    }
+
+    #[test]
+    fn restored_variant_plan_with_independent_layout_executes_matches_reference() {
+        verify_commercial_module_plan(true);
+    }
+
+    fn verify_commercial_module_plan(independent_layout: bool) {
         // Representative linear block (no taken branches — linear-block contract):
         //   R0 = 0x200 ; R1 = 5 ; R2 = R0 >> R1 ; R3 = R0 << 2 ; R4 = R0 - R1
         //   push R3 ; push R0 ; pop R4 ; R5 = ~(R2|R1) ; flags = 0x8C1 ; Halt
@@ -387,21 +426,30 @@ mod tests {
         let ref_st = prog.eval_state(&init);
 
         let seed = 0x1122334455667788u64;
-        let runtime_layout = VmRuntimeLayout::from_seed(seed);
-        let mut enc = PolymorphicEncoder::new(seed);
+        // A valid restored contract may choose state/table layouts independently
+        // of its ISA seed. Regenerating either layout would corrupt this run.
+        let layout_seed = if independent_layout { seed ^ 0xa5a5 } else { seed };
+        let original_plan = crate::vm::poly::VariantPlan::from_contract([0x57;32],
+            crate::vm::poly::VirtualIsaSpec::from_seed_and_family(seed,
+                crate::vm::poly::VmArchitectureFamily::Stack),
+            VmRuntimeLayout::from_seed(layout_seed), TableLayout::from_seed(layout_seed)).unwrap();
+        let plan = crate::vm::poly::VariantPlan::restore(&original_plan.canonical_bytes(),
+            &original_plan.digest()).unwrap();
+        let runtime_layout = plan.runtime_layout().clone();
+        let mut enc = PolymorphicEncoder::from_variant_plan(&plan);
         let bytecode = enc.encode(&prog).unwrap();
 
         // Sizing pass: code/table/bytecode lengths are VA-independent (all
         // runtime anchors use fixed-size RIP-rel32 encodings), so build once
         // with dummy VAs to learn lengths, then lay out and rebuild with real VAs.
-        let dummy = build_program_vm_commercial(
+        let dummy = build_program_vm_commercial_with_variant_plan(
             0,
             0x100000,
             0x200000,
             bytecode.clone(),
             0x300000,
-            seed,
-            None,
+            &plan,
+            None, None, &[], &[], &[], &[],
         )
         .expect("commercial module sizing");
         let code_len = dummy.code.len();
@@ -411,7 +459,7 @@ mod tests {
         // remains the table size.
         assert_eq!(
             table_len,
-            TableLayout::from_seed(seed).total_size,
+            plan.table_layout().total_size,
             "table blob must honor the seed layout"
         );
 
@@ -420,7 +468,7 @@ mod tests {
         let table_off = code_off + ((code_len + 0xF) & !0xF);
         let bytecode_off = table_off + table_len;
         let state_off = bytecode_off + bytecode.len();
-        let stack_off = state_off + COMMERCIAL_STATE_SIZE as usize + VIRTUAL_STACK_SIZE as usize;
+        let stack_off = state_off + crate::vm::threaded::runtime_layout::VIRTUAL_STACK_TOP;
 
         let mut arena = Arena::new(0x20000).unwrap();
         let base = arena.base;
@@ -429,14 +477,14 @@ mod tests {
         let bytecode_va = (base + bytecode_off) as u64;
         let state_va = (base + state_off) as u64;
 
-        let module = build_program_vm_commercial(
+        let module = build_program_vm_commercial_with_variant_plan(
             code_va,
             table_va,
             bytecode_va,
             bytecode.clone(),
             state_va,
-            seed,
-            None,
+            &plan,
+            None, None, &[], &[], &[], &[],
         )
         .expect("commercial module build");
 
@@ -579,6 +627,15 @@ mod tests {
 
     #[test]
     fn native_cross_family_route_calls_child_and_resumes_parent() {
+        for parent in crate::vm::poly::VmArchitectureFamily::ALL {
+            for child in crate::vm::poly::VmArchitectureFamily::ALL {
+                if parent != child { verify_native_family_pair(parent, child); }
+            }
+        }
+    }
+
+    fn verify_native_family_pair(parent_family: crate::vm::poly::VmArchitectureFamily,
+        child_family: crate::vm::poly::VmArchitectureFamily) {
         use crate::vm::poly::VmArchitectureFamily;
         use crate::vm::threaded::poly_direct::NativeCrossFamilyRoute;
 
@@ -596,18 +653,18 @@ mod tests {
                     cond: crate::vm::risc::BranchCondition::Always,
                 })
                 .with_imm(0x2000),
-                MicroInstr::new(RiscOp::Mov)
+                MicroInstr::new(RiscOp::Add {width:8})
                     .with_dst(MicroOperand::VReg(1))
-                    .with_src1(MicroOperand::VReg(0)),
+                    .with_src1(MicroOperand::VReg(0)).with_src2(MicroOperand::Imm64(0)),
                 MicroInstr::new(RiscOp::Halt),
             ],
             HashMap::from([(0x1000, 0), (0x1002, 3)]),
         );
         let child = RiscProgram::with_ip_map(
             std::iter::once(
-                MicroInstr::new(RiscOp::Mov)
+                MicroInstr::new(RiscOp::Add {width:8})
                     .with_dst(MicroOperand::VReg(0))
-                    .with_src1(MicroOperand::VReg(1)),
+                    .with_src1(MicroOperand::VReg(1)).with_src2(MicroOperand::Imm64(0)),
             )
             .chain([2usize, 8, 9, 10, 11].into_iter().map(|reg| {
                 MicroInstr::new(RiscOp::Mov)
@@ -618,11 +675,13 @@ mod tests {
             .collect(),
             HashMap::from([(0x2000, 0)]),
         );
+        let parent = crate::vm::poly::family_lowering::lower(&parent,parent_family).unwrap().program;
+        let child = crate::vm::poly::family_lowering::lower(&child,child_family).unwrap().program;
         let mut parent_encoder =
-            PolymorphicEncoder::new_for_family(parent_seed, VmArchitectureFamily::Stack);
+            PolymorphicEncoder::new_for_family(parent_seed, parent_family);
         let parent_bc = parent_encoder.encode(&parent).unwrap();
         let mut child_encoder =
-            PolymorphicEncoder::new_for_family(child_seed, VmArchitectureFamily::Register);
+            PolymorphicEncoder::new_for_family(child_seed, child_family);
         let child_bc = child_encoder.encode(&child).unwrap();
 
         let mut arena = Arena::new(0xA0000).unwrap();
@@ -645,7 +704,7 @@ mod tests {
             child_bc,
             child_state,
             child_seed,
-            VmArchitectureFamily::Register,
+            child_family,
             child.ip_map(),
             None,
             &[],
@@ -669,7 +728,7 @@ mod tests {
             parent_bc,
             parent_state,
             parent_seed,
-            VmArchitectureFamily::Stack,
+            parent_family,
             parent.ip_map(),
             None,
             &[],
@@ -726,6 +785,10 @@ mod tests {
             0,
             "cross-family invocation must leave the child operand stack empty"
         );
+        for state in [parent_state, child_state] {
+            let off = (state-base) as usize+crate::vm::poly::family_lowering::STACK_DEPTH as usize;
+            assert_eq!(u64::from_le_bytes(buf[off..off+8].try_into().unwrap()),0,"family stack boundary must be empty");
+        }
         let parent_state = (parent_state - base) as usize;
         for reg in [0usize, 1] {
             let off = parent_layout.vregs[reg] as usize;

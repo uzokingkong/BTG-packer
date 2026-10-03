@@ -126,6 +126,19 @@ const LIMB_MASK: u32 = 0x3ff_ffff;
 
 /// Emit the Poly1305 verify blob.
 pub fn emit_poly1305_verify_blob(_state_va: u64) -> Vec<u8> {
+    encode_with_labels(&poly_sequence(), 0x140001000)
+}
+
+pub(crate) fn emit_poly1305_vm_blob(vm_state_va: u64) -> anyhow::Result<super::instruction_vm::Blob> {
+    super::instruction_vm::compile(&poly_sequence(), vm_state_va)
+}
+
+pub fn poly1305_vm_program() -> anyhow::Result<Vec<u8>> {
+    let blob = emit_poly1305_vm_blob(0)?;
+    Ok(blob.code[blob.program_range].to_vec())
+}
+
+fn poly_sequence() -> Seq {
     let mut s: Seq = Vec::new();
 
     // ---- prologue: callee-saved ----
@@ -227,7 +240,7 @@ pub fn emit_poly1305_verify_blob(_state_va: u64) -> Vec<u8> {
     );
     push(&mut s, Instruction::with(Code::Retnq));
 
-    encode_with_labels(&s, 0x140001000)
+    s
 }
 
 /// Poly1305 key init (donna clamp) + zero h.
@@ -1356,4 +1369,26 @@ mod tests {
             "Poly1305 blob length must be VA-independent"
         );
     }
+    #[test]
+    fn full_crypto_vm_poly_matches_reference_and_rejects_tamper() {
+        let mut arena = Arena::new(0x80000).unwrap();
+        let blob = emit_poly1305_vm_blob((arena.base + 0x60000) as u64).unwrap();
+        assert!(blob.code.len() < 0x60000);
+        arena.bytes()[..blob.code.len()].copy_from_slice(&blob.code);
+        let k = key();
+        arena.bytes()[0x62000..0x62020].copy_from_slice(&k);
+        let f: extern "C" fn(usize, u64, usize, usize) -> u64 = unsafe { std::mem::transmute(arena.base) };
+        for len in [0usize, 1, 15, 16, 17, 31, 32, 64, 65, 300, 4096] {
+            let ct: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(19)).collect();
+            let mut tag = poly1305_aead_tag(&POLY1305_AEAD_AAD, &ct, &k);
+            arena.bytes()[0x64000..0x64000+len].copy_from_slice(&ct);
+            arena.bytes()[0x62020..0x62030].copy_from_slice(&tag);
+            assert_eq!(f(arena.base+0x64000,len as u64,arena.base+0x62000,arena.base+0x62020),0,"length {len}");
+            tag[7] ^= 1;
+            arena.bytes()[0x62020..0x62030].copy_from_slice(&tag);
+            assert_ne!(f(arena.base+0x64000,len as u64,arena.base+0x62000,arena.base+0x62020),0);
+            assert_eq!(&arena.bytes()[0x60000..0x60010], &[0;16]);
+        }
+    }
+
 }

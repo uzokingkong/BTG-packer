@@ -18,6 +18,7 @@ pub mod state;
 // T3-1: ChaCha20 (RFC 8439) — reference + boot-stub native crypt blob.
 pub mod chacha20;
 pub mod chacha20_native;
+pub(crate) mod instruction_vm;
 
 // T3-1 Phase D: Poly1305 (RFC 8439 §2.5) reference + boot-stub native verify blob.
 pub mod poly1305;

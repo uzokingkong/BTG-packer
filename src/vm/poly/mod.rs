@@ -11,6 +11,10 @@ pub mod isa_spec;
 pub mod operand_packing;
 pub mod rolling_key;
 pub mod state_machine;
+pub mod variant_plan;
+pub mod variant_validate;
+
+pub use variant_plan::{VariantPlan, VariantPolicy};
 
 pub use architecture_family::{
     architecture_signature, assign_function_families, CrossVmBridge, DispatchTopology,
@@ -65,3 +69,5 @@ mod tests {
         assert_eq!(bytes1.len(), bytes2.len());
     }
 }
+
+pub mod family_lowering;

@@ -25,6 +25,8 @@ pub struct PolymorphicInterpreter {
     pub rolling: RollingKeyEngine,
     pub regs: [u64; 16],
     pub temps: [u64; 8],
+    pub operand_stack: Vec<u64>,
+    pub accumulators: [u64; 2],
     pub flags: VirtualFlags,
     pub stack: Vec<u64>,
     /// 가상 스택 포인터 (바이트 오프셋, 아래로 성장). `RiscProgram::eval_state`와 동일 계약.
@@ -38,6 +40,15 @@ pub struct PolymorphicInterpreter {
 }
 
 impl PolymorphicInterpreter {
+    pub fn from_variant_plan(plan: &super::VariantPlan) -> Self {
+        Self {
+            spec: plan.isa().clone(),
+            rolling: RollingKeyEngine::new(plan.isa().seed),
+            regs: [0; 16], temps: [0; 8], operand_stack: Vec::new(), accumulators: [0; 2], flags: VirtualFlags::default(),
+            stack: Vec::with_capacity(1024), vsp: 0, mem: HashMap::new(), ip_map: None,
+        }
+    }
+
     pub fn new(seed: u64) -> Self {
         Self::new_for_family(seed, VmArchitectureFamily::for_build(seed))
     }
@@ -51,6 +62,8 @@ impl PolymorphicInterpreter {
             rolling: RollingKeyEngine::new(seed),
             regs: [0u64; 16],
             temps: [0u64; 8],
+            operand_stack: Vec::new(),
+            accumulators: [0; 2],
             flags: VirtualFlags::default(),
             stack: Vec::with_capacity(1024),
             vsp: 0,
@@ -137,7 +150,7 @@ impl PolymorphicInterpreter {
                 operands[logical_slot] = self.rolling.decrypt_byte(bytecode[vip], vip as u64);
                 vip += 1;
             }
-            let [op_dst_raw, op_src1_raw, op_src2_raw] = operands;
+            let [mut op_dst_raw, mut op_src1_raw, mut op_src2_raw] = operands;
 
             // 3. Decrypt family-local compact immediates (1/2/4/8 bytes).
             let read_immediate = |marker: u8, vip: &mut usize, rolling: &mut RollingKeyEngine| {
@@ -152,13 +165,13 @@ impl PolymorphicInterpreter {
                 self.spec
                     .decode_immediate_payload(marker, u64::from_le_bytes(b))
             };
-            let imm1 = if self.spec.is_immediate_marker(op_src1_raw) {
+            let mut imm1 = if self.spec.is_immediate_marker(op_src1_raw) {
                 read_immediate(op_src1_raw, &mut vip, &mut self.rolling)
             } else {
                 0
             };
 
-            let imm2 = if self.spec.is_immediate_marker(op_src2_raw) {
+            let mut imm2 = if self.spec.is_immediate_marker(op_src2_raw) {
                 read_immediate(op_src2_raw, &mut vip, &mut self.rolling)
             } else {
                 0
@@ -216,6 +229,18 @@ impl PolymorphicInterpreter {
                     0
                 };
 
+            // Family operands are resolved in their own state model before the
+            // shared canonical semantic operation. T7 is a transient destination
+            // carrier and is restored even when the guest also owns T7.
+            let family_destination = op_dst_raw;
+            let saved_temp = self.temps[7];
+            for (raw, value) in [(&mut op_src1_raw,&mut imm1),(&mut op_src2_raw,&mut imm2)] {
+                if (0x51..=0x55).contains(raw) {
+                    *value = self.read_family_operand(*raw)?;
+                    *raw = self.spec.immediate_marker(8);
+                }
+            }
+            if (0x50..=0x55).contains(&op_dst_raw) { op_dst_raw = 0xC7; }
             // Helper to resolve decoded operand value
             let get_operand_val = |raw: u8,
                                    spec: &VirtualIsaSpec,
@@ -1833,9 +1858,39 @@ impl PolymorphicInterpreter {
                     continue;
                 }
             }
+            if (0x50..=0x55).contains(&family_destination) {
+                let value = self.temps[7];
+                self.temps[7] = saved_temp;
+                match family_destination {
+                    0x50 => {
+                        anyhow::ensure!(self.spec.family == VmArchitectureFamily::Stack &&
+                            self.operand_stack.len() < super::family_lowering::STACK_CAPACITY,
+                            "family operand stack overflow");
+                        self.operand_stack.push(value);
+                    },
+                    0x52 => *self.operand_stack.last_mut().ok_or_else(|| anyhow!("family operand stack underflow"))? = value,
+                    0x54..=0x55 => {
+                        anyhow::ensure!(self.spec.family == VmArchitectureFamily::MixedRisc,"foreign accumulator operand");
+                        self.accumulators[(family_destination-0x54) as usize] = value;
+                    },
+                    _ => return Err(anyhow!("invalid family destination")),
+                }
+            }
         }
 
         Ok(())
+    }
+
+    fn read_family_operand(&mut self, raw: u8) -> Result<u64> {
+        if raw >= 0x54 {
+            anyhow::ensure!(self.spec.family == VmArchitectureFamily::MixedRisc,"foreign accumulator operand");
+            return Ok(self.accumulators[(raw-0x54) as usize]);
+        }
+        anyhow::ensure!(self.spec.family == VmArchitectureFamily::Stack,"foreign stack operand");
+        if raw == 0x51 { return self.operand_stack.pop().ok_or_else(|| anyhow!("family operand stack underflow")); }
+        let index = self.operand_stack.len().checked_sub(1+(raw-0x52) as usize)
+            .ok_or_else(|| anyhow!("family operand stack underflow"))?;
+        Ok(self.operand_stack[index])
     }
 
     fn store_operand(&mut self, raw: u8, val: u64) {

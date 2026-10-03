@@ -4,6 +4,12 @@
 
 #[derive(Clone, Copy)]
 pub(crate) struct BootStubCtx {
+    pub(crate) boot_vm_tag: Option<[u8; 16]>,
+    /// Dedicated Boot VM PC/count/lifecycle state, independent of Program VM.
+    pub(crate) boot_schedule_auth: Option<(u64, [u8;16])>,
+    /// Native root entry, exact VM program address, domain-separated tag.
+    pub(crate) crypto_vm_auth: Option<(u64, u64, u64, [u8;16])>,
+    pub(crate) poly_vm_auth: Option<(u64, u64, u64, [u8;16])>,
     pub(crate) boot_va: u64, // 부트 스텁 시작 VA
     pub(crate) anti_debug: bool,
     pub(crate) dispatcher_va: u64, // 디스패처 본체 (섹션 + 0x20)
@@ -149,6 +155,15 @@ pub(crate) struct BootStubCtx {
     /// ChaCha20 상태 버퍼 VA (0x80B: key[32]@+0x00, ctr[8]@+0x20, nonce[12]@+0x28,
     /// ks[64]@+0x38, ks_off[4]@+0x78). 부트 스텁 emit_chacha_init이 런타임에 초기화.
     pub(crate) chacha_state_va: u64,
+    pub(crate) chacha_material_va: u64,
+    pub(crate) poly_runs_tag_va: u64,
+    pub(crate) poly_text_tag_va: u64,
+    pub(crate) poly_bytecode_tag_va: u64,
+    pub(crate) poly_resolver_tag_va: u64,
+    pub(crate) iat_table_len: u32,
+    pub(crate) native_plain_text_va: u64,
+    pub(crate) native_plain_text_len: u32,
+    pub(crate) poly_plain_text_tag_va: u64,
     // ── T3-1 Phase D (--crypto-mode chacha20 + AEAD): Poly1305 pre-decrypt 인증 ──
     /// true = chacha 경로가 at-rest 암호문을 복호화 **전에** Poly1305 AEAD 태그로
     /// 인증한다 (태그 불일치 시 ud2 — fail-safe, decrypt-and-run 금지).
@@ -191,6 +206,34 @@ impl BootStubCtx {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Label {
+    BootScheduleStart,
+    BootScheduleAuthOk,
+    BootScheduleFetch,
+    BootScheduleCountCheck,
+    BootScheduleCountOk,
+    BootScheduleFail,
+    BootScheduleHalt,
+    BootScheduleDone,
+    BootScheduleDispatch(u8),
+    BootScheduleEdge(u16),
+    BootPhase(u8),
+    BootMaterialStart,
+    BootMaterialAuthOk,
+    BootCryptoTag,
+    BootCryptoAuthOk,
+    BootPolyTag,
+    BootPolyAuthOk,
+    BootMaterialLoop,
+    BootMaterialHalt,
+    BootMaterialDone,
+    BootMaterialFail,
+    RunsMetadataOk,
+    TextMetadataOk,
+    DataAuthOk,
+    TextAuthOk,
+    BytecodeAuthOk,
+    ResolverAuthOk,
+    PlainTextAuthOk,
     // ── C-1 (--vm-oep): 프로그램 VM state 버퍼 0-초기화 ──
     StateZeroLoop,
     StateZeroDone,

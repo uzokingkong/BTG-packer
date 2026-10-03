@@ -6,7 +6,7 @@
 // 마이크로 연산으로 분해(De-synthesis)하여 원본 연산의 시그니처를 파괴한다.
 // ==============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RiscOp {
     /// 비트 단위 NOR 연산: dest = ~(src1 | src2)
     /// 모든 불리언 논리(NOT, AND, OR, XOR, NAND, XNOR)를 단일 원자로 표현
@@ -356,7 +356,7 @@ pub enum RiscOp {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BranchCondition {
     Always,
     Zero,
@@ -384,7 +384,7 @@ pub enum BranchCondition {
 }
 
 /// 가상 마이크로 레지스터 / 피연산자
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum MicroOperand {
     /// 가상 범용 레지스터 (0 ~ 15)
     VReg(u8),
@@ -396,10 +396,15 @@ pub enum MicroOperand {
     Vflags,
     /// 임시 스크래치 레지스터 (T0, T1, T2)
     Temp(u8),
+    /// Internal family lowering operands; never produced by the x86 lifter.
+    StackPush,
+    StackPop,
+    StackPeek(u8),
+    Accumulator(u8),
 }
 
 /// 단일 RISC 마이크로 인스트럭션
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MicroInstr {
     pub op: RiscOp,
     pub dst: Option<MicroOperand>,

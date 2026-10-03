@@ -168,9 +168,9 @@ impl InlineMbaObfuscator {
         Ok(())
     }
 
-    /// P1 (handler diversification): variant 0/1 을 선택해 emit 한다.
-    /// variant 0 = xor 기반 `(a^b)+2*(a&b)`, variant 1 = or/and 기반 `(a|b)+(a&b)`.
-    /// 두 variant 는 opcode 순서가 달라 정적 ADD 핸들러 시그니처가 동일하지 않다.
+    /// Four equivalent 64-bit ADD recipes, with the final ADD producing the
+    /// original arithmetic flags: XOR carry split, OR/AND, De Morgan OR/AND,
+    /// and reversed AND/OR accumulation. Scratch carriers must be distinct.
     pub fn emit_mba_add_reg_reg_variant(
         instructions: &mut Vec<Instruction>,
         dst: Register,
@@ -179,10 +179,41 @@ impl InlineMbaObfuscator {
         scratch2: Register,
         variant: u32,
     ) -> Result<()> {
-        if variant & 1 == 0 {
-            Self::emit_mba_add_reg_reg(instructions, dst, src, scratch1, scratch2)
-        } else {
-            Self::emit_mba_add_reg_reg_orand(instructions, dst, src, scratch1, scratch2)
+        let regs = [dst, src, scratch1, scratch2];
+        if regs.iter().any(|r| !r.is_gpr64() || *r == Register::RSP)
+            || (0..4).any(|i| regs[i + 1..].contains(&regs[i]))
+        {
+            return Err(anyhow!(
+                "MBA ADD requires four distinct 64-bit GPRs excluding RSP"
+            ));
+        }
+        match variant % 4 {
+            0 => Self::emit_mba_add_reg_reg(instructions, dst, src, scratch1, scratch2),
+            1 => Self::emit_mba_add_reg_reg_orand(instructions, dst, src, scratch1, scratch2),
+            2 => {
+                // De Morgan OR: ~(~a & ~b), plus the unmodified AND term.
+                instructions.push(Instruction::with2(Code::Mov_r64_rm64, scratch1, dst)?);
+                instructions.push(Instruction::with1(Code::Not_rm64, scratch1)?);
+                instructions.push(Instruction::with2(Code::Mov_r64_rm64, scratch2, src)?);
+                instructions.push(Instruction::with1(Code::Not_rm64, scratch2)?);
+                instructions.push(Instruction::with2(Code::And_r64_rm64, scratch1, scratch2)?);
+                instructions.push(Instruction::with1(Code::Not_rm64, scratch1)?);
+                instructions.push(Instruction::with2(Code::Mov_r64_rm64, scratch2, dst)?);
+                instructions.push(Instruction::with2(Code::And_r64_rm64, scratch2, src)?);
+                instructions.push(Instruction::with2(Code::Add_r64_rm64, scratch1, scratch2)?);
+                instructions.push(Instruction::with2(Code::Mov_r64_rm64, dst, scratch1)?);
+                Ok(())
+            }
+            _ => {
+                // Reversed AND/OR accumulation has the same arithmetic flags.
+                instructions.push(Instruction::with2(Code::Mov_r64_rm64, scratch1, dst)?);
+                instructions.push(Instruction::with2(Code::And_r64_rm64, scratch1, src)?);
+                instructions.push(Instruction::with2(Code::Mov_r64_rm64, scratch2, src)?);
+                instructions.push(Instruction::with2(Code::Or_r64_rm64, scratch2, dst)?);
+                instructions.push(Instruction::with2(Code::Add_r64_rm64, scratch1, scratch2)?);
+                instructions.push(Instruction::with2(Code::Mov_r64_rm64, dst, scratch1)?);
+                Ok(())
+            }
         }
     }
 }
@@ -191,6 +222,135 @@ impl InlineMbaObfuscator {
 mod tests {
     use super::*;
     use iced_x86::{BlockEncoder, BlockEncoderOptions, InstructionBlock};
+
+    #[test]
+    fn all_four_mba_variants_match_native_add_result_and_flags() {
+        use crate::vm::arena::Arena;
+        let edges = [
+            0,
+            1,
+            15,
+            16,
+            0x7FFFFFFFFFFFFFFF,
+            0x8000000000000000,
+            u64::MAX,
+        ];
+        let mut inputs = Vec::new();
+        for a in edges {
+            for b in edges {
+                inputs.push((a, b));
+            }
+        }
+        let mut random = 0xDABAD00D12345678u64;
+        for _ in 0..256 {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let a = random;
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            inputs.push((a, random));
+        }
+        let mut signatures = std::collections::HashSet::new();
+        for variant in 0..4 {
+            let mut body = Vec::new();
+            InlineMbaObfuscator::emit_mba_add_reg_reg_variant(
+                &mut body,
+                Register::R10,
+                Register::R11,
+                Register::R9,
+                Register::RCX,
+                variant,
+            )
+            .unwrap();
+            signatures.insert(assemble(body.clone()));
+            for &(a, b) in &inputs {
+                let mut result = [0u64; 4];
+                let mut instructions = vec![
+                    Instruction::with2(Code::Mov_r64_imm64, Register::R10, a).unwrap(),
+                    Instruction::with2(Code::Mov_r64_imm64, Register::R11, b).unwrap(),
+                    Instruction::with2(
+                        Code::Mov_r64_imm64,
+                        Register::RDX,
+                        result.as_mut_ptr() as u64,
+                    )
+                    .unwrap(),
+                ];
+                instructions.extend(body.iter().copied());
+                instructions.push(Instruction::with(Code::Pushfq));
+                instructions.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
+                instructions.push(
+                    Instruction::with2(
+                        Code::Mov_rm64_r64,
+                        iced_x86::MemoryOperand::with_base(Register::RDX),
+                        Register::R10,
+                    )
+                    .unwrap(),
+                );
+                instructions.push(
+                    Instruction::with2(
+                        Code::Mov_rm64_r64,
+                        iced_x86::MemoryOperand::with_base_displ(Register::RDX, 8),
+                        Register::RAX,
+                    )
+                    .unwrap(),
+                );
+                instructions
+                    .push(Instruction::with2(Code::Mov_r64_imm64, Register::R10, a).unwrap());
+                instructions.push(
+                    Instruction::with2(Code::Add_r64_rm64, Register::R10, Register::R11).unwrap(),
+                );
+                instructions.push(Instruction::with(Code::Pushfq));
+                instructions.push(Instruction::with1(Code::Pop_r64, Register::RAX).unwrap());
+                instructions.push(
+                    Instruction::with2(
+                        Code::Mov_rm64_r64,
+                        iced_x86::MemoryOperand::with_base_displ(Register::RDX, 16),
+                        Register::R10,
+                    )
+                    .unwrap(),
+                );
+                instructions.push(
+                    Instruction::with2(
+                        Code::Mov_rm64_r64,
+                        iced_x86::MemoryOperand::with_base_displ(Register::RDX, 24),
+                        Register::RAX,
+                    )
+                    .unwrap(),
+                );
+                instructions.push(Instruction::with(Code::Retnq));
+                let mut arena = Arena::new(0x1000).unwrap();
+                let code = BlockEncoder::encode(
+                    64,
+                    InstructionBlock::new(&instructions, arena.base as u64),
+                    BlockEncoderOptions::NONE,
+                )
+                .unwrap()
+                .code_buffer;
+                arena.bytes()[..code.len()].copy_from_slice(&code);
+                arena.call(0);
+                assert_eq!(result[0], result[2], "variant {variant} a={a:#x} b={b:#x}");
+                assert_eq!(
+                    result[1] & 0x8D5,
+                    result[3] & 0x8D5,
+                    "variant {variant} flags a={a:#x} b={b:#x}"
+                );
+            }
+        }
+        assert_eq!(signatures.len(), 4);
+        let mut invalid = Vec::new();
+        assert!(InlineMbaObfuscator::emit_mba_add_reg_reg_variant(
+            &mut invalid,
+            Register::R10,
+            Register::R11,
+            Register::R10,
+            Register::RCX,
+            2
+        )
+        .is_err());
+        assert!(invalid.is_empty());
+    }
 
     fn assemble(instrs: Vec<Instruction>) -> Vec<u8> {
         let block = InstructionBlock::new(&instrs, 0x140001000);

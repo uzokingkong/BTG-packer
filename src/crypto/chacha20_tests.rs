@@ -78,6 +78,15 @@ fn chacha20_keystream_matches_rfc8439_sample_256b() {
 ///  연속 호출한다 — C1 blob 테스트와 동일한 계약.)
 #[test]
 fn chacha_native_blob_multi_call_matches_reference() {
+    verify_multi_call_backend(false);
+}
+
+#[test]
+fn chacha_vm_blob_multi_call_matches_reference() {
+    verify_multi_call_backend(true);
+}
+
+fn verify_multi_call_backend(virtual_rounds: bool) {
     let blob_off = 0x0000usize;
     let state_off = 0x9000usize;
     let buf1_off = 0x9100usize;
@@ -85,7 +94,8 @@ fn chacha_native_blob_multi_call_matches_reference() {
 
     let mut arena = Arena::new(0x40000).unwrap();
     let state_va = (arena.base + state_off) as u64;
-    let code = crate::crypto::chacha20_native::emit_chacha20_blob(state_va);
+    let code = if virtual_rounds { crate::crypto::chacha20_native::emit_chacha20_vm_blob(state_va) }
+        else { crate::crypto::chacha20_native::emit_chacha20_blob(state_va) };
     assert!(
         code.len() <= state_off,
         "chacha blob ({}B) overlaps state",
@@ -265,5 +275,34 @@ fn chacha_raw_seed_at_rest_roundtrip_matches_native_blob() {
             plain.as_slice(),
             "raw-seed at-rest roundtrip must decrypt via native blob (len={len})"
         );
+    }
+}
+
+#[test]
+fn full_crypto_vm_chacha_stream_matches_reference() {
+    let mut arena = Arena::new(0x80000).unwrap();
+    let state_off = 0x60000;
+    let vm_off = 0x61000;
+    let data_off = 0x62000;
+    let blob = crate::crypto::chacha20_native::emit_chacha20_full_vm_blob(
+        (arena.base + state_off) as u64, (arena.base + vm_off) as u64).unwrap();
+    assert!(blob.code.len() < state_off);
+    arena.bytes()[..blob.code.len()].copy_from_slice(&blob.code);
+    let key = [0x37; 32];
+    let nonce = [0x19; 12];
+    for length in [0, 1, 63, 64, 65, 130, 4096] {
+        let mut reference = [0u8; CHA_STATE_SIZE];
+        chacha_init_state(&mut reference, &key, &nonce);
+        chacha_init_state((&mut arena.bytes()[state_off..state_off + CHA_STATE_SIZE]).try_into().unwrap(), &key, &nonce);
+        for chunk in [length, 37] {
+            let plain: Vec<u8> = (0..chunk).map(|i| (i as u8).wrapping_mul(13)).collect();
+            let mut expected = plain.clone();
+            chacha_apply(&mut reference, &mut expected);
+            arena.bytes()[data_off..data_off+chunk].copy_from_slice(&plain);
+            arena.call2(0, arena.base + data_off, chunk as u64);
+            assert_eq!(&arena.bytes()[data_off..data_off+chunk], expected.as_slice());
+            assert_eq!(&arena.bytes()[state_off..state_off+CHA_STATE_SIZE], &reference);
+            assert_eq!(&arena.bytes()[vm_off..vm_off+16], &[0;16]);
+        }
     }
 }

@@ -20,9 +20,9 @@ use std::io;
 use std::path::Path;
 
 /// VM ISA version this packer emits (roadmap v31 — full ISA milestone line).
-pub const VM_VERSION: u32 = 31;
+pub const VM_VERSION: u32 = 32;
 /// Crypto capability manifest ABI. RC4 is no longer a valid emitted mode.
-pub const CRYPTO_VERSION: u32 = 63;
+pub const CRYPTO_VERSION: u32 = 64;
 
 /// M0-2 measurements over the original application's code domain.
 ///
@@ -726,8 +726,8 @@ mod tests {
         assert!(body.contains(concat!("version = ", env!("CARGO_PKG_VERSION"))));
         assert!(body.contains("build_id = BTG-"));
         assert!(body.contains("seed_id = 0x0000000000001234"));
-        assert!(body.contains("vm_version = 31"));
-        assert!(body.contains("crypto_version = 63"));
+        assert!(body.contains("vm_version = 32"));
+        assert!(body.contains("crypto_version = 64"));
         assert!(body.contains("input_hash = "));
         assert!(body.contains("output_hash = "));
         assert!(body.contains("feature_flags = vm,m8"));

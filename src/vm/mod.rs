@@ -20,6 +20,7 @@
 // ==============================================================================
 
 pub mod abi;
+pub(crate) mod boot;
 pub mod bytecode;
 pub mod c1;
 pub mod canonical_semantics;
@@ -32,6 +33,7 @@ pub mod distributed_integrity;
 pub mod embed_hardening;
 pub mod flags;
 pub mod handler_poly;
+pub mod handler_table_codec;
 pub mod handlers;
 pub mod import_key;
 pub mod integrity_layout;

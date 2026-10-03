@@ -11,6 +11,8 @@
 mod build;
 mod ctx;
 mod emit;
+mod stages;
+mod schedule;
 
 pub(crate) use build::{build_anti_debug_raw_block, build_boot_block};
 pub(crate) use ctx::{base_bind_byte, BootStubCtx, Label};

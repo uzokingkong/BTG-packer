@@ -651,10 +651,37 @@ pub(super) fn emit_setcc(seq: &mut Vec<(Instruction, Option<Cl>)>) {
 // ── 0x13 HALT: restore + ret ───────────────────────────────────────────────
 // Pop in the exact reverse of the entry pushes (see entry stub). This restores
 // the caller's callee-saved GPRs (incl. RBP) before retnq.
-pub(super) fn emit_halt(seq: &mut Vec<(Instruction, Option<Cl>)>) {
+pub(super) fn emit_halt(seq: &mut Vec<(Instruction, Option<Cl>)>, mode: EntryMode) {
+    let program = matches!(mode, EntryMode::Program);
+    if program {
+        // Program entry returns the guest RAX. Cipher helper modes preserve
+        // their caller's RAX. The saved RAX is below fourteen other GPRs.
+        seq.push((
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base(Register::R8),
+            )
+            .unwrap(),
+            Some(Cl::Handler(OP_HALT)),
+        ));
+        seq.push((
+            Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_displ(Register::RSP, 14 * 8),
+                Register::RAX,
+            )
+            .unwrap(),
+            None,
+        ));
+    }
     seq.push((
         Instruction::with1(Code::Pop_r64, Register::R12).unwrap(),
-        Some(Cl::Handler(OP_HALT)),
+        if program {
+            None
+        } else {
+            Some(Cl::Handler(OP_HALT))
+        },
     ));
     for r in [Register::R13, Register::R14, Register::R15] {
         seq.push((Instruction::with1(Code::Pop_r64, r).unwrap(), None));

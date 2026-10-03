@@ -438,117 +438,10 @@ pub(crate) fn emit_chacha_call(seq: &mut Vec<(Instruction, Option<Label>)>, stub
     ));
 }
 
-/// v63 (--crypto-mode chacha20): ChaCha20 상태 초기화.
-///   key[32]   = seed_va[0..32]              → chacha_state_va+0x00
-///   ctr       = 0                            → chacha_state_va+0x20 (u64)
-///   nonce     = seed_va[32..44] (12B)        → chacha_state_va+0x28
-///   ks_off    = 0x40 (첫 사용 시 gen_block)  → chacha_state_va+0x78
-/// (RFC 8439 IETF 변형: 32B key + 12B nonce + 32-bit counter — 패커
-///  `derive_chacha_key_nonce_raw`와 동일한 시드 바이트를 복사한다.)
-/// 사용 레지스터(rax/rcx/rdx/rsi/rdi/r8/r9)는 이후 경로에서 덮어쓰므로 안전.
+/// v64 payload-domain state: derived key/nonce from the runtime material
+/// pool, counter 1 for ciphertext. Counter 0 is reserved for the MAC key.
 pub(crate) fn emit_chacha_init(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
-    use iced_x86::MemoryOperand as M;
-    // rsi = seed_va ; rdi = chacha_state_va ; r8d = 32 ; r9 = key byte staging
-    seq.push((
-        Instruction::with2(Code::Mov_r64_imm64, Register::RSI, stub.seed_va).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(Code::Mov_r64_imm64, Register::RDI, stub.chacha_state_va).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(Code::Mov_r32_imm32, Register::R8D, 32).unwrap(),
-        None,
-    ));
-    // ChaKeyLoop: key[rdi] = seed[rsi] ; advance ; loop (32B)
-    seq.push((
-        Instruction::with2(
-            Code::Movzx_r32_rm8,
-            Register::R9D,
-            M::with_base(Register::RSI),
-        )
-        .unwrap(),
-        Some(Label::ChaKeyLoop),
-    ));
-    seq.push((
-        Instruction::with2(Code::Mov_rm8_r8, M::with_base(Register::RDI), Register::R9L).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with1(Code::Inc_rm64, Register::RSI).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with1(Code::Inc_rm64, Register::RDI).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with1(Code::Dec_rm32, Register::R8D).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with_branch(Code::Jne_rel32_64, 0).unwrap(),
-        Some(Label::ChaKeyLoop),
-    ));
-    // The packer encrypts the at-rest code stream starting at ChaCha20 counter 1
-    // (counter 0 is reserved for the Poly1305 one-time key).  The boot stub must
-    // therefore initialize the live decrypt state to the same counter before its
-    // first emit_chacha_call.  Using ctr=0 here produced valid-looking execution
-    // flow into ciphertext and then 0xC0000005 at random-looking bytes (for example
-    // packed+0x8bbe2).
-    seq.push((
-        Instruction::with2(Code::Mov_r64_imm64, Register::RDI, stub.chacha_state_va).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(Code::Mov_r32_imm32, Register::EAX, 1u32).unwrap(),
-        None,
-    ));
-    seq.push((
-        Instruction::with2(
-            Code::Mov_rm64_r64,
-            M::with_base_displ(Register::RDI, 0x20),
-            Register::RAX,
-        )
-        .unwrap(),
-        None,
-    ));
-    // nonce = seed_va[32..44] → chacha_state_va+0x28 (3 dwords = 12B)
-    seq.push((
-        Instruction::with2(Code::Mov_r64_imm64, Register::RSI, stub.seed_va).unwrap(),
-        None,
-    ));
-    for i in 0..3 {
-        seq.push((
-            Instruction::with2(
-                Code::Mov_r32_rm32,
-                Register::R8D,
-                M::with_base_displ(Register::RSI, 32 + i * 4),
-            )
-            .unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(
-                Code::Mov_rm32_r32,
-                M::with_base_displ(Register::RDI, 0x28 + i * 4),
-                Register::R8D,
-            )
-            .unwrap(),
-            None,
-        ));
-    }
-    // ks_off = 0x40 → chacha_state_va+0x78
-    seq.push((
-        Instruction::with2(
-            Code::Mov_rm32_imm32,
-            M::with_base_displ(Register::RDI, 0x78),
-            0x40u32,
-        )
-        .unwrap(),
-        None,
-    ));
+    super::stages::init(seq, stub, super::super::stages::Stage::Payload, false);
 }
 
 pub(crate) fn emit_ksa_init(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
@@ -1192,6 +1085,7 @@ pub(crate) fn emit_run_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stub
             ));
         }
     }
+    if stub.chacha_mode() && !stub.no_crypto { super::stages::index(seq, 0); }
     seq.push((
         Instruction::with2(Code::Test_rm64_r64, Register::R11, Register::R11).unwrap(),
         Some(Label::RunLoop),
@@ -1221,7 +1115,12 @@ pub(crate) fn emit_run_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stub
     if stub.c1_mode() {
         emit_c1_call(seq, stub);
     } else if stub.chacha_mode() {
-        emit_chacha_call(seq, stub);
+        // Independent AEAD record: index selects its nonce, not stream position.
+        super::stages::init(seq, stub, super::super::stages::Stage::Data, true);
+        seq.push((Instruction::with2(Code::Lea_r64_m, Register::R9,
+            MemoryOperand::with_base_displ(Register::RBP, 16)).unwrap(), None));
+        super::stages::verify(seq, stub, Label::DataAuthOk, true);
+        seq.push((Instruction::with1(Code::Inc_rm64, Register::R12).unwrap(), None));
     } else if stub.vm_prga {
         vm_embed::emit_prga_vm_call(seq, stub);
     } else {
@@ -1294,7 +1193,8 @@ pub(crate) fn emit_run_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stub
         seq.push((Instruction::with(Code::Nopd), Some(Label::PoisonDone)));
     }
     seq.push((
-        Instruction::with2(Code::Add_rm64_imm32, Register::RBP, 16).unwrap(),
+        Instruction::with2(Code::Add_rm64_imm32, Register::RBP,
+            if stub.chacha_mode() {super::super::stages::ENTRY_SIZE as i32} else {16}).unwrap(),
         None,
     ));
     seq.push((
@@ -1314,12 +1214,9 @@ pub(crate) fn emit_run_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stub
 
 /// M6 Phase-2.3 (--vm-oep at-rest encryption): Program VM 바이트코드와 (TLS
 /// 콜백 없는 경우) 보존된 원본 .text를 부트 스텁이 디스패치 직전에 복호화한다.
-/// 두 영역은 패커에서 fresh BTG-C1(seed) 하나로 `.text` → bytecode 순으로
-/// 연속 암호화되어 파일에는 평문이 없고, 이 블록이 실행되기 전까지 실행 불가능한
-/// 암호문 상태로 남는다.
-///
-/// 키스트림 동치: 패커와 런타임 모두 seed에서 C1 key/nonce를 다시 유도한 뒤
-/// `.text` → bytecode 순으로 같은 상태를 연속 소비한다.
+/// Production ChaCha20 uses separate NativeText and Bytecode domains with
+/// verification before each decryption. Legacy C1 retains its continuous
+/// text/bytecode stream. TLS/W^X plaintext code is authenticated separately.
 ///
 /// 길이 불변성: 이 블록은 `stub.vm_oep`일 때 항상 전체를 emit한다 (len/va는
 /// imm이므로 값이 달라도 인코딩 길이가 동일). 이렇게 해야 부트 스텁 3-pass
@@ -1329,37 +1226,9 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
     if !stub.vm_oep {
         return;
     }
-    // Main code/string decrypt has already consumed its stream. VM-OEP uses an
-    // independent fresh stream of the selected production primitive for the
-    // preserved .text runs and bytecode.
+    // ChaCha records do not inherit the payload/data stream position.
     if stub.chacha_mode() {
-        // The seed buffer is bootstrap scratch and integrity/cipher stages may
-        // legitimately reuse it after the first initialization.  Re-reading it
-        // here produced a different key for relocated Program-VM payloads.
-        // ChaCha's key and nonce fields are immutable across apply calls, so
-        // retain the authoritative initial state and reset only stream position.
-        seq.push((
-            Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.chacha_state_va).unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(
-                Code::Mov_rm64_imm32,
-                iced_x86::MemoryOperand::with_base_displ(Register::RAX, 0x20),
-                1,
-            )
-            .unwrap(),
-            None,
-        ));
-        seq.push((
-            Instruction::with2(
-                Code::Mov_rm32_imm32,
-                iced_x86::MemoryOperand::with_base_displ(Register::RAX, 0x78),
-                0x40u32,
-            )
-            .unwrap(),
-            None,
-        ));
+        super::stages::index(seq, 0);
     } else if stub.vm_oep {
         debug_assert!(
             stub.c1_mode(),
@@ -1367,9 +1236,8 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
         );
         emit_c1_init(seq, stub);
     }
-    // P5: loop over .text at-rest decrypt run-table (va,len u64 pairs). Fresh
-    // keystream is continuous across runs -> same order/lengths as the packer
-    // encrypted them. count==0 -> immediate no-op (bytecode-only).
+    // ChaCha table entries carry VA, length and tag; their indices select
+    // unique record nonces. C1 uses the legacy VA/length layout.
     if stub.desc_used {
         seq.push((
             Instruction::with2(Code::Mov_r64_imm64, Register::RAX, stub.desc_va).unwrap(),
@@ -1445,12 +1313,17 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
         None,
     ));
     if stub.chacha_mode() {
-        emit_chacha_call(seq, stub);
+        super::stages::init(seq, stub, super::super::stages::Stage::NativeText, true);
+        seq.push((Instruction::with2(Code::Lea_r64_m, Register::R9,
+            MemoryOperand::with_base_displ(Register::RBP, 16)).unwrap(), None));
+        super::stages::verify(seq, stub, Label::TextAuthOk, true);
+        seq.push((Instruction::with1(Code::Inc_rm64, Register::R12).unwrap(), None));
     } else {
         emit_c1_call(seq, stub);
     }
     seq.push((
-        Instruction::with2(Code::Add_rm64_imm32, Register::RBP, 16).unwrap(),
+        Instruction::with2(Code::Add_rm64_imm32, Register::RBP,
+            if stub.chacha_mode() {super::super::stages::ENTRY_SIZE as i32} else {16}).unwrap(),
         None,
     ));
     seq.push((
@@ -1462,6 +1335,9 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
         Some(Label::TextRunLoop),
     ));
     seq.push((Instruction::with(Code::Nopd), Some(Label::TextRunDone)));
+    if stub.chacha_mode() {
+        super::stages::init(seq, stub, super::super::stages::Stage::Bytecode, false);
+    }
     // bytecode 복호화 (len=0이면 no-op)
     if stub.desc_used {
         seq.push((
@@ -1502,7 +1378,9 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
         ));
     }
     if stub.chacha_mode() {
-        emit_chacha_call(seq, stub);
+        seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::R9,
+            stub.poly_bytecode_tag_va).unwrap(), None));
+        super::stages::verify(seq, stub, Label::BytecodeAuthOk, true);
     } else {
         emit_c1_call(seq, stub);
     }
@@ -1510,10 +1388,9 @@ pub(crate) fn emit_rest_decrypt(seq: &mut Vec<(Instruction, Option<Label>)>, stu
 
 pub(crate) fn emit_self_wipe(seq: &mut Vec<(Instruction, Option<Label>)>, stub: &BootStubCtx) {
     // ── v7 chained-crypto: 자기파괴 (시드/S-box/페이로드 원본 소거) ────────────
-    // v18(anti-dump): 복호화가 끝난 뒤 키 재료를 지워 "런타임 덤프 → 재복호화"를
-    // 차단한다. 기존엔 chained 경로에만 있었지만, 정적/덤프 분석에서 seed/S-box를
-    // 탈취해 RC4를 재구성하는 공격을 막기 위해 **모든 crypto 경로**(chained/reencrypt/
-    // vm)로 확장한다. (seed_va/S-box는 문자열 런·리졸브 테이블 복호화에만 쓰이고
+    // Clear transient key material after use. This reduces memory residue;
+    // an observer can still recover bootstrap material or capture live keys.
+    // (seed_va/S-box는 문자열 런·리졸브 테이블 복호화에만 쓰이고
     //  디스패처의 블록 키는 entry_seed 기반이라 지워도 안전. reencrypt는 mem-harden과
     //  동시에 안 켜지므로 RX 전환 순서 문제도 없다.)
     // ⚠ mem-harden(RX 전환) **이전에** 수행해야 한다 — RX 페이지에 시드를
@@ -1547,9 +1424,8 @@ pub(crate) fn emit_self_wipe(seq: &mut Vec<(Instruction, Option<Label>)>, stub: 
             Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(),
             Some(Label::ZeroMem),
         ));
-        // ⚠ 페이로드 원본(.vdata) 소거는 생략 — .vdata가 read-only(R)로 매핑되어
-        //   쓰면 0xC0000005. 어차피 seed/S-box를 지우면 RC4 keystream을 재구성할 수
-        //   없어 덤프→재복호화는 불가능하므로, R-only .vdata는 그대로 둔다.
+        // .vdata is read-only; wiping it would fault. Its ciphertext remains
+        // available, and clearing runtime scratch does not erase file keys.
         // v60 (--custom-cipher): BTG-C1 상태 버퍼(key/ctr/nonce/ks)도 소거해
         //   덤프에서 키스트림을 재구성하지 못하게 한다. (S-box 상수 테이블은
         //   고정 상수라 소거 불필요 — 키가 없으면 무의미.)
@@ -1570,6 +1446,11 @@ pub(crate) fn emit_self_wipe(seq: &mut Vec<(Instruction, Option<Label>)>, stub: 
         // v63 (--crypto-mode chacha20): ChaCha20 상태 버퍼(key/ctr/nonce/ks) 소거 —
         //   덤프에서 키스트림 재구성/재복호화를 차단. (blob은 상태가 없어 소거 불필요.)
         if stub.chacha_mode() {
+            seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RCX,
+                stub.chacha_material_va).unwrap(), None));
+            seq.push((Instruction::with2(Code::Mov_r64_imm64, Register::RDX,
+                super::super::stages::MATERIAL_SIZE as u64).unwrap(), None));
+            seq.push((Instruction::with_branch(Code::Call_rel32_64, 0).unwrap(), Some(Label::ZeroMem)));
             seq.push((
                 Instruction::with2(Code::Mov_r64_imm64, Register::RCX, stub.chacha_state_va)
                     .unwrap(),
@@ -1697,7 +1578,7 @@ pub(crate) fn emit_dispatcher_entry(
                 None,
             )); // fold V4
             seq.push((
-                Instruction::with2(Code::Movsxd_r64_rm32, Register::RAX, Register::EAX).unwrap(),
+                Instruction::with2(Code::Movsxd_r64_rm32, Register::RAX, Register::EDX).unwrap(),
                 None,
             )); // sign-extend
             seq.push((
@@ -1718,21 +1599,6 @@ pub(crate) fn emit_dispatcher_entry(
             Instruction::with1(Code::Jmp_rm64, Register::RAX).unwrap(),
             None,
         ));
-    }
-}
-
-#[cfg(test)]
-mod chacha_bootstub_ctr_tests {
-    use super::*;
-    use crate::pipeline::crypto::bootstub::ctx::BootStubCtx;
-
-    #[test]
-    fn chacha_bootstub_initializes_counter_one() {
-        // Keep this test source-level: the production ChaCha reference reserves
-        // counter 0 for the Poly1305 one-time key, while at-rest payload bytes
-        // are encrypted/decrypted from counter 1.
-        let src = include_str!("emit.rs");
-        assert!(src.contains("Code::Mov_r32_imm32, Register::EAX, 1u32"));
     }
 }
 

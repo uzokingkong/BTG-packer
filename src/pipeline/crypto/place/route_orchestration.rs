@@ -284,10 +284,13 @@ mod tests {
         };
         let modules = vec![EncodedFamilyPartition {
             family: VmArchitectureFamily::Register,
+            variant_plan: std::sync::Arc::new(crate::vm::poly::VariantPlan::generate([0; 32], 1, VmArchitectureFamily::Register, crate::vm::poly::VariantPolicy::Stable).unwrap()),
             function_ids: vec![BASE + 0x2000],
             bytecode: vec![0],
             instruction_offsets: vec![0],
             ip_map: HashMap::from([(BASE + 0x2000, 0)]),
+            runtime_ip_map: HashMap::from([(BASE + 0x2000, 0)]),
+            prepared: None,
             module_domain: 1,
             exit_byte_offset: 0,
         }];

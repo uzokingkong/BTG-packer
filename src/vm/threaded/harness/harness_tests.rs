@@ -718,6 +718,12 @@ fn test_mba_add_handler_diversified_per_key() {
             } else if bytes[i..i + 3] == [0x4D, 0x0B, 0xCB] {
                 s.push('O');
                 i += 3;
+            } else if bytes[i..i + 3] == [0x4D, 0x23, 0xCB] {
+                s.push('A');
+                i += 3;
+            } else if bytes[i..i + 3] == [0x49, 0xF7, 0xD1] {
+                s.push('N');
+                i += 3;
             } else {
                 i += 1;
             }

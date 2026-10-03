@@ -1,8 +1,7 @@
 // ==============================================================================
-// String-run scanning (read-only data runs protected by the RC4 boot-decrypt loop)
+// String-run scanning (read-only literals restored by bulk boot decryption)
 // ==============================================================================
 
-use super::{MAX_STRING_RUNS, MAX_STRING_TOTAL};
 use crate::pe::builder::SectionData;
 use crate::pipeline::patch_data::{
     collect_protected_rva_ranges, collect_string_protected_rva_ranges, locate_security_cookie,
@@ -47,7 +46,7 @@ pub(crate) fn scan_string_runs(
         }
 
         let mut i = 0usize;
-        while i < sec.bytes.len() && runs.len() < MAX_STRING_RUNS {
+        while i < sec.bytes.len() {
             // ── UTF-16LE 런 우선 검사 (문자+0x00 쌍) ─────────────────────────────
             // FIX: 과거 구현은 ASCII 스캔이 첫 문자를 소비한 뒤 그 위치에서 wide 스캔을
             // 시작해서, "H\0e\0l\0l\0o\0" 같은 UTF-16LE 문자열의 첫 글자를 ASCII가
@@ -64,7 +63,8 @@ pub(crate) fn scan_string_runs(
             // Encrypt the exact literal bytes. Rust `&str`/wide slices are
             // length-delimited and commonly have no trailing NUL, so requiring
             // one silently leaves the most important literals in plaintext.
-            if wide_len >= 16 {
+            let wide_terminated = sec.bytes.get(w..w.saturating_add(2)) == Some(&[0, 0][..]);
+            if wide_len >= 16 || (wide_len >= 8 && wide_terminated) {
                 push_run(
                     &mut runs, &mut total, sec_idx, wide_start, wide_len, image_base, sec,
                     protected,
@@ -82,7 +82,12 @@ pub(crate) fn scan_string_runs(
             // Rust literals are length-delimited rather than C strings. The
             // precise loader/relocation exclusion map, not NUL termination or
             // alignment, is the safety boundary for this literal-only pass.
-            if ascii_len >= 8 {
+            // Short compiler/runtime names (e.g. os.nim and IOError) are
+            // ordinary NUL-delimited literals. Retain the old threshold for
+            // unterminated runs to avoid widening guesses about binary data.
+            // Explicit literal maps remain the path for smaller/Unicode spans.
+            let ascii_terminated = sec.bytes.get(i) == Some(&0);
+            if ascii_len >= 8 || (ascii_len >= 4 && ascii_terminated) {
                 push_run(
                     &mut runs,
                     &mut total,
@@ -99,13 +104,6 @@ pub(crate) fn scan_string_runs(
                 i += 1;
             }
         }
-        if total >= MAX_STRING_TOTAL {
-            println!(
-                "[!] v3 Crypto: string run total reached cap ({} bytes).",
-                MAX_STRING_TOTAL
-            );
-            break;
-        }
     }
 
     runs
@@ -121,9 +119,6 @@ fn push_run(
     sec: &SectionData,
     protected: &[(u32, u32)],
 ) {
-    if *total + len > MAX_STRING_TOTAL || runs.len() >= MAX_STRING_RUNS {
-        return;
-    }
     let rva = sec.virtual_address + offset as u32;
     let rva_end = rva + len as u32;
     // 로더가 로드 전에 읽는 영역(import, IAT, LoadConfig, cookie 등)은 건너뛴다.
@@ -148,8 +143,45 @@ pub(crate) fn gather_runs(
     ctx: &mut PipelineContext,
     no_crypto: bool,
     vm_oep_effective: bool,
-) -> Vec<StringRun> {
+) -> anyhow::Result<Vec<StringRun>> {
     let image_base = ctx.target_info.image_base;
+    if let Some(catalog) = &ctx.literal_catalog {
+        anyhow::ensure!(!no_crypto, "literal map requires data encryption");
+        let cookie = locate_security_cookie(ctx, &ctx.patched_sections);
+        let protected = collect_string_protected_rva_ranges(ctx, &ctx.patched_sections, cookie);
+        let mut runs = Vec::new();
+        for entry in catalog.entries() {
+            if entry.decision != crate::pipeline::literal_catalog::Decision::Eligible {
+                continue;
+            }
+            let start = u64::from(entry.span.rva);
+            let end = start + u64::from(entry.span.byte_len) + u64::from(entry.span.terminator_len);
+            anyhow::ensure!(!protected.iter().any(|&(a,b)| start < u64::from(b) && end > u64::from(a)),
+                "approved literal overlaps protected build metadata");
+            let matches: Vec<_> = ctx.patched_sections.iter().enumerate().filter(|(_, section)| {
+                let base = u64::from(section.virtual_address);
+                start >= base && end <= base + section.bytes.len() as u64
+            }).collect();
+            anyhow::ensure!(matches.len() == 1, "approved literal lost unique build ownership");
+            let (sec_idx, section) = matches[0];
+            let offset = (start - u64::from(section.virtual_address)) as usize;
+            let owned_len = entry.span.byte_len as usize + entry.span.terminator_len as usize;
+            use sha2::{Digest, Sha256};
+            let actual: [u8;32] = Sha256::digest(&section.bytes[offset..offset+owned_len]).into();
+            anyhow::ensure!(ctx.literal_payload_hashes.get(&entry.span.id) == Some(&actual),
+                "approved literal bytes changed since input validation");
+            anyhow::ensure!(section.characteristics & 0x4000_0000 != 0
+                && section.characteristics & 0x2000_0000 == 0,
+                "approved literal must belong to readable non-executable data");
+            anyhow::ensure!(!section.name.eq_ignore_ascii_case(".rsrc"),
+                "resource literals require a separate protection policy");
+            runs.push(StringRun { sec_idx, offset,
+                len: entry.span.byte_len as usize, va: image_base + start });
+        }
+        // Owned NUL terminators stay intact; never include undeclared adjacent data.
+        ctx.vm_data_lifetime_objects.clear();
+        return Ok(runs);
+    }
     if vm_oep_effective {
         let cookie_rva = locate_security_cookie(ctx, &ctx.patched_sections);
         let protected = collect_protected_rva_ranges(ctx, &ctx.patched_sections, cookie_rva);
@@ -197,7 +229,7 @@ pub(crate) fn gather_runs(
         Vec::new()
     } else {
         // `--vm-oep` still needs literal confidentiality.  Only scan
-        // NUL-terminated ASCII/UTF-16 strings and keep every loader-critical
+        // ASCII/UTF-16 literal runs and keep every loader-critical
         // RVA (imports, IAT, TLS, LoadConfig, security cookie, etc.) excluded.
         // This is deliberately separate from the full-section encryption
         // below: lifted code may read pointer-bearing `.rdata` directly, but
@@ -302,5 +334,5 @@ pub(crate) fn gather_runs(
         }
     }
 
-    runs
+    Ok(runs)
 }

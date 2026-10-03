@@ -13,6 +13,10 @@ use rand::RngCore;
 use std::collections::BTreeMap;
 
 pub(crate) const MULTI_FAMILY_STATE_STRIDE: usize = 0x8000;
+const _: () = assert!(crate::vm::poly::family_lowering::STATE_END
+    < MULTI_FAMILY_STATE_STRIDE - crate::vm::interp::CALL_STACK_SIZE);
+const _: () = assert!(crate::vm::handler_table_codec::STATE_END
+    < MULTI_FAMILY_STATE_STRIDE - crate::vm::interp::CALL_STACK_SIZE);
 // Keep the statically loader-backed arena below the practical Windows image
 // mapping ceiling.  The previous 16 x 8 pool reserved more than 770 MiB of
 // zero-fill state for a four-family image and CreateProcess rejected the PE as
@@ -1076,6 +1080,9 @@ pub(crate) fn build_multi_family_prog_mod(
         state_va
     };
 
+    for module in &materialized.modules {
+        module.validate_variant_contract()?;
+    }
     let mut modules: Vec<_> = materialized.modules.iter().collect();
     modules.sort_by_key(|module| (module.family != entry_family, module.family as u8));
     let invocation_layout = multi_family_invocation_layout(effective_state_va, modules.len())?;
@@ -1174,7 +1181,7 @@ pub(crate) fn build_multi_family_prog_mod(
                     child_lane_stride: invocation_layout.lane_group_stride as u64,
 
                     target_byte_offset: target.instruction_offsets[route.target_local_op] as u64,
-                    target_layout: vm::threaded::VmRuntimeLayout::from_seed(target.module_domain),
+                    target_layout: target.variant_plan.runtime_layout().clone(),
                     tail_jump_resume_offset: (route.kind
                         == vm::multi_family::CrossFamilyRouteKind::Jump)
                         .then_some(source.exit_byte_offset as u64),
@@ -1216,7 +1223,7 @@ pub(crate) fn build_multi_family_prog_mod(
                         + (target_index as u64) * MULTI_FAMILY_STATE_STRIDE as u64,
                     child_lane_stride: invocation_layout.lane_group_stride as u64,
                     target_byte_offset: target.instruction_offsets[target_local_op] as u64,
-                    target_layout: vm::threaded::VmRuntimeLayout::from_seed(target.module_domain),
+                    target_layout: target.variant_plan.runtime_layout().clone(),
                     tail_jump_resume_offset: None,
                 });
             }
@@ -1282,22 +1289,21 @@ pub(crate) fn build_multi_family_prog_mod(
                 child_lane_stride: invocation_layout.lane_group_stride as u64,
 
                 target_byte_offset: 0,
-                target_layout: vm::threaded::VmRuntimeLayout::from_seed(module.module_domain),
+                target_layout: module.variant_plan.runtime_layout().clone(),
                 tail_jump_resume_offset: None,
             });
         }
         sized.push(
-            vm::commercial_build::build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
+            vm::commercial_build::build_program_vm_commercial_with_variant_plan(
                 0,
                 0,
                 0,
                 module.bytecode.clone(),
                 SIZING_STATE_BASE
                     + (module_index * MULTI_FAMILY_STATE_STRIDE) as u64,
-                module.module_domain,
-                module.family,
-                Some(&module.ip_map),
-                None,
+                &module.variant_plan,
+                Some(&module.runtime_ip_map),
+                module.prepared.as_ref(),
                 &chunk_plans[module_index],
                 &routes,
                 &dummy_native_pointer_rewrites,
@@ -1323,7 +1329,7 @@ pub(crate) fn build_multi_family_prog_mod(
         bytecode_cursor += module.bytecode.len();
     }
 
-    let entry_runtime_layout = vm::threaded::VmRuntimeLayout::from_seed(entry_module.module_domain);
+    let entry_runtime_layout = entry_module.variant_plan.runtime_layout().clone();
     let sized_canonical_gateway = build_canonical_oep_gateway(
         effective_code_va + code_total as u64,
         effective_code_va
@@ -1366,7 +1372,7 @@ pub(crate) fn build_multi_family_prog_mod(
             effective_code_va + code_offsets[target_index] as u64,
             effective_state_va + (target_index * MULTI_FAMILY_STATE_STRIDE) as u64,
             entry_offset,
-            &vm::threaded::VmRuntimeLayout::from_seed(target.module_domain),
+            &target.variant_plan.runtime_layout().clone(),
             lane_control_va,
             lane_group_stride as u64,
             host_stack_pool_va,
@@ -1427,7 +1433,7 @@ pub(crate) fn build_multi_family_prog_mod(
                     child_lane_stride: invocation_layout.lane_group_stride as u64,
 
                     target_byte_offset: target.instruction_offsets[route.target_local_op] as u64,
-                    target_layout: vm::threaded::VmRuntimeLayout::from_seed(target.module_domain),
+                    target_layout: target.variant_plan.runtime_layout().clone(),
                     tail_jump_resume_offset: (route.kind
                         == vm::multi_family::CrossFamilyRouteKind::Jump)
                         .then_some(module.exit_byte_offset as u64),
@@ -1470,7 +1476,7 @@ pub(crate) fn build_multi_family_prog_mod(
                         + (target_index * MULTI_FAMILY_STATE_STRIDE) as u64,
                     child_lane_stride: invocation_layout.lane_group_stride as u64,
                     target_byte_offset: target.instruction_offsets[target_local_op] as u64,
-                    target_layout: vm::threaded::VmRuntimeLayout::from_seed(target.module_domain),
+                    target_layout: target.variant_plan.runtime_layout().clone(),
                     tail_jump_resume_offset: None,
                 });
             }
@@ -1500,21 +1506,20 @@ pub(crate) fn build_multi_family_prog_mod(
                 child_lane_stride: invocation_layout.lane_group_stride as u64,
 
                 target_byte_offset: 0,
-                target_layout: vm::threaded::VmRuntimeLayout::from_seed(module.module_domain),
+                target_layout: module.variant_plan.runtime_layout().clone(),
                 tail_jump_resume_offset: None,
             });
         }
         let built_module =
-            vm::commercial_build::build_program_vm_commercial_with_routes_and_pointer_rewrites_for_family(
+            vm::commercial_build::build_program_vm_commercial_with_variant_plan(
                 effective_code_va + code_offsets[index] as u64,
                 effective_code_va + full_code_total as u64 + table_offsets[index] as u64,
                 effective_code_va + full_code_total as u64 + table_total as u64 + bytecode_offsets[index] as u64,
                 module.bytecode.clone(),
                 effective_state_va + (index * MULTI_FAMILY_STATE_STRIDE) as u64,
-                module.module_domain,
-                module.family,
-                Some(&module.ip_map),
-                None,
+                &module.variant_plan,
+                Some(&module.runtime_ip_map),
+                module.prepared.as_ref(),
                 &chunk_plans[index],
                 &routes,
                 &native_pointer_rewrites,
@@ -1604,7 +1609,7 @@ pub(crate) fn build_multi_family_prog_mod(
                 + built[target_index].dynamic_state_entry_offset.unwrap_or(0) as u64,
             effective_state_va + (target_index * MULTI_FAMILY_STATE_STRIDE) as u64,
             target.instruction_offsets[local_op] as u64,
-            &vm::threaded::VmRuntimeLayout::from_seed(target.module_domain),
+            &target.variant_plan.runtime_layout().clone(),
             lane_control_va,
             lane_group_stride as u64,
             host_stack_pool_va,
@@ -1754,6 +1759,7 @@ mod invocation_layout_tests {
     fn dynamic_routes_use_only_canonical_gateway_inventory() {
         let module = vm::multi_family::EncodedFamilyPartition {
             family: vm::poly::VmArchitectureFamily::Stack,
+            variant_plan: std::sync::Arc::new(crate::vm::poly::VariantPlan::generate([0; 32], 1, vm::poly::VmArchitectureFamily::Stack, crate::vm::poly::VariantPolicy::Stable).unwrap()),
             function_ids: vec![0x1000, 0x2000, 0x3000, 0x4000],
             bytecode: vec![0],
             instruction_offsets: vec![0, 1, 2, 3],
@@ -1763,6 +1769,8 @@ mod invocation_layout_tests {
                 (0x3000, 2usize),
                 (0x4000, 3usize),
             ]),
+            runtime_ip_map: std::collections::HashMap::new(),
+            prepared: None,
             module_domain: 1,
             exit_byte_offset: 0,
         };

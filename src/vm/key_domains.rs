@@ -31,7 +31,7 @@ impl VmKeyDomain {
     }
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     const BLOCK: usize = 64;
     let mut normalized = [0u8; BLOCK];
     if key.len() > BLOCK {
@@ -75,6 +75,13 @@ pub fn derive_u64(master: u64, domain: VmKeyDomain, context: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hmac_matches_rfc4231_case_one() {
+        let expected = [0xb0,0x34,0x4c,0x61,0xd8,0xdb,0x38,0x53,0x5c,0xa8,0xaf,0xce,0xaf,0x0b,0xf1,0x2b,
+            0x88,0x1d,0xc2,0x00,0xc9,0x83,0x3d,0xa7,0x26,0xe9,0x37,0x6c,0x2e,0x32,0xcf,0xf7];
+        assert_eq!(hmac_sha256(&[0x0b;20], b"Hi There"), expected);
+    }
 
     #[test]
     fn domains_and_contexts_are_independent() {

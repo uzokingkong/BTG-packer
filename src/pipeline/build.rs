@@ -159,6 +159,10 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     // final layout; encrypted/non-reloc-aware images already have ASLR and the
     // relocation data directory disabled.
     retire_source_reloc(&mut relayed_sections)?;
+    let original_pdata = relayed_sections
+        .iter()
+        .find(|s| s.name == ".pdata")
+        .cloned();
     let commercial_owns_all_original_text = ctx.vm_commercial
         && ctx.vm_coverage.as_ref().is_some_and(|coverage| {
             coverage.total_functions != 0
@@ -291,6 +295,11 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
             };
             let align_sec = |value: u32| value.div_ceil(sec_align) * sec_align;
             let section_end = |section: &SectionData| {
+                let section = if section.name == ".pdata" {
+                    original_pdata.as_ref().unwrap_or(section)
+                } else {
+                    section
+                };
                 section.virtual_address
                     + align_sec(section.virtual_size.max(section.bytes.len() as u32))
             };
@@ -652,6 +661,11 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
         let max_existing_va = relayed_sections
             .iter()
             .map(|s| {
+                let s = if s.name == ".pdata" {
+                    original_pdata.as_ref().unwrap_or(s)
+                } else {
+                    s
+                };
                 let sz = s.virtual_size.max(s.bytes.len() as u32);
                 s.virtual_address + align_sec(sz)
             })
@@ -792,6 +806,69 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
         }
     }
 
+    // Exception metadata may outgrow its original slot. Move metadata only;
+    // all existing code/data RVAs (including .xdata) must stay frozen.
+    let align = |v: u32| -> Result<u32> {
+        let a = ctx.target_info.section_alignment.max(1);
+        v.checked_add(a - 1)
+            .map(|n| n / a * a)
+            .ok_or_else(|| anyhow::anyhow!("exception placement alignment overflow"))
+    };
+    let end = |s: &SectionData, rva: u32| -> Result<u32> {
+        align(
+            rva.checked_add(s.virtual_size.max(u32::try_from(s.bytes.len())?))
+                .ok_or_else(|| anyhow::anyhow!("exception placement section-end overflow"))?,
+        )
+    };
+    let mut exception_rva = 0;
+    for s in &relayed_sections {
+        let layout_section = if s.name == ".pdata" {
+            original_pdata.as_ref().unwrap_or(s)
+        } else {
+            s
+        };
+        exception_rva = exception_rva.max(end(layout_section, layout_section.virtual_address)?);
+    }
+    exception_rva = end(&btg_section, btg_section.virtual_address.max(exception_rva))?;
+    for (index, section) in [
+        &ctx.bootstrap_iat_section_data,
+        &ctx.mutable_state_section_data,
+        &ctx.mutable_state_metadata_section_data,
+        &ctx.payload_section_data,
+        &ctx.route_metadata_section_data,
+        &native_island_section,
+        &reloc_section,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(s) = section {
+            // State arenas have fixed RVAs and may already precede the IAT
+            // tail. Account for their existing end; never append them twice.
+            if matches!(index, 1 | 2) {
+                exception_rva = exception_rva.max(end(s, s.virtual_address)?);
+                continue;
+            }
+            let rva = if matches!(index, 3 | 4 | 6) {
+                exception_rva
+            } else {
+                s.virtual_address.max(exception_rva)
+            };
+            exception_rva = end(s, rva)?;
+        }
+    }
+    let exception_section = relocate_overflow_pdata(
+        &mut relayed_sections,
+        &mut clean_data_dirs,
+        original_pdata.as_ref(),
+        &ctx.target_info.original_pdata_entries,
+        exception_rva,
+        ctx.target_info.file_alignment,
+        dispatcher_rva,
+        dispatcher_rva.saturating_add(btg_section.virtual_size.max(btg_section.bytes.len() as u32)),
+    )?;
+
+    super::crypto::finalize_native_auth(ctx, &relayed_sections, &mut btg_section)?;
     let multi_builder = PeMultiSectionBuilder::new(
         ctx.target_info.image_base,
         entry_point_rva,
@@ -822,6 +899,7 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     multi_builder.mutable_state_metadata_section = ctx.mutable_state_metadata_section_data.clone();
     multi_builder.route_metadata_section = ctx.route_metadata_section_data.clone();
     multi_builder.native_island_section = native_island_section;
+    multi_builder.exception_section = exception_section;
     multi_builder.preserve_aslr_bits = preserve_aslr_bits;
     multi_builder.reloc_section = reloc_section;
 
@@ -1041,6 +1119,91 @@ fn build_bridge_unwind_info(size_of_prolog: u8, codes: &[(u8, u8)]) -> Vec<u8> {
 }
 
 ///
+#[allow(clippy::too_many_arguments)]
+fn relocate_overflow_pdata(
+    sections: &mut [SectionData],
+    directories: &mut [DataDirectory],
+    original: Option<&SectionData>,
+    original_entries: &[RuntimeFunction],
+    destination: u32,
+    file_alignment: u32,
+    generated_begin: u32,
+    generated_end: u32,
+) -> Result<Option<SectionData>> {
+    let Some(original) = original else {
+        return Ok(None);
+    };
+    let Some(index) = sections.iter().position(|s| s.name == ".pdata") else {
+        return Ok(None);
+    };
+    let next = sections
+        .iter()
+        .filter(|s| s.virtual_address > original.virtual_address)
+        .map(|s| s.virtual_address)
+        .min()
+        .unwrap_or(generated_begin);
+    let a = file_alignment.max(1);
+    let length = u32::try_from(sections[index].bytes.len())?;
+    let raw_length = length
+        .checked_add(a - 1)
+        .ok_or_else(|| anyhow::anyhow!("pdata raw-size overflow"))?
+        / a
+        * a;
+    let extent = sections[index].virtual_size.max(raw_length);
+    if original
+        .virtual_address
+        .checked_add(extent)
+        .is_some_and(|end| end <= next)
+    {
+        return Ok(None);
+    }
+    let directory = directories
+        .get_mut(3)
+        .ok_or_else(|| anyhow::anyhow!("missing exception directory"))?;
+    let array_len = directory.size as usize;
+    let mut relocated = sections[index].clone();
+    anyhow::ensure!(
+        array_len % 12 == 0 && array_len <= relocated.bytes.len(),
+        "invalid rebuilt exception array length"
+    );
+    let old_end = original
+        .virtual_address
+        .checked_add(length)
+        .ok_or_else(|| anyhow::anyhow!("pdata RVA overflow"))?;
+    let old_unwinds: std::collections::HashSet<_> = original_entries
+        .iter()
+        .map(|r| r.unwind_info_address)
+        .collect();
+    for record in relocated.bytes[..array_len].chunks_exact_mut(12) {
+        let begin = u32::from_le_bytes(record[..4].try_into()?);
+        let unwind = u32::from_le_bytes(record[8..12].try_into()?);
+        // Original/native-island records still refer to original .xdata (or
+        // original .pdata unwind objects). Only generated unwind objects move.
+        let generated =
+            (generated_begin..generated_end).contains(&begin) || !old_unwinds.contains(&unwind);
+        if generated && (original.virtual_address..old_end).contains(&unwind) {
+            let rewritten = destination
+                .checked_add(unwind - original.virtual_address)
+                .ok_or_else(|| anyhow::anyhow!("relocated unwind RVA overflow"))?;
+            record[8..12].copy_from_slice(&rewritten.to_le_bytes());
+        }
+    }
+    relocated.virtual_address = destination;
+    relocated.virtual_size = length;
+    // Retain original unwind bytes and mapped reservation, but never retain a
+    // duplicate original RUNTIME_FUNCTION table detached from its directory.
+    sections[index] = original.clone();
+    sections[index].name = ".pdsrc".into();
+    let clear_len = original_entries
+        .len()
+        .saturating_mul(12)
+        .min(sections[index].bytes.len());
+    sections[index].bytes[..clear_len].fill(0);
+    directory.virtual_address = destination;
+    println!("[+] Rebuilt exception metadata exceeded original .pdata slot; relocated to RVA 0x{destination:X} ({length} bytes), original section RVAs preserved");
+    Ok(Some(relocated))
+}
+
 fn update_pdata_seh(
     relayed_sections: &mut Vec<SectionData>,
     clean_data_dirs: &mut Vec<DataDirectory>,
@@ -1298,6 +1461,87 @@ fn update_pdata_seh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overflowing_pdata_moves_without_moving_xdata_or_original_unwinds() {
+        let original = SectionData {
+            name: ".pdata".into(),
+            virtual_address: 0x1000,
+            virtual_size: 0x5000,
+            characteristics: 0x40000040,
+            bytes: vec![0x55; 0x5000],
+        };
+        let original_entries = [RuntimeFunction {
+            begin_address: 0x200,
+            end_address: 0x300,
+            unwind_info_address: 0x6100,
+        }];
+        let mut rebuilt = original.clone();
+        rebuilt.bytes.resize(0x5020, 0);
+        rebuilt.virtual_size = 0x5020;
+        for (i, rf) in [
+            original_entries[0],
+            RuntimeFunction {
+                begin_address: 0x8000,
+                end_address: 0x8100,
+                unwind_info_address: 0x6008,
+            },
+        ]
+        .iter()
+        .enumerate()
+        {
+            let off = i * 12;
+            rebuilt.bytes[off..off + 4].copy_from_slice(&rf.begin_address.to_le_bytes());
+            rebuilt.bytes[off + 4..off + 8].copy_from_slice(&rf.end_address.to_le_bytes());
+            rebuilt.bytes[off + 8..off + 12].copy_from_slice(&rf.unwind_info_address.to_le_bytes());
+        }
+        let xdata = SectionData {
+            name: ".xdata".into(),
+            virtual_address: 0x6000,
+            virtual_size: 0x1000,
+            characteristics: 0x40000040,
+            bytes: vec![0x77; 0x1000],
+        };
+        let mut sections = vec![rebuilt, xdata.clone()];
+        let mut directories = vec![
+            DataDirectory {
+                virtual_address: 0,
+                size: 0
+            };
+            4
+        ];
+        directories[3] = DataDirectory {
+            virtual_address: 0x1000,
+            size: 24,
+        };
+        let relocated = relocate_overflow_pdata(
+            &mut sections,
+            &mut directories,
+            Some(&original),
+            &original_entries,
+            0x10000,
+            0x200,
+            0x8000,
+            0x9000,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(sections[1].virtual_address, xdata.virtual_address);
+        assert_eq!(sections[1].bytes, xdata.bytes);
+        assert_eq!(sections[0].virtual_size, original.virtual_size);
+        assert!(sections[0].bytes[..12].iter().all(|&b| b == 0));
+        assert_eq!(sections[0].bytes[12..], original.bytes[12..]);
+        assert_eq!(
+            u32::from_le_bytes(relocated.bytes[8..12].try_into().unwrap()),
+            0x6100
+        );
+        assert_eq!(
+            u32::from_le_bytes(relocated.bytes[20..24].try_into().unwrap()),
+            0x15008
+        );
+        assert_eq!(directories[3].virtual_address, 0x10000);
+        assert_eq!(directories[3].size, 24);
+    }
 
     #[test]
     fn retired_reloc_span_stays_mapped_without_source_bytes() {

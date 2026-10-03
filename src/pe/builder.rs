@@ -73,6 +73,8 @@ pub struct PeMultiSectionBuilder {
     /// Phase-B relocated native code. Its RVA is fixed by the emitter because
     /// every PC-relative fixup was encoded against that exact address.
     pub native_island_section: Option<SectionData>,
+    /// Overflow exception metadata, fixed after all other generated sections.
+    pub exception_section: Option<SectionData>,
     pub original_headers_bytes: Vec<u8>,
     /// P0-⑦: relocation-aware 출력 — `.reloc` data directory(idx 5)가 제공되면
     /// ASLR(DYNAMIC_BASE 0x0040)/HIGH_ENTROPY_VA(0x0020) 비트를 보존한다.
@@ -124,6 +126,7 @@ impl PeMultiSectionBuilder {
             mutable_state_metadata_section: None,
             route_metadata_section: None,
             native_island_section: None,
+            exception_section: None,
             original_headers_bytes,
             // P0-⑦: 기본값은 기존 동작(ASLR 스트립) 유지. relocation-aware 경로가
             // .reloc data directory를 채우고 이 플래그를 켠다.
@@ -153,6 +156,7 @@ impl PeMultiSectionBuilder {
             + usize::from(self.mutable_state_metadata_section.is_some())
             + usize::from(self.route_metadata_section.is_some())
             + usize::from(self.native_island_section.is_some())
+            + usize::from(self.exception_section.is_some())
             + usize::from(self.payload_section.is_some())
             + usize::from(self.reloc_section.is_some())) as u16;
         let original_e_lfanew = self
@@ -373,6 +377,9 @@ impl PeMultiSectionBuilder {
         }
         if let Some(rs) = adjusted_reloc_section {
             all_sections.push(rs);
+        }
+        if let Some(exception) = self.exception_section {
+            all_sections.push(exception);
         }
         all_sections.sort_by_key(|s| s.virtual_address);
 

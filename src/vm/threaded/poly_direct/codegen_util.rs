@@ -164,6 +164,7 @@ pub(crate) const C5: u64 = 0x94D049BB133111EB;
 
 // ── small code builder (two-pass branch patching, mirroring pass3) ──────────
 pub(crate) struct CodeBuilder {
+    pub(crate) architecture: Option<crate::vm::poly::VmArchitectureFamily>,
     instrs: Vec<Instruction>,
     abi_register_instructions: std::collections::HashSet<usize>,
     /// (branch instruction index, target instruction index)
@@ -173,6 +174,7 @@ pub(crate) struct CodeBuilder {
 impl CodeBuilder {
     pub(crate) fn new() -> Self {
         Self {
+            architecture: None,
             instrs: Vec::new(),
             abi_register_instructions: std::collections::HashSet::new(),
             branches: Vec::new(),

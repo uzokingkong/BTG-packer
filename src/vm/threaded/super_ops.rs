@@ -440,6 +440,21 @@ impl SuperOperatorSynthesizer {
         seed: u64,
         family: crate::vm::poly::VmArchitectureFamily,
     ) -> anyhow::Result<Option<PreparedSuperOpProgram>> {
+        Self::prepare_commercial_program_with_spec(program, &VirtualIsaSpec::from_seed_and_family(seed,family))
+    }
+
+    pub fn prepare_commercial_program_with_variant_plan(
+        program: &crate::vm::risc::RiscProgram,
+        plan: &crate::vm::poly::VariantPlan,
+    ) -> anyhow::Result<Option<PreparedSuperOpProgram>> {
+        Self::prepare_commercial_program_with_spec(program,plan.isa())
+    }
+
+    fn prepare_commercial_program_with_spec(
+        program: &crate::vm::risc::RiscProgram,
+        spec: &VirtualIsaSpec,
+    ) -> anyhow::Result<Option<PreparedSuperOpProgram>> {
+        let seed=spec.seed;
         let mut protected = HashSet::new();
         if let Some(ip_map) = program.ip_map() {
             protected.extend(ip_map.values().copied());
@@ -471,10 +486,9 @@ impl SuperOperatorSynthesizer {
         if plans.is_empty() {
             return Ok(None);
         }
-        let spec = VirtualIsaSpec::from_seed_and_family(seed, family);
-        let assigned = Self::assign_extension_opcodes(&spec, &plans, seed)?;
+        let assigned = Self::assign_extension_opcodes(spec, &plans, seed)?;
         let rewrite = Self::rewrite_stream(&program.instrs, &assigned)?;
-        let mut encoder = PolymorphicEncoder::new_for_family(seed, family);
+        let mut encoder = PolymorphicEncoder {spec:spec.clone(),rolling:crate::vm::poly::RollingKeyEngine::new(seed)};
         let (bytecode, rewritten_offsets) = encoder.encode_superop_rewrite(&rewrite)?;
         let metadata = SuperOpBuildMetadata::from_rewrite(
             program.clone(),

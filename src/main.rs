@@ -136,9 +136,72 @@ impl Drop for PackProgress {
 fn main() -> error::Result<()> {
     let args = CliArgs::parse();
 
+    if args.literal_catalog_only {
+        let input = fs::read(&args.input)?;
+        let catalog = pipeline::literal_discovery::discover(&input)
+            .map_err(error::BtgError::Anyhow)?;
+        println!("{}", catalog.public_summary());
+        return Ok(());
+    }
+
+    // Preflight release separation before logs, cache creation, or output writes.
+    let release_plan = if let Some(destination) = args.release_dir.as_deref() {
+        let mut roots = args.private_root.clone();
+        roots.push(args.cache_dir.clone());
+        let source = if args.release_export_only { &args.input } else { &args.output };
+        let plan = btg_packer::release_export::ReleasePlan::prepare(source, destination, &roots)
+            .map_err(error::BtgError::Anyhow)?;
+        if let Some(log_path) = args.log_file.as_deref() {
+            plan.check_diagnostic_path(log_path).map_err(error::BtgError::Anyhow)?;
+        }
+        for private_input in args.literal_map.iter().chain(args.private_build_key.iter()) {
+            plan.check_diagnostic_path(private_input).map_err(error::BtgError::Anyhow)?;
+        }
+        Some(plan)
+    } else {
+        None
+    };
+
+    if args.release_export_only {
+        release_plan.as_ref().expect("clap requires --release-dir")
+            .finish().map_err(error::BtgError::Anyhow)?;
+        println!("release export complete: program.exe + manifest.json only; execution not verified");
+        return Ok(());
+    }
+
+    // Audit before logging/cache/packing: never creates an EXE or sidecar.
+    if args.literal_audit_only {
+        let result = btg_packer::pipeline::literal_audit::audit_files(
+            &args.input,
+            args.literal_map
+                .as_deref()
+                .expect("clap requires --literal-map"),
+        )
+        .map_err(error::BtgError::Anyhow)?;
+        println!("{}", result.public_summary());
+        return Ok(());
+    }
+
     if args.verify_seeds > 0 {
         return btg_packer::multi_seed::run(&args).map_err(error::BtgError::Anyhow);
     }
+    let mut literal_input = if let Some(path) = args.literal_map.as_deref() {
+        let map_path = fs::canonicalize(path)?;
+        for destination in std::iter::once(args.output.clone())
+            .chain(std::iter::once(btg_packer::build_cache::manifest_path(&args.output)))
+            .chain(args.log_file.iter().cloned()) {
+            if let Ok(resolved) = fs::canonicalize(destination) {
+                let same = if cfg!(windows) {
+                    map_path.to_string_lossy().eq_ignore_ascii_case(&resolved.to_string_lossy())
+                } else { map_path == resolved };
+                if same { return Err(error::BtgError::Anyhow(anyhow::anyhow!(
+                    "private literal map must not be used as an output or log destination"
+                ))); }
+            }
+        }
+        Some(pipeline::literal_audit::LiteralBuildInput::read(&args.input, path)
+            .map_err(error::BtgError::Anyhow)?)
+    } else { None };
     if args.section_name_mode == btg_packer::cli::SectionNameMode::Seeded && args.seed.is_none() {
         return Err(error::BtgError::Anyhow(anyhow::anyhow!(
             "--section-name-mode seeded requires an explicit --seed"
@@ -158,6 +221,57 @@ fn main() -> error::Result<()> {
         }
     }
     let cfg = &profile.config;
+    if args.boot_vm_policy != btg_packer::cli::BootVmPolicy::Native
+        && (!cfg.crypto_enabled || cfg.crypto_mode != btg_packer::crypto::CryptoMode::ChaCha20) {
+        return Err(error::BtgError::Anyhow(anyhow::anyhow!(
+            "--boot-vm-policy requires enabled ChaCha20 stage authentication"
+        )));
+    }
+    if args.vm_variant_policy == btg_packer::cli::VmVariantPolicy::Seeded
+        && (args.seed.is_none() || !cfg.vm_commercial || !cfg.vm_oep || !cfg.crypto_enabled) {
+        return Err(error::BtgError::Anyhow(anyhow::anyhow!(
+            "--vm-variant-policy seeded requires --seed and an enabled commercial whole-program VM"
+        )));
+    }
+    if args.vm_family_policy == btg_packer::cli::VmFamilyPolicy::Single
+        && (!cfg.vm_commercial || !cfg.vm_oep || !cfg.crypto_enabled) {
+        return Err(error::BtgError::Anyhow(anyhow::anyhow!(
+            "--vm-family-policy single requires an enabled commercial whole-program VM"
+        )));
+    }
+    let _handler_codec_guard = if args.handler_prf {
+        if !cfg.vm_commercial || !cfg.vm_oep || !cfg.crypto_enabled {
+            return Err(error::BtgError::Anyhow(anyhow::anyhow!(
+                "--handler-prf requires an enabled commercial whole-program VM"
+            )));
+        }
+        let settings = match args.private_build_key.as_deref() {
+            Some(path) => {
+                let key_path = fs::canonicalize(path)?;
+                for destination in std::iter::once(args.output.clone())
+                    .chain(std::iter::once(btg_packer::build_cache::manifest_path(&args.output)))
+                    .chain(args.log_file.iter().cloned()) {
+                    if let Ok(resolved) = fs::canonicalize(&destination) {
+                        let same = if cfg!(windows) {
+                            key_path.as_os_str().to_string_lossy().eq_ignore_ascii_case(&resolved.as_os_str().to_string_lossy())
+                        } else { key_path == resolved };
+                        if same { return Err(error::BtgError::Anyhow(anyhow::anyhow!(
+                            "private build key must not be used as an output or log destination"
+                        ))); }
+                    }
+                }
+                btg_packer::vm::handler_table_codec::BuildSettings::read_private_key(path)
+                    .map_err(error::BtgError::Anyhow)?
+            },
+            None => Default::default(),
+        };
+        Some(btg_packer::vm::handler_table_codec::activate(settings))
+    } else { None };
+    if literal_input.is_some() && (cfg.reencrypt || args.chained_crypto || !cfg.crypto_enabled) {
+        return Err(error::BtgError::Anyhow(anyhow::anyhow!(
+            "literal map requires the bulk boot-decryption path"
+        )));
+    }
 
     if args.strict_profile && args.allow_partial_vm {
         return Err(error::BtgError::Anyhow(anyhow::anyhow!(
@@ -530,7 +644,7 @@ fn main() -> error::Result<()> {
 
     // ── 입력 PE 로드 ──────────────────────────────────────────────────────────────
     let input_path = args.input;
-    if !input_path.exists() {
+    if !input_path.exists() && literal_input.is_none() {
         println!(
             "[!] Input file not found. Generating default test payload: {}",
             input_path.display()
@@ -539,7 +653,9 @@ fn main() -> error::Result<()> {
         fs::write(&input_path, &dummy_bytes)?;
     }
 
-    let input_pe_bytes = fs::read(&input_path)?;
+    let input_pe_bytes = if let Some(snapshot) = literal_input.as_mut() {
+        snapshot.take_input()
+    } else { fs::read(&input_path)? };
     println!(
         "[+] Target PE Loaded: {} ({} bytes)",
         input_path.display(),
@@ -547,11 +663,15 @@ fn main() -> error::Result<()> {
     );
     progress.report(4, "Input PE loaded");
 
-    let build_cache = btg_packer::build_cache::BuildCache::open(&cache_args, &input_pe_bytes)?;
+    let build_cache = btg_packer::build_cache::BuildCache::open_with_literal_identity(
+        &cache_args, &input_pe_bytes, literal_input.as_ref().map(|snapshot| snapshot.map_identity()))?;
     let _cache_session = build_cache.as_ref().map(|cache| cache.activate());
     if reuse_completed_package {
         if let Some(cache) = &build_cache {
             if cache.restore(&args.output)? {
+                if let Some(plan) = &release_plan {
+                    plan.finish().map_err(error::BtgError::Anyhow)?;
+                }
                 btg_packer::progress::complete("Pack complete (cached package restored)");
                 return Ok(());
             }
@@ -592,6 +712,10 @@ fn main() -> error::Result<()> {
 
     // ── PipelineContext 생성 ───────────────────────────────────────────────────────
     let mut ctx = PipelineContext::new(target_info, dispatcher_va, dispatcher_rva, obf_complexity);
+    if let Some(snapshot) = literal_input {
+        ctx.literal_catalog = Some(snapshot.catalog().clone());
+        ctx.literal_payload_hashes = snapshot.payload_hashes().clone();
+    }
     // ── P3-1: 결정적 빌드 (--seed) — 단일 시드 RNG 고정 ──────────────────────────
     // `--seed <u64>`가 주어지면 ctx.rng를 고정한다. 셔플/mba_constant/crypto 시드/
     // 폴리 시드/레이아웃 패드가 모두 이 RNG에서 파생되므로, 같은 input + seed +
@@ -639,6 +763,9 @@ fn main() -> error::Result<()> {
     // `--vm --vm-oep --vm-commercial` 모두 켜야 상용 경로를 쓰고, 레거시 --vm-oep
     // 경로는 바이트 동일 유지한다.
     ctx.vm_commercial = cfg.vm_commercial;
+    ctx.vm_variant_policy = args.vm_variant_policy;
+    ctx.boot_vm_policy = args.boot_vm_policy;
+    ctx.vm_family_policy = args.vm_family_policy;
     // ── M7: on-demand 재암호화(anti-dump) — 실행 후 블록을 즉시 재암호화하는
     // refcount-safe 디스패처로, 어느 순간에도 "실행 중인 블록만 평문"이다.
     // (m7_effective는 위에서 crypto/vm/reencrypt 배타성과 함께 판정됨.
@@ -799,11 +926,14 @@ fn main() -> error::Result<()> {
     } else if cfg.vm_commercial && !args.allow_partial_vm {
         effective_profile.ensure_vm_full_coverage()?;
     }
-    let existing_section_names = ctx
-        .target_info
-        .relayed_sections
+    let naming_pe = goblin::pe::PE::parse(&output_pe_bytes).map_err(anyhow::Error::from)?;
+    let existing_section_names = naming_pe
+        .sections
         .iter()
-        .map(|section| section.name.clone())
+        .map(|section| {
+            let end = section.name.iter().position(|&byte| byte == 0).unwrap_or(8);
+            String::from_utf8_lossy(&section.name[..end]).into_owned()
+        })
         .collect::<Vec<_>>();
     if let Some(plan) = pipeline::section_names::SectionNamePlan::create(
         args.section_name_mode,
@@ -812,7 +942,7 @@ fn main() -> error::Result<()> {
     )? {
         let rewritten = plan.rewrite_pe_headers(&mut output_pe_bytes)?;
         println!(
-            "[+] Section-name camouflage: rewrote {} generated section header(s) ({:?})",
+            "[+] Section-name randomization: rewrote {} section header(s) ({:?})",
             rewritten, args.section_name_mode
         );
     }
@@ -892,7 +1022,7 @@ fn main() -> error::Result<()> {
     {
         let input_hash = btg_packer::manifest::sha256_hex(&input_pe_bytes);
         let output_hash = btg_packer::manifest::sha256_hex(&output_pe_bytes);
-        let flags = btg_packer::manifest::feature_flags(
+        let mut flags = btg_packer::manifest::feature_flags(
             anti_debug,
             vm_enabled,
             ctx.vm_oep,
@@ -911,6 +1041,36 @@ fn main() -> error::Result<()> {
             args.sym_map,
             args.seed.is_some(),
         );
+        if args.handler_prf {
+            flags.push("handler-codec-v2-prf-init".into());
+            if args.private_build_key.is_some() { flags.push("private-build-key".into()); }
+        }
+        if ctx.boot_vm_policy != btg_packer::cli::BootVmPolicy::Native {
+            flags.push("boot-vm-v2-authenticated-stage-schedule".into());
+            flags.push("boot-native-metadata-root-and-os-bridges".into());
+            if ctx.boot_vm_policy == btg_packer::cli::BootVmPolicy::SelectedStages {
+                flags.push("boot-crypto-vm-v1-chacha-rounds".into());
+                flags.push("boot-native-poly1305-and-stream-bridges".into());
+            }
+            if ctx.boot_vm_policy == btg_packer::cli::BootVmPolicy::FullCrypto {
+                flags.push("boot-crypto-vm-v2-chacha20-poly1305-all-instructions".into());
+                flags.push("boot-native-crypto-authentication-root".into());
+            }
+        }
+        if ctx.vm_variant_policy == btg_packer::cli::VmVariantPolicy::Seeded {
+            flags.push(format!("vm-variant-schema-{}-seeded", btg_packer::vm::poly::variant_plan::VARIANT_SCHEMA_VERSION));
+        }
+        if ctx.vm_commercial && ctx.vm_oep {
+            flags.push("vm-family-lowering-v2-stack-register-mixed-fused".into());
+            flags.push("vm-shared-canonical-memory-and-host-bridge-abi".into());
+        }
+        if ctx.vm_family_policy == btg_packer::cli::VmFamilyPolicy::Single {
+            flags.push("vm-family-single-independent-lowering".into());
+        }
+        if crypto_enabled && cfg.crypto_mode == btg_packer::crypto::CryptoMode::ChaCha20
+            && !ctx.reencrypt && !args.chained_crypto {
+            flags.push("boot-stage-aead-v64".into());
+        }
         // readccc §4.4: W^X 메모리 계약 기술 — 실행 코드의 권한 라이프사이클을
         // capability manifest에 기록한다 (고객이 무엇을 보장하는지 알 수 있게).
         // resolve()가 mem_harden/reencrypt/vm-oep 상충을 이미 해소했으므로
@@ -1140,6 +1300,9 @@ fn main() -> error::Result<()> {
                 log::warn!("Could not save completed build package: {error}");
             }
         }
+    }
+    if let Some(plan) = &release_plan {
+        plan.finish().map_err(error::BtgError::Anyhow)?;
     }
     btg_packer::progress::complete("Pack complete");
     Ok(())

@@ -58,6 +58,34 @@ pub struct RegisterAssignment {
 }
 
 impl RegisterAssignment {
+    pub(crate) fn carrier_order(&self) -> [u8; 4] {
+        let carriers = [Register::R12, Register::R13, Register::R14, Register::R15];
+        carriers.map(|reg| carriers.iter().position(|&candidate|
+            candidate == self.map_legacy_carrier(reg)).expect("validated production carrier set") as u8)
+    }
+
+    pub(crate) fn from_carrier_order(order: [u8; 4]) -> Result<Self, String> {
+        let roles = [VmRole::Vpc, VmRole::StackBase, VmRole::RollingKey, VmRole::TableBase];
+        let carriers = [Register::R12, Register::R13, Register::R14, Register::R15];
+        let mut seen = [false; 4];
+        for &index in &order {
+            if index >= 4 || seen[index as usize] { return Err("invalid persistent carrier permutation".into()); }
+            seen[index as usize] = true;
+        }
+        let mut assignment = Self::legacy();
+        for role in roles {
+            let old = assignment.role_to_gpr.remove(&role).unwrap();
+            assignment.gpr_to_role.remove(&old);
+        }
+        for (role, index) in roles.into_iter().zip(order) {
+            let reg = carriers[index as usize];
+            assignment.role_to_gpr.insert(role, reg);
+            assignment.gpr_to_role.insert(reg, role);
+        }
+        assignment.validate()?;
+        Ok(assignment)
+    }
+
     /// Creates the standard/legacy register assignment (used for fallback or base reference).
     pub fn legacy() -> Self {
         let mut role_to_gpr = HashMap::new();

@@ -7,6 +7,11 @@ pub mod build;
 pub mod config;
 pub mod crypto;
 pub mod iat_hide;
+pub mod literal_audit;
+pub mod literal_catalog;
+pub mod literal_discovery;
+pub mod literal_map;
+mod literal_metadata;
 pub mod native_island;
 pub mod ondemand;
 pub mod ownership;
@@ -64,6 +69,12 @@ pub struct VmCoverageMetrics {
 /// `main`에서 `PipelineContext`를 생성하고 각 Pass 함수에 `&mut self`로 전달한다.
 /// 각 Pass는 이전 Pass의 결과를 소비하거나 참조하여 다음 단계 출력을 채운다.
 pub struct PipelineContext {
+    pub boot_vm_policy: crate::cli::BootVmPolicy,
+    pub vm_variant_policy: crate::cli::VmVariantPolicy,
+    pub vm_family_policy: crate::cli::VmFamilyPolicy,
+    /// Validated opt-in inventory; replaces heuristic/full-section data runs.
+    pub literal_catalog: Option<literal_catalog::LiteralCatalog>,
+    pub literal_payload_hashes: BTreeMap<u64, [u8;32]>,
     /// P3-1 (결정적 빌드): 패킹의 모든 랜덤성(셔플/mba_constant/crypto 시드/폴리
     /// 시드/레이아웃 패드)을 파생하는 단일 시드 RNG. `--seed <u64>`로 고정하면
     /// 같은 input+seed+config → 같은 output (재현·디버깅·상용 배포용).
@@ -232,6 +243,7 @@ pub struct PipelineContext {
     /// Family-scoped integrity descriptors sealed over the exact immutable
     /// runtime representation (including the persistent M7 bytecode layer).
     pub vm_integrity_descriptors: Vec<crate::vm::distributed_integrity::IntegrityDescriptor>,
+    pub(crate) pending_native_auth: Option<crypto::PendingNativeAuth>,
     pub vm_integrity_table_rva: u32,
     pub vm_integrity_table_len: u32,
     /// P2-5 conservative read-only literal/reference graph. Only objects with
@@ -278,6 +290,9 @@ impl PipelineContext {
         obf_complexity: usize,
     ) -> Self {
         Self {
+            boot_vm_policy: crate::cli::BootVmPolicy::Native,
+            vm_variant_policy: crate::cli::VmVariantPolicy::Stable,
+            vm_family_policy: crate::cli::VmFamilyPolicy::FunctionPartition,
             target_info,
             dispatcher_va,
             dispatcher_rva,
@@ -349,9 +364,12 @@ impl PipelineContext {
             vm_prog_bytecode_len: 0,
             vm_prog_runtime_cipher_hash: None,
             vm_integrity_descriptors: Vec::new(),
+            pending_native_auth: None,
             vm_integrity_table_rva: 0,
             vm_integrity_table_len: 0,
             vm_data_lifetime_objects: Vec::new(),
+            literal_catalog: None,
+            literal_payload_hashes: BTreeMap::new(),
             block_ring: false,
             // Keep the library/API baseline identical to protection_profile::resolve.
             // Custom research primitives are opt-in only.

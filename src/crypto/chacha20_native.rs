@@ -20,6 +20,8 @@
 // ==============================================================================
 
 use iced_x86::{Code, Instruction, MemoryOperand, Register};
+#[path = "chacha20_vm.rs"]
+mod rounds_vm;
 
 use crate::crypto::chacha20::{
     CHACHA20_CONST_0, CHACHA20_CONST_1, CHACHA20_CONST_2, CHACHA20_CONST_3, CHA_OFF_CTR,
@@ -103,6 +105,49 @@ fn w(off: i32) -> MemoryOperand {
 
 /// Self-contained ChaCha20 crypt blob.
 pub fn emit_chacha20_blob(state_va: u64) -> Vec<u8> {
+    emit_chacha20_backend(state_va, false)
+}
+
+pub fn chacha20_vm_program() -> Vec<u8> {
+    const ADD:u8=1; const XOR:u8=2; const ROT:u8=3;
+    let mut bytes = Vec::new();
+    for _ in 0..10 {
+        for [a, b, c, d] in [
+            [0, 4, 8, 12], [1, 5, 9, 13], [2, 6, 10, 14], [3, 7, 11, 15],
+            [0, 5, 10, 15], [1, 6, 11, 12], [2, 7, 8, 13], [3, 4, 9, 14],
+        ] {
+            for (op, dst, src, count) in [
+                (ADD,a,b,0), (XOR,d,a,0), (ROT,d,0,16),
+                (ADD,c,d,0), (XOR,b,c,0), (ROT,b,0,12),
+                (ADD,a,b,0), (XOR,d,a,0), (ROT,d,0,8),
+                (ADD,c,d,0), (XOR,b,c,0), (ROT,b,0,7),
+            ] { bytes.extend([op, dst, src, count]); }
+        }
+    }
+    bytes.extend([0;4]);
+    bytes
+}
+
+/// Experimental selected-stage VM: all ChaCha round arithmetic is interpreted.
+/// Streaming, initial state absorption and feedforward remain native bridges.
+pub fn emit_chacha20_vm_blob(state_va: u64) -> Vec<u8> {
+    emit_chacha20_backend(state_va, true)
+}
+
+fn emit_chacha20_backend(state_va: u64, virtual_rounds: bool) -> Vec<u8> {
+    encode_with_labels(&chacha_sequence(state_va, virtual_rounds), 0x140001000)
+}
+
+pub(crate) fn emit_chacha20_full_vm_blob(state_va: u64, vm_state_va: u64) -> anyhow::Result<super::instruction_vm::Blob> {
+    super::instruction_vm::compile(&chacha_sequence(state_va, false), vm_state_va)
+}
+
+pub fn chacha20_full_vm_program() -> anyhow::Result<Vec<u8>> {
+    let blob = emit_chacha20_full_vm_blob(0,0)?;
+    Ok(blob.code[blob.program_range].to_vec())
+}
+
+fn chacha_sequence(state_va: u64, virtual_rounds: bool) -> Seq {
     let mut s: Seq = Vec::new();
 
     // prologue: callee-saved
@@ -293,8 +338,10 @@ pub fn emit_chacha20_blob(state_va: u64) -> Vec<u8> {
             Instruction::with2(Code::Mov_rm32_r32, w(0x40 + i * 4), Register::EAX).unwrap(),
         );
     }
-    for _ in 0..10 {
-        emit_double_round(&mut s);
+    if virtual_rounds {
+        rounds_vm::emit(&mut s);
+    } else {
+        for _ in 0..10 { emit_double_round(&mut s); }
     }
     // feedforward
     for i in 0..16 {
@@ -342,7 +389,7 @@ pub fn emit_chacha20_blob(state_va: u64) -> Vec<u8> {
     );
     push(&mut s, Instruction::with(Code::Retnq));
 
-    encode_with_labels(&s, 0x140001000)
+    s
 }
 
 /// Absorb the initial 16-word state from [r14] into the stack [rsp+0x00..0x40].

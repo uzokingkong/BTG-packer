@@ -19,6 +19,37 @@ use iced_x86::{
 use std::collections::HashMap;
 
 #[test]
+fn prf_codec_executes_all_families_with_seed_and_private_key() {
+    use crate::vm::handler_table_codec::{activate, BuildSettings};
+    use crate::vm::poly::VmArchitectureFamily;
+    for settings in [BuildSettings::default(), BuildSettings::with_private_key([0xA5;32])] {
+        let _guard = activate(settings);
+        for family in [VmArchitectureFamily::Stack, VmArchitectureFamily::Register,
+            VmArchitectureFamily::MixedRisc, VmArchitectureFamily::FusedCisc] {
+            for seed in [2,7,19] {
+                let mut d = RiscDesynthesizer::new();
+                d.instrs.push(MicroInstr::new(RiscOp::Add { width: 8 })
+                    .with_dst(MicroOperand::VReg(0)).with_src1(MicroOperand::VReg(1)).with_src2(MicroOperand::Imm64(17)));
+                d.instrs.push(MicroInstr::new(RiscOp::SubWithBorrow { width: 8 })
+                    .with_dst(MicroOperand::VReg(2)).with_src1(MicroOperand::VReg(0)).with_src2(MicroOperand::Imm64(7)));
+                d.emit_push(MicroOperand::VReg(2));
+                d.emit_pop(MicroOperand::VReg(3));
+                d.instrs.push(MicroInstr::new(RiscOp::Halt));
+                let program = RiscProgram::new(d.instrs);
+                let mut encoder = PolymorphicEncoder::new_for_family(seed, family);
+                let bytecode = encoder.encode(&program).unwrap();
+                let mut init = [0;16]; init[1] = u64::MAX-3;
+                let expected = program.eval_state(&init);
+                let actual = run_native_poly_direct_for_family(&bytecode, seed, family, &init, None).unwrap();
+                assert_eq!(actual.regs, expected.regs, "family {family:?} seed {seed}");
+                assert_eq!(actual.flags & FLAG_MASK, expected.flags & FLAG_MASK);
+                assert_eq!(actual.stack, expected.stack);
+            }
+        }
+    }
+}
+
+#[test]
 fn rep_loop_labels_survive_block_append_and_family_partition() {
     use crate::vm::multi_family::MultiFamilyProgramPlan;
     use crate::vm::poly::{FunctionOpRange, ProductionFamilyPlan, VmArchitectureFamily};
