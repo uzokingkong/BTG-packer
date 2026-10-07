@@ -203,7 +203,20 @@ static int run_gui(void) {
     return 0;
 }
 
+// The BTG commercial Program-VM backend enables --mem-harden, whose boot stub
+// reuses the input image's own LoadLibraryA / GetProcAddress import slots to
+// re-resolve the hidden IAT at runtime. A minimal console app does not import
+// them, so force both into the IAT by taking their addresses through a volatile
+// sink the optimizer cannot discard. (No effect on behavior.)
+static void btg_keep_bootstrap_imports(void) {
+    static volatile FARPROC sink[2];
+    sink[0] = reinterpret_cast<FARPROC>(&LoadLibraryA);
+    sink[1] = reinterpret_cast<FARPROC>(&GetProcAddress);
+    (void)sink;
+}
+
 int main(int argc, char** argv) {
+    btg_keep_bootstrap_imports();
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--headless") == 0) {
             return run_headless();
