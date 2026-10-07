@@ -160,11 +160,20 @@ jobs:
             } else { Write-Host "(absent)" }
           }
           Write-Host "===== out directory ====="; Get-ChildItem -File out -ErrorAction SilentlyContinue | Format-Table Name,Length | Out-String | Write-Host
-          Dump "out/packer-console.log" 0
-          Dump "out/crackme-pack.log" 200
           Dump "out/packed-stdout.txt" 0
           Dump "out/packed-stderr.txt" 0
           Write-Host "===== crashdumps ====="; Get-ChildItem -File crashdumps -ErrorAction SilentlyContinue | Format-Table Name,Length | Out-String | Write-Host
+          Dump "out/crackme-pack.log" 40
+          # Put the packer's own error LAST so it lands in the MCP log tail.
+          if (Test-Path "out/packer-console.log") {
+            Write-Host ""
+            Write-Host "========== packer-console.log : matched error lines =========="
+            Select-String -Path "out/packer-console.log" -Pattern 'error|panic|thread ''main''|unsupported|reject|not supported|Caused by|coverage|ownership|lift|bail|unwrap|Error:' -CaseSensitive:$false |
+              Select-Object -Last 60 | ForEach-Object { Write-Host $_.Line }
+            Write-Host ""
+            Write-Host "========== packer-console.log : last 80 lines =========="
+            Get-Content "out/packer-console.log" -Tail 80 | Write-Host
+          } else { Write-Host "packer-console.log (absent)" }
 
       - name: Fail job if pack/verify failed
         if: steps.pack.outcome == 'failure'
