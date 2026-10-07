@@ -82,135 +82,71 @@ jobs:
           Set-ItemProperty -Path $wer -Name DumpType   -Value 2 -Type DWord
           Set-ItemProperty -Path $wer -Name DumpCount  -Value 10 -Type DWord
 
-      - name: Pack crackme with Program-VM + verify (A)
+      - name: Pack/verify tier bisection (A plain-VM, B commercial)
         id: pack
         continue-on-error: true
         shell: pwsh
         run: |
-          $input  = "out/crackme.exe"
-          $output = "out/crackme.packed.exe"
-          Remove-Item -Force $output, "$output.failed.exe" -ErrorAction SilentlyContinue
-          $packArgs = @(
-            "--input", $input,
-            "--output", $output,
-            "--vm", "--vm-oep", "--vm-commercial", "--allow-partial-vm",
-            "--verify-output", "--verify-timeout-secs", "60",
-            "--map", "--sym-map", "--debug", "--log-file", "out/crackme-pack.log",
-            "--seed", "$env:CRACKME_SEED"
+          $cdb = Get-ChildItem `
+            "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe", `
+            "C:\Program Files\Windows Kits\10\Debuggers\x64\cdb.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          $tiers = @(
+            @{ tag = "A-plainvm";    args = @("--vm","--vm-oep","--allow-partial-vm") },
+            @{ tag = "B-commercial"; args = @("--vm","--vm-oep","--vm-commercial","--allow-partial-vm") }
           )
-          Write-Host ("packing: btg-packer " + ($packArgs -join " "))
-          & ".\target\release\btg-packer.exe" @packArgs 2>&1 | Tee-Object -FilePath out/packer-console.log
-          $code = $LASTEXITCODE
-          Write-Host ("packer exit={0}" -f $code)
-          exit $code
-
-      - name: Run packed crackme --headless and capture crash
-        if: always()
-        shell: pwsh
-        run: |
-          $candidates = @("out/crackme.packed.exe") +
-            (Get-ChildItem -File "out/crackme.packed.failed*.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
-          foreach ($exe in $candidates) {
-            if (-not (Test-Path $exe)) { continue }
-            Write-Host "=== running $exe --headless ==="
-            $started = Get-Date
-            $p = Start-Process -FilePath $exe -ArgumentList "--headless" -PassThru -Wait -RedirectStandardOutput "out/packed-stdout.txt" -RedirectStandardError "out/packed-stderr.txt"
-            $bits = [System.BitConverter]::ToUInt32([System.BitConverter]::GetBytes([int32]$p.ExitCode), 0)
-            Write-Host ("[PACKED-RUN] {0} exit=0x{1:X8} ({2})" -f (Split-Path $exe -Leaf), $bits, $p.ExitCode)
-            if (Test-Path "out/packed-stdout.txt") { Write-Host "--- stdout ---"; Get-Content "out/packed-stdout.txt" | Write-Host }
-            if (Test-Path "out/packed-stderr.txt") { Write-Host "--- stderr ---"; Get-Content "out/packed-stderr.txt" | Write-Host }
-            "[PACKED-RUN] {0} exit=0x{1:X8} ({2})" -f (Split-Path $exe -Leaf), $bits, $p.ExitCode | Out-File -Append out/crash-summary.txt
-            if ($bits -eq 0xC0000005) {
-              Write-Host "[PACKED-RUN] ACCESS_VIOLATION reproduced (0xC0000005)"
-              "[PACKED-RUN] ACCESS_VIOLATION reproduced (0xC0000005)" | Out-File -Append out/crash-summary.txt
+          $summary = @()
+          $anyFail = $false
+          foreach ($t in $tiers) {
+            $tag = $t.tag
+            $out = "out/crackme.$tag.exe"
+            Remove-Item -Force "out/crackme.$tag*.exe" -ErrorAction SilentlyContinue
+            $packArgs = @("--input","out/crackme.exe","--output",$out) + $t.args + @(
+              "--verify-output","--verify-timeout-secs","60",
+              "--debug","--log-file","out/pack-$tag.log","--seed","$env:CRACKME_SEED")
+            Write-Host "===== TIER $tag : btg-packer $($packArgs -join ' ') ====="
+            & ".\target\release\btg-packer.exe" @packArgs 2>&1 | Tee-Object -FilePath "out/console-$tag.log"
+            $code = $LASTEXITCODE
+            Write-Host "TIER $tag packer exit=$code"
+            if ($code -eq 0) { $summary += "TIER $tag : PACK+VERIFY OK (exit 0)"; continue }
+            $anyFail = $true
+            $failed = Get-ChildItem -File "out/crackme.$tag*.failed*.exe", $out -ErrorAction SilentlyContinue | Select-Object -First 1
+            $line = "TIER $tag : FAILED (packer exit $code)"
+            if ($failed -and $cdb) {
+              $cmds = 'g; .echo ===EXR===; .exr -1; .echo ===RVA===; ? @rip-0x140000000; q'
+              & $cdb.FullName -g -G -c $cmds $failed.FullName --headless 2>&1 | Out-File "out/cdb-$tag.txt"
+              $exr = (Select-String -Path "out/cdb-$tag.txt" -Pattern 'ExceptionAddress|ExceptionCode|Attempt to (read|write)' | ForEach-Object { $_.Line.Trim() }) -join " ; "
+              if ($exr) { $line += " | RUNTIME CRASH: $exr" } else { $line += " | (ran, no AV record)" }
+            } elseif (-not $failed) {
+              $err = Select-String -Path "out/console-$tag.log" -Pattern 'Error:|panic' | Select-Object -Last 1
+              $line += " | PACK-TIME ABORT (no output PE): " + ($(if ($err) { $err.Line.Trim() } else { "see console-$tag.log" }))
             }
-            Start-Sleep -Seconds 3
-            # WER event — filter to the 'Application Error' provider (Id 1000 is
-            # shared with Perflib, which is NOT the crash record).
-            $evt = Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Application Error'; StartTime=$started.AddMinutes(-1)} -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-            if ($evt) {
-              "===== WER Application Error =====" | Out-File -Append out/crash-summary.txt
-              $evt.Message | Out-File -Append out/crash-summary.txt
-            }
-            # cdb (WinDbg console) gives the faulting RIP, its disassembly, the
-            # owning module and the image-base-relative RVA — the decisive datum.
-            $cdb = Get-ChildItem `
-              "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe", `
-              "C:\Program Files\Windows Kits\10\Debuggers\x64\cdb.exe" -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-            if ($cdb) {
-              # Modules first, decisive lines (faulting insn + RVA) LAST so they
-              # land in the MCP log tail.
-              # Raw bytes around the call site (unambiguous — ub mis-aligns),
-              # plus an aligned forward disasm from the post-call return addr.
-              $cmds = 'g; .echo ===MODULES===; lm; .echo ===EXR===; .exr -1; .echo ===REGS===; r; .echo ===STACK===; k; .echo ===FAULTING-INSN===; u @rip L6; .echo ===RVA(rip-imagebase)===; ? @rip - 0x140000000; .echo ===CALLSITE-BYTES(0xB5590..0xB55D0)===; db crackme_packed_failed+0xb5590 L60; .echo ===POST-RET-INSN===; u crackme_packed_failed+0xb55cd L6; q'
-              & $cdb.FullName -g -G -c $cmds $exe --headless 2>&1 | Out-File out/cdb.txt
-              "===== cdb crash analysis =====" | Out-File -Append out/crash-summary.txt
-              Get-Content out/cdb.txt | Out-File -Append out/crash-summary.txt
-            } else {
-              "cdb.exe not found on runner (no debugger analysis)" | Out-File -Append out/crash-summary.txt
-            }
+            $summary += $line
           }
-          Get-ChildItem -File "crashdumps" -ErrorAction SilentlyContinue | Format-Table Name, Length, LastWriteTime
+          Set-Content out/tier-summary.txt ($summary -join "`n")
+          if ($anyFail) { exit 1 }
 
-      - name: Upload crackme pack evidence
+      - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: crackme-pack-evidence
           path: |
-            out/cl-build.log
-            out/packer-console.log
             out/crackme.exe
-            out/crackme.packed.exe
-            out/crackme.packed.failed*.exe
-            out/crackme-pack.log
-            out/crackme.packed.exe.btgmanifest
-            out/crackme.packed.exe.map
-            out/crackme.packed.exe.sym
-            out/crackme.packed.exe.ownership.csv
-            out/packed-stdout.txt
-            out/packed-stderr.txt
-            out/crash-summary.txt
-            out/cdb.txt
+            out/crackme.*.exe
+            out/pack-*.log
+            out/console-*.log
+            out/cdb-*.txt
+            out/tier-summary.txt
             crashdumps/*.dmp
           if-no-files-found: ignore
 
-      - name: Print evidence to job log (tail-visible)
+      - name: Print tier summary (tail-visible) and fail if any tier failed
         if: always()
         shell: pwsh
         run: |
-          function Dump($path, $tail) {
-            Write-Host ""
-            Write-Host ("========== {0} ==========" -f $path)
-            if (Test-Path $path) {
-              if ($tail -gt 0) { Get-Content $path -Tail $tail | Write-Host }
-              else { Get-Content $path | Write-Host }
-            } else { Write-Host "(absent)" }
-          }
-          Write-Host "===== out directory ====="; Get-ChildItem -File out -ErrorAction SilentlyContinue | Format-Table Name,Length | Out-String | Write-Host
-          Dump "out/packed-stdout.txt" 0
-          Dump "out/packed-stderr.txt" 0
-          Write-Host "===== crashdumps ====="; Get-ChildItem -File crashdumps -ErrorAction SilentlyContinue | Format-Table Name,Length | Out-String | Write-Host
-          Dump "out/crackme-pack.log" 40
-          # Put the packer's own error LAST so it lands in the MCP log tail.
-          if (Test-Path "out/packer-console.log") {
-            Write-Host ""
-            Write-Host "========== packer-console.log : matched error lines =========="
-            Select-String -Path "out/packer-console.log" -Pattern 'error|panic|thread ''main''|unsupported|reject|not supported|Caused by|coverage|ownership|lift|bail|unwrap|Error:' -CaseSensitive:$false |
-              Select-Object -Last 60 | ForEach-Object { Write-Host $_.Line }
-            Write-Host ""
-            Write-Host "========== packer-console.log : last 40 lines =========="
-            Get-Content "out/packer-console.log" -Tail 40 | Write-Host
-          } else { Write-Host "packer-console.log (absent)" }
-          # CRASH SUMMARY LAST so the faulting module+offset lands in the MCP log tail.
-          Write-Host ""
-          Write-Host "########## CRASH SUMMARY (packed runtime) ##########"
-          if (Test-Path out/crash-summary.txt) { Get-Content out/crash-summary.txt | Write-Host }
-          else { Write-Host "(no crash summary — packed exe may not have run)" }
-          Write-Host "####################################################"
-          if ("${{ steps.pack.outcome }}" -eq "failure") {
-            Write-Host "Packing/--verify-output failed (see crash summary above)."
-            exit 1
-          }
+          Write-Host "########## TIER SUMMARY (same crackme.exe, differing pack options) ##########"
+          if (Test-Path out/tier-summary.txt) { Get-Content out/tier-summary.txt | Write-Host }
+          else { Write-Host "(no tier summary produced)" }
+          Write-Host "############################################################################"
+          if ("${{ steps.pack.outcome }}" -eq "failure") { exit 1 }
