@@ -128,7 +128,31 @@ jobs:
             $summary += $line
           }
           Set-Content out/tier-summary.txt ($summary -join "`n")
-          if ($anyFail) { exit 1 }
+          # NOTE: do not exit here; let the ORIG-DISASM step run first.
+          Set-Content out/anyfail.txt ([int]$anyFail)
+
+      - name: Disasm ORIGINAL crackme.exe at fault-related VAs
+        if: always()
+        shell: pwsh
+        run: |
+          # The faulting guest instruction lifted to OP_NATIVE_CALL,4 (= native_call
+          # on the RSP vreg). In the PACKED exe 0xf7c2's predecessor is virtualized so
+          # `ub` fails; the ORIGINAL out/crackme.exe keeps the real bytes. Load it under
+          # cdb WITHOUT running user code (stop at the initial loader breakpoint; the
+          # image is already mapped) and disassemble the real instruction that pushed
+          # return addr 0xf7c2, plus the intended callee at v0=rax (crackme+0x9248) and
+          # the native CRT frame chain (+0x1f12/+0x1d19/+0x1e89).
+          $cdb = Get-ChildItem `
+            "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe", `
+            "C:\Program Files\Windows Kits\10\Debuggers\x64\cdb.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if ($cdb -and (Test-Path out/crackme.exe)) {
+            $oc = '.echo ===ORIG-ub-f7c2===; ub crackme+0xf7c2; .echo ===ORIG-u-f7b0===; u crackme+0xf7b0 l12; .echo ===ORIG-callee-9248===; u crackme+0x9248 l10; .echo ===ORIG-ub-1f12===; ub crackme+0x1f12; .echo ===ORIG-ub-1d19===; ub crackme+0x1d19; .echo ===ORIG-ub-1e89===; ub crackme+0x1e89; q'
+            & $cdb.FullName -c $oc "out/crackme.exe" --headless 2>&1 | Out-File "out/cdb-orig-disasm.txt"
+            Write-Host "########## ORIGINAL crackme.exe disasm (real guest instructions) ##########"
+            Get-Content out/cdb-orig-disasm.txt | Where-Object { $_ -notmatch 'NatVis|Symbol search|Deferred|\.sympath|Microsoft \(R\)|Copyright|Loading|ModLoad|CommandLine|Executable search|Path validation|Response|Shadow|aka\.ms|^\s*\|' } | Write-Host
+            Write-Host "###########################################################################"
+          } else { Write-Host "(cdb or crackme.exe unavailable)" }
 
       - name: Upload evidence
         if: always()
@@ -178,4 +202,4 @@ jobs:
             }
             Write-Host "#############################################################"
           } else { Write-Host "(no .map/.sym produced for tier A)" }
-          if ("${{ steps.pack.outcome }}" -eq "failure") { exit 1 }
+          if ((Test-Path out/anyfail.txt) -and ((Get-Content out/anyfail.txt) -eq "1")) { exit 1 }
