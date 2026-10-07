@@ -575,9 +575,34 @@ pub(super) fn lift_xadd(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<(
 /// Indirect call/jmp.
 pub(super) fn lift_indirect_call(b: &mut BytecodeBuilder, inst: &Instruction) -> Result<()> {
     if inst.op0_kind() == OpKind::Register {
-        let t = vreg(inst.op0_register())?;
+        let reg = inst.op0_register();
+        let t = vreg(reg)?;
+        // BTG-DIAG(temp): a register-form indirect branch on RSP/RBP is almost
+        // certainly a mis-decoded instruction (CFG/boundary error): no real code
+        // does `call/jmp rsp`. Log it so the offending guest VA is pinpointed.
+        if std::env::var_os("BTG_DIAG_INDIRECT").is_some() {
+            eprintln!(
+                "[BTG-DIAG] indirect reg-form {:?} op0={:?} vreg={} VA=0x{:X}  [{}]",
+                inst.code(),
+                reg,
+                t,
+                inst.ip(),
+                inst
+            );
+        }
         b.native_call(t);
     } else if inst.op0_kind() == OpKind::Memory {
+        if std::env::var_os("BTG_DIAG_INDIRECT").is_some() {
+            eprintln!(
+                "[BTG-DIAG] indirect mem-form {:?} VA=0x{:X} base={:?} idx={:?} disp=0x{:X}  [{}]",
+                inst.code(),
+                inst.ip(),
+                inst.memory_base(),
+                inst.memory_index(),
+                inst.memory_displacement64(),
+                inst
+            );
+        }
         let addr = mem_emit(b, inst, 0)?;
         b.mem_load_a(OP_MOV_R_MEM64_A, SCRATCH, addr);
         b.native_call(SCRATCH);

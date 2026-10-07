@@ -97,6 +97,7 @@ jobs:
           )
           $summary = @()
           $anyFail = $false
+          $env:BTG_DIAG_INDIRECT = "1"   # emit [BTG-DIAG] lines for every indirect call/jmp lifted
           foreach ($t in $tiers) {
             $tag = $t.tag
             $out = "out/crackme.$tag.exe"
@@ -202,4 +203,20 @@ jobs:
             }
             Write-Host "#############################################################"
           } else { Write-Host "(no .map/.sym produced for tier A)" }
+          # BTG-DIAG: the spurious register-form indirect branch on RSP/RBP (= the
+          # mis-decoded `call/jmp rsp` that lifted to OP_NATIVE_CALL,4). Its VA is
+          # the exact guest address to inspect/fix.
+          if (Test-Path out/console-A-plainvm.log) {
+            Write-Host ""
+            Write-Host "########## TIER A BTG-DIAG indirect branches (RSP/RBP = suspect) ##########"
+            Select-String -Path out/console-A-plainvm.log -Pattern 'BTG-DIAG' |
+              Where-Object { $_.Line -match 'op0=RSP|op0=RBP|op0=Rsp|op0=Rbp' } |
+              Select-Object -First 20 | ForEach-Object { Write-Host $_.Line.Trim() }
+            Write-Host "---- total BTG-DIAG indirect lines ----"
+            (Select-String -Path out/console-A-plainvm.log -Pattern 'BTG-DIAG').Count | ForEach-Object { Write-Host "count=$_" }
+            Write-Host "---- first 12 BTG-DIAG lines (context) ----"
+            Select-String -Path out/console-A-plainvm.log -Pattern 'BTG-DIAG' |
+              Select-Object -First 12 | ForEach-Object { Write-Host $_.Line.Trim() }
+            Write-Host "##########################################################################"
+          }
           if ((Test-Path out/anyfail.txt) -and ((Get-Content out/anyfail.txt) -eq "1")) { exit 1 }
