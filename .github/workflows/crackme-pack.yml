@@ -99,9 +99,10 @@ jobs:
             "--seed", "$env:CRACKME_SEED"
           )
           Write-Host ("packing: btg-packer " + ($packArgs -join " "))
-          & ".\target\release\btg-packer.exe" @packArgs
-          Write-Host ("packer exit={0}" -f $LASTEXITCODE)
-          exit $LASTEXITCODE
+          & ".\target\release\btg-packer.exe" @packArgs 2>&1 | Tee-Object -FilePath out/packer-console.log
+          $code = $LASTEXITCODE
+          Write-Host ("packer exit={0}" -f $code)
+          exit $code
 
       - name: Run packed crackme --headless and capture crash
         if: always()
@@ -132,6 +133,7 @@ jobs:
           name: crackme-pack-evidence
           path: |
             out/cl-build.log
+            out/packer-console.log
             out/crackme.exe
             out/crackme.packed.exe
             out/crackme.packed.failed*.exe
@@ -145,9 +147,28 @@ jobs:
             crashdumps/*.dmp
           if-no-files-found: ignore
 
+      - name: Print evidence to job log (tail-visible)
+        if: always()
+        shell: pwsh
+        run: |
+          function Dump($path, $tail) {
+            Write-Host ""
+            Write-Host ("========== {0} ==========" -f $path)
+            if (Test-Path $path) {
+              if ($tail -gt 0) { Get-Content $path -Tail $tail | Write-Host }
+              else { Get-Content $path | Write-Host }
+            } else { Write-Host "(absent)" }
+          }
+          Write-Host "===== out directory ====="; Get-ChildItem -File out -ErrorAction SilentlyContinue | Format-Table Name,Length | Out-String | Write-Host
+          Dump "out/packer-console.log" 0
+          Dump "out/crackme-pack.log" 200
+          Dump "out/packed-stdout.txt" 0
+          Dump "out/packed-stderr.txt" 0
+          Write-Host "===== crashdumps ====="; Get-ChildItem -File crashdumps -ErrorAction SilentlyContinue | Format-Table Name,Length | Out-String | Write-Host
+
       - name: Fail job if pack/verify failed
         if: steps.pack.outcome == 'failure'
         shell: pwsh
         run: |
-          Write-Host "Packing or --verify-output failed; see [PACKED-RUN] exit code, crackme-pack.log and crashdumps artifact."
+          Write-Host "Packing or --verify-output failed; see the printed packer-console.log / crackme-pack.log above and the evidence artifact."
           exit 1
