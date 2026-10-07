@@ -117,7 +117,7 @@ jobs:
               # chain (dps — image return addresses reveal the VM/native transition
               # frames that handed control to the bad RIP), call stack, and the
               # bytes at RIP / around the OEP boot-stub entry 0x140067E00.
-              $cmds = 'g; .echo ===EXR===; .exr -1; .echo ===REGS===; r; .echo ===RVA(rip-imagebase)===; ? @rip-0x140000000; .echo ===STACK-RETCHAIN===; dps @rsp-0x60 L50; .echo ===K===; k; .echo ===RIPBYTES===; db @rip L10; .echo ===FAULT-CALLSITE(ub 6d403)===; ub 0x14006d403; .echo ===FAULT-HANDLER(u 6d3e0 L24)===; u 0x14006d3e0 L24; .echo ===VMSTATE(vregs @ 0x1400aa000 L24; +0x20=archRSP)===; dps 0x1400aa000 L24; .echo ===OEP-ENTRY(0x67E00) L40===; u 0x140067e00 L40; q'
+              $cmds = 'g; .echo ===EXR===; .exr -1; .echo ===REGS===; r; .echo ===RVA(rip-imagebase)===; ? @rip-0x140000000; .echo ===STACK-RETCHAIN===; dps @rsp-0x60 L50; .echo ===K===; k; .echo ===RIPBYTES===; db @rip L10; .echo ===FAULT-CALLSITE(ub 6d403)===; ub 0x14006d403; .echo ===VREGS(dq r12 L14; v0=rax..+0x20=RSP..+0x78=r15)===; dq @r12 L14; .echo ===ORIG-RETSITE(ub f7c2)===; ub 0x1400f7c2; .echo ===ORIG-RETSITE(u f7c2 L8)===; u 0x1400f7c2 L8; .echo ===OEP-ENTRY(0x67E00) L40===; u 0x140067e00 L40; q'
               & $cdb.FullName -g -G -c $cmds $failed.FullName --headless 2>&1 | Out-File "out/cdb-$tag.txt"
               $exr = (Select-String -Path "out/cdb-$tag.txt" -Pattern 'ExceptionAddress|ExceptionCode|Attempt to (read|write)' | ForEach-Object { $_.Line.Trim() }) -join " ; "
               if ($exr) { $line += " | RUNTIME CRASH: $exr" } else { $line += " | (ran, no AV record)" }
