@@ -1,0 +1,149 @@
+name: Crackme Pack (B->A, 0xC0000005 repro)
+
+# B: build the C++ VaultBreaker crackme game with MSVC.
+# A: pack it with the commercial Program-VM backend and run --verify-output,
+#    so an access-violation (0xC0000005) in the packed image is reproduced on
+#    a real Windows runner, with a crash dump + exit code captured as evidence.
+
+on:
+  push:
+    branches: ["claude/**"]
+    paths:
+      - "test/crackme/**"
+      - ".github/workflows/crackme-pack.yml"
+      - "src/**"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CRACKME_SEED: "3134984190"
+
+jobs:
+  crackme:
+    name: build crackme -> pack -> run -> dump
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: MSVC developer environment (cl.exe on PATH)
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build btg-packer (release)
+        run: cargo build --release --locked
+
+      - name: Build crackme game (B) with MSVC
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          cl /nologo /O2 /EHsc /std:c++17 `
+            test/crackme/vaultbreaker.cpp `
+            /Fe:out/crackme.exe /Fo:out/ `
+            /link user32.lib gdi32.lib
+          if ($LASTEXITCODE -ne 0) { throw "cl.exe failed: $LASTEXITCODE" }
+          if (-not (Test-Path out/crackme.exe)) { throw "crackme.exe not produced" }
+
+      - name: Sanity — run unpacked crackme --headless
+        shell: pwsh
+        run: |
+          $out = & "out/crackme.exe" --headless
+          $code = $LASTEXITCODE
+          $out | Write-Host
+          Write-Host ("unpacked exit={0}" -f $code)
+          if ($code -ne 0) { throw "unpacked crackme did not exit 0 (got $code)" }
+          if (($out -join "`n") -notmatch "cleared=3/3") {
+            throw "unpacked crackme battery did not report cleared=3/3"
+          }
+
+      - name: Configure WER local crash dumps (full)
+        shell: pwsh
+        run: |
+          $dumpDir = Join-Path $PWD "crashdumps"
+          New-Item -ItemType Directory -Force $dumpDir | Out-Null
+          $wer = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps"
+          New-Item -Path $wer -Force | Out-Null
+          Set-ItemProperty -Path $wer -Name DumpFolder -Value $dumpDir -Type ExpandString
+          Set-ItemProperty -Path $wer -Name DumpType   -Value 2 -Type DWord
+          Set-ItemProperty -Path $wer -Name DumpCount  -Value 10 -Type DWord
+
+      - name: Pack crackme with Program-VM + verify (A)
+        id: pack
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $input  = "out/crackme.exe"
+          $output = "out/crackme.packed.exe"
+          Remove-Item -Force $output, "$output.failed.exe" -ErrorAction SilentlyContinue
+          $packArgs = @(
+            "--input", $input,
+            "--output", $output,
+            "--vm", "--vm-oep", "--vm-commercial", "--allow-partial-vm",
+            "--verify-output", "--verify-timeout-secs", "60",
+            "--map", "--sym-map", "--debug", "--log-file", "out/crackme-pack.log",
+            "--seed", "$env:CRACKME_SEED"
+          )
+          Write-Host ("packing: btg-packer " + ($packArgs -join " "))
+          & ".\target\release\btg-packer.exe" @packArgs
+          Write-Host ("packer exit={0}" -f $LASTEXITCODE)
+          exit $LASTEXITCODE
+
+      - name: Run packed crackme --headless and capture crash
+        if: always()
+        shell: pwsh
+        run: |
+          $candidates = @("out/crackme.packed.exe") +
+            (Get-ChildItem -File "out/crackme.packed.failed*.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+          foreach ($exe in $candidates) {
+            if (-not (Test-Path $exe)) { continue }
+            Write-Host "=== running $exe --headless ==="
+            $started = Get-Date
+            $p = Start-Process -FilePath $exe -ArgumentList "--headless" -PassThru -Wait -RedirectStandardOutput "out/packed-stdout.txt" -RedirectStandardError "out/packed-stderr.txt"
+            $bits = [System.BitConverter]::ToUInt32([System.BitConverter]::GetBytes([int32]$p.ExitCode), 0)
+            Write-Host ("[PACKED-RUN] {0} exit=0x{1:X8} ({2})" -f (Split-Path $exe -Leaf), $bits, $p.ExitCode)
+            if (Test-Path "out/packed-stdout.txt") { Write-Host "--- stdout ---"; Get-Content "out/packed-stdout.txt" | Write-Host }
+            if (Test-Path "out/packed-stderr.txt") { Write-Host "--- stderr ---"; Get-Content "out/packed-stderr.txt" | Write-Host }
+            if ($bits -eq 0xC0000005) { Write-Host "[PACKED-RUN] ACCESS_VIOLATION reproduced (0xC0000005)" }
+            Start-Sleep -Seconds 3
+            Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000; StartTime=$started.AddMinutes(-1)} -ErrorAction SilentlyContinue |
+              Select-Object -First 3 TimeCreated, Message | Format-List
+          }
+          Get-ChildItem -File "crashdumps" -ErrorAction SilentlyContinue | Format-Table Name, Length, LastWriteTime
+
+      - name: Upload crackme pack evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crackme-pack-evidence
+          path: |
+            out/crackme.exe
+            out/crackme.packed.exe
+            out/crackme.packed.failed*.exe
+            out/crackme-pack.log
+            out/crackme.packed.exe.btgmanifest
+            out/crackme.packed.exe.map
+            out/crackme.packed.exe.sym
+            out/crackme.packed.exe.ownership.csv
+            out/packed-stdout.txt
+            out/packed-stderr.txt
+            crashdumps/*.dmp
+          if-no-files-found: ignore
+
+      - name: Fail job if pack/verify failed
+        if: steps.pack.outcome == 'failure'
+        shell: pwsh
+        run: |
+          Write-Host "Packing or --verify-output failed; see [PACKED-RUN] exit code, crackme-pack.log and crashdumps artifact."
+          exit 1
