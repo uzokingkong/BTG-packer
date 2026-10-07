@@ -125,12 +125,29 @@ jobs:
               "[PACKED-RUN] ACCESS_VIOLATION reproduced (0xC0000005)" | Out-File -Append out/crash-summary.txt
             }
             Start-Sleep -Seconds 3
-            $evt = Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000; StartTime=$started.AddMinutes(-1)} -ErrorAction SilentlyContinue |
+            # WER event — filter to the 'Application Error' provider (Id 1000 is
+            # shared with Perflib, which is NOT the crash record).
+            $evt = Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Application Error'; StartTime=$started.AddMinutes(-1)} -ErrorAction SilentlyContinue |
               Select-Object -First 1
             if ($evt) {
-              # WER event 1000: faulting app, faulting MODULE + offset, exception code.
+              "===== WER Application Error =====" | Out-File -Append out/crash-summary.txt
               $evt.Message | Out-File -Append out/crash-summary.txt
-              $evt.Message | Write-Host
+            }
+            # cdb (WinDbg console) gives the faulting RIP, its disassembly, the
+            # owning module and the image-base-relative RVA — the decisive datum.
+            $cdb = Get-ChildItem `
+              "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe", `
+              "C:\Program Files\Windows Kits\10\Debuggers\x64\cdb.exe" -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if ($cdb) {
+              # Modules first, decisive lines (faulting insn + RVA) LAST so they
+              # land in the MCP log tail.
+              $cmds = 'g; .echo ===MODULES===; lm; .echo ===LASTEVENT===; .lastevent; .echo ===EXR===; .exr -1; .echo ===REGS===; r; .echo ===FAULTING-INSN===; u @rip L6; .echo ===RVA(rip-imagebase)===; ? @rip - 0x140000000; q'
+              & $cdb.FullName -g -G -c $cmds $exe --headless 2>&1 | Out-File out/cdb.txt
+              "===== cdb crash analysis =====" | Out-File -Append out/crash-summary.txt
+              Get-Content out/cdb.txt | Out-File -Append out/crash-summary.txt
+            } else {
+              "cdb.exe not found on runner (no debugger analysis)" | Out-File -Append out/crash-summary.txt
             }
           }
           Get-ChildItem -File "crashdumps" -ErrorAction SilentlyContinue | Format-Table Name, Length, LastWriteTime
@@ -154,6 +171,7 @@ jobs:
             out/packed-stdout.txt
             out/packed-stderr.txt
             out/crash-summary.txt
+            out/cdb.txt
             crashdumps/*.dmp
           if-no-files-found: ignore
 
