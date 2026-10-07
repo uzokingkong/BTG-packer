@@ -113,7 +113,11 @@ jobs:
             $failed = Get-ChildItem -File "out/crackme.$tag*.failed*.exe", $out -ErrorAction SilentlyContinue | Select-Object -First 1
             $line = "TIER $tag : FAILED (packer exit $code)"
             if ($failed -and $cdb) {
-              $cmds = 'g; .echo ===EXR===; .exr -1; .echo ===RVA===; ? @rip-0x140000000; q'
+              # Full control-flow trace at the fault: registers, the stack return
+              # chain (dps — image return addresses reveal the VM/native transition
+              # frames that handed control to the bad RIP), call stack, and the
+              # bytes at RIP / around the OEP boot-stub entry 0x140067E00.
+              $cmds = 'g; .echo ===EXR===; .exr -1; .echo ===REGS===; r; .echo ===RVA(rip-imagebase)===; ? @rip-0x140000000; .echo ===STACK-RETCHAIN===; dps @rsp-0x60 L50; .echo ===K===; k; .echo ===RIPBYTES===; db @rip L10; .echo ===OEP-ENTRY(0x67E00) L40===; u 0x140067e00 L40; q'
               & $cdb.FullName -g -G -c $cmds $failed.FullName --headless 2>&1 | Out-File "out/cdb-$tag.txt"
               $exr = (Select-String -Path "out/cdb-$tag.txt" -Pattern 'ExceptionAddress|ExceptionCode|Attempt to (read|write)' | ForEach-Object { $_.Line.Trim() }) -join " ; "
               if ($exr) { $line += " | RUNTIME CRASH: $exr" } else { $line += " | (ran, no AV record)" }
@@ -149,4 +153,12 @@ jobs:
           if (Test-Path out/tier-summary.txt) { Get-Content out/tier-summary.txt | Write-Host }
           else { Write-Host "(no tier summary produced)" }
           Write-Host "############################################################################"
+          # Tier A = plain --vm-oep core. Dump its full cdb trace LAST (tail-visible)
+          # so the fault registers + stack return chain + OEP entry disasm are read.
+          if (Test-Path out/cdb-A-plainvm.txt) {
+            Write-Host ""
+            Write-Host "########## TIER A (plain VM-OEP) cdb trace ##########"
+            Get-Content out/cdb-A-plainvm.txt | Where-Object { $_ -notmatch 'NatVis|Symbol search|Deferred|\.sympath|Microsoft \(R\)|Copyright|Loading' } | Write-Host
+            Write-Host "####################################################"
+          }
           if ("${{ steps.pack.outcome }}" -eq "failure") { exit 1 }
