@@ -119,10 +119,19 @@ jobs:
             Write-Host ("[PACKED-RUN] {0} exit=0x{1:X8} ({2})" -f (Split-Path $exe -Leaf), $bits, $p.ExitCode)
             if (Test-Path "out/packed-stdout.txt") { Write-Host "--- stdout ---"; Get-Content "out/packed-stdout.txt" | Write-Host }
             if (Test-Path "out/packed-stderr.txt") { Write-Host "--- stderr ---"; Get-Content "out/packed-stderr.txt" | Write-Host }
-            if ($bits -eq 0xC0000005) { Write-Host "[PACKED-RUN] ACCESS_VIOLATION reproduced (0xC0000005)" }
+            "[PACKED-RUN] {0} exit=0x{1:X8} ({2})" -f (Split-Path $exe -Leaf), $bits, $p.ExitCode | Out-File -Append out/crash-summary.txt
+            if ($bits -eq 0xC0000005) {
+              Write-Host "[PACKED-RUN] ACCESS_VIOLATION reproduced (0xC0000005)"
+              "[PACKED-RUN] ACCESS_VIOLATION reproduced (0xC0000005)" | Out-File -Append out/crash-summary.txt
+            }
             Start-Sleep -Seconds 3
-            Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000; StartTime=$started.AddMinutes(-1)} -ErrorAction SilentlyContinue |
-              Select-Object -First 3 TimeCreated, Message | Format-List
+            $evt = Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000; StartTime=$started.AddMinutes(-1)} -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if ($evt) {
+              # WER event 1000: faulting app, faulting MODULE + offset, exception code.
+              $evt.Message | Out-File -Append out/crash-summary.txt
+              $evt.Message | Write-Host
+            }
           }
           Get-ChildItem -File "crashdumps" -ErrorAction SilentlyContinue | Format-Table Name, Length, LastWriteTime
 
@@ -144,6 +153,7 @@ jobs:
             out/crackme.packed.exe.ownership.csv
             out/packed-stdout.txt
             out/packed-stderr.txt
+            out/crash-summary.txt
             crashdumps/*.dmp
           if-no-files-found: ignore
 
@@ -171,13 +181,16 @@ jobs:
             Select-String -Path "out/packer-console.log" -Pattern 'error|panic|thread ''main''|unsupported|reject|not supported|Caused by|coverage|ownership|lift|bail|unwrap|Error:' -CaseSensitive:$false |
               Select-Object -Last 60 | ForEach-Object { Write-Host $_.Line }
             Write-Host ""
-            Write-Host "========== packer-console.log : last 80 lines =========="
-            Get-Content "out/packer-console.log" -Tail 80 | Write-Host
+            Write-Host "========== packer-console.log : last 40 lines =========="
+            Get-Content "out/packer-console.log" -Tail 40 | Write-Host
           } else { Write-Host "packer-console.log (absent)" }
-
-      - name: Fail job if pack/verify failed
-        if: steps.pack.outcome == 'failure'
-        shell: pwsh
-        run: |
-          Write-Host "Packing or --verify-output failed; see the printed packer-console.log / crackme-pack.log above and the evidence artifact."
-          exit 1
+          # CRASH SUMMARY LAST so the faulting module+offset lands in the MCP log tail.
+          Write-Host ""
+          Write-Host "########## CRASH SUMMARY (packed runtime) ##########"
+          if (Test-Path out/crash-summary.txt) { Get-Content out/crash-summary.txt | Write-Host }
+          else { Write-Host "(no crash summary — packed exe may not have run)" }
+          Write-Host "####################################################"
+          if ("${{ steps.pack.outcome }}" -eq "failure") {
+            Write-Host "Packing/--verify-output failed (see crash summary above)."
+            exit 1
+          }
