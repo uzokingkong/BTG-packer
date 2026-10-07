@@ -154,8 +154,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_status = CreateWindowA("STATIC", "Three locks stand between you and the vault.",
                     WS_CHILD | WS_VISIBLE,
                     20, 178, 420, 48, hwnd, (HMENU)ID_STATUS, NULL, NULL);
-        for (HWND h : { g_level, g_edit, g_unlock, g_status })
-            SendMessageA(h, WM_SETFONT, (WPARAM)g_font, TRUE);
+        HWND ctrls[4] = { g_level, g_edit, g_unlock, g_status };
+        for (int i = 0; i < 4; ++i)
+            SendMessageA(ctrls[i], WM_SETFONT, (WPARAM)g_font, TRUE);
         refresh_labels(hwnd);
         return 0;
     }

@@ -51,9 +51,12 @@ jobs:
           New-Item -ItemType Directory -Force out | Out-Null
           cl /nologo /O2 /EHsc /std:c++17 `
             test/crackme/vaultbreaker.cpp `
-            /Fe:out/crackme.exe /Fo:out/ `
-            /link user32.lib gdi32.lib
-          if ($LASTEXITCODE -ne 0) { throw "cl.exe failed: $LASTEXITCODE" }
+            /Fe:out/crackme.exe /Fo:out/crackme.obj `
+            /link user32.lib gdi32.lib 2>&1 | Tee-Object -FilePath out/cl-build.log
+          $clExit = $LASTEXITCODE
+          Write-Host "--- cl.exe output ---"
+          Get-Content out/cl-build.log | Write-Host
+          if ($clExit -ne 0) { throw "cl.exe failed: $clExit" }
           if (-not (Test-Path out/crackme.exe)) { throw "crackme.exe not produced" }
 
       - name: Sanity — run unpacked crackme --headless
@@ -128,6 +131,7 @@ jobs:
         with:
           name: crackme-pack-evidence
           path: |
+            out/cl-build.log
             out/crackme.exe
             out/crackme.packed.exe
             out/crackme.packed.failed*.exe
