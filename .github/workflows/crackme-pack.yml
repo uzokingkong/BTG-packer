@@ -102,7 +102,7 @@ jobs:
             $out = "out/crackme.$tag.exe"
             Remove-Item -Force "out/crackme.$tag*.exe" -ErrorAction SilentlyContinue
             $packArgs = @("--input","out/crackme.exe","--output",$out) + $t.args + @(
-              "--verify-output","--verify-timeout-secs","60",
+              "--verify-output","--verify-timeout-secs","60","--map","--sym-map",
               "--debug","--log-file","out/pack-$tag.log","--seed","$env:CRACKME_SEED")
             Write-Host "===== TIER $tag : btg-packer $($packArgs -join ' ') ====="
             & ".\target\release\btg-packer.exe" @packArgs 2>&1 | Tee-Object -FilePath "out/console-$tag.log"
@@ -141,6 +141,8 @@ jobs:
             out/pack-*.log
             out/console-*.log
             out/cdb-*.txt
+            out/*.map
+            out/*.sym
             out/tier-summary.txt
             crashdumps/*.dmp
           if-no-files-found: ignore
@@ -161,4 +163,19 @@ jobs:
             Get-Content out/cdb-A-plainvm.txt | Where-Object { $_ -notmatch 'NatVis|Symbol search|Deferred|\.sympath|Microsoft \(R\)|Copyright|Loading' } | Write-Host
             Write-Host "####################################################"
           }
+          # Resolve the decisive tier-A VM-module RVAs to packer map/sym symbols:
+          #   0x6d403 = faulting VM handler (did the bad control transfer)
+          #   0xf7c2  = the code target stored at the stack slot
+          #   0x6b657/0x6a458/0x6a598/0xb0ab8/0xaa000/0xb0950 = transition context
+          $maps = Get-ChildItem "out/crackme.A-plainvm.exe.map","out/crackme.A-plainvm.exe.sym" -ErrorAction SilentlyContinue
+          if ($maps) {
+            Write-Host ""
+            Write-Host "########## TIER A map/sym resolution of fault RVAs ##########"
+            foreach ($rva in @("6d403","6d3","f7c2","6b657","6a458","6a598","b0ab8","aa000","b0950","67e00")) {
+              Write-Host "---- matches for $rva ----"
+              Select-String -Path $maps.FullName -Pattern $rva -SimpleMatch -CaseSensitive:$false |
+                Select-Object -First 4 | ForEach-Object { Write-Host $_.Line.Trim() }
+            }
+            Write-Host "#############################################################"
+          } else { Write-Host "(no .map/.sym produced for tier A)" }
           if ("${{ steps.pack.outcome }}" -eq "failure") { exit 1 }
