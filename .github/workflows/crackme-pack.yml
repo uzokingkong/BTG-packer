@@ -142,7 +142,7 @@ jobs:
             if ($cdb) {
               # Modules first, decisive lines (faulting insn + RVA) LAST so they
               # land in the MCP log tail.
-              $cmds = 'g; .echo ===MODULES===; lm; .echo ===LASTEVENT===; .lastevent; .echo ===EXR===; .exr -1; .echo ===REGS===; r; .echo ===FAULTING-INSN===; u @rip L6; .echo ===RVA(rip-imagebase)===; ? @rip - 0x140000000; q'
+              $cmds = 'g; .echo ===MODULES===; lm; .echo ===EXR===; .exr -1; .echo ===REGS===; r; .echo ===FAULTING-INSN===; u @rip L6; .echo ===RVA(rip-imagebase)===; ? @rip - 0x140000000; .echo ===STACK(kb)===; kb; .echo ===STACK-RVAs===; k; q'
               & $cdb.FullName -g -G -c $cmds $exe --headless 2>&1 | Out-File out/cdb.txt
               "===== cdb crash analysis =====" | Out-File -Append out/crash-summary.txt
               Get-Content out/cdb.txt | Out-File -Append out/crash-summary.txt
