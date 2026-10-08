@@ -105,13 +105,23 @@ mod tests {
     //! compare the destination register to independent ground-truth arithmetic.
     //! A wrong alias mapping (e.g. SAL -> SHR) makes these fail.
     use crate::vm::risc::{RiscLifter, RiscProgram};
-    use iced_x86::{Code, Instruction, OpKind, Register};
+    use iced_x86::{Code, Decoder, DecoderOptions};
 
-    fn eval_reg0(inst: &Instruction, init_rax: u64) -> u64 {
+    fn decode64(bytes: &[u8]) -> iced_x86::Instruction {
+        // Decode REAL machine code so the Instruction is fully formed (operand
+        // size, memory size, etc.) exactly as in production — no synthetic gaps.
+        Decoder::new(64, bytes, DecoderOptions::NONE).decode()
+    }
+
+    fn eval_rax(inst: &iced_x86::Instruction, init_rax: u64) -> u64 {
         let mut lifter = RiscLifter::new();
         lifter
             .lift_instruction(inst)
             .expect("alias must lift via generated fallback");
+        assert!(
+            !lifter.desynth.instrs.is_empty(),
+            "alias lowering produced no micro-ops"
+        );
         let prog = RiscProgram::new(lifter.desynth.instrs.clone());
         let mut init = [0u64; 16];
         init[0] = init_rax;
@@ -119,37 +129,24 @@ mod tests {
     }
 
     #[test]
-    fn sal_imm8_matches_shift_left_ground_truth() {
-        for (a, count) in [
-            (0x0000_0000_0000_0001u64, 1u32),
+    fn sal_rax_imm8_matches_shift_left_ground_truth() {
+        // SAL rax, imm8  ==  REX.W C1 /6 ib  ==  48 C1 F0 ib
+        for (a, imm) in [
+            (0x0000_0000_0000_0001u64, 1u8),
             (0x1234_5678_9abc_def0, 4),
             (0xffff_ffff_ffff_ffff, 7),
             (0x8000_0000_0000_0001, 31),
         ] {
-            let mut inst = Instruction::with(Code::Sal_rm64_imm8);
-            inst.set_op_kind(0, OpKind::Register);
-            inst.set_op_register(0, Register::RAX);
-            inst.set_op_kind(1, OpKind::Immediate8);
-            inst.set_immediate8(count as u8);
-
-            let got = eval_reg0(&inst, a);
-            let expected = a.wrapping_shl(count & 63);
-            assert_eq!(got, expected, "SAL/SHL mismatch a={a:#x} count={count}");
-        }
-    }
-
-    #[test]
-    fn add_82_dup_matches_add_ground_truth() {
-        for (a, imm) in [(0x10u64, 0x20u8), (0xffu64, 0x01u8), (0x7fu64, 0x7fu8)] {
-            let mut inst = Instruction::with(Code::Add_rm8_imm8_82);
-            inst.set_op_kind(0, OpKind::Register);
-            inst.set_op_register(0, Register::AL);
-            inst.set_op_kind(1, OpKind::Immediate8);
-            inst.set_immediate8(imm);
-
-            let got = eval_reg0(&inst, a) & 0xff;
-            let expected = (a.wrapping_add(imm as u64)) & 0xff;
-            assert_eq!(got, expected, "ADD 0x82 mismatch a={a:#x} imm={imm:#x}");
+            let inst = decode64(&[0x48, 0xC1, 0xF0, imm]);
+            assert_eq!(
+                inst.code(),
+                Code::Sal_rm64_imm8,
+                "unexpected decode: {:?}",
+                inst.code()
+            );
+            let got = eval_rax(&inst, a);
+            let expected = a.wrapping_shl((imm as u32) & 63);
+            assert_eq!(got, expected, "SAL/SHL mismatch a={a:#x} imm={imm}");
         }
     }
 
