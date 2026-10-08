@@ -191,12 +191,18 @@ impl DiffResult {
 /// RSP/RBP) and status flags. This is the measurement that turns a confidence
 /// *claim* into a *proof*.
 pub fn differential(code_bytes: &[u8], init: [u64; 16]) -> DiffResult {
+    let btg = btg_eval(code_bytes, init, std::collections::HashMap::new());
+    let sil = run_instruction(code_bytes, &OracleCtx { regs: init, flags: 0 });
+    compare_states(&btg, &sil)
+}
+
+/// Lift and evaluate `code_bytes` on the BTG side with an optional memory seed.
+fn btg_eval(code_bytes: &[u8], init: [u64; 16], mem: std::collections::HashMap<u64, u8>) -> super::RiscEvalState {
     use super::lifter::RiscLifter;
     use super::RiscProgram;
     use iced_x86::{Decoder, DecoderOptions};
     use std::collections::HashMap;
 
-    // BTG side: lift every instruction in the buffer, then evaluate.
     let ip = 0x1_0000u64;
     let mut decoder = Decoder::with_ip(64, code_bytes, ip, DecoderOptions::NONE);
     let mut lifter = RiscLifter::new();
@@ -207,12 +213,12 @@ pub fn differential(code_bytes: &[u8], init: [u64; 16]) -> DiffResult {
         lifter.lift_instruction(&inst).expect("lift");
     }
     let prog = RiscProgram::with_ip_map(lifter.desynth.instrs, ip_map);
-    let btg = prog.eval_state(&init);
+    prog.eval_state_with_mem(&init, mem)
+}
 
-    // Silicon side.
-    let inctx = OracleCtx { regs: init, flags: 0 };
-    let sil = run_instruction(code_bytes, &inctx);
-
+/// Compare a BTG evaluator state against a silicon context: GPRs (excluding
+/// host-reserved RSP/RBP) and status flags.
+fn compare_states(btg: &super::RiscEvalState, sil: &OracleCtx) -> DiffResult {
     let mut res = DiffResult { value_match: true, flags_match: true, mismatches: Vec::new() };
     for i in 0..16 {
         if HOST_RESERVED.contains(&i) {
@@ -236,6 +242,62 @@ pub fn differential(code_bytes: &[u8], init: [u64; 16]) -> DiffResult {
         ));
     }
     res
+}
+
+/// Memory-operand differential (increment 3): run an instruction that reads/
+/// writes memory through a guest base register. A real RW buffer is allocated;
+/// its virtual address is injected into `base_reg` on both sides, the same bytes
+/// seed the silicon buffer and the BTG memory map, and after execution the
+/// watched bytes of the silicon buffer are compared against the BTG memory map.
+/// This is what proves the AUTO_MEMORY_EXACT tier.
+pub fn differential_mem(
+    code_bytes: &[u8],
+    mut init: [u64; 16],
+    base_reg: usize,
+    buf_size: usize,
+    seed: &[(usize, u8)],
+    watch: std::ops::Range<usize>,
+) -> DiffResult {
+    assert!(!HOST_RESERVED.contains(&base_reg), "base reg must be guest-controlled");
+    unsafe {
+        const PAGE_READWRITE: u32 = 0x04;
+        let buf = VirtualAlloc(
+            core::ptr::null_mut(),
+            buf_size.max(16),
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        ) as *mut u8;
+        assert!(!buf.is_null(), "VirtualAlloc RW buffer failed");
+        core::ptr::write_bytes(buf, 0, buf_size);
+
+        let base_va = buf as u64;
+        let mut mem = std::collections::HashMap::new();
+        for &(off, b) in seed {
+            *buf.add(off) = b;
+            mem.insert(base_va + off as u64, b);
+        }
+        init[base_reg] = base_va;
+
+        // BTG side.
+        let btg = btg_eval(code_bytes, init, mem);
+
+        // Silicon side (writes the real buffer in place).
+        let sil = run_instruction(code_bytes, &OracleCtx { regs: init, flags: 0 });
+
+        let mut res = compare_states(&btg, &sil);
+        for off in watch {
+            let addr = base_va + off as u64;
+            let s = *buf.add(off);
+            let b = btg.mem.get(&addr).copied().unwrap_or(0);
+            if s != b {
+                res.value_match = false;
+                res.mismatches.push(format!("mem[+{off}]: btg=0x{b:02X} silicon=0x{s:02X}"));
+            }
+        }
+
+        VirtualFree(buf as *mut core::ffi::c_void, 0, MEM_RELEASE);
+        res
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +331,23 @@ mod tests {
             let d = differential(&[0x48, 0x29, 0xD8], init_with(&[(RAX, a), (RBX, b)]));
             assert!(d.exact(), "SUB {a:#x}-{b:#x} not exact: {:?}", d.mismatches);
         }
+    }
+
+    #[test]
+    fn differential_mem_add_to_memory() {
+        // add [rcx], rbx  (48 01 19): rbx added to the 8 bytes at [rcx].
+        // Seed [rcx..+8] = 0x10, rbx = 5 -> 0x15 at [rcx]; compare value, flags,
+        // and the written memory bytes against silicon.
+        let d = differential_mem(
+            &[0x48, 0x01, 0x19],
+            init_with(&[(RBX, 5)]),
+            RCX,
+            64,
+            &[(0, 0x10)],
+            0..8,
+        );
+        assert!(d.exact(), "add [rcx],rbx value/flags mismatch: {:?}", d.mismatches);
+        assert!(d.value_match, "written memory mismatch: {:?}", d.mismatches);
     }
 
     #[test]
