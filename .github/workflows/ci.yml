@@ -136,58 +136,50 @@ jobs:
         if: always()
         run: cargo test --release --locked self_test::fuzz
 
-      # ── Non-gating: real CPU coverage DB -> codegen gap report ───────────────
-      # Runs the real auditor over all iced-x86 Code values, then feeds the DB to
-      # the standalone generator. Reporting only (continue-on-error) so it can
-      # never red the core gate.
-      - name: Real CPU coverage DB + codegen gap report
+      # ── Real coverage DB -> generator -> feature-on re-coverage loop ─────────
+      # These run after the exact-QA gate (if: always) and have truthful
+      # conclusions (no continue-on-error) so each is an observable signal. The
+      # job may already be red from the pre-existing exact-QA gate; these steps
+      # measure and gate only the codegen pipeline. Each cargo command is on a
+      # single line (no pwsh backtick continuation).
+      - name: Real CPU coverage DB (baseline, feature off)
         if: always()
-        continue-on-error: true
         shell: pwsh
         run: |
           cargo run --release --locked --bin vm-coverage -- --out-dir coverage
-          cargo run --release --manifest-path tools/btg_codegen/Cargo.toml -- `
-            --coverage coverage/vm_coverage.json `
-            --out-dir tools/btg_codegen/generated `
-            --strict
+          Get-ChildItem coverage | Format-Table Name,Length
 
-      - name: Upload real codegen gap report
+      - name: Codegen gap report from real DB
+        if: always()
+        shell: pwsh
+        run: |
+          cargo run --release --manifest-path tools/btg_codegen/Cargo.toml -- --coverage coverage/vm_coverage.json --out-dir tools/btg_codegen/generated --strict
+          Get-ChildItem tools/btg_codegen/generated | Format-Table Name,Length
+
+      - name: Codegen fallback build + re-coverage (feature on)
+        if: always()
+        shell: pwsh
+        run: |
+          cargo run --release --locked --features codegen_fallback --bin vm-coverage -- --out-dir coverage-fallback
+          $b = (Get-Content coverage/vm_coverage.json -Raw | ConvertFrom-Json).summary
+          $f = (Get-Content coverage-fallback/vm_coverage.json -Raw | ConvertFrom-Json).summary
+          $txt = "baseline_unsupported=$($b.unsupported)`nfeature_unsupported=$($f.unsupported)`ndelta_unsupported=$($b.unsupported - $f.unsupported)`nbaseline_lifted_no_micro_op=$($b.lifted_no_micro_op)`nfeature_lifted_no_micro_op=$($f.lifted_no_micro_op)"
+          $txt | Out-File -Encoding utf8 coverage-fallback/delta.txt
+          Get-Content coverage-fallback/delta.txt
+          if ($f.unsupported -gt $b.unsupported) { throw "codegen fallback increased unsupported ($($b.unsupported) -> $($f.unsupported))" }
+
+      - name: Upload codegen real artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: btg-codegen-real-report
+          name: btg-codegen-real
           path: |
             coverage/vm_coverage.json
             coverage/vm_coverage.txt
-            tools/btg_codegen/generated/
-          if-no-files-found: ignore
-
-      # ── Closed loop: build with the generated fallback ON and re-cover ───────
-      # Non-gating. Proves the generate -> build -> re-coverage loop and that the
-      # fallback only REDUCES the unsupported count (never regresses it). The
-      # feature-ON compile itself is already gated by the mandatory
-      # `clippy --all-features` step above.
-      - name: Codegen fallback - build + re-coverage (feature on)
-        if: always()
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          cargo build --release --locked --features codegen_fallback --bin vm-coverage
-          cargo run --release --locked --features codegen_fallback --bin vm-coverage -- --out-dir coverage-fallback
-          $base = (Get-Content coverage/vm_coverage.json -Raw | ConvertFrom-Json).summary.unsupported
-          $fb   = (Get-Content coverage-fallback/vm_coverage.json -Raw | ConvertFrom-Json).summary.unsupported
-          Write-Host "[CODEGEN-FALLBACK] unsupported: baseline=$base feature_on=$fb delta=$($base - $fb)"
-          if ($fb -gt $base) { throw "codegen fallback increased unsupported count ($base -> $fb)" }
-
-      - name: Upload fallback re-coverage
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: btg-codegen-fallback-coverage
-          path: |
             coverage-fallback/vm_coverage.json
-            coverage-fallback/vm_coverage.txt
-          if-no-files-found: ignore
+            coverage-fallback/delta.txt
+            tools/btg_codegen/generated/
+          if-no-files-found: warn
 
   btg-codegen:
     name: btg_codegen generator (standalone)
