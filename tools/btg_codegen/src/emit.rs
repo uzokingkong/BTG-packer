@@ -5,9 +5,10 @@
 //! artifacts (candidate lifter arms + test skeletons), not code that is wired
 //! into the build automatically — integration is a deliberate human step.
 
+use crate::binder::BoundOperand;
 use crate::coverage::CoverageReport;
 use crate::family::classify;
-use crate::rules::{resolve, template_ops_are_known, Strategy};
+use crate::rules::{resolve, semantic_template_bound, template_ops_are_known, Strategy};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,6 +24,12 @@ pub struct PlanEntry {
     pub risc_ops: Vec<String>,
     pub notes: String,
     pub ops_known: bool,
+    /// Confidence tier from the semantic template (Priority 1).
+    pub confidence: String,
+    /// Primary operation width in bits (Priority 2 operand binding; 0 = unbound).
+    pub width_bits: u16,
+    /// Concrete operands bound from the coverage DB's `op_kinds` (Priority 2).
+    pub operands: Vec<BoundOperand>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -77,12 +84,15 @@ pub fn build_plan(report: &CoverageReport) -> Plan {
             .entry(family.as_str().to_string())
             .or_insert(0) += 1;
 
-        let lowering = resolve(family, &rec.mnemonic.to_ascii_uppercase());
+        let mnemonic_upper = rec.mnemonic.to_ascii_uppercase();
+        let lowering = resolve(family, &mnemonic_upper);
         match lowering.strategy {
             Strategy::AutoTemplate => summary.auto_template += 1,
             Strategy::ManualSemantics => summary.manual_semantics += 1,
             Strategy::NativeFallback => summary.native_fallback += 1,
         }
+
+        let template = semantic_template_bound(&lowering, &mnemonic_upper, &rec.op_kinds);
 
         entries.push(PlanEntry {
             code: rec.code.clone(),
@@ -94,6 +104,9 @@ pub fn build_plan(report: &CoverageReport) -> Plan {
             risc_ops: lowering.risc_ops.iter().map(|s| s.to_string()).collect(),
             notes: lowering.notes.to_string(),
             ops_known: template_ops_are_known(&lowering),
+            confidence: template.confidence.as_str().to_string(),
+            width_bits: template.width_bits,
+            operands: crate::binder::bind_operands(family, &rec.op_kinds),
         });
     }
 
@@ -209,22 +222,44 @@ pub fn render_lifter_rules_rs(plan: &Plan) -> String {
 
     for e in plan.entries.iter().filter(|e| e.strategy == "AUTO_TEMPLATE") {
         out.push_str(&format!(
-            "    // ── {} [{}] family={} ──\n",
-            e.mnemonic, e.encoding, e.family
+            "    // ── {} [{}] family={} confidence={} width={} ──\n",
+            e.mnemonic, e.encoding, e.family, e.confidence, e.width_bits
         ));
         out.push_str(&format!("    // {}\n", e.notes));
+        // Bound operands (Priority 2): the concrete dst/src/imm mapping the old
+        // skeletons left as `/* params */`.
+        if e.operands.is_empty() {
+            out.push_str("    // operands: (none recorded in coverage DB)\n");
+        } else {
+            for b in &e.operands {
+                out.push_str(&format!(
+                    "    // operand[{}]: role={:?} class={} width={} slot={:?}{}\n",
+                    b.index,
+                    b.role,
+                    b.class.as_str(),
+                    b.width_bits,
+                    b.slot,
+                    if b.mem_capable { " mem_capable" } else { "" },
+                ));
+            }
+        }
         out.push_str(&format!("    // Code::{} => {{\n", e.code));
         if e.risc_ops.is_empty() {
             out.push_str("    //     // no micro-op (NOP / fence); emit nothing\n");
         } else {
             for op in &e.risc_ops {
                 out.push_str(&format!(
-                    "    //     self.desynth.instrs.push(MicroInstr::new(RiscOp::{}{{ /* params */ }}));\n",
-                    riscop_ident(op)
+                    "    //     self.desynth.instrs.push(MicroInstr::new(RiscOp::{}{{ {} }}));\n",
+                    riscop_ident(op),
+                    operand_hint(&e.operands),
                 ));
             }
         }
-        out.push_str("    //     // TODO: wire operands / widths / flags\n");
+        out.push_str(&format!(
+            "    //     // confidence={} — wire via the bound operands above; \
+             flags/semantics unproven until the oracle (Priority 3)\n",
+            e.confidence
+        ));
         out.push_str("    // }\n\n");
     }
 
@@ -377,6 +412,28 @@ fn riscop_ident(stable: &str) -> String {
             }
         })
         .collect()
+}
+
+/// A compact `dst=… src=… imm=…` hint for the skeleton, built from the bound
+/// operands so a reviewer sees which encoding slot feeds each RiscOp field.
+fn operand_hint(operands: &[BoundOperand]) -> String {
+    use crate::template::OperandRole;
+    if operands.is_empty() {
+        return "/* params */".to_string();
+    }
+    let mut parts = Vec::new();
+    for b in operands {
+        let src = if b.mem_capable { "reg_or_mem" } else { "reg" };
+        match b.role {
+            OperandRole::Dst => parts.push(format!("dst: {src}/*w{}*/", b.width_bits)),
+            OperandRole::ReadWrite => parts.push(format!("dst: {src}/*rw,w{}*/", b.width_bits)),
+            OperandRole::Src => parts.push(format!("src: {src}/*w{}*/", b.width_bits)),
+            OperandRole::Imm => parts.push(format!("imm/*w{}*/", b.width_bits)),
+            OperandRole::Mem => parts.push("mem".to_string()),
+            OperandRole::Implicit => parts.push("implicit".to_string()),
+        }
+    }
+    parts.join(", ")
 }
 
 fn sanitize_ident(s: &str) -> String {

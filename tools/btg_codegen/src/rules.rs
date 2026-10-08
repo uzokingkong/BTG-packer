@@ -384,7 +384,12 @@ pub fn confidence_ceiling(l: &Lowering, mnemonic_upper: &str) -> Confidence {
         Strategy::NativeFallback => Confidence::NativeFallback,
         Strategy::ManualSemantics => Confidence::Manual,
         Strategy::AutoTemplate => {
-            if is_flag_faithful_auto(mnemonic_upper) {
+            // An effect-free hint/fence that lowers to no micro-op is a provable
+            // no-op in the single-threaded reference model (see family.rs): there
+            // is nothing to get wrong, so it is semantically exact.
+            if l.family == Family::NopFence && l.risc_ops.is_empty() {
+                Confidence::AutoSemanticExact
+            } else if is_flag_faithful_auto(mnemonic_upper) {
                 // Flag-exact ceiling; memory/SIMD exactness still unproven, so we
                 // do not claim AutoMemoryExact/AutoSemanticExact yet.
                 Confidence::AutoFlagExact
@@ -453,5 +458,20 @@ pub fn semantic_template(l: &Lowering, mnemonic_upper: &str) -> SemanticTemplate
     // Record the lowering rationale as a side-effect note so the IR carries the
     // same human context the old report did.
     t = t.side_effect(l.notes);
+    t
+}
+
+/// Build the semantic template and bind concrete operands onto it (Priority 2).
+/// `op_kinds` are the iced `OpCodeOperandKind` strings from the coverage DB.
+pub fn semantic_template_bound(
+    l: &Lowering,
+    mnemonic_upper: &str,
+    op_kinds: &[String],
+) -> SemanticTemplate {
+    let mut t = semantic_template(l, mnemonic_upper);
+    if !op_kinds.is_empty() {
+        let bound = crate::binder::bind_operands(l.family, op_kinds);
+        crate::binder::bind_into_template(&mut t, &bound);
+    }
     t
 }

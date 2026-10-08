@@ -256,3 +256,41 @@ fn native_and_manual_map_to_their_tiers() {
     let pdep = semantic_template(&resolve(Family::Bmi, "PDEP"), "PDEP");
     assert_eq!(pdep.confidence, Confidence::Manual);
 }
+
+// ── Priority 2: operand binder ───────────────────────────────────────────────
+
+#[test]
+fn generated_skeleton_carries_bound_operands() {
+    let r = fixture();
+    let plan = build_plan(&r);
+    let rs = render_lifter_rules_rs(&plan);
+
+    // The old `/* params */` placeholder is gone; operands are spelled out.
+    assert!(!rs.contains("/* params */"), "operands should be bound, not placeholder");
+    assert!(rs.contains("operand[0]: role="), "per-operand binding must be emitted");
+    assert!(rs.contains("confidence="), "confidence tier must be surfaced");
+    // A concrete role/class/width binding for a GPR slot.
+    assert!(rs.contains("class=gpr"));
+}
+
+#[test]
+fn plan_entries_bind_width_and_confidence() {
+    let r = fixture();
+    let plan = build_plan(&r);
+
+    // Every auto-template entry should have a confidence tier and, when the DB
+    // recorded operands, a non-zero primary width.
+    let add = plan
+        .entries
+        .iter()
+        .find(|e| e.mnemonic.eq_ignore_ascii_case("add"))
+        .expect("fixture has ADD");
+    assert_eq!(add.confidence, "AUTO_FLAG_EXACT");
+    assert!(!add.operands.is_empty(), "ADD should have bound operands");
+    assert!(add.width_bits > 0, "ADD primary width should be bound");
+
+    // AND stays value-only (pseudo NOR lowering).
+    if let Some(and) = plan.entries.iter().find(|e| e.mnemonic.eq_ignore_ascii_case("and")) {
+        assert_eq!(and.confidence, "AUTO_VALUE_ONLY");
+    }
+}
