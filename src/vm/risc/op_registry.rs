@@ -302,7 +302,7 @@ mod tests {
         assert_eq!(names.len(), RiscOpKind::ALL.len());
         assert_eq!(
             RiscOpKind::ALL.len(),
-            71,
+            72,
             "update registry when RiscOp changes"
         );
     }
