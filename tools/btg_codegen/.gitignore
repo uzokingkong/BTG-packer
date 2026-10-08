@@ -1,0 +1,8 @@
+# Build output
+/target
+Cargo.lock
+
+# Generated artifacts are produced by CI (and locally on demand); do not commit
+# them so they never drift from the rule table.
+/generated/*
+!/generated/.gitkeep

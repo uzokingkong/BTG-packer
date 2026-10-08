@@ -135,3 +135,51 @@ jobs:
       - name: Fuzz regression corpus (mandatory)
         if: always()
         run: cargo test --release --locked self_test::fuzz
+
+  btg-codegen:
+    name: btg_codegen generator (standalone)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tools/btg_codegen/target
+          key: ${{ runner.os }}-btgcodegen-${{ hashFiles('tools/btg_codegen/Cargo.toml') }}
+
+      - name: Build (release)
+        run: cargo build --release --manifest-path tools/btg_codegen/Cargo.toml
+
+      - name: Test (release)
+        run: cargo test --release --manifest-path tools/btg_codegen/Cargo.toml -- --nocapture
+
+      - name: Clippy (strict)
+        run: cargo clippy --manifest-path tools/btg_codegen/Cargo.toml --all-targets -- -D warnings
+
+      - name: E2E smoke on sample fixture (+ template integrity gate)
+        run: |
+          cargo run --release --manifest-path tools/btg_codegen/Cargo.toml -- \
+            --coverage tools/btg_codegen/fixtures/sample_vm_coverage.json \
+            --out-dir tools/btg_codegen/generated \
+            --strict
+          test -f tools/btg_codegen/generated/codegen_report.md
+          test -f tools/btg_codegen/generated/rule_coverage.json
+          test -f tools/btg_codegen/generated/lifter_rules.generated.rs
+          test -f tools/btg_codegen/generated/semantic_tests.generated.rs
+
+      - name: Upload generated artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btg-codegen-generated
+          path: tools/btg_codegen/generated/
+          if-no-files-found: ignore
