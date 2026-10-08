@@ -613,6 +613,39 @@ pub fn build_self_decoding_parts_with_variant_plan(
             }
         }
     }
+    // Native-call return sites (B-fix). A lifted call is
+    // `VirtualPush(Imm64 ret_ip); {VirtualBranch | VirtualIndirectCall}`, and the
+    // continuation is the micro-op two positions later. After an internal callee
+    // (VirtualRet) OR a native bridge returns, the resume looks `ret_ip` up in
+    // this map. When the return site's VA is not an `ip_map` key — e.g. a
+    // mid-block return after a Win32 callback bridges out to DefWindowProcW and
+    // the original .text has been scrubbed/NX at full VM coverage — the lookup
+    // would miss and the raw VA was misread as a bytecode offset (0xC0000005).
+    // Register `ret_ip -> fallthrough byte offset` explicitly so the resume
+    // always resolves to the correct VM continuation, independent of .text.
+    for i in 0..prog.instrs.len() {
+        if prog.instrs[i].op != RiscOp::VirtualPush {
+            continue;
+        }
+        let Some(MicroOperand::Imm64(ret_ip)) = prog.instrs[i].src1 else {
+            continue;
+        };
+        let is_call = prog
+            .instrs
+            .get(i + 1)
+            .map(|n| {
+                matches!(n.op, RiscOp::VirtualBranch { .. } | RiscOp::VirtualIndirectCall)
+            })
+            .unwrap_or(false);
+        if !is_call {
+            continue;
+        }
+        if let Some(&resume_off) = op_offsets.get(i + 2) {
+            if !entries.iter().any(|(k, _)| *k == ret_ip) {
+                entries.push((ret_ip, resume_off as u64));
+            }
+        }
+    }
     entries.sort_unstable_by_key(|e| e.0);
     entries.dedup_by_key(|e| e.0);
 
