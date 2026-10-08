@@ -2614,10 +2614,27 @@ pub fn lift_program_cfg_commercial_with_model(
         let mut lifter = RiscLifter::new();
         let mut failed = false;
         for i in &real {
-            if let Err(err) = lifter.lift_instruction(i) {
+            // Count EVERY unsupported instruction, not just the first blocker:
+            //   * lift failures (RiscLifter rejects the instruction), and
+            //   * instructions that lift but produce a VM op the commercial ISA
+            //     cannot encode (UnsupportedVmOpcode) — previously uncounted.
+            let before = lifter.desynth.instrs.len();
+            let failure: Option<(UnsupportedStage, String)> = match lifter.lift_instruction(i) {
+                Err(err) => Some((UnsupportedStage::Lift, err.to_string())),
+                Ok(()) => lifter.desynth.instrs[before..]
+                    .iter()
+                    .find(|op| !VirtualIsaSpec::is_encodable(op.op))
+                    .map(|op| {
+                        (
+                            UnsupportedStage::Encode,
+                            format!("commercial ISA cannot encode {:?}", op.op),
+                        )
+                    }),
+            };
+            if let Some((stage, detail)) = failure {
                 failed = true;
                 unsupported.push((format!("0x{:X}", i.ip()), i.code()));
-                unsupported_reasons.push((i.ip(), err.to_string()));
+                unsupported_reasons.push((i.ip(), detail.clone()));
 
                 let function_va = indexed_function_owner(&all_function_ranges, i.ip())
                     .map(|(start, _)| start)
@@ -2659,8 +2676,8 @@ pub fn lift_program_cfg_commercial_with_model(
                     instruction_rva,
                     i,
                     raw_bytes,
-                    UnsupportedStage::Lift,
-                    err.to_string(),
+                    stage,
+                    detail,
                 )?)?;
             }
         }
