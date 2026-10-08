@@ -7,6 +7,7 @@ pub mod binder;
 pub mod coverage;
 pub mod emit;
 pub mod family;
+pub mod registry;
 pub mod rules;
 pub mod simd;
 pub mod template;

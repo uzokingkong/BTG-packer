@@ -44,6 +44,12 @@ struct Args {
     /// (template-integrity gate for CI).
     #[arg(long)]
     strict: bool,
+
+    /// Validate auto-template RiscOps against the LIVE registry emitted by the
+    /// `btg-op-registry` binary (op_registry.json), not just the built-in const.
+    /// This is the anti-drift gate for the closed loop.
+    #[arg(long)]
+    op_registry: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -76,11 +82,31 @@ fn main() -> Result<()> {
     println!("  native-fallback     : {}", s.native_fallback);
     println!("  output              : {}", args.out_dir.display());
 
+    // Anti-drift gate: validate against the live registry when provided.
+    let live = match &args.op_registry {
+        Some(path) => {
+            let reg = btg_codegen::registry::OpRegistry::load(path)?;
+            println!("  op-registry         : {} ops (live, {})", reg.count, path.display());
+            Some(reg)
+        }
+        None => None,
+    };
+
     if args.strict {
         let bad: Vec<&emit::PlanEntry> = plan
             .entries
             .iter()
-            .filter(|e| e.strategy == "AUTO_TEMPLATE" && !e.ops_known)
+            .filter(|e| {
+                if e.strategy != "AUTO_TEMPLATE" {
+                    return false;
+                }
+                match &live {
+                    // Validate every emitted RiscOp against the live registry.
+                    Some(reg) => e.risc_ops.iter().any(|op| !reg.contains(op)),
+                    // Fall back to the built-in const.
+                    None => !e.ops_known,
+                }
+            })
             .collect();
         if !bad.is_empty() {
             for e in &bad {
