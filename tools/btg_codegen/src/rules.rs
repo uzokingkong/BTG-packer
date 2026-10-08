@@ -12,6 +12,7 @@
 //! to register an op in `VirtualIsaSpec::is_encodable`).
 
 use crate::family::Family;
+use crate::template::{Confidence, ExceptionClass, Flag, SemanticTemplate};
 
 /// Canonical RiscOp stable-names that already exist in the core VM. Kept in sync
 /// with `src/vm/risc/op_registry.rs`. Used to validate that every template only
@@ -349,4 +350,219 @@ pub fn resolve(family: Family, mnemonic_upper: &str) -> Lowering {
 /// Validate that a lowering references only real RiscOps.
 pub fn template_ops_are_known(l: &Lowering) -> bool {
     l.risc_ops.iter().all(|op| KNOWN_RISC_OPS.contains(op))
+}
+
+/// A proposed mechanism for an instruction the RISC core cannot represent today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewPrimitive {
+    /// "NativeBridge" or "new RiscOp".
+    pub mechanism: &'static str,
+    /// Why the current RiscOp vocabulary is insufficient.
+    pub reason: &'static str,
+}
+
+/// Classify a native-fallback family as a "needs new RiscOp / NativeBridge"
+/// candidate, or `None` when it is kept native *by policy* (crypto accelerators,
+/// x87) and is not a gap to close. This separates "we choose to stay native"
+/// from "we cannot express this yet" — the latter are real design candidates
+/// (RDRAND/RDTSC/XSAVE/SYSCALL/MSR/PKU/AMX ...), never fake-lowered.
+pub fn new_primitive_candidate(family: Family) -> Option<NewPrimitive> {
+    use Family::*;
+    match family {
+        Random => Some(NewPrimitive {
+            mechanism: "NativeBridge",
+            reason: "non-deterministic RNG (RDRAND/RDSEED); a pure RiscOp cannot model entropy",
+        }),
+        StateSave => Some(NewPrimitive {
+            mechanism: "NativeBridge",
+            reason: "large architectural state save/restore (XSAVE/FXSAVE family)",
+        }),
+        Amx => Some(NewPrimitive {
+            mechanism: "new RiscOp",
+            reason: "AMX tile state; needs a dedicated tile RiscOp family or native bridge",
+        }),
+        SystemPrivileged => Some(NewPrimitive {
+            mechanism: "NativeBridge",
+            reason: "privileged/system/timing (RDTSC/RDMSR/WRMSR/SYSCALL/PKU/VMX); \
+                     needs a native bridge or new control-transfer RiscOp",
+        }),
+        // Crypto (AES/SHA/PCLMUL) and X87 are intentional native fallbacks by
+        // policy, not missing-primitive gaps.
+        _ => None,
+    }
+}
+
+// ── Semantic IR bridge (Priority 1) ──────────────────────────────────────────
+//
+// `confidence_ceiling` is the *maximum* tier a lowering could ever reach given
+// how it is constructed — an honest static upper bound, NOT a claim that the
+// lowering is already correct. A template's `proven` flag (set only by the
+// differential oracle, Priority 3) stays false until measured, so nothing is
+// auto-emittable yet regardless of ceiling. The one guarantee we make here is
+// the design note's requirement: a pseudo lowering (value-correct but not
+// flag/semantic-exact — AND/OR/XOR/TEST via NOR, NEG via sub, and anything we
+// are not yet confident about) can never exceed `AutoValueOnly`.
+
+/// Mnemonics whose auto-template is flag-faithful by construction: each maps to
+/// a dedicated flag-aware core RiscOp (or writes no flags at all, like MOV).
+/// Everything else that auto-lowers is capped at `AutoValueOnly` until the
+/// oracle proves otherwise.
+fn is_flag_faithful_auto(mnemonic_upper: &str) -> bool {
+    matches!(
+        mnemonic_upper,
+        // Integer ALU mapping 1:1 onto flag-aware ops (add/sub_with_borrow/adc/
+        // sbb/inc/dec/not). NOT writes no flags, so it is trivially flag-exact.
+        "ADD" | "SUB" | "CMP" | "ADC" | "SBB" | "INC" | "DEC" | "NOT"
+        // Flag-transparent data moves (define no flags).
+        | "MOV" | "MOVZX" | "MOVSX" | "MOVSXD"
+    )
+}
+
+/// The honest upper bound on a lowering's confidence tier.
+pub fn confidence_ceiling(l: &Lowering, mnemonic_upper: &str) -> Confidence {
+    match l.strategy {
+        Strategy::NativeFallback => Confidence::NativeFallback,
+        Strategy::ManualSemantics => Confidence::Manual,
+        Strategy::AutoTemplate => {
+            // An effect-free hint/fence that lowers to no micro-op is a provable
+            // no-op in the single-threaded reference model (see family.rs): there
+            // is nothing to get wrong, so it is semantically exact.
+            if l.family == Family::NopFence && l.risc_ops.is_empty() {
+                Confidence::AutoSemanticExact
+            } else if is_flag_faithful_auto(mnemonic_upper) {
+                // Flag-exact ceiling; memory/SIMD exactness still unproven, so we
+                // do not claim AutoMemoryExact/AutoSemanticExact yet.
+                Confidence::AutoFlagExact
+            } else {
+                // Pseudo lowering or anything not yet confidence-classified.
+                Confidence::AutoValueOnly
+            }
+        }
+    }
+}
+
+/// x86 flag *definedness* for the common scalar families, so the report and the
+/// future oracle know which bits a faithful lowering must reproduce. This is the
+/// instruction's spec, independent of whether the lowering achieves it.
+fn flags_for(family: Family, mnemonic_upper: &str) -> (Vec<Flag>, Vec<Flag>) {
+    use Family::*;
+    let all = Flag::ARITH.to_vec();
+    match (family, mnemonic_upper) {
+        // Reads CF, defines all six.
+        (IntegerAlu, "ADC") | (IntegerAlu, "SBB") => (vec![Flag::Cf], all),
+        // INC/DEC define all arithmetic flags EXCEPT CF.
+        (IntegerAlu, "INC") | (IntegerAlu, "DEC") => {
+            (vec![], vec![Flag::Pf, Flag::Af, Flag::Zf, Flag::Sf, Flag::Of])
+        }
+        // NOT writes no flags.
+        (IntegerAlu, "NOT") => (vec![], vec![]),
+        // ADD/SUB/CMP/AND/OR/XOR/TEST/NEG define all six.
+        (IntegerAlu, _) => (vec![], all),
+        // Shifts define CF/OF (and SF/ZF/PF); count-dependent — oracle territory.
+        (ShiftRotate, _) => (vec![], all),
+        // MUL/IMUL define CF/OF; DIV/IDIV leave flags undefined.
+        (MulDiv, "MUL") | (MulDiv, "IMUL") => (vec![], vec![Flag::Cf, Flag::Of]),
+        // Data moves are flag-transparent.
+        (DataMove, _) => (vec![], vec![]),
+        _ => (vec![], vec![]),
+    }
+}
+
+/// Build the semantic template for a resolved lowering. Operand widths/lanes are
+/// left unbound (width 0) until the operand binder (Priority 2); SIMD shape is
+/// scalar until the SIMD engine (Priority 4). This records what we know now:
+/// the mnemonic, flag spec, memory/fault class, and the confidence ceiling.
+pub fn semantic_template(l: &Lowering, mnemonic_upper: &str) -> SemanticTemplate {
+    let ceiling = confidence_ceiling(l, mnemonic_upper);
+    let (flags_read, flags_write) = flags_for(l.family, mnemonic_upper);
+
+    let mem_read = l.risc_ops.iter().any(|op| *op == "memory_read")
+        || l.risc_ops.iter().any(|op| *op == "virtual_pop");
+    let mem_write = l.risc_ops.iter().any(|op| *op == "memory_write")
+        || l.risc_ops.iter().any(|op| *op == "virtual_push");
+
+    let exception = match l.family {
+        Family::MulDiv if matches!(mnemonic_upper, "DIV" | "IDIV") => ExceptionClass::DivideError,
+        _ if mem_read || mem_write => ExceptionClass::MemoryFault,
+        Family::ControlFlow => ExceptionClass::ControlFault,
+        _ => ExceptionClass::None,
+    };
+
+    let mut t = SemanticTemplate::scalar(mnemonic_upper, 0, ceiling)
+        .reads_flags(&flags_read)
+        .writes_flags(&flags_write)
+        .reads_mem(mem_read)
+        .writes_mem(mem_write)
+        .faults(exception);
+
+    // Record the lowering rationale as a side-effect note so the IR carries the
+    // same human context the old report did.
+    t = t.side_effect(l.notes);
+    t
+}
+
+/// Build the semantic template and bind concrete operands onto it (Priority 2).
+/// `op_kinds` are the iced `OpCodeOperandKind` strings from the coverage DB.
+pub fn semantic_template_bound(
+    l: &Lowering,
+    mnemonic_upper: &str,
+    op_kinds: &[String],
+) -> SemanticTemplate {
+    let mut t = semantic_template(l, mnemonic_upper);
+    if !op_kinds.is_empty() {
+        let bound = crate::binder::bind_operands(l.family, op_kinds);
+        crate::binder::bind_into_template(&mut t, &bound);
+    }
+    t
+}
+
+/// Full template build including the SIMD/EVEX parameter engine (Priority 4):
+/// binds operands, fills the SIMD shape (vector length, element width, lanes,
+/// mask/zeroing/broadcast) from the coverage DB decorations, and demotes the
+/// confidence to `Manual` when the form carries EVEX features or a >128-bit
+/// vector that the current 128-bit-slot Packed* ops cannot represent — those
+/// must never be auto-lowered.
+#[allow(clippy::too_many_arguments)]
+pub fn semantic_template_for(
+    l: &Lowering,
+    mnemonic_upper: &str,
+    op_kinds: &[String],
+    encoding: &str,
+    opmask: &str,
+    zeroing: bool,
+    broadcast: bool,
+    can_rounding: bool,
+    can_sae: bool,
+    tuple_type: &str,
+    cpuid: &[String],
+) -> SemanticTemplate {
+    let mut t = semantic_template(l, mnemonic_upper);
+    if op_kinds.is_empty() {
+        return t;
+    }
+    let bound = crate::binder::bind_operands(l.family, op_kinds);
+    crate::binder::bind_into_template(&mut t, &bound);
+
+    let sig = crate::simd::SemanticSignature::new(
+        mnemonic_upper, encoding, &bound, opmask, zeroing, broadcast, can_rounding, can_sae,
+        tuple_type, cpuid,
+    );
+    if sig.simd.is_simd() {
+        t.simd = sig.simd;
+        if sig.needs_parameterized_vector_op() {
+            t.confidence = Confidence::Manual;
+            t = t.side_effect(
+                "EVEX mask/zeroing/broadcast/rounding/SAE or VL>128 — needs a \
+                 parameterized packed-op family; not auto-lowerable onto 128-bit \
+                 slot ops",
+            );
+        } else if sig.is_wide_vector() {
+            t.confidence = Confidence::Manual;
+            t = t.side_effect(
+                "256-bit vector — existing Packed* ops are 128-bit slot based; \
+                 needs lane fan-out",
+            );
+        }
+    }
+    t
 }

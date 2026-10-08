@@ -386,6 +386,20 @@ pub(super) fn emit_native_call(seq: &mut Vec<(Instruction, Option<Cl>)>) {
         Instruction::with2(Code::Mov_r64_rm64, Register::R9, m(Register::R12, 72)).unwrap(),
         None,
     ));
+    // FIX(CFG icall): restore guest RAX (vreg[0]) immediately before the native
+    // call. A Control-Flow-Guard indirect call compiles to
+    //   `mov rax,<target>; call qword ptr [__guard_dispatch_icall_fptr]`
+    // and the dispatch thunk ends in `jmp rax`, i.e. it consumes RAX as the real
+    // branch target. The bridge above clobbers physical RAX for stack-arg
+    // forwarding (`mov rax,[r12+0x20]` = the guest RSP vreg) and never restored
+    // it, so the thunk jumped to that stale RSP value (a non-executable stack
+    // address) -> DEP 0xC0000005 at VM-OEP startup (CRT init). Loading vreg[0]
+    // here is also harmless for ordinary (non-CFG) native calls, where RAX is a
+    // caller-saved scratch the callee overwrites.
+    seq.push((
+        Instruction::with2(Code::Mov_r64_rm64, Register::RAX, m(Register::R12, 0)).unwrap(),
+        None,
+    ));
     seq.push((
         Instruction::with1(Code::Call_rm64, Register::R11).unwrap(),
         None,

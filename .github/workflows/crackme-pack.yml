@@ -1,0 +1,222 @@
+name: Crackme Pack (B->A, 0xC0000005 repro)
+
+# B: build the C++ VaultBreaker crackme game with MSVC.
+# A: pack it with the commercial Program-VM backend and run --verify-output,
+#    so an access-violation (0xC0000005) in the packed image is reproduced on
+#    a real Windows runner, with a crash dump + exit code captured as evidence.
+
+on:
+  push:
+    branches: ["claude/**"]
+    paths:
+      - "test/crackme/**"
+      - ".github/workflows/crackme-pack.yml"
+      - "src/**"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CRACKME_SEED: "3134984190"
+
+jobs:
+  crackme:
+    name: build crackme -> pack -> run -> dump
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: MSVC developer environment (cl.exe on PATH)
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build btg-packer (release)
+        run: cargo build --release --locked
+
+      - name: Build crackme game (B) with MSVC
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          cl /nologo /O2 /EHsc /std:c++17 `
+            test/crackme/vaultbreaker.cpp `
+            /Fe:out/crackme.exe /Fo:out/crackme.obj `
+            /link user32.lib gdi32.lib 2>&1 | Tee-Object -FilePath out/cl-build.log
+          $clExit = $LASTEXITCODE
+          Write-Host "--- cl.exe output ---"
+          Get-Content out/cl-build.log | Write-Host
+          if ($clExit -ne 0) { throw "cl.exe failed: $clExit" }
+          if (-not (Test-Path out/crackme.exe)) { throw "crackme.exe not produced" }
+
+      - name: Sanity — run unpacked crackme --headless
+        shell: pwsh
+        run: |
+          $out = & "out/crackme.exe" --headless
+          $code = $LASTEXITCODE
+          $out | Write-Host
+          Write-Host ("unpacked exit={0}" -f $code)
+          if ($code -ne 0) { throw "unpacked crackme did not exit 0 (got $code)" }
+          if (($out -join "`n") -notmatch "cleared=3/3") {
+            throw "unpacked crackme battery did not report cleared=3/3"
+          }
+
+      - name: Configure WER local crash dumps (full)
+        shell: pwsh
+        run: |
+          $dumpDir = Join-Path $PWD "crashdumps"
+          New-Item -ItemType Directory -Force $dumpDir | Out-Null
+          $wer = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps"
+          New-Item -Path $wer -Force | Out-Null
+          Set-ItemProperty -Path $wer -Name DumpFolder -Value $dumpDir -Type ExpandString
+          Set-ItemProperty -Path $wer -Name DumpType   -Value 2 -Type DWord
+          Set-ItemProperty -Path $wer -Name DumpCount  -Value 10 -Type DWord
+
+      - name: Pack/verify tier bisection (A plain-VM, B commercial)
+        id: pack
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $cdb = Get-ChildItem `
+            "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe", `
+            "C:\Program Files\Windows Kits\10\Debuggers\x64\cdb.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          $tiers = @(
+            @{ tag = "A-plainvm";    args = @("--vm","--vm-oep","--allow-partial-vm") },
+            @{ tag = "B-commercial"; args = @("--vm","--vm-oep","--vm-commercial","--allow-partial-vm") }
+          )
+          $summary = @()
+          $anyFail = $false
+          $env:BTG_DIAG_INDIRECT = "1"   # emit [BTG-DIAG] lines for every indirect call/jmp lifted
+          foreach ($t in $tiers) {
+            $tag = $t.tag
+            $out = "out/crackme.$tag.exe"
+            Remove-Item -Force "out/crackme.$tag*.exe" -ErrorAction SilentlyContinue
+            $packArgs = @("--input","out/crackme.exe","--output",$out) + $t.args + @(
+              "--verify-output","--verify-timeout-secs","60","--map","--sym-map",
+              "--debug","--log-file","out/pack-$tag.log","--seed","$env:CRACKME_SEED")
+            Write-Host "===== TIER $tag : btg-packer $($packArgs -join ' ') ====="
+            & ".\target\release\btg-packer.exe" @packArgs 2>&1 | Tee-Object -FilePath "out/console-$tag.log"
+            $code = $LASTEXITCODE
+            Write-Host "TIER $tag packer exit=$code"
+            if ($code -eq 0) { $summary += "TIER $tag : PACK+VERIFY OK (exit 0)"; continue }
+            $anyFail = $true
+            $failed = Get-ChildItem -File "out/crackme.$tag*.failed*.exe", $out -ErrorAction SilentlyContinue | Select-Object -First 1
+            $line = "TIER $tag : FAILED (packer exit $code)"
+            if ($failed -and $cdb) {
+              # Full control-flow trace at the fault: registers, the stack return
+              # chain (dps — image return addresses reveal the VM/native transition
+              # frames that handed control to the bad RIP), call stack, and the
+              # bytes at RIP / around the OEP boot-stub entry 0x140067E00.
+              $cmds = 'g; .echo ===EXR===; .exr -1; .echo ===REGS===; r; .echo ===RVA(rip-imagebase)===; ? @rip-0x140000000; .echo ===K===; k; .echo ===VREGS-dq-r12-l14===; dq @r12 l14; .echo ===BYTECODE-at-r13-savedR9===; db @r13-0x20 l40; .echo ===R13-RVA===; ? @r13-0x140000000; .echo ===DISASM-r11-val===; u @r11 l6; .echo ===VMENTRY-b0950===; u 0x1400b0950 l30; .echo ===DISPATCH-b0ab8===; u 0x1400b0a90 l20; .echo ===HANDLER-6a458===; u 0x14006a440 l12; .echo ===HANDLER-6a598===; u 0x14006a580 l12; q'
+              & $cdb.FullName -g -G -c $cmds $failed.FullName --headless 2>&1 | Out-File "out/cdb-$tag.txt"
+              $exr = (Select-String -Path "out/cdb-$tag.txt" -Pattern 'ExceptionAddress|ExceptionCode|Attempt to (read|write)' | ForEach-Object { $_.Line.Trim() }) -join " ; "
+              if ($exr) { $line += " | RUNTIME CRASH: $exr" } else { $line += " | (ran, no AV record)" }
+            } elseif (-not $failed) {
+              $err = Select-String -Path "out/console-$tag.log" -Pattern 'Error:|panic' | Select-Object -Last 1
+              $line += " | PACK-TIME ABORT (no output PE): " + ($(if ($err) { $err.Line.Trim() } else { "see console-$tag.log" }))
+            }
+            $summary += $line
+          }
+          Set-Content out/tier-summary.txt ($summary -join "`n")
+          # NOTE: do not exit here; let the ORIG-DISASM step run first.
+          Set-Content out/anyfail.txt ([int]$anyFail)
+
+      - name: Disasm ORIGINAL crackme.exe at fault-related VAs
+        if: always()
+        shell: pwsh
+        run: |
+          # The faulting guest instruction lifted to OP_NATIVE_CALL,4 (= native_call
+          # on the RSP vreg). In the PACKED exe 0xf7c2's predecessor is virtualized so
+          # `ub` fails; the ORIGINAL out/crackme.exe keeps the real bytes. Load it under
+          # cdb WITHOUT running user code (stop at the initial loader breakpoint; the
+          # image is already mapped) and disassemble the real instruction that pushed
+          # return addr 0xf7c2, plus the intended callee at v0=rax (crackme+0x9248) and
+          # the native CRT frame chain (+0x1f12/+0x1d19/+0x1e89).
+          $cdb = Get-ChildItem `
+            "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe", `
+            "C:\Program Files\Windows Kits\10\Debuggers\x64\cdb.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if ($cdb -and (Test-Path out/crackme.exe)) {
+            $oc = '.echo ===ORIG-ub-f7c2===; ub crackme+0xf7c2; .echo ===ORIG-u-f7b0===; u crackme+0xf7b0 l12; .echo ===ORIG-callee-9248===; u crackme+0x9248 l10; .echo ===ORIG-ub-1f12===; ub crackme+0x1f12; .echo ===ORIG-ub-1d19===; ub crackme+0x1d19; .echo ===ORIG-ub-1e89===; ub crackme+0x1e89; q'
+            & $cdb.FullName -c $oc "out/crackme.exe" --headless 2>&1 | Out-File "out/cdb-orig-disasm.txt"
+            Write-Host "########## ORIGINAL crackme.exe disasm (real guest instructions) ##########"
+            Get-Content out/cdb-orig-disasm.txt | Where-Object { $_ -notmatch 'NatVis|Symbol search|Deferred|\.sympath|Microsoft \(R\)|Copyright|Loading|ModLoad|CommandLine|Executable search|Path validation|Response|Shadow|aka\.ms|^\s*\|' } | Write-Host
+            Write-Host "###########################################################################"
+          } else { Write-Host "(cdb or crackme.exe unavailable)" }
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crackme-pack-evidence
+          path: |
+            out/crackme.exe
+            out/crackme.*.exe
+            out/pack-*.log
+            out/console-*.log
+            out/cdb-*.txt
+            out/*.map
+            out/*.sym
+            out/tier-summary.txt
+            crashdumps/*.dmp
+          if-no-files-found: ignore
+
+      - name: Print tier summary (tail-visible) and fail if any tier failed
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "########## TIER SUMMARY (same crackme.exe, differing pack options) ##########"
+          if (Test-Path out/tier-summary.txt) { Get-Content out/tier-summary.txt | Write-Host }
+          else { Write-Host "(no tier summary produced)" }
+          Write-Host "############################################################################"
+          # Tier A = plain --vm-oep core. Dump its full cdb trace LAST (tail-visible)
+          # so the fault registers + stack return chain + OEP entry disasm are read.
+          if (Test-Path out/cdb-A-plainvm.txt) {
+            Write-Host ""
+            Write-Host "########## TIER A (plain VM-OEP) cdb trace ##########"
+            Get-Content out/cdb-A-plainvm.txt | Where-Object { $_ -notmatch 'NatVis|Symbol search|Deferred|\.sympath|Microsoft \(R\)|Copyright|Loading' } | Write-Host
+            Write-Host "####################################################"
+          }
+          # Resolve the decisive tier-A VM-module RVAs to packer map/sym symbols:
+          #   0x6d403 = faulting VM handler (did the bad control transfer)
+          #   0xf7c2  = the code target stored at the stack slot
+          #   0x6b657/0x6a458/0x6a598/0xb0ab8/0xaa000/0xb0950 = transition context
+          $maps = Get-ChildItem "out/crackme.A-plainvm.exe.map","out/crackme.A-plainvm.exe.sym" -ErrorAction SilentlyContinue
+          if ($maps) {
+            Write-Host ""
+            Write-Host "########## TIER A map/sym resolution of fault RVAs ##########"
+            foreach ($rva in @("6d403","6d3","f7c2","6b657","6a458","6a598","b0ab8","aa000","b0950","67e00")) {
+              Write-Host "---- matches for $rva ----"
+              Select-String -Path $maps.FullName -Pattern $rva -SimpleMatch -CaseSensitive:$false |
+                Select-Object -First 4 | ForEach-Object { Write-Host $_.Line.Trim() }
+            }
+            Write-Host "#############################################################"
+          } else { Write-Host "(no .map/.sym produced for tier A)" }
+          # BTG-DIAG: the spurious register-form indirect branch on RSP/RBP (= the
+          # mis-decoded `call/jmp rsp` that lifted to OP_NATIVE_CALL,4). Its VA is
+          # the exact guest address to inspect/fix.
+          if (Test-Path out/console-A-plainvm.log) {
+            Write-Host ""
+            Write-Host "########## TIER A BTG-DIAG indirect branches (RSP/RBP = suspect) ##########"
+            Select-String -Path out/console-A-plainvm.log -Pattern 'BTG-DIAG' |
+              Where-Object { $_.Line -match 'op0=RSP|op0=RBP|op0=Rsp|op0=Rbp' } |
+              Select-Object -First 20 | ForEach-Object { Write-Host $_.Line.Trim() }
+            Write-Host "---- total BTG-DIAG indirect lines ----"
+            (Select-String -Path out/console-A-plainvm.log -Pattern 'BTG-DIAG').Count | ForEach-Object { Write-Host "count=$_" }
+            Write-Host "---- first 12 BTG-DIAG lines (context) ----"
+            Select-String -Path out/console-A-plainvm.log -Pattern 'BTG-DIAG' |
+              Select-Object -First 12 | ForEach-Object { Write-Host $_.Line.Trim() }
+            Write-Host "##########################################################################"
+          }
+          if ((Test-Path out/anyfail.txt) -and ((Get-Content out/anyfail.txt) -eq "1")) { exit 1 }

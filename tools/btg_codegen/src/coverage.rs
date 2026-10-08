@@ -31,6 +31,24 @@ pub struct CoverageRecord {
     pub cpuid_features: Vec<String>,
     #[serde(default)]
     pub op_kinds: Vec<String>,
+    /// EVEX opmask register selection as recorded by the auditor ("none" / "K1").
+    #[serde(default)]
+    pub opmask: String,
+    /// EVEX zeroing-masking (`{z}`) in effect.
+    #[serde(default)]
+    pub zeroing: bool,
+    /// EVEX embedded broadcast (`{1toN}`) in effect.
+    #[serde(default)]
+    pub broadcast: bool,
+    /// EVEX static rounding control {er} supported by this form.
+    #[serde(default)]
+    pub can_rounding: bool,
+    /// EVEX suppress-all-exceptions {sae} supported by this form.
+    #[serde(default)]
+    pub can_sae: bool,
+    /// EVEX tuple type (disp8 compression class).
+    #[serde(default)]
+    pub tuple_type: String,
     /// Pipeline status string: FULL_PIPELINE / LIFTED_NO_MICRO_OP / UNSUPPORTED /
     /// LIFT_ERROR / EVALUATOR_GAP / ISA_GAP / INTERPRETER_GAP / THREADED_GAP / ...
     #[serde(default)]

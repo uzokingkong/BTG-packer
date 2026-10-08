@@ -75,6 +75,11 @@ impl Default for RiscEvalState {
     }
 }
 
+// Silicon reference oracle (Priority 3 differential validation). Unsafe host
+// JIT execution: test-only, Windows x86-64 only, never in the shipped binary.
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+pub mod oracle;
+
 #[cfg(test)]
 mod bridge_abi_tests;
 

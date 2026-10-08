@@ -183,3 +183,189 @@ fn fallback_emits_redispatch_aliases_from_db() {
     assert!(rs.contains("Add_rm8_imm8_82 => Add_rm8_imm8"));
     assert!(rs.contains("self.lift_instruction_inner(&aliased)"));
 }
+
+// ── Priority 1: Semantic IR / confidence tiers ───────────────────────────────
+
+#[test]
+fn semantic_template_tiers_pseudo_vs_faithful() {
+    use btg_codegen::rules::{resolve, semantic_template};
+    use btg_codegen::template::Confidence;
+
+    // Pseudo lowerings (value-correct, flags not reproduced) are pinned at
+    // AUTO_VALUE_ONLY and can never be auto-emitted.
+    for m in ["AND", "OR", "XOR", "TEST", "NEG"] {
+        let l = resolve(Family::IntegerAlu, m);
+        let t = semantic_template(&l, m);
+        assert_eq!(
+            t.confidence,
+            Confidence::AutoValueOnly,
+            "{m} must be AUTO_VALUE_ONLY (pseudo lowering)"
+        );
+        assert!(!t.is_auto_emittable(), "{m} must never auto-emit");
+    }
+
+    // Flag-faithful scalar ALU maps 1:1 onto flag-aware ops -> AUTO_FLAG_EXACT
+    // ceiling (still unproven, so still not auto-emittable yet).
+    for m in ["ADD", "SUB", "CMP", "ADC", "SBB", "INC", "DEC", "NOT"] {
+        let l = resolve(Family::IntegerAlu, m);
+        let t = semantic_template(&l, m);
+        assert_eq!(
+            t.confidence,
+            Confidence::AutoFlagExact,
+            "{m} should carry an AUTO_FLAG_EXACT ceiling"
+        );
+        assert!(!t.is_auto_emittable(), "{m} is unproven -> not auto-emittable");
+    }
+}
+
+#[test]
+fn semantic_template_records_flag_and_memory_spec() {
+    use btg_codegen::rules::{resolve, semantic_template};
+    use btg_codegen::template::{ExceptionClass, Flag};
+
+    // ADC consumes CF and defines all six arithmetic flags.
+    let adc = semantic_template(&resolve(Family::IntegerAlu, "ADC"), "ADC");
+    assert!(adc.flags_read.contains(&Flag::Cf));
+    assert!(adc.flags_write.contains(&Flag::Of));
+
+    // INC defines every arithmetic flag except CF.
+    let inc = semantic_template(&resolve(Family::IntegerAlu, "INC"), "INC");
+    assert!(!inc.flags_write.contains(&Flag::Cf));
+    assert!(inc.flags_write.contains(&Flag::Zf));
+
+    // DIV carries the divide-error fault class.
+    let div = semantic_template(&resolve(Family::MulDiv, "DIV"), "DIV");
+    assert_eq!(div.exception, ExceptionClass::DivideError);
+
+    // MOV is flag-transparent and memory-capable.
+    let mov = semantic_template(&resolve(Family::DataMove, "MOV"), "MOV");
+    assert!(mov.flags_write.is_empty());
+    assert!(mov.mem_read && mov.mem_write);
+}
+
+#[test]
+fn native_and_manual_map_to_their_tiers() {
+    use btg_codegen::rules::{resolve, semantic_template};
+    use btg_codegen::template::Confidence;
+
+    // Crypto is an intentional native fallback.
+    let aes = semantic_template(&resolve(Family::Crypto, "AESENC"), "AESENC");
+    assert_eq!(aes.confidence, Confidence::NativeFallback);
+
+    // BMI needs hand-written semantics.
+    let pdep = semantic_template(&resolve(Family::Bmi, "PDEP"), "PDEP");
+    assert_eq!(pdep.confidence, Confidence::Manual);
+}
+
+// ── Priority 2: operand binder ───────────────────────────────────────────────
+
+#[test]
+fn generated_skeleton_carries_bound_operands() {
+    let r = fixture();
+    let plan = build_plan(&r);
+    let rs = render_lifter_rules_rs(&plan);
+
+    // The old `/* params */` placeholder is gone; operands are spelled out.
+    assert!(!rs.contains("/* params */"), "operands should be bound, not placeholder");
+    assert!(rs.contains("operand[0]: role="), "per-operand binding must be emitted");
+    assert!(rs.contains("confidence="), "confidence tier must be surfaced");
+    // A concrete role/class/width binding for a GPR slot.
+    assert!(rs.contains("class=gpr"));
+}
+
+#[test]
+fn plan_entries_bind_width_and_confidence() {
+    let r = fixture();
+    let plan = build_plan(&r);
+
+    // Every auto-template entry should have a confidence tier and, when the DB
+    // recorded operands, a non-zero primary width.
+    let add = plan
+        .entries
+        .iter()
+        .find(|e| e.mnemonic.eq_ignore_ascii_case("add"))
+        .expect("fixture has ADD");
+    assert_eq!(add.confidence, "AUTO_FLAG_EXACT");
+    assert!(!add.operands.is_empty(), "ADD should have bound operands");
+    assert!(add.width_bits > 0, "ADD primary width should be bound");
+
+    // AND stays value-only (pseudo NOR lowering).
+    if let Some(and) = plan.entries.iter().find(|e| e.mnemonic.eq_ignore_ascii_case("and")) {
+        assert_eq!(and.confidence, "AUTO_VALUE_ONLY");
+    }
+}
+
+// ── Priority 4: SIMD / EVEX parameter engine ─────────────────────────────────
+
+#[test]
+fn simd_params_and_evex_demotion_in_plan() {
+    let r = fixture();
+    let plan = build_plan(&r);
+
+    // Scalar SS/SD forms are a single lane, not VL/elem lanes.
+    if let Some(s) = plan.entries.iter().find(|e| e.mnemonic.eq_ignore_ascii_case("addss")) {
+        assert_eq!(s.vector_len, 128);
+        assert_eq!(s.element_bits, 32);
+        assert_eq!(s.lanes, 1, "ADDSS is scalar: one lane");
+    }
+
+    // EVEX 512-bit masked form must be demoted to MANUAL (cannot auto-lower onto
+    // the 128-bit slot ops) and expose its decorations + 16 packed lanes.
+    if let Some(z) = plan.entries.iter().find(|e| e.vector_len == 512) {
+        assert_eq!(z.confidence, "MANUAL", "EVEX 512-bit must not auto-lower");
+        assert_eq!(z.lanes, 16, "512-bit / 32-bit elem = 16 lanes");
+        assert!(z.masked || z.zeroing, "EVEX form should record its mask decoration");
+        // Priority 4: rounding/SAE and tuple type flow from the coverage DB.
+        assert!(z.rounding_sae, "EVEX {{er}}/{{sae}} support must be recorded");
+        assert_eq!(z.tuple_type, "Full", "EVEX tuple type must flow through");
+    }
+
+    // A 256-bit VEX vector is demoted to MANUAL (needs lane fan-out).
+    if let Some(y) = plan.entries.iter().find(|e| e.vector_len == 256) {
+        assert_eq!(y.confidence, "MANUAL", "256-bit vector needs lane fan-out");
+    }
+}
+
+#[test]
+fn simd_params_surface_in_skeleton() {
+    let r = fixture();
+    let plan = build_plan(&r);
+    let rs = render_lifter_rules_rs(&plan);
+    // Only auto-template entries reach the skeleton; at least the 128-bit packed
+    // ones should print their SIMD shape.
+    if plan.entries.iter().any(|e| e.strategy == "AUTO_TEMPLATE" && e.vector_len != 0) {
+        assert!(rs.contains("simd: VL="), "SIMD shape must be surfaced in the skeleton");
+    }
+}
+
+// ── New RiscOp / NativeBridge candidate surfacing ────────────────────────────
+
+#[test]
+fn new_primitive_candidates_are_surfaced_and_split_from_policy() {
+    let r = fixture();
+    let plan = build_plan(&r);
+    let md = render_report_md(&plan);
+
+    // The report has the dedicated candidates section.
+    assert!(md.contains("## Needs new RiscOp / NativeBridge (candidates)"));
+
+    // RNG / state-save / privileged families, when present as gaps, are tagged
+    // as candidates; crypto / x87 are NOT (kept native by policy).
+    for e in plan.entries.iter().filter(|e| e.strategy == "NATIVE_FALLBACK") {
+        match e.family.as_str() {
+            "Random" | "StateSave" | "SystemPrivileged" | "Amx" => {
+                assert!(e.new_primitive.is_some(), "{} must be a candidate", e.mnemonic);
+            }
+            "Crypto" | "X87" => {
+                assert!(e.new_primitive.is_none(), "{} is native by policy", e.mnemonic);
+            }
+            _ => {}
+        }
+    }
+
+    // Summary counter is consistent with the tagged entries.
+    let tagged = plan.entries.iter().filter(|e| e.new_primitive.is_some()).count();
+    assert_eq!(plan.summary.new_primitive_candidates, tagged);
+    // And candidates never exceed the native-fallback total.
+    assert!(plan.summary.new_primitive_candidates <= plan.summary.native_fallback);
+}
