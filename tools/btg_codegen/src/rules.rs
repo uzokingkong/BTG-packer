@@ -79,6 +79,7 @@ pub const KNOWN_RISC_OPS: &[&str] = &[
     "packed_cmp_gt",
     "packed_unpack",
     "packed_shift_right_q",
+    "packed_shift_left_logical",
     "packed_shuffle",
     "double_shift_left",
     "bit_test",

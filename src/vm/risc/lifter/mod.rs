@@ -1700,6 +1700,9 @@ impl RiscLifter {
             | Code::Movups_xmmm128_xmm | Code::Movaps_xmmm128_xmm
             | Code::Movupd_xmmm128_xmm | Code::Movapd_xmmm128_xmm => self.lift_sse_packed_move(inst)?,
             Code::Psrlq_xmm_imm8 => self.lift_packed_shift_right_q(inst)?,
+            Code::Psllw_xmm_imm8 => self.lift_packed_shift_left(inst, 2, 8)?,
+            Code::Pslld_xmm_imm8 => self.lift_packed_shift_left(inst, 4, 4)?,
+            Code::Psllq_xmm_imm8 => self.lift_packed_shift_left(inst, 8, 2)?,
             Code::Pshufd_xmm_xmmm128_imm8 => self.lift_packed_shuffle(inst, false)?,
             Code::Pshuflw_xmm_xmmm128_imm8 => self.lift_packed_shuffle(inst, true)?,
             Code::Pmovmskb_r32_xmm => self.lift_packed_movmask(inst, false)?,
