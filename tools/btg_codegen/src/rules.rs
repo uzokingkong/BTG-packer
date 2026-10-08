@@ -475,3 +475,49 @@ pub fn semantic_template_bound(
     }
     t
 }
+
+/// Full template build including the SIMD/EVEX parameter engine (Priority 4):
+/// binds operands, fills the SIMD shape (vector length, element width, lanes,
+/// mask/zeroing/broadcast) from the coverage DB decorations, and demotes the
+/// confidence to `Manual` when the form carries EVEX features or a >128-bit
+/// vector that the current 128-bit-slot Packed* ops cannot represent — those
+/// must never be auto-lowered.
+#[allow(clippy::too_many_arguments)]
+pub fn semantic_template_for(
+    l: &Lowering,
+    mnemonic_upper: &str,
+    op_kinds: &[String],
+    encoding: &str,
+    opmask: &str,
+    zeroing: bool,
+    broadcast: bool,
+    cpuid: &[String],
+) -> SemanticTemplate {
+    let mut t = semantic_template(l, mnemonic_upper);
+    if op_kinds.is_empty() {
+        return t;
+    }
+    let bound = crate::binder::bind_operands(l.family, op_kinds);
+    crate::binder::bind_into_template(&mut t, &bound);
+
+    let sig = crate::simd::SemanticSignature::new(
+        mnemonic_upper, encoding, &bound, opmask, zeroing, broadcast, cpuid,
+    );
+    if sig.simd.is_simd() {
+        t.simd = sig.simd;
+        if sig.needs_parameterized_vector_op() {
+            t.confidence = Confidence::Manual;
+            t = t.side_effect(
+                "EVEX mask/zeroing/broadcast or VL>128 — needs a parameterized \
+                 packed-op family; not auto-lowerable onto 128-bit slot ops",
+            );
+        } else if sig.is_wide_vector() {
+            t.confidence = Confidence::Manual;
+            t = t.side_effect(
+                "256-bit vector — existing Packed* ops are 128-bit slot based; \
+                 needs lane fan-out",
+            );
+        }
+    }
+    t
+}

@@ -8,7 +8,7 @@
 use crate::binder::BoundOperand;
 use crate::coverage::CoverageReport;
 use crate::family::classify;
-use crate::rules::{resolve, semantic_template_bound, template_ops_are_known, Strategy};
+use crate::rules::{resolve, semantic_template_for, template_ops_are_known, Strategy};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -30,6 +30,16 @@ pub struct PlanEntry {
     pub width_bits: u16,
     /// Concrete operands bound from the coverage DB's `op_kinds` (Priority 2).
     pub operands: Vec<BoundOperand>,
+    /// Vector length in bits (Priority 4 SIMD engine; 0 = scalar).
+    pub vector_len: u16,
+    /// Element width in bits for a packed form (Priority 4; 0 = n/a).
+    pub element_bits: u16,
+    /// Lane count for a packed form (Priority 4; 0 = n/a).
+    pub lanes: u16,
+    /// EVEX mask/zeroing/broadcast decorations in effect (Priority 4).
+    pub masked: bool,
+    pub zeroing: bool,
+    pub broadcast: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -92,7 +102,16 @@ pub fn build_plan(report: &CoverageReport) -> Plan {
             Strategy::NativeFallback => summary.native_fallback += 1,
         }
 
-        let template = semantic_template_bound(&lowering, &mnemonic_upper, &rec.op_kinds);
+        let template = semantic_template_for(
+            &lowering,
+            &mnemonic_upper,
+            &rec.op_kinds,
+            &rec.encoding,
+            &rec.opmask,
+            rec.zeroing,
+            rec.broadcast,
+            &rec.cpuid_features,
+        );
 
         entries.push(PlanEntry {
             code: rec.code.clone(),
@@ -107,6 +126,12 @@ pub fn build_plan(report: &CoverageReport) -> Plan {
             confidence: template.confidence.as_str().to_string(),
             width_bits: template.width_bits,
             operands: crate::binder::bind_operands(family, &rec.op_kinds),
+            vector_len: template.simd.vector_len,
+            element_bits: template.simd.element_bits,
+            lanes: template.simd.lanes,
+            masked: template.simd.masked,
+            zeroing: template.simd.zeroing,
+            broadcast: template.simd.broadcast,
         });
     }
 
@@ -225,6 +250,17 @@ pub fn render_lifter_rules_rs(plan: &Plan) -> String {
             "    // ── {} [{}] family={} confidence={} width={} ──\n",
             e.mnemonic, e.encoding, e.family, e.confidence, e.width_bits
         ));
+        if e.vector_len != 0 {
+            out.push_str(&format!(
+                "    // simd: VL={} elem={} lanes={}{}{}{}\n",
+                e.vector_len,
+                e.element_bits,
+                e.lanes,
+                if e.masked { " mask=K1" } else { "" },
+                if e.zeroing { " {z}" } else { "" },
+                if e.broadcast { " {1toN}" } else { "" },
+            ));
+        }
         out.push_str(&format!("    // {}\n", e.notes));
         // Bound operands (Priority 2): the concrete dst/src/imm mapping the old
         // skeletons left as `/* params */`.

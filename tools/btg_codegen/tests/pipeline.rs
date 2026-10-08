@@ -294,3 +294,43 @@ fn plan_entries_bind_width_and_confidence() {
         assert_eq!(and.confidence, "AUTO_VALUE_ONLY");
     }
 }
+
+// ── Priority 4: SIMD / EVEX parameter engine ─────────────────────────────────
+
+#[test]
+fn simd_params_and_evex_demotion_in_plan() {
+    let r = fixture();
+    let plan = build_plan(&r);
+
+    // Scalar SS/SD forms are a single lane, not VL/elem lanes.
+    if let Some(s) = plan.entries.iter().find(|e| e.mnemonic.eq_ignore_ascii_case("addss")) {
+        assert_eq!(s.vector_len, 128);
+        assert_eq!(s.element_bits, 32);
+        assert_eq!(s.lanes, 1, "ADDSS is scalar: one lane");
+    }
+
+    // EVEX 512-bit masked form must be demoted to MANUAL (cannot auto-lower onto
+    // the 128-bit slot ops) and expose its decorations + 16 packed lanes.
+    if let Some(z) = plan.entries.iter().find(|e| e.vector_len == 512) {
+        assert_eq!(z.confidence, "MANUAL", "EVEX 512-bit must not auto-lower");
+        assert_eq!(z.lanes, 16, "512-bit / 32-bit elem = 16 lanes");
+        assert!(z.masked || z.zeroing, "EVEX form should record its mask decoration");
+    }
+
+    // A 256-bit VEX vector is demoted to MANUAL (needs lane fan-out).
+    if let Some(y) = plan.entries.iter().find(|e| e.vector_len == 256) {
+        assert_eq!(y.confidence, "MANUAL", "256-bit vector needs lane fan-out");
+    }
+}
+
+#[test]
+fn simd_params_surface_in_skeleton() {
+    let r = fixture();
+    let plan = build_plan(&r);
+    let rs = render_lifter_rules_rs(&plan);
+    // Only auto-template entries reach the skeleton; at least the 128-bit packed
+    // ones should print their SIMD shape.
+    if plan.entries.iter().any(|e| e.strategy == "AUTO_TEMPLATE" && e.vector_len != 0) {
+        assert!(rs.contains("simd: VL="), "SIMD shape must be surfaced in the skeleton");
+    }
+}
