@@ -169,7 +169,20 @@ jobs:
       # alias (e.g. SAL -> SHR) fails here. Gating (no continue-on-error).
       - name: Codegen fallback - differential tests (feature on)
         if: always()
-        run: cargo test --release --locked --features codegen_fallback --lib generated_fallback -- --nocapture
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $out = (cargo test --release --locked --features codegen_fallback --lib generated_fallback -- --nocapture 2>&1 | Out-String)
+          $code = $LASTEXITCODE
+          Write-Host $out
+          $line = ($out -split "`n" | Where-Object { $_ -match "mismatch|panicked|assertion|unexpected decode|error\[|error:" } | Select-Object -First 1)
+          if (-not $line) { $line = "difftest exit=$code" }
+          $desc = $line.Trim(); if ($desc.Length -gt 139) { $desc = $desc.Substring(0, 139) }
+          $st = if ($code -eq 0) { "success" } else { "failure" }
+          try { gh api -X POST "repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -f state=$st -f context=codegen/difftest -f "description=$desc" | Out-Null } catch { Write-Host "status post skipped: $_" }
+          $global:LASTEXITCODE = 0
+          if ($code -ne 0) { exit 1 }
 
       - name: Codegen fallback build + re-coverage (feature on)
         if: always()
