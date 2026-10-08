@@ -176,7 +176,8 @@ jobs:
           $out = (cargo test --release --locked --features codegen_fallback --lib generated_fallback -- --nocapture 2>&1 | Out-String)
           $code = $LASTEXITCODE
           Write-Host $out
-          $line = ($out -split "`n" | Where-Object { $_ -match "mismatch|panicked|assertion|unexpected decode|error\[|error:" } | Select-Object -First 1)
+          $lines = ($out -split "`n" | Where-Object { $_ -match "mismatch|left:|right:|unexpected decode|assertion|error\[|error:" } | Select-Object -First 3)
+          $line = ($lines -join " | ")
           if (-not $line) { $line = "difftest exit=$code" }
           $desc = $line.Trim(); if ($desc.Length -gt 139) { $desc = $desc.Substring(0, 139) }
           $st = if ($code -eq 0) { "success" } else { "failure" }

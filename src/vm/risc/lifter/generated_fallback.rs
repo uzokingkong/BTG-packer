@@ -128,26 +128,47 @@ mod tests {
         prog.eval_registers(&init)[0]
     }
 
+    // Differential: the SHL lowering that the SAL alias re-dispatches to is
+    // x86-exact. (SAL and SHL share an opcode; iced canonicalizes a decoded
+    // C1 /6 to Shl_*, so SAL is reachable only via the synthetic auditor — we
+    // verify the reused lowering by decoding real SHL bytes.)
     #[test]
-    fn sal_rax_imm8_matches_shift_left_ground_truth() {
-        // SAL rax, imm8  ==  REX.W C1 /6 ib  ==  48 C1 F0 ib
+    fn shl_lowering_matches_ground_truth() {
+        // SHL rax, imm8  ==  REX.W C1 /4 ib  ==  48 C1 E0 ib
         for (a, imm) in [
             (0x0000_0000_0000_0001u64, 1u8),
             (0x1234_5678_9abc_def0, 4),
             (0xffff_ffff_ffff_ffff, 7),
             (0x8000_0000_0000_0001, 31),
         ] {
-            let inst = decode64(&[0x48, 0xC1, 0xF0, imm]);
+            let inst = decode64(&[0x48, 0xC1, 0xE0, imm]);
             assert_eq!(
                 inst.code(),
-                Code::Sal_rm64_imm8,
+                Code::Shl_rm64_imm8,
                 "unexpected decode: {:?}",
                 inst.code()
             );
             let got = eval_rax(&inst, a);
             let expected = a.wrapping_shl((imm as u32) & 63);
-            assert_eq!(got, expected, "SAL/SHL mismatch a={a:#x} imm={imm}");
+            assert_eq!(got, expected, "SHL mismatch a={a:#x} imm={imm}");
         }
+    }
+
+    // The alias table maps each unsupported Code to the correct handled sibling.
+    // This is the mapping half of the SAL/0x82 differential; composed with the
+    // SHL ground-truth test above it verifies the aliases end-to-end.
+    #[test]
+    fn alias_targets_are_correct() {
+        assert_eq!(super::alias_target(Code::Sal_rm64_CL), Some(Code::Shl_rm64_CL));
+        assert_eq!(super::alias_target(Code::Sal_rm64_imm8), Some(Code::Shl_rm64_imm8));
+        assert_eq!(super::alias_target(Code::Sal_rm8_1), Some(Code::Shl_rm8_1));
+        assert_eq!(super::alias_target(Code::Sal_rm32_imm8), Some(Code::Shl_rm32_imm8));
+        assert_eq!(super::alias_target(Code::Add_rm8_imm8_82), Some(Code::Add_rm8_imm8));
+        assert_eq!(super::alias_target(Code::Sub_rm8_imm8_82), Some(Code::Sub_rm8_imm8));
+        assert_eq!(super::alias_target(Code::Adc_rm8_imm8_82), Some(Code::Adc_rm8_imm8));
+        assert_eq!(super::alias_target(Code::Sbb_rm8_imm8_82), Some(Code::Sbb_rm8_imm8));
+        // Non-aliases must not be remapped.
+        assert_eq!(super::alias_target(Code::Mov_r64_rm64), None);
     }
 
     #[test]
