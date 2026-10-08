@@ -84,6 +84,8 @@ Request the measured full-coverage Program-VM contract:
 
 The normal commercial path requires measured **100% function, basic-block and instruction ownership**, zero unresolved internal edges, zero unsupported instructions and zero capability mismatches. Validation also checks that original `.text` bytes do not remain executable or intact in the output. These are build-time measurements for the analyzed image, not a promise that every PE is compatible. VM-owned functions may still call generated native handlers and bridges.
 
+`--text-vm` and `--text-vm-oep` exercise the generic lifter, not the commercial ownership planner. Their instruction-lift percentage is not a forecast of commercial function/block/instruction ownership; use the commercial build manifest and ownership report for that measurement.
+
 For development of a target that fails the coverage gate, use `--allow-partial-vm` and omit `--strict-profile`. Inspect the reported ownership/coverage before describing that output as virtualized; the partial flag expressly relaxes the full-coverage contract. `--vm-oep` takes precedence over native `--dispatcher-reencrypt`, so combining it with `--full --strict-profile` is rejected as a downgrade.
 
 ## Crypto and option boundaries

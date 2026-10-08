@@ -821,6 +821,14 @@ impl RiscLifter {
 
             Code::Lea_r64_m | Code::Lea_r32_m => {
                 let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid dst"))?;
+                // x86 LEA is strictly flag-transparent. The internal address-lowering
+                // expressions (emit_add/zero_extend_dst_if32) produce flags, so preserve
+                // incoming flags across the entire lowering.
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::Mov)
+                        .with_dst(MicroOperand::Temp(7))
+                        .with_src1(MicroOperand::Vflags),
+                );
                 // LEA only computes an address; it never dereferences memory.  Treat
                 // RIP-relative LEA separately from the still-gated RIP-relative
                 // MemoryRead/MemoryWrite path. iced-x86 has already resolved the
@@ -845,6 +853,9 @@ impl RiscLifter {
                         self.zero_extend_dst_if32(inst, dst);
                     }
                 }
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)),
+                );
             }
 
             Code::Add_rm64_r64
@@ -895,6 +906,11 @@ impl RiscLifter {
             | Code::Rol_rm32_1 | Code::Rol_rm32_imm8 | Code::Rol_rm32_CL
             | Code::Rol_rm64_1 | Code::Rol_rm64_imm8 | Code::Rol_rm64_CL
                 => self.lift_rotate_left(inst)?,
+            Code::Ror_rm8_1 | Code::Ror_rm8_imm8 | Code::Ror_rm8_CL
+            | Code::Ror_rm16_1 | Code::Ror_rm16_imm8 | Code::Ror_rm16_CL
+            | Code::Ror_rm32_1 | Code::Ror_rm32_imm8 | Code::Ror_rm32_CL
+            | Code::Ror_rm64_1 | Code::Ror_rm64_imm8 | Code::Ror_rm64_CL
+                => self.lift_rotate_right(inst)?,
             Code::Xor_rm64_r64
             | Code::Xor_r64_rm64
             | Code::Xor_rm32_r32
@@ -1162,6 +1178,18 @@ impl RiscLifter {
             Code::Jrcxz_rel8_16 | Code::Jrcxz_rel8_64 => {
                 let target = inst.near_branch_target();
                 self.emit_jcxz(8, target);
+            }
+            Code::Loop_rel8_16_CX | Code::Loop_rel8_32_CX | Code::Loop_rel8_16_ECX
+            | Code::Loop_rel8_32_ECX | Code::Loop_rel8_64_ECX | Code::Loop_rel8_16_RCX | Code::Loop_rel8_64_RCX => {
+                self.lift_loop(inst, None)?;
+            }
+            Code::Loope_rel8_16_CX | Code::Loope_rel8_32_CX | Code::Loope_rel8_16_ECX
+            | Code::Loope_rel8_32_ECX | Code::Loope_rel8_64_ECX | Code::Loope_rel8_16_RCX | Code::Loope_rel8_64_RCX => {
+                self.lift_loop(inst, Some(true))?;
+            }
+            Code::Loopne_rel8_16_CX | Code::Loopne_rel8_32_CX | Code::Loopne_rel8_16_ECX
+            | Code::Loopne_rel8_32_ECX | Code::Loopne_rel8_64_ECX | Code::Loopne_rel8_16_RCX | Code::Loopne_rel8_64_RCX => {
+                self.lift_loop(inst, Some(false))?;
             }
             Code::Retnq | Code::Retnw => {
                 let width = if code == Code::Retnw { 2 } else { 8 };
@@ -1456,17 +1484,26 @@ impl RiscLifter {
             | Code::Cmovns_r64_rm64 => {
                 let cond = cond_for_cmov(code).expect("cmov cond");
                 let dst = Self::reg_to_vreg(inst.op0_register()).ok_or_else(|| anyhow!("invalid cmov dst"))?;
+                let is_mem = inst.op1_kind() == OpKind::Memory;
+                let is32 = inst.op0_register().size() == 4;
+                if is_mem || is32 {
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Mov)
+                            .with_dst(MicroOperand::Temp(7))
+                            .with_src1(MicroOperand::Vflags),
+                    );
+                }
                 let src = self.operand_value(inst, 1)?;
-                let w = inst.op0_register().full_register();
-                let is32 = matches!(w, Register::EAX | Register::ECX | Register::EDX | Register::EBX
-                    | Register::ESP | Register::EBP | Register::ESI | Register::EDI
-                    | Register::R8D | Register::R9D | Register::R10D | Register::R11D
-                    | Register::R12D | Register::R13D | Register::R14D | Register::R15D);
                 let src = if is32 {
                     self.mask_operand(src, 4)?
                 } else {
                     src
                 };
+                if is_mem || is32 {
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::SetFlag).with_src1(MicroOperand::Temp(7)),
+                    );
+                }
                 self.desynth.instrs.push(
                     MicroInstr::new(RiscOp::ConditionalMove { cond })
                         .with_dst(dst)

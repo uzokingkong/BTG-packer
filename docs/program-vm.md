@@ -70,6 +70,8 @@ The ownership layer exists to prevent a partial or ambiguous function from being
 
 Ownership also propagates through semantic dependencies where required: a function can become native-owned because a dependency cannot be represented safely even if the function's local instructions appear individually liftable.
 
+Latency-sensitive native roots are selected from GUI, wait, spin, timer, allocator and string imports. The default preserves the directly matching functions and leaves VM/native call boundaries to the generated bridge. The older transitive wrapper/callee closure can pull a large shared CRT graph into native ownership, so it is opt-in with `BTG_NATIVE_HOT_CLOSURE=1`. `BTG_NATIVE_HOT_CLASSES` can restrict which root classes are selected; use this only when investigating a concrete compatibility or performance issue.
+
 ## Commercial coverage
 
 The pipeline records:
@@ -86,6 +88,8 @@ capability_mismatches
 The normal commercial contract is intentionally fail-closed. A generated VM module is not sufficient proof of complete virtualization; measured original-program ownership must satisfy the configured coverage gate.
 
 `--allow-partial-vm` is the explicit development escape hatch for incomplete coverage and is incompatible with strict-profile operation.
+
+`--text-vm` and `--text-vm-oep` use the generic lift diagnostic and do not apply commercial ownership policy. Their instruction-lift percentage is not a forecast of commercial function/block/instruction ownership; use a commercial pack manifest and ownership report for that measurement.
 
 ## Multi-family architecture
 

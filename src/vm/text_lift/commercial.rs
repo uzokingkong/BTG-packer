@@ -537,7 +537,7 @@ fn performance_native_roots(
     image_base: u64,
 ) -> HashMap<(u64, u64), CommercialFirstBlocker> {
     let enabled = std::env::var("BTG_NATIVE_HOT_CLASSES")
-        .unwrap_or_else(|_| "gui,wait,spin,timer,allocator,string".to_string())
+        .unwrap_or_default()
         .to_ascii_lowercase();
     let class_enabled = |class: &str| enabled.split(',').any(|item| item.trim() == class);
     let hot_slots: HashMap<u64, &str> = imports
@@ -1758,7 +1758,7 @@ pub fn lift_program_cfg_commercial_with_model(
     let mut performance_roots =
         performance_native_roots(&all_function_ranges, &blocks, original_imports, image_base);
     let needs_dependency_closure = std::env::var("BTG_NATIVE_HOT_CLASSES")
-        .unwrap_or_else(|_| "gui,wait,spin,timer,allocator,string".to_string())
+        .unwrap_or_default()
         .split(',')
         .any(|class| {
             matches!(

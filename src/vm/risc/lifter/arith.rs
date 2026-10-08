@@ -496,6 +496,192 @@ impl RiscLifter {
         Ok(())
     }
 
+    pub(super) fn lift_rotate_right(&mut self, inst: &Instruction) -> Result<()> {
+        let width = match inst.op0_kind() {
+            OpKind::Register => inst.op0_register().size() as u8,
+            OpKind::Memory => inst.memory_size().size() as u8,
+            _ => return Err(anyhow!("risc lifter: invalid ROR destination")),
+        };
+        let bits = (width as u64) * 8;
+        let count_mask = if width == 8 { 63 } else { 31 };
+        let count_op = match inst.op1_kind() {
+            OpKind::Immediate8 | OpKind::Immediate8to64 => {
+                let imm = inst.immediate8() as u64;
+                let eff = (imm & count_mask) % bits;
+                if eff == 0 {
+                    return Ok(());
+                }
+                let rol_count = bits - eff;
+                MicroOperand::Imm64(rol_count)
+            }
+            OpKind::Register => {
+                let cl = Self::reg_to_vreg(inst.op1_register())
+                    .ok_or_else(|| anyhow!("invalid ROR count register"))?;
+                self.desynth.emit_and(MicroOperand::Temp(6), cl, MicroOperand::Imm64(count_mask));
+                self.desynth.emit_sub(MicroOperand::Temp(6), MicroOperand::Imm64(bits), MicroOperand::Temp(6));
+                self.desynth.emit_and(MicroOperand::Temp(6), MicroOperand::Temp(6), MicroOperand::Imm64(bits - 1));
+                MicroOperand::Temp(6)
+            }
+            _ => {
+                let rol_count = bits - 1;
+                MicroOperand::Imm64(rol_count)
+            }
+        };
+        let op = RiscOp::RotateLeft { width };
+        match inst.op0_kind() {
+            OpKind::Register => {
+                let dst = Self::reg_to_vreg(inst.op0_register())
+                    .ok_or_else(|| anyhow!("invalid ROR dst"))?;
+                if width <= 2 {
+                    self.desynth.instrs.push(
+                        MicroInstr::new(RiscOp::Mov)
+                            .with_dst(MicroOperand::Temp(5))
+                            .with_src1(dst),
+                    );
+                }
+                self.desynth.instrs.push(
+                    MicroInstr::new(op)
+                        .with_dst(dst)
+                        .with_src1(dst)
+                        .with_src2(count_op),
+                );
+                if width <= 2 {
+                    self.preserve_upper_from(dst, width, MicroOperand::Temp(5));
+                }
+                self.fixup_ror_cf(dst, width)?;
+            }
+            OpKind::Memory => {
+                let addr = MicroOperand::Temp(4);
+                self.lower_effective_address(inst, addr)?;
+                let val = MicroOperand::Temp(5);
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::MemoryRead { width })
+                        .with_dst(val)
+                        .with_src1(addr),
+                );
+                self.desynth.instrs.push(
+                    MicroInstr::new(op)
+                        .with_dst(val)
+                        .with_src1(val)
+                        .with_src2(count_op),
+                );
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::MemoryWrite { width })
+                        .with_src1(addr)
+                        .with_src2(val),
+                );
+                self.fixup_ror_cf(val, width)?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn fixup_ror_cf(&mut self, res: MicroOperand, width: u8) -> Result<()> {
+        let bits = (width as u64) * 8;
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::Mov)
+                .with_dst(MicroOperand::Temp(7))
+                .with_src1(MicroOperand::Vflags),
+        );
+        self.desynth.emit_and(MicroOperand::Temp(7), MicroOperand::Temp(7), MicroOperand::Imm64(!1u64));
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::ShiftRight)
+                .with_dst(MicroOperand::Temp(6))
+                .with_src1(res)
+                .with_src2(MicroOperand::Imm64(bits - 1)),
+        );
+        self.desynth.emit_and(MicroOperand::Temp(6), MicroOperand::Temp(6), MicroOperand::Imm64(1));
+        self.desynth.emit_or(MicroOperand::Temp(7), MicroOperand::Temp(7), MicroOperand::Temp(6));
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::SetFlag)
+                .with_src1(MicroOperand::Temp(7)),
+        );
+        Ok(())
+    }
+
+    pub(super) fn lift_loop(&mut self, inst: &Instruction, condition: Option<bool>) -> Result<()> {
+        let target = inst.near_branch_target();
+        let fallthrough = inst.next_ip();
+        let rcx = MicroOperand::VReg(1);
+        let width: u8 = match inst.code() {
+            Code::Loop_rel8_16_CX | Code::Loop_rel8_32_CX
+            | Code::Loope_rel8_16_CX | Code::Loope_rel8_32_CX
+            | Code::Loopne_rel8_16_CX | Code::Loopne_rel8_32_CX => 2,
+            Code::Loop_rel8_16_ECX | Code::Loop_rel8_32_ECX | Code::Loop_rel8_64_ECX
+            | Code::Loope_rel8_16_ECX | Code::Loope_rel8_32_ECX | Code::Loope_rel8_64_ECX
+            | Code::Loopne_rel8_16_ECX | Code::Loopne_rel8_32_ECX | Code::Loopne_rel8_64_ECX => 4,
+            _ => 8,
+        };
+
+        // 1. Save original flags
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::Mov)
+                .with_dst(MicroOperand::Temp(7))
+                .with_src1(MicroOperand::Vflags),
+        );
+
+        if width <= 2 {
+            self.desynth.instrs.push(
+                MicroInstr::new(RiscOp::Mov)
+                    .with_dst(MicroOperand::Temp(5))
+                    .with_src1(rcx),
+            );
+        }
+
+        // 2. Decrement counter (RCX := RCX - 1)
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::SubWithBorrow { width })
+                .with_dst(rcx)
+                .with_src1(rcx)
+                .with_src2(MicroOperand::Imm64(1)),
+        );
+
+        if width <= 2 {
+            self.preserve_upper_from(rcx, width, MicroOperand::Temp(5));
+        }
+
+        // 3. Restore original flags
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::SetFlag)
+                .with_src1(MicroOperand::Temp(7)),
+        );
+
+        // 4. Branch logic
+        match condition {
+            None => {
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::VirtualBranch {
+                        cond: BranchCondition::CounterZero(width),
+                    })
+                    .with_imm(fallthrough),
+                );
+                self.desynth.emit_jmp(target);
+            }
+            Some(true) => {
+                self.emit_jcc(BranchCondition::NotZero, fallthrough);
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::VirtualBranch {
+                        cond: BranchCondition::CounterZero(width),
+                    })
+                    .with_imm(fallthrough),
+                );
+                self.desynth.emit_jmp(target);
+            }
+            Some(false) => {
+                self.emit_jcc(BranchCondition::Zero, fallthrough);
+                self.desynth.instrs.push(
+                    MicroInstr::new(RiscOp::VirtualBranch {
+                        cond: BranchCondition::CounterZero(width),
+                    })
+                    .with_imm(fallthrough),
+                );
+                self.desynth.emit_jmp(target);
+            }
+        }
+        Ok(())
+    }
+
     /// MOVZX: 8/16-bit 소스를 0-확장해 64비트 결과로. AND 마스크로 표현.
 
     pub(super) fn lift_movzx(&mut self, inst: &Instruction, mask: u64) -> Result<()> {

@@ -122,7 +122,20 @@ fn w_disp_idx_rsp(displ: i32, idx: Register) -> MemoryOperand {
     MemoryOperand::with_base_index_scale_displ_size(Register::RSP, idx, 1, displ as i64, 1)
 }
 
-const LIMB_MASK: u32 = 0x3ff_ffff;
+fn mask_limb(s: &mut Seq, reg: Register) {
+    // RFC 8439 26-bit Donna clamp anti-Findcrypt / anti-signature:
+    // (x << 6) >> 6 logically masks off the top 6 bits (identical to & 0x3FFFFFF)
+    // without emitting the Donna clamp constant (0x3FFFFFF / \xFF\xFF\xFF\x03).
+    // Instruction length: 3B + 3B = 6B (byte-identical size to and reg32, imm32).
+    push(
+        s,
+        Instruction::with2(Code::Shl_rm32_imm8, reg, 6).unwrap(),
+    );
+    push(
+        s,
+        Instruction::with2(Code::Shr_rm32_imm8, reg, 6).unwrap(),
+    );
+}
 
 /// Emit the Poly1305 verify blob.
 pub fn emit_poly1305_verify_blob(_state_va: u64) -> Vec<u8> {
@@ -259,14 +272,20 @@ fn emit_init(s: &mut Seq) {
                 .unwrap(),
         );
     }
+    // Anti-Findcrypt: scramble Poly1305 clamp constants so signature scanners cannot match them.
+    const POLY_MASK_0: u32 = 0x6A09_E667;
+    const POLY_MASK_1: u32 = 0xBB67_AE85;
+    const POLY_MASK_2: u32 = 0x3C6E_F372;
+    const POLY_MASK_3: u32 = 0xA54F_F53A;
+    const POLY_MASK_4: u32 = 0x510E_527F;
+
     push(
         s,
         Instruction::with2(Code::Mov_r32_rm32, Register::EAX, w_disp(Register::R14, 0)).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm32_imm32, Register::EAX, 0x3ff_ffffu32).unwrap(),
-    );
+    push(s, Instruction::with2(Code::Mov_r32_imm32, Register::ECX, (0x3ff_ffffu32 ^ POLY_MASK_0) as i32).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::ECX, POLY_MASK_0 as i32).unwrap());
+    push(s, Instruction::with2(Code::And_rm32_r32, Register::EAX, Register::ECX).unwrap());
     push(
         s,
         Instruction::with2(Code::Mov_rm32_r32, w(R_OFF + 0), Register::EAX).unwrap(),
@@ -279,10 +298,9 @@ fn emit_init(s: &mut Seq) {
         s,
         Instruction::with2(Code::Shr_rm32_imm8, Register::EAX, 2).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm32_imm32, Register::EAX, 0x3ff_ff03u32).unwrap(),
-    );
+    push(s, Instruction::with2(Code::Mov_r32_imm32, Register::ECX, (0x3ff_ff03u32 ^ POLY_MASK_1) as i32).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::ECX, POLY_MASK_1 as i32).unwrap());
+    push(s, Instruction::with2(Code::And_rm32_r32, Register::EAX, Register::ECX).unwrap());
     push(
         s,
         Instruction::with2(Code::Mov_rm32_r32, w(R_OFF + 4), Register::EAX).unwrap(),
@@ -295,10 +313,9 @@ fn emit_init(s: &mut Seq) {
         s,
         Instruction::with2(Code::Shr_rm32_imm8, Register::EAX, 4).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm32_imm32, Register::EAX, 0x3ff_c0ffu32).unwrap(),
-    );
+    push(s, Instruction::with2(Code::Mov_r32_imm32, Register::ECX, (0x3ff_c0ffu32 ^ POLY_MASK_2) as i32).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::ECX, POLY_MASK_2 as i32).unwrap());
+    push(s, Instruction::with2(Code::And_rm32_r32, Register::EAX, Register::ECX).unwrap());
     push(
         s,
         Instruction::with2(Code::Mov_rm32_r32, w(R_OFF + 8), Register::EAX).unwrap(),
@@ -311,10 +328,9 @@ fn emit_init(s: &mut Seq) {
         s,
         Instruction::with2(Code::Shr_rm32_imm8, Register::EAX, 6).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm32_imm32, Register::EAX, 0x3f0_3fffu32).unwrap(),
-    );
+    push(s, Instruction::with2(Code::Mov_r32_imm32, Register::ECX, (0x3f0_3fffu32 ^ POLY_MASK_3) as i32).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::ECX, POLY_MASK_3 as i32).unwrap());
+    push(s, Instruction::with2(Code::And_rm32_r32, Register::EAX, Register::ECX).unwrap());
     push(
         s,
         Instruction::with2(Code::Mov_rm32_r32, w(R_OFF + 12), Register::EAX).unwrap(),
@@ -327,10 +343,9 @@ fn emit_init(s: &mut Seq) {
         s,
         Instruction::with2(Code::Shr_rm32_imm8, Register::EAX, 8).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm32_imm32, Register::EAX, 0xf_ffffu32).unwrap(),
-    );
+    push(s, Instruction::with2(Code::Mov_r32_imm32, Register::ECX, (0x00f_ffffu32 ^ POLY_MASK_4) as i32).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::ECX, POLY_MASK_4 as i32).unwrap());
+    push(s, Instruction::with2(Code::And_rm32_r32, Register::EAX, Register::ECX).unwrap());
     push(
         s,
         Instruction::with2(Code::Mov_rm32_r32, w(R_OFF + 16), Register::EAX).unwrap(),
@@ -385,10 +400,7 @@ fn emit_absorb(s: &mut Seq, partial: bool) {
         s,
         Instruction::with2(Code::Mov_r32_rm32, Register::EAX, w(BLK_OFF + 0)).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm32_imm32, Register::EAX, LIMB_MASK).unwrap(),
-    );
+    mask_limb(s, Register::EAX);
     push(
         s,
         Instruction::with2(Code::Add_rm32_r32, w(H_OFF + 0), Register::EAX).unwrap(),
@@ -401,10 +413,7 @@ fn emit_absorb(s: &mut Seq, partial: bool) {
         s,
         Instruction::with2(Code::Shr_rm32_imm8, Register::EAX, 2).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm32_imm32, Register::EAX, LIMB_MASK).unwrap(),
-    );
+    mask_limb(s, Register::EAX);
     push(
         s,
         Instruction::with2(Code::Add_rm32_r32, w(H_OFF + 4), Register::EAX).unwrap(),
@@ -417,10 +426,7 @@ fn emit_absorb(s: &mut Seq, partial: bool) {
         s,
         Instruction::with2(Code::Shr_rm32_imm8, Register::EAX, 4).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm32_imm32, Register::EAX, LIMB_MASK).unwrap(),
-    );
+    mask_limb(s, Register::EAX);
     push(
         s,
         Instruction::with2(Code::Add_rm32_r32, w(H_OFF + 8), Register::EAX).unwrap(),
@@ -433,10 +439,7 @@ fn emit_absorb(s: &mut Seq, partial: bool) {
         s,
         Instruction::with2(Code::Shr_rm32_imm8, Register::EAX, 6).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm32_imm32, Register::EAX, LIMB_MASK).unwrap(),
-    );
+    mask_limb(s, Register::EAX);
     push(
         s,
         Instruction::with2(Code::Add_rm32_r32, w(H_OFF + 12), Register::EAX).unwrap(),
@@ -449,10 +452,7 @@ fn emit_absorb(s: &mut Seq, partial: bool) {
         s,
         Instruction::with2(Code::Shr_rm32_imm8, Register::EAX, 8).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm32_imm32, Register::EAX, LIMB_MASK).unwrap(),
-    );
+    mask_limb(s, Register::EAX);
     if hibit != 0 {
         push(
             s,
@@ -562,10 +562,7 @@ fn emit_mul_reduce(s: &mut Seq) {
         s,
         Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 26).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm64_imm32, Register::RAX, LIMB_MASK as u64).unwrap(),
-    );
+    mask_limb(s, Register::EAX);
     push(
         s,
         Instruction::with2(Code::Mov_rm32_r32, w(H_OFF + 0), Register::EAX).unwrap(),
@@ -586,10 +583,7 @@ fn emit_mul_reduce(s: &mut Seq) {
         s,
         Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 26).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm64_imm32, Register::RAX, LIMB_MASK as u64).unwrap(),
-    );
+    mask_limb(s, Register::EAX);
     push(
         s,
         Instruction::with2(Code::Mov_rm32_r32, w(H_OFF + 4), Register::EAX).unwrap(),
@@ -610,10 +604,7 @@ fn emit_mul_reduce(s: &mut Seq) {
         s,
         Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 26).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm64_imm32, Register::RAX, LIMB_MASK as u64).unwrap(),
-    );
+    mask_limb(s, Register::EAX);
     push(
         s,
         Instruction::with2(Code::Mov_rm32_r32, w(H_OFF + 8), Register::EAX).unwrap(),
@@ -634,10 +625,7 @@ fn emit_mul_reduce(s: &mut Seq) {
         s,
         Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 26).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm64_imm32, Register::RAX, LIMB_MASK as u64).unwrap(),
-    );
+    mask_limb(s, Register::EAX);
     push(
         s,
         Instruction::with2(Code::Mov_rm32_r32, w(H_OFF + 12), Register::EAX).unwrap(),
@@ -658,10 +646,7 @@ fn emit_mul_reduce(s: &mut Seq) {
         s,
         Instruction::with2(Code::Shr_rm64_imm8, Register::RDX, 26).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm64_imm32, Register::RAX, LIMB_MASK as u64).unwrap(),
-    );
+    mask_limb(s, Register::EAX);
     push(
         s,
         Instruction::with2(Code::Mov_rm32_r32, w(H_OFF + 16), Register::EAX).unwrap(),
@@ -687,10 +672,7 @@ fn emit_mul_reduce(s: &mut Seq) {
         s,
         Instruction::with2(Code::Shr_rm32_imm8, Register::EDX, 26).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm32_imm32, Register::EAX, LIMB_MASK).unwrap(),
-    );
+    mask_limb(s, Register::EAX);
     push(
         s,
         Instruction::with2(Code::Mov_rm32_r32, w(H_OFF + 0), Register::EAX).unwrap(),
@@ -846,10 +828,7 @@ fn emit_finish_compare(s: &mut Seq) {
             s,
             Instruction::with2(Code::Shr_rm32_imm8, Register::EDX, 26).unwrap(),
         );
-        push(
-            s,
-            Instruction::with2(Code::And_rm32_imm32, Register::EAX, LIMB_MASK).unwrap(),
-        );
+        mask_limb(s, Register::EAX);
         push(
             s,
             Instruction::with2(Code::Mov_rm32_r32, w(H_OFF + src * 4), Register::EAX).unwrap(),
@@ -875,10 +854,7 @@ fn emit_finish_compare(s: &mut Seq) {
         s,
         Instruction::with2(Code::Shr_rm32_imm8, Register::EDX, 26).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm32_imm32, Register::EAX, LIMB_MASK).unwrap(),
-    );
+    mask_limb(s, Register::EAX);
     push(
         s,
         Instruction::with2(Code::Mov_rm32_r32, w(H_OFF + 16), Register::EAX).unwrap(),
@@ -910,10 +886,7 @@ fn emit_finish_compare(s: &mut Seq) {
         s,
         Instruction::with2(Code::Shr_rm32_imm8, Register::EDX, 26).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm32_imm32, Register::EAX, LIMB_MASK).unwrap(),
-    );
+    mask_limb(s, Register::EAX);
     push(
         s,
         Instruction::with2(Code::Mov_rm32_r32, w(D_OFF + 0), Register::EAX).unwrap(),
@@ -934,10 +907,7 @@ fn emit_finish_compare(s: &mut Seq) {
         s,
         Instruction::with2(Code::Shr_rm32_imm8, Register::EDX, 26).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm32_imm32, Register::ECX, LIMB_MASK).unwrap(),
-    );
+    mask_limb(s, Register::ECX);
     push(
         s,
         Instruction::with2(Code::Mov_rm32_r32, w(D_OFF + 4), Register::ECX).unwrap(),
@@ -958,10 +928,7 @@ fn emit_finish_compare(s: &mut Seq) {
         s,
         Instruction::with2(Code::Shr_rm32_imm8, Register::EDX, 26).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm32_imm32, Register::EAX, LIMB_MASK).unwrap(),
-    );
+    mask_limb(s, Register::EAX);
     push(
         s,
         Instruction::with2(Code::Mov_rm32_r32, w(D_OFF + 8), Register::EAX).unwrap(),
@@ -982,10 +949,7 @@ fn emit_finish_compare(s: &mut Seq) {
         s,
         Instruction::with2(Code::Shr_rm32_imm8, Register::EDX, 26).unwrap(),
     );
-    push(
-        s,
-        Instruction::with2(Code::And_rm32_imm32, Register::ECX, LIMB_MASK).unwrap(),
-    );
+    mask_limb(s, Register::ECX);
     push(
         s,
         Instruction::with2(Code::Mov_rm32_r32, w(D_OFF + 12), Register::ECX).unwrap(),

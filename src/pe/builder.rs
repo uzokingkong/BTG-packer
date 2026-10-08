@@ -499,7 +499,7 @@ impl PeMultiSectionBuilder {
         // 부트 영역 절대 VA 슬롯을 패치 → 안전). GUARD_CF는 여전히 스트립 — CFG 함수
         // 테이블/비트맵이 패커 변환과 무결하지 않아 켜면 로더 거부/크래시 위험이 있다.
         let sanitized_dll_characteristics = if self.preserve_aslr_bits {
-            self.dll_characteristics & !0x4000
+            (self.dll_characteristics | 0x0020 | 0x0040) & !0x4000
         } else {
             self.dll_characteristics & !(0x0020 | 0x0040 | 0x4000)
         };

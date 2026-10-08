@@ -106,6 +106,8 @@ Use it when changing VM semantics or runtime generation before debugging a compl
 
 `--text-vm-oep` follows the reachable CFG from the original entry point and attempts to construct a single VM program, reporting block/instruction coverage, bytecode size and VM memory-model information.
 
+These two diagnostics exercise the generic lifter, not the commercial ownership planner. They do not include commercial native hot-path roots, function-atomic exclusions, or family/capability decisions, and their instruction lift percentage should not be used to predict commercial coverage. For that, inspect the commercial build manifest and ownership report; `--allow-partial-vm` permits an incomplete result but records it as ineffective.
+
 These modes isolate lifting/analysis problems from PE reconstruction problems.
 
 ## Mapping artifacts
