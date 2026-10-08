@@ -183,3 +183,76 @@ fn fallback_emits_redispatch_aliases_from_db() {
     assert!(rs.contains("Add_rm8_imm8_82 => Add_rm8_imm8"));
     assert!(rs.contains("self.lift_instruction_inner(&aliased)"));
 }
+
+// ── Priority 1: Semantic IR / confidence tiers ───────────────────────────────
+
+#[test]
+fn semantic_template_tiers_pseudo_vs_faithful() {
+    use btg_codegen::rules::{resolve, semantic_template};
+    use btg_codegen::template::Confidence;
+
+    // Pseudo lowerings (value-correct, flags not reproduced) are pinned at
+    // AUTO_VALUE_ONLY and can never be auto-emitted.
+    for m in ["AND", "OR", "XOR", "TEST", "NEG"] {
+        let l = resolve(Family::IntegerAlu, m);
+        let t = semantic_template(&l, m);
+        assert_eq!(
+            t.confidence,
+            Confidence::AutoValueOnly,
+            "{m} must be AUTO_VALUE_ONLY (pseudo lowering)"
+        );
+        assert!(!t.is_auto_emittable(), "{m} must never auto-emit");
+    }
+
+    // Flag-faithful scalar ALU maps 1:1 onto flag-aware ops -> AUTO_FLAG_EXACT
+    // ceiling (still unproven, so still not auto-emittable yet).
+    for m in ["ADD", "SUB", "CMP", "ADC", "SBB", "INC", "DEC", "NOT"] {
+        let l = resolve(Family::IntegerAlu, m);
+        let t = semantic_template(&l, m);
+        assert_eq!(
+            t.confidence,
+            Confidence::AutoFlagExact,
+            "{m} should carry an AUTO_FLAG_EXACT ceiling"
+        );
+        assert!(!t.is_auto_emittable(), "{m} is unproven -> not auto-emittable");
+    }
+}
+
+#[test]
+fn semantic_template_records_flag_and_memory_spec() {
+    use btg_codegen::rules::{resolve, semantic_template};
+    use btg_codegen::template::{ExceptionClass, Flag};
+
+    // ADC consumes CF and defines all six arithmetic flags.
+    let adc = semantic_template(&resolve(Family::IntegerAlu, "ADC"), "ADC");
+    assert!(adc.flags_read.contains(&Flag::Cf));
+    assert!(adc.flags_write.contains(&Flag::Of));
+
+    // INC defines every arithmetic flag except CF.
+    let inc = semantic_template(&resolve(Family::IntegerAlu, "INC"), "INC");
+    assert!(!inc.flags_write.contains(&Flag::Cf));
+    assert!(inc.flags_write.contains(&Flag::Zf));
+
+    // DIV carries the divide-error fault class.
+    let div = semantic_template(&resolve(Family::MulDiv, "DIV"), "DIV");
+    assert_eq!(div.exception, ExceptionClass::DivideError);
+
+    // MOV is flag-transparent and memory-capable.
+    let mov = semantic_template(&resolve(Family::DataMove, "MOV"), "MOV");
+    assert!(mov.flags_write.is_empty());
+    assert!(mov.mem_read && mov.mem_write);
+}
+
+#[test]
+fn native_and_manual_map_to_their_tiers() {
+    use btg_codegen::rules::{resolve, semantic_template};
+    use btg_codegen::template::Confidence;
+
+    // Crypto is an intentional native fallback.
+    let aes = semantic_template(&resolve(Family::Crypto, "AESENC"), "AESENC");
+    assert_eq!(aes.confidence, Confidence::NativeFallback);
+
+    // BMI needs hand-written semantics.
+    let pdep = semantic_template(&resolve(Family::Bmi, "PDEP"), "PDEP");
+    assert_eq!(pdep.confidence, Confidence::Manual);
+}

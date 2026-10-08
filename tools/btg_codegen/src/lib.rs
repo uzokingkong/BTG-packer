@@ -7,3 +7,4 @@ pub mod coverage;
 pub mod emit;
 pub mod family;
 pub mod rules;
+pub mod template;
