@@ -946,6 +946,7 @@ RiscOp::Halt => {
             | RiscOp::PackedCmpGt { .. }
             | RiscOp::PackedUnpack { .. }
             | RiscOp::PackedShiftRightQ
+            | RiscOp::PackedShiftLeftLogical { .. }
             | RiscOp::PackedShuffle { .. } => {}
             RiscOp::DoubleShiftLeft { .. } => {}
             RiscOp::BitTest { .. } => {}

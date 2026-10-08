@@ -1,0 +1,30 @@
+[package]
+name = "btg_codegen"
+version = "0.1.0"
+edition = "2021"
+description = "BTG coverage-DB -> semantic rule engine -> RiscOp lowering / Rust source generator"
+publish = false
+
+# Standalone sub-crate (same convention as `test/Cargo.toml`): the root
+# `btg-packer` package has no [workspace] table, so this crate is built on its
+# own via `--manifest-path tools/btg_codegen/Cargo.toml` and never participates
+# in the core VM build. It deliberately does NOT depend on `btg_packer` so the
+# generator stays cross-platform, fast to build, and incapable of perturbing the
+# production virtualizer.
+
+[lib]
+name = "btg_codegen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "btg_codegen"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 2

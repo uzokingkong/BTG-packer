@@ -14,6 +14,12 @@ mod arith;
 mod sse;
 mod string;
 
+// OFF by default. A generated, reviewed lowering fallback for instructions that
+// otherwise hit the `_ => unsupported` arm below. Compiled only under the
+// `codegen_fallback` feature, so the default production lifter is unchanged.
+#[cfg(feature = "codegen_fallback")]
+mod generated_fallback;
+
 const XMM_SLOT_BASE: u64 = 0xF000_0000_0000_0000;
 
 fn has_any_rep(inst: &Instruction) -> bool {
@@ -1694,6 +1700,9 @@ impl RiscLifter {
             | Code::Movups_xmmm128_xmm | Code::Movaps_xmmm128_xmm
             | Code::Movupd_xmmm128_xmm | Code::Movapd_xmmm128_xmm => self.lift_sse_packed_move(inst)?,
             Code::Psrlq_xmm_imm8 => self.lift_packed_shift_right_q(inst)?,
+            Code::Psllw_xmm_imm8 => self.lift_packed_shift_left(inst, 2, 8)?,
+            Code::Pslld_xmm_imm8 => self.lift_packed_shift_left(inst, 4, 4)?,
+            Code::Psllq_xmm_imm8 => self.lift_packed_shift_left(inst, 8, 2)?,
             Code::Pshufd_xmm_xmmm128_imm8 => self.lift_packed_shuffle(inst, false)?,
             Code::Pshuflw_xmm_xmmm128_imm8 => self.lift_packed_shuffle(inst, true)?,
             Code::Pmovmskb_r32_xmm => self.lift_packed_movmask(inst, false)?,
@@ -1706,6 +1715,17 @@ impl RiscLifter {
             }
 
             _ => {
+                // OFF by default. When the `codegen_fallback` feature is on, the
+                // generated fallback may lower a subset of otherwise-unsupported
+                // instructions. It is purely additive: it only runs for codes
+                // that already reach this unsupported arm, so it cannot change
+                // the behavior of any instruction the match above handles.
+                #[cfg(feature = "codegen_fallback")]
+                {
+                    if self.try_generated_fallback(inst)? {
+                        return Ok(());
+                    }
+                }
                 // Fallback for unsupported complex instruction
                 return Err(anyhow!("risc lifter: unsupported opcode {:?}", code));
             }

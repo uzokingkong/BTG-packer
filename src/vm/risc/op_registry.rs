@@ -46,7 +46,8 @@ kinds! {
     PackedSub => "packed_sub", PackedXor => "packed_xor", PackedAnd => "packed_and",
     PackedOr => "packed_or", PackedAndNot => "packed_and_not", PackedCmpEq => "packed_cmp_eq",
     PackedCmpGt => "packed_cmp_gt", PackedUnpack => "packed_unpack",
-    PackedShiftRightQ => "packed_shift_right_q", PackedShuffle => "packed_shuffle",
+    PackedShiftRightQ => "packed_shift_right_q",
+    PackedShiftLeftLogical => "packed_shift_left_logical", PackedShuffle => "packed_shuffle",
     DoubleShiftLeft => "double_shift_left", BitTest => "bit_test",
     PackedMovMaskBytes => "packed_mov_mask_bytes", PackedMovMaskPs => "packed_mov_mask_ps",
     PackedInsertWord => "packed_insert_word", CpuId => "cpuid", XGetBv => "xgetbv",
@@ -120,6 +121,7 @@ impl RiscOp {
             PackedCmpGt { .. } => RiscOpKind::PackedCmpGt,
             PackedUnpack { .. } => RiscOpKind::PackedUnpack,
             PackedShiftRightQ => RiscOpKind::PackedShiftRightQ,
+            PackedShiftLeftLogical { .. } => RiscOpKind::PackedShiftLeftLogical,
             PackedShuffle { .. } => RiscOpKind::PackedShuffle,
             DoubleShiftLeft { .. } => RiscOpKind::DoubleShiftLeft,
             BitTest { .. } => RiscOpKind::BitTest,
@@ -270,6 +272,7 @@ pub fn capabilities(op: RiscOp) -> RiscOpCapabilities {
             | PackedCmpGt
             | PackedUnpack
             | PackedShiftRightQ
+            | PackedShiftLeftLogical
             | PackedShuffle
             | PackedMovMaskBytes
             | PackedMovMaskPs
@@ -299,7 +302,7 @@ mod tests {
         assert_eq!(names.len(), RiscOpKind::ALL.len());
         assert_eq!(
             RiscOpKind::ALL.len(),
-            71,
+            72,
             "update registry when RiscOp changes"
         );
     }

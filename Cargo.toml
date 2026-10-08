@@ -13,6 +13,12 @@ default = []
 # Research-only custom primitives and compatibility tests. Production builds
 # leave this feature disabled and cannot select C1.
 experimental-custom-crypto = []
+# OFF by default. Enables the generated, reviewed lowering fallback consulted by
+# the RISC lifter ONLY for instructions that otherwise hit the unsupported
+# error. The default production build never compiles it, so the production
+# virtualizer is byte-identical with the feature off. See
+# src/vm/risc/lifter/generated_fallback.rs and tools/btg_codegen.
+codegen_fallback = []
 
 [[bin]]
 name = "btg-packer"

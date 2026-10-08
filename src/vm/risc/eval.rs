@@ -1057,6 +1057,18 @@ impl RiscProgram {
                         if count >= 64 { 0 } else { hi >> count },
                     );
                 }
+                RiscOp::PackedShiftLeftLogical { elem_width, lanes } => {
+                    let a = get_val(ins.src1, &st, flags.raw);
+                    let d = get_val(ins.dst, &st, flags.raw);
+                    let count = get_val(ins.src2, &st, flags.raw);
+                    let bits = elem_width as u64 * 8;
+                    for i in 0..lanes as u64 {
+                        let off = i * elem_width as u64;
+                        let v = mem_read(&st.mem, a.wrapping_add(off), elem_width);
+                        let r = if count >= bits { 0 } else { v << count };
+                        mem_write(&mut st.mem, d.wrapping_add(off), elem_width, r);
+                    }
+                }
                 RiscOp::PackedShuffle { low_words } => {
                     let a = get_val(ins.src1, &st, flags.raw);
                     let d = get_val(ins.dst, &st, flags.raw);
@@ -1788,6 +1800,19 @@ impl RiscProgram {
                     8,
                     if count >= 64 { 0 } else { hi >> count },
                 );
+                ExecResult::Next
+            }
+            RiscOp::PackedShiftLeftLogical { elem_width, lanes } => {
+                let a = get_val(ins.src1, st, flags.raw);
+                let d = get_val(ins.dst, st, flags.raw);
+                let count = get_val(ins.src2, st, flags.raw);
+                let bits = elem_width as u64 * 8;
+                for i in 0..lanes as u64 {
+                    let off = i * elem_width as u64;
+                    let v = mem_read(&st.mem, a.wrapping_add(off), elem_width);
+                    let r = if count >= bits { 0 } else { v << count };
+                    mem_write(&mut st.mem, d.wrapping_add(off), elem_width, r);
+                }
                 ExecResult::Next
             }
             RiscOp::PackedShuffle { low_words } => {

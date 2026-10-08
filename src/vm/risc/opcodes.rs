@@ -330,6 +330,14 @@ pub enum RiscOp {
     /// PSRLQ xmm, imm8 — 두 64-bit lane을 독립적으로 논리 우측 shift.
     PackedShiftRightQ,
 
+    /// PSLLW/PSLLD/PSLLQ (packed logical left shift by immediate). Operates on
+    /// a 16-byte XMM slot as `lanes` elements of `elem_width` bytes; each lane
+    /// is shifted left by `src2` (count>=elem_bits -> 0). Flags unchanged.
+    PackedShiftLeftLogical {
+        elem_width: u8,
+        lanes: u8,
+    },
+
     /// PSHUFD / PSHUFLW. src2의 low imm8이 2-bit lane selector 4개를 담는다.
     PackedShuffle {
         low_words: bool,
