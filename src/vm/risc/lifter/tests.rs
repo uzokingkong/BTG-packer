@@ -1344,6 +1344,25 @@ fn test_lift_addsd() {
     );
 }
 
+/// PSLLD xmm0, 4 — packed 32-bit logical left shift by immediate. Differential
+/// against ground-truth per-lane shift. (New op: PackedShiftLeftLogical.)
+#[test]
+fn test_lift_pslld_xmm_imm8() {
+    // PSLLD xmm0, 4  == 66 0F 72 F0 04 ; ret
+    let raw = [0x66u8, 0x0F, 0x72, 0xF0, 0x04, 0xC3];
+    let mut mem = HashMap::new();
+    let lanes = [0x0000_0001u64, 0x1234_5678, 0xFFFF_FFFF, 0x8000_0001];
+    for (i, &v) in lanes.iter().enumerate() {
+        seed_mem(&mut mem, xmm_slot(0) + (i as u64) * 4, 4, v);
+    }
+    let st = run_mem(&raw, 0x140001000, [0u64; 16], mem);
+    for (i, &v) in lanes.iter().enumerate() {
+        let got = read_mem(&st.mem, xmm_slot(0) + (i as u64) * 4, 4);
+        let exp = (v << 4) & 0xFFFF_FFFF;
+        assert_eq!(got, exp, "PSLLD lane {i}");
+    }
+}
+
 /// MULSD + DIVSD ??(3.0 * 2.0) / 4.0 = 1.5.
 #[test]
 fn test_lift_mulsd_divsd() {

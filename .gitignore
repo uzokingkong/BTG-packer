@@ -32,7 +32,12 @@ apply_fix.*
 *.7z
 temp_iced_src/
 scratch/
-src/bin/
+# Ignore scratch bins under src/bin/, but TRACK the coverage auditor binaries so
+# they actually ship to the repo and CI can build/run them. (A `dir/*` pattern
+# — not `dir/` — is required so specific files can be re-included below.)
+src/bin/*
+!src/bin/vm-coverage.rs
+!src/bin/btg-cpu-coverage-db.rs
 src/vm/count.ps1
 pack_log.txt
 pack_keep_log.txt

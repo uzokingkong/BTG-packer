@@ -394,6 +394,26 @@ impl RiscLifter {
         Ok(())
     }
 
+    /// PSLLW/PSLLD/PSLLQ xmm, imm8 — packed logical left shift by immediate.
+    pub(super) fn lift_packed_shift_left(
+        &mut self,
+        inst: &Instruction,
+        elem_width: u8,
+        lanes: u8,
+    ) -> Result<()> {
+        let idx = Self::xmm_index(inst.op0_register())
+            .ok_or_else(|| anyhow!("packed shift-left requires XMM destination"))?;
+        let addr = MicroOperand::Temp(4);
+        self.xmm_slot_addr(idx, addr);
+        self.desynth.instrs.push(
+            MicroInstr::new(RiscOp::PackedShiftLeftLogical { elem_width, lanes })
+                .with_dst(addr)
+                .with_src1(addr)
+                .with_src2(MicroOperand::Imm64(inst.immediate8() as u64)),
+        );
+        Ok(())
+    }
+
     pub(super) fn lift_packed_shuffle(
         &mut self,
         inst: &Instruction,

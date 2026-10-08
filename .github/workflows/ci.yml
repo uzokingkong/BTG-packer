@@ -6,6 +6,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Superset of what the jobs need (checkout read, artifact upload, and posting a
+# codegen delta commit status). Listed explicitly so status posting works.
+permissions:
+  contents: read
+  statuses: write
+  checks: write
+  actions: write
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -135,3 +143,136 @@ jobs:
       - name: Fuzz regression corpus (mandatory)
         if: always()
         run: cargo test --release --locked self_test::fuzz
+
+      # ── Real coverage DB -> generator -> feature-on re-coverage loop ─────────
+      # These run after the exact-QA gate (if: always) and have truthful
+      # conclusions (no continue-on-error) so each is an observable signal. The
+      # job may already be red from the pre-existing exact-QA gate; these steps
+      # measure and gate only the codegen pipeline. Each cargo command is on a
+      # single line (no pwsh backtick continuation).
+      - name: Real CPU coverage DB (baseline, feature off)
+        if: always()
+        shell: pwsh
+        run: |
+          cargo run --release --locked --bin vm-coverage -- --out-dir coverage
+          Get-ChildItem coverage | Format-Table Name,Length
+
+      - name: Codegen gap report from real DB
+        if: always()
+        shell: pwsh
+        run: |
+          cargo run --release --manifest-path tools/btg_codegen/Cargo.toml -- --coverage coverage/vm_coverage.json --out-dir tools/btg_codegen/generated --strict
+          Get-ChildItem tools/btg_codegen/generated | Format-Table Name,Length
+
+      # Differential verification gate: the generated fallback's arithmetic
+      # aliases must match independent ground-truth x86 arithmetic. A wrong
+      # alias (e.g. SAL -> SHR) fails here. Gating (no continue-on-error).
+      - name: Codegen fallback - differential tests (feature on)
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $out = (cargo test --release --locked --features codegen_fallback --lib generated_fallback -- --nocapture 2>&1 | Out-String)
+          $code = $LASTEXITCODE
+          Write-Host $out
+          $lines = ($out -split "`n" | Where-Object { $_ -match "mismatch|left:|right:|unexpected decode|assertion|error\[|error:" } | Select-Object -First 3)
+          $line = ($lines -join " | ")
+          if (-not $line) { $line = "difftest exit=$code" }
+          $desc = $line.Trim(); if ($desc.Length -gt 139) { $desc = $desc.Substring(0, 139) }
+          $st = if ($code -eq 0) { "success" } else { "failure" }
+          try { gh api -X POST "repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -f state=$st -f context=codegen/difftest -f "description=$desc" | Out-Null } catch { Write-Host "status post skipped: $_" }
+          $global:LASTEXITCODE = 0
+          if ($code -ne 0) { exit 1 }
+
+      - name: Codegen fallback build + re-coverage (feature on)
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo run --release --locked --features codegen_fallback --bin vm-coverage -- --out-dir coverage-fallback
+          $b = (Get-Content coverage/vm_coverage.json -Raw | ConvertFrom-Json).summary
+          $f = (Get-Content coverage-fallback/vm_coverage.json -Raw | ConvertFrom-Json).summary
+          $du = $b.unsupported - $f.unsupported
+          $txt = "baseline_unsupported=$($b.unsupported)`nfeature_unsupported=$($f.unsupported)`ndelta_unsupported=$du`nbaseline_lifted_no_micro_op=$($b.lifted_no_micro_op)`nfeature_lifted_no_micro_op=$($f.lifted_no_micro_op)"
+          $txt | Out-File -Encoding utf8 coverage-fallback/delta.txt
+          Get-Content coverage-fallback/delta.txt
+          # (2) Readable channel: a Markdown table in the run summary (UI).
+          $s = $env:GITHUB_STEP_SUMMARY
+          "## BTG codegen fallback - coverage delta" | Out-File -Encoding utf8 -Append $s
+          "" | Out-File -Encoding utf8 -Append $s
+          "| metric | feature OFF | feature ON | delta |" | Out-File -Encoding utf8 -Append $s
+          "|---|---:|---:|---:|" | Out-File -Encoding utf8 -Append $s
+          "| UNSUPPORTED | $($b.unsupported) | $($f.unsupported) | -$du |" | Out-File -Encoding utf8 -Append $s
+          "| lifted (no micro-op) | $($b.lifted_no_micro_op) | $($f.lifted_no_micro_op) | +$($f.lifted_no_micro_op - $b.lifted_no_micro_op) |" | Out-File -Encoding utf8 -Append $s
+          "| full pipeline | $($b.full_pipeline) | $($f.full_pipeline) | $($f.full_pipeline - $b.full_pipeline) |" | Out-File -Encoding utf8 -Append $s
+          "" | Out-File -Encoding utf8 -Append $s
+          "Closed-loop auto-patch reduced UNSUPPORTED by **$du** Code variants." | Out-File -Encoding utf8 -Append $s
+          # (2) Machine-readable channel: a commit status carrying the numbers.
+          $desc = "OFF=$($b.unsupported) ON=$($f.unsupported) delta=-$du lifted=$($f.lifted_no_micro_op)"
+          try { gh api -X POST "repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -f state=success -f context=codegen/unsupported-delta -f "description=$desc" -f "target_url=$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" | Out-Null } catch { Write-Host "commit-status post skipped (non-fatal): $_" }
+          $global:LASTEXITCODE = 0
+          if ($f.unsupported -gt $b.unsupported) { throw "codegen fallback increased unsupported ($($b.unsupported) -> $($f.unsupported))" }
+
+      - name: Upload codegen real artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btg-codegen-real
+          path: |
+            coverage/vm_coverage.json
+            coverage/vm_coverage.txt
+            coverage-fallback/vm_coverage.json
+            coverage-fallback/delta.txt
+            tools/btg_codegen/generated/
+          if-no-files-found: warn
+
+  btg-codegen:
+    name: btg_codegen generator (standalone)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tools/btg_codegen/target
+          key: ${{ runner.os }}-btgcodegen-${{ hashFiles('tools/btg_codegen/Cargo.toml') }}
+
+      - name: Build (release)
+        run: cargo build --release --manifest-path tools/btg_codegen/Cargo.toml
+
+      - name: Test (release)
+        run: cargo test --release --manifest-path tools/btg_codegen/Cargo.toml -- --nocapture
+
+      - name: Clippy (strict)
+        run: cargo clippy --manifest-path tools/btg_codegen/Cargo.toml --all-targets -- -D warnings
+
+      - name: E2E smoke on sample fixture (+ template integrity gate)
+        run: |
+          cargo run --release --manifest-path tools/btg_codegen/Cargo.toml -- \
+            --coverage tools/btg_codegen/fixtures/sample_vm_coverage.json \
+            --out-dir tools/btg_codegen/generated \
+            --strict
+          test -f tools/btg_codegen/generated/codegen_report.md
+          test -f tools/btg_codegen/generated/rule_coverage.json
+          test -f tools/btg_codegen/generated/lifter_rules.generated.rs
+          test -f tools/btg_codegen/generated/semantic_tests.generated.rs
+          test -f tools/btg_codegen/generated/generated_fallback.candidate.rs
+
+      - name: Upload generated artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btg-codegen-generated
+          path: tools/btg_codegen/generated/
+          if-no-files-found: ignore
