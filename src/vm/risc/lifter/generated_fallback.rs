@@ -4,22 +4,31 @@
 // lifter's `_ => unsupported` arm. Compiled ONLY under the `codegen_fallback`
 // feature; the default production lifter never sees it.
 //
-// Two classes, both proven-safe:
+// Three safe classes (all flag-correct; none invents semantics):
 //
 //   1. EFFECT-FREE HINTS (prefetch/fence/CET/cache) -> no micro-op. Exact in the
-//      single-threaded reference semantics. Matched by mnemonic DEBUG STRING, so
-//      a wrong/stale entry can only fail to fire, never miscompile or mis-lower.
+//      single-threaded reference model. Matched by mnemonic DEBUG STRING.
 //
-//   2. RE-DISPATCH ALIASES. Some unsupported Code values are *exact semantic
-//      aliases* of a Code the hand-written match already lowers correctly
-//      (SAL == SHL; the 0x82 group is a duplicate encoding of the 0x80 group).
-//      We rewrite the instruction's Code to its handled sibling and reuse the
-//      proven lowering verbatim -- zero new operand wiring, correct by
-//      construction. The differential oracle test below independently checks the
-//      lowered result against ground-truth x86 arithmetic.
+//   2. SAME-OPERAND ALIASES. An unsupported Code that is a byte-for-byte operand
+//      alias of a handled Code is rewritten to that sibling and lowered by the
+//      proven path verbatim (Inc_r16==Inc_rm16 register form; the 0x82 duplicate
+//      encoding of ADC/SBB).
+//
+//   3. HELPER RE-DISPATCH. Unsupported ALU/shift forms (notably 16-bit
+//      operand-size variants and the SAL encoding) are lowered by the lifter's
+//      OWN width-generic helpers (`lift_binary_alu`, `lift_cmp`, `lift_test`,
+//      `lift_shift`). These derive width/operands from the instruction, so the
+//      result and x86 flags are correct by construction -- the same helpers the
+//      hand-written match uses for the 8/32/64-bit forms.
+//
+// NOTE: ROR is intentionally NOT handled here. The only rotate micro-op is
+// RotateLeft, whose CF/OF follow ROL semantics; lowering ROR as ROL(bits-n)
+// would match the value but not x86 ROR's flags. A correct ROR needs a dedicated
+// op or flag fix-up, so it stays unsupported rather than subtly wrong.
 // =============================================================================
 
-use super::RiscLifter;
+use super::{Alu, RiscLifter};
+use crate::vm::risc::RiscOp;
 use anyhow::Result;
 use iced_x86::{Code, Instruction};
 
@@ -33,10 +42,9 @@ impl RiscLifter {
             return Ok(true);
         }
 
-        // Class 2: re-dispatch to an already-handled semantic sibling. We append
-        // onto the same desynth buffer via the inner match; the outer
-        // diagnostic wrapper that invoked us still performs branch-site
-        // bookkeeping over the full appended range.
+        // Class 2: rewrite to a handled, byte-for-byte-equivalent sibling and
+        // lower via the proven inner match (the outer diagnostic wrapper still
+        // does branch-site bookkeeping over the appended range).
         if let Some(target) = alias_target(inst.code()) {
             let mut aliased = *inst;
             aliased.set_code(target);
@@ -44,7 +52,19 @@ impl RiscLifter {
             return Ok(true);
         }
 
-        Ok(false)
+        // Class 3: lower via the lifter's own width-generic helpers.
+        match mnemonic.as_str() {
+            "Add" => self.lift_binary_alu(inst, Alu::Add).map(|()| true),
+            "Sub" => self.lift_binary_alu(inst, Alu::Sub).map(|()| true),
+            "And" => self.lift_binary_alu(inst, Alu::And).map(|()| true),
+            "Or" => self.lift_binary_alu(inst, Alu::Or).map(|()| true),
+            "Xor" => self.lift_binary_alu(inst, Alu::Xor).map(|()| true),
+            "Cmp" => self.lift_cmp(inst).map(|()| true),
+            "Test" => self.lift_test(inst).map(|()| true),
+            // SAL is SHL; lift_shift is width/form-generic over reg/mem/imm/CL/1.
+            "Sal" => self.lift_shift(inst, RiscOp::ShiftLeft).map(|()| true),
+            _ => Ok(false),
+        }
     }
 }
 
@@ -71,72 +91,52 @@ fn is_effect_free_hint(mnemonic: &str) -> bool {
     )
 }
 
-/// Map an unsupported Code to a handled Code with identical semantics.
-/// Every pair here is a true alias: same operands, same effect.
+/// Map an unsupported Code to a handled Code with identical semantics and the
+/// same operands. (SAL and the 0x82 ADD/SUB/AND/OR/XOR/CMP forms are handled by
+/// the helper dispatch above, not here.)
 fn alias_target(code: Code) -> Option<Code> {
     use Code::*;
     Some(match code {
-        // SAL is an alias of SHL (opcode /4 vs /6 of the same group).
-        Sal_rm8_1 => Shl_rm8_1,
-        Sal_rm8_CL => Shl_rm8_CL,
-        Sal_rm8_imm8 => Shl_rm8_imm8,
-        Sal_rm16_1 => Shl_rm16_1,
-        Sal_rm16_CL => Shl_rm16_CL,
-        Sal_rm16_imm8 => Shl_rm16_imm8,
-        Sal_rm32_1 => Shl_rm32_1,
-        Sal_rm32_CL => Shl_rm32_CL,
-        Sal_rm32_imm8 => Shl_rm32_imm8,
-        Sal_rm64_1 => Shl_rm64_1,
-        Sal_rm64_CL => Shl_rm64_CL,
-        Sal_rm64_imm8 => Shl_rm64_imm8,
-        // The 0x82 group is a documented duplicate encoding of the 0x80 group.
-        Add_rm8_imm8_82 => Add_rm8_imm8,
+        // The single-byte INC/DEC r16/r32 encodings (legacy; only reachable via
+        // the synthetic auditor in 64-bit) are the register form of INC/DEC rm.
+        Inc_r16 => Inc_rm16,
+        Inc_r32 => Inc_rm32,
+        Dec_r16 => Dec_rm16,
+        Dec_r32 => Dec_rm32,
+        // 0x82 duplicate encodings of ADC/SBB (ALU helper has no ADC/SBB path).
         Adc_rm8_imm8_82 => Adc_rm8_imm8,
         Sbb_rm8_imm8_82 => Sbb_rm8_imm8,
-        Sub_rm8_imm8_82 => Sub_rm8_imm8,
         _ => return None,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    //! Differential verification: lift an alias through the fallback, evaluate
-    //! the produced micro-program with the real RISC reference evaluator, and
-    //! compare the destination register to independent ground-truth arithmetic.
-    //! A wrong alias mapping (e.g. SAL -> SHR) makes these fail.
+    //! Differential verification. We decode REAL machine-code bytes (so the
+    //! Instruction is fully formed), lift via the generated fallback, evaluate
+    //! with the full reference evaluator (`eval_state`), and compare the
+    //! destination register to independent ground-truth x86 arithmetic.
     use crate::vm::risc::{RiscLifter, RiscProgram};
     use iced_x86::{Code, Decoder, DecoderOptions};
 
     fn decode64(bytes: &[u8]) -> iced_x86::Instruction {
-        // Decode REAL machine code so the Instruction is fully formed (operand
-        // size, memory size, etc.) exactly as in production — no synthetic gaps.
         Decoder::new(64, bytes, DecoderOptions::NONE).decode()
     }
 
-    fn eval_rax(inst: &iced_x86::Instruction, init_rax: u64) -> u64 {
+    /// Lift `inst` (must route through the fallback), evaluate with regs seeded
+    /// to `init`, and return the final register array.
+    fn eval(inst: &iced_x86::Instruction, init: [u64; 16]) -> [u64; 16] {
         let mut lifter = RiscLifter::new();
         lifter
             .lift_instruction(inst)
-            .expect("alias must lift via generated fallback");
-        assert!(
-            !lifter.desynth.instrs.is_empty(),
-            "alias lowering produced no micro-ops"
-        );
-        let prog = RiscProgram::new(lifter.desynth.instrs.clone());
-        let mut init = [0u64; 16];
-        init[0] = init_rax;
-        // Use the full reference evaluator (eval_state); eval_registers is a
-        // partial evaluator that does not implement every RiscOp.
-        prog.eval_state(&init).regs[0]
+            .expect("must lift via generated fallback");
+        assert!(!lifter.desynth.instrs.is_empty(), "lowering produced no micro-ops");
+        RiscProgram::new(lifter.desynth.instrs.clone()).eval_state(&init).regs
     }
 
-    // Differential: the SHL lowering that the SAL alias re-dispatches to is
-    // x86-exact. (SAL and SHL share an opcode; iced canonicalizes a decoded
-    // C1 /6 to Shl_*, so SAL is reachable only via the synthetic auditor — we
-    // verify the reused lowering by decoding real SHL bytes.)
     #[test]
     fn shl_lowering_matches_ground_truth() {
-        // SHL rax, imm8  ==  REX.W C1 /4 ib  ==  48 C1 E0 ib
+        // SHL rax, imm8 == 48 C1 E0 ib. (SAL routes to the same lift_shift path.)
         for (a, imm) in [
             (0x0000_0000_0000_0001u64, 1u8),
             (0x1234_5678_9abc_def0, 4),
@@ -144,39 +144,65 @@ mod tests {
             (0x8000_0000_0000_0001, 31),
         ] {
             let inst = decode64(&[0x48, 0xC1, 0xE0, imm]);
-            assert_eq!(
-                inst.code(),
-                Code::Shl_rm64_imm8,
-                "unexpected decode: {:?}",
-                inst.code()
-            );
-            let got = eval_rax(&inst, a);
-            let expected = a.wrapping_shl((imm as u32) & 63);
-            assert_eq!(got, expected, "SHL mismatch a={a:#x} imm={imm}");
+            assert_eq!(inst.code(), Code::Shl_rm64_imm8, "decode {:?}", inst.code());
+            let mut init = [0u64; 16];
+            init[0] = a;
+            let got = eval(&inst, init)[0];
+            assert_eq!(got, a.wrapping_shl((imm as u32) & 63), "SHL a={a:#x} imm={imm}");
         }
     }
 
-    // The alias table maps each unsupported Code to the correct handled sibling.
-    // This is the mapping half of the SAL/0x82 differential; composed with the
-    // SHL ground-truth test above it verifies the aliases end-to-end.
+    #[test]
+    fn add16_lowering_matches_ground_truth() {
+        // ADD ax, bx == 66 01 D8. Only AX's low 16 bits change; upper preserved.
+        let inst = decode64(&[0x66, 0x01, 0xD8]);
+        assert_eq!(inst.code(), Code::Add_rm16_r16, "decode {:?}", inst.code());
+        for (a, b) in [
+            (0x1111_2222_3333_0005u64, 0x0003u64),
+            (0xdead_beef_cafe_ffffu64, 0x0002u64),
+            (0x0000_0000_0000_abcdu64, 0x1111u64),
+        ] {
+            let mut init = [0u64; 16];
+            init[0] = a; // RAX (AX = low 16)
+            init[3] = b; // RBX (BX = low 16)
+            let got = eval(&inst, init)[0];
+            let expected = (a & !0xffffu64) | (a.wrapping_add(b) & 0xffff);
+            assert_eq!(got, expected, "ADD16 a={a:#x} b={b:#x}");
+        }
+    }
+
+    #[test]
+    fn sub16_lowering_matches_ground_truth() {
+        // SUB ax, bx == 66 29 D8.
+        let inst = decode64(&[0x66, 0x29, 0xD8]);
+        assert_eq!(inst.code(), Code::Sub_rm16_r16, "decode {:?}", inst.code());
+        for (a, b) in [
+            (0x1111_2222_3333_0005u64, 0x0003u64),
+            (0xdead_beef_cafe_0000u64, 0x0001u64),
+            (0x0000_0000_0000_1234u64, 0x9999u64),
+        ] {
+            let mut init = [0u64; 16];
+            init[0] = a;
+            init[3] = b;
+            let got = eval(&inst, init)[0];
+            let expected = (a & !0xffffu64) | (a.wrapping_sub(b) & 0xffff);
+            assert_eq!(got, expected, "SUB16 a={a:#x} b={b:#x}");
+        }
+    }
+
     #[test]
     fn alias_targets_are_correct() {
-        assert_eq!(super::alias_target(Code::Sal_rm64_CL), Some(Code::Shl_rm64_CL));
-        assert_eq!(super::alias_target(Code::Sal_rm64_imm8), Some(Code::Shl_rm64_imm8));
-        assert_eq!(super::alias_target(Code::Sal_rm8_1), Some(Code::Shl_rm8_1));
-        assert_eq!(super::alias_target(Code::Sal_rm32_imm8), Some(Code::Shl_rm32_imm8));
-        assert_eq!(super::alias_target(Code::Add_rm8_imm8_82), Some(Code::Add_rm8_imm8));
-        assert_eq!(super::alias_target(Code::Sub_rm8_imm8_82), Some(Code::Sub_rm8_imm8));
+        assert_eq!(super::alias_target(Code::Inc_r16), Some(Code::Inc_rm16));
+        assert_eq!(super::alias_target(Code::Inc_r32), Some(Code::Inc_rm32));
+        assert_eq!(super::alias_target(Code::Dec_r16), Some(Code::Dec_rm16));
+        assert_eq!(super::alias_target(Code::Dec_r32), Some(Code::Dec_rm32));
         assert_eq!(super::alias_target(Code::Adc_rm8_imm8_82), Some(Code::Adc_rm8_imm8));
         assert_eq!(super::alias_target(Code::Sbb_rm8_imm8_82), Some(Code::Sbb_rm8_imm8));
-        // Non-aliases must not be remapped.
         assert_eq!(super::alias_target(Code::Mov_r64_rm64), None);
     }
 
     #[test]
     fn effect_free_hints_are_recognized() {
-        // String-level guard: the no-op class is keyed off the mnemonic debug
-        // string recorded by the auditor.
         for m in ["Sfence", "Lfence", "Mfence", "Prefetcht0", "Endbr64"] {
             assert!(super::is_effect_free_hint(m), "{m} should be effect-free");
         }
