@@ -8,7 +8,9 @@
 use crate::binder::BoundOperand;
 use crate::coverage::CoverageReport;
 use crate::family::classify;
-use crate::rules::{resolve, semantic_template_for, template_ops_are_known, Strategy};
+use crate::rules::{
+    new_primitive_candidate, resolve, semantic_template_for, template_ops_are_known, Strategy,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -44,6 +46,17 @@ pub struct PlanEntry {
     pub rounding_sae: bool,
     /// EVEX tuple type / disp8 compression class (Priority 4; from DB).
     pub tuple_type: String,
+    /// When this native-fallback instruction is a "needs new RiscOp /
+    /// NativeBridge" candidate (as opposed to kept-native-by-policy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_primitive: Option<NewPrimitiveInfo>,
+}
+
+/// Report-facing form of a new-primitive candidate.
+#[derive(Debug, Clone, Serialize)]
+pub struct NewPrimitiveInfo {
+    pub mechanism: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -55,6 +68,9 @@ pub struct PlanSummary {
     pub auto_template: usize,
     pub manual_semantics: usize,
     pub native_fallback: usize,
+    /// Native-fallback entries that are new-primitive candidates (subset of
+    /// native_fallback; the rest are kept native by policy).
+    pub new_primitive_candidates: usize,
     pub by_family: BTreeMap<String, usize>,
     pub gaps_by_family: BTreeMap<String, usize>,
 }
@@ -100,10 +116,21 @@ pub fn build_plan(report: &CoverageReport) -> Plan {
 
         let mnemonic_upper = rec.mnemonic.to_ascii_uppercase();
         let lowering = resolve(family, &mnemonic_upper);
+        let new_primitive = if lowering.strategy == Strategy::NativeFallback {
+            new_primitive_candidate(family).map(|np| NewPrimitiveInfo {
+                mechanism: np.mechanism.to_string(),
+                reason: np.reason.to_string(),
+            })
+        } else {
+            None
+        };
         match lowering.strategy {
             Strategy::AutoTemplate => summary.auto_template += 1,
             Strategy::ManualSemantics => summary.manual_semantics += 1,
             Strategy::NativeFallback => summary.native_fallback += 1,
+        }
+        if new_primitive.is_some() {
+            summary.new_primitive_candidates += 1;
         }
 
         let template = semantic_template_for(
@@ -141,6 +168,7 @@ pub fn build_plan(report: &CoverageReport) -> Plan {
             broadcast: template.simd.broadcast,
             rounding_sae: template.simd.rounding_sae,
             tuple_type: rec.tuple_type.clone(),
+            new_primitive,
         });
     }
 
@@ -176,6 +204,10 @@ pub fn render_report_md(plan: &Plan) -> String {
     out.push_str(&format!("| ↳ auto-template candidates | {} |\n", s.auto_template));
     out.push_str(&format!("| ↳ manual-semantics required | {} |\n", s.manual_semantics));
     out.push_str(&format!("| ↳ intentional native fallback | {} |\n", s.native_fallback));
+    out.push_str(&format!(
+        "| ↳↳ new RiscOp / NativeBridge candidates | {} |\n",
+        s.new_primitive_candidates
+    ));
     out.push('\n');
 
     out.push_str("## Instructions by family\n\n");
@@ -220,10 +252,12 @@ pub fn render_report_md(plan: &Plan) -> String {
     }
 
     out.push_str("## Native fallback (kept native by policy)\n\n");
+    out.push_str("_Crypto accelerators and x87 — virtualizing them is out of scope; \
+        these are a deliberate choice, not a missing primitive._\n\n");
     let native_fams: BTreeMap<&str, usize> = plan
         .entries
         .iter()
-        .filter(|e| e.strategy == "NATIVE_FALLBACK")
+        .filter(|e| e.strategy == "NATIVE_FALLBACK" && e.new_primitive.is_none())
         .fold(BTreeMap::new(), |mut acc, e| {
             *acc.entry(e.family.as_str()).or_insert(0) += 1;
             acc
@@ -233,6 +267,38 @@ pub fn render_report_md(plan: &Plan) -> String {
         out.push_str(&format!("| {fam} | {n} |\n"));
     }
     out.push('\n');
+
+    // ── needs new RiscOp / NativeBridge (candidates) ─────────────────────────
+    out.push_str("## Needs new RiscOp / NativeBridge (candidates)\n\n");
+    out.push_str("_Instructions the RISC core cannot express today. They are NOT \
+        auto-lowered; each needs a new primitive or a native bridge before it can \
+        be virtualized faithfully._\n\n");
+    // Group candidates by (family, mechanism, reason).
+    let mut cand: BTreeMap<(&str, &str, &str), Vec<&str>> = BTreeMap::new();
+    for e in plan.entries.iter() {
+        if let Some(np) = &e.new_primitive {
+            cand.entry((e.family.as_str(), np.mechanism.as_str(), np.reason.as_str()))
+                .or_default()
+                .push(e.mnemonic.as_str());
+        }
+    }
+    if cand.is_empty() {
+        out.push_str("_None in this coverage set._\n\n");
+    } else {
+        for ((fam, mechanism, reason), mnemonics) in &cand {
+            let mut uniq: Vec<&str> = mnemonics.clone();
+            uniq.sort_unstable();
+            uniq.dedup();
+            out.push_str(&format!("### {fam} → {mechanism} ({} instructions)\n\n", uniq.len()));
+            out.push_str(&format!("_{reason}_\n\n"));
+            let sample: Vec<String> = uniq.iter().take(24).map(|m| format!("`{m}`")).collect();
+            out.push_str(&sample.join(", "));
+            if uniq.len() > 24 {
+                out.push_str(&format!(" … (+{} more)", uniq.len() - 24));
+            }
+            out.push_str("\n\n");
+        }
+    }
 
     out
 }

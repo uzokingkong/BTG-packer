@@ -337,3 +337,35 @@ fn simd_params_surface_in_skeleton() {
         assert!(rs.contains("simd: VL="), "SIMD shape must be surfaced in the skeleton");
     }
 }
+
+// ── New RiscOp / NativeBridge candidate surfacing ────────────────────────────
+
+#[test]
+fn new_primitive_candidates_are_surfaced_and_split_from_policy() {
+    let r = fixture();
+    let plan = build_plan(&r);
+    let md = render_report_md(&plan);
+
+    // The report has the dedicated candidates section.
+    assert!(md.contains("## Needs new RiscOp / NativeBridge (candidates)"));
+
+    // RNG / state-save / privileged families, when present as gaps, are tagged
+    // as candidates; crypto / x87 are NOT (kept native by policy).
+    for e in plan.entries.iter().filter(|e| e.strategy == "NATIVE_FALLBACK") {
+        match e.family.as_str() {
+            "Random" | "StateSave" | "SystemPrivileged" | "Amx" => {
+                assert!(e.new_primitive.is_some(), "{} must be a candidate", e.mnemonic);
+            }
+            "Crypto" | "X87" => {
+                assert!(e.new_primitive.is_none(), "{} is native by policy", e.mnemonic);
+            }
+            _ => {}
+        }
+    }
+
+    // Summary counter is consistent with the tagged entries.
+    let tagged = plan.entries.iter().filter(|e| e.new_primitive.is_some()).count();
+    assert_eq!(plan.summary.new_primitive_candidates, tagged);
+    // And candidates never exceed the native-fallback total.
+    assert!(plan.summary.new_primitive_candidates <= plan.summary.native_fallback);
+}

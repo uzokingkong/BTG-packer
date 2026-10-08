@@ -352,6 +352,46 @@ pub fn template_ops_are_known(l: &Lowering) -> bool {
     l.risc_ops.iter().all(|op| KNOWN_RISC_OPS.contains(op))
 }
 
+/// A proposed mechanism for an instruction the RISC core cannot represent today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewPrimitive {
+    /// "NativeBridge" or "new RiscOp".
+    pub mechanism: &'static str,
+    /// Why the current RiscOp vocabulary is insufficient.
+    pub reason: &'static str,
+}
+
+/// Classify a native-fallback family as a "needs new RiscOp / NativeBridge"
+/// candidate, or `None` when it is kept native *by policy* (crypto accelerators,
+/// x87) and is not a gap to close. This separates "we choose to stay native"
+/// from "we cannot express this yet" — the latter are real design candidates
+/// (RDRAND/RDTSC/XSAVE/SYSCALL/MSR/PKU/AMX ...), never fake-lowered.
+pub fn new_primitive_candidate(family: Family) -> Option<NewPrimitive> {
+    use Family::*;
+    match family {
+        Random => Some(NewPrimitive {
+            mechanism: "NativeBridge",
+            reason: "non-deterministic RNG (RDRAND/RDSEED); a pure RiscOp cannot model entropy",
+        }),
+        StateSave => Some(NewPrimitive {
+            mechanism: "NativeBridge",
+            reason: "large architectural state save/restore (XSAVE/FXSAVE family)",
+        }),
+        Amx => Some(NewPrimitive {
+            mechanism: "new RiscOp",
+            reason: "AMX tile state; needs a dedicated tile RiscOp family or native bridge",
+        }),
+        SystemPrivileged => Some(NewPrimitive {
+            mechanism: "NativeBridge",
+            reason: "privileged/system/timing (RDTSC/RDMSR/WRMSR/SYSCALL/PKU/VMX); \
+                     needs a native bridge or new control-transfer RiscOp",
+        }),
+        // Crypto (AES/SHA/PCLMUL) and X87 are intentional native fallbacks by
+        // policy, not missing-primitive gaps.
+        _ => None,
+    }
+}
+
 // ── Semantic IR bridge (Priority 1) ──────────────────────────────────────────
 //
 // `confidence_ceiling` is the *maximum* tier a lowering could ever reach given
