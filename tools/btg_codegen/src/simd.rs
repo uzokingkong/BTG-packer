@@ -50,13 +50,17 @@ fn vector_len_of(operands: &[BoundOperand]) -> u16 {
 }
 
 /// Build the full SIMD shape for an instruction form from its bound operands,
-/// mnemonic, and the EVEX decorations recorded in the coverage DB.
+/// mnemonic, and the EVEX decorations recorded in the coverage DB (opmask,
+/// zeroing, broadcast, and rounding/SAE support).
+#[allow(clippy::too_many_arguments)]
 pub fn build_simd_shape(
     operands: &[BoundOperand],
     mnemonic_upper: &str,
     opmask: &str,
     zeroing: bool,
     broadcast: bool,
+    can_rounding: bool,
+    can_sae: bool,
 ) -> SimdShape {
     let vector_len = vector_len_of(operands);
     if vector_len == 0 {
@@ -81,8 +85,9 @@ pub fn build_simd_shape(
         masked,
         zeroing,
         broadcast,
-        // Rounding/SAE are not represented in the coverage DB; see module note.
-        rounding_sae: false,
+        // The form supports static rounding {er} or SAE {sae}: either makes the
+        // result rounding-mode dependent, so it cannot be lowered naively.
+        rounding_sae: can_rounding || can_sae,
     }
 }
 
@@ -114,10 +119,13 @@ pub struct SemanticSignature {
     pub mnemonic: String,
     pub encoding: Encoding,
     pub simd: SimdShape,
+    /// EVEX tuple type (disp8 compression class) from the coverage DB.
+    pub tuple_type: String,
     pub cpuid: Vec<String>,
 }
 
 impl SemanticSignature {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mnemonic_upper: &str,
         encoding: &str,
@@ -125,12 +133,18 @@ impl SemanticSignature {
         opmask: &str,
         zeroing: bool,
         broadcast: bool,
+        can_rounding: bool,
+        can_sae: bool,
+        tuple_type: &str,
         cpuid: &[String],
     ) -> Self {
         SemanticSignature {
             mnemonic: mnemonic_upper.to_string(),
             encoding: Encoding::parse(encoding),
-            simd: build_simd_shape(operands, mnemonic_upper, opmask, zeroing, broadcast),
+            simd: build_simd_shape(
+                operands, mnemonic_upper, opmask, zeroing, broadcast, can_rounding, can_sae,
+            ),
+            tuple_type: tuple_type.to_string(),
             cpuid: cpuid.to_vec(),
         }
     }
@@ -174,7 +188,7 @@ mod tests {
     #[test]
     fn xmm_paddd_has_four_32bit_lanes() {
         let ops = bind_operands(Family::SsePackedInt, &["xmm_reg".into(), "xmm_or_mem".into()]);
-        let shape = build_simd_shape(&ops, "PADDD", "none", false, false);
+        let shape = build_simd_shape(&ops, "PADDD", "none", false, false, false, false);
         assert_eq!(shape.vector_len, 128);
         assert_eq!(shape.element_bits, 32);
         assert_eq!(shape.lanes, 4);
@@ -188,9 +202,11 @@ mod tests {
             &["zmm_reg".into(), "k_reg".into(), "zmm_vvvv".into(), "zmm_or_mem".into()],
         );
         let sig = SemanticSignature::new(
-            "VADDPS", "EVEX", &ops, "K1", true, false, &["AVX512F".into()],
+            "VADDPS", "EVEX", &ops, "K1", true, false, true, true, "Full", &["AVX512F".into()],
         );
         assert_eq!(sig.simd.vector_len, 512);
+        assert!(sig.simd.rounding_sae, "EVEX rounding/SAE recorded");
+        assert_eq!(sig.tuple_type, "Full");
         assert_eq!(sig.simd.element_bits, 32);
         assert_eq!(sig.simd.lanes, 16);
         assert!(sig.simd.masked);
@@ -205,7 +221,9 @@ mod tests {
     #[test]
     fn legacy_xmm_does_not_need_parameterized_op() {
         let ops = bind_operands(Family::SsePackedInt, &["xmm_reg".into(), "xmm_or_mem".into()]);
-        let sig = SemanticSignature::new("PADDD", "Legacy", &ops, "none", false, false, &[]);
+        let sig = SemanticSignature::new(
+            "PADDD", "Legacy", &ops, "none", false, false, false, false, "N1", &[],
+        );
         assert!(!sig.needs_parameterized_vector_op());
         assert!(!sig.is_wide_vector());
     }

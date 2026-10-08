@@ -491,6 +491,9 @@ pub fn semantic_template_for(
     opmask: &str,
     zeroing: bool,
     broadcast: bool,
+    can_rounding: bool,
+    can_sae: bool,
+    tuple_type: &str,
     cpuid: &[String],
 ) -> SemanticTemplate {
     let mut t = semantic_template(l, mnemonic_upper);
@@ -501,15 +504,17 @@ pub fn semantic_template_for(
     crate::binder::bind_into_template(&mut t, &bound);
 
     let sig = crate::simd::SemanticSignature::new(
-        mnemonic_upper, encoding, &bound, opmask, zeroing, broadcast, cpuid,
+        mnemonic_upper, encoding, &bound, opmask, zeroing, broadcast, can_rounding, can_sae,
+        tuple_type, cpuid,
     );
     if sig.simd.is_simd() {
         t.simd = sig.simd;
         if sig.needs_parameterized_vector_op() {
             t.confidence = Confidence::Manual;
             t = t.side_effect(
-                "EVEX mask/zeroing/broadcast or VL>128 — needs a parameterized \
-                 packed-op family; not auto-lowerable onto 128-bit slot ops",
+                "EVEX mask/zeroing/broadcast/rounding/SAE or VL>128 — needs a \
+                 parameterized packed-op family; not auto-lowerable onto 128-bit \
+                 slot ops",
             );
         } else if sig.is_wide_vector() {
             t.confidence = Confidence::Manual;

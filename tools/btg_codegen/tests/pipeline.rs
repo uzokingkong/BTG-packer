@@ -315,6 +315,9 @@ fn simd_params_and_evex_demotion_in_plan() {
         assert_eq!(z.confidence, "MANUAL", "EVEX 512-bit must not auto-lower");
         assert_eq!(z.lanes, 16, "512-bit / 32-bit elem = 16 lanes");
         assert!(z.masked || z.zeroing, "EVEX form should record its mask decoration");
+        // Priority 4: rounding/SAE and tuple type flow from the coverage DB.
+        assert!(z.rounding_sae, "EVEX {{er}}/{{sae}} support must be recorded");
+        assert_eq!(z.tuple_type, "Full", "EVEX tuple type must flow through");
     }
 
     // A 256-bit VEX vector is demoted to MANUAL (needs lane fan-out).

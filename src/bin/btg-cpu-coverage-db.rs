@@ -55,6 +55,12 @@ struct ProbeRecord {
     opmask: String,
     zeroing: bool,
     broadcast: bool,
+    /// EVEX static rounding control {er} is supported by this form.
+    can_rounding: bool,
+    /// EVEX suppress-all-exceptions {sae} is supported by this form.
+    can_sae: bool,
+    /// EVEX tuple type (disp8 compression class), e.g. "N1", "Full", "Tuple1Scalar".
+    tuple_type: String,
     encoded_bytes: String,
     decoded_code: String,
     roundtrip_ok: bool,
@@ -195,6 +201,9 @@ fn metadata_probe(id: u64, code: Code) -> ProbeRecord {
         opmask: "none".into(),
         zeroing: false,
         broadcast: false,
+        can_rounding: info.can_use_rounding_control(),
+        can_sae: info.can_suppress_all_exceptions(),
+        tuple_type: format!("{:?}", info.tuple_type()),
         encoded_bytes: String::new(),
         decoded_code: String::new(),
         roundtrip_ok: false,
@@ -336,6 +345,7 @@ fn run_probe(code: Code, dim: &Dimension, semantic_samples: usize, probe_id: u64
         return ProbeRecord {
             probe_id, code_id: code as usize, code: format!("{code:?}"), mnemonic: format!("{:?}", info.mnemonic()), encoding: format!("{:?}", info.encoding()),
             bitness: dim.bitness, operand_form: dim.operand_form.clone(), prefix: dim.prefix.clone(), opmask: dim.opmask.clone(), zeroing: dim.zeroing, broadcast: dim.broadcast,
+            can_rounding: info.can_use_rounding_control(), can_sae: info.can_suppress_all_exceptions(), tuple_type: format!("{:?}", info.tuple_type()),
             encoded_bytes: hex(&bytes), decoded_code: format!("{:?}", decoded.code()), roundtrip_ok: false,
             lifter: "ROUNDTRIP_MISMATCH".into(), lift_error: Some(format!("decoded as {:?}", decoded.code())), risc_ops: vec![], isa: "N/A".into(), interpreter: "N/A".into(), threaded: "N/A".into(), semantic: "NOT_RUN".into(), semantic_error: None, status: "DECODE_ERROR".into(),
         };
@@ -369,6 +379,7 @@ fn run_probe(code: Code, dim: &Dimension, semantic_samples: usize, probe_id: u64
             ProbeRecord {
                 probe_id, code_id: code as usize, code: format!("{code:?}"), mnemonic: format!("{:?}", info.mnemonic()), encoding: format!("{:?}", info.encoding()),
                 bitness: dim.bitness, operand_form: dim.operand_form.clone(), prefix: dim.prefix.clone(), opmask: dim.opmask.clone(), zeroing: dim.zeroing, broadcast: dim.broadcast,
+                can_rounding: info.can_use_rounding_control(), can_sae: info.can_suppress_all_exceptions(), tuple_type: format!("{:?}", info.tuple_type()),
                 encoded_bytes: hex(&bytes), decoded_code: format!("{:?}", decoded.code()), roundtrip_ok: true,
                 lifter: "SUPPORTED".into(), lift_error: None, risc_ops, isa: if isa_ok { "SUPPORTED" } else { "GAP" }.into(), interpreter: if interp_ok { "SUPPORTED" } else { "GAP" }.into(), threaded: if threaded_ok { "SUPPORTED" } else { "GAP" }.into(), semantic, semantic_error, status: status.into(),
             }
@@ -381,6 +392,7 @@ fn failed_probe(id: u64, code: Code, dim: &Dimension, status: &str, error: Strin
     ProbeRecord {
         probe_id: id, code_id: code as usize, code: format!("{code:?}"), mnemonic: format!("{:?}", code.op_code().mnemonic()), encoding: format!("{:?}", code.op_code().encoding()),
         bitness: dim.bitness, operand_form: dim.operand_form.clone(), prefix: dim.prefix.clone(), opmask: dim.opmask.clone(), zeroing: dim.zeroing, broadcast: dim.broadcast,
+        can_rounding: code.op_code().can_use_rounding_control(), can_sae: code.op_code().can_suppress_all_exceptions(), tuple_type: format!("{:?}", code.op_code().tuple_type()),
         encoded_bytes: String::new(), decoded_code: String::new(), roundtrip_ok: false, lifter: status.into(), lift_error: Some(error), risc_ops: vec![], isa: "N/A".into(), interpreter: "N/A".into(), threaded: "N/A".into(), semantic: "NOT_RUN".into(), semantic_error: None, status: status.into(),
     }
 }

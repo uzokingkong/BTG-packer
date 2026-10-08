@@ -40,6 +40,15 @@ pub struct CoverageRecord {
     /// EVEX embedded broadcast (`{1toN}`) in effect.
     #[serde(default)]
     pub broadcast: bool,
+    /// EVEX static rounding control {er} supported by this form.
+    #[serde(default)]
+    pub can_rounding: bool,
+    /// EVEX suppress-all-exceptions {sae} supported by this form.
+    #[serde(default)]
+    pub can_sae: bool,
+    /// EVEX tuple type (disp8 compression class).
+    #[serde(default)]
+    pub tuple_type: String,
     /// Pipeline status string: FULL_PIPELINE / LIFTED_NO_MICRO_OP / UNSUPPORTED /
     /// LIFT_ERROR / EVALUATOR_GAP / ISA_GAP / INTERPRETER_GAP / THREADED_GAP / ...
     #[serde(default)]

@@ -40,6 +40,10 @@ pub struct PlanEntry {
     pub masked: bool,
     pub zeroing: bool,
     pub broadcast: bool,
+    /// Form supports static rounding {er} or SAE {sae} (Priority 4; from DB).
+    pub rounding_sae: bool,
+    /// EVEX tuple type / disp8 compression class (Priority 4; from DB).
+    pub tuple_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -110,6 +114,9 @@ pub fn build_plan(report: &CoverageReport) -> Plan {
             &rec.opmask,
             rec.zeroing,
             rec.broadcast,
+            rec.can_rounding,
+            rec.can_sae,
+            &rec.tuple_type,
             &rec.cpuid_features,
         );
 
@@ -132,6 +139,8 @@ pub fn build_plan(report: &CoverageReport) -> Plan {
             masked: template.simd.masked,
             zeroing: template.simd.zeroing,
             broadcast: template.simd.broadcast,
+            rounding_sae: template.simd.rounding_sae,
+            tuple_type: rec.tuple_type.clone(),
         });
     }
 
@@ -252,13 +261,15 @@ pub fn render_lifter_rules_rs(plan: &Plan) -> String {
         ));
         if e.vector_len != 0 {
             out.push_str(&format!(
-                "    // simd: VL={} elem={} lanes={}{}{}{}\n",
+                "    // simd: VL={} elem={} lanes={}{}{}{}{}{}\n",
                 e.vector_len,
                 e.element_bits,
                 e.lanes,
                 if e.masked { " mask=K1" } else { "" },
                 if e.zeroing { " {z}" } else { "" },
                 if e.broadcast { " {1toN}" } else { "" },
+                if e.rounding_sae { " {er/sae}" } else { "" },
+                if e.tuple_type.is_empty() { String::new() } else { format!(" tuple={}", e.tuple_type) },
             ));
         }
         out.push_str(&format!("    // {}\n", e.notes));
