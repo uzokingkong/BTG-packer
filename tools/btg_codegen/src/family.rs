@@ -113,8 +113,16 @@ fn is_vex(rec: &CoverageRecord) -> bool {
 pub fn classify(rec: &CoverageRecord) -> Family {
     let m = rec.mnemonic.to_ascii_uppercase();
 
-    // ── NOP / fences / control-flow-guard hints (semantics: none / trivial) ──
-    if m == "NOP" || m == "PAUSE" || m.ends_with("FENCE") || m.starts_with("ENDBR") || m == "HINT_NOP"
+    // ── NOP / fences / cache & prefetch hints / CET guards ───────────────────
+    // All architecturally effect-free in the single-threaded reference model:
+    // safe to lower to no micro-op. Drives the generated fallback's no-op class.
+    if m == "NOP"
+        || m == "PAUSE"
+        || m == "HINT_NOP"
+        || m.ends_with("FENCE")
+        || m.starts_with("ENDBR")
+        || m.starts_with("PREFETCH")
+        || matches!(m.as_str(), "CLFLUSH" | "CLFLUSHOPT" | "CLWB" | "CLDEMOTE")
     {
         return Family::NopFence;
     }

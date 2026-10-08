@@ -14,6 +14,12 @@ mod arith;
 mod sse;
 mod string;
 
+// OFF by default. A generated, reviewed lowering fallback for instructions that
+// otherwise hit the `_ => unsupported` arm below. Compiled only under the
+// `codegen_fallback` feature, so the default production lifter is unchanged.
+#[cfg(feature = "codegen_fallback")]
+mod generated_fallback;
+
 const XMM_SLOT_BASE: u64 = 0xF000_0000_0000_0000;
 
 fn has_any_rep(inst: &Instruction) -> bool {
@@ -1706,6 +1712,17 @@ impl RiscLifter {
             }
 
             _ => {
+                // OFF by default. When the `codegen_fallback` feature is on, the
+                // generated fallback may lower a subset of otherwise-unsupported
+                // instructions. It is purely additive: it only runs for codes
+                // that already reach this unsupported arm, so it cannot change
+                // the behavior of any instruction the match above handles.
+                #[cfg(feature = "codegen_fallback")]
+                {
+                    if self.try_generated_fallback(inst)? {
+                        return Ok(());
+                    }
+                }
                 // Fallback for unsupported complex instruction
                 return Err(anyhow!("risc lifter: unsupported opcode {:?}", code));
             }

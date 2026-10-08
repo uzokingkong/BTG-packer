@@ -58,11 +58,13 @@ fn main() -> Result<()> {
     let plan_json = serde_json::to_string_pretty(&plan)?;
     let lifter_rs = emit::render_lifter_rules_rs(&plan);
     let tests_rs = emit::render_semantic_tests_rs(&plan);
+    let fallback_rs = emit::render_fallback_rs(&plan);
 
     write(&args.out_dir, "codegen_report.md", &report_md)?;
     write(&args.out_dir, "rule_coverage.json", &plan_json)?;
     write(&args.out_dir, "lifter_rules.generated.rs", &lifter_rs)?;
     write(&args.out_dir, "semantic_tests.generated.rs", &tests_rs)?;
+    write(&args.out_dir, "generated_fallback.candidate.rs", &fallback_rs)?;
 
     let s = &plan.summary;
     println!("BTG codegen plan complete");

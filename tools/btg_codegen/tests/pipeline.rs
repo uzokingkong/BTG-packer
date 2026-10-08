@@ -2,7 +2,10 @@
 //! sample coverage fixture.
 
 use btg_codegen::coverage::{CoverageRecord, CoverageReport};
-use btg_codegen::emit::{build_plan, render_lifter_rules_rs, render_report_md, render_semantic_tests_rs};
+use btg_codegen::emit::{
+    build_plan, render_fallback_rs, render_lifter_rules_rs, render_report_md,
+    render_semantic_tests_rs,
+};
 use btg_codegen::family::{classify, Family};
 use btg_codegen::rules::{resolve, template_ops_are_known, Strategy};
 use std::path::PathBuf;
@@ -43,6 +46,9 @@ fn classifies_representative_families() {
     assert_eq!(classify(rec_by_code(&r, "Movsq_m64_m64")), Family::StringOp);
     assert_eq!(classify(rec_by_code(&r, "Fadd_m32fp")), Family::X87);
     assert_eq!(classify(rec_by_code(&r, "Nopd")), Family::NopFence);
+    assert_eq!(classify(rec_by_code(&r, "Sfence")), Family::NopFence);
+    assert_eq!(classify(rec_by_code(&r, "Prefetcht0_m8")), Family::NopFence);
+    assert_eq!(classify(rec_by_code(&r, "Endbr64")), Family::NopFence);
     // BMI is VEX-encoded but must not be mistaken for AVX.
     assert_eq!(classify(rec_by_code(&r, "Andnd_r32_r32_rm32")), Family::Bmi);
 }
@@ -91,8 +97,8 @@ fn plan_summary_is_consistent() {
     let plan = build_plan(&r);
     let s = &plan.summary;
 
-    // 22 instruction records + 1 non-instruction in the fixture.
-    assert_eq!(s.instructions, 22);
+    // 25 instruction records + 1 non-instruction in the fixture.
+    assert_eq!(s.instructions, 25);
     assert!(s.gaps > 0);
     // Buckets partition the gap set exactly.
     assert_eq!(s.auto_template + s.manual_semantics + s.native_fallback, s.gaps);
@@ -142,4 +148,25 @@ fn emitters_produce_wellformed_artifacts() {
     let back: serde_json::Value = serde_json::from_str(&json).expect("parse plan");
     assert!(back.get("summary").is_some());
     assert!(back.get("entries").is_some());
+}
+
+#[test]
+fn fallback_emits_effect_free_hints_from_db() {
+    let r = fixture();
+    let plan = build_plan(&r);
+    let rs = render_fallback_rs(&plan);
+
+    // Structural contract the core file relies on.
+    assert!(rs.contains("fn try_generated_fallback"));
+    assert!(rs.contains("fn is_effect_free_hint"));
+    assert!(rs.contains("format!(\"{:?}\", inst.mnemonic())"));
+
+    // Mnemonics observed as NopFence gaps are present, verbatim from the DB.
+    assert!(rs.contains("\"Sfence\""));
+    assert!(rs.contains("\"Prefetcht0\""));
+    assert!(rs.contains("\"Endbr64\""));
+
+    // An instruction with real effects must never land in the no-op class.
+    assert!(!rs.contains("\"Rdrand\""));
+    assert!(!rs.contains("\"Add\""));
 }
