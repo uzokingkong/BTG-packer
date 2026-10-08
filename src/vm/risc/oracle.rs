@@ -38,8 +38,9 @@ pub const HOST_RESERVED: [usize; 2] = [reg::RSP, reg::RBP];
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OracleCtx {
-    pub regs: [u64; 16],
-    pub flags: u64,
+    pub regs: [u64; 16],       // offset 0
+    pub flags: u64,            // offset 128
+    pub xmm: [[u8; 16]; 16],   // offset 136
 }
 
 const MEM_COMMIT: u32 = 0x1000;
@@ -86,6 +87,23 @@ btg_oracle_run:
     push    rax
     popfq
 
+    movups  xmm0,  [rcx+136]
+    movups  xmm1,  [rcx+152]
+    movups  xmm2,  [rcx+168]
+    movups  xmm3,  [rcx+184]
+    movups  xmm4,  [rcx+200]
+    movups  xmm5,  [rcx+216]
+    movups  xmm6,  [rcx+232]
+    movups  xmm7,  [rcx+248]
+    movups  xmm8,  [rcx+264]
+    movups  xmm9,  [rcx+280]
+    movups  xmm10, [rcx+296]
+    movups  xmm11, [rcx+312]
+    movups  xmm12, [rcx+328]
+    movups  xmm13, [rcx+344]
+    movups  xmm14, [rcx+360]
+    movups  xmm15, [rcx+376]
+
     mov     rax, [rcx+0]
     mov     rdx, [rcx+16]
     mov     rbx, [rcx+24]
@@ -123,6 +141,22 @@ btg_oracle_run:
     mov     [rax+0], rcx
     pop     rcx
     mov     [rax+128], rcx
+    movups  [rax+136], xmm0
+    movups  [rax+152], xmm1
+    movups  [rax+168], xmm2
+    movups  [rax+184], xmm3
+    movups  [rax+200], xmm4
+    movups  [rax+216], xmm5
+    movups  [rax+232], xmm6
+    movups  [rax+248], xmm7
+    movups  [rax+264], xmm8
+    movups  [rax+280], xmm9
+    movups  [rax+296], xmm10
+    movups  [rax+312], xmm11
+    movups  [rax+328], xmm12
+    movups  [rax+344], xmm13
+    movups  [rax+360], xmm14
+    movups  [rax+376], xmm15
 
     lea     rsp, [rbp-56]
     pop     r15
@@ -192,7 +226,7 @@ impl DiffResult {
 /// *claim* into a *proof*.
 pub fn differential(code_bytes: &[u8], init: [u64; 16]) -> DiffResult {
     let btg = btg_eval(code_bytes, init, std::collections::HashMap::new());
-    let sil = run_instruction(code_bytes, &OracleCtx { regs: init, flags: 0 });
+    let sil = run_instruction(code_bytes, &OracleCtx { regs: init, flags: 0, xmm: [[0u8; 16]; 16] });
     compare_states(&btg, &sil)
 }
 
@@ -282,7 +316,7 @@ pub fn differential_mem(
         let btg = btg_eval(code_bytes, init, mem);
 
         // Silicon side (writes the real buffer in place).
-        let sil = run_instruction(code_bytes, &OracleCtx { regs: init, flags: 0 });
+        let sil = run_instruction(code_bytes, &OracleCtx { regs: init, flags: 0, xmm: [[0u8; 16]; 16] });
 
         let mut res = compare_states(&btg, &sil);
         for off in watch {
@@ -300,11 +334,88 @@ pub fn differential_mem(
     }
 }
 
+/// SIMD execution differential (increment 3b): compare a vector instruction's
+/// result between the BTG evaluator and the silicon oracle.
+///
+/// The evaluator models XMM registers as 16-byte memory slots at
+/// `XMM_SLOT_BASE + idx*16`, so the input XMM bytes seed the BTG memory map at
+/// those slot addresses; on the silicon side they load the real XMM registers.
+/// After execution, the watched XMM slots are compared byte-for-byte against
+/// the captured silicon XMM registers. This is the AUTO_SEMANTIC_EXACT proof
+/// for 128-bit packed ops.
+pub fn differential_simd(
+    code_bytes: &[u8],
+    xmm_in: &[(usize, [u8; 16])],
+    watch_xmm: &[usize],
+) -> DiffResult {
+    use super::lifter::XMM_SLOT_BASE;
+
+    // Seed the BTG memory map at the XMM slot addresses.
+    let mut mem = std::collections::HashMap::new();
+    for &(idx, bytes) in xmm_in {
+        let base = XMM_SLOT_BASE + (idx as u64) * 16;
+        for (i, b) in bytes.iter().enumerate() {
+            mem.insert(base + i as u64, *b);
+        }
+    }
+    let btg = btg_eval(code_bytes, [0u64; 16], mem);
+
+    // Silicon: load the input XMM registers, run, capture.
+    let mut inctx = OracleCtx { regs: [0u64; 16], flags: 0, xmm: [[0u8; 16]; 16] };
+    for &(idx, bytes) in xmm_in {
+        inctx.xmm[idx] = bytes;
+    }
+    let sil = run_instruction(code_bytes, &inctx);
+
+    let mut res = DiffResult { value_match: true, flags_match: true, mismatches: Vec::new() };
+    for &idx in watch_xmm {
+        let base = XMM_SLOT_BASE + (idx as u64) * 16;
+        for i in 0..16usize {
+            let b = btg.mem.get(&(base + i as u64)).copied().unwrap_or(0);
+            let s = sil.xmm[idx][i];
+            if b != s {
+                res.value_match = false;
+                res.mismatches.push(format!(
+                    "xmm{idx}[byte {i}]: btg=0x{b:02X} silicon=0x{s:02X}"
+                ));
+            }
+        }
+    }
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use super::reg::*;
     use super::*;
     use crate::vm::risc::flags::{VFLAG_CF, VFLAG_SF, VFLAG_ZF};
+
+    fn xmm_lanes32(lanes: [u32; 4]) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        for (i, v) in lanes.iter().enumerate() {
+            b[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn differential_simd_paddd_matches_silicon() {
+        // paddd xmm0, xmm1 (66 0F FE C1): 4-lane 32-bit add, incl. a wrapping
+        // lane. BTG slot memory must match the real silicon XMM0.
+        let a = xmm_lanes32([1, 2, 0xFFFF_FFFF, 0x1000]);
+        let b = xmm_lanes32([10, 20, 1, 0x2000]);
+        let d = differential_simd(&[0x66, 0x0F, 0xFE, 0xC1], &[(0, a), (1, b)], &[0]);
+        assert!(d.value_match, "PADDD differential mismatch: {:?}", d.mismatches);
+    }
+
+    #[test]
+    fn differential_simd_pxor_matches_silicon() {
+        // pxor xmm0, xmm1 (66 0F EF C1): 128-bit xor.
+        let a = xmm_lanes32([0xDEAD_BEEF, 0x0F0F_0F0F, 0, 0xFFFF_FFFF]);
+        let b = xmm_lanes32([0x1234_5678, 0xF0F0_F0F0, 0xAAAA_AAAA, 0xFFFF_FFFF]);
+        let d = differential_simd(&[0x66, 0x0F, 0xEF, 0xC1], &[(0, a), (1, b)], &[0]);
+        assert!(d.value_match, "PXOR differential mismatch: {:?}", d.mismatches);
+    }
 
     fn init_with(regs: &[(usize, u64)]) -> [u64; 16] {
         let mut r = [0u64; 16];

@@ -20,7 +20,7 @@ mod string;
 #[cfg(feature = "codegen_fallback")]
 mod generated_fallback;
 
-const XMM_SLOT_BASE: u64 = 0xF000_0000_0000_0000;
+pub(crate) const XMM_SLOT_BASE: u64 = 0xF000_0000_0000_0000;
 
 fn has_any_rep(inst: &Instruction) -> bool {
     inst.has_rep_prefix() || inst.has_repne_prefix()
