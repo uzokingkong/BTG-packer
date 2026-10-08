@@ -27,6 +27,8 @@
     { "code_id": 23, "code": "Sfence", "mnemonic": "Sfence", "encoding": "Legacy", "is_instruction": true, "mode64": true, "privileged": false, "cpuid_features": ["SSE"], "op_kinds": [], "status": "UNSUPPORTED", "risc_ops": [] },
     { "code_id": 24, "code": "Prefetcht0_m8", "mnemonic": "Prefetcht0", "encoding": "Legacy", "is_instruction": true, "mode64": true, "privileged": false, "cpuid_features": ["SSE"], "op_kinds": ["mem"], "status": "UNSUPPORTED", "risc_ops": [] },
     { "code_id": 25, "code": "Endbr64", "mnemonic": "Endbr64", "encoding": "Legacy", "is_instruction": true, "mode64": true, "privileged": false, "cpuid_features": ["CET_IBT"], "op_kinds": [], "status": "UNSUPPORTED", "risc_ops": [] },
+    { "code_id": 26, "code": "Sal_rm64_CL", "mnemonic": "Sal", "encoding": "Legacy", "is_instruction": true, "mode64": true, "privileged": false, "cpuid_features": [], "op_kinds": ["r64_or_mem", "cl"], "status": "UNSUPPORTED", "risc_ops": [] },
+    { "code_id": 27, "code": "Add_rm8_imm8_82", "mnemonic": "Add", "encoding": "Legacy", "is_instruction": true, "mode64": true, "privileged": false, "cpuid_features": [], "op_kinds": ["r8_or_mem", "imm8"], "status": "UNSUPPORTED", "risc_ops": [] },
     { "code_id": 999, "code": "DeclareByte", "mnemonic": "INVALID", "encoding": "Legacy", "is_instruction": false, "mode64": false, "privileged": false, "cpuid_features": [], "op_kinds": [], "status": "NON_INSTRUCTION", "risc_ops": [] }
   ]
 }

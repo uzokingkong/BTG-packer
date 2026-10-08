@@ -97,8 +97,8 @@ fn plan_summary_is_consistent() {
     let plan = build_plan(&r);
     let s = &plan.summary;
 
-    // 25 instruction records + 1 non-instruction in the fixture.
-    assert_eq!(s.instructions, 25);
+    // 27 instruction records + 1 non-instruction in the fixture.
+    assert_eq!(s.instructions, 27);
     assert!(s.gaps > 0);
     // Buckets partition the gap set exactly.
     assert_eq!(s.auto_template + s.manual_semantics + s.native_fallback, s.gaps);
@@ -169,4 +169,17 @@ fn fallback_emits_effect_free_hints_from_db() {
     // An instruction with real effects must never land in the no-op class.
     assert!(!rs.contains("\"Rdrand\""));
     assert!(!rs.contains("\"Add\""));
+}
+
+#[test]
+fn fallback_emits_redispatch_aliases_from_db() {
+    let r = fixture();
+    let plan = build_plan(&r);
+    let rs = render_fallback_rs(&plan);
+
+    assert!(rs.contains("fn alias_target"));
+    // SAL aliases to SHL; the 0x82 dup aliases to its base encoding.
+    assert!(rs.contains("Sal_rm64_CL => Shl_rm64_CL"));
+    assert!(rs.contains("Add_rm8_imm8_82 => Add_rm8_imm8"));
+    assert!(rs.contains("self.lift_instruction_inner(&aliased)"));
 }

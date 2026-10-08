@@ -4,34 +4,43 @@
 // lifter's `_ => unsupported` arm. Compiled ONLY under the `codegen_fallback`
 // feature; the default production lifter never sees it.
 //
-// Matching is by the instruction's mnemonic DEBUG STRING — exactly the form the
-// coverage auditor (`vm-coverage`) records. Consequences by design:
-//   * An entry that does not correspond to a real iced-x86 mnemonic simply
-//     never fires. It can never be a compile error and never a mis-lowering.
-//   * The generator emits these strings straight from the coverage DB, so every
-//     emitted entry is guaranteed to match at runtime.
+// Two classes, both proven-safe:
 //
-// Every mnemonic in this seed is architecturally effect-free in the
-// single-threaded reference semantics (cache/prefetch hints, memory-ordering
-// fences, CET landing pads). Lowering them to NO micro-op is exact — the same
-// treatment the hand-written lifter already gives NOP/PAUSE.
+//   1. EFFECT-FREE HINTS (prefetch/fence/CET/cache) -> no micro-op. Exact in the
+//      single-threaded reference semantics. Matched by mnemonic DEBUG STRING, so
+//      a wrong/stale entry can only fail to fire, never miscompile or mis-lower.
+//
+//   2. RE-DISPATCH ALIASES. Some unsupported Code values are *exact semantic
+//      aliases* of a Code the hand-written match already lowers correctly
+//      (SAL == SHL; the 0x82 group is a duplicate encoding of the 0x80 group).
+//      We rewrite the instruction's Code to its handled sibling and reuse the
+//      proven lowering verbatim -- zero new operand wiring, correct by
+//      construction. The differential oracle test below independently checks the
+//      lowered result against ground-truth x86 arithmetic.
 // =============================================================================
 
 use super::RiscLifter;
 use anyhow::Result;
-use iced_x86::Instruction;
+use iced_x86::{Code, Instruction};
 
 impl RiscLifter {
     /// Try to lower an otherwise-unsupported instruction with a generated rule.
     /// Returns `Ok(true)` when handled (any micro-ops have been pushed).
-    ///
-    /// Takes `&mut self` because future, non-no-op generated arms will push
-    /// onto `self.desynth`; the current effect-free class pushes nothing.
     pub(crate) fn try_generated_fallback(&mut self, inst: &Instruction) -> Result<bool> {
+        // Class 1: architecturally effect-free hints -> no micro-op.
         let mnemonic = format!("{:?}", inst.mnemonic());
-
         if is_effect_free_hint(&mnemonic) {
-            // Architectural no-op: emit no micro-op (cf. the NOP/PAUSE arm).
+            return Ok(true);
+        }
+
+        // Class 2: re-dispatch to an already-handled semantic sibling. We append
+        // onto the same desynth buffer via the inner match; the outer
+        // diagnostic wrapper that invoked us still performs branch-site
+        // bookkeeping over the full appended range.
+        if let Some(target) = alias_target(inst.code()) {
+            let mut aliased = *inst;
+            aliased.set_code(target);
+            self.lift_instruction_inner(&aliased)?;
             return Ok(true);
         }
 
@@ -60,4 +69,97 @@ fn is_effect_free_hint(mnemonic: &str) -> bool {
             | "Endbr32"
             | "Endbr64"
     )
+}
+
+/// Map an unsupported Code to a handled Code with identical semantics.
+/// Every pair here is a true alias: same operands, same effect.
+fn alias_target(code: Code) -> Option<Code> {
+    use Code::*;
+    Some(match code {
+        // SAL is an alias of SHL (opcode /4 vs /6 of the same group).
+        Sal_rm8_1 => Shl_rm8_1,
+        Sal_rm8_CL => Shl_rm8_CL,
+        Sal_rm8_imm8 => Shl_rm8_imm8,
+        Sal_rm16_1 => Shl_rm16_1,
+        Sal_rm16_CL => Shl_rm16_CL,
+        Sal_rm16_imm8 => Shl_rm16_imm8,
+        Sal_rm32_1 => Shl_rm32_1,
+        Sal_rm32_CL => Shl_rm32_CL,
+        Sal_rm32_imm8 => Shl_rm32_imm8,
+        Sal_rm64_1 => Shl_rm64_1,
+        Sal_rm64_CL => Shl_rm64_CL,
+        Sal_rm64_imm8 => Shl_rm64_imm8,
+        // The 0x82 group is a documented duplicate encoding of the 0x80 group.
+        Add_rm8_imm8_82 => Add_rm8_imm8,
+        Adc_rm8_imm8_82 => Adc_rm8_imm8,
+        Sbb_rm8_imm8_82 => Sbb_rm8_imm8,
+        Sub_rm8_imm8_82 => Sub_rm8_imm8,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Differential verification: lift an alias through the fallback, evaluate
+    //! the produced micro-program with the real RISC reference evaluator, and
+    //! compare the destination register to independent ground-truth arithmetic.
+    //! A wrong alias mapping (e.g. SAL -> SHR) makes these fail.
+    use crate::vm::risc::{RiscLifter, RiscProgram};
+    use iced_x86::{Code, Instruction, OpKind, Register};
+
+    fn eval_reg0(inst: &Instruction, init_rax: u64) -> u64 {
+        let mut lifter = RiscLifter::new();
+        lifter
+            .lift_instruction(inst)
+            .expect("alias must lift via generated fallback");
+        let prog = RiscProgram::new(lifter.desynth.instrs.clone());
+        let mut init = [0u64; 16];
+        init[0] = init_rax;
+        prog.eval_registers(&init)[0]
+    }
+
+    #[test]
+    fn sal_imm8_matches_shift_left_ground_truth() {
+        for (a, count) in [
+            (0x0000_0000_0000_0001u64, 1u32),
+            (0x1234_5678_9abc_def0, 4),
+            (0xffff_ffff_ffff_ffff, 7),
+            (0x8000_0000_0000_0001, 31),
+        ] {
+            let mut inst = Instruction::with(Code::Sal_rm64_imm8);
+            inst.set_op0_kind(OpKind::Register);
+            inst.set_op0_register(Register::RAX);
+            inst.set_op1_kind(OpKind::Immediate8);
+            inst.set_immediate8(count as u8);
+
+            let got = eval_reg0(&inst, a);
+            let expected = a.wrapping_shl(count & 63);
+            assert_eq!(got, expected, "SAL/SHL mismatch a={a:#x} count={count}");
+        }
+    }
+
+    #[test]
+    fn add_82_dup_matches_add_ground_truth() {
+        for (a, imm) in [(0x10u64, 0x20u8), (0xffu64, 0x01u8), (0x7fu64, 0x7fu8)] {
+            let mut inst = Instruction::with(Code::Add_rm8_imm8_82);
+            inst.set_op0_kind(OpKind::Register);
+            inst.set_op0_register(Register::AL);
+            inst.set_op1_kind(OpKind::Immediate8);
+            inst.set_immediate8(imm);
+
+            let got = eval_reg0(&inst, a) & 0xff;
+            let expected = (a.wrapping_add(imm as u64)) & 0xff;
+            assert_eq!(got, expected, "ADD 0x82 mismatch a={a:#x} imm={imm:#x}");
+        }
+    }
+
+    #[test]
+    fn effect_free_hints_are_recognized() {
+        // String-level guard: the no-op class is keyed off the mnemonic debug
+        // string recorded by the auditor.
+        for m in ["Sfence", "Lfence", "Mfence", "Prefetcht0", "Endbr64"] {
+            assert!(super::is_effect_free_hint(m), "{m} should be effect-free");
+        }
+        assert!(!super::is_effect_free_hint("Add"));
+    }
 }
