@@ -1405,37 +1405,47 @@ pub(crate) fn place_boot_stub(
             metadata.bytes.len(),
         )?;
         for original in &ctx.route_required_original_targets {
-            let route = routes.lookup(*original)?;
-            let family_index = sizing
-                .families
-                .iter()
-                .position(|family| *family == route.family)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("route target {:?} has no placed family", original)
+            let target_va = image_base + u64::from(original.0);
+            let destination_rva = if let Some(&gateway_off) =
+                sizing.native_entry_gateways.get(&target_va)
+            {
+                ctx.vm_prog_rva
+                    .checked_add(gateway_off as u32)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("route target {:?} gateway RVA overflow", original)
+                    })?
+            } else {
+                let route = routes.lookup(*original)?;
+                let family_index = sizing
+                    .families
+                    .iter()
+                    .position(|family| *family == route.family)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("route target {:?} has no placed family", original)
+                    })?;
+                let module = program
+                    .modules
+                    .iter()
+                    .find(|module| module.family == route.family)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("route target {:?} has no encoded family", original)
+                    })?;
+                let local_op = usize::try_from(route.entry_vip.0).map_err(|_| {
+                    anyhow::anyhow!("route target {:?} entry VIP overflows usize", original)
                 })?;
-            let module = program
-                .modules
-                .iter()
-                .find(|module| module.family == route.family)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("route target {:?} has no encoded family", original)
+                let byte_offset = *module.instruction_offsets.get(local_op).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "route target {:?} entry VIP is outside encoded family",
+                        original
+                    )
                 })?;
-            let local_op = usize::try_from(route.entry_vip.0).map_err(|_| {
-                anyhow::anyhow!("route target {:?} entry VIP overflows usize", original)
-            })?;
-            let byte_offset = *module.instruction_offsets.get(local_op).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "route target {:?} entry VIP is outside encoded family",
-                    original
-                )
-            })?;
-            let destination_rva = ctx
-                .vm_prog_rva
-                .checked_add(sizing.code_ranges[family_index].0 as u32)
-                .and_then(|rva| rva.checked_add(byte_offset as u32))
-                .ok_or_else(|| {
-                    anyhow::anyhow!("route target {:?} destination RVA overflow", original)
-                })?;
+                ctx.vm_prog_rva
+                    .checked_add(sizing.code_ranges[family_index].0 as u32)
+                    .and_then(|rva| rva.checked_add(byte_offset as u32))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("route target {:?} destination RVA overflow", original)
+                    })?
+            };
             ctx.route_generated_destinations.push(
                 crate::vm::route_metadata::GeneratedRouteDestination {
                     original: *original,

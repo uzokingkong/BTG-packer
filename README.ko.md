@@ -82,6 +82,8 @@ cargo build --release --locked
 
 일반 commercial 경로는 **함수·기본 블록·명령어 ownership이 각각 100%**인지 측정하고, unresolved internal edge·unsupported instruction·capability mismatch가 모두 0인지 확인합니다. 최종 이미지에 원본 `.text`가 실행 가능하거나 평문 그대로 남아 있는지도 검사합니다. 이는 분석한 이미지에 대한 빌드 시점의 측정치이며 모든 PE가 호환된다는 뜻은 아닙니다. VM 소유 함수에서도 생성된 native handler와 bridge를 호출할 수 있습니다.
 
+`--text-vm`과 `--text-vm-oep`은 commercial ownership planner를 실행하지 않는 일반 lift 진단입니다. 이들의 명령어 lift 비율은 commercial 함수/블록 ownership 예상치가 아니므로, 실제 패킹 manifest와 ownership 보고서를 기준으로 판단하세요.
+
 coverage가 부족한 타깃을 개발 중이라면 `--strict-profile` 대신 `--allow-partial-vm`을 사용하고 출력된 ownership/coverage를 확인하세요. 이 결과를 전체 가상화로 표시하면 안 됩니다. `--vm-oep`는 native `--dispatcher-reencrypt`보다 우선하므로 `--full --strict-profile` 조합은 다운그레이드로 거부됩니다.
 
 ## 암호 및 옵션 조건

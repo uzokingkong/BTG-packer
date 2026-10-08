@@ -17,65 +17,66 @@ use iced_x86::{Code, Instruction, MemoryOperand, Register};
 pub(crate) fn build_anti_debug_raw_block(
     policy: crate::dispatcher::antidebug::AntiDebugPolicy,
 ) -> Vec<u8> {
-    // ── v10: stable PEB checks + policy-specific failure path ───────────────
-    // 기본 레이아웃(고정 73B)은 기존과 동일:
-    //   pushfq; push rax; (BeingDebugged) jnz→실패; (NtGlobalFlag) jnz→실패;
-    //   (Heap.Flags) jnz→실패; jmp +2(정상); [실패슬롯 2B]; pop rax; popfq
-    // Trap: 실패슬롯 = ud2 (0F 0B) — 기존 동작 (sensitive)
-    // Hang: 실패슬롯 = jmp $ (EB FE) — 무한 루프 (research/툴 고정)
-    // Warn: 세 jnz를 정상 경로(시작+0x47의 pop rax)로 리다이렉트 — fail-open
+    // Multi-layered stealth anti-debug (fixed 73B block layout):
+    // 1. Direct PEB check: gs:[0x60] -> [PEB+2] (BeingDebugged)
+    // 2. TEB-indirect check: gs:[0x30] -> [TEB+0x60] (PEB) -> [PEB+2] (BeingDebugged)
+    //    Defeats hooks that only intercept gs:[0x60] reads.
+    // 3. RDTSC timing probe: detects debugger stepping and execution stalls
+    //    (delta >> 20 != 0 triggers failure, normal delta ~30 cycles is 0).
+    // Branches at 0x11 (+0x32), 0x27 (+0x1C), 0x41 (+0x02) jump to failure slot @0x45.
     let mut b: Vec<u8> = vec![
-        0x9C, // pushfq
-        0x50, // push rax
+        0x9C, // 0x00: pushfq
+        0x50, // 0x01: push rax
+        // ── Check 1: Direct PEB BeingDebugged (0x02..0x11, 15B) ─────────────
         // mov rax, gs:[0x60] (PEB)
         0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00,
         // movzx eax, byte [rax+2] (BeingDebugged)
-        0x0F, 0xB6, 0x40, 0x02, // test eax, eax
-        0x85, 0xC0, // jnz +0x32 → 실패 슬롯 (Warn: +0x34 → 정상 경로)
-        0x75, 0x32, // mov rax, gs:[0x60]
-        0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00,
-        // mov eax, [rax+0xBC] (NtGlobalFlag)
-        0x8B, 0x80, 0xBC, 0x00, 0x00, 0x00, // and eax, 0x70
-        0x25, 0x70, 0x00, 0x00, 0x00,
-        // jnz +0x1C → 실패 슬롯 (Warn: +0x1E → 정상 경로)
-        0x75, 0x1C, // mov rax, gs:[0x60]
-        0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00,
-        // mov rax, [rax+0x30] (ProcessHeap)
-        0x48, 0x8B, 0x40, 0x30, // mov eax, [rax+0x70] (Heap.Flags)
-        0x8B, 0x80, 0x70, 0x00, 0x00, 0x00, // and eax, 0x70
-        0x25, 0x70, 0x00, 0x00, 0x00,
-        // jnz +0x02 → 실패 슬롯 (Warn: +0x04 → 정상 경로)
-        0x75, 0x02, // jmp +0x02 → 정상 경로 (pop rax)
-        0xEB, 0x02, // 실패 슬롯 (2B — Trap: ud2 / Hang: jmp $ / Warn: nop nop)
-        0x0F, 0x0B, 0x58, // pop rax
-        0x9D, // popfq
-    ];
-    // The raw pre-loader PEB probe has produced repeatable false positives on
-    // ordinary Windows launches (including differential verification) before
-    // the protected runtime has established its normal process context. Keep
-    // the fixed block/branch shape but make this early probe neutral; the
-    // structured post-entry anti-debug policy remains responsible for an
-    // actual debugger decision.
-    b[0x02] = 0x31;
-    b[0x03] = 0xC0;
-    b[0x04..0x11].fill(0x90);
-    // NtGlobalFlag is a system/process instrumentation policy, not proof that
-    // this process is currently debugged.  Machines with GFlags enabled would
-    // otherwise make every protected binary trap during ordinary execution.
-    // Preserve the fixed block shape and leave BeingDebugged as the explicit
-    // debugger-presence signal.
-    b[0x13] = 0x31;
-    b[0x14] = 0xC0;
-    b[0x15..0x27].fill(0x90);
+        0x0F, 0xB6, 0x40, 0x02,
+        // test eax, eax
+        0x85, 0xC0,
+        // 0x11: jnz +0x32 → 실패 슬롯 @0x45 (Warn: +0x34 → 정상 경로 @0x47)
+        0x75, 0x32,
 
-    // Segment-heap implementations do not expose a stable public Flags field
-    // at ProcessHeap+0x70.  Treating those implementation bytes as the legacy
-    // NT heap flags causes false UD2 traps on ordinary modern Windows runs.
-    // Preserve the fixed raw-block shape (and every branch displacement) while
-    // retiring that unsupported probe: xor eax,eax; NOP padding; existing JNZ.
-    b[0x2A] = 0x31;
-    b[0x2B] = 0xC0;
-    b[0x2C..0x41].fill(0x90);
+        // ── Check 2: TEB-Indirect BeingDebugged (0x13..0x27, 20B) ───────────
+        // mov rax, gs:[0x30] (TEB.Self)
+        0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00,
+        // mov rax, [rax+0x60] (PEB)
+        0x48, 0x8B, 0x40, 0x60,
+        // movzx eax, byte [rax+2] (BeingDebugged)
+        0x0F, 0xB6, 0x40, 0x02,
+        // test eax, eax
+        0x85, 0xC0,
+        // nop
+        0x90,
+        // 0x27: jnz +0x1C → 실패 슬롯 @0x45 (Warn: +0x1E → 정상 경로 @0x47)
+        0x75, 0x1C,
+
+        // ── Check 3: RDTSC Timing Delta Probe (0x29..0x41, 24B) ─────────────
+        // rdtsc -> EDX:EAX
+        0x0F, 0x31,
+        // mov ecx, eax
+        0x89, 0xC1,
+        // rdtsc -> EDX:EAX
+        0x0F, 0x31,
+        // sub eax, ecx
+        0x29, 0xC8,
+        // shr eax, 20 (if delta >= 0x100000 cycles, ZF=0)
+        0xC1, 0xE8, 0x14,
+        // 13 NOPs padding to preserve exact branch slot alignment
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        // 0x41: jnz +0x02 → 실패 슬롯 @0x45 (Warn: +0x04 → 정상 경로 @0x47)
+        0x75, 0x02,
+
+        // ── Fallthrough & Failure Handler ───────────────────────────────────
+        // 0x43: jmp +0x02 → 정상 경로 (0x47: pop rax)
+        0xEB, 0x02,
+        // 0x45..0x46: 실패 슬롯 (2B — Trap: ud2 / Hang: jmp $ / Poison: jmp / Warn: nop nop)
+        0x0F, 0x0B,
+        // 0x47: pop rax
+        0x58,
+        // 0x48: popfq
+        0x9D,
+    ];
     // ── 정책 적용 (고정 길이 유지 — 인코딩/길이 불변성 무회귀) ─────────────
     match policy {
         crate::dispatcher::antidebug::AntiDebugPolicy::Trap => {

@@ -866,6 +866,32 @@ fn test_lift_cmovcc() {
     assert_eq!(regs(&st)[1], 0xDEAD, "CMOVE taken when equal");
 }
 
+#[test]
+fn test_lift_cmp_lea_cmovle() {
+    // cmp edx, 0x312 (786) ; lea rax, [rsp + 0x24] ; cmovle rax, rcx ; ret
+    let raw = [
+        0x81, 0xFA, 0x12, 0x03, 0x00, 0x00,
+        0x48, 0x8D, 0x44, 0x24, 0x24,
+        0x48, 0x0F, 0x4E, 0xC1,
+        0xC3,
+    ];
+    // edx = 128 (<= 786 -> taken)
+    let mut init = [0u64; 16];
+    init[2] = 128;        // RDX (edx = 128)
+    init[1] = 0xCAFE;     // RCX
+    init[4] = 0x10000;    // RSP
+    let st = run(&raw, 0x140001000, init);
+    assert_eq!(regs(&st)[0], 0xCAFE, "CMOVLE taken when edx (128) <= 786 even after LEA");
+
+    // edx = 1000 (> 786 -> not taken)
+    let mut init2 = [0u64; 16];
+    init2[2] = 1000;       // RDX (edx = 1000)
+    init2[1] = 0xCAFE;     // RCX
+    init2[4] = 0x10000;    // RSP
+    let st2 = run(&raw, 0x140001000, init2);
+    assert_eq!(regs(&st2)[0], 0x10024, "CMOVLE not taken when edx (1000) > 786");
+}
+
 /// TEST ??AND flags without writing a destination.
 #[test]
 fn test_lift_test() {

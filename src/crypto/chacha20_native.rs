@@ -394,23 +394,32 @@ fn chacha_sequence(state_va: u64, virtual_rounds: bool) -> Seq {
 
 /// Absorb the initial 16-word state from [r14] into the stack [rsp+0x00..0x40].
 fn emit_absorb(s: &mut Seq) {
-    // constants st[0..4]
-    push(
-        s,
-        Instruction::with2(Code::Mov_rm32_imm32, w(0), CHACHA20_CONST_0 as i32).unwrap(),
-    );
-    push(
-        s,
-        Instruction::with2(Code::Mov_rm32_imm32, w(4), CHACHA20_CONST_1 as i32).unwrap(),
-    );
-    push(
-        s,
-        Instruction::with2(Code::Mov_rm32_imm32, w(8), CHACHA20_CONST_2 as i32).unwrap(),
-    );
-    push(
-        s,
-        Instruction::with2(Code::Mov_rm32_imm32, w(12), CHACHA20_CONST_3 as i32).unwrap(),
-    );
+    // Anti-Findcrypt: scramble ChaCha constants so "expand 32-byte k" never appears
+    // as plaintext immediates in the binary.
+    const CHA_MASK_0: u32 = 0x5A3C_96E7;
+    const CHA_MASK_1: u32 = 0xA749_1B3D;
+    const CHA_MASK_2: u32 = 0x3E82_C5F1;
+    const CHA_MASK_3: u32 = 0x91F4_D82A;
+
+    // st[0]: 0x61707865
+    push(s, Instruction::with2(Code::Mov_r32_imm32, Register::EAX, (CHACHA20_CONST_0 ^ CHA_MASK_0) as i32).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::EAX, CHA_MASK_0 as i32).unwrap());
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(0), Register::EAX).unwrap());
+
+    // st[1]: 0x3320646e
+    push(s, Instruction::with2(Code::Mov_r32_imm32, Register::EAX, (CHACHA20_CONST_1 ^ CHA_MASK_1) as i32).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::EAX, CHA_MASK_1 as i32).unwrap());
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(4), Register::EAX).unwrap());
+
+    // st[2]: 0x79622d32
+    push(s, Instruction::with2(Code::Mov_r32_imm32, Register::EAX, (CHACHA20_CONST_2 ^ CHA_MASK_2) as i32).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::EAX, CHA_MASK_2 as i32).unwrap());
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(8), Register::EAX).unwrap());
+
+    // st[3]: 0x6b206574
+    push(s, Instruction::with2(Code::Mov_r32_imm32, Register::EAX, (CHACHA20_CONST_3 ^ CHA_MASK_3) as i32).unwrap());
+    push(s, Instruction::with2(Code::Xor_rm32_imm32, Register::EAX, CHA_MASK_3 as i32).unwrap());
+    push(s, Instruction::with2(Code::Mov_rm32_r32, w(12), Register::EAX).unwrap());
     // key words st[4..12] <- [r14+0x00..0x20]
     for i in 0..8 {
         push(

@@ -8359,6 +8359,65 @@ pub fn build_self_decoding_parts_with_variant_plan(
         }
     }
 
+    // Hardening: Synthesize unique polymorphic decoy handlers for every unregistered
+    // opcode byte so that the 256-entry dispatch table contains 256 completely distinct
+    // handler virtual addresses, defeating automated invalid-sink deduplication.
+    let mut active_handlers: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
+    for (op, byte) in &spec.opcode_map {
+        if let Some(&hidx) = handlers.get(op) {
+            active_handlers.insert(*byte, hidx);
+        }
+    }
+    for (&byte, &hidx) in &extension_handlers {
+        active_handlers.insert(byte, hidx);
+    }
+
+    let mut decoy_handlers: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
+    for byte in 0u16..256 {
+        let b_u8 = byte as u8;
+        if !active_handlers.contains_key(&b_u8) {
+            let h_decoy = b.len();
+            let mut mixed = seed
+                ^ (u64::from(b_u8) << 32)
+                ^ 0xD1B5_4A32_D192_ED03;
+            let mut next_u32 = |mixed: &mut u64| -> u32 {
+                *mixed = mixed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x3C6E_F35F_CEBE_A5CE);
+                (*mixed >> 32) as u32
+            };
+
+            // 50% chance to simulate an operand decode prologue
+            if (next_u32(&mut mixed) & 1) == 0 {
+                b.call(sub_dec_ops);
+            }
+
+            let scratch_regs = [
+                Register::RAX,
+                Register::RCX,
+                Register::RDX,
+                Register::R8,
+                Register::R9,
+                Register::R10,
+                Register::R11,
+            ];
+            let num_ops = 2 + (next_u32(&mut mixed) % 3) as usize; // 2..=4
+            for _ in 0..num_ops {
+                let r1 = scratch_regs[(next_u32(&mut mixed) as usize) % scratch_regs.len()];
+                let r2 = scratch_regs[(next_u32(&mut mixed) as usize) % scratch_regs.len()];
+                let imm = next_u32(&mut mixed) as i32;
+                match next_u32(&mut mixed) % 5 {
+                    0 => { b.push(Instruction::with2(Code::Add_rm64_r64, r1, r2).unwrap()); }
+                    1 => { b.push(Instruction::with2(Code::Xor_rm64_r64, r1, r2).unwrap()); }
+                    2 => { b.push(Instruction::with2(Code::Ror_rm64_imm8, r1, ((next_u32(&mut mixed) % 62) + 1) as u32).unwrap()); }
+                    3 => { b.push(Instruction::with2(Code::Mov_r64_imm64, r1, imm as i64).unwrap()); }
+                    _ => { b.push(Instruction::with2(Code::Sub_rm64_r64, r1, r2).unwrap()); }
+                }
+            }
+            // Terminate with trap
+            b.push(Instruction::with(Code::Ud2));
+            decoy_handlers.insert(b_u8, h_decoy);
+        }
+    }
+
     // P3: distribute identical handler `jmp dispatch` tails over seed-derived,
     // semantics-neutral tail islands before final branch layout.
     let diversified_tails = b.diversify_direct_tails(dispatch, seed);
@@ -8423,15 +8482,15 @@ pub fn build_self_decoding_parts_with_variant_plan(
         } else { Ok(address ^ per_op_key(table_key, byte)) }
     };
     for byte in 0u16..256 {
-        table[byte as usize] = encode_handler(byte as u8, va_of(h_trap))?;
-    }
-    for (op, byte) in &spec.opcode_map {
-        if let Some(&hidx) = handlers.get(op) {
-            table[*byte as usize] = encode_handler(*byte, va_of(hidx))?;
-        }
-    }
-    for (&byte, &hidx) in &extension_handlers {
-        table[byte as usize] = encode_handler(byte, va_of(hidx))?;
+        let b_u8 = byte as u8;
+        let hidx = if let Some(&hidx) = active_handlers.get(&b_u8) {
+            hidx
+        } else if let Some(&hdecoy) = decoy_handlers.get(&b_u8) {
+            hdecoy
+        } else {
+            h_trap
+        };
+        table[byte as usize] = encode_handler(b_u8, va_of(hidx))?;
     }
     // P6-3: 엔트리 스텁의 무결성 셀프체크를 위한 테이블 checksum.
     let table_checksum = table_checksum_with_topology(&table, table_integrity_topology);

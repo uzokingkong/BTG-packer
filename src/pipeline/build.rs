@@ -640,10 +640,6 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
     // 로더가 부트 스텁 복호화 전에 .reloc을 적용하더라도 암호문 슬롯은 skip되어
     // 암호문이 다치지 않는다. 부트 스텁 imm64들(모듈 엔트리 VA 등)은 평문이라
     // reloc되어도 안전하다.
-    // The protected runtime still contains absolute address forms which are not
-    // all covered by the relocation scanner. Keep ASLR disabled until every
-    // generated address has explicit relocation ownership; enabling this early
-    // produces a load-time access violation under a randomized base.
     let reloc_aware = !ctx.at_rest_encrypted;
 
     let mut preserve_aslr_bits = false;
@@ -876,7 +872,7 @@ pub fn run(ctx: &PipelineContext, output_path: Option<&Path>) -> Result<Vec<u8>>
         // P0-⑦: relocation-aware 경로는 원본 DLL characteristics(DYNAMIC_BASE/
         // HIGH_ENTROPY_VA 포함)를 그대로 넘겨 builder가 .reloc과 함께 보존한다.
         if preserve_aslr_bits {
-            ctx.target_info.original_dll_characteristics
+            ctx.target_info.original_dll_characteristics | 0x0020 | 0x0040
         } else {
             clean_dll_characteristics
         },

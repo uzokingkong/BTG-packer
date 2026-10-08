@@ -4369,7 +4369,7 @@ fn test_unused_opcode_slots_decode_to_trap() {
         for &byte in spec.opcode_map.values() {
             used.push(byte);
         }
-        let mut trap_va: Option<u64> = None;
+        let mut unused_vas: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut count = 0usize;
         for byte in 0u16..256 {
             let byte = byte as u8;
@@ -4377,37 +4377,34 @@ fn test_unused_opcode_slots_decode_to_trap() {
                 continue;
             }
             let dec = parts.table[byte as usize] ^ per_op_key(master, byte);
-            match trap_va {
-                None => trap_va = Some(dec),
-                Some(t) => assert_eq!(
-                    t, dec,
-                    "seed {seed:#x}: unused slot {byte:#04x} not the shared trap VA"
-                ),
-            }
             assert!(
                 (code_base..code_hi).contains(&dec),
                 "seed {seed:#x}: unused slot {byte:#04x} trap VA {dec:#x} outside code region"
             );
+            unused_vas.insert(dec);
             count += 1;
         }
-        // The canonical ISA grows as formerly native-only instructions become
-        // virtualizable. Keep a meaningful trap reserve without freezing the
-        // old opcode cardinality as a false invariant.
         assert!(
             count >= 64,
             "seed {seed:#x}: expected at least 64 unused trap slots, got {count}"
         );
-        // The trap VA must differ from every registered handler VA.
-        let trap = trap_va.unwrap();
+        // Decoy divergence: all unused slots get distinct decoy handler VAs to defeat
+        // automated sink-deduplication attacks.
+        assert_eq!(
+            unused_vas.len(),
+            count,
+            "seed {seed:#x}: all {count} unused slots must have distinct decoy handler VAs"
+        );
+        // The decoy VAs must differ from registered handler VAs.
         for (op, &byte) in &spec.opcode_map {
             let dec = parts.table[byte as usize] ^ per_op_key(master, byte);
             if *op == RiscOp::Trap {
                 assert!((code_base..code_hi).contains(&dec));
                 continue;
             }
-            assert_ne!(
-                trap, dec,
-                "seed {seed:#x}: op {op:?} decodes to the trap VA"
+            assert!(
+                !unused_vas.contains(&dec),
+                "seed {seed:#x}: registered op {op:?} collides with unused decoy VA"
             );
         }
     }
