@@ -125,7 +125,9 @@ mod tests {
         let prog = RiscProgram::new(lifter.desynth.instrs.clone());
         let mut init = [0u64; 16];
         init[0] = init_rax;
-        prog.eval_registers(&init)[0]
+        // Use the full reference evaluator (eval_state); eval_registers is a
+        // partial evaluator that does not implement every RiscOp.
+        prog.eval_state(&init).regs[0]
     }
 
     // Differential: the SHL lowering that the SAL alias re-dispatches to is
