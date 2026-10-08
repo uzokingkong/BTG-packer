@@ -127,9 +127,9 @@ mod tests {
             (0x8000_0000_0000_0001, 31),
         ] {
             let mut inst = Instruction::with(Code::Sal_rm64_imm8);
-            inst.set_op0_kind(OpKind::Register);
-            inst.set_op0_register(Register::RAX);
-            inst.set_op1_kind(OpKind::Immediate8);
+            inst.set_op_kind(0, OpKind::Register);
+            inst.set_op_register(0, Register::RAX);
+            inst.set_op_kind(1, OpKind::Immediate8);
             inst.set_immediate8(count as u8);
 
             let got = eval_reg0(&inst, a);
@@ -142,9 +142,9 @@ mod tests {
     fn add_82_dup_matches_add_ground_truth() {
         for (a, imm) in [(0x10u64, 0x20u8), (0xffu64, 0x01u8), (0x7fu64, 0x7fu8)] {
             let mut inst = Instruction::with(Code::Add_rm8_imm8_82);
-            inst.set_op0_kind(OpKind::Register);
-            inst.set_op0_register(Register::AL);
-            inst.set_op1_kind(OpKind::Immediate8);
+            inst.set_op_kind(0, OpKind::Register);
+            inst.set_op_register(0, Register::AL);
+            inst.set_op_kind(1, OpKind::Immediate8);
             inst.set_immediate8(imm);
 
             let got = eval_reg0(&inst, a) & 0xff;
