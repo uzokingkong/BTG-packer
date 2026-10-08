@@ -1605,6 +1605,42 @@ impl PolymorphicInterpreter {
                         if count >= 64 { 0 } else { hi >> count },
                     );
                 }
+                RiscOp::PackedShiftLeftLogical { elem_width, lanes } => {
+                    let a = get_operand_val(
+                        op_src1_raw,
+                        &self.spec,
+                        &self.regs,
+                        &self.temps,
+                        self.flags.raw,
+                        self.vsp,
+                        imm1,
+                    );
+                    let d = get_operand_val(
+                        op_dst_raw,
+                        &self.spec,
+                        &self.regs,
+                        &self.temps,
+                        self.flags.raw,
+                        self.vsp,
+                        0,
+                    );
+                    let count = get_operand_val(
+                        op_src2_raw,
+                        &self.spec,
+                        &self.regs,
+                        &self.temps,
+                        self.flags.raw,
+                        self.vsp,
+                        imm2,
+                    );
+                    let bits = elem_width as u64 * 8;
+                    for i in 0..lanes as u64 {
+                        let off = i * elem_width as u64;
+                        let v = mem_read(&self.mem, a.wrapping_add(off), elem_width);
+                        let r = if count >= bits { 0 } else { v << count };
+                        mem_write(&mut self.mem, d.wrapping_add(off), elem_width, r);
+                    }
+                }
                 RiscOp::PackedShuffle { low_words } => {
                     let a = get_operand_val(
                         op_src1_raw,
