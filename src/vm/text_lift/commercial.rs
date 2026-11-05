@@ -2554,7 +2554,13 @@ pub fn lift_program_cfg_commercial_with_model(
     // 함수를 XMM0 가비지로 잘못 읽으므로 위험.)
     let fp_returns = detect_fp_return_functions(text_bytes, base_va, &native_function_ranges);
     if !fp_returns.is_empty() {
-        program.annotate_native_fp_returns(&fp_returns);
+        if let Some(boundaries) = program.annotate_native_fp_returns(&fp_returns) {
+            for range in &mut raw_function_op_ranges {
+                range.start_op = boundaries[range.start_op];
+                range.end_op = boundaries[range.end_op];
+            }
+            crate::vm::mapper::remap_risc_indices(&boundaries);
+        }
         println!(
             "[+] F1 bridge FP-return: {} native function(s) detected as FP-returning (f32/f64) — SetNativeFpReturn hints injected",
             fp_returns.len()
@@ -2939,6 +2945,77 @@ pub fn lift_program_cfg_commercial_with_model(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn native_fp_hint_preserves_later_function_ranges() {
+        use crate::pe::builder::SectionData;
+        use iced_x86::{Decoder, DecoderOptions};
+
+        let image_base = 0x140000000;
+        let base = image_base + 0x1000;
+        let mut text = vec![0x90; 0x47];
+        text[..11].copy_from_slice(&[
+            0xE8, 0x3B, 0, 0, 0, // call native FP function at +0x40
+            0xE8, 0x16, 0, 0, 0, // call later VM function at +0x20
+            0xC3,
+        ]);
+        let later = [0x53, 0xBB, 42, 0, 0, 0, 0x5B, 0xC3];
+        text[0x20..0x28].copy_from_slice(&later);
+        text[0x40..].copy_from_slice(&[
+            0xB4, 0, // Legacy AH keeps this function native
+            0xF2, 0x0F, 0x2A, 0xC0, // cvtsi2sd xmm0,eax
+            0xC3,
+        ]);
+        let pdata = [
+            0x1000u32, 0x100B, 0x3000, 0x1020, 0x1028, 0x3000,
+            0x1040, 0x1047, 0x3000,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+        let sections = [
+            SectionData {
+                name: ".pdata".into(),
+                virtual_address: 0x2000,
+                virtual_size: 36,
+                characteristics: 0x40000040,
+                bytes: pdata,
+            },
+            SectionData {
+                name: ".xdata".into(),
+                virtual_address: 0x3000,
+                virtual_size: 4,
+                characteristics: 0x40000040,
+                bytes: vec![1, 0, 0, 0],
+            },
+        ];
+        crate::vm::mapper::begin("fp-insertion-regression");
+        let lifted = lift_program_cfg_commercial(
+            &text, base, base, &sections, image_base, &[], 0,
+        ).unwrap();
+        let mapping = crate::vm::mapper::take().unwrap();
+        assert!(lifted.program.instrs.iter().any(|instruction| {
+            matches!(instruction.op, RiscOp::SetNativeFpReturn { width: 8 })
+        }));
+
+        let mut expected = RiscLifter::new();
+        for instruction in Decoder::with_ip(64, &later, base + 0x20, DecoderOptions::NONE) {
+            expected.lift_instruction(&instruction).unwrap();
+        }
+        let range = lifted.function_op_ranges.iter()
+            .find(|range| range.function_id == base + 0x20)
+            .unwrap();
+        assert_eq!(
+            &lifted.program.instrs[range.start_op..range.end_op],
+            expected.desynth.instrs.as_slice(),
+        );
+        assert_eq!(lifted.program.ip_map().unwrap()[&(base + 0x20)], range.start_op);
+        let mapped_entry = mapping.risc_entries.iter()
+            .find(|entry| entry.src_va == base + 0x20)
+            .unwrap();
+        assert_eq!(mapped_entry.risc_op_start, range.start_op);
+        assert_eq!(mapping.risc_op_src[range.start_op], base + 0x20);
+    }
 
     #[test]
     fn trailing_zero_op_source_ip_is_not_published_past_block_end() {

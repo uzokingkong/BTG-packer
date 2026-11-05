@@ -187,12 +187,18 @@ impl RiscProgram {
     /// branch-map 에 없어 네이티브 브릿지로 나갈 때 반환값을 XMM0(FP)에서
     /// regs[0] 으로 동기화하도록 한다. (VM 내부 타깃이면 브릿지가 안 쓰이므로
     /// 무해한 스테일 슬롯 기록일 뿐.)
-    pub fn annotate_native_fp_returns(&mut self, fp_returns: &std::collections::HashMap<u64, u8>) {
+    /// Returns old-to-new operation boundaries for external ownership/map ranges
+    pub fn annotate_native_fp_returns(
+        &mut self,
+        fp_returns: &std::collections::HashMap<u64, u8>,
+    ) -> Option<Vec<usize>> {
         if fp_returns.is_empty() {
-            return;
+            return None;
         }
         let mut out = Vec::with_capacity(self.instrs.len() + fp_returns.len());
+        let mut boundaries = Vec::with_capacity(self.instrs.len() + 1);
         for ins in &self.instrs {
+            boundaries.push(out.len());
             if let RiscOp::VirtualBranch {
                 cond: BranchCondition::Always,
             } = ins.op
@@ -207,7 +213,28 @@ impl RiscProgram {
             }
             out.push(ins.clone());
         }
+        boundaries.push(out.len());
+        // We preserve source-address routes and REP micro-op labels through
+        // insertion; callers use the same boundaries for function/map ranges
+        for ins in &mut out {
+            if matches!(ins.op, RiscOp::VirtualBranch { .. })
+                && ins.src1.is_none()
+                && !self.ip_map.as_ref().is_some_and(|map| map.contains_key(&ins.imm))
+            {
+                if let Ok(index) = usize::try_from(ins.imm) {
+                    if let Some(&target) = boundaries.get(index) {
+                        ins.imm = target as u64;
+                    }
+                }
+            }
+        }
+        if let Some(map) = &mut self.ip_map {
+            for index in map.values_mut() {
+                *index = boundaries[*index];
+            }
+        }
         self.instrs = out;
+        Some(boundaries)
     }
 
     pub fn resolve_target(&self, imm: u64) -> usize {
@@ -1991,6 +2018,60 @@ impl RiscProgram {
         xors(&mut st, &mut flags, key);
         st.flags = flags.raw;
         st
+    }
+}
+
+#[cfg(test)]
+mod native_fp_annotation_tests {
+    use super::*;
+
+    #[test]
+    fn native_fp_hint_preserves_source_and_index_routes() {
+        let branch = |target| {
+            MicroInstr::new(RiscOp::VirtualBranch {
+                cond: BranchCondition::Always,
+            })
+            .with_imm(target)
+        };
+        let mut program = RiscProgram::with_ip_map(
+            vec![
+                branch(0x2000),
+                branch(0x4000), // Unexecuted native FP call before the later entry
+                MicroInstr::new(RiscOp::Mov)
+                    .with_dst(MicroOperand::VReg(0))
+                    .with_src1(MicroOperand::Imm64(111)),
+                branch(6), // REP-style instruction-index target
+                MicroInstr::new(RiscOp::Mov)
+                    .with_dst(MicroOperand::VReg(0))
+                    .with_src1(MicroOperand::Imm64(222)),
+                MicroInstr::new(RiscOp::Halt),
+                MicroInstr::new(RiscOp::Mov)
+                    .with_dst(MicroOperand::VReg(1))
+                    .with_src1(MicroOperand::Imm64(42)),
+                MicroInstr::new(RiscOp::Halt),
+            ],
+            HashMap::from([(0x1000, 0), (0x2000, 2), (0x4000, 6)]),
+        );
+        let expected = program.eval_state(&[0; 16]);
+        assert_eq!((expected.regs[0], expected.regs[1]), (111, 42));
+        let boundaries = program
+            .annotate_native_fp_returns(&HashMap::from([(0x4000, 8)]))
+            .unwrap();
+        assert_eq!(program.eval_state(&[0; 16]), expected);
+        assert_eq!(boundaries[8], program.instrs.len());
+        assert_eq!(program.instrs[0].imm, 0x2000);
+        assert_eq!(program.instrs[boundaries[1] + 1].imm, 0x4000);
+
+        for family in crate::vm::poly::VmArchitectureFamily::ALL {
+            let lowered = crate::vm::poly::family_lowering::lower(&program, family).unwrap();
+            let bytecode = crate::vm::poly::PolymorphicEncoder::new_for_family(31018, family)
+                .encode(&lowered.program)
+                .unwrap();
+            let native = crate::vm::threaded::poly_direct::run_native_poly_direct_for_family(
+                &bytecode, 31018, family, &[0; 16], lowered.program.ip_map(),
+            ).unwrap();
+            assert_eq!(native.regs, expected.regs, "native {family:?}");
+        }
     }
 }
 
