@@ -265,6 +265,23 @@ pub fn record_risc_entry(
     });
 }
 
+pub fn remap_risc_indices(boundaries: &[usize]) {
+    SLOT.with(|s| {
+        if let Some(m) = s.borrow_mut().as_mut() {
+            let mut sources = vec![0; *boundaries.last().unwrap_or(&0)];
+            for (index, &source) in m.risc_op_src.iter().enumerate() {
+                sources[boundaries[index]..boundaries[index + 1]].fill(source);
+            }
+            m.risc_op_src = sources;
+            for entry in &mut m.risc_entries {
+                let end = boundaries[entry.risc_op_start + entry.risc_op_count];
+                entry.risc_op_start = boundaries[entry.risc_op_start];
+                entry.risc_op_count = end - entry.risc_op_start;
+            }
+        }
+    });
+}
+
 /// P3 (G1): `PolymorphicEncoder::encode_with_offsets`가 계산한 per-micro-op 폴리
 /// 바이트코드 오프셋을 받아 각 RISC 엔트리의 첫 micro-op 오프셋을 채운다
 /// (place.rs가 상용 lift를 인코딩한 직후 호출).
