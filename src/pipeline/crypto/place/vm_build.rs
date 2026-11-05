@@ -49,10 +49,11 @@ pub(crate) const VM_INVOCATION_LANES: usize =
 pub(crate) const VM_HOST_STACK_SIZE: usize = 0x1_0000;
 pub(crate) const VM_HOST_STACK_SLOTS: usize = VM_INVOCATION_LANES + 1;
 // Canonical OEP is entered by a tail jump from the boot stub. Preserve its
-// loader-supplied RSP at the top of the dedicated canonical host stack, outside
+// loader-supplied RSP and return PC on the dedicated canonical host stack, outside
 // the mutable VM state block. Dispatcher/partial-native execution may reuse
 // otherwise spare state offsets, so a state-relative snapshot is not stable.
 const CANONICAL_HOST_STACK_RSP_SLOT: i64 = -8;
+const CANONICAL_HOST_STACK_RETURN_SLOT: i64 = -16;
 // Each hashed thread bucket owns a 64-bit live-slot bitmap. A set bit means
 // the corresponding native-entry root lane (and its host stack) is currently
 // in use. This is occupancy, not a nesting counter: out-of-order returns can
@@ -346,12 +347,22 @@ fn build_canonical_oep_gateway(
     )?);
     ins.push(Instruction::with2(
         Code::Mov_r64_rm64,
+        Register::RAX,
+        MemoryOperand::with_base(Register::RAX),
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_rm64_r64,
+        MemoryOperand::with_base_displ_size(Register::R11, CANONICAL_HOST_STACK_RETURN_SLOT, 8),
+        Register::RAX,
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_rm64,
         Register::RSP,
         Register::R11,
     )?);
     // Reserve the Win64 caller shadow space plus a guard above it. The native
-    // RSP snapshot at H-8 must not overlap the callee-owned H-0x20..H-1 home
-    // area. H is page/16-byte aligned, so H-0x50 preserves pre-call alignment.
+    // RSP/return snapshots at H-8/H-16 stay above the callee's home area
+    // H is page/16-byte aligned, so H-0x50 preserves pre-call alignment
     ins.push(Instruction::with2(
         Code::Sub_rm64_imm8,
         Register::RSP,
@@ -367,8 +378,8 @@ fn build_canonical_oep_gateway(
     // A top-level lifted RET has already consumed the architectural return slot.
     // Do not recover the native return through guest vRSP: partial VM/native
     // execution can change or corrupt that architectural value.  Restore the
-    // exact loader-supplied stack snapshot, consume its return slot, and tail
-    // jump without clobbering virtual RAX (the process/thread entry result).
+    // exact loader-supplied stack and return PC snapshots: a nested native tail
+    // call may have overwritten the guest return slot with its bridge return PC
     ins.push(Instruction::with2(
         Code::Mov_r64_imm64,
         Register::R11,
@@ -376,13 +387,13 @@ fn build_canonical_oep_gateway(
     )?);
     ins.push(Instruction::with2(
         Code::Mov_r64_rm64,
-        Register::R11,
-        MemoryOperand::with_base_displ_size(Register::R11, CANONICAL_HOST_STACK_RSP_SLOT, 8),
+        Register::R10,
+        MemoryOperand::with_base_displ_size(Register::R11, CANONICAL_HOST_STACK_RETURN_SLOT, 8),
     )?);
     ins.push(Instruction::with2(
         Code::Mov_r64_rm64,
-        Register::R10,
-        MemoryOperand::with_base(Register::R11),
+        Register::R11,
+        MemoryOperand::with_base_displ_size(Register::R11, CANONICAL_HOST_STACK_RSP_SLOT, 8),
     )?);
     ins.push(Instruction::with2(Code::Add_rm64_imm8, Register::R11, 8)?);
     ins.push(Instruction::with2(
@@ -885,8 +896,8 @@ fn build_native_entry_gateway(
         Register::R11,
     )?);
     // Reserve Win64 shadow space, bridge metadata, 10 x 16 bytes for the
-    // nonvolatile XMM6..XMM15 register set, and one final qword containing the
-    // exact occupancy bit claimed for this invocation. 0xF0 preserves the
+    // nonvolatile XMM6..XMM15 register set, the claimed occupancy bit and the
+    // original native return PC. 0xF0 preserves the
     // required 16-byte pre-call alignment.
     ins.push(Instruction::with2(
         Code::Sub_rm64_imm32,
@@ -895,10 +906,20 @@ fn build_native_entry_gateway(
     )?);
     // Persistent host frame: +0x20 guest RSP, +0x28 original RBX,
     // +0x30 occupancy-bitmap VA, +0x38 selected architectural state,
-    // +0xE0 claimed slot index.
+    // +0xE0 claimed slot index, +0xE8 native return PC
     ins.push(Instruction::with2(
         Code::Mov_rm64_r64,
         MemoryOperand::with_base_displ_size(Register::RSP, 0x20, 8),
+        Register::RAX,
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::RAX,
+        MemoryOperand::with_base(Register::RAX),
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_rm64_r64,
+        MemoryOperand::with_base_displ_size(Register::RSP, 0xE8, 8),
         Register::RAX,
     )?);
     ins.push(Instruction::with2(
@@ -1003,6 +1024,18 @@ fn build_native_entry_gateway(
         Code::Mov_r64_rm64,
         Register::R11,
         MemoryOperand::with_base_displ_size(Register::RSP, 0x20, 8),
+    )?);
+    // A nested native tail call can reuse the guest return slot for CALL's
+    // bridge continuation. Restore the native caller's identity before RET
+    ins.push(Instruction::with2(
+        Code::Mov_r64_rm64,
+        Register::R10,
+        MemoryOperand::with_base_displ_size(Register::RSP, 0xE8, 8),
+    )?);
+    ins.push(Instruction::with2(
+        Code::Mov_rm64_r64,
+        MemoryOperand::with_base(Register::R11),
+        Register::R10,
     )?);
     ins.push(Instruction::with2(
         Code::Mov_r64_rm64,
@@ -1750,6 +1783,10 @@ pub(crate) fn build_prog_vm_mod(
         vm::build_program_vm(code_va, table_va, bytecode_va, bc, state_va, m8_mod, rng)
     }
 }
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+#[path = "vm_build_tests.rs"]
+mod gateway_return_tests;
 
 #[cfg(test)]
 mod invocation_layout_tests {
